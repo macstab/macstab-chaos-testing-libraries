@@ -40,7 +40,8 @@ Wrapper families are split by responsibility:
 - [`src/wrappers/chaos_io_open.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/wrappers/chaos_io_open.c)
   owns `open()` and `openat()`.
 - [`src/wrappers/chaos_io_rw.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/wrappers/chaos_io_rw.c)
-  owns `read()`, `write()`, `pread()`, `pwrite()`, and Linux `sendfile()`.
+  owns `read()`, `readv()`, `write()`, `writev()`, `pread()`, `preadv()`,
+  `pwrite()`, `pwritev()`, and Linux `sendfile()` plus `copy_file_range()`.
 - [`src/wrappers/chaos_io_sync.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/wrappers/chaos_io_sync.c)
   owns `close()`, `fsync()`, and `fdatasync()`.
 
@@ -63,7 +64,7 @@ That boundary rule is important:
 
 [`src/config/chaos_io_fdcache.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/config/chaos_io_fdcache.c)
 
-- `read`, `write`, `fsync`, `fdatasync`, `pread`, and `pwrite` operate on fds, not paths.
+- `read`, `readv`, `write`, `writev`, `fsync`, `fdatasync`, `pread`, `preadv`, `pwrite`, and `pwritev` operate on fds, not paths.
 - The library resolves each fd through `/proc/self/fd/<fd>`.
 - Resolved paths are cached in thread-local direct-mapped slots.
 - Successful `close` invalidates the cache entry.
@@ -104,18 +105,21 @@ That is why coverage can stay strict without adding exported test-only symbols.
 - Linux-only
 - Builds the real shared object
 - Verifies passthrough, injected errno failure, measured latency, and
-  `openat()` plus Linux `sendfile()` runtime interposition on Linux hosts
+  `openat()`, `readv()`, `writev()`, `preadv()`, `pwritev()`, and Linux
+  `sendfile()` plus `copy_file_range()` runtime interposition on Linux hosts
 
 [`test/runtime/test_glibc.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/runtime/test_glibc.sh)
 
 - Verifies the glibc Debian Docker build and runtime path, including direct
-  `openat()` and Linux `sendfile()` probes
+  `openat()`, `readv()`, `writev()`, `preadv()`, `pwritev()`, and Linux
+  `sendfile()` plus `copy_file_range()` probes
 - Accepts `linux/amd64` or `linux/arm64` as an optional explicit Docker target
 
 [`test/runtime/test_alpine.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/runtime/test_alpine.sh)
 
 - Verifies the musl Alpine Docker build and runtime path, including direct
-  `openat()` and Linux `sendfile()` probes
+  `openat()`, `readv()`, `writev()`, `preadv()`, `pwritev()`, and Linux
+  `sendfile()` plus `copy_file_range()` probes
 - Accepts `linux/amd64` or `linux/arm64` as an optional explicit Docker target
 
 ## Maintenance Rules

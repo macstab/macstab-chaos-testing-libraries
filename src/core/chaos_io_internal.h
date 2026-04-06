@@ -16,6 +16,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #ifdef __linux__
@@ -43,18 +44,25 @@
 
 typedef ssize_t (*chaos_io_read_fn)(int, void *, size_t);
 typedef ssize_t (*chaos_io_write_fn)(int, const void *, size_t);
+typedef ssize_t (*chaos_io_readv_fn)(int, const struct iovec *, int);
+typedef ssize_t (*chaos_io_writev_fn)(int, const struct iovec *, int);
 typedef int (*chaos_io_open_fn)(const char *, int, ...);
 typedef int (*chaos_io_openat_fn)(int, const char *, int, ...);
 typedef int (*chaos_io_close_fn)(int);
 typedef int (*chaos_io_sync_fn)(int);
 typedef ssize_t (*chaos_io_pread_fn)(int, void *, size_t, off_t);
 typedef ssize_t (*chaos_io_pwrite_fn)(int, const void *, size_t, off_t);
+typedef ssize_t (*chaos_io_preadv_fn)(int, const struct iovec *, int, off_t);
+typedef ssize_t (*chaos_io_pwritev_fn)(int, const struct iovec *, int, off_t);
 #ifdef __linux__
 typedef ssize_t (*chaos_io_sendfile_fn)(int, int, off_t *, size_t);
+typedef ssize_t (*chaos_io_copy_file_range_fn)(int, off_t *, int, off_t *, size_t, unsigned int);
 #endif
 
 extern chaos_io_read_fn g_chaos_io_real_read;
 extern chaos_io_write_fn g_chaos_io_real_write;
+extern chaos_io_readv_fn g_chaos_io_real_readv;
+extern chaos_io_writev_fn g_chaos_io_real_writev;
 extern chaos_io_open_fn g_chaos_io_real_open;
 extern chaos_io_openat_fn g_chaos_io_real_openat;
 extern chaos_io_close_fn g_chaos_io_real_close;
@@ -62,8 +70,11 @@ extern chaos_io_sync_fn g_chaos_io_real_fsync;
 extern chaos_io_sync_fn g_chaos_io_real_fdatasync;
 extern chaos_io_pread_fn g_chaos_io_real_pread;
 extern chaos_io_pwrite_fn g_chaos_io_real_pwrite;
+extern chaos_io_preadv_fn g_chaos_io_real_preadv;
+extern chaos_io_pwritev_fn g_chaos_io_real_pwritev;
 #ifdef __linux__
 extern chaos_io_sendfile_fn g_chaos_io_real_sendfile;
+extern chaos_io_copy_file_range_fn g_chaos_io_real_copy_file_range;
 #endif
 
 extern __thread int g_chaos_io_tls_guard;

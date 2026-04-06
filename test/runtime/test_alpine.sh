@@ -77,7 +77,7 @@ docker run --rm \
         apk add --no-cache build-base >/dev/null
 
         cat >/tmp/probe.c <<'EOF'
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
 #include <errno.h>
 #include <fcntl.h>
@@ -85,6 +85,7 @@ docker run --rm \
 #include <string.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -228,6 +229,234 @@ static int torn_write_payload(const char *path, const char *payload)
     return 0;
 }
 
+static int writev_payload(const char *path, const char *first, const char *second)
+{
+    struct iovec iov[2];
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    size_t first_len = strlen(first);
+    size_t second_len = strlen(second);
+    ssize_t rc;
+
+    if (fd < 0) {
+        return 44;
+    }
+
+    iov[0].iov_base = (void *)first;
+    iov[0].iov_len = first_len;
+    iov[1].iov_base = (void *)second;
+    iov[1].iov_len = second_len;
+    rc = writev(fd, iov, 2);
+    if (rc < 0) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 45 : saved;
+    }
+    if ((size_t)rc != first_len + second_len) {
+        close(fd);
+        return 46;
+    }
+
+    if (close(fd) != 0) {
+        return 47;
+    }
+
+    return 0;
+}
+
+static int torn_writev_payload(const char *path, const char *first, const char *second)
+{
+    struct iovec iov[2];
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    size_t first_len = strlen(first);
+    size_t second_len = strlen(second);
+    size_t total = first_len + second_len;
+    ssize_t rc;
+
+    if (fd < 0) {
+        return 48;
+    }
+
+    iov[0].iov_base = (void *)first;
+    iov[0].iov_len = first_len;
+    iov[1].iov_base = (void *)second;
+    iov[1].iov_len = second_len;
+    rc = writev(fd, iov, 2);
+    if (rc < 0) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 49 : saved;
+    }
+    if (rc <= 0 || (size_t)rc >= total) {
+        close(fd);
+        return 50;
+    }
+
+    if (close(fd) != 0) {
+        return 51;
+    }
+
+    return 0;
+}
+
+static int readv_check_payload(const char *path, const char *expected, int expect_difference)
+{
+    size_t len = strlen(expected);
+    size_t first_len = len > 1U ? len / 2U : len;
+    size_t second_len = len - first_len;
+    char first_buf[(first_len == 0U) ? 1U : first_len];
+    char second_buf[(second_len == 0U) ? 1U : second_len];
+    struct iovec iov[2];
+    int fd = open(path, O_RDONLY);
+    ssize_t rc;
+    int same;
+
+    if (fd < 0) {
+        return 52;
+    }
+
+    iov[0].iov_base = first_buf;
+    iov[0].iov_len = first_len;
+    iov[1].iov_base = second_buf;
+    iov[1].iov_len = second_len;
+    rc = readv(fd, iov, 2);
+    if (rc < 0) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 53 : saved;
+    }
+    if ((size_t)rc != len) {
+        close(fd);
+        return 54;
+    }
+
+    same = memcmp(first_buf, expected, first_len) == 0
+        && memcmp(second_buf, expected + first_len, second_len) == 0;
+    if (close(fd) != 0) {
+        return 55;
+    }
+
+    if (expect_difference) {
+        return same ? 56 : 0;
+    }
+    return same ? 0 : 57;
+}
+
+static int preadv_check_payload(
+    const char *path,
+    off_t offset,
+    const char *expected,
+    int expect_difference)
+{
+    size_t len = strlen(expected);
+    size_t first_len = len > 1U ? len / 2U : len;
+    size_t second_len = len - first_len;
+    char first_buf[(first_len == 0U) ? 1U : first_len];
+    char second_buf[(second_len == 0U) ? 1U : second_len];
+    struct iovec iov[2];
+    int fd = open(path, O_RDONLY);
+    ssize_t rc;
+    int same;
+
+    if (fd < 0) {
+        return 58;
+    }
+
+    iov[0].iov_base = first_buf;
+    iov[0].iov_len = first_len;
+    iov[1].iov_base = second_buf;
+    iov[1].iov_len = second_len;
+    rc = preadv(fd, iov, 2, offset);
+    if (rc < 0) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 59 : saved;
+    }
+    if ((size_t)rc != len) {
+        close(fd);
+        return 60;
+    }
+
+    same = memcmp(first_buf, expected, first_len) == 0
+        && memcmp(second_buf, expected + first_len, second_len) == 0;
+    if (close(fd) != 0) {
+        return 61;
+    }
+
+    if (expect_difference) {
+        return same ? 62 : 0;
+    }
+    return same ? 0 : 63;
+}
+
+static int pwritev_payload(const char *path, off_t offset, const char *first, const char *second)
+{
+    struct iovec iov[2];
+    int fd = open(path, O_WRONLY);
+    size_t first_len = strlen(first);
+    size_t second_len = strlen(second);
+    ssize_t rc;
+
+    if (fd < 0) {
+        return 64;
+    }
+
+    iov[0].iov_base = (void *)first;
+    iov[0].iov_len = first_len;
+    iov[1].iov_base = (void *)second;
+    iov[1].iov_len = second_len;
+    rc = pwritev(fd, iov, 2, offset);
+    if (rc < 0) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 65 : saved;
+    }
+    if ((size_t)rc != first_len + second_len) {
+        close(fd);
+        return 66;
+    }
+
+    if (close(fd) != 0) {
+        return 67;
+    }
+
+    return 0;
+}
+
+static int torn_pwritev_payload(const char *path, off_t offset, const char *first, const char *second)
+{
+    struct iovec iov[2];
+    int fd = open(path, O_WRONLY);
+    size_t first_len = strlen(first);
+    size_t second_len = strlen(second);
+    size_t total = first_len + second_len;
+    ssize_t rc;
+
+    if (fd < 0) {
+        return 68;
+    }
+
+    iov[0].iov_base = (void *)first;
+    iov[0].iov_len = first_len;
+    iov[1].iov_base = (void *)second;
+    iov[1].iov_len = second_len;
+    rc = pwritev(fd, iov, 2, offset);
+    if (rc < 0) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 69 : saved;
+    }
+    if (rc <= 0 || (size_t)rc >= total) {
+        close(fd);
+        return 70;
+    }
+
+    if (close(fd) != 0) {
+        return 71;
+    }
+
+    return 0;
+}
+
 static int sendfile_copy_payload(const char *source_path, const char *target_path)
 {
     int in_fd = open(source_path, O_RDONLY);
@@ -318,6 +547,96 @@ static int torn_sendfile_copy_payload(const char *source_path, const char *targe
     return 0;
 }
 
+static int copy_file_range_copy_payload(const char *source_path, const char *target_path)
+{
+    int in_fd = open(source_path, O_RDONLY);
+    int out_fd;
+    struct stat st;
+    ssize_t rc;
+
+    if (in_fd < 0) {
+        return 64;
+    }
+    if (fstat(in_fd, &st) != 0) {
+        close(in_fd);
+        return 65;
+    }
+
+    out_fd = open(target_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (out_fd < 0) {
+        close(in_fd);
+        return 66;
+    }
+
+    rc = copy_file_range(in_fd, NULL, out_fd, NULL, (size_t)st.st_size, 0U);
+    if (rc < 0) {
+        int saved = errno;
+        close(out_fd);
+        close(in_fd);
+        return saved == 0 ? 67 : saved;
+    }
+    if ((size_t)rc != (size_t)st.st_size) {
+        close(out_fd);
+        close(in_fd);
+        return 68;
+    }
+
+    if (close(out_fd) != 0) {
+        close(in_fd);
+        return 69;
+    }
+    if (close(in_fd) != 0) {
+        return 70;
+    }
+
+    return 0;
+}
+
+static int torn_copy_file_range_copy_payload(const char *source_path, const char *target_path)
+{
+    int in_fd = open(source_path, O_RDONLY);
+    int out_fd;
+    struct stat st;
+    ssize_t rc;
+
+    if (in_fd < 0) {
+        return 71;
+    }
+    if (fstat(in_fd, &st) != 0) {
+        close(in_fd);
+        return 72;
+    }
+
+    out_fd = open(target_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (out_fd < 0) {
+        close(in_fd);
+        return 73;
+    }
+
+    rc = copy_file_range(in_fd, NULL, out_fd, NULL, (size_t)st.st_size, 0U);
+    if (rc < 0) {
+        int saved = errno;
+        close(out_fd);
+        close(in_fd);
+        return saved == 0 ? 74 : saved;
+    }
+    if (rc <= 0 || (size_t)rc >= (size_t)st.st_size) {
+        close(out_fd);
+        close(in_fd);
+        return 75;
+    }
+
+    if (close(out_fd) != 0) {
+        close(in_fd);
+        return 76;
+    }
+    if (close(in_fd) != 0) {
+        return 77;
+    }
+
+    return 0;
+}
+
 static int fsync_with_latency(const char *path)
 {
     struct timespec start;
@@ -381,40 +700,128 @@ int main(void)
         return 7;
     }
 
-    if (write_payload(\"/tmp/sendfile-src.bin\", \"sendfile\") != 0) {
+    if (write_payload(\"/tmp/readv-src.bin\", \"readv\") != 0) {
         return 8;
     }
 
-    if (write_config(\"/tmp/sendfile-dst.bin:write:EIO:1.0\", now + 3) != 0) {
+    if (readv_check_payload(\"/tmp/readv-src.bin\", \"readv\", 0) != 0) {
         return 9;
     }
 
-    if (sendfile_copy_payload(\"/tmp/sendfile-src.bin\", \"/tmp/sendfile-dst.bin\") != EIO) {
+    if (write_config(\"/tmp/readv-src.bin:read:CORRUPT:1.0\", now + 3) != 0) {
         return 10;
     }
 
-    if (write_config(\"/tmp/sendfile-dst.bin:write:TORN:1.0\", now + 4) != 0) {
+    if (readv_check_payload(\"/tmp/readv-src.bin\", \"readv\", 1) != 0) {
         return 11;
     }
 
-    if (torn_sendfile_copy_payload(\"/tmp/sendfile-src.bin\", \"/tmp/sendfile-dst.bin\") != 0) {
+    if (write_config(\"/tmp/writev-target.bin:write:EIO:1.0\", now + 4) != 0) {
         return 12;
     }
 
-    if (write_config(\"/tmp/target.bin:write:TORN:1.0\", now + 5) != 0) {
+    if (writev_payload(\"/tmp/writev-target.bin\", \"wr\", \"itev\") != EIO) {
         return 13;
     }
 
-    if (torn_write_payload(\"/tmp/target.bin\", \"hello\") != 0) {
+    if (write_config(\"/tmp/writev-target.bin:write:TORN:1.0\", now + 5) != 0) {
         return 14;
     }
 
-    if (write_config(\"/tmp/target.bin:fsync:LATENCY:200\", now + 6) != 0) {
+    if (torn_writev_payload(\"/tmp/writev-target.bin\", \"wr\", \"itev\") != 0) {
         return 15;
     }
 
-    if (fsync_with_latency(\"/tmp/target.bin\") != 0) {
+    if (write_payload(\"/tmp/preadv-src.bin\", \"preadv\") != 0) {
         return 16;
+    }
+
+    if (preadv_check_payload(\"/tmp/preadv-src.bin\", 1, \"read\", 0) != 0) {
+        return 17;
+    }
+
+    if (write_config(\"/tmp/preadv-src.bin:pread:CORRUPT:1.0\", now + 6) != 0) {
+        return 18;
+    }
+
+    if (preadv_check_payload(\"/tmp/preadv-src.bin\", 1, \"read\", 1) != 0) {
+        return 19;
+    }
+
+    if (write_payload(\"/tmp/pwritev-target.bin\", \"........\") != 0) {
+        return 20;
+    }
+
+    if (write_config(\"/tmp/pwritev-target.bin:pwrite:EIO:1.0\", now + 7) != 0) {
+        return 21;
+    }
+
+    if (pwritev_payload(\"/tmp/pwritev-target.bin\", 1, \"pw\", \"rite\") != EIO) {
+        return 22;
+    }
+
+    if (write_config(\"/tmp/pwritev-target.bin:pwrite:TORN:1.0\", now + 8) != 0) {
+        return 23;
+    }
+
+    if (torn_pwritev_payload(\"/tmp/pwritev-target.bin\", 1, \"pw\", \"rite\") != 0) {
+        return 24;
+    }
+
+    if (write_payload(\"/tmp/sendfile-src.bin\", \"sendfile\") != 0) {
+        return 25;
+    }
+
+    if (write_config(\"/tmp/sendfile-dst.bin:write:EIO:1.0\", now + 9) != 0) {
+        return 26;
+    }
+
+    if (sendfile_copy_payload(\"/tmp/sendfile-src.bin\", \"/tmp/sendfile-dst.bin\") != EIO) {
+        return 27;
+    }
+
+    if (write_config(\"/tmp/sendfile-dst.bin:write:TORN:1.0\", now + 10) != 0) {
+        return 28;
+    }
+
+    if (torn_sendfile_copy_payload(\"/tmp/sendfile-src.bin\", \"/tmp/sendfile-dst.bin\") != 0) {
+        return 29;
+    }
+
+    if (write_payload(\"/tmp/copy-range-src.bin\", \"copy-range\") != 0) {
+        return 30;
+    }
+
+    if (write_config(\"/tmp/copy-range-dst.bin:write:EIO:1.0\", now + 11) != 0) {
+        return 31;
+    }
+
+    if (copy_file_range_copy_payload(\"/tmp/copy-range-src.bin\", \"/tmp/copy-range-dst.bin\") != EIO) {
+        return 32;
+    }
+
+    if (write_config(\"/tmp/copy-range-dst.bin:write:TORN:1.0\", now + 12) != 0) {
+        return 33;
+    }
+
+    if (torn_copy_file_range_copy_payload(\"/tmp/copy-range-src.bin\", \"/tmp/copy-range-dst.bin\") != 0) {
+        return 34;
+    }
+
+    if (write_config(\"/tmp/target.bin:write:TORN:1.0\", now + 13) != 0) {
+        return 35;
+    }
+
+    if (torn_write_payload(\"/tmp/target.bin\", \"hello\") != 0) {
+        return 36;
+    }
+
+    if (write_config(\"/tmp/target.bin:fsync:LATENCY:200\", now + 14) != 0) {
+        return 37;
+    }
+
+    if (fsync_with_latency(\"/tmp/target.bin\") != 0) {
+        return 38;
     }
 
     return 0;

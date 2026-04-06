@@ -24,6 +24,8 @@
 
 chaos_io_read_fn g_chaos_io_real_read = NULL;
 chaos_io_write_fn g_chaos_io_real_write = NULL;
+chaos_io_readv_fn g_chaos_io_real_readv = NULL;
+chaos_io_writev_fn g_chaos_io_real_writev = NULL;
 chaos_io_open_fn g_chaos_io_real_open = NULL;
 chaos_io_openat_fn g_chaos_io_real_openat = NULL;
 chaos_io_close_fn g_chaos_io_real_close = NULL;
@@ -31,8 +33,11 @@ chaos_io_sync_fn g_chaos_io_real_fsync = NULL;
 chaos_io_sync_fn g_chaos_io_real_fdatasync = NULL;
 chaos_io_pread_fn g_chaos_io_real_pread = NULL;
 chaos_io_pwrite_fn g_chaos_io_real_pwrite = NULL;
+chaos_io_preadv_fn g_chaos_io_real_preadv = NULL;
+chaos_io_pwritev_fn g_chaos_io_real_pwritev = NULL;
 #ifdef __linux__
 chaos_io_sendfile_fn g_chaos_io_real_sendfile = NULL;
+chaos_io_copy_file_range_fn g_chaos_io_real_copy_file_range = NULL;
 #endif
 
 __thread int g_chaos_io_tls_guard = 0;
@@ -125,6 +130,8 @@ static void chaos_io_init(void)
 {
     chaos_io_resolve_symbol(&g_chaos_io_real_read, "read");
     chaos_io_resolve_symbol(&g_chaos_io_real_write, "write");
+    chaos_io_resolve_symbol(&g_chaos_io_real_readv, "readv");
+    chaos_io_resolve_symbol(&g_chaos_io_real_writev, "writev");
     chaos_io_resolve_symbol(&g_chaos_io_real_open, "open");
     chaos_io_resolve_symbol(&g_chaos_io_real_openat, "openat");
     chaos_io_resolve_symbol(&g_chaos_io_real_close, "close");
@@ -132,8 +139,11 @@ static void chaos_io_init(void)
     chaos_io_resolve_symbol(&g_chaos_io_real_fdatasync, "fdatasync");
     chaos_io_resolve_symbol(&g_chaos_io_real_pread, "pread");
     chaos_io_resolve_symbol(&g_chaos_io_real_pwrite, "pwrite");
+    chaos_io_resolve_symbol(&g_chaos_io_real_preadv, "preadv");
+    chaos_io_resolve_symbol(&g_chaos_io_real_pwritev, "pwritev");
 #ifdef __linux__
     chaos_io_resolve_symbol(&g_chaos_io_real_sendfile, "sendfile");
+    chaos_io_resolve_symbol(&g_chaos_io_real_copy_file_range, "copy_file_range");
 #endif
 
     g_chaos_io_process_seed = chaos_io_read_seed_material();

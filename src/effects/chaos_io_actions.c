@@ -80,7 +80,15 @@ void chaos_io_corrupt_buffer_sample(
 /* Flips one random bit in a buffer using the thread-local PRNG. */
 void chaos_io_corrupt_buffer(void *buffer, size_t size)
 {
-    chaos_io_corrupt_buffer_sample(buffer, size, chaos_io_prng_next_u32(), chaos_io_prng_next_u32());
+    uint32_t index_sample = chaos_io_prng_next_u32();
+    uint32_t bit_sample = chaos_io_prng_next_u32();
+
+    /*
+     * C does not define function-argument evaluation order, so the samples
+     * must be captured explicitly to keep corruption deterministic across
+     * compilers and architectures.
+     */
+    chaos_io_corrupt_buffer_sample(buffer, size, index_sample, bit_sample);
 }
 
 /* Applies a configured latency before the real libc call. */

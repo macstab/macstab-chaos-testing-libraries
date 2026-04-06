@@ -10,6 +10,8 @@
 #include <dlfcn.h>
 #include <sys/syscall.h>
 
+#define CHAOS_TEST_IOV_SNAPSHOT_COUNT 4
+
 static int g_config_init_calls = 0;
 static int g_config_prepare_calls = 0;
 static int g_config_match_loaded_calls = 0;
@@ -43,6 +45,10 @@ static size_t g_torn_count_result = 0U;
 static size_t g_last_torn_requested = 0U;
 static int g_corrupt_calls = 0;
 static size_t g_last_corrupt_size = 0U;
+static int g_corrupt_sample_calls = 0;
+static size_t g_last_corrupt_sample_size = 0U;
+static uint32_t g_last_corrupt_index_sample = 0U;
+static uint32_t g_last_corrupt_bit_sample = 0U;
 
 static int g_real_open_calls = 0;
 static int g_real_open_return = 0;
@@ -67,12 +73,24 @@ static int g_real_read_guard = 0;
 static int g_real_read_fd = -1;
 static size_t g_real_read_count = 0U;
 static char g_real_read_fill[64];
+static int g_real_readv_calls = 0;
+static ssize_t g_real_readv_return = 0;
+static int g_real_readv_guard = 0;
+static int g_real_readv_fd = -1;
+static int g_real_readv_iovcnt = 0;
+static size_t g_real_readv_lengths[CHAOS_TEST_IOV_SNAPSHOT_COUNT];
 
 static int g_real_write_calls = 0;
 static ssize_t g_real_write_return = 0;
 static int g_real_write_guard = 0;
 static int g_real_write_fd = -1;
 static size_t g_real_write_count = 0U;
+static int g_real_writev_calls = 0;
+static ssize_t g_real_writev_return = 0;
+static int g_real_writev_guard = 0;
+static int g_real_writev_fd = -1;
+static int g_real_writev_iovcnt = 0;
+static size_t g_real_writev_lengths[CHAOS_TEST_IOV_SNAPSHOT_COUNT];
 #ifdef __linux__
 static int g_real_sendfile_calls = 0;
 static ssize_t g_real_sendfile_return = 0;
@@ -81,6 +99,15 @@ static int g_real_sendfile_out_fd = -1;
 static int g_real_sendfile_in_fd = -1;
 static off_t *g_real_sendfile_offset = NULL;
 static size_t g_real_sendfile_count = 0U;
+static int g_real_copy_file_range_calls = 0;
+static ssize_t g_real_copy_file_range_return = 0;
+static int g_real_copy_file_range_guard = 0;
+static int g_real_copy_file_range_in_fd = -1;
+static int g_real_copy_file_range_out_fd = -1;
+static off_t *g_real_copy_file_range_in_offset = NULL;
+static off_t *g_real_copy_file_range_out_offset = NULL;
+static size_t g_real_copy_file_range_count = 0U;
+static unsigned int g_real_copy_file_range_flags = 0U;
 #endif
 
 static int g_real_close_calls = 0;
@@ -105,6 +132,13 @@ static int g_real_pread_fd = -1;
 static size_t g_real_pread_count = 0U;
 static off_t g_real_pread_offset = 0;
 static char g_real_pread_fill[64];
+static int g_real_preadv_calls = 0;
+static ssize_t g_real_preadv_return = 0;
+static int g_real_preadv_guard = 0;
+static int g_real_preadv_fd = -1;
+static int g_real_preadv_iovcnt = 0;
+static off_t g_real_preadv_offset = 0;
+static size_t g_real_preadv_lengths[CHAOS_TEST_IOV_SNAPSHOT_COUNT];
 
 static int g_real_pwrite_calls = 0;
 static ssize_t g_real_pwrite_return = 0;
@@ -112,6 +146,13 @@ static int g_real_pwrite_guard = 0;
 static int g_real_pwrite_fd = -1;
 static size_t g_real_pwrite_count = 0U;
 static off_t g_real_pwrite_offset = 0;
+static int g_real_pwritev_calls = 0;
+static ssize_t g_real_pwritev_return = 0;
+static int g_real_pwritev_guard = 0;
+static int g_real_pwritev_fd = -1;
+static int g_real_pwritev_iovcnt = 0;
+static off_t g_real_pwritev_offset = 0;
+static size_t g_real_pwritev_lengths[CHAOS_TEST_IOV_SNAPSHOT_COUNT];
 
 static int g_sys_open_calls = 0;
 static int g_sys_read_calls = 0;
@@ -253,6 +294,76 @@ void chaos_io_corrupt_buffer(void *buffer, size_t size)
     }
 }
 
+void chaos_io_corrupt_buffer_sample(
+    void *buffer,
+    size_t size,
+    uint32_t index_sample,
+    uint32_t bit_sample)
+{
+    unsigned char *bytes = (unsigned char *)buffer;
+    size_t index;
+
+    ++g_corrupt_sample_calls;
+    g_last_corrupt_sample_size = size;
+    g_last_corrupt_index_sample = index_sample;
+    g_last_corrupt_bit_sample = bit_sample;
+    if (bytes == NULL || size == 0U) {
+        return;
+    }
+
+    index = (size_t)(index_sample % size);
+    bytes[index] ^= (unsigned char)(1U << (bit_sample & 7U));
+}
+
+static void chaos_test_capture_iov_lengths(
+    const struct iovec *iov,
+    int iovcnt,
+    int *captured_iovcnt,
+    size_t *captured_lengths)
+{
+    int index;
+
+    assert(captured_iovcnt != NULL);
+    assert(captured_lengths != NULL);
+    *captured_iovcnt = iovcnt;
+    for (index = 0; index < CHAOS_TEST_IOV_SNAPSHOT_COUNT; ++index) {
+        captured_lengths[index] = 0U;
+    }
+    if (iov == NULL || iovcnt <= 0) {
+        return;
+    }
+
+    for (index = 0; index < iovcnt && index < CHAOS_TEST_IOV_SNAPSHOT_COUNT; ++index) {
+        captured_lengths[index] = iov[index].iov_len;
+    }
+}
+
+static void chaos_test_fill_iovecs(
+    const struct iovec *iov,
+    int iovcnt,
+    const char *fill,
+    size_t fill_size)
+{
+    size_t copied = 0U;
+    int index;
+
+    if (iov == NULL || iovcnt <= 0 || fill == NULL || fill_size == 0U) {
+        return;
+    }
+
+    for (index = 0; index < iovcnt && copied < fill_size; ++index) {
+        size_t segment = iov[index].iov_len;
+
+        if (segment > fill_size - copied) {
+            segment = fill_size - copied;
+        }
+        if (segment > 0U) {
+            (void)memcpy(iov[index].iov_base, fill + copied, segment);
+            copied += segment;
+        }
+    }
+}
+
 static int chaos_test_real_open_impl(const char *path, int flags, ...)
 {
     ++g_real_open_calls;
@@ -324,6 +435,20 @@ static ssize_t chaos_test_real_read_impl(int fd, void *buffer, size_t count)
     return g_real_read_return;
 }
 
+static ssize_t chaos_test_real_readv_impl(int fd, const struct iovec *iov, int iovcnt)
+{
+    ++g_real_readv_calls;
+    g_real_readv_fd = fd;
+    g_real_readv_guard = g_chaos_io_tls_guard;
+    chaos_test_capture_iov_lengths(iov, iovcnt, &g_real_readv_iovcnt, g_real_readv_lengths);
+
+    if (g_real_readv_return > 0) {
+        chaos_test_fill_iovecs(iov, iovcnt, g_real_read_fill, (size_t)g_real_readv_return);
+    }
+
+    return g_real_readv_return;
+}
+
 static ssize_t chaos_test_real_write_impl(int fd, const void *buffer, size_t count)
 {
     (void)buffer;
@@ -332,6 +457,15 @@ static ssize_t chaos_test_real_write_impl(int fd, const void *buffer, size_t cou
     g_real_write_count = count;
     g_real_write_guard = g_chaos_io_tls_guard;
     return g_real_write_return;
+}
+
+static ssize_t chaos_test_real_writev_impl(int fd, const struct iovec *iov, int iovcnt)
+{
+    ++g_real_writev_calls;
+    g_real_writev_fd = fd;
+    g_real_writev_guard = g_chaos_io_tls_guard;
+    chaos_test_capture_iov_lengths(iov, iovcnt, &g_real_writev_iovcnt, g_real_writev_lengths);
+    return g_real_writev_return;
 }
 
 #ifdef __linux__
@@ -344,6 +478,25 @@ static ssize_t chaos_test_real_sendfile_impl(int out_fd, int in_fd, off_t *offse
     g_real_sendfile_count = count;
     g_real_sendfile_guard = g_chaos_io_tls_guard;
     return g_real_sendfile_return;
+}
+
+static ssize_t chaos_test_real_copy_file_range_impl(
+    int in_fd,
+    off_t *in_offset,
+    int out_fd,
+    off_t *out_offset,
+    size_t count,
+    unsigned int flags)
+{
+    ++g_real_copy_file_range_calls;
+    g_real_copy_file_range_in_fd = in_fd;
+    g_real_copy_file_range_in_offset = in_offset;
+    g_real_copy_file_range_out_fd = out_fd;
+    g_real_copy_file_range_out_offset = out_offset;
+    g_real_copy_file_range_count = count;
+    g_real_copy_file_range_flags = flags;
+    g_real_copy_file_range_guard = g_chaos_io_tls_guard;
+    return g_real_copy_file_range_return;
 }
 #endif
 
@@ -386,6 +539,21 @@ static ssize_t chaos_test_real_pread_impl(int fd, void *buffer, size_t count, of
     return g_real_pread_return;
 }
 
+static ssize_t chaos_test_real_preadv_impl(int fd, const struct iovec *iov, int iovcnt, off_t offset)
+{
+    ++g_real_preadv_calls;
+    g_real_preadv_fd = fd;
+    g_real_preadv_guard = g_chaos_io_tls_guard;
+    g_real_preadv_offset = offset;
+    chaos_test_capture_iov_lengths(iov, iovcnt, &g_real_preadv_iovcnt, g_real_preadv_lengths);
+
+    if (g_real_preadv_return > 0) {
+        chaos_test_fill_iovecs(iov, iovcnt, g_real_pread_fill, (size_t)g_real_preadv_return);
+    }
+
+    return g_real_preadv_return;
+}
+
 static ssize_t chaos_test_real_pwrite_impl(int fd, const void *buffer, size_t count, off_t offset)
 {
     (void)buffer;
@@ -395,6 +563,16 @@ static ssize_t chaos_test_real_pwrite_impl(int fd, const void *buffer, size_t co
     g_real_pwrite_offset = offset;
     g_real_pwrite_guard = g_chaos_io_tls_guard;
     return g_real_pwrite_return;
+}
+
+static ssize_t chaos_test_real_pwritev_impl(int fd, const struct iovec *iov, int iovcnt, off_t offset)
+{
+    ++g_real_pwritev_calls;
+    g_real_pwritev_fd = fd;
+    g_real_pwritev_guard = g_chaos_io_tls_guard;
+    g_real_pwritev_offset = offset;
+    chaos_test_capture_iov_lengths(iov, iovcnt, &g_real_pwritev_iovcnt, g_real_pwritev_lengths);
+    return g_real_pwritev_return;
 }
 
 static void *chaos_test_dlsym_pointer(const void *function_bytes, size_t function_size)
@@ -425,9 +603,18 @@ static void *chaos_test_dlsym(void *handle, const char *symbol)
     if (strcmp(symbol, "write") == 0) {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_write_fn, chaos_test_real_write_impl);
     }
+    if (strcmp(symbol, "readv") == 0) {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_readv_fn, chaos_test_real_readv_impl);
+    }
+    if (strcmp(symbol, "writev") == 0) {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_writev_fn, chaos_test_real_writev_impl);
+    }
 #ifdef __linux__
     if (strcmp(symbol, "sendfile") == 0) {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_sendfile_fn, chaos_test_real_sendfile_impl);
+    }
+    if (strcmp(symbol, "copy_file_range") == 0) {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_copy_file_range_fn, chaos_test_real_copy_file_range_impl);
     }
 #endif
     if (strcmp(symbol, "open") == 0) {
@@ -450,6 +637,12 @@ static void *chaos_test_dlsym(void *handle, const char *symbol)
     }
     if (strcmp(symbol, "pwrite") == 0) {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_pwrite_fn, chaos_test_real_pwrite_impl);
+    }
+    if (strcmp(symbol, "preadv") == 0) {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_preadv_fn, chaos_test_real_preadv_impl);
+    }
+    if (strcmp(symbol, "pwritev") == 0) {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_pwritev_fn, chaos_test_real_pwritev_impl);
     }
 
     g_dlerror_pending = "unexpected symbol";
@@ -556,6 +749,10 @@ static void chaos_test_reset_state(void)
     g_last_torn_requested = 0U;
     g_corrupt_calls = 0;
     g_last_corrupt_size = 0U;
+    g_corrupt_sample_calls = 0;
+    g_last_corrupt_sample_size = 0U;
+    g_last_corrupt_index_sample = 0U;
+    g_last_corrupt_bit_sample = 0U;
 
     g_real_open_calls = 0;
     g_real_open_return = 10;
@@ -580,12 +777,24 @@ static void chaos_test_reset_state(void)
     g_real_read_fd = -1;
     g_real_read_count = 0U;
     (void)memset(g_real_read_fill, 0, sizeof(g_real_read_fill));
+    g_real_readv_calls = 0;
+    g_real_readv_return = 0;
+    g_real_readv_guard = 0;
+    g_real_readv_fd = -1;
+    g_real_readv_iovcnt = 0;
+    (void)memset(g_real_readv_lengths, 0, sizeof(g_real_readv_lengths));
 
     g_real_write_calls = 0;
     g_real_write_return = 0;
     g_real_write_guard = 0;
     g_real_write_fd = -1;
     g_real_write_count = 0U;
+    g_real_writev_calls = 0;
+    g_real_writev_return = 0;
+    g_real_writev_guard = 0;
+    g_real_writev_fd = -1;
+    g_real_writev_iovcnt = 0;
+    (void)memset(g_real_writev_lengths, 0, sizeof(g_real_writev_lengths));
 #ifdef __linux__
     g_real_sendfile_calls = 0;
     g_real_sendfile_return = 0;
@@ -594,6 +803,15 @@ static void chaos_test_reset_state(void)
     g_real_sendfile_in_fd = -1;
     g_real_sendfile_offset = NULL;
     g_real_sendfile_count = 0U;
+    g_real_copy_file_range_calls = 0;
+    g_real_copy_file_range_return = 0;
+    g_real_copy_file_range_guard = 0;
+    g_real_copy_file_range_in_fd = -1;
+    g_real_copy_file_range_out_fd = -1;
+    g_real_copy_file_range_in_offset = NULL;
+    g_real_copy_file_range_out_offset = NULL;
+    g_real_copy_file_range_count = 0U;
+    g_real_copy_file_range_flags = 0U;
 #endif
 
     g_real_close_calls = 0;
@@ -618,6 +836,13 @@ static void chaos_test_reset_state(void)
     g_real_pread_count = 0U;
     g_real_pread_offset = 0;
     (void)memset(g_real_pread_fill, 0, sizeof(g_real_pread_fill));
+    g_real_preadv_calls = 0;
+    g_real_preadv_return = 0;
+    g_real_preadv_guard = 0;
+    g_real_preadv_fd = -1;
+    g_real_preadv_iovcnt = 0;
+    g_real_preadv_offset = 0;
+    (void)memset(g_real_preadv_lengths, 0, sizeof(g_real_preadv_lengths));
 
     g_real_pwrite_calls = 0;
     g_real_pwrite_return = 0;
@@ -625,6 +850,13 @@ static void chaos_test_reset_state(void)
     g_real_pwrite_fd = -1;
     g_real_pwrite_count = 0U;
     g_real_pwrite_offset = 0;
+    g_real_pwritev_calls = 0;
+    g_real_pwritev_return = 0;
+    g_real_pwritev_guard = 0;
+    g_real_pwritev_fd = -1;
+    g_real_pwritev_iovcnt = 0;
+    g_real_pwritev_offset = 0;
+    (void)memset(g_real_pwritev_lengths, 0, sizeof(g_real_pwritev_lengths));
 
     g_sys_open_calls = 0;
     g_sys_read_calls = 0;
@@ -638,6 +870,8 @@ static void chaos_test_reset_state(void)
     g_dlerror_pending = NULL;
     g_chaos_io_real_read = NULL;
     g_chaos_io_real_write = NULL;
+    g_chaos_io_real_readv = NULL;
+    g_chaos_io_real_writev = NULL;
     g_chaos_io_real_open = NULL;
     g_chaos_io_real_openat = NULL;
     g_chaos_io_real_close = NULL;
@@ -645,8 +879,11 @@ static void chaos_test_reset_state(void)
     g_chaos_io_real_fdatasync = NULL;
     g_chaos_io_real_pread = NULL;
     g_chaos_io_real_pwrite = NULL;
+    g_chaos_io_real_preadv = NULL;
+    g_chaos_io_real_pwritev = NULL;
 #ifdef __linux__
     g_chaos_io_real_sendfile = NULL;
+    g_chaos_io_real_copy_file_range = NULL;
 #endif
     g_chaos_io_tls_guard = 0;
     g_chaos_io_tls_prng_state = 0U;
@@ -657,6 +894,8 @@ static void chaos_test_bind_real_functions(void)
 {
     g_chaos_io_real_read = chaos_test_real_read_impl;
     g_chaos_io_real_write = chaos_test_real_write_impl;
+    g_chaos_io_real_readv = chaos_test_real_readv_impl;
+    g_chaos_io_real_writev = chaos_test_real_writev_impl;
     g_chaos_io_real_open = chaos_test_real_open_impl;
     g_chaos_io_real_openat = chaos_test_real_openat_impl;
     g_chaos_io_real_close = chaos_test_real_close_impl;
@@ -664,8 +903,11 @@ static void chaos_test_bind_real_functions(void)
     g_chaos_io_real_fdatasync = chaos_test_real_fdatasync_impl;
     g_chaos_io_real_pread = chaos_test_real_pread_impl;
     g_chaos_io_real_pwrite = chaos_test_real_pwrite_impl;
+    g_chaos_io_real_preadv = chaos_test_real_preadv_impl;
+    g_chaos_io_real_pwritev = chaos_test_real_pwritev_impl;
 #ifdef __linux__
     g_chaos_io_real_sendfile = chaos_test_real_sendfile_impl;
+    g_chaos_io_real_copy_file_range = chaos_test_real_copy_file_range_impl;
 #endif
 }
 
@@ -680,6 +922,14 @@ static void chaos_test_bind_libc_functions_for_exit(void)
     resolved = dlsym(RTLD_NEXT, "write");
     assert(resolved != NULL);
     (void)memcpy(&g_chaos_io_real_write, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "readv");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_readv, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "writev");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_writev, &resolved, sizeof(resolved));
 
     resolved = dlsym(RTLD_NEXT, "open");
     assert(resolved != NULL);
@@ -708,10 +958,22 @@ static void chaos_test_bind_libc_functions_for_exit(void)
     resolved = dlsym(RTLD_NEXT, "pwrite");
     assert(resolved != NULL);
     (void)memcpy(&g_chaos_io_real_pwrite, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "preadv");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_preadv, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "pwritev");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_pwritev, &resolved, sizeof(resolved));
 #ifdef __linux__
     resolved = dlsym(RTLD_NEXT, "sendfile");
     assert(resolved != NULL);
     (void)memcpy(&g_chaos_io_real_sendfile, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "copy_file_range");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_copy_file_range, &resolved, sizeof(resolved));
 #endif
 
     g_config_prepare_result = 0;

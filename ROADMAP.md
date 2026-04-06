@@ -70,10 +70,15 @@ Implemented in `libchaos-io`:
 - `openat`
 - `close`
 - `read`
+- `readv`
 - `write`
+- `writev`
 - Linux `sendfile`
+- Linux `copy_file_range`
 - `pread`
+- `preadv`
 - `pwrite`
+- `pwritev`
 - `fsync`
 - `fdatasync`
 
@@ -86,23 +91,25 @@ Current effects:
 
 Known gap:
 
-- `cp` and similar tools may still move data with `copy_file_range()` or
-  `splice()`, which bypass the current write hooks.
+- `cp` and similar tools may still move data with `splice()`, which bypasses
+  the current write hooks.
 
 Local verification snapshot for the current implementation:
 
-- passed after the wrapper split: Linux arm64 Docker unit run
-- passed after the wrapper split: Linux arm64 Docker coverage run
-- passed after the wrapper split: glibc arm64 Docker runtime
-- passed after the wrapper split: musl arm64 Docker runtime
-- blocked locally after the wrapper split: glibc amd64 Docker unit and runtime
-  because Debian GCC image extraction failed with `no space left on device`
-- blocked locally after the wrapper split: musl amd64 Docker runtime because
-  Alpine package installation failed with `no space left on device`
+- passed: Linux amd64 Docker unit run
+- passed: Linux arm64 Docker unit run
+- passed: Linux amd64 Docker coverage run
+- passed: Linux arm64 Docker coverage run
+- passed: glibc amd64 Docker runtime
+- passed: glibc arm64 Docker runtime
+- passed: musl amd64 Docker runtime
+- passed: musl arm64 Docker runtime
+- passed: Linux amd64 Docker integration run for `openat`, `readv`, `writev`,
+  `preadv`, `pwritev`, `sendfile`, and `copy_file_range`
 
 This means the implementation is materially ahead of the roadmap, but the
-cross-target completion gate is still open until the amd64 Docker paths are
-re-proven on a clean local Docker host or in CI.
+current `openat`, vectored I/O, `sendfile`, and `copy_file_range` work is
+locally proven across the required libc and architecture matrix.
 
 ## Phase 1: Close The Biggest Real-World Gaps
 
@@ -125,32 +132,27 @@ model or inflating the library too much.
 
 Phase 1 release-gate closure is still separate and remains open:
 
-- [ ] Close the cross-target gate for `openat`
+- [x] Close the cross-target gate for `openat`
   - Reuse existing `open` rule semantics.
   - Support absolute paths, `AT_FDCWD`, and directory-fd relative paths.
   - Cache the resolved path for the returned fd after success.
-  - Implementation is already landed; final closure still requires complete
-    glibc/musl amd64/arm64 runtime proof.
+  - Complete glibc/musl amd64/arm64 runtime proof now passes locally.
   - Cross-target completion gate applies.
-- [ ] Close the cross-target gate for Linux `sendfile`
+- [x] Close the cross-target gate for Linux `sendfile`
   - Treat it as a destination-side `write` operation.
   - Support `ERRNO`, `LATENCY`, and `TORN`.
-  - Implementation is already landed; final closure still requires complete
-    glibc/musl amd64/arm64 runtime proof.
+  - Complete glibc/musl amd64/arm64 runtime proof now passes locally.
   - Cross-target completion gate applies.
-- [ ] Close the cross-target gate for the glibc Docker runtime test.
+- [x] Close the cross-target gate for the glibc Docker runtime test.
   - A matching glibc runtime test is already landed.
-  - Local arm64 runtime proof passes.
-  - Local amd64 unit and runtime proof are still blocked by Docker host
-    storage.
+  - Local amd64 and arm64 runtime proof now pass.
   - Cross-target completion gate applies.
-- [ ] Close the cross-target gate for unit coverage of the Phase 1 wrappers.
+- [x] Close the cross-target gate for unit coverage of the Phase 1 wrappers.
   - Unit branches for `openat`, Linux `sendfile`, and the `TORN` fix are
     already landed.
-  - Linux arm64 unit and coverage execution in Docker pass.
-  - Local amd64 Docker unit re-proof is still blocked by Docker host storage.
+  - Linux amd64 and arm64 unit plus coverage execution in Docker pass.
   - Cross-target completion gate applies.
-- [ ] Close the cross-target gate for Phase 1 documentation.
+- [x] Close the cross-target gate for Phase 1 documentation.
   - `README`, architecture notes, and engineering notes already describe
     `openat` and Linux `sendfile` semantics.
   - Cross-target completion gate applies.
@@ -160,25 +162,40 @@ Phase 1 release-gate closure is still separate and remains open:
 These additions keep the same logical fault model while covering more real
 applications.
 
-- [ ] Add `copy_file_range`
+- [x] Add `copy_file_range`
   - Treat it as a destination-side `write` operation.
   - Support `ERRNO`, `LATENCY`, and `TORN`.
+  - Local glibc/musl amd64/arm64 runtime proof now passes.
   - Cross-target completion gate applies.
-- [ ] Add `readv`
-  - Reuse `read` semantics.
+- [x] Extend native Linux integration tests for `copy_file_range`
+  - Linux amd64 Docker integration proof passes locally.
   - Cross-target completion gate applies.
-- [ ] Add `writev`
-  - Reuse `write` semantics.
+- [x] Extend Docker runtime tests for `copy_file_range` on both libc families
+  - glibc and musl amd64/arm64 runtime proof now passes locally.
   - Cross-target completion gate applies.
-- [ ] Add `preadv`
-  - Reuse `pread` semantics.
+- [x] Extend native Linux integration tests for vectored I/O
+  - Linux amd64 Docker integration proof for `readv`, `writev`, `preadv`, and
+    `pwritev` now passes locally.
   - Cross-target completion gate applies.
-- [ ] Add `pwritev`
-  - Reuse `pwrite` semantics.
+- [x] Extend Docker runtime tests for vectored I/O on both libc families
+  - glibc and musl amd64/arm64 runtime proof for `readv`, `writev`, `preadv`,
+    and `pwritev` now passes locally.
   - Cross-target completion gate applies.
-- [ ] Extend native Linux integration tests to exercise the new paths.
+- [x] Add `readv`
+  - Reuses `read` semantics across the concatenated iovec byte stream.
+  - Local glibc/musl amd64/arm64 runtime proof now passes.
   - Cross-target completion gate applies.
-- [ ] Extend Docker runtime tests to verify the new paths on both libc families.
+- [x] Add `writev`
+  - Reuses `write` semantics across the concatenated iovec byte stream.
+  - Local glibc/musl amd64/arm64 runtime proof now passes.
+  - Cross-target completion gate applies.
+- [x] Add `preadv`
+  - Reuses `pread` semantics across the concatenated iovec byte stream.
+  - Local glibc/musl amd64/arm64 runtime proof now passes.
+  - Cross-target completion gate applies.
+- [x] Add `pwritev`
+  - Reuses `pwrite` semantics across the concatenated iovec byte stream.
+  - Local glibc/musl amd64/arm64 runtime proof now passes.
   - Cross-target completion gate applies.
 
 ## Phase 3: File Lifecycle And Capacity Operations

@@ -32,7 +32,8 @@ If you are new to the repository, read it in this order:
 2. [`src/wrappers/chaos_io_open.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/wrappers/chaos_io_open.c)
    This holds the path-first wrappers and the `openat()` resolution logic.
 3. [`src/wrappers/chaos_io_rw.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/wrappers/chaos_io_rw.c)
-   This holds the read/write wrappers and Linux `sendfile()`.
+   This holds the read/write wrappers plus Linux `sendfile()` and
+   `copy_file_range()`.
 4. [`src/wrappers/chaos_io_sync.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/wrappers/chaos_io_sync.c)
    This holds `close()`, `fsync()`, and `fdatasync()`.
 5. [`src/config/chaos_io_config.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/config/chaos_io_config.c)
@@ -92,11 +93,11 @@ Use it when:
 - adding a new fd-backed data-path wrapper
 - changing when read corruption is applied
 - changing when torn writes are applied
-- changing Linux `sendfile()` behavior
+- changing Linux `sendfile()` or `copy_file_range()` behavior
 
 The invariant here is operational symmetry: read-style wrappers should stay
-read-like, write-style wrappers should stay write-like, and Linux `sendfile()`
-must remain explicitly destination-side.
+read-like, write-style wrappers should stay write-like, and Linux
+`sendfile()` plus `copy_file_range()` must remain explicitly destination-side.
 
 ### [`src/wrappers/chaos_io_sync.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/wrappers/chaos_io_sync.c)
 
@@ -174,7 +175,7 @@ pre-call injection and rely on post-open fd resolution only.
 
 If you extend open-path behavior, keep those responsibilities together.
 
-### `read()` and `pread()`
+### `read()`, `readv()`, `pread()`, and `preadv()`
 
 Read-style wrappers may:
 
@@ -185,7 +186,11 @@ Read-style wrappers may:
 They do not truncate the requested byte count before delegation. Any corruption
 happens after libc has already returned data.
 
-### `write()`, `pwrite()`, and Linux `sendfile()`
+`readv()` and `preadv()` must preserve that contract across the logical
+concatenation of the returned iovec buffers. Corruption sampling therefore
+happens across the total byte stream, not independently per segment.
+
+### `write()`, `writev()`, `pwrite()`, `pwritev()`, and Linux `sendfile()` / `copy_file_range()`
 
 Write-style wrappers may:
 
@@ -196,13 +201,19 @@ Write-style wrappers may:
 They do not modify the caller buffer. Torn writes are modeled as partial writes,
 not buffer corruption.
 
-Linux `sendfile()` now reuses the same logical `write` rule class, but it
-matches on the destination fd only. There is no read-side corruption path for
-`sendfile()` because there is no caller-visible read buffer to mutate.
+`writev()` and `pwritev()` must apply torn-write sizing across the logical
+total byte span and then translate that shortened byte budget back into a valid
+truncated iovec array for the real libc call.
+
+Linux `sendfile()` and `copy_file_range()` now reuse the same logical `write`
+rule class, but they match on the destination fd only. There is no read-side
+corruption path for either call because there is no caller-visible read buffer
+to mutate.
 
 The remaining gap is other alternate copy paths. Tools that move data through
-`copy_file_range()`, `splice()`, `mmap()`, or similar non-`write()` and
-non-`sendfile()` paths are still outside the current fault surface.
+`splice()`, `mmap()`, or similar non-`write()`, non-`writev()`,
+non-`sendfile()`, and non-`copy_file_range()` paths are still outside the
+current fault surface.
 
 ### `close()`
 

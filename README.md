@@ -81,15 +81,19 @@ Examples:
 ### Operations
 
 - `read`
+  Applies to `read()` and `readv()`.
 - `write`
-  Applies to `write()` and Linux `sendfile()` destination paths.
+  Applies to `write()`, `writev()`, Linux `sendfile()`, and Linux
+  `copy_file_range()` destination paths.
 - `open`
   Applies to both `open()` and `openat()`.
 - `close`
 - `fsync`
 - `fdatasync`
 - `pread`
+  Applies to `pread()` and `preadv()`.
 - `pwrite`
+  Applies to `pwrite()` and `pwritev()`.
 
 ### Effects
 
@@ -126,14 +130,16 @@ Examples:
 
 ## Runtime Behavior
 
-- The intercepted libc entry points are `read`, `write`, `open`, `openat`, `close`, `fsync`, `fdatasync`, `pread`, `pwrite`, and Linux `sendfile`.
+- The intercepted libc entry points are `read`, `readv`, `write`, `writev`, `open`, `openat`, `close`, `fsync`, `fdatasync`, `pread`, `preadv`, `pwrite`, `pwritev`, and Linux `sendfile` plus `copy_file_range`.
 - The config file is checked with `stat()` on each intercepted call.
 - Reload is lock-free for readers and swaps between two config snapshots.
 - FD-backed operations resolve paths through `/proc/self/fd/<fd>` and cache them in thread-local storage.
 - The library uses a thread-local recursion guard.
 - The library seeds a thread-local PRNG once per thread.
-- Linux `sendfile(2)` uses the logical `write` rule class and matches on the destination fd path.
-- Programs that copy data with `copy_file_range(2)`, `splice(2)`, `mmap(2)`, or other non-`write(2)`/`sendfile(2)` paths bypass `write` and `pwrite` rules.
+- `readv(2)` and `preadv(2)` reuse the logical `read` and `pread` rule classes across the concatenated iovec byte stream.
+- `writev(2)` and `pwritev(2)` reuse the logical `write` and `pwrite` rule classes across the concatenated iovec byte stream.
+- Linux `sendfile(2)` and `copy_file_range(2)` use the logical `write` rule class and match on the destination fd path.
+- Programs that copy data with `splice(2)`, `mmap(2)`, or other non-`write(2)`/`writev(2)`/`sendfile(2)`/`copy_file_range(2)` paths bypass `write` and `pwrite` rules.
 - Injection is never applied to:
   `stdin`, `stdout`, `stderr`, `/tmp/.chaos-io.conf`, `/proc`, `/sys`, or `/dev`.
 
@@ -193,6 +199,10 @@ sh test/runtime/test_alpine.sh linux/arm64
 ```
 
 When no platform is given, each script falls back to the host architecture.
+
+The Docker runtime probes explicitly validate `openat()`, `readv()`, `writev()`,
+`preadv()`, `pwritev()`, Linux `sendfile()`, Linux `copy_file_range()`, and
+`fsync()` under `LD_PRELOAD`.
 
 ### Build targets
 
