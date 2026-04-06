@@ -27,40 +27,89 @@ The project is not optimized for:
 If you are new to the repository, read it in this order:
 
 1. [`src/chaos_io.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io.c)
-   This is the control center. It resolves real libc symbols, owns the
-   constructor path, and defines the interposed wrappers.
-2. [`src/chaos_io_config.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_config.c)
+   This is the shared runtime core. It resolves real libc symbols, owns the
+   constructor path, and centralizes the common fd-backed match path.
+2. [`src/chaos_io_open.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_open.c)
+   This holds the path-first wrappers and the `openat()` resolution logic.
+3. [`src/chaos_io_rw.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_rw.c)
+   This holds the read/write wrappers and Linux `sendfile()`.
+4. [`src/chaos_io_sync.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_sync.c)
+   This holds `close()`, `fsync()`, and `fdatasync()`.
+5. [`src/chaos_io_config.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_config.c)
    This explains how rules get from text into an active in-memory snapshot.
-3. [`src/chaos_io_actions.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_actions.c)
+6. [`src/chaos_io_actions.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_actions.c)
    This contains the actual fault-effect mechanics once a rule has matched.
-4. [`src/chaos_io_fdcache.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_fdcache.c)
+7. [`src/chaos_io_fdcache.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_fdcache.c)
    This explains how fd-based calls recover the original path cheaply.
-5. [`test/test_chaos_io.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/test_chaos_io.c)
-   This is the fastest way to see the intended behavior of every wrapper branch.
+8. [`test/test_chaos_io_harness.h`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/test_chaos_io_harness.h)
+   This holds the wrapper test harness and direct source inclusion boundary.
+9. [`test/test_chaos_io.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/test_chaos_io.c)
+   This holds the actual wrapper behavior assertions.
 
 ## File Responsibilities
 
 ### [`src/chaos_io.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io.c)
 
-This file owns the wrapper lifecycle end to end.
+This file owns shared runtime state and lifecycle setup.
 
 Use it when:
 
-- adding a new interposed libc symbol
+- adding or resolving a downstream libc symbol
 - changing recursion-guard boundaries
-- changing when latency, errno, corruption, or torn writes are applied
+- changing constructor ordering
+- changing shared fd-backed rule lookup behavior
 - changing startup behavior
 
 Do not use it for:
 
-- config parsing rules
+- wrapper-specific call flow
 - probability math
 - fd-cache policies
 
-The main invariant is simple: wrappers should be easy to audit linearly. A
-reader should be able to answer, in order, whether the call bypasses internal
-work, whether config was matched, what fault effect is possible, when the real
-libc symbol is called, and what post-call work still happens.
+The main invariant is simple: shared runtime helpers should stay small, typed,
+and obviously safe under preload recursion.
+
+### [`src/chaos_io_open.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_open.c)
+
+This file owns path-first wrappers and open-path resolution.
+
+Use it when:
+
+- adding or changing `open()` behavior
+- adding or changing `openat()` behavior
+- changing varargs forwarding for open-style calls
+- changing pre-open path resolution and fd-cache seeding
+
+Keep the `open()` and `openat()` wrappers together. They share ABI handling,
+rule matching, and post-open cache population.
+
+### [`src/chaos_io_rw.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_rw.c)
+
+This file owns read- and write-side wrappers.
+
+Use it when:
+
+- adding a new fd-backed data-path wrapper
+- changing when read corruption is applied
+- changing when torn writes are applied
+- changing Linux `sendfile()` behavior
+
+The invariant here is operational symmetry: read-style wrappers should stay
+read-like, write-style wrappers should stay write-like, and Linux `sendfile()`
+must remain explicitly destination-side.
+
+### [`src/chaos_io_sync.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_sync.c)
+
+This file owns close and persistence-boundary wrappers.
+
+Use it when:
+
+- changing `close()` semantics
+- changing sync-wrapper behavior
+- changing how fd-cache invalidation relates to successful close
+
+Keep these wrappers boring. If they grow effect-specific policy beyond latency
+and errno injection, the design is probably drifting.
 
 ### [`src/chaos_io_config.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_config.c)
 
@@ -208,8 +257,9 @@ The tests are intentionally close to the implementation.
 
 - parser tests include config internals directly so malformed input and reload
   edges can be tested precisely
-- wrapper tests include `src/chaos_io.c` directly so every branch can be forced
-  without needing a real preload environment
+- wrapper tests include the wrapper implementation files directly through
+  [`test/test_chaos_io_harness.h`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/test_chaos_io_harness.h)
+  so every branch can be forced without needing a real preload environment
 - integration tests still exist to validate the real shared library on Linux
 
 This is a low-level systems library. Direct source inclusion in tests is a
@@ -221,10 +271,14 @@ If you add a new interposed operation:
 
 1. Add the enum value in [`src/chaos_io_config.h`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_config.h).
 2. Extend parser support and validation in [`src/chaos_io_config.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_config.c).
-3. Add the real libc symbol plumbing and wrapper in [`src/chaos_io.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io.c).
-4. Decide whether the operation is path-based or fd-based.
-5. Add direct unit coverage for every new branch.
-6. Keep `make coverage` at 100% for `src/*.c`.
+3. Add the real libc symbol plumbing in [`src/chaos_io.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io.c).
+4. Add the wrapper in the appropriate translation unit:
+   [`src/chaos_io_open.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_open.c),
+   [`src/chaos_io_rw.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_rw.c),
+   or [`src/chaos_io_sync.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_sync.c).
+5. Decide whether the operation is path-based or fd-based.
+6. Add direct unit coverage for every new branch.
+7. Keep `make coverage` at 100% for `src/*.c`.
 
 If you add a new effect:
 
@@ -232,7 +286,7 @@ If you add a new effect:
 2. Define which operations are allowed to use it.
 3. Add parser support.
 4. Add the effect logic in [`src/chaos_io_actions.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_actions.c) or a new helper module if it cannot live there cleanly.
-5. Wire the wrapper branches in [`src/chaos_io.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io.c).
+5. Wire the wrapper branches in the appropriate wrapper translation unit.
 6. Add deterministic tests first, then integration coverage where it matters.
 
 ## Maintenance Bar

@@ -37,9 +37,35 @@ check_target() {
     '
 }
 
-check_target "$BUILD_DIR/test_config_parse-test_config_parse.gcno" "src/chaos_io_config.c"
-check_target "$BUILD_DIR/test_actions-test_actions.gcno" "src/chaos_io_actions.c"
-check_target "$BUILD_DIR/test_fdcache-test_fdcache.gcno" "src/chaos_io_fdcache.c"
-check_target "$BUILD_DIR/test_chaos_io-test_chaos_io.gcno" "src/chaos_io.c"
+resolve_gcno() {
+    base_name=$1
+    plain_path=$BUILD_DIR/$base_name.gcno
+    duplicate_path=$BUILD_DIR/$base_name-$base_name.gcno
+
+    if [ -f "$plain_path" ]; then
+        printf '%s\n' "$plain_path"
+        return 0
+    fi
+    if [ -f "$duplicate_path" ]; then
+        printf '%s\n' "$duplicate_path"
+        return 0
+    fi
+
+    printf 'missing gcno for %s\n' "$base_name" >&2
+    exit 1
+}
+
+CONFIG_GCNO=$(resolve_gcno test_config_parse)
+ACTIONS_GCNO=$(resolve_gcno test_actions)
+FDCACHE_GCNO=$(resolve_gcno test_fdcache)
+CHAOS_IO_GCNO=$(resolve_gcno test_chaos_io)
+
+check_target "$CONFIG_GCNO" "src/chaos_io_config.c"
+check_target "$ACTIONS_GCNO" "src/chaos_io_actions.c"
+check_target "$FDCACHE_GCNO" "src/chaos_io_fdcache.c"
+check_target "$CHAOS_IO_GCNO" "src/chaos_io.c"
+check_target "$CHAOS_IO_GCNO" "src/chaos_io_open.c"
+check_target "$CHAOS_IO_GCNO" "src/chaos_io_rw.c"
+check_target "$CHAOS_IO_GCNO" "src/chaos_io_sync.c"
 
 echo "coverage check passed"

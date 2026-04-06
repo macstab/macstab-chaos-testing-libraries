@@ -20,6 +20,9 @@ intercepted libc symbols plus the config file at `/tmp/.chaos-io.conf`.
 ROADMAP.md
 src/
   chaos_io.c
+  chaos_io_open.c
+  chaos_io_rw.c
+  chaos_io_sync.c
   chaos_io_actions.c
   chaos_io_actions.h
   chaos_io_config.c
@@ -27,12 +30,14 @@ src/
   chaos_io_fdcache.c
   chaos_io_fdcache.h
   chaos_io_internal.h
+  chaos_io_wrappers.h
 test/
   check_coverage.sh
   test_actions.c
   test_alpine.sh
   test_glibc.sh
   test_chaos_io.c
+  test_chaos_io_harness.h
   test_config_parse.c
   test_fdcache.c
   test_integration.sh
@@ -137,7 +142,8 @@ Runs all unit binaries:
 - config parsing and reload logic
 - effect helpers
 - fd cache logic
-- full wrapper behavior in `chaos_io.c`
+- full wrapper behavior across `chaos_io.c`, `chaos_io_open.c`,
+  `chaos_io_rw.c`, and `chaos_io_sync.c`
 
 ### Coverage gate
 
@@ -148,6 +154,9 @@ make coverage
 This compiles an instrumented build and enforces `100.00%` line coverage for:
 
 - `src/chaos_io.c`
+- `src/chaos_io_open.c`
+- `src/chaos_io_rw.c`
+- `src/chaos_io_sync.c`
 - `src/chaos_io_actions.c`
 - `src/chaos_io_config.c`
 - `src/chaos_io_fdcache.c`

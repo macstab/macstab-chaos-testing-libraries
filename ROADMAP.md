@@ -91,23 +91,39 @@ Known gap:
 
 Local verification snapshot for the current implementation:
 
-- passed: host `make unit`
-- passed: host `make coverage`
-- passed: Linux arm64 unit run in Docker
-- passed: glibc arm64 Docker runtime
-- passed: musl arm64 Docker runtime
-- passed: musl amd64 Docker runtime
-- blocked locally: glibc amd64 Docker runtime because Docker layer extraction
-  failed with `no space left on device`
+- passed after the wrapper split: Linux arm64 Docker unit run
+- passed after the wrapper split: Linux arm64 Docker coverage run
+- passed after the wrapper split: glibc arm64 Docker runtime
+- passed after the wrapper split: musl arm64 Docker runtime
+- blocked locally after the wrapper split: glibc amd64 Docker unit and runtime
+  because Debian GCC image extraction failed with `no space left on device`
+- blocked locally after the wrapper split: musl amd64 Docker runtime because
+  Alpine package installation failed with `no space left on device`
 
 This means the implementation is materially ahead of the roadmap, but the
-cross-target completion gate is still open until glibc amd64 runtime proof is
-finished on a clean local Docker host or in CI.
+cross-target completion gate is still open until the amd64 Docker paths are
+re-proven on a clean local Docker host or in CI.
 
 ## Phase 1: Close The Biggest Real-World Gaps
 
 These items deliver the best coverage gain without changing the current config
 model or inflating the library too much.
+
+- [x] Add `openat`
+  - Existing `open` rule semantics are reused.
+  - Absolute paths, `AT_FDCWD`, and directory-fd relative paths are supported.
+  - Successful calls seed the fd cache with the resolved path.
+- [x] Add Linux `sendfile`
+  - Treated as a destination-side `write` operation.
+  - Supports `ERRNO`, `LATENCY`, and `TORN`.
+- [x] Add a glibc Docker runtime test matching the Alpine musl test
+  - The dedicated glibc runtime script exists and is part of the repo.
+- [x] Extend unit tests for every new wrapper branch and failure path
+  - `openat`, Linux `sendfile`, and the `TORN` contract regression are covered.
+- [x] Document the exact matching semantics for `openat` and Linux `sendfile`
+  - `README`, architecture notes, and engineering notes are updated.
+
+Phase 1 release-gate closure is still separate and remains open:
 
 - [ ] Close the cross-target gate for `openat`
   - Reuse existing `open` rule semantics.
@@ -125,12 +141,14 @@ model or inflating the library too much.
 - [ ] Close the cross-target gate for the glibc Docker runtime test.
   - A matching glibc runtime test is already landed.
   - Local arm64 runtime proof passes.
-  - Local amd64 runtime proof is still blocked by Docker host storage.
+  - Local amd64 unit and runtime proof are still blocked by Docker host
+    storage.
   - Cross-target completion gate applies.
 - [ ] Close the cross-target gate for unit coverage of the Phase 1 wrappers.
   - Unit branches for `openat`, Linux `sendfile`, and the `TORN` fix are
     already landed.
-  - Linux arm64 unit execution in Docker passes.
+  - Linux arm64 unit and coverage execution in Docker pass.
+  - Local amd64 Docker unit re-proof is still blocked by Docker host storage.
   - Cross-target completion gate applies.
 - [ ] Close the cross-target gate for Phase 1 documentation.
   - `README`, architecture notes, and engineering notes already describe

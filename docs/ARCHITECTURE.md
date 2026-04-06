@@ -21,6 +21,7 @@ The code stays intentionally narrow:
 - Seeds process entropy from `/dev/urandom`, with a deterministic fallback when that read fails.
 - Seeds the current thread PRNG.
 - Resets config and fd-cache state.
+- Shares common fd-rule matching used by the wrapper translation units.
 
 ### Request flow
 
@@ -33,6 +34,15 @@ For each intercepted operation:
 5. Apply latency, errno injection, torn writes, or read corruption.
 6. Call the real libc symbol.
 7. Update the fd cache when needed.
+
+Wrapper families are split by responsibility:
+
+- [`src/chaos_io_open.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_open.c)
+  owns `open()` and `openat()`.
+- [`src/chaos_io_rw.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_rw.c)
+  owns `read()`, `write()`, `pread()`, `pwrite()`, and Linux `sendfile()`.
+- [`src/chaos_io_sync.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_sync.c)
+  owns `close()`, `fsync()`, and `fdatasync()`.
 
 ## Config Reloading
 

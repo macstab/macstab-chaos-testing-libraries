@@ -19,10 +19,13 @@ BUILD_DIR := build
 DIST_DIR := dist
 SRC_DIR := src
 TEST_DIR := test
-TEST_SUPPORT_HDRS := $(TEST_DIR)/test_support.h
+TEST_SUPPORT_HDRS := $(TEST_DIR)/test_support.h $(TEST_DIR)/test_chaos_io_harness.h
 
 LIB_SRCS := \
 	$(SRC_DIR)/chaos_io.c \
+	$(SRC_DIR)/chaos_io_open.c \
+	$(SRC_DIR)/chaos_io_rw.c \
+	$(SRC_DIR)/chaos_io_sync.c \
 	$(SRC_DIR)/chaos_io_actions.c \
 	$(SRC_DIR)/chaos_io_config.c \
 	$(SRC_DIR)/chaos_io_fdcache.c
@@ -31,7 +34,8 @@ LIB_HDRS := \
 	$(SRC_DIR)/chaos_io_actions.h \
 	$(SRC_DIR)/chaos_io_config.h \
 	$(SRC_DIR)/chaos_io_fdcache.h \
-	$(SRC_DIR)/chaos_io_internal.h
+	$(SRC_DIR)/chaos_io_internal.h \
+	$(SRC_DIR)/chaos_io_wrappers.h
 
 NATIVE_LIB := $(BUILD_DIR)/libchaos-io.so
 CONFIG_TEST := $(BUILD_DIR)/test_config_parse
