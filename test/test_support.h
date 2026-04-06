@@ -11,15 +11,27 @@
 #include <string.h>
 #include <unistd.h>
 
+#ifdef __linux__
+#define CHAOS_IO_DEFINE_TEST_SENDFILE_GLOBAL() chaos_io_sendfile_fn g_chaos_io_real_sendfile = NULL;
+#define CHAOS_IO_TEST_ASSIGN_REAL_SENDFILE() g_chaos_io_real_sendfile = sendfile;
+#define CHAOS_IO_TEST_RESET_REAL_SENDFILE() g_chaos_io_real_sendfile = NULL;
+#else
+#define CHAOS_IO_DEFINE_TEST_SENDFILE_GLOBAL()
+#define CHAOS_IO_TEST_ASSIGN_REAL_SENDFILE()
+#define CHAOS_IO_TEST_RESET_REAL_SENDFILE()
+#endif
+
 #define CHAOS_IO_DEFINE_TEST_GLOBALS() \
     chaos_io_read_fn g_chaos_io_real_read = NULL; \
     chaos_io_write_fn g_chaos_io_real_write = NULL; \
     chaos_io_open_fn g_chaos_io_real_open = NULL; \
+    chaos_io_openat_fn g_chaos_io_real_openat = NULL; \
     chaos_io_close_fn g_chaos_io_real_close = NULL; \
     chaos_io_sync_fn g_chaos_io_real_fsync = NULL; \
     chaos_io_sync_fn g_chaos_io_real_fdatasync = NULL; \
     chaos_io_pread_fn g_chaos_io_real_pread = NULL; \
     chaos_io_pwrite_fn g_chaos_io_real_pwrite = NULL; \
+    CHAOS_IO_DEFINE_TEST_SENDFILE_GLOBAL() \
     __thread int g_chaos_io_tls_guard = 0; \
     __thread uint64_t g_chaos_io_tls_prng_state = 0U; \
     uint64_t g_chaos_io_process_seed = 1U
@@ -89,11 +101,13 @@ static inline void chaos_test_use_real_io(void)
     g_chaos_io_real_read = chaos_test_real_read;
     g_chaos_io_real_write = chaos_test_real_write;
     g_chaos_io_real_open = chaos_test_real_open;
+    g_chaos_io_real_openat = openat;
     g_chaos_io_real_close = chaos_test_real_close;
     g_chaos_io_real_fsync = chaos_test_real_fsync;
     g_chaos_io_real_fdatasync = chaos_test_real_fdatasync;
     g_chaos_io_real_pread = chaos_test_real_pread;
     g_chaos_io_real_pwrite = chaos_test_real_pwrite;
+    CHAOS_IO_TEST_ASSIGN_REAL_SENDFILE()
 }
 
 static inline void chaos_test_reset_runtime(void)
@@ -101,11 +115,13 @@ static inline void chaos_test_reset_runtime(void)
     g_chaos_io_real_read = NULL;
     g_chaos_io_real_write = NULL;
     g_chaos_io_real_open = NULL;
+    g_chaos_io_real_openat = NULL;
     g_chaos_io_real_close = NULL;
     g_chaos_io_real_fsync = NULL;
     g_chaos_io_real_fdatasync = NULL;
     g_chaos_io_real_pread = NULL;
     g_chaos_io_real_pwrite = NULL;
+    CHAOS_IO_TEST_RESET_REAL_SENDFILE()
     g_chaos_io_tls_guard = 0;
     g_chaos_io_tls_prng_state = 0U;
     g_chaos_io_process_seed = 1U;

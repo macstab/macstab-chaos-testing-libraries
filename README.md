@@ -17,6 +17,7 @@ intercepted libc symbols plus the config file at `/tmp/.chaos-io.conf`.
 ## Repository Layout
 
 ```text
+ROADMAP.md
 src/
   chaos_io.c
   chaos_io_actions.c
@@ -30,6 +31,7 @@ test/
   check_coverage.sh
   test_actions.c
   test_alpine.sh
+  test_glibc.sh
   test_chaos_io.c
   test_config_parse.c
   test_fdcache.c
@@ -40,6 +42,9 @@ docs/
 Dockerfile.build
 Makefile
 ```
+
+Planned extension work and scope boundaries live in
+[`ROADMAP.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/ROADMAP.md).
 
 ## Config Format
 
@@ -64,7 +69,9 @@ Examples:
 
 - `read`
 - `write`
+  Applies to `write()` and Linux `sendfile()` destination paths.
 - `open`
+  Applies to both `open()` and `openat()`.
 - `close`
 - `fsync`
 - `fdatasync`
@@ -106,11 +113,14 @@ Examples:
 
 ## Runtime Behavior
 
+- The intercepted libc entry points are `read`, `write`, `open`, `openat`, `close`, `fsync`, `fdatasync`, `pread`, `pwrite`, and Linux `sendfile`.
 - The config file is checked with `stat()` on each intercepted call.
 - Reload is lock-free for readers and swaps between two config snapshots.
 - FD-backed operations resolve paths through `/proc/self/fd/<fd>` and cache them in thread-local storage.
 - The library uses a thread-local recursion guard.
 - The library seeds a thread-local PRNG once per thread.
+- Linux `sendfile(2)` uses the logical `write` rule class and matches on the destination fd path.
+- Programs that copy data with `copy_file_range(2)`, `splice(2)`, `mmap(2)`, or other non-`write(2)`/`sendfile(2)` paths bypass `write` and `pwrite` rules.
 - Injection is never applied to:
   `stdin`, `stdout`, `stderr`, `/tmp/.chaos-io.conf`, `/proc`, `/sys`, or `/dev`.
 
@@ -153,7 +163,18 @@ This runs:
 1. `make coverage`
 2. `make test`
 
-On non-Linux hosts, the Linux-only integration test is skipped. The Alpine Docker test is skipped when Docker is unavailable.
+On non-Linux hosts, the Linux-only integration test is skipped. The glibc and Alpine Docker tests are skipped when Docker is unavailable.
+
+The Docker runtime scripts accept an optional explicit platform argument:
+
+```sh
+sh test/test_glibc.sh linux/amd64
+sh test/test_glibc.sh linux/arm64
+sh test/test_alpine.sh linux/amd64
+sh test/test_alpine.sh linux/arm64
+```
+
+When no platform is given, each script falls back to the host architecture.
 
 ### Build targets
 

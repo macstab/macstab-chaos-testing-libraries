@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #ifdef __linux__
+#include <sys/sendfile.h>
 #include <sys/syscall.h>
 #endif
 
@@ -43,19 +44,27 @@
 typedef ssize_t (*chaos_io_read_fn)(int, void *, size_t);
 typedef ssize_t (*chaos_io_write_fn)(int, const void *, size_t);
 typedef int (*chaos_io_open_fn)(const char *, int, ...);
+typedef int (*chaos_io_openat_fn)(int, const char *, int, ...);
 typedef int (*chaos_io_close_fn)(int);
 typedef int (*chaos_io_sync_fn)(int);
 typedef ssize_t (*chaos_io_pread_fn)(int, void *, size_t, off_t);
 typedef ssize_t (*chaos_io_pwrite_fn)(int, const void *, size_t, off_t);
+#ifdef __linux__
+typedef ssize_t (*chaos_io_sendfile_fn)(int, int, off_t *, size_t);
+#endif
 
 extern chaos_io_read_fn g_chaos_io_real_read;
 extern chaos_io_write_fn g_chaos_io_real_write;
 extern chaos_io_open_fn g_chaos_io_real_open;
+extern chaos_io_openat_fn g_chaos_io_real_openat;
 extern chaos_io_close_fn g_chaos_io_real_close;
 extern chaos_io_sync_fn g_chaos_io_real_fsync;
 extern chaos_io_sync_fn g_chaos_io_real_fdatasync;
 extern chaos_io_pread_fn g_chaos_io_real_pread;
 extern chaos_io_pwrite_fn g_chaos_io_real_pwrite;
+#ifdef __linux__
+extern chaos_io_sendfile_fn g_chaos_io_real_sendfile;
+#endif
 
 extern __thread int g_chaos_io_tls_guard;
 extern __thread uint64_t g_chaos_io_tls_prng_state;

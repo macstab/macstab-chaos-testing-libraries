@@ -110,15 +110,20 @@ hit ratios.
 
 ## Wrapper Semantics
 
-### `open()`
+### `open()` and `openat()`
 
-`open()` is the only wrapper that naturally starts from a path. That makes it
-special in two ways:
+`open()` and `openat()` are the wrappers that naturally start from a path. That
+makes them special in two ways:
 
 - it performs direct path-based matching without going through fd resolution
 - it seeds the fd cache for later descriptor-based calls
 
-If you extend open-path behavior, keep those two responsibilities together.
+`openat()` adds one extra rule: when the pathname is relative, the wrapper tries
+to resolve a match path from `AT_FDCWD` or from the supplied directory fd before
+rule selection. If that pre-open resolution fails, the wrapper must bypass
+pre-call injection and rely on post-open fd resolution only.
+
+If you extend open-path behavior, keep those responsibilities together.
 
 ### `read()` and `pread()`
 
@@ -131,7 +136,7 @@ Read-style wrappers may:
 They do not truncate the requested byte count before delegation. Any corruption
 happens after libc has already returned data.
 
-### `write()` and `pwrite()`
+### `write()`, `pwrite()`, and Linux `sendfile()`
 
 Write-style wrappers may:
 
@@ -141,6 +146,14 @@ Write-style wrappers may:
 
 They do not modify the caller buffer. Torn writes are modeled as partial writes,
 not buffer corruption.
+
+Linux `sendfile()` now reuses the same logical `write` rule class, but it
+matches on the destination fd only. There is no read-side corruption path for
+`sendfile()` because there is no caller-visible read buffer to mutate.
+
+The remaining gap is other alternate copy paths. Tools that move data through
+`copy_file_range()`, `splice()`, `mmap()`, or similar non-`write()` and
+non-`sendfile()` paths are still outside the current fault surface.
 
 ### `close()`
 

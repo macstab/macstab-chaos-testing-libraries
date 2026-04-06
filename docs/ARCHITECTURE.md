@@ -93,11 +93,20 @@ That is why coverage can stay strict without adding exported test-only symbols.
 
 - Linux-only
 - Builds the real shared object
-- Verifies passthrough, injected errno failure, and measured latency
+- Verifies passthrough, injected errno failure, measured latency, and
+  `openat()` plus Linux `sendfile()` runtime interposition on Linux hosts
+
+[`test/test_glibc.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/test_glibc.sh)
+
+- Verifies the glibc Debian Docker build and runtime path, including direct
+  `openat()` and Linux `sendfile()` probes
+- Accepts `linux/amd64` or `linux/arm64` as an optional explicit Docker target
 
 [`test/test_alpine.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/test_alpine.sh)
 
-- Verifies the musl Alpine Docker build path
+- Verifies the musl Alpine Docker build and runtime path, including direct
+  `openat()` and Linux `sendfile()` probes
+- Accepts `linux/amd64` or `linux/arm64` as an optional explicit Docker target
 
 ## Maintenance Rules
 

@@ -69,8 +69,9 @@ test: unit
 ifeq ($(UNAME_S),Linux)
 test: native
 endif
-	./$(TEST_DIR)/test_integration.sh
-	./$(TEST_DIR)/test_alpine.sh
+		./$(TEST_DIR)/test_integration.sh
+		./$(TEST_DIR)/test_glibc.sh
+		./$(TEST_DIR)/test_alpine.sh
 
 cross-glibc-amd64: $(GLIBC_AMD64_DIST)
 
@@ -81,9 +82,9 @@ cross-musl-amd64: $(MUSL_AMD64_DIST)
 cross-musl-arm64: $(MUSL_ARM64_DIST)
 
 docker-build-all: | $(BUILD_DIR) $(DIST_DIR)
-	docker buildx build --platform linux/amd64 --build-arg BASE_IMAGE=debian:bookworm-slim --build-arg MAKE_TARGET=cross-glibc-amd64 --output type=local,dest=$(BUILD_DIR)/docker-glibc-amd64 -f Dockerfile.build .
+	docker buildx build --platform linux/amd64 --build-arg BASE_IMAGE=gcc:bookworm --build-arg MAKE_TARGET=cross-glibc-amd64 --output type=local,dest=$(BUILD_DIR)/docker-glibc-amd64 -f Dockerfile.build .
 	cp $(BUILD_DIR)/docker-glibc-amd64/libchaos-io-glibc-amd64.so $(DIST_DIR)/
-	docker buildx build --platform linux/arm64 --build-arg BASE_IMAGE=debian:bookworm-slim --build-arg MAKE_TARGET=cross-glibc-arm64 --output type=local,dest=$(BUILD_DIR)/docker-glibc-arm64 -f Dockerfile.build .
+	docker buildx build --platform linux/arm64 --build-arg BASE_IMAGE=gcc:bookworm --build-arg MAKE_TARGET=cross-glibc-arm64 --output type=local,dest=$(BUILD_DIR)/docker-glibc-arm64 -f Dockerfile.build .
 	cp $(BUILD_DIR)/docker-glibc-arm64/libchaos-io-glibc-arm64.so $(DIST_DIR)/
 	docker buildx build --platform linux/amd64 --build-arg BASE_IMAGE=alpine:3.20 --build-arg MAKE_TARGET=cross-musl-amd64 --output type=local,dest=$(BUILD_DIR)/docker-musl-amd64 -f Dockerfile.build .
 	cp $(BUILD_DIR)/docker-musl-amd64/libchaos-io-musl-amd64.so $(DIST_DIR)/

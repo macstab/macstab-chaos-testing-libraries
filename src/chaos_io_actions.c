@@ -40,7 +40,15 @@ size_t chaos_io_torn_count_sample(size_t requested, uint32_t sample)
     if (requested == 0U) {
         return 0U;
     }
-    return (size_t)(sample % requested) + 1U;
+    if (requested == 1U) {
+        return 1U;
+    }
+
+    /*
+     * Torn writes must stay strictly smaller than the original request, or the
+     * wrapper would report a full write and silently fail to inject anything.
+     */
+    return (size_t)(sample % (requested - 1U)) + 1U;
 }
 
 /* Returns the torn write count derived from the thread-local PRNG. */

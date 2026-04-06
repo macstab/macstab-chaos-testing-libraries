@@ -30,8 +30,9 @@ int chaos_io_probability_hit(double probability);
 /*
  * Computes the shortened byte count for a torn write from an explicit sample.
  *
- * The helper maps a sample into the inclusive range `[1, requested]`, while
- * preserving `0` requests as `0`.
+ * The helper preserves `0` requests as `0`, returns `1` for single-byte
+ * requests, and otherwise maps a sample into the inclusive range
+ * `[1, requested - 1]` so a torn write always stays partial.
  */
 size_t chaos_io_torn_count_sample(size_t requested, uint32_t sample);
 

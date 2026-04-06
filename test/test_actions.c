@@ -60,7 +60,9 @@ static void test_torn_helpers(void)
 
     assert(chaos_io_torn_count_sample(0U, 123U) == 0U);
     assert(chaos_io_torn_count_sample(1U, 123U) == 1U);
+    assert(chaos_io_torn_count_sample(2U, 123U) == 1U);
     assert(chaos_io_torn_count_sample(10U, 3U) == 4U);
+    assert(chaos_io_torn_count_sample(10U, UINT32_MAX) < 10U);
 }
 
 static void test_corrupt_helpers(void)

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG BASE_IMAGE=debian:bookworm-slim
+ARG BASE_IMAGE=gcc:bookworm
 FROM --platform=$TARGETPLATFORM ${BASE_IMAGE} AS build
 
 ARG MAKE_TARGET=cross-glibc-amd64
@@ -9,10 +9,12 @@ WORKDIR /src
 COPY src ./src
 COPY Makefile ./Makefile
 
-RUN if command -v apt-get >/dev/null 2>&1; then \
-        apt-get update && apt-get install -y --no-install-recommends build-essential make file && rm -rf /var/lib/apt/lists/*; \
-    else \
-        apk add --no-cache build-base musl-dev make file; \
+RUN if ! command -v gcc >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1; then \
+        if command -v apt-get >/dev/null 2>&1; then \
+            apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev make && rm -rf /var/lib/apt/lists/*; \
+        else \
+            apk add --no-cache build-base musl-dev make; \
+        fi; \
     fi && \
     case "$MAKE_TARGET" in \
         cross-glibc-amd64) make cross-glibc-amd64 GLIBC_AMD64_CC=gcc ;; \

@@ -57,11 +57,15 @@
 chaos_io_read_fn g_chaos_io_real_read = NULL;
 chaos_io_write_fn g_chaos_io_real_write = NULL;
 chaos_io_open_fn g_chaos_io_real_open = NULL;
+chaos_io_openat_fn g_chaos_io_real_openat = NULL;
 chaos_io_close_fn g_chaos_io_real_close = NULL;
 chaos_io_sync_fn g_chaos_io_real_fsync = NULL;
 chaos_io_sync_fn g_chaos_io_real_fdatasync = NULL;
 chaos_io_pread_fn g_chaos_io_real_pread = NULL;
 chaos_io_pwrite_fn g_chaos_io_real_pwrite = NULL;
+#ifdef __linux__
+chaos_io_sendfile_fn g_chaos_io_real_sendfile = NULL;
+#endif
 
 __thread int g_chaos_io_tls_guard = 0;
 __thread uint64_t g_chaos_io_tls_prng_state = 0U;
@@ -213,6 +217,199 @@ static int chaos_io_call_real_open(const char *path, int flags, int has_mode, mo
 }
 
 /*
+ * Returns non-zero when an open-style call must forward a trailing mode.
+ *
+ * `open()` and `openat()` share the same varargs contract. Keeping the flag
+ * check in one helper avoids subtle divergence between the two wrappers.
+ */
+static int chaos_io_open_needs_mode(int flags)
+{
+#ifdef O_TMPFILE
+    return ((flags & O_CREAT) != 0) || ((flags & O_TMPFILE) == O_TMPFILE);
+#else
+    return ((flags & O_CREAT) != 0);
+#endif
+}
+
+/*
+ * Call the real `openat()` with the ABI shape expected by libc.
+ *
+ * This mirrors `chaos_io_call_real_open()` exactly, but keeps the directory-fd
+ * argument in place for relative-path callers.
+ */
+static int chaos_io_call_real_openat(int dirfd, const char *path, int flags, int has_mode, mode_t mode)
+{
+    int previous;
+    int result;
+
+    previous = chaos_io_enter_internal();
+    if (has_mode != 0) {
+        result = g_chaos_io_real_openat(dirfd, path, flags, mode);
+    } else {
+        result = g_chaos_io_real_openat(dirfd, path, flags);
+    }
+    chaos_io_leave_internal(previous);
+    return result;
+}
+
+#ifdef __linux__
+/*
+ * Call the real Linux `sendfile()` while preserving the recursion guard.
+ *
+ * `sendfile()` is Linux-specific in this library because non-Linux libcs expose
+ * incompatible ABIs. The wrapper therefore lives behind `__linux__` and reuses
+ * the existing logical `write` rule class on the destination fd.
+ */
+static ssize_t chaos_io_call_real_sendfile(int out_fd, int in_fd, off_t *offset, size_t count)
+{
+    int previous;
+    ssize_t result;
+
+    previous = chaos_io_enter_internal();
+    result = g_chaos_io_real_sendfile(out_fd, in_fd, offset, count);
+    chaos_io_leave_internal(previous);
+    return result;
+}
+#endif
+
+/*
+ * Copy one path string into caller storage if it fits.
+ *
+ * Open-style wrappers resolve a match path up front and then reuse it for rule
+ * selection and fd-cache seeding. This helper keeps the bounds check uniform.
+ */
+static int chaos_io_copy_path(char *destination, size_t destination_size, const char *path)
+{
+    size_t length;
+
+    if (destination == NULL || destination_size == 0U || path == NULL) {
+        return 0;
+    }
+
+    length = strlen(path);
+    if (length + 1U > destination_size) {
+        return 0;
+    }
+
+    (void)memcpy(destination, path, length + 1U);
+    return 1;
+}
+
+/*
+ * Join a resolved base directory and a relative child path.
+ *
+ * `openat()` needs a stable absolute-ish string for config matching. The join is
+ * intentionally lexical; it does not normalize `.` or `..` segments.
+ */
+static int chaos_io_join_paths(char *destination, size_t destination_size, const char *base, const char *path)
+{
+    size_t base_length;
+    size_t path_length;
+    size_t needs_separator;
+
+    if (destination == NULL || destination_size == 0U || base == NULL || path == NULL) {
+        return 0;
+    }
+    if (*base == '\0' || *path == '\0') {
+        return 0;
+    }
+
+    base_length = strlen(base);
+    path_length = strlen(path);
+    needs_separator = (base[base_length - 1U] == '/') ? 0U : 1U;
+    if (base_length + needs_separator + path_length + 1U > destination_size) {
+        return 0;
+    }
+
+    (void)memcpy(destination, base, base_length);
+    if (needs_separator != 0U) {
+        destination[base_length] = '/';
+        ++base_length;
+    }
+    (void)memcpy(destination + base_length, path, path_length + 1U);
+    return 1;
+}
+
+/*
+ * Resolve the current working directory without leaving the preload layer.
+ *
+ * Relative `open()` and `openat(AT_FDCWD, ...)` calls need a matchable path
+ * before any rule can fire. The library does not interpose `getcwd()`, but it
+ * still enters internal mode so any libc work it performs stays out of scope.
+ */
+static int chaos_io_getcwd_path(char *path, size_t path_size)
+{
+    int previous;
+    int ok;
+
+    if (path == NULL || path_size == 0U) {
+        return 0;
+    }
+
+    previous = chaos_io_enter_internal();
+    ok = getcwd(path, path_size) != NULL;
+    chaos_io_leave_internal(previous);
+    return ok;
+}
+
+/*
+ * Resolve an open-style pathname into the string used for matching.
+ *
+ * Resolution rules:
+ * - absolute paths are used as-is
+ * - relative paths under `AT_FDCWD` are joined with the current working
+ *   directory
+ * - other relative paths are joined with the directory-fd path resolved through
+ *   the fd cache or `/proc/self/fd`
+ *
+ * If resolution fails, the caller must bypass pre-open path injection and rely
+ * on post-open fd resolution only.
+ */
+static int chaos_io_resolve_open_path(int dirfd, const char *path, char *resolved_path, size_t resolved_path_size)
+{
+    char base_path[CHAOS_IO_MAX_PATH];
+
+    if (path == NULL || resolved_path == NULL || resolved_path_size == 0U) {
+        return 0;
+    }
+    if (path[0] == '/') {
+        return chaos_io_copy_path(resolved_path, resolved_path_size, path);
+    }
+    if (dirfd == AT_FDCWD) {
+        return chaos_io_getcwd_path(base_path, sizeof(base_path))
+            && chaos_io_join_paths(resolved_path, resolved_path_size, base_path, path);
+    }
+    if (!chaos_io_fdcache_resolve(dirfd, base_path, sizeof(base_path))) {
+        return 0;
+    }
+    return chaos_io_join_paths(resolved_path, resolved_path_size, base_path, path);
+}
+
+/*
+ * Seed the fd cache after a successful open-style call.
+ *
+ * When the wrapper already resolved a stable path, store it directly. When it
+ * could not resolve the path up front, ask the fd cache module to resolve the
+ * new descriptor through `/proc/self/fd` instead.
+ */
+static void chaos_io_cache_open_result(int fd, const char *path)
+{
+    char resolved_path[CHAOS_IO_MAX_PATH];
+
+    if (fd < 0) {
+        return;
+    }
+    if (path != NULL) {
+        if (!chaos_io_is_excluded_path(path)) {
+            chaos_io_fdcache_store(fd, path);
+        }
+        return;
+    }
+
+    (void)chaos_io_fdcache_resolve(fd, resolved_path, sizeof(resolved_path));
+}
+
+/*
  * Match a rule for an fd-backed operation.
  *
  * Parameters:
@@ -294,11 +491,15 @@ static void chaos_io_init(void)
     chaos_io_resolve_symbol(&g_chaos_io_real_read, "read");
     chaos_io_resolve_symbol(&g_chaos_io_real_write, "write");
     chaos_io_resolve_symbol(&g_chaos_io_real_open, "open");
+    chaos_io_resolve_symbol(&g_chaos_io_real_openat, "openat");
     chaos_io_resolve_symbol(&g_chaos_io_real_close, "close");
     chaos_io_resolve_symbol(&g_chaos_io_real_fsync, "fsync");
     chaos_io_resolve_symbol(&g_chaos_io_real_fdatasync, "fdatasync");
     chaos_io_resolve_symbol(&g_chaos_io_real_pread, "pread");
     chaos_io_resolve_symbol(&g_chaos_io_real_pwrite, "pwrite");
+#ifdef __linux__
+    chaos_io_resolve_symbol(&g_chaos_io_real_sendfile, "sendfile");
+#endif
 
     g_chaos_io_process_seed = chaos_io_read_seed_material();
     chaos_io_prng_seed_thread(g_chaos_io_process_seed);
@@ -349,15 +550,13 @@ static void chaos_io_init(void)
 CHAOS_IO_EXPORT int open(const char *path, int flags, ...)
 {
     chaos_io_rule_t rule;
+    char resolved_path[CHAOS_IO_MAX_PATH];
+    const char *match_path = NULL;
     mode_t mode = 0;
-    int has_mode = 0;
+    int has_mode;
     int fd;
 
-#ifdef O_TMPFILE
-    has_mode = ((flags & O_CREAT) != 0) || ((flags & O_TMPFILE) == O_TMPFILE);
-#else
-    has_mode = ((flags & O_CREAT) != 0);
-#endif
+    has_mode = chaos_io_open_needs_mode(flags);
 
     if (has_mode != 0) {
         va_list args;
@@ -370,7 +569,13 @@ CHAOS_IO_EXPORT int open(const char *path, int flags, ...)
         return chaos_io_call_real_open(path, flags, has_mode, mode);
     }
 
-    if (!chaos_io_is_excluded_path(path) && chaos_io_config_match_path(CHAOS_IO_OP_OPEN, path, &rule)) {
+    if (chaos_io_resolve_open_path(AT_FDCWD, path, resolved_path, sizeof(resolved_path))) {
+        match_path = resolved_path;
+    }
+
+    if (match_path != NULL
+        && !chaos_io_is_excluded_path(match_path)
+        && chaos_io_config_match_path(CHAOS_IO_OP_OPEN, match_path, &rule)) {
         if (rule.effect == CHAOS_IO_EFFECT_LATENCY) {
             chaos_io_rule_apply_latency(&rule);
         } else if (chaos_io_rule_apply_errno(&rule)) {
@@ -379,9 +584,70 @@ CHAOS_IO_EXPORT int open(const char *path, int flags, ...)
     }
 
     fd = chaos_io_call_real_open(path, flags, has_mode, mode);
-    if (fd >= 0 && !chaos_io_is_excluded_path(path)) {
-        chaos_io_fdcache_store(fd, path);
+    chaos_io_cache_open_result(fd, match_path);
+    return fd;
+}
+
+/*
+ * Interposed `openat(2)` entry point.
+ *
+ * Parameters:
+ * - `dirfd`
+ *   Base directory descriptor for relative paths, or `AT_FDCWD` for the current
+ *   working directory.
+ * - `path`
+ *   Absolute or relative target pathname. Relative paths are resolved into a
+ *   match string before rule selection when possible.
+ * - `flags`
+ *   Original open flags, forwarded unchanged to libc after optional mode
+ *   decoding.
+ * - `...`
+ *   Optional `mode_t`, present when `flags` requires it.
+ *
+ * Returns:
+ * - the result of the real libc `openat()`
+ * - `-1` with injected `errno` when an `open` rule fires before libc is called
+ *
+ * `openat()` reuses the logical `open` rule class. The only extra work here is
+ * resolving relative paths into the string used for matching and cache seeding.
+ */
+CHAOS_IO_EXPORT int openat(int dirfd, const char *path, int flags, ...)
+{
+    chaos_io_rule_t rule;
+    char resolved_path[CHAOS_IO_MAX_PATH];
+    const char *match_path = NULL;
+    mode_t mode = 0;
+    int has_mode;
+    int fd;
+
+    has_mode = chaos_io_open_needs_mode(flags);
+    if (has_mode != 0) {
+        va_list args;
+        va_start(args, flags);
+        mode = (mode_t)va_arg(args, int);
+        va_end(args);
     }
+
+    if (chaos_io_in_internal()) {
+        return chaos_io_call_real_openat(dirfd, path, flags, has_mode, mode);
+    }
+
+    if (chaos_io_resolve_open_path(dirfd, path, resolved_path, sizeof(resolved_path))) {
+        match_path = resolved_path;
+    }
+
+    if (match_path != NULL
+        && !chaos_io_is_excluded_path(match_path)
+        && chaos_io_config_match_path(CHAOS_IO_OP_OPEN, match_path, &rule)) {
+        if (rule.effect == CHAOS_IO_EFFECT_LATENCY) {
+            chaos_io_rule_apply_latency(&rule);
+        } else if (chaos_io_rule_apply_errno(&rule)) {
+            return -1;
+        }
+    }
+
+    fd = chaos_io_call_real_openat(dirfd, path, flags, has_mode, mode);
+    chaos_io_cache_open_result(fd, match_path);
     return fd;
 }
 
@@ -514,6 +780,34 @@ CHAOS_IO_EXPORT ssize_t write(int fd, const void *buffer, size_t count)
     chaos_io_leave_internal(previous);
     return rc;
 }
+
+#ifdef __linux__
+/*
+ * Interposed `sendfile(2)` entry point.
+ *
+ * The library treats Linux `sendfile()` as a destination-side logical write.
+ * Matching therefore happens on `out_fd`, and the supported effects mirror the
+ * write path: `ERRNO`, `LATENCY`, and `TORN`.
+ */
+CHAOS_IO_EXPORT ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count)
+{
+    chaos_io_rule_t rule;
+
+    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(out_fd, CHAOS_IO_OP_WRITE, &rule)) {
+        return chaos_io_call_real_sendfile(out_fd, in_fd, offset, count);
+    }
+
+    if (rule.effect == CHAOS_IO_EFFECT_LATENCY) {
+        chaos_io_rule_apply_latency(&rule);
+    } else if (chaos_io_rule_apply_errno(&rule)) {
+        return -1;
+    } else if (rule.effect == CHAOS_IO_EFFECT_TORN && chaos_io_rule_should_trigger(&rule)) {
+        count = chaos_io_torn_count(count);
+    }
+
+    return chaos_io_call_real_sendfile(out_fd, in_fd, offset, count);
+}
+#endif
 
 /*
  * Interposed `close(2)` entry point.

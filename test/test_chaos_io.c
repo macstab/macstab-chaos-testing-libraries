@@ -49,6 +49,15 @@ static int g_real_open_guard = 0;
 static mode_t g_real_open_mode = 0;
 static char g_real_open_path[CHAOS_IO_MAX_PATH];
 
+static int g_real_openat_calls = 0;
+static int g_real_openat_return = 0;
+static int g_real_openat_dirfd = -1;
+static int g_real_openat_flags = 0;
+static int g_real_openat_has_mode = 0;
+static int g_real_openat_guard = 0;
+static mode_t g_real_openat_mode = 0;
+static char g_real_openat_path[CHAOS_IO_MAX_PATH];
+
 static int g_real_read_calls = 0;
 static ssize_t g_real_read_return = 0;
 static int g_real_read_guard = 0;
@@ -61,6 +70,15 @@ static ssize_t g_real_write_return = 0;
 static int g_real_write_guard = 0;
 static int g_real_write_fd = -1;
 static size_t g_real_write_count = 0U;
+#ifdef __linux__
+static int g_real_sendfile_calls = 0;
+static ssize_t g_real_sendfile_return = 0;
+static int g_real_sendfile_guard = 0;
+static int g_real_sendfile_out_fd = -1;
+static int g_real_sendfile_in_fd = -1;
+static off_t *g_real_sendfile_offset = NULL;
+static size_t g_real_sendfile_count = 0U;
+#endif
 
 static int g_real_close_calls = 0;
 static int g_real_close_return = 0;
@@ -258,6 +276,37 @@ static int chaos_test_real_open_impl(const char *path, int flags, ...)
     return g_real_open_return;
 }
 
+static int chaos_test_real_openat_impl(int dirfd, const char *path, int flags, ...)
+{
+    ++g_real_openat_calls;
+    g_real_openat_dirfd = dirfd;
+    g_real_openat_flags = flags;
+    g_real_openat_guard = g_chaos_io_tls_guard;
+    if (path != NULL) {
+        (void)snprintf(g_real_openat_path, sizeof(g_real_openat_path), "%s", path);
+    } else {
+        g_real_openat_path[0] = '\0';
+    }
+
+    if ((flags & O_CREAT) != 0
+#ifdef O_TMPFILE
+        || ((flags & O_TMPFILE) == O_TMPFILE)
+#endif
+    ) {
+        va_list args;
+
+        g_real_openat_has_mode = 1;
+        va_start(args, flags);
+        g_real_openat_mode = (mode_t)va_arg(args, int);
+        va_end(args);
+    } else {
+        g_real_openat_has_mode = 0;
+        g_real_openat_mode = 0;
+    }
+
+    return g_real_openat_return;
+}
+
 static ssize_t chaos_test_real_read_impl(int fd, void *buffer, size_t count)
 {
     ++g_real_read_calls;
@@ -281,6 +330,19 @@ static ssize_t chaos_test_real_write_impl(int fd, const void *buffer, size_t cou
     g_real_write_guard = g_chaos_io_tls_guard;
     return g_real_write_return;
 }
+
+#ifdef __linux__
+static ssize_t chaos_test_real_sendfile_impl(int out_fd, int in_fd, off_t *offset, size_t count)
+{
+    ++g_real_sendfile_calls;
+    g_real_sendfile_out_fd = out_fd;
+    g_real_sendfile_in_fd = in_fd;
+    g_real_sendfile_offset = offset;
+    g_real_sendfile_count = count;
+    g_real_sendfile_guard = g_chaos_io_tls_guard;
+    return g_real_sendfile_return;
+}
+#endif
 
 static int chaos_test_real_close_impl(int fd)
 {
@@ -332,6 +394,19 @@ static ssize_t chaos_test_real_pwrite_impl(int fd, const void *buffer, size_t co
     return g_real_pwrite_return;
 }
 
+static void *chaos_test_dlsym_pointer(const void *function_bytes, size_t function_size)
+{
+    void *resolved = NULL;
+
+    assert(function_bytes != NULL);
+    assert(function_size <= sizeof(resolved));
+    (void)memcpy(&resolved, function_bytes, function_size);
+    return resolved;
+}
+
+#define CHAOS_TEST_DLSYM_RESULT(type, function) \
+    chaos_test_dlsym_pointer(&(type){ function }, sizeof(type))
+
 static void *chaos_test_dlsym(void *handle, const char *symbol)
 {
     (void)handle;
@@ -342,28 +417,36 @@ static void *chaos_test_dlsym(void *handle, const char *symbol)
         return NULL;
     }
     if (strcmp(symbol, "read") == 0) {
-        return (void *)&chaos_test_real_read_impl;
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_read_fn, chaos_test_real_read_impl);
     }
     if (strcmp(symbol, "write") == 0) {
-        return (void *)&chaos_test_real_write_impl;
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_write_fn, chaos_test_real_write_impl);
     }
+#ifdef __linux__
+    if (strcmp(symbol, "sendfile") == 0) {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_sendfile_fn, chaos_test_real_sendfile_impl);
+    }
+#endif
     if (strcmp(symbol, "open") == 0) {
-        return (void *)&chaos_test_real_open_impl;
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_open_fn, chaos_test_real_open_impl);
+    }
+    if (strcmp(symbol, "openat") == 0) {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_openat_fn, chaos_test_real_openat_impl);
     }
     if (strcmp(symbol, "close") == 0) {
-        return (void *)&chaos_test_real_close_impl;
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_close_fn, chaos_test_real_close_impl);
     }
     if (strcmp(symbol, "fsync") == 0) {
-        return (void *)&chaos_test_real_fsync_impl;
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_sync_fn, chaos_test_real_fsync_impl);
     }
     if (strcmp(symbol, "fdatasync") == 0) {
-        return (void *)&chaos_test_real_fdatasync_impl;
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_sync_fn, chaos_test_real_fdatasync_impl);
     }
     if (strcmp(symbol, "pread") == 0) {
-        return (void *)&chaos_test_real_pread_impl;
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_pread_fn, chaos_test_real_pread_impl);
     }
     if (strcmp(symbol, "pwrite") == 0) {
-        return (void *)&chaos_test_real_pwrite_impl;
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_pwrite_fn, chaos_test_real_pwrite_impl);
     }
 
     g_dlerror_pending = "unexpected symbol";
@@ -476,6 +559,15 @@ static void chaos_test_reset_state(void)
     g_real_open_mode = 0;
     g_real_open_path[0] = '\0';
 
+    g_real_openat_calls = 0;
+    g_real_openat_return = 10;
+    g_real_openat_dirfd = -1;
+    g_real_openat_flags = 0;
+    g_real_openat_has_mode = 0;
+    g_real_openat_guard = 0;
+    g_real_openat_mode = 0;
+    g_real_openat_path[0] = '\0';
+
     g_real_read_calls = 0;
     g_real_read_return = 0;
     g_real_read_guard = 0;
@@ -488,6 +580,15 @@ static void chaos_test_reset_state(void)
     g_real_write_guard = 0;
     g_real_write_fd = -1;
     g_real_write_count = 0U;
+#ifdef __linux__
+    g_real_sendfile_calls = 0;
+    g_real_sendfile_return = 0;
+    g_real_sendfile_guard = 0;
+    g_real_sendfile_out_fd = -1;
+    g_real_sendfile_in_fd = -1;
+    g_real_sendfile_offset = NULL;
+    g_real_sendfile_count = 0U;
+#endif
 
     g_real_close_calls = 0;
     g_real_close_return = 0;
@@ -532,11 +633,15 @@ static void chaos_test_reset_state(void)
     g_chaos_io_real_read = NULL;
     g_chaos_io_real_write = NULL;
     g_chaos_io_real_open = NULL;
+    g_chaos_io_real_openat = NULL;
     g_chaos_io_real_close = NULL;
     g_chaos_io_real_fsync = NULL;
     g_chaos_io_real_fdatasync = NULL;
     g_chaos_io_real_pread = NULL;
     g_chaos_io_real_pwrite = NULL;
+#ifdef __linux__
+    g_chaos_io_real_sendfile = NULL;
+#endif
     g_chaos_io_tls_guard = 0;
     g_chaos_io_tls_prng_state = 0U;
     g_chaos_io_process_seed = 0U;
@@ -547,11 +652,15 @@ static void chaos_test_bind_real_functions(void)
     g_chaos_io_real_read = chaos_test_real_read_impl;
     g_chaos_io_real_write = chaos_test_real_write_impl;
     g_chaos_io_real_open = chaos_test_real_open_impl;
+    g_chaos_io_real_openat = chaos_test_real_openat_impl;
     g_chaos_io_real_close = chaos_test_real_close_impl;
     g_chaos_io_real_fsync = chaos_test_real_fsync_impl;
     g_chaos_io_real_fdatasync = chaos_test_real_fdatasync_impl;
     g_chaos_io_real_pread = chaos_test_real_pread_impl;
     g_chaos_io_real_pwrite = chaos_test_real_pwrite_impl;
+#ifdef __linux__
+    g_chaos_io_real_sendfile = chaos_test_real_sendfile_impl;
+#endif
 }
 
 static void chaos_test_bind_libc_functions_for_exit(void)
@@ -569,6 +678,10 @@ static void chaos_test_bind_libc_functions_for_exit(void)
     resolved = dlsym(RTLD_NEXT, "open");
     assert(resolved != NULL);
     (void)memcpy(&g_chaos_io_real_open, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "openat");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_openat, &resolved, sizeof(resolved));
 
     resolved = dlsym(RTLD_NEXT, "close");
     assert(resolved != NULL);
@@ -589,6 +702,11 @@ static void chaos_test_bind_libc_functions_for_exit(void)
     resolved = dlsym(RTLD_NEXT, "pwrite");
     assert(resolved != NULL);
     (void)memcpy(&g_chaos_io_real_pwrite, &resolved, sizeof(resolved));
+#ifdef __linux__
+    resolved = dlsym(RTLD_NEXT, "sendfile");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_sendfile, &resolved, sizeof(resolved));
+#endif
 
     g_config_prepare_result = 0;
     g_config_match_loaded_result = 0;
@@ -628,6 +746,9 @@ static void test_resolve_symbol_and_seed_material(void)
 static void test_call_real_open_and_match_fd_rule(void)
 {
     chaos_io_rule_t rule;
+    char expected_path[CHAOS_IO_MAX_PATH];
+    char path[CHAOS_IO_MAX_PATH];
+    char cwd[CHAOS_IO_MAX_PATH];
 
     chaos_test_reset_state();
     chaos_test_bind_real_functions();
@@ -643,6 +764,49 @@ static void test_call_real_open_and_match_fd_rule(void)
     assert(chaos_io_call_real_open("/tmp/b", O_CREAT | O_WRONLY, 1, 0644) == 12);
     assert(g_real_open_has_mode == 1);
     assert(g_real_open_mode == 0644);
+
+    g_real_openat_return = 13;
+    assert(chaos_io_call_real_openat(AT_FDCWD, "/tmp/c", O_RDONLY, 0, 0) == 13);
+    assert(g_real_openat_calls == 1);
+    assert(g_real_openat_dirfd == AT_FDCWD);
+    assert(g_real_openat_has_mode == 0);
+    assert(g_real_openat_guard == 1);
+    assert(g_chaos_io_tls_guard == 0);
+
+    g_real_openat_return = 14;
+    assert(chaos_io_call_real_openat(7, "/tmp/d", O_CREAT | O_WRONLY, 1, 0600) == 14);
+    assert(g_real_openat_has_mode == 1);
+    assert(g_real_openat_mode == 0600);
+
+    assert(chaos_io_copy_path(NULL, sizeof(path), "/tmp/path") == 0);
+    assert(chaos_io_copy_path(path, 0U, "/tmp/path") == 0);
+    assert(chaos_io_copy_path(path, sizeof(path), NULL) == 0);
+    assert(chaos_io_copy_path(path, 4U, "/tmp/path") == 0);
+    assert(chaos_io_resolve_open_path(AT_FDCWD, "/tmp/absolute.bin", path, sizeof(path)) == 1);
+    assert(strcmp(path, "/tmp/absolute.bin") == 0);
+
+    assert(chaos_io_join_paths(NULL, sizeof(path), "/tmp", "child.bin") == 0);
+    assert(chaos_io_join_paths(path, sizeof(path), "", "child.bin") == 0);
+    assert(chaos_io_join_paths(path, sizeof(path), "/tmp", "") == 0);
+    assert(chaos_io_join_paths(path, 4U, "/tmp", "child.bin") == 0);
+
+    assert(chaos_io_getcwd_path(NULL, sizeof(path)) == 0);
+    assert(chaos_io_getcwd_path(path, 0U) == 0);
+    assert(getcwd(cwd, sizeof(cwd)) != NULL);
+    assert(chaos_io_resolve_open_path(AT_FDCWD, "relative.bin", path, sizeof(path)) == 1);
+    assert(chaos_io_join_paths(expected_path, sizeof(expected_path), cwd, "relative.bin") == 1);
+    assert(strcmp(path, expected_path) == 0);
+
+    assert(chaos_io_resolve_open_path(AT_FDCWD, NULL, path, sizeof(path)) == 0);
+    assert(chaos_io_resolve_open_path(AT_FDCWD, "relative.bin", NULL, sizeof(path)) == 0);
+    assert(chaos_io_resolve_open_path(AT_FDCWD, "relative.bin", path, 0U) == 0);
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/base");
+    assert(chaos_io_resolve_open_path(9, "child.bin", path, sizeof(path)) == 1);
+    assert(strcmp(path, "/tmp/base/child.bin") == 0);
+
+    g_fdcache_resolve_result = 0;
+    assert(chaos_io_resolve_open_path(9, "child.bin", path, sizeof(path)) == 0);
 
     g_config_prepare_result = 0;
     assert(chaos_io_match_fd_rule(1, CHAOS_IO_OP_READ, &rule) == 0);
@@ -678,11 +842,15 @@ static void test_init_runtime(void)
     assert(g_chaos_io_real_read == chaos_test_real_read_impl);
     assert(g_chaos_io_real_write == chaos_test_real_write_impl);
     assert(g_chaos_io_real_open == chaos_test_real_open_impl);
+    assert(g_chaos_io_real_openat == chaos_test_real_openat_impl);
     assert(g_chaos_io_real_close == chaos_test_real_close_impl);
     assert(g_chaos_io_real_fsync == chaos_test_real_fsync_impl);
     assert(g_chaos_io_real_fdatasync == chaos_test_real_fdatasync_impl);
     assert(g_chaos_io_real_pread == chaos_test_real_pread_impl);
     assert(g_chaos_io_real_pwrite == chaos_test_real_pwrite_impl);
+#ifdef __linux__
+    assert(g_chaos_io_real_sendfile == chaos_test_real_sendfile_impl);
+#endif
     assert(g_chaos_io_process_seed == UINT64_C(0xfeedbeef12345678));
     assert(g_chaos_io_tls_prng_state != 0U);
     assert(g_config_init_calls == 1);
@@ -691,6 +859,9 @@ static void test_init_runtime(void)
 
 static void test_open_wrapper(void)
 {
+    char expected_path[CHAOS_IO_MAX_PATH];
+    char cwd[CHAOS_IO_MAX_PATH];
+
     chaos_test_reset_state();
     chaos_test_bind_real_functions();
     g_real_open_return = 13;
@@ -735,6 +906,79 @@ static void test_open_wrapper(void)
     assert(open("/tmp/create.bin", O_CREAT | O_WRONLY, 0600) == 16);
     assert(g_real_open_has_mode == 1);
     assert(g_real_open_mode == 0600);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_open_return = 17;
+    g_config_match_path_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_LATENCY;
+    assert(getcwd(cwd, sizeof(cwd)) != NULL);
+    assert(open("relative-open.bin", O_RDONLY) == 17);
+    assert(chaos_io_join_paths(expected_path, sizeof(expected_path), cwd, "relative-open.bin") == 1);
+    assert(strcmp(g_last_match_path, expected_path) == 0);
+    assert(strcmp(g_last_store_path, expected_path) == 0);
+}
+
+static void test_openat_wrapper(void)
+{
+    char expected_path[CHAOS_IO_MAX_PATH];
+    char cwd[CHAOS_IO_MAX_PATH];
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_openat_return = 18;
+    g_chaos_io_tls_guard = 1;
+    assert(openat(7, "direct.bin", O_RDONLY) == 18);
+    assert(g_config_match_path_calls == 0);
+    assert(g_fdcache_store_calls == 0);
+    g_chaos_io_tls_guard = 0;
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_openat_return = 19;
+    g_config_match_path_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_LATENCY;
+    assert(getcwd(cwd, sizeof(cwd)) != NULL);
+    assert(openat(AT_FDCWD, "relative-openat.bin", O_RDONLY) == 19);
+    assert(chaos_io_join_paths(expected_path, sizeof(expected_path), cwd, "relative-openat.bin") == 1);
+    assert(strcmp(g_last_match_path, expected_path) == 0);
+    assert(strcmp(g_last_store_path, expected_path) == 0);
+    assert(g_latency_calls == 1);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_openat_return = 20;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/openat-base");
+    g_config_match_path_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_LATENCY;
+    assert(openat(21, "child.bin", O_RDONLY) == 20);
+    assert(strcmp(g_last_match_path, "/tmp/openat-base/child.bin") == 0);
+    assert(strcmp(g_last_store_path, "/tmp/openat-base/child.bin") == 0);
+    assert(g_real_openat_dirfd == 21);
+    assert(strcmp(g_real_openat_path, "child.bin") == 0);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/openat-fail");
+    g_config_match_path_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
+    g_config_rule.errnum = EIO;
+    g_rule_apply_errno_result = 1;
+    assert(openat(22, "child.bin", O_RDONLY) == -1);
+    assert(errno == EIO);
+    assert(g_real_openat_calls == 0);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_openat_return = 23;
+    assert(openat(23, "child.bin", O_CREAT | O_WRONLY, 0640) == 23);
+    assert(g_real_openat_has_mode == 1);
+    assert(g_real_openat_mode == 0640);
+    assert(g_config_match_path_calls == 0);
+    assert(g_fdcache_store_calls == 0);
+    assert(g_fdcache_resolve_calls == 2);
 }
 
 static void test_read_and_write_wrappers(void)
@@ -833,6 +1077,64 @@ static void test_read_and_write_wrappers(void)
     assert(write(9, "abc", 3U) == -1);
     assert(errno == EROFS);
 }
+
+#ifdef __linux__
+static void test_sendfile_wrapper(void)
+{
+    off_t offset = 7;
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_sendfile_return = 5;
+    g_chaos_io_tls_guard = 1;
+    assert(sendfile(8, 4, &offset, 5U) == 5);
+    assert(g_real_sendfile_calls == 1);
+    assert(g_real_sendfile_guard == 1);
+    assert(g_real_sendfile_out_fd == 8);
+    assert(g_real_sendfile_in_fd == 4);
+    assert(g_real_sendfile_offset == &offset);
+    g_chaos_io_tls_guard = 0;
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/sendfile.bin");
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_TORN;
+    g_rule_should_trigger_result = 1;
+    g_torn_count_result = 3U;
+    g_real_sendfile_return = 3;
+    assert(sendfile(9, 4, NULL, 6U) == 3);
+    assert(g_last_match_loaded_operation == CHAOS_IO_OP_WRITE);
+    assert(g_last_torn_requested == 6U);
+    assert(g_real_sendfile_count == 3U);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/sendfile-latency.bin");
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_LATENCY;
+    g_real_sendfile_return = 2;
+    assert(sendfile(9, 4, NULL, 2U) == 2);
+    assert(g_latency_calls == 1);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/sendfile-fail.bin");
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
+    g_config_rule.errnum = EIO;
+    g_rule_apply_errno_result = 1;
+    assert(sendfile(9, 4, NULL, 2U) == -1);
+    assert(errno == EIO);
+    assert(g_real_sendfile_calls == 0);
+}
+#endif
 
 static void test_close_sync_and_positioned_wrappers(void)
 {
@@ -1030,7 +1332,11 @@ int main(void)
     test_call_real_open_and_match_fd_rule();
     test_init_runtime();
     test_open_wrapper();
+    test_openat_wrapper();
     test_read_and_write_wrappers();
+#ifdef __linux__
+    test_sendfile_wrapper();
+#endif
     test_close_sync_and_positioned_wrappers();
     chaos_test_bind_libc_functions_for_exit();
     return 0;
