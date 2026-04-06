@@ -37,6 +37,8 @@ For each intercepted operation:
 
 Wrapper families are split by responsibility:
 
+- [`src/wrappers/chaos_io_fsops.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/wrappers/chaos_io_fsops.c)
+  owns `ftruncate()`, Linux `fallocate()`, `unlinkat()`, and `renameat()`.
 - [`src/wrappers/chaos_io_open.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/wrappers/chaos_io_open.c)
   owns `open()` and `openat()`.
 - [`src/wrappers/chaos_io_rw.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/wrappers/chaos_io_rw.c)
@@ -64,10 +66,12 @@ That boundary rule is important:
 
 [`src/config/chaos_io_fdcache.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/config/chaos_io_fdcache.c)
 
-- `read`, `readv`, `write`, `writev`, `fsync`, `fdatasync`, `pread`, `preadv`, `pwrite`, and `pwritev` operate on fds, not paths.
+- `read`, `readv`, `write`, `writev`, `fsync`, `fdatasync`, `pread`, `preadv`, `pwrite`, `pwritev`, `ftruncate`, and Linux `fallocate` operate on fds, not paths.
 - The library resolves each fd through `/proc/self/fd/<fd>`.
 - Resolved paths are cached in thread-local direct-mapped slots.
 - Successful `close` invalidates the cache entry.
+- Successful `unlinkat` and `renameat` reset the current thread cache because
+  previously resolved path identities may now be stale.
 
 ## Fault Effects
 
@@ -105,21 +109,24 @@ That is why coverage can stay strict without adding exported test-only symbols.
 - Linux-only
 - Builds the real shared object
 - Verifies passthrough, injected errno failure, measured latency, and
-  `openat()`, `readv()`, `writev()`, `preadv()`, `pwritev()`, and Linux
-  `sendfile()` plus `copy_file_range()` runtime interposition on Linux hosts
+  `openat()`, `readv()`, `writev()`, `preadv()`, `pwritev()`, `ftruncate()`,
+  Linux `fallocate()`, `unlinkat()`, `renameat()`, and Linux `sendfile()` plus
+  `copy_file_range()` runtime interposition on Linux hosts
 
 [`test/runtime/test_glibc.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/runtime/test_glibc.sh)
 
 - Verifies the glibc Debian Docker build and runtime path, including direct
-  `openat()`, `readv()`, `writev()`, `preadv()`, `pwritev()`, and Linux
-  `sendfile()` plus `copy_file_range()` probes
+  `openat()`, `readv()`, `writev()`, `preadv()`, `pwritev()`, `ftruncate()`,
+  Linux `fallocate()`, `unlinkat()`, `renameat()`, and Linux `sendfile()` plus
+  `copy_file_range()` probes
 - Accepts `linux/amd64` or `linux/arm64` as an optional explicit Docker target
 
 [`test/runtime/test_alpine.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/runtime/test_alpine.sh)
 
 - Verifies the musl Alpine Docker build and runtime path, including direct
-  `openat()`, `readv()`, `writev()`, `preadv()`, `pwritev()`, and Linux
-  `sendfile()` plus `copy_file_range()` probes
+  `openat()`, `readv()`, `writev()`, `preadv()`, `pwritev()`, `ftruncate()`,
+  Linux `fallocate()`, `unlinkat()`, `renameat()`, and Linux `sendfile()` plus
+  `copy_file_range()` probes
 - Accepts `linux/amd64` or `linux/arm64` as an optional explicit Docker target
 
 ## Maintenance Rules

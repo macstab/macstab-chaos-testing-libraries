@@ -35,7 +35,11 @@ chaos_io_pread_fn g_chaos_io_real_pread = NULL;
 chaos_io_pwrite_fn g_chaos_io_real_pwrite = NULL;
 chaos_io_preadv_fn g_chaos_io_real_preadv = NULL;
 chaos_io_pwritev_fn g_chaos_io_real_pwritev = NULL;
+chaos_io_ftruncate_fn g_chaos_io_real_ftruncate = NULL;
+chaos_io_unlinkat_fn g_chaos_io_real_unlinkat = NULL;
+chaos_io_renameat_fn g_chaos_io_real_renameat = NULL;
 #ifdef __linux__
+chaos_io_fallocate_fn g_chaos_io_real_fallocate = NULL;
 chaos_io_sendfile_fn g_chaos_io_real_sendfile = NULL;
 chaos_io_copy_file_range_fn g_chaos_io_real_copy_file_range = NULL;
 #endif
@@ -141,7 +145,11 @@ static void chaos_io_init(void)
     chaos_io_resolve_symbol(&g_chaos_io_real_pwrite, "pwrite");
     chaos_io_resolve_symbol(&g_chaos_io_real_preadv, "preadv");
     chaos_io_resolve_symbol(&g_chaos_io_real_pwritev, "pwritev");
+    chaos_io_resolve_symbol(&g_chaos_io_real_ftruncate, "ftruncate");
+    chaos_io_resolve_symbol(&g_chaos_io_real_unlinkat, "unlinkat");
+    chaos_io_resolve_symbol(&g_chaos_io_real_renameat, "renameat");
 #ifdef __linux__
+    chaos_io_resolve_symbol(&g_chaos_io_real_fallocate, "fallocate");
     chaos_io_resolve_symbol(&g_chaos_io_real_sendfile, "sendfile");
     chaos_io_resolve_symbol(&g_chaos_io_real_copy_file_range, "copy_file_range");
 #endif

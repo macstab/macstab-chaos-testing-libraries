@@ -33,6 +33,7 @@ LIB_SRCS := \
 	$(SRC_CORE_DIR)/chaos_io.c \
 	$(SRC_WRAPPERS_DIR)/chaos_io_open.c \
 	$(SRC_WRAPPERS_DIR)/chaos_io_rw.c \
+	$(SRC_WRAPPERS_DIR)/chaos_io_fsops.c \
 	$(SRC_WRAPPERS_DIR)/chaos_io_sync.c \
 	$(SRC_EFFECTS_DIR)/chaos_io_actions.c \
 	$(SRC_CONFIG_DIR)/chaos_io_config.c \

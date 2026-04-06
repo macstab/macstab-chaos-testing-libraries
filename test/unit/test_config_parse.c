@@ -93,6 +93,11 @@ static void test_helper_primitives(void)
     assert(chaos_io_parse_operation("fdatasync") == CHAOS_IO_OP_FDATASYNC);
     assert(chaos_io_parse_operation("pread") == CHAOS_IO_OP_PREAD);
     assert(chaos_io_parse_operation("pwrite") == CHAOS_IO_OP_PWRITE);
+    assert(chaos_io_parse_operation("truncate") == CHAOS_IO_OP_TRUNCATE);
+    assert(chaos_io_parse_operation("allocate") == CHAOS_IO_OP_ALLOCATE);
+    assert(chaos_io_parse_operation("unlink") == CHAOS_IO_OP_UNLINK);
+    assert(chaos_io_parse_operation("rename_from") == CHAOS_IO_OP_RENAME_FROM);
+    assert(chaos_io_parse_operation("rename_to") == CHAOS_IO_OP_RENAME_TO);
     assert(chaos_io_parse_operation("bogus") == CHAOS_IO_OP_INVALID);
 
     assert(chaos_io_parse_errno_name(NULL) == -1);
@@ -138,11 +143,15 @@ static void test_helper_primitives(void)
 
     assert(chaos_io_effect_allowed(CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_ERRNO));
     assert(chaos_io_effect_allowed(CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_LATENCY));
+    assert(chaos_io_effect_allowed(CHAOS_IO_OP_TRUNCATE, CHAOS_IO_EFFECT_LATENCY));
+    assert(chaos_io_effect_allowed(CHAOS_IO_OP_RENAME_TO, CHAOS_IO_EFFECT_ERRNO));
     assert(chaos_io_effect_allowed(CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_TORN));
     assert(!chaos_io_effect_allowed(CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_TORN));
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_TRUNCATE, CHAOS_IO_EFFECT_TORN));
     assert(chaos_io_effect_allowed(CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_CORRUPT));
     assert(chaos_io_effect_allowed(CHAOS_IO_OP_PREAD, CHAOS_IO_EFFECT_CORRUPT));
     assert(!chaos_io_effect_allowed(CHAOS_IO_OP_OPEN, CHAOS_IO_EFFECT_CORRUPT));
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_UNLINK, CHAOS_IO_EFFECT_CORRUPT));
     assert(!chaos_io_effect_allowed(CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_INVALID));
 
     assert(chaos_io_config_normalize_mtime_hash(CHAOS_IO_MTIME_MISSING) != CHAOS_IO_MTIME_MISSING);
@@ -180,7 +189,13 @@ static void test_parse_line_valid_cases(void)
         { "/data:fdatasync:EACCES:0.6", CHAOS_IO_OP_FDATASYNC, CHAOS_IO_EFFECT_ERRNO, EACCES, 0.6, 0U },
         { "/data:pread:ENOENT:0.7", CHAOS_IO_OP_PREAD, CHAOS_IO_EFFECT_ERRNO, ENOENT, 0.7, 0U },
         { "/data:pwrite:ENFILE:0.8", CHAOS_IO_OP_PWRITE, CHAOS_IO_EFFECT_ERRNO, ENFILE, 0.8, 0U },
+        { "/data:truncate:EIO:0.2", CHAOS_IO_OP_TRUNCATE, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U },
+        { "/data:allocate:EIO:0.2", CHAOS_IO_OP_ALLOCATE, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U },
+        { "/data:unlink:EIO:0.2", CHAOS_IO_OP_UNLINK, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U },
+        { "/data:rename_from:EIO:0.2", CHAOS_IO_OP_RENAME_FROM, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U },
+        { "/data:rename_to:EIO:0.2", CHAOS_IO_OP_RENAME_TO, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U },
         { "/data:write:LATENCY:25", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_LATENCY, 0, 0.0, 25U },
+        { "/data:truncate:LATENCY:25", CHAOS_IO_OP_TRUNCATE, CHAOS_IO_EFFECT_LATENCY, 0, 0.0, 25U },
         { "/data:write:TORN:0.9", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_TORN, 0, 0.9, 0U },
         { "/data:read:CORRUPT:1.0", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_CORRUPT, 0, 1.0, 0U }
     };
@@ -229,6 +244,7 @@ static void test_parse_line_invalid_cases(void)
     char invalid_errno_probability[] = "/data:read:EIO:not-a-number";
     char invalid_effect[] = "/data:read:BOOM:0.1";
     char invalid_combination[] = "/data:read:TORN:0.2";
+    char invalid_truncate_combination[] = "/data:truncate:TORN:0.2";
     char invalid_latency[] = "/data:write:LATENCY:not-a-number";
     char invalid_corrupt_probability[] = "/data:read:CORRUPT:2.0";
     char invalid_torn_probability[] = "/data:pwrite:TORN:-0.1";
@@ -249,6 +265,7 @@ static void test_parse_line_invalid_cases(void)
     assert(chaos_io_config_parse_line(invalid_errno_probability, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_effect, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_combination, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_truncate_combination, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_latency, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_corrupt_probability, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_torn_probability, &rule) == -1);

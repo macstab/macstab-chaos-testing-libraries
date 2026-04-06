@@ -92,6 +92,13 @@ static int g_real_writev_fd = -1;
 static int g_real_writev_iovcnt = 0;
 static size_t g_real_writev_lengths[CHAOS_TEST_IOV_SNAPSHOT_COUNT];
 #ifdef __linux__
+static int g_real_fallocate_calls = 0;
+static int g_real_fallocate_return = 0;
+static int g_real_fallocate_guard = 0;
+static int g_real_fallocate_fd = -1;
+static int g_real_fallocate_mode = 0;
+static off_t g_real_fallocate_offset = 0;
+static off_t g_real_fallocate_length = 0;
 static int g_real_sendfile_calls = 0;
 static ssize_t g_real_sendfile_return = 0;
 static int g_real_sendfile_guard = 0;
@@ -124,6 +131,27 @@ static int g_real_fdatasync_calls = 0;
 static int g_real_fdatasync_return = 0;
 static int g_real_fdatasync_guard = 0;
 static int g_real_fdatasync_fd = -1;
+
+static int g_real_ftruncate_calls = 0;
+static int g_real_ftruncate_return = 0;
+static int g_real_ftruncate_guard = 0;
+static int g_real_ftruncate_fd = -1;
+static off_t g_real_ftruncate_length = 0;
+
+static int g_real_unlinkat_calls = 0;
+static int g_real_unlinkat_return = 0;
+static int g_real_unlinkat_guard = 0;
+static int g_real_unlinkat_dirfd = -1;
+static int g_real_unlinkat_flags = 0;
+static char g_real_unlinkat_path[CHAOS_IO_MAX_PATH];
+
+static int g_real_renameat_calls = 0;
+static int g_real_renameat_return = 0;
+static int g_real_renameat_guard = 0;
+static int g_real_renameat_olddirfd = -1;
+static int g_real_renameat_newdirfd = -1;
+static char g_real_renameat_oldpath[CHAOS_IO_MAX_PATH];
+static char g_real_renameat_newpath[CHAOS_IO_MAX_PATH];
 
 static int g_real_pread_calls = 0;
 static ssize_t g_real_pread_return = 0;
@@ -469,6 +497,17 @@ static ssize_t chaos_test_real_writev_impl(int fd, const struct iovec *iov, int 
 }
 
 #ifdef __linux__
+static int chaos_test_real_fallocate_impl(int fd, int mode, off_t offset, off_t length)
+{
+    ++g_real_fallocate_calls;
+    g_real_fallocate_fd = fd;
+    g_real_fallocate_mode = mode;
+    g_real_fallocate_offset = offset;
+    g_real_fallocate_length = length;
+    g_real_fallocate_guard = g_chaos_io_tls_guard;
+    return g_real_fallocate_return;
+}
+
 static ssize_t chaos_test_real_sendfile_impl(int out_fd, int in_fd, off_t *offset, size_t count)
 {
     ++g_real_sendfile_calls;
@@ -522,6 +561,52 @@ static int chaos_test_real_fdatasync_impl(int fd)
     g_real_fdatasync_fd = fd;
     g_real_fdatasync_guard = g_chaos_io_tls_guard;
     return g_real_fdatasync_return;
+}
+
+static int chaos_test_real_ftruncate_impl(int fd, off_t length)
+{
+    ++g_real_ftruncate_calls;
+    g_real_ftruncate_fd = fd;
+    g_real_ftruncate_length = length;
+    g_real_ftruncate_guard = g_chaos_io_tls_guard;
+    return g_real_ftruncate_return;
+}
+
+static int chaos_test_real_unlinkat_impl(int dirfd, const char *path, int flags)
+{
+    ++g_real_unlinkat_calls;
+    g_real_unlinkat_dirfd = dirfd;
+    g_real_unlinkat_flags = flags;
+    g_real_unlinkat_guard = g_chaos_io_tls_guard;
+    if (path != NULL) {
+        (void)snprintf(g_real_unlinkat_path, sizeof(g_real_unlinkat_path), "%s", path);
+    } else {
+        g_real_unlinkat_path[0] = '\0';
+    }
+    return g_real_unlinkat_return;
+}
+
+static int chaos_test_real_renameat_impl(
+    int olddirfd,
+    const char *oldpath,
+    int newdirfd,
+    const char *newpath)
+{
+    ++g_real_renameat_calls;
+    g_real_renameat_olddirfd = olddirfd;
+    g_real_renameat_newdirfd = newdirfd;
+    g_real_renameat_guard = g_chaos_io_tls_guard;
+    if (oldpath != NULL) {
+        (void)snprintf(g_real_renameat_oldpath, sizeof(g_real_renameat_oldpath), "%s", oldpath);
+    } else {
+        g_real_renameat_oldpath[0] = '\0';
+    }
+    if (newpath != NULL) {
+        (void)snprintf(g_real_renameat_newpath, sizeof(g_real_renameat_newpath), "%s", newpath);
+    } else {
+        g_real_renameat_newpath[0] = '\0';
+    }
+    return g_real_renameat_return;
 }
 
 static ssize_t chaos_test_real_pread_impl(int fd, void *buffer, size_t count, off_t offset)
@@ -610,6 +695,9 @@ static void *chaos_test_dlsym(void *handle, const char *symbol)
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_writev_fn, chaos_test_real_writev_impl);
     }
 #ifdef __linux__
+    if (strcmp(symbol, "fallocate") == 0) {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_fallocate_fn, chaos_test_real_fallocate_impl);
+    }
     if (strcmp(symbol, "sendfile") == 0) {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_sendfile_fn, chaos_test_real_sendfile_impl);
     }
@@ -631,6 +719,15 @@ static void *chaos_test_dlsym(void *handle, const char *symbol)
     }
     if (strcmp(symbol, "fdatasync") == 0) {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_sync_fn, chaos_test_real_fdatasync_impl);
+    }
+    if (strcmp(symbol, "ftruncate") == 0) {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_ftruncate_fn, chaos_test_real_ftruncate_impl);
+    }
+    if (strcmp(symbol, "unlinkat") == 0) {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_unlinkat_fn, chaos_test_real_unlinkat_impl);
+    }
+    if (strcmp(symbol, "renameat") == 0) {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_renameat_fn, chaos_test_real_renameat_impl);
     }
     if (strcmp(symbol, "pread") == 0) {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_pread_fn, chaos_test_real_pread_impl);
@@ -707,6 +804,7 @@ static long chaos_test_syscall(long number, ...)
 #include "../../src/core/chaos_io.c"
 #include "../../src/wrappers/chaos_io_open.c"
 #include "../../src/wrappers/chaos_io_rw.c"
+#include "../../src/wrappers/chaos_io_fsops.c"
 #include "../../src/wrappers/chaos_io_sync.c"
 #undef CHAOS_IO_CONSTRUCTOR
 #undef syscall
@@ -796,6 +894,13 @@ static void chaos_test_reset_state(void)
     g_real_writev_iovcnt = 0;
     (void)memset(g_real_writev_lengths, 0, sizeof(g_real_writev_lengths));
 #ifdef __linux__
+    g_real_fallocate_calls = 0;
+    g_real_fallocate_return = 0;
+    g_real_fallocate_guard = 0;
+    g_real_fallocate_fd = -1;
+    g_real_fallocate_mode = 0;
+    g_real_fallocate_offset = 0;
+    g_real_fallocate_length = 0;
     g_real_sendfile_calls = 0;
     g_real_sendfile_return = 0;
     g_real_sendfile_guard = 0;
@@ -828,6 +933,27 @@ static void chaos_test_reset_state(void)
     g_real_fdatasync_return = 0;
     g_real_fdatasync_guard = 0;
     g_real_fdatasync_fd = -1;
+
+    g_real_ftruncate_calls = 0;
+    g_real_ftruncate_return = 0;
+    g_real_ftruncate_guard = 0;
+    g_real_ftruncate_fd = -1;
+    g_real_ftruncate_length = 0;
+
+    g_real_unlinkat_calls = 0;
+    g_real_unlinkat_return = 0;
+    g_real_unlinkat_guard = 0;
+    g_real_unlinkat_dirfd = -1;
+    g_real_unlinkat_flags = 0;
+    g_real_unlinkat_path[0] = '\0';
+
+    g_real_renameat_calls = 0;
+    g_real_renameat_return = 0;
+    g_real_renameat_guard = 0;
+    g_real_renameat_olddirfd = -1;
+    g_real_renameat_newdirfd = -1;
+    g_real_renameat_oldpath[0] = '\0';
+    g_real_renameat_newpath[0] = '\0';
 
     g_real_pread_calls = 0;
     g_real_pread_return = 0;
@@ -881,7 +1007,11 @@ static void chaos_test_reset_state(void)
     g_chaos_io_real_pwrite = NULL;
     g_chaos_io_real_preadv = NULL;
     g_chaos_io_real_pwritev = NULL;
+    g_chaos_io_real_ftruncate = NULL;
+    g_chaos_io_real_unlinkat = NULL;
+    g_chaos_io_real_renameat = NULL;
 #ifdef __linux__
+    g_chaos_io_real_fallocate = NULL;
     g_chaos_io_real_sendfile = NULL;
     g_chaos_io_real_copy_file_range = NULL;
 #endif
@@ -905,7 +1035,11 @@ static void chaos_test_bind_real_functions(void)
     g_chaos_io_real_pwrite = chaos_test_real_pwrite_impl;
     g_chaos_io_real_preadv = chaos_test_real_preadv_impl;
     g_chaos_io_real_pwritev = chaos_test_real_pwritev_impl;
+    g_chaos_io_real_ftruncate = chaos_test_real_ftruncate_impl;
+    g_chaos_io_real_unlinkat = chaos_test_real_unlinkat_impl;
+    g_chaos_io_real_renameat = chaos_test_real_renameat_impl;
 #ifdef __linux__
+    g_chaos_io_real_fallocate = chaos_test_real_fallocate_impl;
     g_chaos_io_real_sendfile = chaos_test_real_sendfile_impl;
     g_chaos_io_real_copy_file_range = chaos_test_real_copy_file_range_impl;
 #endif
@@ -951,6 +1085,18 @@ static void chaos_test_bind_libc_functions_for_exit(void)
     assert(resolved != NULL);
     (void)memcpy(&g_chaos_io_real_fdatasync, &resolved, sizeof(resolved));
 
+    resolved = dlsym(RTLD_NEXT, "ftruncate");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_ftruncate, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "unlinkat");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_unlinkat, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "renameat");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_renameat, &resolved, sizeof(resolved));
+
     resolved = dlsym(RTLD_NEXT, "pread");
     assert(resolved != NULL);
     (void)memcpy(&g_chaos_io_real_pread, &resolved, sizeof(resolved));
@@ -967,6 +1113,10 @@ static void chaos_test_bind_libc_functions_for_exit(void)
     assert(resolved != NULL);
     (void)memcpy(&g_chaos_io_real_pwritev, &resolved, sizeof(resolved));
 #ifdef __linux__
+    resolved = dlsym(RTLD_NEXT, "fallocate");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_fallocate, &resolved, sizeof(resolved));
+
     resolved = dlsym(RTLD_NEXT, "sendfile");
     assert(resolved != NULL);
     (void)memcpy(&g_chaos_io_real_sendfile, &resolved, sizeof(resolved));

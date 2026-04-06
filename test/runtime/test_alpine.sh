@@ -637,6 +637,251 @@ static int torn_copy_file_range_copy_payload(const char *source_path, const char
     return 0;
 }
 
+static int ftruncate_payload(const char *path, off_t length)
+{
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+
+    if (fd < 0) {
+        return 78;
+    }
+    if (write(fd, \"truncate\", 8) != 8) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 79 : saved;
+    }
+    if (ftruncate(fd, length) != 0) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 80 : saved;
+    }
+    if (close(fd) != 0) {
+        return 81;
+    }
+
+    return 0;
+}
+
+static int ftruncate_with_latency(const char *path, off_t length)
+{
+    struct timespec start;
+    struct timespec end;
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+
+    if (fd < 0) {
+        return 82;
+    }
+    if (write(fd, \"truncate\", 8) != 8) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 83 : saved;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        close(fd);
+        return 84;
+    }
+    if (ftruncate(fd, length) != 0) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 85 : saved;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        close(fd);
+        return 86;
+    }
+    if (close(fd) != 0) {
+        return 87;
+    }
+
+    return elapsed_ms(&start, &end) >= 150LL ? 0 : 88;
+}
+
+static int fallocate_payload(const char *path, off_t length)
+{
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+
+    if (fd < 0) {
+        return 89;
+    }
+    if (fallocate(fd, 0, 0, length) != 0) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 90 : saved;
+    }
+    if (close(fd) != 0) {
+        return 91;
+    }
+
+    return 0;
+}
+
+static int fallocate_with_latency(const char *path, off_t length)
+{
+    struct timespec start;
+    struct timespec end;
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    int rc;
+    int saved = 0;
+
+    if (fd < 0) {
+        return 92;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        close(fd);
+        return 93;
+    }
+
+    rc = fallocate(fd, 0, 0, length);
+    if (rc != 0) {
+        saved = errno;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        close(fd);
+        return 94;
+    }
+    if (close(fd) != 0) {
+        return 95;
+    }
+    if (elapsed_ms(&start, &end) < 150LL) {
+        return 96;
+    }
+    if (rc != 0 && saved == 0) {
+        return 97;
+    }
+
+    return 0;
+}
+
+static int unlinkat_payload(const char *dir_path, const char *name)
+{
+    int dirfd = open(dir_path, O_RDONLY);
+
+    if (dirfd < 0) {
+        return 98;
+    }
+    if (unlinkat(dirfd, name, 0) != 0) {
+        int saved = errno;
+        close(dirfd);
+        return saved == 0 ? 99 : saved;
+    }
+    if (close(dirfd) != 0) {
+        return 100;
+    }
+
+    return 0;
+}
+
+static int unlinkat_with_latency(const char *dir_path, const char *name)
+{
+    struct timespec start;
+    struct timespec end;
+    int dirfd = open(dir_path, O_RDONLY);
+
+    if (dirfd < 0) {
+        return 101;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        close(dirfd);
+        return 102;
+    }
+    if (unlinkat(dirfd, name, 0) != 0) {
+        int saved = errno;
+        close(dirfd);
+        return saved == 0 ? 103 : saved;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        close(dirfd);
+        return 104;
+    }
+    if (close(dirfd) != 0) {
+        return 105;
+    }
+
+    return elapsed_ms(&start, &end) >= 150LL ? 0 : 106;
+}
+
+static int renameat_payload(
+    const char *old_dir,
+    const char *old_name,
+    const char *new_dir,
+    const char *new_name)
+{
+    int olddirfd = open(old_dir, O_RDONLY);
+    int newdirfd;
+
+    if (olddirfd < 0) {
+        return 107;
+    }
+
+    newdirfd = open(new_dir, O_RDONLY);
+    if (newdirfd < 0) {
+        close(olddirfd);
+        return 108;
+    }
+    if (renameat(olddirfd, old_name, newdirfd, new_name) != 0) {
+        int saved = errno;
+        close(newdirfd);
+        close(olddirfd);
+        return saved == 0 ? 109 : saved;
+    }
+    if (close(newdirfd) != 0) {
+        close(olddirfd);
+        return 110;
+    }
+    if (close(olddirfd) != 0) {
+        return 111;
+    }
+
+    return 0;
+}
+
+static int renameat_with_latency(
+    const char *old_dir,
+    const char *old_name,
+    const char *new_dir,
+    const char *new_name)
+{
+    struct timespec start;
+    struct timespec end;
+    int olddirfd = open(old_dir, O_RDONLY);
+    int newdirfd;
+
+    if (olddirfd < 0) {
+        return 112;
+    }
+
+    newdirfd = open(new_dir, O_RDONLY);
+    if (newdirfd < 0) {
+        close(olddirfd);
+        return 113;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        close(newdirfd);
+        close(olddirfd);
+        return 114;
+    }
+    if (renameat(olddirfd, old_name, newdirfd, new_name) != 0) {
+        int saved = errno;
+        close(newdirfd);
+        close(olddirfd);
+        return saved == 0 ? 115 : saved;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        close(newdirfd);
+        close(olddirfd);
+        return 116;
+    }
+    if (close(newdirfd) != 0) {
+        close(olddirfd);
+        return 117;
+    }
+    if (close(olddirfd) != 0) {
+        return 118;
+    }
+
+    return elapsed_ms(&start, &end) >= 150LL ? 0 : 119;
+}
+
 static int fsync_with_latency(const char *path)
 {
     struct timespec start;
@@ -822,6 +1067,96 @@ int main(void)
 
     if (fsync_with_latency(\"/tmp/target.bin\") != 0) {
         return 38;
+    }
+
+    if (write_config(\"/tmp/truncate.bin:truncate:EIO:1.0\", now + 15) != 0) {
+        return 39;
+    }
+
+    if (ftruncate_payload(\"/tmp/truncate.bin\", 3) != EIO) {
+        return 40;
+    }
+
+    if (write_config(\"/tmp/truncate.bin:truncate:LATENCY:200\", now + 16) != 0) {
+        return 41;
+    }
+
+    if (ftruncate_with_latency(\"/tmp/truncate.bin\", 3) != 0) {
+        return 42;
+    }
+
+    if (write_config(\"/tmp/allocate.bin:allocate:EIO:1.0\", now + 17) != 0) {
+        return 43;
+    }
+
+    if (fallocate_payload(\"/tmp/allocate.bin\", 4096) != EIO) {
+        return 44;
+    }
+
+    if (write_config(\"/tmp/allocate.bin:allocate:LATENCY:200\", now + 18) != 0) {
+        return 45;
+    }
+
+    if (fallocate_with_latency(\"/tmp/allocate.bin\", 4096) != 0) {
+        return 46;
+    }
+
+    if (mkdir(\"/tmp/unlink-dir\", 0700) != 0 && errno != EEXIST) {
+        return 47;
+    }
+
+    if (openat_write_payload(\"/tmp/unlink-dir\", \"victim.bin\", \"unlink\") != 0) {
+        return 48;
+    }
+
+    if (write_config(\"/tmp/unlink-dir/victim.bin:unlink:EIO:1.0\", now + 19) != 0) {
+        return 49;
+    }
+
+    if (unlinkat_payload(\"/tmp/unlink-dir\", \"victim.bin\") != EIO) {
+        return 50;
+    }
+
+    if (openat_write_payload(\"/tmp/unlink-dir\", \"victim.bin\", \"unlink\") != 0) {
+        return 51;
+    }
+
+    if (write_config(\"/tmp/unlink-dir/victim.bin:unlink:LATENCY:200\", now + 20) != 0) {
+        return 52;
+    }
+
+    if (unlinkat_with_latency(\"/tmp/unlink-dir\", \"victim.bin\") != 0) {
+        return 53;
+    }
+
+    if (mkdir(\"/tmp/rename-old\", 0700) != 0 && errno != EEXIST) {
+        return 54;
+    }
+    if (mkdir(\"/tmp/rename-new\", 0700) != 0 && errno != EEXIST) {
+        return 55;
+    }
+    if (openat_write_payload(\"/tmp/rename-old\", \"source.bin\", \"rename\") != 0) {
+        return 56;
+    }
+
+    if (write_config(\"/tmp/rename-old/source.bin:rename_from:EIO:1.0\", now + 21) != 0) {
+        return 57;
+    }
+
+    if (renameat_payload(\"/tmp/rename-old\", \"source.bin\", \"/tmp/rename-new\", \"dest.bin\") != EIO) {
+        return 58;
+    }
+
+    if (openat_write_payload(\"/tmp/rename-old\", \"source.bin\", \"rename\") != 0) {
+        return 59;
+    }
+
+    if (write_config(\"/tmp/rename-new/dest.bin:rename_to:LATENCY:200\", now + 22) != 0) {
+        return 60;
+    }
+
+    if (renameat_with_latency(\"/tmp/rename-old\", \"source.bin\", \"/tmp/rename-new\", \"dest.bin\") != 0) {
+        return 61;
     }
 
     return 0;

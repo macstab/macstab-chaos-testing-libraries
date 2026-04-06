@@ -139,6 +139,21 @@ static chaos_io_operation_t chaos_io_parse_operation(const char *text)
     if (strcmp(text, "pwrite") == 0) {
         return CHAOS_IO_OP_PWRITE;
     }
+    if (strcmp(text, "truncate") == 0) {
+        return CHAOS_IO_OP_TRUNCATE;
+    }
+    if (strcmp(text, "allocate") == 0) {
+        return CHAOS_IO_OP_ALLOCATE;
+    }
+    if (strcmp(text, "unlink") == 0) {
+        return CHAOS_IO_OP_UNLINK;
+    }
+    if (strcmp(text, "rename_from") == 0) {
+        return CHAOS_IO_OP_RENAME_FROM;
+    }
+    if (strcmp(text, "rename_to") == 0) {
+        return CHAOS_IO_OP_RENAME_TO;
+    }
     return CHAOS_IO_OP_INVALID;
 }
 

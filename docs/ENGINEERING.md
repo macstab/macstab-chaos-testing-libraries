@@ -34,17 +34,20 @@ If you are new to the repository, read it in this order:
 3. [`src/wrappers/chaos_io_rw.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/wrappers/chaos_io_rw.c)
    This holds the read/write wrappers plus Linux `sendfile()` and
    `copy_file_range()`.
-4. [`src/wrappers/chaos_io_sync.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/wrappers/chaos_io_sync.c)
+4. [`src/wrappers/chaos_io_fsops.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/wrappers/chaos_io_fsops.c)
+   This holds `ftruncate()`, Linux `fallocate()`, `unlinkat()`, and
+   `renameat()`.
+5. [`src/wrappers/chaos_io_sync.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/wrappers/chaos_io_sync.c)
    This holds `close()`, `fsync()`, and `fdatasync()`.
-5. [`src/config/chaos_io_config.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/config/chaos_io_config.c)
+6. [`src/config/chaos_io_config.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/config/chaos_io_config.c)
    This explains how rules get from text into an active in-memory snapshot.
-6. [`src/effects/chaos_io_actions.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/effects/chaos_io_actions.c)
+7. [`src/effects/chaos_io_actions.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/effects/chaos_io_actions.c)
    This contains the actual fault-effect mechanics once a rule has matched.
-7. [`src/config/chaos_io_fdcache.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/config/chaos_io_fdcache.c)
+8. [`src/config/chaos_io_fdcache.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/config/chaos_io_fdcache.c)
    This explains how fd-based calls recover the original path cheaply.
-8. [`test/support/test_chaos_io_harness.h`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/support/test_chaos_io_harness.h)
+9. [`test/support/test_chaos_io_harness.h`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/support/test_chaos_io_harness.h)
    This holds the wrapper test harness and direct source inclusion boundary.
-9. [`test/unit/test_chaos_io.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/unit/test_chaos_io.c)
+10. [`test/unit/test_chaos_io.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/unit/test_chaos_io.c)
    This holds the actual wrapper behavior assertions.
 
 ## File Responsibilities
@@ -98,6 +101,22 @@ Use it when:
 The invariant here is operational symmetry: read-style wrappers should stay
 read-like, write-style wrappers should stay write-like, and Linux
 `sendfile()` plus `copy_file_range()` must remain explicitly destination-side.
+
+### [`src/wrappers/chaos_io_fsops.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/wrappers/chaos_io_fsops.c)
+
+This file owns size-change and path-identity wrappers.
+
+Use it when:
+
+- adding or changing `ftruncate()` behavior
+- adding or changing Linux `fallocate()` behavior
+- adding or changing `unlinkat()` behavior
+- adding or changing `renameat()` behavior
+- changing how successful path-identity changes invalidate the fd cache
+
+Keep the policy narrow here. These wrappers support only errno injection and
+latency. If they start growing torn-write or corruption semantics, the config
+model is drifting.
 
 ### [`src/wrappers/chaos_io_sync.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/wrappers/chaos_io_sync.c)
 
@@ -214,6 +233,25 @@ The remaining gap is other alternate copy paths. Tools that move data through
 `splice()`, `mmap()`, or similar non-`write()`, non-`writev()`,
 non-`sendfile()`, and non-`copy_file_range()` paths are still outside the
 current fault surface.
+
+### `ftruncate()`, Linux `fallocate()`, `unlinkat()`, and `renameat()`
+
+These wrappers model filesystem lifecycle and capacity edges without changing
+the basic rule engine:
+
+- `ftruncate()` matches the logical `truncate` rule class on the target fd path
+- Linux `fallocate()` matches the logical `allocate` rule class on the target
+  fd path
+- `unlinkat()` matches the logical `unlink` rule class on the resolved target
+  path
+- `renameat()` matches `rename_from` and `rename_to` on the resolved source and
+  destination paths
+
+`renameat()` keeps source and destination separate on purpose. Atomic replace
+patterns often care more about the destination pathname than about the original
+temporary source. Successful `unlinkat()` and `renameat()` reset the current
+thread fd cache because already-cached `/proc/self/fd` resolutions may no
+longer describe the same pathname.
 
 ### `close()`
 

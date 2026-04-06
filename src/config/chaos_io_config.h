@@ -26,7 +26,12 @@ typedef enum chaos_io_operation {
     CHAOS_IO_OP_FSYNC,
     CHAOS_IO_OP_FDATASYNC,
     CHAOS_IO_OP_PREAD,
-    CHAOS_IO_OP_PWRITE
+    CHAOS_IO_OP_PWRITE,
+    CHAOS_IO_OP_TRUNCATE,
+    CHAOS_IO_OP_ALLOCATE,
+    CHAOS_IO_OP_UNLINK,
+    CHAOS_IO_OP_RENAME_FROM,
+    CHAOS_IO_OP_RENAME_TO
 } chaos_io_operation_t;
 
 /*

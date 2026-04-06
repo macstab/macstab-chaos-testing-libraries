@@ -32,6 +32,7 @@ src/
     chaos_io_actions.c
     chaos_io_actions.h
   wrappers/
+    chaos_io_fsops.c
     chaos_io_open.c
     chaos_io_rw.c
     chaos_io_sync.c
@@ -94,6 +95,16 @@ Examples:
   Applies to `pread()` and `preadv()`.
 - `pwrite`
   Applies to `pwrite()` and `pwritev()`.
+- `truncate`
+  Applies to `ftruncate()`.
+- `allocate`
+  Applies to Linux `fallocate()`.
+- `unlink`
+  Applies to `unlinkat()`.
+- `rename_from`
+  Applies to `renameat()` source paths.
+- `rename_to`
+  Applies to `renameat()` destination paths.
 
 ### Effects
 
@@ -130,7 +141,7 @@ Examples:
 
 ## Runtime Behavior
 
-- The intercepted libc entry points are `read`, `readv`, `write`, `writev`, `open`, `openat`, `close`, `fsync`, `fdatasync`, `pread`, `preadv`, `pwrite`, `pwritev`, and Linux `sendfile` plus `copy_file_range`.
+- The intercepted libc entry points are `read`, `readv`, `write`, `writev`, `open`, `openat`, `close`, `fsync`, `fdatasync`, `pread`, `preadv`, `pwrite`, `pwritev`, `ftruncate`, `unlinkat`, `renameat`, and Linux `sendfile`, `copy_file_range`, plus `fallocate`.
 - The config file is checked with `stat()` on each intercepted call.
 - Reload is lock-free for readers and swaps between two config snapshots.
 - FD-backed operations resolve paths through `/proc/self/fd/<fd>` and cache them in thread-local storage.
@@ -139,6 +150,10 @@ Examples:
 - `readv(2)` and `preadv(2)` reuse the logical `read` and `pread` rule classes across the concatenated iovec byte stream.
 - `writev(2)` and `pwritev(2)` reuse the logical `write` and `pwrite` rule classes across the concatenated iovec byte stream.
 - Linux `sendfile(2)` and `copy_file_range(2)` use the logical `write` rule class and match on the destination fd path.
+- `ftruncate(2)` and Linux `fallocate(2)` use the logical `truncate` and `allocate` rule classes on the target fd path.
+- `unlinkat(2)` matches the logical `unlink` rule class on the resolved target path.
+- `renameat(2)` matches the logical `rename_from` and `rename_to` rule classes against the resolved source and destination paths.
+- Successful `unlinkat(2)` and `renameat(2)` calls reset the current thread fd cache because cached path identities may now be stale.
 - Programs that copy data with `splice(2)`, `mmap(2)`, or other non-`write(2)`/`writev(2)`/`sendfile(2)`/`copy_file_range(2)` paths bypass `write` and `pwrite` rules.
 - Injection is never applied to:
   `stdin`, `stdout`, `stderr`, `/tmp/.chaos-io.conf`, `/proc`, `/sys`, or `/dev`.
@@ -157,6 +172,7 @@ Runs all unit binaries:
 - effect helpers
 - fd cache logic
 - full wrapper behavior across `src/core/chaos_io.c`,
+  `src/wrappers/chaos_io_fsops.c`,
   `src/wrappers/chaos_io_open.c`, `src/wrappers/chaos_io_rw.c`, and
   `src/wrappers/chaos_io_sync.c`
 
@@ -169,6 +185,7 @@ make coverage
 This compiles an instrumented build and enforces `100.00%` line coverage for:
 
 - `src/core/chaos_io.c`
+- `src/wrappers/chaos_io_fsops.c`
 - `src/wrappers/chaos_io_open.c`
 - `src/wrappers/chaos_io_rw.c`
 - `src/wrappers/chaos_io_sync.c`
@@ -201,8 +218,9 @@ sh test/runtime/test_alpine.sh linux/arm64
 When no platform is given, each script falls back to the host architecture.
 
 The Docker runtime probes explicitly validate `openat()`, `readv()`, `writev()`,
-`preadv()`, `pwritev()`, Linux `sendfile()`, Linux `copy_file_range()`, and
-`fsync()` under `LD_PRELOAD`.
+`preadv()`, `pwritev()`, `ftruncate()`, Linux `fallocate()`, `unlinkat()`,
+`renameat()`, Linux `sendfile()`, Linux `copy_file_range()`, and `fsync()`
+under `LD_PRELOAD`.
 
 ### Build targets
 

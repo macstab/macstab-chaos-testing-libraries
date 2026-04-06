@@ -203,17 +203,34 @@ applications.
 These operations are valuable, but they likely require expanding the config
 surface with new logical operations rather than silently reusing unrelated ones.
 
-- [ ] Add `ftruncate`
-  - Cross-target completion gate applies.
-- [ ] Add `fallocate`
-  - Cross-target completion gate applies.
-- [ ] Add `renameat`
-  - Cross-target completion gate applies.
-- [ ] Add `unlinkat`
-  - Cross-target completion gate applies.
-- [ ] Define the config contract for these operations before implementation.
-  - Cross-target completion gate applies.
-- [ ] Add unit and runtime tests for each new operation/effect combination.
+- [x] Define the config contract for these operations before implementation.
+  - Added logical operations: `truncate`, `allocate`, `unlink`,
+    `rename_from`, and `rename_to`.
+  - Only `ERRNO` and `LATENCY` apply in this phase.
+  - Cross-target completion gate passed locally in Docker across glibc/musl and
+    amd64/arm64.
+- [x] Add `ftruncate`
+  - Implemented with logical `truncate` matching on the target fd path.
+  - Cross-target completion gate passed locally in Docker across glibc/musl and
+    amd64/arm64.
+- [x] Add `fallocate`
+  - Implemented as a Linux-only wrapper with logical `allocate` matching on the
+    target fd path.
+  - Cross-target completion gate passed locally in Docker across glibc/musl and
+    amd64/arm64.
+- [x] Add `renameat`
+  - Implemented with explicit `rename_from` and `rename_to` matching and
+    successful-cache reset behavior.
+  - Cross-target completion gate passed locally in Docker across glibc/musl and
+    amd64/arm64.
+- [x] Add `unlinkat`
+  - Implemented with logical `unlink` matching and successful-cache reset
+    behavior.
+  - Cross-target completion gate passed locally in Docker across glibc/musl and
+    amd64/arm64.
+- [x] Add unit and runtime tests for each new operation/effect combination.
+  - Docker proof now passes for unit amd64/arm64, coverage amd64/arm64, glibc
+    runtime amd64/arm64, musl runtime amd64/arm64, and Linux amd64 integration.
   - Cross-target completion gate applies.
 
 Notes:

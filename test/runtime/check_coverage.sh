@@ -66,6 +66,7 @@ check_target "$FDCACHE_GCNO" "src/config/chaos_io_fdcache.c"
 check_target "$CHAOS_IO_GCNO" "src/core/chaos_io.c"
 check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_open.c"
 check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_rw.c"
+check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_fsops.c"
 check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_sync.c"
 
 echo "coverage check passed"

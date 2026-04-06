@@ -192,7 +192,7 @@ static int chaos_io_getcwd_path(char *path, size_t path_size)
  * If resolution fails, the caller must bypass pre-open path injection and rely
  * on post-open fd resolution only.
  */
-static int chaos_io_resolve_open_path(int dirfd, const char *path, char *resolved_path, size_t resolved_path_size)
+int chaos_io_resolve_at_path(int dirfd, const char *path, char *resolved_path, size_t resolved_path_size)
 {
     char base_path[CHAOS_IO_MAX_PATH];
 
@@ -273,7 +273,7 @@ CHAOS_IO_EXPORT int open(const char *path, int flags, ...)
         return chaos_io_call_real_open(path, flags, has_mode, mode);
     }
 
-    if (chaos_io_resolve_open_path(AT_FDCWD, path, resolved_path, sizeof(resolved_path))) {
+    if (chaos_io_resolve_at_path(AT_FDCWD, path, resolved_path, sizeof(resolved_path))) {
         match_path = resolved_path;
     }
 
@@ -319,7 +319,7 @@ CHAOS_IO_EXPORT int openat(int dirfd, const char *path, int flags, ...)
         return chaos_io_call_real_openat(dirfd, path, flags, has_mode, mode);
     }
 
-    if (chaos_io_resolve_open_path(dirfd, path, resolved_path, sizeof(resolved_path))) {
+    if (chaos_io_resolve_at_path(dirfd, path, resolved_path, sizeof(resolved_path))) {
         match_path = resolved_path;
     }
 

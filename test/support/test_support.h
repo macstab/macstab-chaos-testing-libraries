@@ -13,12 +13,15 @@
 
 #ifdef __linux__
 #define CHAOS_IO_DEFINE_TEST_LINUX_COPY_GLOBALS() \
+    chaos_io_fallocate_fn g_chaos_io_real_fallocate = NULL; \
     chaos_io_sendfile_fn g_chaos_io_real_sendfile = NULL; \
     chaos_io_copy_file_range_fn g_chaos_io_real_copy_file_range = NULL;
 #define CHAOS_IO_TEST_ASSIGN_REAL_LINUX_COPY() \
+    g_chaos_io_real_fallocate = fallocate; \
     g_chaos_io_real_sendfile = sendfile; \
     g_chaos_io_real_copy_file_range = copy_file_range;
 #define CHAOS_IO_TEST_RESET_REAL_LINUX_COPY() \
+    g_chaos_io_real_fallocate = NULL; \
     g_chaos_io_real_sendfile = NULL; \
     g_chaos_io_real_copy_file_range = NULL;
 #else
@@ -41,6 +44,9 @@
     chaos_io_pwrite_fn g_chaos_io_real_pwrite = NULL; \
     chaos_io_preadv_fn g_chaos_io_real_preadv = NULL; \
     chaos_io_pwritev_fn g_chaos_io_real_pwritev = NULL; \
+    chaos_io_ftruncate_fn g_chaos_io_real_ftruncate = NULL; \
+    chaos_io_unlinkat_fn g_chaos_io_real_unlinkat = NULL; \
+    chaos_io_renameat_fn g_chaos_io_real_renameat = NULL; \
     CHAOS_IO_DEFINE_TEST_LINUX_COPY_GLOBALS() \
     __thread int g_chaos_io_tls_guard = 0; \
     __thread uint64_t g_chaos_io_tls_prng_state = 0U; \
@@ -126,6 +132,21 @@ static inline int chaos_test_real_fdatasync(int fd)
     return fdatasync(fd);
 }
 
+static inline int chaos_test_real_ftruncate(int fd, off_t length)
+{
+    return ftruncate(fd, length);
+}
+
+static inline int chaos_test_real_unlinkat(int dirfd, const char *path, int flags)
+{
+    return unlinkat(dirfd, path, flags);
+}
+
+static inline int chaos_test_real_renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath)
+{
+    return renameat(olddirfd, oldpath, newdirfd, newpath);
+}
+
 static inline void chaos_test_use_real_io(void)
 {
     g_chaos_io_real_read = chaos_test_real_read;
@@ -141,6 +162,9 @@ static inline void chaos_test_use_real_io(void)
     g_chaos_io_real_pwrite = chaos_test_real_pwrite;
     g_chaos_io_real_preadv = chaos_test_real_preadv;
     g_chaos_io_real_pwritev = chaos_test_real_pwritev;
+    g_chaos_io_real_ftruncate = chaos_test_real_ftruncate;
+    g_chaos_io_real_unlinkat = chaos_test_real_unlinkat;
+    g_chaos_io_real_renameat = chaos_test_real_renameat;
     CHAOS_IO_TEST_ASSIGN_REAL_LINUX_COPY()
 }
 
@@ -159,6 +183,9 @@ static inline void chaos_test_reset_runtime(void)
     g_chaos_io_real_pwrite = NULL;
     g_chaos_io_real_preadv = NULL;
     g_chaos_io_real_pwritev = NULL;
+    g_chaos_io_real_ftruncate = NULL;
+    g_chaos_io_real_unlinkat = NULL;
+    g_chaos_io_real_renameat = NULL;
     CHAOS_IO_TEST_RESET_REAL_LINUX_COPY()
     g_chaos_io_tls_guard = 0;
     g_chaos_io_tls_prng_state = 0U;

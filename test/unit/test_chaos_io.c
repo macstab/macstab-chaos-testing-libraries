@@ -66,7 +66,7 @@ static void test_call_real_open_and_match_fd_rule(void)
     assert(chaos_io_copy_path(path, 0U, "/tmp/path") == 0);
     assert(chaos_io_copy_path(path, sizeof(path), NULL) == 0);
     assert(chaos_io_copy_path(path, 4U, "/tmp/path") == 0);
-    assert(chaos_io_resolve_open_path(AT_FDCWD, "/tmp/absolute.bin", path, sizeof(path)) == 1);
+    assert(chaos_io_resolve_at_path(AT_FDCWD, "/tmp/absolute.bin", path, sizeof(path)) == 1);
     assert(strcmp(path, "/tmp/absolute.bin") == 0);
 
     assert(chaos_io_join_paths(NULL, sizeof(path), "/tmp", "child.bin") == 0);
@@ -77,20 +77,20 @@ static void test_call_real_open_and_match_fd_rule(void)
     assert(chaos_io_getcwd_path(NULL, sizeof(path)) == 0);
     assert(chaos_io_getcwd_path(path, 0U) == 0);
     assert(getcwd(cwd, sizeof(cwd)) != NULL);
-    assert(chaos_io_resolve_open_path(AT_FDCWD, "relative.bin", path, sizeof(path)) == 1);
+    assert(chaos_io_resolve_at_path(AT_FDCWD, "relative.bin", path, sizeof(path)) == 1);
     assert(chaos_io_join_paths(expected_path, sizeof(expected_path), cwd, "relative.bin") == 1);
     assert(strcmp(path, expected_path) == 0);
 
-    assert(chaos_io_resolve_open_path(AT_FDCWD, NULL, path, sizeof(path)) == 0);
-    assert(chaos_io_resolve_open_path(AT_FDCWD, "relative.bin", NULL, sizeof(path)) == 0);
-    assert(chaos_io_resolve_open_path(AT_FDCWD, "relative.bin", path, 0U) == 0);
+    assert(chaos_io_resolve_at_path(AT_FDCWD, NULL, path, sizeof(path)) == 0);
+    assert(chaos_io_resolve_at_path(AT_FDCWD, "relative.bin", NULL, sizeof(path)) == 0);
+    assert(chaos_io_resolve_at_path(AT_FDCWD, "relative.bin", path, 0U) == 0);
     g_fdcache_resolve_result = 1;
     (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/base");
-    assert(chaos_io_resolve_open_path(9, "child.bin", path, sizeof(path)) == 1);
+    assert(chaos_io_resolve_at_path(9, "child.bin", path, sizeof(path)) == 1);
     assert(strcmp(path, "/tmp/base/child.bin") == 0);
 
     g_fdcache_resolve_result = 0;
-    assert(chaos_io_resolve_open_path(9, "child.bin", path, sizeof(path)) == 0);
+    assert(chaos_io_resolve_at_path(9, "child.bin", path, sizeof(path)) == 0);
 
     g_config_prepare_result = 0;
     assert(chaos_io_match_fd_rule(1, CHAOS_IO_OP_READ, &rule) == 0);
@@ -134,16 +134,241 @@ static void test_init_runtime(void)
     assert(g_chaos_io_real_fdatasync == chaos_test_real_fdatasync_impl);
     assert(g_chaos_io_real_pread == chaos_test_real_pread_impl);
     assert(g_chaos_io_real_pwrite == chaos_test_real_pwrite_impl);
+    assert(g_chaos_io_real_ftruncate == chaos_test_real_ftruncate_impl);
+    assert(g_chaos_io_real_unlinkat == chaos_test_real_unlinkat_impl);
+    assert(g_chaos_io_real_renameat == chaos_test_real_renameat_impl);
     assert(g_chaos_io_real_preadv == chaos_test_real_preadv_impl);
     assert(g_chaos_io_real_pwritev == chaos_test_real_pwritev_impl);
 #ifdef __linux__
     assert(g_chaos_io_real_sendfile == chaos_test_real_sendfile_impl);
     assert(g_chaos_io_real_copy_file_range == chaos_test_real_copy_file_range_impl);
+    assert(g_chaos_io_real_fallocate == chaos_test_real_fallocate_impl);
 #endif
     assert(g_chaos_io_process_seed == UINT64_C(0xfeedbeef12345678));
     assert(g_chaos_io_tls_prng_state != 0U);
     assert(g_config_init_calls == 1);
     assert(g_fdcache_reset_calls == 1);
+}
+
+static void test_fsops_helpers_and_wrappers(void)
+{
+    chaos_io_rule_t rule;
+
+    chaos_test_reset_state();
+    assert(chaos_io_match_loaded_path_rule(CHAOS_IO_OP_UNLINK, NULL, &rule) == 0);
+    assert(chaos_io_match_loaded_path_rule(CHAOS_IO_OP_UNLINK, "/tmp/unlink.bin", NULL) == 0);
+    assert(chaos_io_match_loaded_path_rule(CHAOS_IO_OP_UNLINK, "/proc/self/maps", &rule) == 0);
+    assert(g_config_match_loaded_calls == 0);
+
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
+    g_config_rule.errnum = EIO;
+    g_config_rule.path_len = strlen("/tmp/unlink.bin");
+    assert(chaos_io_match_loaded_path_rule(CHAOS_IO_OP_UNLINK, "/tmp/unlink.bin", &rule) == 1);
+    assert(g_last_match_loaded_operation == CHAOS_IO_OP_UNLINK);
+    assert(strcmp(g_last_match_loaded_path, "/tmp/unlink.bin") == 0);
+
+    chaos_test_reset_state();
+    assert(chaos_io_match_rename_rule(AT_FDCWD, "/tmp/from.bin", AT_FDCWD, "/tmp/to.bin", NULL) == 0);
+    assert(chaos_io_match_rename_rule(AT_FDCWD, NULL, AT_FDCWD, NULL, &rule) == 0);
+
+    g_config_prepare_result = 0;
+    assert(chaos_io_match_rename_rule(AT_FDCWD, "/tmp/from.bin", AT_FDCWD, "/tmp/to.bin", &rule) == 0);
+    assert(g_config_prepare_calls == 1);
+
+    chaos_test_reset_state();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 0;
+    assert(chaos_io_match_rename_rule(AT_FDCWD, "/tmp/from.bin", AT_FDCWD, "/tmp/to.bin", &rule) == 0);
+    assert(g_config_match_loaded_calls == 2);
+
+    chaos_test_reset_state();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
+    g_config_rule.errnum = EACCES;
+    g_config_rule.path_len = strlen("/tmp/from.bin");
+    assert(chaos_io_match_rename_rule(
+        AT_FDCWD,
+        "/tmp/from.bin",
+        AT_FDCWD,
+        "/proc/self/maps",
+        &rule) == 1);
+    assert(rule.effect == CHAOS_IO_EFFECT_ERRNO);
+    assert(g_last_match_loaded_operation == CHAOS_IO_OP_RENAME_FROM);
+    assert(strcmp(g_last_match_loaded_path, "/tmp/from.bin") == 0);
+
+    chaos_test_reset_state();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_LATENCY;
+    g_config_rule.latency_ms = 7U;
+    g_config_rule.path_len = strlen("/tmp/to.bin");
+    assert(chaos_io_match_rename_rule(
+        AT_FDCWD,
+        "/proc/self/maps",
+        AT_FDCWD,
+        "/tmp/to.bin",
+        &rule) == 1);
+    assert(rule.effect == CHAOS_IO_EFFECT_LATENCY);
+    assert(g_last_match_loaded_operation == CHAOS_IO_OP_RENAME_TO);
+    assert(strcmp(g_last_match_loaded_path, "/tmp/to.bin") == 0);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_ftruncate_return = 0;
+    assert(ftruncate(31, 4) == 0);
+    assert(g_real_ftruncate_calls == 1);
+    assert(g_real_ftruncate_guard == 1);
+    assert(g_real_ftruncate_fd == 31);
+    assert(g_real_ftruncate_length == 4);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/truncate.bin");
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_LATENCY;
+    g_real_ftruncate_return = 0;
+    assert(ftruncate(9, 3) == 0);
+    assert(g_last_match_loaded_operation == CHAOS_IO_OP_TRUNCATE);
+    assert(g_latency_calls == 1);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/truncate-fail.bin");
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
+    g_config_rule.errnum = EIO;
+    g_rule_apply_errno_result = 1;
+    assert(ftruncate(9, 1) == -1);
+    assert(errno == EIO);
+    assert(g_real_ftruncate_calls == 0);
+
+#ifdef __linux__
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_fallocate_return = 0;
+    assert(fallocate(33, 0, 2, 9) == 0);
+    assert(g_real_fallocate_calls == 1);
+    assert(g_real_fallocate_guard == 1);
+    assert(g_real_fallocate_fd == 33);
+    assert(g_real_fallocate_mode == 0);
+    assert(g_real_fallocate_offset == 2);
+    assert(g_real_fallocate_length == 9);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/allocate.bin");
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_LATENCY;
+    g_real_fallocate_return = 0;
+    assert(fallocate(9, 3, 4, 5) == 0);
+    assert(g_last_match_loaded_operation == CHAOS_IO_OP_ALLOCATE);
+    assert(g_latency_calls == 1);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/allocate-fail.bin");
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
+    g_config_rule.errnum = ENOSPC;
+    g_rule_apply_errno_result = 1;
+    assert(fallocate(9, 0, 0, 5) == -1);
+    assert(errno == ENOSPC);
+    assert(g_real_fallocate_calls == 0);
+#endif
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_unlinkat_return = 0;
+    assert(unlinkat(AT_FDCWD, "/tmp/unlink.bin", 0) == 0);
+    assert(g_real_unlinkat_calls == 1);
+    assert(g_real_unlinkat_guard == 1);
+    assert(g_real_unlinkat_dirfd == AT_FDCWD);
+    assert(strcmp(g_real_unlinkat_path, "/tmp/unlink.bin") == 0);
+    assert(g_fdcache_reset_calls == 1);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_unlinkat_return = -1;
+    assert(unlinkat(AT_FDCWD, "/tmp/unlink-fail.bin", 0) == -1);
+    assert(g_fdcache_reset_calls == 0);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_LATENCY;
+    g_real_unlinkat_return = 0;
+    assert(unlinkat(AT_FDCWD, "/tmp/unlink-latency.bin", 0) == 0);
+    assert(g_last_match_loaded_operation == CHAOS_IO_OP_UNLINK);
+    assert(strcmp(g_last_match_loaded_path, "/tmp/unlink-latency.bin") == 0);
+    assert(g_latency_calls == 1);
+    assert(g_fdcache_reset_calls == 1);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
+    g_config_rule.errnum = ENOENT;
+    g_rule_apply_errno_result = 1;
+    assert(unlinkat(AT_FDCWD, "/tmp/unlink-errno.bin", 0) == -1);
+    assert(errno == ENOENT);
+    assert(g_real_unlinkat_calls == 0);
+    assert(g_fdcache_reset_calls == 0);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_renameat_return = 0;
+    assert(renameat(AT_FDCWD, "/tmp/rename-from.bin", AT_FDCWD, "/tmp/rename-to.bin") == 0);
+    assert(g_real_renameat_calls == 1);
+    assert(g_real_renameat_guard == 1);
+    assert(g_real_renameat_olddirfd == AT_FDCWD);
+    assert(g_real_renameat_newdirfd == AT_FDCWD);
+    assert(strcmp(g_real_renameat_oldpath, "/tmp/rename-from.bin") == 0);
+    assert(strcmp(g_real_renameat_newpath, "/tmp/rename-to.bin") == 0);
+    assert(g_fdcache_reset_calls == 1);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_renameat_return = -1;
+    assert(renameat(AT_FDCWD, "/tmp/rename-from-fail.bin", AT_FDCWD, "/tmp/rename-to-fail.bin") == -1);
+    assert(g_fdcache_reset_calls == 0);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_LATENCY;
+    g_real_renameat_return = 0;
+    assert(renameat(AT_FDCWD, "/proc/self/maps", AT_FDCWD, "/tmp/rename-to-latency.bin") == 0);
+    assert(g_last_match_loaded_operation == CHAOS_IO_OP_RENAME_TO);
+    assert(strcmp(g_last_match_loaded_path, "/tmp/rename-to-latency.bin") == 0);
+    assert(g_latency_calls == 1);
+    assert(g_fdcache_reset_calls == 1);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
+    g_config_rule.errnum = EROFS;
+    g_rule_apply_errno_result = 1;
+    assert(renameat(AT_FDCWD, "/tmp/rename-from-errno.bin", AT_FDCWD, "/proc/self/maps") == -1);
+    assert(errno == EROFS);
+    assert(g_last_match_loaded_operation == CHAOS_IO_OP_RENAME_FROM);
+    assert(strcmp(g_last_match_loaded_path, "/tmp/rename-from-errno.bin") == 0);
+    assert(g_real_renameat_calls == 0);
+    assert(g_fdcache_reset_calls == 0);
 }
 
 static void test_open_wrapper(void)
@@ -1032,6 +1257,7 @@ int main(void)
     test_init_runtime();
     test_open_wrapper();
     test_openat_wrapper();
+    test_fsops_helpers_and_wrappers();
     test_read_and_write_wrappers();
     test_vectored_helpers();
     test_readv_and_writev_wrappers();

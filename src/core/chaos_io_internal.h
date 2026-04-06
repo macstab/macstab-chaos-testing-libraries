@@ -54,7 +54,11 @@ typedef ssize_t (*chaos_io_pread_fn)(int, void *, size_t, off_t);
 typedef ssize_t (*chaos_io_pwrite_fn)(int, const void *, size_t, off_t);
 typedef ssize_t (*chaos_io_preadv_fn)(int, const struct iovec *, int, off_t);
 typedef ssize_t (*chaos_io_pwritev_fn)(int, const struct iovec *, int, off_t);
+typedef int (*chaos_io_ftruncate_fn)(int, off_t);
+typedef int (*chaos_io_unlinkat_fn)(int, const char *, int);
+typedef int (*chaos_io_renameat_fn)(int, const char *, int, const char *);
 #ifdef __linux__
+typedef int (*chaos_io_fallocate_fn)(int, int, off_t, off_t);
 typedef ssize_t (*chaos_io_sendfile_fn)(int, int, off_t *, size_t);
 typedef ssize_t (*chaos_io_copy_file_range_fn)(int, off_t *, int, off_t *, size_t, unsigned int);
 #endif
@@ -72,7 +76,11 @@ extern chaos_io_pread_fn g_chaos_io_real_pread;
 extern chaos_io_pwrite_fn g_chaos_io_real_pwrite;
 extern chaos_io_preadv_fn g_chaos_io_real_preadv;
 extern chaos_io_pwritev_fn g_chaos_io_real_pwritev;
+extern chaos_io_ftruncate_fn g_chaos_io_real_ftruncate;
+extern chaos_io_unlinkat_fn g_chaos_io_real_unlinkat;
+extern chaos_io_renameat_fn g_chaos_io_real_renameat;
 #ifdef __linux__
+extern chaos_io_fallocate_fn g_chaos_io_real_fallocate;
 extern chaos_io_sendfile_fn g_chaos_io_real_sendfile;
 extern chaos_io_copy_file_range_fn g_chaos_io_real_copy_file_range;
 #endif

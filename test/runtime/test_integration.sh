@@ -37,6 +37,7 @@ cat > "$TMP_DIR/fixture.c" <<'EOF'
 #define _GNU_SOURCE
 
 #include <fcntl.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -445,6 +446,117 @@ static int copy_file_range_copy_once(const char *source_path, const char *target
     return 0;
 }
 
+static int ftruncate_once(const char *path, off_t length)
+{
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+
+    if (fd < 0) {
+        perror("open");
+        return 1;
+    }
+    if (write(fd, "truncate", 8) != 8) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 1 : saved;
+    }
+    if (ftruncate(fd, length) != 0) {
+        int saved = errno;
+        perror("ftruncate");
+        close(fd);
+        return saved == 0 ? 1 : saved;
+    }
+    if (close(fd) != 0) {
+        perror("close");
+        return 1;
+    }
+
+    return 0;
+}
+
+static int fallocate_once(const char *path, off_t length)
+{
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+
+    if (fd < 0) {
+        perror("open");
+        return 1;
+    }
+    if (fallocate(fd, 0, 0, length) != 0) {
+        int saved = errno;
+        perror("fallocate");
+        close(fd);
+        return saved == 0 ? 1 : saved;
+    }
+    if (close(fd) != 0) {
+        perror("close");
+        return 1;
+    }
+
+    return 0;
+}
+
+static int unlinkat_once(const char *dir_path, const char *name)
+{
+    int dirfd = open(dir_path, O_RDONLY);
+
+    if (dirfd < 0) {
+        perror("open dir");
+        return 1;
+    }
+    if (unlinkat(dirfd, name, 0) != 0) {
+        int saved = errno;
+        perror("unlinkat");
+        close(dirfd);
+        return saved == 0 ? 1 : saved;
+    }
+    if (close(dirfd) != 0) {
+        perror("close dir");
+        return 1;
+    }
+
+    return 0;
+}
+
+static int renameat_once(
+    const char *old_dir,
+    const char *old_name,
+    const char *new_dir,
+    const char *new_name)
+{
+    int olddirfd = open(old_dir, O_RDONLY);
+    int newdirfd;
+
+    if (olddirfd < 0) {
+        perror("open old dir");
+        return 1;
+    }
+
+    newdirfd = open(new_dir, O_RDONLY);
+    if (newdirfd < 0) {
+        perror("open new dir");
+        close(olddirfd);
+        return 1;
+    }
+    if (renameat(olddirfd, old_name, newdirfd, new_name) != 0) {
+        int saved = errno;
+        perror("renameat");
+        close(newdirfd);
+        close(olddirfd);
+        return saved == 0 ? 1 : saved;
+    }
+    if (close(newdirfd) != 0) {
+        perror("close new dir");
+        close(olddirfd);
+        return 1;
+    }
+    if (close(olddirfd) != 0) {
+        perror("close old dir");
+        return 1;
+    }
+
+    return 0;
+}
+
 static int pwritev_once(const char *path, off_t offset, const char *first, const char *second)
 {
     struct iovec iov[2];
@@ -541,6 +653,30 @@ int main(int argc, char **argv)
         }
         return copy_file_range_copy_once(argv[2], argv[3]);
     }
+    if (strcmp(argv[1], "truncate") == 0) {
+        if (argc < 4) {
+            return 2;
+        }
+        return ftruncate_once(argv[2], (off_t)atoll(argv[3]));
+    }
+    if (strcmp(argv[1], "allocate") == 0) {
+        if (argc < 4) {
+            return 2;
+        }
+        return fallocate_once(argv[2], (off_t)atoll(argv[3]));
+    }
+    if (strcmp(argv[1], "unlinkat") == 0) {
+        if (argc < 4) {
+            return 2;
+        }
+        return unlinkat_once(argv[2], argv[3]);
+    }
+    if (strcmp(argv[1], "renameat") == 0) {
+        if (argc < 6) {
+            return 2;
+        }
+        return renameat_once(argv[2], argv[3], argv[4], argv[5]);
+    }
     if (strcmp(argv[1], "pwritev-write") == 0) {
         if (argc < 6) {
             return 2;
@@ -564,8 +700,16 @@ PREADV_SOURCE="$TMP_DIR/preadv-src.bin"
 COPY_RANGE_SOURCE="$TMP_DIR/copy-range-src.bin"
 COPY_RANGE_TARGET="$TMP_DIR/copy-range-dst.bin"
 PWRITEV_TARGET="$TMP_DIR/pwritev-target.bin"
+TRUNCATE_TARGET="$TMP_DIR/truncate-target.bin"
+ALLOCATE_TARGET="$TMP_DIR/allocate-target.bin"
+UNLINK_DIR="$TMP_DIR/unlink-dir"
+RENAME_OLD_DIR="$TMP_DIR/rename-old"
+RENAME_NEW_DIR="$TMP_DIR/rename-new"
 
 mkdir "$OPENAT_DIR"
+mkdir "$UNLINK_DIR"
+mkdir "$RENAME_OLD_DIR"
+mkdir "$RENAME_NEW_DIR"
 
 rm -f "$CONFIG_PATH"
 LD_PRELOAD="$LIB_PATH" "$TMP_DIR/fixture" write "$TARGET" "hello"
@@ -658,12 +802,86 @@ if LD_PRELOAD="$LIB_PATH" "$TMP_DIR/fixture" pwritev-write "$PWRITEV_TARGET" 1 "
     exit 1
 fi
 
+printf '%s:truncate:EIO:1.0\n' "$TRUNCATE_TARGET" > "$CONFIG_PATH"
+if LD_PRELOAD="$LIB_PATH" "$TMP_DIR/fixture" truncate "$TRUNCATE_TARGET" 3 >/dev/null 2>&1; then
+    echo "expected ftruncate to fail with injected EIO" >&2
+    exit 1
+else
+    RC=$?
+fi
+[ "$RC" -eq 5 ]
+
+printf '%s:allocate:EIO:1.0\n' "$ALLOCATE_TARGET" > "$CONFIG_PATH"
+if LD_PRELOAD="$LIB_PATH" "$TMP_DIR/fixture" allocate "$ALLOCATE_TARGET" 4096 >/dev/null 2>&1; then
+    echo "expected fallocate to fail with injected EIO" >&2
+    exit 1
+else
+    RC=$?
+fi
+[ "$RC" -eq 5 ]
+
+LD_PRELOAD="$LIB_PATH" "$TMP_DIR/fixture" openat-write "$UNLINK_DIR" "victim.bin" "unlink" >/dev/null
+printf '%s:unlink:EIO:1.0\n' "$UNLINK_DIR/victim.bin" > "$CONFIG_PATH"
+if LD_PRELOAD="$LIB_PATH" "$TMP_DIR/fixture" unlinkat "$UNLINK_DIR" "victim.bin" >/dev/null 2>&1; then
+    echo "expected unlinkat to fail with injected EIO" >&2
+    exit 1
+else
+    RC=$?
+fi
+[ "$RC" -eq 5 ]
+
+LD_PRELOAD="$LIB_PATH" "$TMP_DIR/fixture" openat-write "$RENAME_OLD_DIR" "source.bin" "rename" >/dev/null
+printf '%s:rename_from:EIO:1.0\n' "$RENAME_OLD_DIR/source.bin" > "$CONFIG_PATH"
+if LD_PRELOAD="$LIB_PATH" "$TMP_DIR/fixture" renameat "$RENAME_OLD_DIR" "source.bin" "$RENAME_NEW_DIR" "dest.bin" >/dev/null 2>&1; then
+    echo "expected renameat to fail with injected EIO" >&2
+    exit 1
+else
+    RC=$?
+fi
+[ "$RC" -eq 5 ]
+
 printf '%s:write:LATENCY:200\n' "$TARGET" > "$CONFIG_PATH"
 START=$(date +%s%3N)
 LD_PRELOAD="$LIB_PATH" "$TMP_DIR/fixture" write "$TARGET" "hello" >/dev/null
 END=$(date +%s%3N)
 ELAPSED_MS=$((END - START))
 [ "$ELAPSED_MS" -ge 150 ]
+
+printf '%s:truncate:LATENCY:200\n' "$TRUNCATE_TARGET" > "$CONFIG_PATH"
+START=$(date +%s%3N)
+LD_PRELOAD="$LIB_PATH" "$TMP_DIR/fixture" truncate "$TRUNCATE_TARGET" 3 >/dev/null
+END=$(date +%s%3N)
+ELAPSED_MS=$((END - START))
+[ "$ELAPSED_MS" -ge 150 ]
+
+printf '%s:allocate:LATENCY:200\n' "$ALLOCATE_TARGET" > "$CONFIG_PATH"
+START=$(date +%s%3N)
+if LD_PRELOAD="$LIB_PATH" "$TMP_DIR/fixture" allocate "$ALLOCATE_TARGET" 4096 >/dev/null 2>&1; then
+    :
+else
+    :
+fi
+END=$(date +%s%3N)
+ELAPSED_MS=$((END - START))
+[ "$ELAPSED_MS" -ge 150 ]
+
+LD_PRELOAD="$LIB_PATH" "$TMP_DIR/fixture" openat-write "$UNLINK_DIR" "victim.bin" "unlink" >/dev/null
+printf '%s:unlink:LATENCY:200\n' "$UNLINK_DIR/victim.bin" > "$CONFIG_PATH"
+START=$(date +%s%3N)
+LD_PRELOAD="$LIB_PATH" "$TMP_DIR/fixture" unlinkat "$UNLINK_DIR" "victim.bin" >/dev/null
+END=$(date +%s%3N)
+ELAPSED_MS=$((END - START))
+[ "$ELAPSED_MS" -ge 150 ]
+
+LD_PRELOAD="$LIB_PATH" "$TMP_DIR/fixture" openat-write "$RENAME_OLD_DIR" "source.bin" "rename" >/dev/null
+printf '%s:rename_to:LATENCY:200\n' "$RENAME_NEW_DIR/dest.bin" > "$CONFIG_PATH"
+START=$(date +%s%3N)
+LD_PRELOAD="$LIB_PATH" "$TMP_DIR/fixture" renameat "$RENAME_OLD_DIR" "source.bin" "$RENAME_NEW_DIR" "dest.bin" >/dev/null
+END=$(date +%s%3N)
+ELAPSED_MS=$((END - START))
+[ "$ELAPSED_MS" -ge 150 ]
+OUTPUT=$(LD_PRELOAD="$LIB_PATH" "$TMP_DIR/fixture" read "$RENAME_NEW_DIR/dest.bin")
+[ "$OUTPUT" = "rename" ]
 
 printf '%s:write:TORN:1.0\n' "$SENDFILE_TARGET" > "$CONFIG_PATH"
 LD_PRELOAD="$LIB_PATH" "$TMP_DIR/fixture" sendfile-copy "$SENDFILE_SOURCE" "$SENDFILE_TARGET" >/dev/null
