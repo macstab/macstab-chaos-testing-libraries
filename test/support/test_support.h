@@ -1,7 +1,7 @@
 #ifndef CHAOS_IO_TEST_SUPPORT_H
 #define CHAOS_IO_TEST_SUPPORT_H
 
-#include "../src/chaos_io_internal.h"
+#include "../../src/core/chaos_io_internal.h"
 
 #include <assert.h>
 #include <fcntl.h>

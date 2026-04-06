@@ -1,10 +1,10 @@
 #!/bin/sh
 set -eu
 
-ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 BUILD_DIR=${BUILD_DIR:-build-coverage}
 CC=${CC:-cc}
-CPPFLAGS=${CPPFLAGS:--D_GNU_SOURCE -Isrc}
+CPPFLAGS=${CPPFLAGS:--D_GNU_SOURCE -Isrc -Isrc/core -Isrc/config -Isrc/effects -Isrc/wrappers}
 CFLAGS=${CFLAGS:--std=c99 -Wall -Wextra -Werror -pedantic -Os}
 
 cd "$ROOT_DIR"
@@ -60,12 +60,12 @@ ACTIONS_GCNO=$(resolve_gcno test_actions)
 FDCACHE_GCNO=$(resolve_gcno test_fdcache)
 CHAOS_IO_GCNO=$(resolve_gcno test_chaos_io)
 
-check_target "$CONFIG_GCNO" "src/chaos_io_config.c"
-check_target "$ACTIONS_GCNO" "src/chaos_io_actions.c"
-check_target "$FDCACHE_GCNO" "src/chaos_io_fdcache.c"
-check_target "$CHAOS_IO_GCNO" "src/chaos_io.c"
-check_target "$CHAOS_IO_GCNO" "src/chaos_io_open.c"
-check_target "$CHAOS_IO_GCNO" "src/chaos_io_rw.c"
-check_target "$CHAOS_IO_GCNO" "src/chaos_io_sync.c"
+check_target "$CONFIG_GCNO" "src/config/chaos_io_config.c"
+check_target "$ACTIONS_GCNO" "src/effects/chaos_io_actions.c"
+check_target "$FDCACHE_GCNO" "src/config/chaos_io_fdcache.c"
+check_target "$CHAOS_IO_GCNO" "src/core/chaos_io.c"
+check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_open.c"
+check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_rw.c"
+check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_sync.c"
 
 echo "coverage check passed"

@@ -3,9 +3,9 @@
 
 #include "test_support.h"
 
-#include "../src/chaos_io_actions.h"
-#include "../src/chaos_io_config.h"
-#include "../src/chaos_io_fdcache.h"
+#include "../../src/effects/chaos_io_actions.h"
+#include "../../src/config/chaos_io_config.h"
+#include "../../src/config/chaos_io_fdcache.h"
 
 #include <dlfcn.h>
 #include <sys/syscall.h>
@@ -511,10 +511,10 @@ static long chaos_test_syscall(long number, ...)
 #define abort chaos_test_abort
 #define syscall chaos_test_syscall
 #define CHAOS_IO_CONSTRUCTOR
-#include "../src/chaos_io.c"
-#include "../src/chaos_io_open.c"
-#include "../src/chaos_io_rw.c"
-#include "../src/chaos_io_sync.c"
+#include "../../src/core/chaos_io.c"
+#include "../../src/wrappers/chaos_io_open.c"
+#include "../../src/wrappers/chaos_io_rw.c"
+#include "../../src/wrappers/chaos_io_sync.c"
 #undef CHAOS_IO_CONSTRUCTOR
 #undef syscall
 #undef abort

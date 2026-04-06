@@ -3,9 +3,9 @@
  *
  * The exported wrappers live in smaller companion translation units:
  *
- * - `chaos_io_open.c` for `open()` and `openat()`
- * - `chaos_io_rw.c` for `read()` / `write()` style operations
- * - `chaos_io_sync.c` for `close()` and sync boundaries
+ * - `wrappers/chaos_io_open.c` for `open()` and `openat()`
+ * - `wrappers/chaos_io_rw.c` for `read()` / `write()` style operations
+ * - `wrappers/chaos_io_sync.c` for `close()` and sync boundaries
  *
  * This file keeps only the process-global state and helper paths that are
  * genuinely shared across those wrapper families.

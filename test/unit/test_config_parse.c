@@ -1,4 +1,4 @@
-#include "test_support.h"
+#include "../support/test_support.h"
 
 #include <stdint.h>
 #include <sys/stat.h>
@@ -38,7 +38,7 @@ static int chaos_test_stub_close(int fd)
     return g_stub_close_result;
 }
 
-#include "../src/chaos_io_config.c"
+#include "../../src/config/chaos_io_config.c"
 
 static chaos_test_file_backup_t g_config_backup;
 

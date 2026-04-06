@@ -1,4 +1,4 @@
-#include "test_support.h"
+#include "../support/test_support.h"
 
 #include <stdint.h>
 
@@ -15,7 +15,7 @@ static int chaos_test_usleep(useconds_t usec)
 }
 
 #define usleep chaos_test_usleep
-#include "../src/chaos_io_actions.c"
+#include "../../src/effects/chaos_io_actions.c"
 #undef usleep
 
 static void chaos_test_reset_sleep_state(void)

@@ -15,7 +15,7 @@ The code stays intentionally narrow:
 
 ### Library initialization
 
-[`src/chaos_io.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io.c)
+[`src/core/chaos_io.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/core/chaos_io.c)
 
 - Resolves the real libc symbols with `dlsym(RTLD_NEXT, ...)`.
 - Seeds process entropy from `/dev/urandom`, with a deterministic fallback when that read fails.
@@ -37,16 +37,16 @@ For each intercepted operation:
 
 Wrapper families are split by responsibility:
 
-- [`src/chaos_io_open.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_open.c)
+- [`src/wrappers/chaos_io_open.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/wrappers/chaos_io_open.c)
   owns `open()` and `openat()`.
-- [`src/chaos_io_rw.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_rw.c)
+- [`src/wrappers/chaos_io_rw.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/wrappers/chaos_io_rw.c)
   owns `read()`, `write()`, `pread()`, `pwrite()`, and Linux `sendfile()`.
-- [`src/chaos_io_sync.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_sync.c)
+- [`src/wrappers/chaos_io_sync.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/wrappers/chaos_io_sync.c)
   owns `close()`, `fsync()`, and `fdatasync()`.
 
 ## Config Reloading
 
-[`src/chaos_io_config.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_config.c)
+[`src/config/chaos_io_config.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/config/chaos_io_config.c)
 
 - The config cache uses two snapshots.
 - Reload writes into the inactive snapshot, then atomically flips the active index.
@@ -61,7 +61,7 @@ That boundary rule is important:
 
 ## FD Path Resolution
 
-[`src/chaos_io_fdcache.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_fdcache.c)
+[`src/config/chaos_io_fdcache.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/config/chaos_io_fdcache.c)
 
 - `read`, `write`, `fsync`, `fdatasync`, `pread`, and `pwrite` operate on fds, not paths.
 - The library resolves each fd through `/proc/self/fd/<fd>`.
@@ -70,7 +70,7 @@ That boundary rule is important:
 
 ## Fault Effects
 
-[`src/chaos_io_actions.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/chaos_io_actions.c)
+[`src/effects/chaos_io_actions.c`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src/effects/chaos_io_actions.c)
 
 - `ERRNO`: fail before calling libc.
 - `LATENCY`: sleep before calling libc.
@@ -91,7 +91,7 @@ That is why coverage can stay strict without adding exported test-only symbols.
 
 ### Coverage gate
 
-[`test/check_coverage.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/check_coverage.sh)
+[`test/runtime/check_coverage.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/runtime/check_coverage.sh)
 
 - Builds an instrumented tree in `build-coverage/`
 - Runs all unit binaries
@@ -99,20 +99,20 @@ That is why coverage can stay strict without adding exported test-only symbols.
 
 ### Integration checks
 
-[`test/test_integration.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/test_integration.sh)
+[`test/runtime/test_integration.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/runtime/test_integration.sh)
 
 - Linux-only
 - Builds the real shared object
 - Verifies passthrough, injected errno failure, measured latency, and
   `openat()` plus Linux `sendfile()` runtime interposition on Linux hosts
 
-[`test/test_glibc.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/test_glibc.sh)
+[`test/runtime/test_glibc.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/runtime/test_glibc.sh)
 
 - Verifies the glibc Debian Docker build and runtime path, including direct
   `openat()` and Linux `sendfile()` probes
 - Accepts `linux/amd64` or `linux/arm64` as an optional explicit Docker target
 
-[`test/test_alpine.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/test_alpine.sh)
+[`test/runtime/test_alpine.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/runtime/test_alpine.sh)
 
 - Verifies the musl Alpine Docker build and runtime path, including direct
   `openat()` and Linux `sendfile()` probes

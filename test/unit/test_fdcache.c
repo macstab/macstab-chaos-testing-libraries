@@ -1,4 +1,4 @@
-#include "test_support.h"
+#include "../support/test_support.h"
 
 CHAOS_IO_DEFINE_TEST_GLOBALS();
 
@@ -25,7 +25,7 @@ static ssize_t chaos_test_readlink(const char *path, char *buffer, size_t size)
 }
 
 #define readlink chaos_test_readlink
-#include "../src/chaos_io_fdcache.c"
+#include "../../src/config/chaos_io_fdcache.c"
 #undef readlink
 
 static void chaos_test_reset_readlink_state(void)

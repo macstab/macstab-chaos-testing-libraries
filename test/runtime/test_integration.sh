@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 LIB_PATH="$ROOT_DIR/build/libchaos-io.so"
 CONFIG_PATH="/tmp/.chaos-io.conf"
 TMP_DIR=$(mktemp -d)

@@ -19,32 +19,40 @@ intercepted libc symbols plus the config file at `/tmp/.chaos-io.conf`.
 ```text
 ROADMAP.md
 src/
-  chaos_io.c
-  chaos_io_open.c
-  chaos_io_rw.c
-  chaos_io_sync.c
-  chaos_io_actions.c
-  chaos_io_actions.h
-  chaos_io_config.c
-  chaos_io_config.h
-  chaos_io_fdcache.c
-  chaos_io_fdcache.h
-  chaos_io_internal.h
-  chaos_io_wrappers.h
+  core/
+    chaos_io.c
+    chaos_io_internal.h
+    chaos_io_wrappers.h
+  config/
+    chaos_io_config.c
+    chaos_io_config.h
+    chaos_io_fdcache.c
+    chaos_io_fdcache.h
+  effects/
+    chaos_io_actions.c
+    chaos_io_actions.h
+  wrappers/
+    chaos_io_open.c
+    chaos_io_rw.c
+    chaos_io_sync.c
 test/
-  check_coverage.sh
-  test_actions.c
-  test_alpine.sh
-  test_glibc.sh
-  test_chaos_io.c
-  test_chaos_io_harness.h
-  test_config_parse.c
-  test_fdcache.c
-  test_integration.sh
-  test_support.h
+  runtime/
+    check_coverage.sh
+    test_alpine.sh
+    test_glibc.sh
+    test_integration.sh
+  support/
+    test_chaos_io_harness.h
+    test_support.h
+  unit/
+    test_actions.c
+    test_chaos_io.c
+    test_config_parse.c
+    test_fdcache.c
+docker/
+  Dockerfile.build
 docs/
   ARCHITECTURE.md
-Dockerfile.build
 Makefile
 ```
 
@@ -142,8 +150,9 @@ Runs all unit binaries:
 - config parsing and reload logic
 - effect helpers
 - fd cache logic
-- full wrapper behavior across `chaos_io.c`, `chaos_io_open.c`,
-  `chaos_io_rw.c`, and `chaos_io_sync.c`
+- full wrapper behavior across `src/core/chaos_io.c`,
+  `src/wrappers/chaos_io_open.c`, `src/wrappers/chaos_io_rw.c`, and
+  `src/wrappers/chaos_io_sync.c`
 
 ### Coverage gate
 
@@ -153,13 +162,13 @@ make coverage
 
 This compiles an instrumented build and enforces `100.00%` line coverage for:
 
-- `src/chaos_io.c`
-- `src/chaos_io_open.c`
-- `src/chaos_io_rw.c`
-- `src/chaos_io_sync.c`
-- `src/chaos_io_actions.c`
-- `src/chaos_io_config.c`
-- `src/chaos_io_fdcache.c`
+- `src/core/chaos_io.c`
+- `src/wrappers/chaos_io_open.c`
+- `src/wrappers/chaos_io_rw.c`
+- `src/wrappers/chaos_io_sync.c`
+- `src/effects/chaos_io_actions.c`
+- `src/config/chaos_io_config.c`
+- `src/config/chaos_io_fdcache.c`
 
 ### Full local quality gate
 
@@ -177,10 +186,10 @@ On non-Linux hosts, the Linux-only integration test is skipped. The glibc and Al
 The Docker runtime scripts accept an optional explicit platform argument:
 
 ```sh
-sh test/test_glibc.sh linux/amd64
-sh test/test_glibc.sh linux/arm64
-sh test/test_alpine.sh linux/amd64
-sh test/test_alpine.sh linux/arm64
+sh test/runtime/test_glibc.sh linux/amd64
+sh test/runtime/test_glibc.sh linux/arm64
+sh test/runtime/test_alpine.sh linux/amd64
+sh test/runtime/test_alpine.sh linux/arm64
 ```
 
 When no platform is given, each script falls back to the host architecture.

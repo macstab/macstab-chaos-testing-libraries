@@ -1,4 +1,4 @@
-#include "test_chaos_io_harness.h"
+#include "../support/test_chaos_io_harness.h"
 
 static void test_resolve_symbol_and_seed_material(void)
 {
