@@ -54,9 +54,12 @@ static int chaos_io_call_real_open(const char *path, int flags, int has_mode, mo
     int result;
 
     previous = chaos_io_enter_internal();
-    if (has_mode != 0) {
+    if (has_mode != 0)
+    {
         result = g_chaos_io_real_open(path, flags, mode);
-    } else {
+    }
+    else
+    {
         result = g_chaos_io_real_open(path, flags);
     }
     chaos_io_leave_internal(previous);
@@ -84,15 +87,19 @@ static int chaos_io_open_needs_mode(int flags)
  * This mirrors `chaos_io_call_real_open()` exactly, but keeps the directory-fd
  * argument in place for relative-path callers.
  */
-static int chaos_io_call_real_openat(int dirfd, const char *path, int flags, int has_mode, mode_t mode)
+static int
+chaos_io_call_real_openat(int dirfd, const char *path, int flags, int has_mode, mode_t mode)
 {
     int previous;
     int result;
 
     previous = chaos_io_enter_internal();
-    if (has_mode != 0) {
+    if (has_mode != 0)
+    {
         result = g_chaos_io_real_openat(dirfd, path, flags, mode);
-    } else {
+    }
+    else
+    {
         result = g_chaos_io_real_openat(dirfd, path, flags);
     }
     chaos_io_leave_internal(previous);
@@ -109,12 +116,14 @@ static int chaos_io_copy_path(char *destination, size_t destination_size, const 
 {
     size_t length;
 
-    if (destination == NULL || destination_size == 0U || path == NULL) {
+    if (destination == NULL || destination_size == 0U || path == NULL)
+    {
         return 0;
     }
 
     length = strlen(path);
-    if (length + 1U > destination_size) {
+    if (length + 1U > destination_size)
+    {
         return 0;
     }
 
@@ -128,28 +137,33 @@ static int chaos_io_copy_path(char *destination, size_t destination_size, const 
  * `openat()` needs a stable absolute-ish string for config matching. The join
  * is intentionally lexical; it does not normalize `.` or `..` segments.
  */
-static int chaos_io_join_paths(char *destination, size_t destination_size, const char *base, const char *path)
+static int
+chaos_io_join_paths(char *destination, size_t destination_size, const char *base, const char *path)
 {
     size_t base_length;
     size_t path_length;
     size_t needs_separator;
 
-    if (destination == NULL || destination_size == 0U || base == NULL || path == NULL) {
+    if (destination == NULL || destination_size == 0U || base == NULL || path == NULL)
+    {
         return 0;
     }
-    if (*base == '\0' || *path == '\0') {
+    if (*base == '\0' || *path == '\0')
+    {
         return 0;
     }
 
     base_length = strlen(base);
     path_length = strlen(path);
     needs_separator = (base[base_length - 1U] == '/') ? 0U : 1U;
-    if (base_length + needs_separator + path_length + 1U > destination_size) {
+    if (base_length + needs_separator + path_length + 1U > destination_size)
+    {
         return 0;
     }
 
     (void)memcpy(destination, base, base_length);
-    if (needs_separator != 0U) {
+    if (needs_separator != 0U)
+    {
         destination[base_length] = '/';
         ++base_length;
     }
@@ -169,7 +183,8 @@ static int chaos_io_getcwd_path(char *path, size_t path_size)
     int previous;
     int ok;
 
-    if (path == NULL || path_size == 0U) {
+    if (path == NULL || path_size == 0U)
+    {
         return 0;
     }
 
@@ -192,21 +207,27 @@ static int chaos_io_getcwd_path(char *path, size_t path_size)
  * If resolution fails, the caller must bypass pre-open path injection and rely
  * on post-open fd resolution only.
  */
-int chaos_io_resolve_at_path(int dirfd, const char *path, char *resolved_path, size_t resolved_path_size)
+int chaos_io_resolve_at_path(
+    int dirfd, const char *path, char *resolved_path, size_t resolved_path_size
+)
 {
     char base_path[CHAOS_IO_MAX_PATH];
 
-    if (path == NULL || resolved_path == NULL || resolved_path_size == 0U) {
+    if (path == NULL || resolved_path == NULL || resolved_path_size == 0U)
+    {
         return 0;
     }
-    if (path[0] == '/') {
+    if (path[0] == '/')
+    {
         return chaos_io_copy_path(resolved_path, resolved_path_size, path);
     }
-    if (dirfd == AT_FDCWD) {
-        return chaos_io_getcwd_path(base_path, sizeof(base_path))
-            && chaos_io_join_paths(resolved_path, resolved_path_size, base_path, path);
+    if (dirfd == AT_FDCWD)
+    {
+        return chaos_io_getcwd_path(base_path, sizeof(base_path)) &&
+               chaos_io_join_paths(resolved_path, resolved_path_size, base_path, path);
     }
-    if (!chaos_io_fdcache_resolve(dirfd, base_path, sizeof(base_path))) {
+    if (!chaos_io_fdcache_resolve(dirfd, base_path, sizeof(base_path)))
+    {
         return 0;
     }
     return chaos_io_join_paths(resolved_path, resolved_path_size, base_path, path);
@@ -223,11 +244,14 @@ static void chaos_io_cache_open_result(int fd, const char *path)
 {
     char resolved_path[CHAOS_IO_MAX_PATH];
 
-    if (fd < 0) {
+    if (fd < 0)
+    {
         return;
     }
-    if (path != NULL) {
-        if (!chaos_io_is_excluded_path(path)) {
+    if (path != NULL)
+    {
+        if (!chaos_io_is_excluded_path(path))
+        {
             chaos_io_fdcache_store(fd, path);
         }
         return;
@@ -262,27 +286,33 @@ CHAOS_IO_EXPORT int open(const char *path, int flags, ...)
 
     has_mode = chaos_io_open_needs_mode(flags);
 
-    if (has_mode != 0) {
+    if (has_mode != 0)
+    {
         va_list args;
         va_start(args, flags);
         mode = (mode_t)va_arg(args, int);
         va_end(args);
     }
 
-    if (chaos_io_in_internal()) {
+    if (chaos_io_in_internal())
+    {
         return chaos_io_call_real_open(path, flags, has_mode, mode);
     }
 
-    if (chaos_io_resolve_at_path(AT_FDCWD, path, resolved_path, sizeof(resolved_path))) {
+    if (chaos_io_resolve_at_path(AT_FDCWD, path, resolved_path, sizeof(resolved_path)))
+    {
         match_path = resolved_path;
     }
 
-    if (match_path != NULL
-        && !chaos_io_is_excluded_path(match_path)
-        && chaos_io_config_match_path(CHAOS_IO_OP_OPEN, match_path, &rule)) {
-        if (rule.effect == CHAOS_IO_EFFECT_LATENCY) {
+    if (match_path != NULL && !chaos_io_is_excluded_path(match_path) &&
+        chaos_io_config_match_path(CHAOS_IO_OP_OPEN, match_path, &rule))
+    {
+        if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
+        {
             chaos_io_rule_apply_latency(&rule);
-        } else if (chaos_io_rule_apply_errno(&rule)) {
+        }
+        else if (chaos_io_rule_apply_errno(&rule))
+        {
             return -1;
         }
     }
@@ -308,27 +338,33 @@ CHAOS_IO_EXPORT int openat(int dirfd, const char *path, int flags, ...)
     int fd;
 
     has_mode = chaos_io_open_needs_mode(flags);
-    if (has_mode != 0) {
+    if (has_mode != 0)
+    {
         va_list args;
         va_start(args, flags);
         mode = (mode_t)va_arg(args, int);
         va_end(args);
     }
 
-    if (chaos_io_in_internal()) {
+    if (chaos_io_in_internal())
+    {
         return chaos_io_call_real_openat(dirfd, path, flags, has_mode, mode);
     }
 
-    if (chaos_io_resolve_at_path(dirfd, path, resolved_path, sizeof(resolved_path))) {
+    if (chaos_io_resolve_at_path(dirfd, path, resolved_path, sizeof(resolved_path)))
+    {
         match_path = resolved_path;
     }
 
-    if (match_path != NULL
-        && !chaos_io_is_excluded_path(match_path)
-        && chaos_io_config_match_path(CHAOS_IO_OP_OPEN, match_path, &rule)) {
-        if (rule.effect == CHAOS_IO_EFFECT_LATENCY) {
+    if (match_path != NULL && !chaos_io_is_excluded_path(match_path) &&
+        chaos_io_config_match_path(CHAOS_IO_OP_OPEN, match_path, &rule))
+    {
+        if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
+        {
             chaos_io_rule_apply_latency(&rule);
-        } else if (chaos_io_rule_apply_errno(&rule)) {
+        }
+        else if (chaos_io_rule_apply_errno(&rule))
+        {
             return -1;
         }
     }

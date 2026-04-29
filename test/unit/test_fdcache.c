@@ -6,6 +6,7 @@ static const char *g_readlink_target = NULL;
 static ssize_t g_readlink_result = -1;
 static int g_readlink_errno = ENOENT;
 static size_t g_readlink_calls = 0U;
+static int g_snprintf_result = 0;
 
 static ssize_t chaos_test_readlink(const char *path, char *buffer, size_t size)
 {
@@ -13,7 +14,8 @@ static ssize_t chaos_test_readlink(const char *path, char *buffer, size_t size)
     (void)size;
     ++g_readlink_calls;
 
-    if (g_readlink_result < 0) {
+    if (g_readlink_result < 0)
+    {
         errno = g_readlink_errno;
         return -1;
     }
@@ -24,9 +26,30 @@ static ssize_t chaos_test_readlink(const char *path, char *buffer, size_t size)
     return g_readlink_result;
 }
 
+static int chaos_test_snprintf(char *buffer, size_t size, const char *format, ...)
+{
+    va_list args;
+    int rc;
+
+    if (g_snprintf_result != 0)
+    {
+        return g_snprintf_result;
+    }
+
+    va_start(args, format);
+    rc = vsnprintf(buffer, size, format, args);
+    va_end(args);
+    return rc;
+}
+
+#ifdef snprintf
+#undef snprintf
+#endif
+#define snprintf chaos_test_snprintf
 #define readlink chaos_test_readlink
 #include "../../src/config/chaos_io_fdcache.c"
 #undef readlink
+#undef snprintf
 
 static void chaos_test_reset_readlink_state(void)
 {
@@ -34,6 +57,7 @@ static void chaos_test_reset_readlink_state(void)
     g_readlink_result = -1;
     g_readlink_errno = ENOENT;
     g_readlink_calls = 0U;
+    g_snprintf_result = 0;
 }
 
 static void test_store_lookup_and_invalidate(void)
@@ -94,6 +118,11 @@ static void test_resolve_paths(void)
     g_readlink_result = -1;
     assert(chaos_io_fdcache_resolve(9, path, sizeof(path)) == 0);
     assert(g_chaos_io_tls_guard == 0);
+
+    chaos_test_reset_readlink_state();
+    g_snprintf_result = -1;
+    assert(chaos_io_fdcache_resolve(9, path, sizeof(path)) == 0);
+    assert(g_readlink_calls == 0U);
 
     chaos_test_reset_readlink_state();
     g_readlink_target = "/tmp/short.bin";

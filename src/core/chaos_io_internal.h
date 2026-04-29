@@ -145,10 +145,8 @@ static inline uint64_t chaos_io_atomic_load_u64(volatile uint64_t *value)
  * Config reload ownership is decided without locks so only one thread performs
  * disk I/O while the others continue serving calls from the current snapshot.
  */
-static inline int chaos_io_atomic_cas_u64(
-    volatile uint64_t *value,
-    uint64_t expected,
-    uint64_t desired)
+static inline int
+chaos_io_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint64_t desired)
 {
     return __sync_bool_compare_and_swap(value, expected, desired);
 }
@@ -195,7 +193,8 @@ static inline void chaos_io_prng_ensure_seeded(void)
 {
     uint64_t seed;
 
-    if (g_chaos_io_tls_prng_state != 0U) {
+    if (g_chaos_io_tls_prng_state != 0U)
+    {
         return;
     }
 
@@ -203,7 +202,8 @@ static inline void chaos_io_prng_ensure_seeded(void)
     seed ^= chaos_io_current_tid();
     seed ^= (uint64_t)(uintptr_t)&seed;
     g_chaos_io_tls_prng_state = chaos_io_prng_mix(seed);
-    if (g_chaos_io_tls_prng_state == 0U) {
+    if (g_chaos_io_tls_prng_state == 0U)
+    {
         g_chaos_io_tls_prng_state = UINT64_C(0x2545f4914f6cdd1d);
     }
 }
@@ -260,12 +260,14 @@ static inline int chaos_io_has_reserved_prefix(const char *path, const char *pre
 {
     size_t prefix_len;
 
-    if (path == NULL || prefix == NULL) {
+    if (path == NULL || prefix == NULL)
+    {
         return 0;
     }
 
     prefix_len = strlen(prefix);
-    if (strncmp(path, prefix, prefix_len) != 0) {
+    if (strncmp(path, prefix, prefix_len) != 0)
+    {
         return 0;
     }
 
@@ -281,15 +283,17 @@ static inline int chaos_io_has_reserved_prefix(const char *path, const char *pre
  */
 static inline int chaos_io_is_excluded_path(const char *path)
 {
-    if (path == NULL || *path == '\0') {
+    if (path == NULL || *path == '\0')
+    {
         return 1;
     }
-    if (chaos_io_is_config_path(path)) {
+    if (chaos_io_is_config_path(path))
+    {
         return 1;
     }
-    if (chaos_io_has_reserved_prefix(path, "/proc")
-        || chaos_io_has_reserved_prefix(path, "/sys")
-        || chaos_io_has_reserved_prefix(path, "/dev")) {
+    if (chaos_io_has_reserved_prefix(path, "/proc") || chaos_io_has_reserved_prefix(path, "/sys") ||
+        chaos_io_has_reserved_prefix(path, "/dev"))
+    {
         return 1;
     }
     return 0;

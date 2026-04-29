@@ -1,12 +1,27 @@
 # Engineering Notes
 
+This document records repository-wide engineering rules and release discipline.
+It still uses `libchaos-io` as the most detailed concrete example, but the
+same expectations now apply across `libchaos-net`, `libchaos-dns`,
+`libchaos-time`, `libchaos-memory`, and `libchaos-process`.
+Subsystem-specific current-state details live in
+[`docs/NETWORK.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/docs/NETWORK.md),
+DNS-specific current-state details live in
+[`docs/DNS.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/docs/DNS.md),
+and time-specific current-state details live in
+[`docs/TIME.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/docs/TIME.md),
+and memory-specific current-state details live in
+[`docs/MEMORY.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/docs/MEMORY.md),
+and process-specific current-state details live in
+[`docs/PROCESS.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/docs/PROCESS.md).
+
 ## Scope
 
-`libchaos-io` is a deliberately small `LD_PRELOAD` library for filesystem fault
-injection. It is not a general observability agent, not a daemon, and not a
-full policy engine. The code exists to do one job well: intercept a narrow set
-of POSIX-style I/O calls and make them fail, slow down, tear, or corrupt under
-controlled rules.
+This repository ships deliberately small `LD_PRELOAD` libraries for Linux fault
+injection. They are not general observability agents, not daemons, and not
+full policy engines. Each library exists to do one job well: intercept a
+narrow libc-facing surface and make it fail, slow down, or otherwise misbehave
+under explicit rules.
 
 The project is optimized for:
 
@@ -21,6 +36,25 @@ The project is not optimized for:
 - plugin systems
 - runtime configuration APIs
 - abstract framework design
+
+Current maturity boundary:
+
+- `libchaos-io` is at the repository's full bar: strict source-line coverage
+  gate plus Docker runtime validation
+- `libchaos-net` is now at the same bar: strict source-line coverage gate plus
+  Docker runtime validation
+- `libchaos-dns` is now inside the repository QA gate: enforced source-line
+  coverage floor plus Docker runtime validation
+- `libchaos-time` is now at the same bar: strict source-line coverage gate plus
+  Docker runtime validation
+- `libchaos-memory` is now at the same bar: strict source-line coverage gate
+  plus Docker runtime validation
+- `libchaos-process` is now at the same bar: strict source-line coverage gate
+  plus Docker runtime validation
+
+Repository-wide release discipline now also includes a `clang-format` check for
+all shipped C sources and tests. Formatting is part of the quality gate, not a
+best-effort cleanup step.
 
 ## How To Read The Code
 

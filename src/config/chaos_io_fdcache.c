@@ -11,7 +11,8 @@
 #include <stdio.h>
 #include <string.h>
 
-typedef struct chaos_io_fd_cache_entry {
+typedef struct chaos_io_fd_cache_entry
+{
     int valid;
     int fd;
     char path[CHAOS_IO_MAX_PATH];
@@ -38,17 +39,20 @@ int chaos_io_fdcache_lookup(int fd, char *path, size_t path_size)
     chaos_io_fd_cache_entry_t *entry;
     size_t length;
 
-    if (fd < 0 || path == NULL || path_size == 0U) {
+    if (fd < 0 || path == NULL || path_size == 0U)
+    {
         return 0;
     }
 
     entry = chaos_io_fdcache_slot(fd);
-    if (entry->valid == 0 || entry->fd != fd) {
+    if (entry->valid == 0 || entry->fd != fd)
+    {
         return 0;
     }
 
     length = strlen(entry->path);
-    if (length + 1U > path_size) {
+    if (length + 1U > path_size)
+    {
         return 0;
     }
 
@@ -62,12 +66,14 @@ void chaos_io_fdcache_store(int fd, const char *path)
     chaos_io_fd_cache_entry_t *entry;
     size_t length;
 
-    if (fd < 0 || path == NULL || chaos_io_is_excluded_path(path)) {
+    if (fd < 0 || path == NULL || chaos_io_is_excluded_path(path))
+    {
         return;
     }
 
     length = strlen(path);
-    if (length >= CHAOS_IO_MAX_PATH) {
+    if (length >= CHAOS_IO_MAX_PATH)
+    {
         return;
     }
 
@@ -82,12 +88,14 @@ void chaos_io_fdcache_invalidate(int fd)
 {
     chaos_io_fd_cache_entry_t *entry;
 
-    if (fd < 0) {
+    if (fd < 0)
+    {
         return;
     }
 
     entry = chaos_io_fdcache_slot(fd);
-    if (entry->valid != 0 && entry->fd == fd) {
+    if (entry->valid != 0 && entry->fd == fd)
+    {
         entry->valid = 0;
         entry->fd = -1;
         entry->path[0] = '\0';
@@ -102,25 +110,30 @@ int chaos_io_fdcache_resolve(int fd, char *path, size_t path_size)
     int written;
     ssize_t length;
 
-    if (fd <= 2 || path == NULL || path_size < 2U) {
+    if (fd <= 2 || path == NULL || path_size < 2U)
+    {
         return 0;
     }
-    if (chaos_io_fdcache_lookup(fd, path, path_size)) {
+    if (chaos_io_fdcache_lookup(fd, path, path_size))
+    {
         return 1;
     }
 
     written = snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
-    if (written < 0) return 0;
+    if (written < 0)
+        return 0;
 
     previous = chaos_io_enter_internal();
     length = readlink(proc_path, path, path_size - 1U);
     chaos_io_leave_internal(previous);
-    if (length <= 0 || (size_t)length >= path_size) {
+    if (length <= 0 || (size_t)length >= path_size)
+    {
         return 0;
     }
 
     path[length] = '\0';
-    if (chaos_io_is_excluded_path(path)) {
+    if (chaos_io_is_excluded_path(path))
+    {
         return 0;
     }
 

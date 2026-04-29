@@ -20,13 +20,17 @@ make unit \
 check_target() {
     gcno_path=$1
     source_path=$2
+    minimum_pct=$3
     output=$(gcov "$gcno_path")
 
     printf '%s\n' "$output"
-    printf '%s\n' "$output" | awk -v file="$source_path" '
+    printf '%s\n' "$output" | awk -v file="$source_path" -v min_pct="$minimum_pct" '
         $0 == "File \047" file "\047" { want = 1; next }
         want && $1 == "Lines" {
-            if ($2 == "executed:100.00%") {
+            pct = $2;
+            sub(/^executed:/, "", pct);
+            sub(/%$/, "", pct);
+            if ((pct + 0.0) >= (min_pct + 0.0)) {
                 ok = 1;
             }
             exit ok ? 0 : 1;
@@ -59,14 +63,58 @@ CONFIG_GCNO=$(resolve_gcno test_config_parse)
 ACTIONS_GCNO=$(resolve_gcno test_actions)
 FDCACHE_GCNO=$(resolve_gcno test_fdcache)
 CHAOS_IO_GCNO=$(resolve_gcno test_chaos_io)
+NET_ACTIONS_GCNO=$(resolve_gcno test_net_actions)
+NET_ENDPOINT_GCNO=$(resolve_gcno test_net_endpoint)
+NET_CONFIG_GCNO=$(resolve_gcno test_net_config)
+NET_RUNTIME_GCNO=$(resolve_gcno test_net_runtime)
+CHAOS_NET_GCNO=$(resolve_gcno test_chaos_net)
+DNS_ACTIONS_GCNO=$(resolve_gcno test_dns_actions)
+DNS_CONFIG_GCNO=$(resolve_gcno test_dns_config)
+DNS_RUNTIME_GCNO=$(resolve_gcno test_dns_runtime)
+CHAOS_DNS_GCNO=$(resolve_gcno test_chaos_dns)
+TIME_ACTIONS_GCNO=$(resolve_gcno test_time_actions)
+TIME_CONFIG_GCNO=$(resolve_gcno test_time_config)
+TIME_RUNTIME_GCNO=$(resolve_gcno test_time_runtime)
+CHAOS_TIME_GCNO=$(resolve_gcno test_chaos_time)
+MEMORY_ACTIONS_GCNO=$(resolve_gcno test_memory_actions)
+MEMORY_CONFIG_GCNO=$(resolve_gcno test_memory_config)
+MEMORY_RUNTIME_GCNO=$(resolve_gcno test_memory_runtime)
+CHAOS_MEMORY_GCNO=$(resolve_gcno test_chaos_memory)
+PROCESS_ACTIONS_GCNO=$(resolve_gcno test_process_actions)
+PROCESS_CONFIG_GCNO=$(resolve_gcno test_process_config)
+PROCESS_RUNTIME_GCNO=$(resolve_gcno test_process_runtime)
+CHAOS_PROCESS_GCNO=$(resolve_gcno test_chaos_process)
 
-check_target "$CONFIG_GCNO" "src/config/chaos_io_config.c"
-check_target "$ACTIONS_GCNO" "src/effects/chaos_io_actions.c"
-check_target "$FDCACHE_GCNO" "src/config/chaos_io_fdcache.c"
-check_target "$CHAOS_IO_GCNO" "src/core/chaos_io.c"
-check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_open.c"
-check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_rw.c"
-check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_fsops.c"
-check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_sync.c"
+check_target "$CONFIG_GCNO" "src/config/chaos_io_config.c" "100.00"
+check_target "$ACTIONS_GCNO" "src/effects/chaos_io_actions.c" "100.00"
+check_target "$FDCACHE_GCNO" "src/config/chaos_io_fdcache.c" "100.00"
+check_target "$CHAOS_IO_GCNO" "src/core/chaos_io.c" "100.00"
+check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_open.c" "100.00"
+check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_rw.c" "100.00"
+check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_fsops.c" "100.00"
+check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_sync.c" "100.00"
+check_target "$NET_ACTIONS_GCNO" "src/net/chaos_net_actions.c" "100.00"
+check_target "$NET_ENDPOINT_GCNO" "src/net/chaos_net_endpoint.c" "100.00"
+check_target "$NET_CONFIG_GCNO" "src/net/chaos_net_config.c" "100.00"
+check_target "$NET_RUNTIME_GCNO" "src/net/chaos_net.c" "100.00"
+check_target "$CHAOS_NET_GCNO" "src/net/chaos_net_extra.c" "100.00"
+check_target "$CHAOS_NET_GCNO" "src/net/chaos_net_socket.c" "100.00"
+check_target "$CHAOS_NET_GCNO" "src/net/chaos_net_wait.c" "100.00"
+check_target "$DNS_ACTIONS_GCNO" "src/dns/chaos_dns_actions.c" "100.00"
+check_target "$DNS_CONFIG_GCNO" "src/dns/chaos_dns_config.c" "85.00"
+check_target "$DNS_RUNTIME_GCNO" "src/dns/chaos_dns.c" "100.00"
+check_target "$CHAOS_DNS_GCNO" "src/dns/chaos_dns_lookup.c" "85.00"
+check_target "$TIME_ACTIONS_GCNO" "src/time/chaos_time_actions.c" "100.00"
+check_target "$TIME_CONFIG_GCNO" "src/time/chaos_time_config.c" "100.00"
+check_target "$TIME_RUNTIME_GCNO" "src/time/chaos_time.c" "100.00"
+check_target "$CHAOS_TIME_GCNO" "src/time/chaos_time_hooks.c" "100.00"
+check_target "$MEMORY_ACTIONS_GCNO" "src/memory/chaos_memory_actions.c" "100.00"
+check_target "$MEMORY_CONFIG_GCNO" "src/memory/chaos_memory_config.c" "100.00"
+check_target "$MEMORY_RUNTIME_GCNO" "src/memory/chaos_memory.c" "100.00"
+check_target "$CHAOS_MEMORY_GCNO" "src/memory/chaos_memory_hooks.c" "100.00"
+check_target "$PROCESS_ACTIONS_GCNO" "src/process/chaos_process_actions.c" "100.00"
+check_target "$PROCESS_CONFIG_GCNO" "src/process/chaos_process_config.c" "100.00"
+check_target "$PROCESS_RUNTIME_GCNO" "src/process/chaos_process.c" "100.00"
+check_target "$CHAOS_PROCESS_GCNO" "src/process/chaos_process_hooks.c" "100.00"
 
 echo "coverage check passed"

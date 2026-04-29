@@ -24,26 +24,32 @@ CHAOS_IO_EXPORT int close(int fd)
     int rc;
     int previous;
 
-    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_CLOSE, &rule)) {
+    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_CLOSE, &rule))
+    {
         previous = chaos_io_enter_internal();
         rc = g_chaos_io_real_close(fd);
         chaos_io_leave_internal(previous);
-        if (rc == 0) {
+        if (rc == 0)
+        {
             chaos_io_fdcache_invalidate(fd);
         }
         return rc;
     }
 
-    if (rule.effect == CHAOS_IO_EFFECT_LATENCY) {
+    if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
+    {
         chaos_io_rule_apply_latency(&rule);
-    } else if (chaos_io_rule_apply_errno(&rule)) {
+    }
+    else if (chaos_io_rule_apply_errno(&rule))
+    {
         return -1;
     }
 
     previous = chaos_io_enter_internal();
     rc = g_chaos_io_real_close(fd);
     chaos_io_leave_internal(previous);
-    if (rc == 0) {
+    if (rc == 0)
+    {
         chaos_io_fdcache_invalidate(fd);
     }
     return rc;
@@ -61,16 +67,20 @@ CHAOS_IO_EXPORT int fsync(int fd)
     int rc;
     int previous;
 
-    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_FSYNC, &rule)) {
+    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_FSYNC, &rule))
+    {
         previous = chaos_io_enter_internal();
         rc = g_chaos_io_real_fsync(fd);
         chaos_io_leave_internal(previous);
         return rc;
     }
 
-    if (rule.effect == CHAOS_IO_EFFECT_LATENCY) {
+    if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
+    {
         chaos_io_rule_apply_latency(&rule);
-    } else if (chaos_io_rule_apply_errno(&rule)) {
+    }
+    else if (chaos_io_rule_apply_errno(&rule))
+    {
         return -1;
     }
 
@@ -91,16 +101,20 @@ CHAOS_IO_EXPORT int fdatasync(int fd)
     int rc;
     int previous;
 
-    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_FDATASYNC, &rule)) {
+    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_FDATASYNC, &rule))
+    {
         previous = chaos_io_enter_internal();
         rc = g_chaos_io_real_fdatasync(fd);
         chaos_io_leave_internal(previous);
         return rc;
     }
 
-    if (rule.effect == CHAOS_IO_EFFECT_LATENCY) {
+    if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
+    {
         chaos_io_rule_apply_latency(&rule);
-    } else if (chaos_io_rule_apply_errno(&rule)) {
+    }
+    else if (chaos_io_rule_apply_errno(&rule))
+    {
         return -1;
     }
 

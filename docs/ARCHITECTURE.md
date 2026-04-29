@@ -1,8 +1,28 @@
 # Architecture
 
+This document describes the repository-wide preload architecture and uses
+`libchaos-io` as the reference implementation for the common execution model.
+The repository also ships implemented `libchaos-net`, `libchaos-dns`,
+`libchaos-time`, `libchaos-memory`, and `libchaos-process` libraries.
+Each of those libraries has its own current-state technical reference:
+
+- `libchaos-net` in
+[`docs/NETWORK.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/docs/NETWORK.md)
+- `libchaos-dns` in
+[`docs/DNS.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/docs/DNS.md),
+- `libchaos-time` in
+[`docs/TIME.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/docs/TIME.md),
+- `libchaos-memory` in
+[`docs/MEMORY.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/docs/MEMORY.md),
+- `libchaos-process` in
+[`docs/PROCESS.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/docs/PROCESS.md).
+
 ## Purpose
 
-`libchaos-io` exists to inject controlled filesystem failures into Linux processes by interposing a small set of libc calls with `LD_PRELOAD`.
+Repository-wide, these libraries exist to inject controlled Linux libc-boundary
+failures through small `LD_PRELOAD` shared objects. The sections below describe
+that shared architecture through the `libchaos-io` implementation, because it
+is still the clearest example of the common preload model.
 
 The code stays intentionally narrow:
 
@@ -100,7 +120,19 @@ That is why coverage can stay strict without adding exported test-only symbols.
 
 - Builds an instrumented tree in `build-coverage/`
 - Runs all unit binaries
-- Verifies `100.00%` line coverage for every `src/*.c`
+- Verifies `100.00%` line coverage for the shipped `libchaos-io`,
+  `libchaos-net`, `libchaos-time`, `libchaos-memory`, and
+  `libchaos-process` sources
+- Verifies an enforced source-line coverage floor for the shipped
+  `libchaos-dns` sources
+
+### Style gate
+
+[`test/runtime/check_format.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/runtime/check_format.sh)
+
+- Resolves `clang-format` from `PATH`, `CLANG_FORMAT`, or `xcrun`
+- Checks or rewrites all shipped C sources and tests against the repository
+  `.clang-format`
 
 ### Integration checks
 
@@ -128,6 +160,34 @@ That is why coverage can stay strict without adding exported test-only symbols.
   Linux `fallocate()`, `unlinkat()`, `renameat()`, and Linux `sendfile()` plus
   `copy_file_range()` probes
 - Accepts `linux/amd64` or `linux/arm64` as an optional explicit Docker target
+
+[`test/runtime/test_net_glibc.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/runtime/test_net_glibc.sh)
+and [`test/runtime/test_net_alpine.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/runtime/test_net_alpine.sh)
+
+- Build and run the real `libchaos-net` shared object under glibc and musl
+- Exercise `socket`, `bind`, `listen`, `connect`, `accept`, `shutdown`,
+  `send`, `recv`, and readiness waits with endpoint-based rules
+- Accept `linux/amd64` or `linux/arm64` as explicit Docker targets
+
+[`test/runtime/test_dns_glibc.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/runtime/test_dns_glibc.sh)
+and [`test/runtime/test_dns_alpine.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/runtime/test_dns_alpine.sh)
+
+- Build and run the real `libchaos-dns` shared object under glibc and musl
+- Exercise `getaddrinfo` failure injection, rewrite, service rewrite, latency,
+  and synthetic answer manipulation
+- Accept `linux/amd64` or `linux/arm64` as explicit Docker targets
+
+[`test/runtime/test_time_glibc.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/runtime/test_time_glibc.sh),
+[`test/runtime/test_time_alpine.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/runtime/test_time_alpine.sh),
+[`test/runtime/test_memory_glibc.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/runtime/test_memory_glibc.sh),
+[`test/runtime/test_memory_alpine.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/runtime/test_memory_alpine.sh),
+[`test/runtime/test_process_glibc.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/runtime/test_process_glibc.sh),
+and [`test/runtime/test_process_alpine.sh`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/test/runtime/test_process_alpine.sh)
+
+- Build and run the real `libchaos-time`, `libchaos-memory`, and
+  `libchaos-process` shared objects under glibc and musl
+- Exercise their dedicated runtime probes on both supported architectures
+- Accept `linux/amd64` or `linux/arm64` as explicit Docker targets
 
 ## Maintenance Rules
 

@@ -66,7 +66,8 @@ static void chaos_io_resolve_symbol(void *target, const char *symbol)
 
     (void)dlerror();
     resolved = dlsym(RTLD_NEXT, symbol);
-    if (resolved == NULL && dlerror() != NULL) abort();
+    if (resolved == NULL && dlerror() != NULL)
+        abort();
 
     (void)memcpy(target, &resolved, sizeof(resolved));
 }
@@ -85,14 +86,18 @@ static uint64_t chaos_io_read_seed_material(void)
 
     previous = chaos_io_enter_internal();
     fd = (int)syscall(SYS_openat, AT_FDCWD, "/dev/urandom", O_RDONLY, 0);
-    if (fd >= 0) {
+    if (fd >= 0)
+    {
         ssize_t rc = (ssize_t)syscall(SYS_read, fd, &seed, sizeof(seed));
         (void)syscall(SYS_close, fd);
         chaos_io_leave_internal(previous);
-        if (rc == (ssize_t)sizeof(seed)) {
+        if (rc == (ssize_t)sizeof(seed))
+        {
             return seed;
         }
-    } else {
+    }
+    else
+    {
         chaos_io_leave_internal(previous);
     }
 
@@ -109,13 +114,16 @@ int chaos_io_match_fd_rule(int fd, chaos_io_operation_t operation, chaos_io_rule
 {
     char path[CHAOS_IO_MAX_PATH];
 
-    if (fd <= 2 || rule == NULL) {
+    if (fd <= 2 || rule == NULL)
+    {
         return 0;
     }
-    if (!chaos_io_config_prepare()) {
+    if (!chaos_io_config_prepare())
+    {
         return 0;
     }
-    if (!chaos_io_fdcache_resolve(fd, path, sizeof(path))) {
+    if (!chaos_io_fdcache_resolve(fd, path, sizeof(path)))
+    {
         return 0;
     }
     return chaos_io_config_match_loaded(operation, path, rule);

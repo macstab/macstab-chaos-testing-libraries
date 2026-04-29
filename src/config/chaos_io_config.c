@@ -21,7 +21,8 @@
 #define CHAOS_IO_STAT_NSEC(st) ((st)->st_mtimespec.tv_nsec)
 #endif
 
-typedef struct chaos_io_config_state {
+typedef struct chaos_io_config_state
+{
     chaos_io_rule_t rules[CHAOS_IO_MAX_RULES];
     size_t rule_count;
     int parse_ok;
@@ -35,7 +36,8 @@ static __thread char g_chaos_io_config_buffer[CHAOS_IO_MAX_CONFIG_BYTES + 1U];
 /* Resets a config state to an empty passthrough configuration. */
 static void chaos_io_config_reset_state(chaos_io_config_state_t *state, int parse_ok)
 {
-    if (state == NULL) {
+    if (state == NULL)
+    {
         return;
     }
 
@@ -73,20 +75,24 @@ static char *chaos_io_trim(char *text)
 {
     char *end;
 
-    if (text == NULL) {
+    if (text == NULL)
+    {
         return NULL;
     }
 
-    while (*text != '\0' && chaos_io_is_blank_char(*text)) {
+    while (*text != '\0' && chaos_io_is_blank_char(*text))
+    {
         ++text;
     }
 
-    if (*text == '\0') {
+    if (*text == '\0')
+    {
         return text;
     }
 
     end = text + strlen(text);
-    while (end > text && chaos_io_is_blank_char(end[-1])) {
+    while (end > text && chaos_io_is_blank_char(end[-1]))
+    {
         --end;
     }
     *end = '\0';
@@ -99,12 +105,14 @@ static void chaos_io_strip_comment(char *line)
 {
     char *comment;
 
-    if (line == NULL) {
+    if (line == NULL)
+    {
         return;
     }
 
     comment = strchr(line, '#');
-    if (comment != NULL) {
+    if (comment != NULL)
+    {
         *comment = '\0';
     }
 }
@@ -112,46 +120,60 @@ static void chaos_io_strip_comment(char *line)
 /* Parses the string name of an operation. */
 static chaos_io_operation_t chaos_io_parse_operation(const char *text)
 {
-    if (text == NULL) {
+    if (text == NULL)
+    {
         return CHAOS_IO_OP_INVALID;
     }
-    if (strcmp(text, "read") == 0) {
+    if (strcmp(text, "read") == 0)
+    {
         return CHAOS_IO_OP_READ;
     }
-    if (strcmp(text, "write") == 0) {
+    if (strcmp(text, "write") == 0)
+    {
         return CHAOS_IO_OP_WRITE;
     }
-    if (strcmp(text, "open") == 0) {
+    if (strcmp(text, "open") == 0)
+    {
         return CHAOS_IO_OP_OPEN;
     }
-    if (strcmp(text, "close") == 0) {
+    if (strcmp(text, "close") == 0)
+    {
         return CHAOS_IO_OP_CLOSE;
     }
-    if (strcmp(text, "fsync") == 0) {
+    if (strcmp(text, "fsync") == 0)
+    {
         return CHAOS_IO_OP_FSYNC;
     }
-    if (strcmp(text, "fdatasync") == 0) {
+    if (strcmp(text, "fdatasync") == 0)
+    {
         return CHAOS_IO_OP_FDATASYNC;
     }
-    if (strcmp(text, "pread") == 0) {
+    if (strcmp(text, "pread") == 0)
+    {
         return CHAOS_IO_OP_PREAD;
     }
-    if (strcmp(text, "pwrite") == 0) {
+    if (strcmp(text, "pwrite") == 0)
+    {
         return CHAOS_IO_OP_PWRITE;
     }
-    if (strcmp(text, "truncate") == 0) {
+    if (strcmp(text, "truncate") == 0)
+    {
         return CHAOS_IO_OP_TRUNCATE;
     }
-    if (strcmp(text, "allocate") == 0) {
+    if (strcmp(text, "allocate") == 0)
+    {
         return CHAOS_IO_OP_ALLOCATE;
     }
-    if (strcmp(text, "unlink") == 0) {
+    if (strcmp(text, "unlink") == 0)
+    {
         return CHAOS_IO_OP_UNLINK;
     }
-    if (strcmp(text, "rename_from") == 0) {
+    if (strcmp(text, "rename_from") == 0)
+    {
         return CHAOS_IO_OP_RENAME_FROM;
     }
-    if (strcmp(text, "rename_to") == 0) {
+    if (strcmp(text, "rename_to") == 0)
+    {
         return CHAOS_IO_OP_RENAME_TO;
     }
     return CHAOS_IO_OP_INVALID;
@@ -160,31 +182,40 @@ static chaos_io_operation_t chaos_io_parse_operation(const char *text)
 /* Parses an errno name supported by the config format. */
 static int chaos_io_parse_errno_name(const char *text)
 {
-    if (text == NULL) {
+    if (text == NULL)
+    {
         return -1;
     }
-    if (strcmp(text, "EIO") == 0) {
+    if (strcmp(text, "EIO") == 0)
+    {
         return EIO;
     }
-    if (strcmp(text, "ENOSPC") == 0) {
+    if (strcmp(text, "ENOSPC") == 0)
+    {
         return ENOSPC;
     }
-    if (strcmp(text, "EDQUOT") == 0) {
+    if (strcmp(text, "EDQUOT") == 0)
+    {
         return EDQUOT;
     }
-    if (strcmp(text, "EROFS") == 0) {
+    if (strcmp(text, "EROFS") == 0)
+    {
         return EROFS;
     }
-    if (strcmp(text, "EACCES") == 0) {
+    if (strcmp(text, "EACCES") == 0)
+    {
         return EACCES;
     }
-    if (strcmp(text, "EMFILE") == 0) {
+    if (strcmp(text, "EMFILE") == 0)
+    {
         return EMFILE;
     }
-    if (strcmp(text, "ENFILE") == 0) {
+    if (strcmp(text, "ENFILE") == 0)
+    {
         return ENFILE;
     }
-    if (strcmp(text, "ENOENT") == 0) {
+    if (strcmp(text, "ENOENT") == 0)
+    {
         return ENOENT;
     }
     return -1;
@@ -196,15 +227,18 @@ static int chaos_io_parse_probability(const char *text, double *probability)
     char *end = NULL;
     double value;
 
-    if (text == NULL || probability == NULL) {
+    if (text == NULL || probability == NULL)
+    {
         return -1;
     }
 
     value = strtod(text, &end);
-    if (end == text || *chaos_io_trim(end) != '\0') {
+    if (end == text || *chaos_io_trim(end) != '\0')
+    {
         return -1;
     }
-    if (value < 0.0 || value > 1.0) {
+    if (value < 0.0 || value > 1.0)
+    {
         return -1;
     }
 
@@ -218,15 +252,18 @@ static int chaos_io_parse_latency(const char *text, unsigned int *latency_ms)
     char *end = NULL;
     unsigned long value;
 
-    if (text == NULL || latency_ms == NULL) {
+    if (text == NULL || latency_ms == NULL)
+    {
         return -1;
     }
 
     value = strtoul(text, &end, 10);
-    if (end == text || *chaos_io_trim(end) != '\0') {
+    if (end == text || *chaos_io_trim(end) != '\0')
+    {
         return -1;
     }
-    if (value > 0xffffffffUL) {
+    if (value > 0xffffffffUL)
+    {
         return -1;
     }
 
@@ -237,13 +274,16 @@ static int chaos_io_parse_latency(const char *text, unsigned int *latency_ms)
 /* Returns non-zero when the effect is valid for the selected operation. */
 static int chaos_io_effect_allowed(chaos_io_operation_t operation, chaos_io_effect_t effect)
 {
-    if (effect == CHAOS_IO_EFFECT_ERRNO || effect == CHAOS_IO_EFFECT_LATENCY) {
+    if (effect == CHAOS_IO_EFFECT_ERRNO || effect == CHAOS_IO_EFFECT_LATENCY)
+    {
         return 1;
     }
-    if (effect == CHAOS_IO_EFFECT_TORN) {
+    if (effect == CHAOS_IO_EFFECT_TORN)
+    {
         return operation == CHAOS_IO_OP_WRITE || operation == CHAOS_IO_OP_PWRITE;
     }
-    if (effect == CHAOS_IO_EFFECT_CORRUPT) {
+    if (effect == CHAOS_IO_EFFECT_CORRUPT)
+    {
         return operation == CHAOS_IO_OP_READ || operation == CHAOS_IO_OP_PREAD;
     }
     return 0;
@@ -252,9 +292,9 @@ static int chaos_io_effect_allowed(chaos_io_operation_t operation, chaos_io_effe
 /* Normalizes hashed mtimes so they never overlap with sentinel values. */
 static uint64_t chaos_io_config_normalize_mtime_hash(uint64_t value)
 {
-    if (value == CHAOS_IO_MTIME_MISSING
-        || value == CHAOS_IO_MTIME_RELOADING
-        || value == CHAOS_IO_MTIME_UNKNOWN) {
+    if (value == CHAOS_IO_MTIME_MISSING || value == CHAOS_IO_MTIME_RELOADING ||
+        value == CHAOS_IO_MTIME_UNKNOWN)
+    {
         return value ^ UINT64_C(0x9e3779b97f4a7c15);
     }
 
@@ -266,7 +306,8 @@ static uint64_t chaos_io_config_hash_mtime(const struct stat *st)
 {
     uint64_t value;
 
-    if (st == NULL) {
+    if (st == NULL)
+    {
         return CHAOS_IO_MTIME_MISSING;
     }
 
@@ -290,7 +331,8 @@ static uint64_t chaos_io_config_observed_mtime(void)
     rc = stat(CHAOS_IO_CONFIG_PATH, &st);
     chaos_io_leave_internal(previous);
 
-    if (rc != 0) {
+    if (rc != 0)
+    {
         return CHAOS_IO_MTIME_MISSING;
     }
 
@@ -304,32 +346,38 @@ static int chaos_io_config_read_file(size_t *size_out)
     int previous;
     int fd;
 
-    if (size_out == NULL
-        || g_chaos_io_real_open == NULL
-        || g_chaos_io_real_read == NULL
-        || g_chaos_io_real_close == NULL) {
+    if (size_out == NULL || g_chaos_io_real_open == NULL || g_chaos_io_real_read == NULL ||
+        g_chaos_io_real_close == NULL)
+    {
         return -1;
     }
 
     previous = chaos_io_enter_internal();
     fd = g_chaos_io_real_open(CHAOS_IO_CONFIG_PATH, O_RDONLY);
-    if (fd < 0) {
+    if (fd < 0)
+    {
         chaos_io_leave_internal(previous);
         return -1;
     }
 
-    for (;;) {
-        ssize_t rc = g_chaos_io_real_read(fd, g_chaos_io_config_buffer + total, CHAOS_IO_MAX_CONFIG_BYTES - total);
-        if (rc < 0) {
+    for (;;)
+    {
+        ssize_t rc = g_chaos_io_real_read(
+            fd, g_chaos_io_config_buffer + total, CHAOS_IO_MAX_CONFIG_BYTES - total
+        );
+        if (rc < 0)
+        {
             (void)g_chaos_io_real_close(fd);
             chaos_io_leave_internal(previous);
             return -1;
         }
-        if (rc == 0) {
+        if (rc == 0)
+        {
             break;
         }
         total += (size_t)rc;
-        if (total == CHAOS_IO_MAX_CONFIG_BYTES) {
+        if (total == CHAOS_IO_MAX_CONFIG_BYTES)
+        {
             (void)g_chaos_io_real_close(fd);
             chaos_io_leave_internal(previous);
             return -1;
@@ -347,19 +395,24 @@ static int chaos_io_config_read_file(size_t *size_out)
 /* Returns non-zero when a rule prefix matches the supplied path. */
 static int chaos_io_rule_prefix_matches(const chaos_io_rule_t *rule, const char *path)
 {
-    if (rule == NULL || path == NULL) {
+    if (rule == NULL || path == NULL)
+    {
         return 0;
     }
-    if (strcmp(rule->path_prefix, "*") == 0) {
+    if (strcmp(rule->path_prefix, "*") == 0)
+    {
         return 1;
     }
-    if (strncmp(path, rule->path_prefix, rule->path_len) != 0) {
+    if (strncmp(path, rule->path_prefix, rule->path_len) != 0)
+    {
         return 0;
     }
-    if (path[rule->path_len] == '\0') {
+    if (path[rule->path_len] == '\0')
+    {
         return 1;
     }
-    if (rule->path_len > 0U && rule->path_prefix[rule->path_len - 1U] == '/') {
+    if (rule->path_len > 0U && rule->path_prefix[rule->path_len - 1U] == '/')
+    {
         return 1;
     }
     return path[rule->path_len] == '/';
@@ -374,18 +427,23 @@ static void chaos_io_config_reload(uint64_t observed_mtime)
 
     chaos_io_config_reset_state(next_state, 1);
 
-    if (observed_mtime == CHAOS_IO_MTIME_MISSING) {
+    if (observed_mtime == CHAOS_IO_MTIME_MISSING)
+    {
         chaos_io_config_publish(next_index, CHAOS_IO_MTIME_MISSING);
         return;
     }
 
-    if (chaos_io_config_read_file(&file_size) != 0) {
+    if (chaos_io_config_read_file(&file_size) != 0)
+    {
         chaos_io_config_reset_state(next_state, 0);
         chaos_io_config_publish(next_index, observed_mtime);
         return;
     }
 
-    if (chaos_io_config_parse_buffer(g_chaos_io_config_buffer, next_state->rules, &next_state->rule_count) != 0) {
+    if (chaos_io_config_parse_buffer(
+            g_chaos_io_config_buffer, next_state->rules, &next_state->rule_count
+        ) != 0)
+    {
         chaos_io_config_reset_state(next_state, 0);
     }
 
@@ -411,13 +469,16 @@ int chaos_io_config_prepare(void)
     observed_mtime = chaos_io_config_observed_mtime();
     cached_mtime = chaos_io_atomic_load_u64(&g_chaos_io_cached_mtime);
 
-    if (cached_mtime == observed_mtime) {
+    if (cached_mtime == observed_mtime)
+    {
         return chaos_io_config_active_state()->rule_count != 0U;
     }
-    if (cached_mtime == CHAOS_IO_MTIME_RELOADING) {
+    if (cached_mtime == CHAOS_IO_MTIME_RELOADING)
+    {
         return chaos_io_config_active_state()->rule_count != 0U;
     }
-    if (chaos_io_atomic_cas_u64(&g_chaos_io_cached_mtime, cached_mtime, CHAOS_IO_MTIME_RELOADING)) {
+    if (chaos_io_atomic_cas_u64(&g_chaos_io_cached_mtime, cached_mtime, CHAOS_IO_MTIME_RELOADING))
+    {
         chaos_io_config_reload(observed_mtime);
     }
     return chaos_io_config_active_state()->rule_count != 0U;
@@ -433,26 +494,31 @@ int chaos_io_config_parse_line(char *line, chaos_io_rule_t *rule)
     double probability;
     unsigned int latency_ms;
 
-    if (line == NULL || rule == NULL) {
+    if (line == NULL || rule == NULL)
+    {
         return -1;
     }
 
     chaos_io_strip_comment(line);
     cursor = chaos_io_trim(line);
-    if (*cursor == '\0') {
+    if (*cursor == '\0')
+    {
         return 0;
     }
 
     fields[field_index++] = cursor;
-    while (*cursor != '\0' && field_index < 4U) {
-        if (*cursor == ':') {
+    while (*cursor != '\0' && field_index < 4U)
+    {
+        if (*cursor == ':')
+        {
             *cursor = '\0';
             fields[field_index++] = cursor + 1;
         }
         ++cursor;
     }
 
-    if (field_index != 4U) {
+    if (field_index != 4U)
+    {
         return -1;
     }
 
@@ -461,10 +527,12 @@ int chaos_io_config_parse_line(char *line, chaos_io_rule_t *rule)
     fields[2] = chaos_io_trim(fields[2]);
     fields[3] = chaos_io_trim(fields[3]);
 
-    if (*fields[0] == '\0' || *fields[1] == '\0' || *fields[2] == '\0' || *fields[3] == '\0') {
+    if (*fields[0] == '\0' || *fields[1] == '\0' || *fields[2] == '\0' || *fields[3] == '\0')
+    {
         return -1;
     }
-    if (strlen(fields[0]) >= CHAOS_IO_MAX_RULE_PATH) {
+    if (strlen(fields[0]) >= CHAOS_IO_MAX_RULE_PATH)
+    {
         return -1;
     }
 
@@ -472,41 +540,56 @@ int chaos_io_config_parse_line(char *line, chaos_io_rule_t *rule)
     (void)memcpy(rule->path_prefix, fields[0], strlen(fields[0]) + 1U);
     rule->path_len = strlen(rule->path_prefix);
     rule->operation = chaos_io_parse_operation(fields[1]);
-    if (rule->operation == CHAOS_IO_OP_INVALID) {
+    if (rule->operation == CHAOS_IO_OP_INVALID)
+    {
         return -1;
     }
 
     parsed_errno = chaos_io_parse_errno_name(fields[2]);
-    if (parsed_errno >= 0) {
+    if (parsed_errno >= 0)
+    {
         rule->effect = CHAOS_IO_EFFECT_ERRNO;
         rule->errnum = parsed_errno;
-        if (chaos_io_parse_probability(fields[3], &probability) != 0) {
+        if (chaos_io_parse_probability(fields[3], &probability) != 0)
+        {
             return -1;
         }
         rule->probability = probability;
-    } else if (strcmp(fields[2], "LATENCY") == 0) {
+    }
+    else if (strcmp(fields[2], "LATENCY") == 0)
+    {
         rule->effect = CHAOS_IO_EFFECT_LATENCY;
-        if (chaos_io_parse_latency(fields[3], &latency_ms) != 0) {
+        if (chaos_io_parse_latency(fields[3], &latency_ms) != 0)
+        {
             return -1;
         }
         rule->latency_ms = latency_ms;
-    } else if (strcmp(fields[2], "TORN") == 0) {
+    }
+    else if (strcmp(fields[2], "TORN") == 0)
+    {
         rule->effect = CHAOS_IO_EFFECT_TORN;
-        if (chaos_io_parse_probability(fields[3], &probability) != 0) {
+        if (chaos_io_parse_probability(fields[3], &probability) != 0)
+        {
             return -1;
         }
         rule->probability = probability;
-    } else if (strcmp(fields[2], "CORRUPT") == 0) {
+    }
+    else if (strcmp(fields[2], "CORRUPT") == 0)
+    {
         rule->effect = CHAOS_IO_EFFECT_CORRUPT;
-        if (chaos_io_parse_probability(fields[3], &probability) != 0) {
+        if (chaos_io_parse_probability(fields[3], &probability) != 0)
+        {
             return -1;
         }
         rule->probability = probability;
-    } else {
+    }
+    else
+    {
         return -1;
     }
 
-    if (!chaos_io_effect_allowed(rule->operation, rule->effect)) {
+    if (!chaos_io_effect_allowed(rule->operation, rule->effect))
+    {
         return -1;
     }
 
@@ -519,34 +602,41 @@ int chaos_io_config_parse_buffer(char *buffer, chaos_io_rule_t *rules, size_t *r
     char *line;
     size_t count = 0U;
 
-    if (buffer == NULL || rules == NULL || rule_count == NULL) {
+    if (buffer == NULL || rules == NULL || rule_count == NULL)
+    {
         return -1;
     }
 
     line = buffer;
-    for (;;) {
+    for (;;)
+    {
         char *next = strchr(line, '\n');
         chaos_io_rule_t parsed_rule;
         int parse_result;
 
-        if (next != NULL) {
+        if (next != NULL)
+        {
             *next = '\0';
         }
 
         parse_result = chaos_io_config_parse_line(line, &parsed_rule);
-        if (parse_result < 0) {
+        if (parse_result < 0)
+        {
             *rule_count = 0U;
             return -1;
         }
-        if (parse_result > 0) {
-            if (count >= CHAOS_IO_MAX_RULES) {
+        if (parse_result > 0)
+        {
+            if (count >= CHAOS_IO_MAX_RULES)
+            {
                 *rule_count = 0U;
                 return -1;
             }
             rules[count++] = parsed_rule;
         }
 
-        if (next == NULL) {
+        if (next == NULL)
+        {
             break;
         }
         line = next + 1;
@@ -562,29 +652,36 @@ int chaos_io_config_select_rule(
     size_t rule_count,
     chaos_io_operation_t operation,
     const char *path,
-    chaos_io_rule_t *rule)
+    chaos_io_rule_t *rule
+)
 {
     const chaos_io_rule_t *best = NULL;
     size_t index;
 
-    if (rules == NULL || path == NULL || rule == NULL) {
+    if (rules == NULL || path == NULL || rule == NULL)
+    {
         return 0;
     }
 
-    for (index = 0U; index < rule_count; ++index) {
+    for (index = 0U; index < rule_count; ++index)
+    {
         const chaos_io_rule_t *candidate = &rules[index];
-        if (candidate->operation != operation) {
+        if (candidate->operation != operation)
+        {
             continue;
         }
-        if (!chaos_io_rule_prefix_matches(candidate, path)) {
+        if (!chaos_io_rule_prefix_matches(candidate, path))
+        {
             continue;
         }
-        if (best == NULL || candidate->path_len > best->path_len) {
+        if (best == NULL || candidate->path_len > best->path_len)
+        {
             best = candidate;
         }
     }
 
-    if (best == NULL) {
+    if (best == NULL)
+    {
         return 0;
     }
 
@@ -594,18 +691,19 @@ int chaos_io_config_select_rule(
 
 /* Matches a path against the current loaded config without forcing a refresh. */
 int chaos_io_config_match_loaded(
-    chaos_io_operation_t operation,
-    const char *path,
-    chaos_io_rule_t *rule)
+    chaos_io_operation_t operation, const char *path, chaos_io_rule_t *rule
+)
 {
     const chaos_io_config_state_t *state;
 
-    if (path == NULL || rule == NULL) {
+    if (path == NULL || rule == NULL)
+    {
         return 0;
     }
 
     state = chaos_io_config_active_state();
-    if (state->rule_count == 0U) {
+    if (state->rule_count == 0U)
+    {
         return 0;
     }
 
@@ -614,14 +712,15 @@ int chaos_io_config_match_loaded(
 
 /* Refreshes the config if needed and then matches a path against it. */
 int chaos_io_config_match_path(
-    chaos_io_operation_t operation,
-    const char *path,
-    chaos_io_rule_t *rule)
+    chaos_io_operation_t operation, const char *path, chaos_io_rule_t *rule
+)
 {
-    if (path == NULL || rule == NULL || chaos_io_is_excluded_path(path)) {
+    if (path == NULL || rule == NULL || chaos_io_is_excluded_path(path))
+    {
         return 0;
     }
-    if (!chaos_io_config_prepare()) {
+    if (!chaos_io_config_prepare())
+    {
         return 0;
     }
     return chaos_io_config_match_loaded(operation, path, rule);

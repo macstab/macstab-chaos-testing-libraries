@@ -8,6 +8,7 @@
 #include "../../src/config/chaos_io_fdcache.h"
 
 #include <dlfcn.h>
+#include <setjmp.h>
 #include <sys/syscall.h>
 
 #define CHAOS_TEST_IOV_SNAPSHOT_COUNT 4
@@ -192,6 +193,9 @@ static uint64_t g_sys_seed_value = 0U;
 
 static const char *g_dlsym_fail_symbol = NULL;
 static const char *g_dlerror_pending = NULL;
+static int g_abort_expected = 0;
+static int g_abort_called = 0;
+static jmp_buf g_abort_env;
 
 void chaos_io_config_init(void)
 {
@@ -205,19 +209,22 @@ int chaos_io_config_prepare(void)
 }
 
 int chaos_io_config_match_loaded(
-    chaos_io_operation_t operation,
-    const char *path,
-    chaos_io_rule_t *rule)
+    chaos_io_operation_t operation, const char *path, chaos_io_rule_t *rule
+)
 {
     ++g_config_match_loaded_calls;
     g_last_match_loaded_operation = operation;
-    if (path != NULL) {
+    if (path != NULL)
+    {
         (void)snprintf(g_last_match_loaded_path, sizeof(g_last_match_loaded_path), "%s", path);
-    } else {
+    }
+    else
+    {
         g_last_match_loaded_path[0] = '\0';
     }
 
-    if (!g_config_match_loaded_result || rule == NULL) {
+    if (!g_config_match_loaded_result || rule == NULL)
+    {
         return 0;
     }
 
@@ -226,19 +233,22 @@ int chaos_io_config_match_loaded(
 }
 
 int chaos_io_config_match_path(
-    chaos_io_operation_t operation,
-    const char *path,
-    chaos_io_rule_t *rule)
+    chaos_io_operation_t operation, const char *path, chaos_io_rule_t *rule
+)
 {
     ++g_config_match_path_calls;
     g_last_match_path_operation = operation;
-    if (path != NULL) {
+    if (path != NULL)
+    {
         (void)snprintf(g_last_match_path, sizeof(g_last_match_path), "%s", path);
-    } else {
+    }
+    else
+    {
         g_last_match_path[0] = '\0';
     }
 
-    if (!g_config_match_path_result || rule == NULL) {
+    if (!g_config_match_path_result || rule == NULL)
+    {
         return 0;
     }
 
@@ -256,7 +266,8 @@ int chaos_io_fdcache_resolve(int fd, char *path, size_t path_size)
     ++g_fdcache_resolve_calls;
     g_last_resolve_fd = fd;
 
-    if (!g_fdcache_resolve_result || path == NULL || path_size == 0U) {
+    if (!g_fdcache_resolve_result || path == NULL || path_size == 0U)
+    {
         return 0;
     }
 
@@ -269,9 +280,12 @@ void chaos_io_fdcache_store(int fd, const char *path)
 {
     ++g_fdcache_store_calls;
     g_last_store_fd = fd;
-    if (path != NULL) {
+    if (path != NULL)
+    {
         (void)snprintf(g_last_store_path, sizeof(g_last_store_path), "%s", path);
-    } else {
+    }
+    else
+    {
         g_last_store_path[0] = '\0';
     }
 }
@@ -299,7 +313,8 @@ int chaos_io_rule_apply_errno(const chaos_io_rule_t *rule)
 {
     assert(rule != NULL);
     ++g_rule_apply_errno_calls;
-    if (g_rule_apply_errno_result != 0) {
+    if (g_rule_apply_errno_result != 0)
+    {
         errno = rule->errnum;
     }
     return g_rule_apply_errno_result;
@@ -317,16 +332,15 @@ void chaos_io_corrupt_buffer(void *buffer, size_t size)
 
     ++g_corrupt_calls;
     g_last_corrupt_size = size;
-    if (bytes != NULL && size > 0U) {
+    if (bytes != NULL && size > 0U)
+    {
         bytes[0] ^= 0x01U;
     }
 }
 
 void chaos_io_corrupt_buffer_sample(
-    void *buffer,
-    size_t size,
-    uint32_t index_sample,
-    uint32_t bit_sample)
+    void *buffer, size_t size, uint32_t index_sample, uint32_t bit_sample
+)
 {
     unsigned char *bytes = (unsigned char *)buffer;
     size_t index;
@@ -335,7 +349,8 @@ void chaos_io_corrupt_buffer_sample(
     g_last_corrupt_sample_size = size;
     g_last_corrupt_index_sample = index_sample;
     g_last_corrupt_bit_sample = bit_sample;
-    if (bytes == NULL || size == 0U) {
+    if (bytes == NULL || size == 0U)
+    {
         return;
     }
 
@@ -344,48 +359,50 @@ void chaos_io_corrupt_buffer_sample(
 }
 
 static void chaos_test_capture_iov_lengths(
-    const struct iovec *iov,
-    int iovcnt,
-    int *captured_iovcnt,
-    size_t *captured_lengths)
+    const struct iovec *iov, int iovcnt, int *captured_iovcnt, size_t *captured_lengths
+)
 {
     int index;
 
     assert(captured_iovcnt != NULL);
     assert(captured_lengths != NULL);
     *captured_iovcnt = iovcnt;
-    for (index = 0; index < CHAOS_TEST_IOV_SNAPSHOT_COUNT; ++index) {
+    for (index = 0; index < CHAOS_TEST_IOV_SNAPSHOT_COUNT; ++index)
+    {
         captured_lengths[index] = 0U;
     }
-    if (iov == NULL || iovcnt <= 0) {
+    if (iov == NULL || iovcnt <= 0)
+    {
         return;
     }
 
-    for (index = 0; index < iovcnt && index < CHAOS_TEST_IOV_SNAPSHOT_COUNT; ++index) {
+    for (index = 0; index < iovcnt && index < CHAOS_TEST_IOV_SNAPSHOT_COUNT; ++index)
+    {
         captured_lengths[index] = iov[index].iov_len;
     }
 }
 
-static void chaos_test_fill_iovecs(
-    const struct iovec *iov,
-    int iovcnt,
-    const char *fill,
-    size_t fill_size)
+static void
+chaos_test_fill_iovecs(const struct iovec *iov, int iovcnt, const char *fill, size_t fill_size)
 {
     size_t copied = 0U;
     int index;
 
-    if (iov == NULL || iovcnt <= 0 || fill == NULL || fill_size == 0U) {
+    if (iov == NULL || iovcnt <= 0 || fill == NULL || fill_size == 0U)
+    {
         return;
     }
 
-    for (index = 0; index < iovcnt && copied < fill_size; ++index) {
+    for (index = 0; index < iovcnt && copied < fill_size; ++index)
+    {
         size_t segment = iov[index].iov_len;
 
-        if (segment > fill_size - copied) {
+        if (segment > fill_size - copied)
+        {
             segment = fill_size - copied;
         }
-        if (segment > 0U) {
+        if (segment > 0U)
+        {
             (void)memcpy(iov[index].iov_base, fill + copied, segment);
             copied += segment;
         }
@@ -397,20 +414,26 @@ static int chaos_test_real_open_impl(const char *path, int flags, ...)
     ++g_real_open_calls;
     g_real_open_flags = flags;
     g_real_open_guard = g_chaos_io_tls_guard;
-    if (path != NULL) {
+    if (path != NULL)
+    {
         (void)snprintf(g_real_open_path, sizeof(g_real_open_path), "%s", path);
-    } else {
+    }
+    else
+    {
         g_real_open_path[0] = '\0';
     }
 
-    if ((flags & O_CREAT) != 0) {
+    if ((flags & O_CREAT) != 0)
+    {
         va_list args;
 
         g_real_open_has_mode = 1;
         va_start(args, flags);
         g_real_open_mode = (mode_t)va_arg(args, int);
         va_end(args);
-    } else {
+    }
+    else
+    {
         g_real_open_has_mode = 0;
         g_real_open_mode = 0;
     }
@@ -424,9 +447,12 @@ static int chaos_test_real_openat_impl(int dirfd, const char *path, int flags, .
     g_real_openat_dirfd = dirfd;
     g_real_openat_flags = flags;
     g_real_openat_guard = g_chaos_io_tls_guard;
-    if (path != NULL) {
+    if (path != NULL)
+    {
         (void)snprintf(g_real_openat_path, sizeof(g_real_openat_path), "%s", path);
-    } else {
+    }
+    else
+    {
         g_real_openat_path[0] = '\0';
     }
 
@@ -434,14 +460,17 @@ static int chaos_test_real_openat_impl(int dirfd, const char *path, int flags, .
 #ifdef O_TMPFILE
         || ((flags & O_TMPFILE) == O_TMPFILE)
 #endif
-    ) {
+    )
+    {
         va_list args;
 
         g_real_openat_has_mode = 1;
         va_start(args, flags);
         g_real_openat_mode = (mode_t)va_arg(args, int);
         va_end(args);
-    } else {
+    }
+    else
+    {
         g_real_openat_has_mode = 0;
         g_real_openat_mode = 0;
     }
@@ -456,7 +485,8 @@ static ssize_t chaos_test_real_read_impl(int fd, void *buffer, size_t count)
     g_real_read_count = count;
     g_real_read_guard = g_chaos_io_tls_guard;
 
-    if (buffer != NULL && g_real_read_return > 0) {
+    if (buffer != NULL && g_real_read_return > 0)
+    {
         (void)memcpy(buffer, g_real_read_fill, (size_t)g_real_read_return);
     }
 
@@ -470,7 +500,8 @@ static ssize_t chaos_test_real_readv_impl(int fd, const struct iovec *iov, int i
     g_real_readv_guard = g_chaos_io_tls_guard;
     chaos_test_capture_iov_lengths(iov, iovcnt, &g_real_readv_iovcnt, g_real_readv_lengths);
 
-    if (g_real_readv_return > 0) {
+    if (g_real_readv_return > 0)
+    {
         chaos_test_fill_iovecs(iov, iovcnt, g_real_read_fill, (size_t)g_real_readv_return);
     }
 
@@ -520,12 +551,8 @@ static ssize_t chaos_test_real_sendfile_impl(int out_fd, int in_fd, off_t *offse
 }
 
 static ssize_t chaos_test_real_copy_file_range_impl(
-    int in_fd,
-    off_t *in_offset,
-    int out_fd,
-    off_t *out_offset,
-    size_t count,
-    unsigned int flags)
+    int in_fd, off_t *in_offset, int out_fd, off_t *out_offset, size_t count, unsigned int flags
+)
 {
     ++g_real_copy_file_range_calls;
     g_real_copy_file_range_in_fd = in_fd;
@@ -578,32 +605,38 @@ static int chaos_test_real_unlinkat_impl(int dirfd, const char *path, int flags)
     g_real_unlinkat_dirfd = dirfd;
     g_real_unlinkat_flags = flags;
     g_real_unlinkat_guard = g_chaos_io_tls_guard;
-    if (path != NULL) {
+    if (path != NULL)
+    {
         (void)snprintf(g_real_unlinkat_path, sizeof(g_real_unlinkat_path), "%s", path);
-    } else {
+    }
+    else
+    {
         g_real_unlinkat_path[0] = '\0';
     }
     return g_real_unlinkat_return;
 }
 
-static int chaos_test_real_renameat_impl(
-    int olddirfd,
-    const char *oldpath,
-    int newdirfd,
-    const char *newpath)
+static int
+chaos_test_real_renameat_impl(int olddirfd, const char *oldpath, int newdirfd, const char *newpath)
 {
     ++g_real_renameat_calls;
     g_real_renameat_olddirfd = olddirfd;
     g_real_renameat_newdirfd = newdirfd;
     g_real_renameat_guard = g_chaos_io_tls_guard;
-    if (oldpath != NULL) {
+    if (oldpath != NULL)
+    {
         (void)snprintf(g_real_renameat_oldpath, sizeof(g_real_renameat_oldpath), "%s", oldpath);
-    } else {
+    }
+    else
+    {
         g_real_renameat_oldpath[0] = '\0';
     }
-    if (newpath != NULL) {
+    if (newpath != NULL)
+    {
         (void)snprintf(g_real_renameat_newpath, sizeof(g_real_renameat_newpath), "%s", newpath);
-    } else {
+    }
+    else
+    {
         g_real_renameat_newpath[0] = '\0';
     }
     return g_real_renameat_return;
@@ -617,14 +650,16 @@ static ssize_t chaos_test_real_pread_impl(int fd, void *buffer, size_t count, of
     g_real_pread_offset = offset;
     g_real_pread_guard = g_chaos_io_tls_guard;
 
-    if (buffer != NULL && g_real_pread_return > 0) {
+    if (buffer != NULL && g_real_pread_return > 0)
+    {
         (void)memcpy(buffer, g_real_pread_fill, (size_t)g_real_pread_return);
     }
 
     return g_real_pread_return;
 }
 
-static ssize_t chaos_test_real_preadv_impl(int fd, const struct iovec *iov, int iovcnt, off_t offset)
+static ssize_t
+chaos_test_real_preadv_impl(int fd, const struct iovec *iov, int iovcnt, off_t offset)
 {
     ++g_real_preadv_calls;
     g_real_preadv_fd = fd;
@@ -632,7 +667,8 @@ static ssize_t chaos_test_real_preadv_impl(int fd, const struct iovec *iov, int 
     g_real_preadv_offset = offset;
     chaos_test_capture_iov_lengths(iov, iovcnt, &g_real_preadv_iovcnt, g_real_preadv_lengths);
 
-    if (g_real_preadv_return > 0) {
+    if (g_real_preadv_return > 0)
+    {
         chaos_test_fill_iovecs(iov, iovcnt, g_real_pread_fill, (size_t)g_real_preadv_return);
     }
 
@@ -650,7 +686,8 @@ static ssize_t chaos_test_real_pwrite_impl(int fd, const void *buffer, size_t co
     return g_real_pwrite_return;
 }
 
-static ssize_t chaos_test_real_pwritev_impl(int fd, const struct iovec *iov, int iovcnt, off_t offset)
+static ssize_t
+chaos_test_real_pwritev_impl(int fd, const struct iovec *iov, int iovcnt, off_t offset)
 {
     ++g_real_pwritev_calls;
     g_real_pwritev_fd = fd;
@@ -670,75 +707,97 @@ static void *chaos_test_dlsym_pointer(const void *function_bytes, size_t functio
     return resolved;
 }
 
-#define CHAOS_TEST_DLSYM_RESULT(type, function) \
-    chaos_test_dlsym_pointer(&(type){ function }, sizeof(type))
+#define CHAOS_TEST_DLSYM_RESULT(type, function)                                                    \
+    chaos_test_dlsym_pointer(&(type){function}, sizeof(type))
 
 static void *chaos_test_dlsym(void *handle, const char *symbol)
 {
     (void)handle;
 
     g_dlerror_pending = NULL;
-    if (g_dlsym_fail_symbol != NULL && strcmp(symbol, g_dlsym_fail_symbol) == 0) {
+    if (g_dlsym_fail_symbol != NULL && strcmp(symbol, g_dlsym_fail_symbol) == 0)
+    {
         g_dlerror_pending = "missing symbol";
         return NULL;
     }
-    if (strcmp(symbol, "read") == 0) {
+    if (strcmp(symbol, "read") == 0)
+    {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_read_fn, chaos_test_real_read_impl);
     }
-    if (strcmp(symbol, "write") == 0) {
+    if (strcmp(symbol, "write") == 0)
+    {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_write_fn, chaos_test_real_write_impl);
     }
-    if (strcmp(symbol, "readv") == 0) {
+    if (strcmp(symbol, "readv") == 0)
+    {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_readv_fn, chaos_test_real_readv_impl);
     }
-    if (strcmp(symbol, "writev") == 0) {
+    if (strcmp(symbol, "writev") == 0)
+    {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_writev_fn, chaos_test_real_writev_impl);
     }
 #ifdef __linux__
-    if (strcmp(symbol, "fallocate") == 0) {
+    if (strcmp(symbol, "fallocate") == 0)
+    {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_fallocate_fn, chaos_test_real_fallocate_impl);
     }
-    if (strcmp(symbol, "sendfile") == 0) {
+    if (strcmp(symbol, "sendfile") == 0)
+    {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_sendfile_fn, chaos_test_real_sendfile_impl);
     }
-    if (strcmp(symbol, "copy_file_range") == 0) {
-        return CHAOS_TEST_DLSYM_RESULT(chaos_io_copy_file_range_fn, chaos_test_real_copy_file_range_impl);
+    if (strcmp(symbol, "copy_file_range") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(
+            chaos_io_copy_file_range_fn, chaos_test_real_copy_file_range_impl
+        );
     }
 #endif
-    if (strcmp(symbol, "open") == 0) {
+    if (strcmp(symbol, "open") == 0)
+    {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_open_fn, chaos_test_real_open_impl);
     }
-    if (strcmp(symbol, "openat") == 0) {
+    if (strcmp(symbol, "openat") == 0)
+    {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_openat_fn, chaos_test_real_openat_impl);
     }
-    if (strcmp(symbol, "close") == 0) {
+    if (strcmp(symbol, "close") == 0)
+    {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_close_fn, chaos_test_real_close_impl);
     }
-    if (strcmp(symbol, "fsync") == 0) {
+    if (strcmp(symbol, "fsync") == 0)
+    {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_sync_fn, chaos_test_real_fsync_impl);
     }
-    if (strcmp(symbol, "fdatasync") == 0) {
+    if (strcmp(symbol, "fdatasync") == 0)
+    {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_sync_fn, chaos_test_real_fdatasync_impl);
     }
-    if (strcmp(symbol, "ftruncate") == 0) {
+    if (strcmp(symbol, "ftruncate") == 0)
+    {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_ftruncate_fn, chaos_test_real_ftruncate_impl);
     }
-    if (strcmp(symbol, "unlinkat") == 0) {
+    if (strcmp(symbol, "unlinkat") == 0)
+    {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_unlinkat_fn, chaos_test_real_unlinkat_impl);
     }
-    if (strcmp(symbol, "renameat") == 0) {
+    if (strcmp(symbol, "renameat") == 0)
+    {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_renameat_fn, chaos_test_real_renameat_impl);
     }
-    if (strcmp(symbol, "pread") == 0) {
+    if (strcmp(symbol, "pread") == 0)
+    {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_pread_fn, chaos_test_real_pread_impl);
     }
-    if (strcmp(symbol, "pwrite") == 0) {
+    if (strcmp(symbol, "pwrite") == 0)
+    {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_pwrite_fn, chaos_test_real_pwrite_impl);
     }
-    if (strcmp(symbol, "preadv") == 0) {
+    if (strcmp(symbol, "preadv") == 0)
+    {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_preadv_fn, chaos_test_real_preadv_impl);
     }
-    if (strcmp(symbol, "pwritev") == 0) {
+    if (strcmp(symbol, "pwritev") == 0)
+    {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_pwritev_fn, chaos_test_real_pwritev_impl);
     }
 
@@ -755,6 +814,11 @@ static char *chaos_test_dlerror(void)
 
 static void chaos_test_abort(void)
 {
+    if (g_abort_expected)
+    {
+        g_abort_called = 1;
+        longjmp(g_abort_env, 1);
+    }
     exit(111);
 }
 
@@ -764,29 +828,36 @@ static long chaos_test_syscall(long number, ...)
     long result = -1;
 
     va_start(args, number);
-    if (number == SYS_openat) {
+    if (number == SYS_openat)
+    {
         (void)va_arg(args, int);
         (void)va_arg(args, const char *);
         (void)va_arg(args, int);
         (void)va_arg(args, int);
         ++g_sys_open_calls;
         result = g_sys_open_result;
-    } else if (number == SYS_read) {
+    }
+    else if (number == SYS_read)
+    {
         int fd = va_arg(args, int);
         void *buffer = va_arg(args, void *);
         size_t size = va_arg(args, size_t);
 
         (void)fd;
         ++g_sys_read_calls;
-        if (g_sys_read_result > 0) {
+        if (g_sys_read_result > 0)
+        {
             size_t copy_size = (size_t)g_sys_read_result;
-            if (copy_size > size) {
+            if (copy_size > size)
+            {
                 copy_size = size;
             }
             (void)memcpy(buffer, &g_sys_seed_value, copy_size);
         }
         result = g_sys_read_result;
-    } else if (number == SYS_close) {
+    }
+    else if (number == SYS_close)
+    {
         (void)va_arg(args, int);
         ++g_sys_close_calls;
         result = g_sys_close_result;
@@ -994,6 +1065,8 @@ static void chaos_test_reset_state(void)
 
     g_dlsym_fail_symbol = NULL;
     g_dlerror_pending = NULL;
+    g_abort_expected = 0;
+    g_abort_called = 0;
     g_chaos_io_real_read = NULL;
     g_chaos_io_real_write = NULL;
     g_chaos_io_real_readv = NULL;

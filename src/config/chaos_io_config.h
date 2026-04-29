@@ -17,7 +17,8 @@
  * Config text is parsed into enum values once so the hot path can match rules
  * without repeated string comparisons.
  */
-typedef enum chaos_io_operation {
+typedef enum chaos_io_operation
+{
     CHAOS_IO_OP_INVALID = -1,
     CHAOS_IO_OP_READ = 0,
     CHAOS_IO_OP_WRITE,
@@ -40,7 +41,8 @@ typedef enum chaos_io_operation {
  * Validation happens at parse time, so wrappers can switch on the enum directly
  * without re-checking string tokens or unsupported combinations.
  */
-typedef enum chaos_io_effect {
+typedef enum chaos_io_effect
+{
     CHAOS_IO_EFFECT_INVALID = -1,
     CHAOS_IO_EFFECT_ERRNO = 0,
     CHAOS_IO_EFFECT_LATENCY,
@@ -54,7 +56,8 @@ typedef enum chaos_io_effect {
  * Rules are stored in the active snapshot exactly in this form so wrapper code
  * can make decisions without reparsing text or allocating temporary structures.
  */
-typedef struct chaos_io_rule {
+typedef struct chaos_io_rule
+{
     char path_prefix[CHAOS_IO_MAX_RULE_PATH];
     size_t path_len;
     chaos_io_operation_t operation;
@@ -88,9 +91,8 @@ int chaos_io_config_prepare(void);
  * cheapest possible lookup path.
  */
 int chaos_io_config_match_loaded(
-    chaos_io_operation_t operation,
-    const char *path,
-    chaos_io_rule_t *rule);
+    chaos_io_operation_t operation, const char *path, chaos_io_rule_t *rule
+);
 
 /*
  * Refreshes config state if necessary and then matches a path.
@@ -99,9 +101,8 @@ int chaos_io_config_match_loaded(
  * freshness, permanent exclusions, and longest-prefix rule selection.
  */
 int chaos_io_config_match_path(
-    chaos_io_operation_t operation,
-    const char *path,
-    chaos_io_rule_t *rule);
+    chaos_io_operation_t operation, const char *path, chaos_io_rule_t *rule
+);
 
 /*
  * Parses one config line into a single `chaos_io_rule_t`.
@@ -136,6 +137,7 @@ int chaos_io_config_select_rule(
     size_t rule_count,
     chaos_io_operation_t operation,
     const char *path,
-    chaos_io_rule_t *rule);
+    chaos_io_rule_t *rule
+);
 
 #endif

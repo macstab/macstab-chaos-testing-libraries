@@ -23,7 +23,8 @@ static void chaos_test_reset_sleep_state(void)
     size_t index;
 
     g_sleep_count = 0U;
-    for (index = 0U; index < sizeof(g_sleep_chunks) / sizeof(g_sleep_chunks[0]); ++index) {
+    for (index = 0U; index < sizeof(g_sleep_chunks) / sizeof(g_sleep_chunks[0]); ++index)
+    {
         g_sleep_chunks[index] = 0U;
     }
 }
@@ -67,10 +68,10 @@ static void test_torn_helpers(void)
 
 static void test_corrupt_helpers(void)
 {
-    unsigned char buffer[] = { 0x00U, 0x00U, 0x00U };
-    unsigned char expected[] = { 0x00U, 0x20U, 0x00U };
-    unsigned char seeded_buffer[] = { 0x00U, 0x00U, 0x00U, 0x00U };
-    unsigned char seeded_expected[] = { 0x00U, 0x00U, 0x00U, 0x00U };
+    unsigned char buffer[] = {0x00U, 0x00U, 0x00U};
+    unsigned char expected[] = {0x00U, 0x20U, 0x00U};
+    unsigned char seeded_buffer[] = {0x00U, 0x00U, 0x00U, 0x00U};
+    unsigned char seeded_expected[] = {0x00U, 0x00U, 0x00U, 0x00U};
 
     chaos_io_corrupt_buffer_sample(NULL, sizeof(buffer), 0U, 0U);
     chaos_io_corrupt_buffer_sample(buffer, 0U, 0U, 0U);
@@ -84,10 +85,8 @@ static void test_corrupt_helpers(void)
         uint32_t expected_bit_sample = chaos_io_prng_next_u32();
 
         chaos_io_corrupt_buffer_sample(
-            seeded_expected,
-            sizeof(seeded_expected),
-            expected_index_sample,
-            expected_bit_sample);
+            seeded_expected, sizeof(seeded_expected), expected_index_sample, expected_bit_sample
+        );
     }
 
     chaos_io_prng_seed_thread(99U);

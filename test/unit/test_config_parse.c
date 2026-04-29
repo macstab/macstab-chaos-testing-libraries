@@ -155,7 +155,9 @@ static void test_helper_primitives(void)
     assert(!chaos_io_effect_allowed(CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_INVALID));
 
     assert(chaos_io_config_normalize_mtime_hash(CHAOS_IO_MTIME_MISSING) != CHAOS_IO_MTIME_MISSING);
-    assert(chaos_io_config_normalize_mtime_hash(CHAOS_IO_MTIME_RELOADING) != CHAOS_IO_MTIME_RELOADING);
+    assert(
+        chaos_io_config_normalize_mtime_hash(CHAOS_IO_MTIME_RELOADING) != CHAOS_IO_MTIME_RELOADING
+    );
     assert(chaos_io_config_normalize_mtime_hash(CHAOS_IO_MTIME_UNKNOWN) != CHAOS_IO_MTIME_UNKNOWN);
     assert(chaos_io_config_normalize_mtime_hash(7U) == 7U);
 
@@ -173,7 +175,8 @@ static void test_helper_primitives(void)
 
 static void test_parse_line_valid_cases(void)
 {
-    static const struct {
+    static const struct
+    {
         const char *line;
         chaos_io_operation_t operation;
         chaos_io_effect_t effect;
@@ -181,27 +184,29 @@ static void test_parse_line_valid_cases(void)
         double probability;
         unsigned int latency_ms;
     } cases[] = {
-        { "/data:read:EIO:0.1", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_ERRNO, EIO, 0.1, 0U },
-        { "/data:write:ENOSPC:0.2", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_ERRNO, ENOSPC, 0.2, 0U },
-        { "/data:open:EMFILE:0.3", CHAOS_IO_OP_OPEN, CHAOS_IO_EFFECT_ERRNO, EMFILE, 0.3, 0U },
-        { "/data:close:EDQUOT:0.4", CHAOS_IO_OP_CLOSE, CHAOS_IO_EFFECT_ERRNO, EDQUOT, 0.4, 0U },
-        { "/data:fsync:EROFS:0.5", CHAOS_IO_OP_FSYNC, CHAOS_IO_EFFECT_ERRNO, EROFS, 0.5, 0U },
-        { "/data:fdatasync:EACCES:0.6", CHAOS_IO_OP_FDATASYNC, CHAOS_IO_EFFECT_ERRNO, EACCES, 0.6, 0U },
-        { "/data:pread:ENOENT:0.7", CHAOS_IO_OP_PREAD, CHAOS_IO_EFFECT_ERRNO, ENOENT, 0.7, 0U },
-        { "/data:pwrite:ENFILE:0.8", CHAOS_IO_OP_PWRITE, CHAOS_IO_EFFECT_ERRNO, ENFILE, 0.8, 0U },
-        { "/data:truncate:EIO:0.2", CHAOS_IO_OP_TRUNCATE, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U },
-        { "/data:allocate:EIO:0.2", CHAOS_IO_OP_ALLOCATE, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U },
-        { "/data:unlink:EIO:0.2", CHAOS_IO_OP_UNLINK, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U },
-        { "/data:rename_from:EIO:0.2", CHAOS_IO_OP_RENAME_FROM, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U },
-        { "/data:rename_to:EIO:0.2", CHAOS_IO_OP_RENAME_TO, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U },
-        { "/data:write:LATENCY:25", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_LATENCY, 0, 0.0, 25U },
-        { "/data:truncate:LATENCY:25", CHAOS_IO_OP_TRUNCATE, CHAOS_IO_EFFECT_LATENCY, 0, 0.0, 25U },
-        { "/data:write:TORN:0.9", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_TORN, 0, 0.9, 0U },
-        { "/data:read:CORRUPT:1.0", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_CORRUPT, 0, 1.0, 0U }
+        {"/data:read:EIO:0.1", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_ERRNO, EIO, 0.1, 0U},
+        {"/data:write:ENOSPC:0.2", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_ERRNO, ENOSPC, 0.2, 0U},
+        {"/data:open:EMFILE:0.3", CHAOS_IO_OP_OPEN, CHAOS_IO_EFFECT_ERRNO, EMFILE, 0.3, 0U},
+        {"/data:close:EDQUOT:0.4", CHAOS_IO_OP_CLOSE, CHAOS_IO_EFFECT_ERRNO, EDQUOT, 0.4, 0U},
+        {"/data:fsync:EROFS:0.5", CHAOS_IO_OP_FSYNC, CHAOS_IO_EFFECT_ERRNO, EROFS, 0.5, 0U},
+        {"/data:fdatasync:EACCES:0.6", CHAOS_IO_OP_FDATASYNC, CHAOS_IO_EFFECT_ERRNO, EACCES, 0.6, 0U
+        },
+        {"/data:pread:ENOENT:0.7", CHAOS_IO_OP_PREAD, CHAOS_IO_EFFECT_ERRNO, ENOENT, 0.7, 0U},
+        {"/data:pwrite:ENFILE:0.8", CHAOS_IO_OP_PWRITE, CHAOS_IO_EFFECT_ERRNO, ENFILE, 0.8, 0U},
+        {"/data:truncate:EIO:0.2", CHAOS_IO_OP_TRUNCATE, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U},
+        {"/data:allocate:EIO:0.2", CHAOS_IO_OP_ALLOCATE, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U},
+        {"/data:unlink:EIO:0.2", CHAOS_IO_OP_UNLINK, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U},
+        {"/data:rename_from:EIO:0.2", CHAOS_IO_OP_RENAME_FROM, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U},
+        {"/data:rename_to:EIO:0.2", CHAOS_IO_OP_RENAME_TO, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U},
+        {"/data:write:LATENCY:25", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_LATENCY, 0, 0.0, 25U},
+        {"/data:truncate:LATENCY:25", CHAOS_IO_OP_TRUNCATE, CHAOS_IO_EFFECT_LATENCY, 0, 0.0, 25U},
+        {"/data:write:TORN:0.9", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_TORN, 0, 0.9, 0U},
+        {"/data:read:CORRUPT:1.0", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_CORRUPT, 0, 1.0, 0U}
     };
     size_t index;
 
-    for (index = 0U; index < sizeof(cases) / sizeof(cases[0]); ++index) {
+    for (index = 0U; index < sizeof(cases) / sizeof(cases[0]); ++index)
+    {
         char line[128];
         chaos_io_rule_t rule;
 
@@ -209,14 +214,17 @@ static void test_parse_line_valid_cases(void)
         assert(chaos_io_config_parse_line(line, &rule) == 1);
         assert(rule.operation == cases[index].operation);
         assert(rule.effect == cases[index].effect);
-        if (rule.effect == CHAOS_IO_EFFECT_ERRNO) {
+        if (rule.effect == CHAOS_IO_EFFECT_ERRNO)
+        {
             assert(rule.errnum == cases[index].errnum);
             assert(rule.probability == cases[index].probability);
         }
-        if (rule.effect == CHAOS_IO_EFFECT_LATENCY) {
+        if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
+        {
             assert(rule.latency_ms == cases[index].latency_ms);
         }
-        if (rule.effect == CHAOS_IO_EFFECT_TORN || rule.effect == CHAOS_IO_EFFECT_CORRUPT) {
+        if (rule.effect == CHAOS_IO_EFFECT_TORN || rule.effect == CHAOS_IO_EFFECT_CORRUPT)
+        {
             assert(rule.probability == cases[index].probability);
         }
     }
@@ -276,19 +284,19 @@ static void test_parse_line_invalid_cases(void)
     (void)snprintf(
         long_path_line + CHAOS_IO_MAX_RULE_PATH + 1U,
         sizeof(long_path_line) - (CHAOS_IO_MAX_RULE_PATH + 1U),
-        "read:EIO:0.1");
+        "read:EIO:0.1"
+    );
     assert(chaos_io_config_parse_line(long_path_line, &rule) == -1);
 }
 
 static void test_parse_buffer_and_selection(void)
 {
-    char buffer[] =
-        "# comment\n"
-        "\n"
-        "*:open:EMFILE:0.05\n"
-        "/data:write:EIO:0.30\n"
-        "/data/wal.log:write:ENOSPC:1.0\n"
-        "/data/wal/:read:CORRUPT:0.20\n";
+    char buffer[] = "# comment\n"
+                    "\n"
+                    "*:open:EMFILE:0.05\n"
+                    "/data:write:EIO:0.30\n"
+                    "/data/wal.log:write:ENOSPC:1.0\n"
+                    "/data/wal/:read:CORRUPT:0.20\n";
     chaos_io_rule_t rules[CHAOS_IO_MAX_RULES];
     chaos_io_rule_t match;
     size_t rule_count = 0U;
@@ -311,12 +319,22 @@ static void test_parse_buffer_and_selection(void)
     assert(chaos_io_config_select_rule(NULL, rule_count, CHAOS_IO_OP_WRITE, "/data", &match) == 0);
     assert(chaos_io_config_select_rule(rules, rule_count, CHAOS_IO_OP_WRITE, NULL, &match) == 0);
     assert(chaos_io_config_select_rule(rules, rule_count, CHAOS_IO_OP_WRITE, "/data", NULL) == 0);
-    assert(chaos_io_config_select_rule(rules, rule_count, CHAOS_IO_OP_WRITE, "/data/wal.log", &match) == 1);
+    assert(
+        chaos_io_config_select_rule(
+            rules, rule_count, CHAOS_IO_OP_WRITE, "/data/wal.log", &match
+        ) == 1
+    );
     assert(match.errnum == ENOSPC);
-    assert(chaos_io_config_select_rule(rules, rule_count, CHAOS_IO_OP_OPEN, "/tmp/file", &match) == 1);
+    assert(
+        chaos_io_config_select_rule(rules, rule_count, CHAOS_IO_OP_OPEN, "/tmp/file", &match) == 1
+    );
     assert(strcmp(match.path_prefix, "*") == 0);
-    assert(chaos_io_config_select_rule(rules, rule_count, CHAOS_IO_OP_WRITE, "/tmp/file", &match) == 0);
-    assert(chaos_io_config_select_rule(rules, rule_count, CHAOS_IO_OP_CLOSE, "/tmp/file", &match) == 0);
+    assert(
+        chaos_io_config_select_rule(rules, rule_count, CHAOS_IO_OP_WRITE, "/tmp/file", &match) == 0
+    );
+    assert(
+        chaos_io_config_select_rule(rules, rule_count, CHAOS_IO_OP_CLOSE, "/tmp/file", &match) == 0
+    );
 }
 
 static void test_parse_buffer_error_paths(void)
@@ -333,7 +351,8 @@ static void test_parse_buffer_error_paths(void)
     overflow_buffer = (char *)malloc((CHAOS_IO_MAX_RULES + 2U) * 20U);
     assert(overflow_buffer != NULL);
     overflow_buffer[0] = '\0';
-    for (index = 0U; index <= CHAOS_IO_MAX_RULES; ++index) {
+    for (index = 0U; index <= CHAOS_IO_MAX_RULES; ++index)
+    {
         (void)strcat(overflow_buffer, "*:open:EIO:0.0\n");
     }
 

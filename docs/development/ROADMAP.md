@@ -1,6 +1,8 @@
 # Roadmap
 
-This repository currently ships one library: `libchaos-io`.
+This repository currently ships implemented `libchaos-io`, `libchaos-net`,
+`libchaos-dns`, `libchaos-time`, `libchaos-process`, and `libchaos-memory`
+libraries.
 
 The roadmap below answers two separate questions:
 
@@ -110,6 +112,86 @@ Local verification snapshot for the current implementation:
 This means the implementation is materially ahead of the roadmap, but the
 current `openat`, vectored I/O, `sendfile`, and `copy_file_range` work is
 locally proven across the required libc and architecture matrix.
+
+Implemented in `libchaos-net`:
+
+- `socket`
+  - backed by `socket()` and `socketpair()`
+- `bind`
+- `listen`
+- `connect`
+- `accept`
+  - backed by `accept()` and Linux `accept4()`
+- `shutdown`
+  - backed by `shutdown()`
+- `poll`
+  - backed by `poll()`, `ppoll()`, `select()`, `pselect()`, and Linux
+    `epoll_wait()` plus `epoll_pwait()`
+- `send`
+  - backed by `send()`, `sendto()`, `sendmsg()`, and Linux `sendmmsg()`
+- `recv`
+  - backed by `recv()`, `recvfrom()`, `recvmsg()`, and Linux `recvmmsg()`
+- `dns`
+  - backed by `getaddrinfo()`
+
+Current `libchaos-net` effects:
+
+- `ERRNO`
+- `LATENCY`
+- `CORRUPT` for receive-side buffers
+- `TIMEOUT` for readiness waits
+- `GAI` for `getaddrinfo()`
+
+Current `libchaos-net` verification snapshot:
+
+- passed: Linux amd64 Docker unit run
+- passed: Linux arm64 Docker unit run
+- passed: Linux amd64 Docker coverage run
+- passed: Linux arm64 Docker coverage run
+- passed: glibc amd64 Docker runtime
+- passed: glibc arm64 Docker runtime
+- passed: musl amd64 Docker runtime
+- passed: musl arm64 Docker runtime
+
+Current `libchaos-net` gaps:
+
+- `libchaos-net` deliberately does not own `read()`, `write()`, or `close()`
+  so it can compose with `libchaos-io`
+- Linux `epoll_*` matching is intentionally best-effort and derived from
+  `/proc/self/fdinfo/<epfd>` instead of an owned membership cache
+
+Implemented in `libchaos-process`:
+
+- `pthread_create`
+- `fork`
+- `posix_spawn`
+- `posix_spawnp`
+- `execve`
+- `execveat`
+- `waitpid`
+
+Current `libchaos-process` effects:
+
+- `ERRNO`
+- `LATENCY`
+- `FAIL_AFTER`
+
+Current `libchaos-process` verification snapshot:
+
+- passed: `make unit`
+- passed: `make coverage`
+- passed: glibc amd64 Docker runtime
+- passed: glibc arm64 Docker runtime
+- passed: musl amd64 Docker runtime
+- passed: musl arm64 Docker runtime
+
+Current `libchaos-process` gaps:
+
+- selectors are symbol-only today
+- `waitid()`, `kill()`, `pthread_kill()`, `clone*()`, and `vfork()` remain
+  future work
+- `execveat()` depends on the current libc exporting that symbol; some musl
+  environments do not
 
 ## Phase 1: Close The Biggest Real-World Gaps
 
@@ -237,6 +319,48 @@ Notes:
 
 - `ftruncate` and `fallocate` are useful for realistic storage and capacity
   failures.
+
+## libchaos-net Phase 1: Endpoint-Based Network Surface
+
+- [x] Add a dedicated `/tmp/.chaos-net.conf` grammar with endpoint selectors.
+  - Implemented selectors: `*`, `tcp4`, `tcp6`, `udp4`, `udp6`, `unix`, and
+    `dns`.
+  - Cross-target runtime gate passed locally on glibc/musl and amd64/arm64.
+- [x] Add endpoint-based matching instead of fd-number matching.
+  - Matching now uses peer, local, or DNS identities depending on the logical
+    operation.
+  - Cross-target runtime gate passed locally on glibc/musl and amd64/arm64.
+- [x] Add the first socket wrapper set.
+  - Implemented operations: `bind`, `listen`, `connect`, `accept`,
+    `send`, `recv`, and `dns`.
+  - `accept` is backed by `accept()` and Linux `accept4()`.
+  - `send` is backed by `send()`, `sendto()`, and `sendmsg()`.
+  - `recv` is backed by `recv()`, `recvfrom()`, and `recvmsg()`.
+  - `dns` is backed by `getaddrinfo()`.
+  - Cross-target runtime gate passed locally on glibc/musl and amd64/arm64.
+- [x] Add the first network effect set.
+  - Implemented effects: `ERRNO`, `LATENCY`, `CORRUPT`, and `GAI`.
+  - `CORRUPT` is receive-only.
+  - `GAI` is DNS-only.
+  - Cross-target runtime gate passed locally on glibc/musl and amd64/arm64.
+- [x] Add the remaining planned network wrapper surface.
+  - Implemented operations now also include `socket`, `shutdown`, and `poll`.
+  - `socket` is backed by `socket()` and `socketpair()`.
+  - `poll` is backed by `poll()`, `ppoll()`, `select()`, `pselect()`, and
+    Linux `epoll_wait()` plus `epoll_pwait()`.
+  - `send` now also covers Linux `sendmmsg()`.
+  - `recv` now also covers Linux `recvmmsg()`.
+  - Cross-target runtime gate passed locally on glibc/musl and amd64/arm64.
+- [x] Add the remaining planned network effect set.
+  - Implemented effect: `TIMEOUT` for readiness waits.
+  - Cross-target runtime gate passed locally on glibc/musl and amd64/arm64.
+- [x] Add Docker runtime probes for `libchaos-net`.
+  - Dedicated glibc and Alpine runtime scripts now exist.
+  - Cross-target runtime gate passed locally on glibc/musl and amd64/arm64.
+- [x] Promote changed `libchaos-net` sources into the strict `100.00%` source
+  coverage gate.
+  - `check_coverage.sh` now asserts `src/net/*.c` at `100.00%` line coverage.
+  - Linux amd64 and arm64 Docker coverage runs pass.
 - `renameat` and `unlinkat` matter for atomic replace patterns, compaction, WAL
   rotation, and cleanup behavior.
 
@@ -296,22 +420,33 @@ Candidate future library: `libchaos-net`
 - `getaddrinfo`
 - `poll`
 - `epoll_wait`
-
+YOU 
 ### Time Chaos
 
-Candidate future library: `libchaos-time`
+Current shipped library: `libchaos-time`
 
 - `clock_gettime`
 - `nanosleep`
 - `usleep`
 
+Candidate future time hooks:
+
+- `clock_nanosleep`
+- `gettimeofday`
+
 ### Memory Chaos
 
-Candidate future library: `libchaos-mem`
+Current shipped library: `libchaos-memory`
 
-- `mmap` for anonymous memory failures
+- `mmap`
+- `munmap`
 - `madvise`
 - `mprotect`
+
+Candidate future memory hooks:
+
+- `mmap64`
+- `mremap`
 - `brk`
 - `sbrk`
 

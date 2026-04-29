@@ -49,10 +49,8 @@ size_t chaos_io_torn_count(size_t requested);
  * Tests use this deterministic form to assert exact corruption behavior.
  */
 void chaos_io_corrupt_buffer_sample(
-    void *buffer,
-    size_t size,
-    uint32_t index_sample,
-    uint32_t bit_sample);
+    void *buffer, size_t size, uint32_t index_sample, uint32_t bit_sample
+);
 
 /*
  * Corrupts one random bit in a read buffer.

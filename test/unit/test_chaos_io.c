@@ -9,6 +9,16 @@ static void test_resolve_symbol_and_seed_material(void)
     assert(resolved_read == chaos_test_real_read_impl);
 
     chaos_test_reset_state();
+    g_dlsym_fail_symbol = "read";
+    g_abort_expected = 1;
+    if (setjmp(g_abort_env) == 0)
+    {
+        chaos_io_resolve_symbol(&resolved_read, "read");
+        assert(0);
+    }
+    assert(g_abort_called == 1);
+
+    chaos_test_reset_state();
     g_sys_open_result = 9;
     g_sys_read_result = (long)sizeof(uint64_t);
     assert(chaos_io_read_seed_material() == UINT64_C(0x0123456789abcdef));
@@ -169,17 +179,23 @@ static void test_fsops_helpers_and_wrappers(void)
     assert(strcmp(g_last_match_loaded_path, "/tmp/unlink.bin") == 0);
 
     chaos_test_reset_state();
-    assert(chaos_io_match_rename_rule(AT_FDCWD, "/tmp/from.bin", AT_FDCWD, "/tmp/to.bin", NULL) == 0);
+    assert(
+        chaos_io_match_rename_rule(AT_FDCWD, "/tmp/from.bin", AT_FDCWD, "/tmp/to.bin", NULL) == 0
+    );
     assert(chaos_io_match_rename_rule(AT_FDCWD, NULL, AT_FDCWD, NULL, &rule) == 0);
 
     g_config_prepare_result = 0;
-    assert(chaos_io_match_rename_rule(AT_FDCWD, "/tmp/from.bin", AT_FDCWD, "/tmp/to.bin", &rule) == 0);
+    assert(
+        chaos_io_match_rename_rule(AT_FDCWD, "/tmp/from.bin", AT_FDCWD, "/tmp/to.bin", &rule) == 0
+    );
     assert(g_config_prepare_calls == 1);
 
     chaos_test_reset_state();
     g_config_prepare_result = 1;
     g_config_match_loaded_result = 0;
-    assert(chaos_io_match_rename_rule(AT_FDCWD, "/tmp/from.bin", AT_FDCWD, "/tmp/to.bin", &rule) == 0);
+    assert(
+        chaos_io_match_rename_rule(AT_FDCWD, "/tmp/from.bin", AT_FDCWD, "/tmp/to.bin", &rule) == 0
+    );
     assert(g_config_match_loaded_calls == 2);
 
     chaos_test_reset_state();
@@ -188,12 +204,10 @@ static void test_fsops_helpers_and_wrappers(void)
     g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
     g_config_rule.errnum = EACCES;
     g_config_rule.path_len = strlen("/tmp/from.bin");
-    assert(chaos_io_match_rename_rule(
-        AT_FDCWD,
-        "/tmp/from.bin",
-        AT_FDCWD,
-        "/proc/self/maps",
-        &rule) == 1);
+    assert(
+        chaos_io_match_rename_rule(AT_FDCWD, "/tmp/from.bin", AT_FDCWD, "/proc/self/maps", &rule) ==
+        1
+    );
     assert(rule.effect == CHAOS_IO_EFFECT_ERRNO);
     assert(g_last_match_loaded_operation == CHAOS_IO_OP_RENAME_FROM);
     assert(strcmp(g_last_match_loaded_path, "/tmp/from.bin") == 0);
@@ -204,12 +218,9 @@ static void test_fsops_helpers_and_wrappers(void)
     g_config_rule.effect = CHAOS_IO_EFFECT_LATENCY;
     g_config_rule.latency_ms = 7U;
     g_config_rule.path_len = strlen("/tmp/to.bin");
-    assert(chaos_io_match_rename_rule(
-        AT_FDCWD,
-        "/proc/self/maps",
-        AT_FDCWD,
-        "/tmp/to.bin",
-        &rule) == 1);
+    assert(
+        chaos_io_match_rename_rule(AT_FDCWD, "/proc/self/maps", AT_FDCWD, "/tmp/to.bin", &rule) == 1
+    );
     assert(rule.effect == CHAOS_IO_EFFECT_LATENCY);
     assert(g_last_match_loaded_operation == CHAOS_IO_OP_RENAME_TO);
     assert(strcmp(g_last_match_loaded_path, "/tmp/to.bin") == 0);
@@ -341,7 +352,9 @@ static void test_fsops_helpers_and_wrappers(void)
     chaos_test_reset_state();
     chaos_test_bind_real_functions();
     g_real_renameat_return = -1;
-    assert(renameat(AT_FDCWD, "/tmp/rename-from-fail.bin", AT_FDCWD, "/tmp/rename-to-fail.bin") == -1);
+    assert(
+        renameat(AT_FDCWD, "/tmp/rename-from-fail.bin", AT_FDCWD, "/tmp/rename-to-fail.bin") == -1
+    );
     assert(g_fdcache_reset_calls == 0);
 
     chaos_test_reset_state();
@@ -428,7 +441,9 @@ static void test_open_wrapper(void)
     g_config_rule.effect = CHAOS_IO_EFFECT_LATENCY;
     assert(getcwd(cwd, sizeof(cwd)) != NULL);
     assert(open("relative-open.bin", O_RDONLY) == 17);
-    assert(chaos_io_join_paths(expected_path, sizeof(expected_path), cwd, "relative-open.bin") == 1);
+    assert(
+        chaos_io_join_paths(expected_path, sizeof(expected_path), cwd, "relative-open.bin") == 1
+    );
     assert(strcmp(g_last_match_path, expected_path) == 0);
     assert(strcmp(g_last_store_path, expected_path) == 0);
 }
@@ -454,7 +469,9 @@ static void test_openat_wrapper(void)
     g_config_rule.effect = CHAOS_IO_EFFECT_LATENCY;
     assert(getcwd(cwd, sizeof(cwd)) != NULL);
     assert(openat(AT_FDCWD, "relative-openat.bin", O_RDONLY) == 19);
-    assert(chaos_io_join_paths(expected_path, sizeof(expected_path), cwd, "relative-openat.bin") == 1);
+    assert(
+        chaos_io_join_paths(expected_path, sizeof(expected_path), cwd, "relative-openat.bin") == 1
+    );
     assert(strcmp(g_last_match_path, expected_path) == 0);
     assert(strcmp(g_last_store_path, expected_path) == 0);
     assert(g_latency_calls == 1);
@@ -497,7 +514,7 @@ static void test_openat_wrapper(void)
 
 static void test_read_and_write_wrappers(void)
 {
-    char buffer[8] = { 0 };
+    char buffer[8] = {0};
 
     chaos_test_reset_state();
     chaos_test_bind_real_functions();
@@ -596,8 +613,8 @@ static void test_vectored_helpers(void)
 {
     struct iovec source[2];
     struct iovec target[2];
-    char first[4] = { 'a', 'b', 'c', 'd' };
-    char second[4] = { 'e', 'f', 'g', 'h' };
+    char first[4] = {'a', 'b', 'c', 'd'};
+    char second[4] = {'e', 'f', 'g', 'h'};
     size_t total = 0U;
     int target_count = 0;
     uint64_t seed = 1U;
@@ -660,9 +677,11 @@ static void test_vectored_helpers(void)
     chaos_test_reset_state();
     source[0].iov_len = 1U;
     source[1].iov_len = 1U;
-    while (seed < 256U) {
+    while (seed < 256U)
+    {
         chaos_io_prng_seed_thread(seed);
-        if ((chaos_io_prng_next_u32() % 2U) == 1U) {
+        if ((chaos_io_prng_next_u32() % 2U) == 1U)
+        {
             break;
         }
         ++seed;
@@ -676,8 +695,8 @@ static void test_vectored_helpers(void)
 
 static void test_readv_and_writev_wrappers(void)
 {
-    char first[3] = { 0 };
-    char second[3] = { 0 };
+    char first[3] = {0};
+    char second[3] = {0};
     struct iovec empty_iov[1];
     struct iovec read_iov[2];
     struct iovec write_iov[2];
@@ -927,8 +946,8 @@ static void test_copy_file_range_wrapper(void)
 
 static void test_preadv_and_pwritev_wrappers(void)
 {
-    char first[3] = { 0 };
-    char second[3] = { 0 };
+    char first[3] = {0};
+    char second[3] = {0};
     struct iovec empty_iov[1];
     struct iovec read_iov[2];
     struct iovec write_iov[2];
@@ -1062,7 +1081,7 @@ static void test_preadv_and_pwritev_wrappers(void)
 
 static void test_close_sync_and_positioned_wrappers(void)
 {
-    char buffer[8] = { 0 };
+    char buffer[8] = {0};
 
     chaos_test_reset_state();
     chaos_test_bind_real_functions();
