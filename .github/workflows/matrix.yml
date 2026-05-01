@@ -13,6 +13,9 @@ concurrency:
   group: matrix-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   cross-build:
     name: ${{ matrix.target.libc }}-${{ matrix.target.arch }} (${{ matrix.target.runner }})
@@ -28,11 +31,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Docker buildx prerequisites
+      - name: Install build prerequisites
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential gcc make docker-buildx
+            build-essential gcc make
 
       - name: Set up Docker buildx
         uses: docker/setup-buildx-action@v3
