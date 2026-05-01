@@ -220,7 +220,7 @@ MATRIX_RUNTIME_TESTS := \
 	$(TEST_RUNTIME_DIR)/test_process_alpine.sh
 
 .PHONY: all check clean coverage native test unit docker-build-all fmt fmt-check qa test-matrix \
-	fuzz fuzz-clean \
+	fuzz fuzz-clean verify-docs \
 	cross-glibc-amd64 cross-glibc-arm64 cross-musl-amd64 cross-musl-arm64 \
 	$(foreach lib,$(LIB_NAMES),native-$(lib)) \
 	$(foreach lib,$(LIB_NAMES),cross-glibc-amd64-$(lib)) \
@@ -451,3 +451,6 @@ $(FUZZ_BUILD_DIR)/fuzz_%: test/fuzz/fuzz_%.c | $(FUZZ_BUILD_DIR)
 
 fuzz-clean:
 	rm -rf $(FUZZ_BUILD_DIR)
+
+verify-docs:
+	@bash scripts/run_verified_examples.sh

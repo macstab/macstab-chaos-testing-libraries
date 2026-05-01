@@ -55,6 +55,8 @@ jobs:
           path: build-coverage/
           retention-days: 14
           if-no-files-found: ignore
+      - name: Verify doc examples
+        run: make verify-docs
 
   integration:
     name: native integration tests

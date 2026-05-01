@@ -977,6 +977,13 @@ Examples:
 *:open:EMFILE:0.05
 ```
 
+The parser rejects malformed lines at load time.
+Verify the parser accepts and rejects the expected inputs:
+
+```sh verified
+make unit 2>&1 | grep -E 'PROPTEST|test_config|OK'
+```
+
 ### Matching rules
 
 - longest prefix wins

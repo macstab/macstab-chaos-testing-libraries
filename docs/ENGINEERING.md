@@ -729,6 +729,18 @@ The tests are intentionally close to the implementation.
 This is a low-level systems library. Direct source inclusion in tests is a
 feature here, not a smell.
 
+To verify the complete test suite passes from a clean state:
+
+```sh verified
+make unit
+```
+
+To verify all six native shared libraries build successfully (Linux only):
+
+```sh verified
+[ "$(uname -s)" != "Linux" ] && exit 0; make native
+```
+
 ## Extending The Library Safely
 
 ### Adding a new interposed symbol to an existing subsystem
