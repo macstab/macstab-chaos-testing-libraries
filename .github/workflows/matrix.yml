@@ -34,14 +34,24 @@ jobs:
       - name: Install build prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential gcc make
+          PKGS="build-essential gcc make"
+          if [ "${{ matrix.target.libc }}" = "musl" ]; then
+            PKGS="$PKGS musl-tools"
+          fi
+          sudo apt-get install -y --no-install-recommends $PKGS
 
       - name: Set up Docker buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Cross-build ${{ matrix.target.libc }}-${{ matrix.target.arch }}
-        run: make cross-${{ matrix.target.libc }}-${{ matrix.target.arch }}
+        run: |
+          # On native arm64 runners musl-tools ships musl-gcc (not aarch64-linux-musl-gcc)
+          EXTRA_ARGS=""
+          if [ "${{ matrix.target.libc }}" = "musl" ] && \
+             [ "${{ matrix.target.arch }}" = "arm64" ]; then
+            EXTRA_ARGS="MUSL_ARM64_CC=musl-gcc"
+          fi
+          make cross-${{ matrix.target.libc }}-${{ matrix.target.arch }} $EXTRA_ARGS
 
       - name: List built shared objects
         run: |
