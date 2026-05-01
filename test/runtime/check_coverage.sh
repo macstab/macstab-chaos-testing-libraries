@@ -130,3 +130,7 @@ check_target "$PROCESS_RUNTIME_GCNO" "src/process/chaos_process.c" "100.00"
 check_target "$CHAOS_PROCESS_GCNO" "src/process/chaos_process_hooks.c" "100.00"
 
 echo "coverage check passed"
+
+# gcov writes .gcov annotation files into the working directory; remove them
+# now that the gate has passed — they are intermediate artifacts, not outputs.
+rm -f ./*.gcov
