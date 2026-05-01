@@ -938,6 +938,75 @@ source coverage gate (ensuring all buffer-access branches are tested), and
 | `-fno-asynchronous-unwind-tables` | No .eh_frame                                | Removes ~2-5 KB; no C++ unwinding needed  |
 | `-fno-stack-protector`            | No stack canary                             | Avoids write() re-entrancy in canary path |
 
+## Verified Doc Examples
+
+Documentation examples rot. A command shown in a doc that no longer works is
+worse than no command at all — it signals the docs are not maintained.
+
+This repository uses an opt-in tagging convention to prevent that. Any fenced
+shell block in `docs/*.md` tagged with `verified` is automatically extracted
+and executed as part of CI:
+
+````markdown
+```sh verified
+make unit
+```
+````
+
+Untagged blocks — placeholder paths, conceptual commands, Linux-only sequences,
+pseudo-code — are never touched. Only blocks you explicitly mark are run.
+
+### Safety model
+
+Each block runs in a subprocess with:
+
+- `set -euo pipefail` — the first failing command aborts that block
+- a 30-second timeout per block
+- `REPO_ROOT` exported so blocks can reference the project root
+
+There is no sandbox beyond that. The convention is: **only tag commands you
+would be comfortable running in a fresh checkout**. If a command has side
+effects, requires root, touches absolute paths outside the project, or is
+platform-specific, leave it untagged or add an explicit guard:
+
+```sh verified
+[ "$(uname -s)" != "Linux" ] && exit 0; make native
+```
+
+### Running locally
+
+```sh
+make verify-docs
+```
+
+The same target runs as the final step of the `unit` CI job.
+
+### Adding a new verified block
+
+1. Write the command you want validated.
+2. Change ` ```sh ` to ` ```sh verified `.
+3. Run `make verify-docs` locally to confirm it passes.
+4. Commit.
+
+That is the entire workflow. There is no registry, no manifest file, no
+separate test file to update.
+
+### What to tag
+
+Good candidates:
+
+- `make unit`, `make fmt-check`, `make coverage` — always portable
+- `make native` with a Linux guard
+- Config syntax examples that pipe through a validator
+- Any command from a "Quick start" or "Getting started" section
+
+Bad candidates (leave untagged):
+
+- Commands with placeholder paths (`/path/to/libchaos-io.so`)
+- Root or privilege-requiring commands
+- Commands that assume a specific running process or environment
+- Long-running commands without a natural exit (fuzz runs, Docker pulls)
+
 ## Maintenance Bar
 
 Good changes in this repository usually have these properties:
