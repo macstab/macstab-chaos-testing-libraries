@@ -410,6 +410,28 @@ static void test_resolve_symbol_abort_path(void)
 
 #ifdef __linux__
 /**
+ * @brief Invariant: `chaos_process_try_resolve_symbol()` clears the dlerror state
+ *        and stores NULL when the symbol is absent.
+ *
+ * Triggering condition: stub `dlsym` returns NULL for any unrecognised symbol;
+ *   `g_dlerror_text` may be set or NULL — the `try` variant does not abort.
+ *
+ * Expected observable behaviour: the target pointer is NULL after the call,
+ *   and the second `dlerror()` call (the "clear" call inside the NULL branch)
+ *   has incremented `g_dlerror_calls` from 1 to 2.
+ */
+static void test_try_resolve_symbol_missing(void)
+{
+    chaos_process_execveat_fn execveat_fn = (chaos_process_execveat_fn)(uintptr_t)0xdead;
+
+    reset_test_state();
+    g_dlerror_text = "missing-on-musl";
+    chaos_process_try_resolve_symbol(&execveat_fn, "this-symbol-does-not-exist");
+    assert(execveat_fn == NULL);
+    assert(g_dlerror_calls == 2);
+}
+
+/**
  * @brief Invariant: seed fallback paths produce PID-based seeds when /dev/urandom fails.
  *
  * Triggering conditions:
@@ -477,6 +499,7 @@ int main(void)
     test_resolve_symbol_and_seed_helpers();
     test_resolve_symbol_abort_path();
 #ifdef __linux__
+    test_try_resolve_symbol_missing();
     test_seed_fallback_paths();
 #endif
     test_constructor_init();

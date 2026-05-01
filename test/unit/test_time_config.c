@@ -421,6 +421,18 @@ static void test_helper_functions(void)
 #ifdef CLOCK_MONOTONIC_RAW
     assert(chaos_time_parse_clock_id("monotonic_raw", &(clockid_t){0}));
 #endif
+#ifdef CLOCK_REALTIME_COARSE
+    assert(chaos_time_parse_clock_id("realtime_coarse", &(clockid_t){0}));
+#endif
+#ifdef CLOCK_MONOTONIC_COARSE
+    assert(chaos_time_parse_clock_id("monotonic_coarse", &(clockid_t){0}));
+#endif
+#ifdef CLOCK_BOOTTIME
+    assert(chaos_time_parse_clock_id("boottime", &(clockid_t){0}));
+#endif
+#ifdef CLOCK_TAI
+    assert(chaos_time_parse_clock_id("tai", &(clockid_t){0}));
+#endif
 #ifdef CLOCK_PROCESS_CPUTIME_ID
     assert(chaos_time_parse_clock_id("process_cputime_id", &(clockid_t){0}));
 #endif

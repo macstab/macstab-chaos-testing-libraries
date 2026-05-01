@@ -483,6 +483,15 @@ static void test_call_real_helpers(void)
 #ifdef __linux__
     assert(chaos_process_call_real_execveat(AT_FDCWD, "/bin/echo", argv, envp, 0) == 0);
     assert(g_real_execveat_calls == 1);
+
+    /* Cover the "execveat unavailable on musl" fallback: ENOSYS without
+     * incrementing the stub call count. */
+    g_chaos_process_real_execveat = NULL;
+    errno = 0;
+    assert(chaos_process_call_real_execveat(AT_FDCWD, "/bin/echo", argv, envp, 0) == -1);
+    assert(errno == ENOSYS);
+    assert(g_real_execveat_calls == 1);
+    g_chaos_process_real_execveat = stub_execveat;
 #endif
 
     assert(chaos_process_call_real_waitpid(777, NULL, WNOHANG) == 321);
