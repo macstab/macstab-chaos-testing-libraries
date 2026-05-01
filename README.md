@@ -11,7 +11,7 @@
 
 # macstab-chaos-testing-libraries
 
-**Pure C99 `LD_PRELOAD` chaos engineering for any Linux process. Kernel-real syscall faults — language-agnostic, library-thin, 100% line-coverage gated.**
+**Pure C99 `LD_PRELOAD` chaos engineering for any Linux process. Kernel-real syscall faults — language-agnostic, zero runtime dependencies beyond libc and libdl, 100% line-coverage gated.**
 
 [![C99](https://img.shields.io/badge/C-C99-00599C.svg)](https://en.wikipedia.org/wiki/C99)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
@@ -27,32 +27,16 @@ Principal+ Engineer · [Macstab GmbH](https://macstab.com) · Hamburg, Germany
 
 ---
 
-<div align="center">
+## Overview
 
-### Part of the Macstab Chaos Engineering Stack
+`chaos-testing-libraries` is a set of Linux `LD_PRELOAD` fault-injection
+libraries that intercept libc symbols at the loader level. Six domains are
+covered: file I/O, network sockets, DNS resolution, clocks and sleep,
+process lifecycle, and virtual memory.
 
-| [**JVM bytecode**](https://github.com/macstab/macstab-chaos-jvm-agent) | [**Container orchestration**](https://github.com/macstab/chaos-testing) |        **`LD_PRELOAD` libc** *(this repo)*        |
-|:----------------------------------------------------------------------:|:-----------------------------------------------------------------------:|:-------------------------------------------------:|
-|                  In-process chaos for JVM applications                 |          Annotation-driven Testcontainers chaos for any service         | Pure C99 syscall-level chaos for any Linux container |
-|          62 JDK call sites · Spring 3/4 · Micronaut · Quarkus          |        Network · disk · DNS · CPU · memory · pre-built scenarios        |    glibc + musl × amd64 + arm64 · 100 % line coverage   |
-
-**One mental model — three layers.** Same selector × effect × policy DSL spans the JVM, the container, and the libc layer. Each layer ships and runs independently; combine them when you need full distributed-system chaos coverage.
-
-</div>
-
----
-
-## chaos-testing-libraries
-
-`chaos-testing-libraries` is a small collection of Linux `LD_PRELOAD`
-fault-injection libraries. Today, `libchaos-io`, `libchaos-net`,
-`libchaos-dns`, `libchaos-time`, `libchaos-process`, and `libchaos-memory` are
-implemented.
-
-There is intentionally no public C API header. Each library surface is its
-interposed libc symbols plus its config file. Today, `libchaos-io`,
-`libchaos-net`, `libchaos-dns`, `libchaos-time`, `libchaos-process`, and
-`libchaos-memory` all interpose real libc symbols.
+There is intentionally no public C API header. Each library's surface is
+exactly its interposed libc symbols plus a plain-text config file — loaded,
+reloaded, and discarded without stopping the target process.
 
 ## Part of a Three-Layer Chaos Engineering Stack
 
@@ -100,24 +84,41 @@ Three repos, one mental model: **the same selector × effect × policy DSL spans
     shipped `src/process/*.c`, plus Docker runtime validation across glibc and
     musl on amd64 and arm64
 
-## Documentation Standard
-
-The repository documentation is expected to be an authoritative engineering
-reference, not a feature sketch.
-
-Each subsystem document should:
-
-- describe current implemented behavior first
-- label future work explicitly
-- state ownership boundaries and non-goals directly
-- state failure and passthrough behavior directly
-- state cross-target constraints when libc, loader, distro, or architecture
-  materially affect correctness
-- state the validation bar used to call work complete
-
-[`docs/SYSTEM.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/docs/SYSTEM.md)
-is the repository-level reference for cross-library composition, symbol
-ownership, and the Linux loader/libc/kernel stack model.
+## Table of Contents
+<!-- TOC -->
+* [macstab-chaos-testing-libraries](#macstab-chaos-testing-libraries)
+  * [Overview](#overview)
+  * [Part of a Three-Layer Chaos Engineering Stack](#part-of-a-three-layer-chaos-engineering-stack)
+  * [Design Constraints](#design-constraints)
+  * [Table of Contents](#table-of-contents)
+  * [Repository Layout](#repository-layout)
+  * [libchaos-time](#libchaos-time)
+  * [libchaos-memory](#libchaos-memory)
+  * [libchaos-process](#libchaos-process)
+  * [libchaos-dns](#libchaos-dns)
+  * [libchaos-net](#libchaos-net)
+  * [libchaos-io Config Format](#libchaos-io-config-format)
+    * [Operations](#operations)
+    * [Effects](#effects)
+    * [Supported Errnos](#supported-errnos)
+    * [Matching Rules](#matching-rules)
+  * [Runtime Behavior](#runtime-behavior)
+  * [Build And Test](#build-and-test)
+    * [Fast local loop](#fast-local-loop)
+    * [Coverage gate](#coverage-gate)
+    * [C style gate](#c-style-gate)
+    * [Docker runtime probes](#docker-runtime-probes)
+    * [Full local quality gate](#full-local-quality-gate)
+    * [Full Docker matrix gate](#full-docker-matrix-gate)
+    * [Build targets](#build-targets)
+  * [Minimal Artifact Strategy](#minimal-artifact-strategy)
+  * [More Detail](#more-detail)
+  * [License](#license)
+  * [About the Engineer](#about-the-engineer)
+    * [Timeline](#timeline)
+    * [Specific evidence in this project](#specific-evidence-in-this-project)
+    * [Available for Principal+ engineering engagements](#available-for-principal-engineering-engagements)
+<!-- TOC -->
 
 ## Repository Layout
 
@@ -232,7 +233,7 @@ Makefile
 ```
 
 Planned extension work and scope boundaries live in
-[`ROADMAP.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/ROADMAP.md).
+[`ROADMAP.md`](ROADMAP.md).
 
 Deep subsystem references:
 
@@ -277,25 +278,6 @@ Deep subsystem references:
 - [`docs/diagrams/`](docs/diagrams/)
   PlantUML: `linkmap.puml`, `vdso.puml`, `dispatch.puml`, `fdcache.puml`,
   `config_reload.puml`, `composition.puml`, `atsecure.puml`, `dsl_pipeline.puml`
-
-## Libraries
-
-- `libchaos-io`
-  Fully implemented file-I/O fault injection library.
-- `libchaos-net`
-  Implemented endpoint-based network chaos library.
-- `libchaos-dns`
-  Implemented resolver-focused chaos and answer-manipulation library.
-- `libchaos-time`
-  Implemented clock/sleep chaos library.
-- `libchaos-memory`
-  Implemented memory-mapping chaos library.
-- `libchaos-process`
-  Implemented process-lifecycle chaos library.
-
-The remainder of this README documents the current `libchaos-time`,
-`libchaos-memory`, `libchaos-process`, and `libchaos-dns` contracts directly.
-`libchaos-io` and `libchaos-net` retain their subsystem references.
 
 ## libchaos-time
 
@@ -639,7 +621,13 @@ Important current boundary:
   `libchaos-net`, `libchaos-time`, `libchaos-memory`, and
   `libchaos-process`
 
-## Config Format
+## libchaos-io Config Format
+
+Config path:
+
+```text
+/tmp/.chaos-io.conf
+```
 
 Each non-empty rule line is:
 
@@ -1036,7 +1024,7 @@ Concrete artifacts a reviewer can read:
 - **Composable by design** — `libchaos-net` deliberately does not own `read()`, `write()`, or `close()` so it composes cleanly with `libchaos-io`; DNS interception was extracted out of `libchaos-net` into its own library for the same reason
 - **Apache 2.0 throughout** — usable in production, in commercial products, no lock-in
 
-### Available for senior engineering engagements
+### Available for Principal+ engineering engagements
 
 Limited capacity. Typically:
 
