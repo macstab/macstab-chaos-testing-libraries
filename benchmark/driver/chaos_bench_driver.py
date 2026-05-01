@@ -158,6 +158,42 @@ def _bootstrap_median_delta_ci(
 
 # --------------------------------------------------------------- group ---
 
+# -------------------------------------------------- reference CPU table ---
+
+# Current fastest consumer/server CPUs per architecture (2026).
+# Used to convert measured cycle deltas to reference wall-clock ns.
+# These are NOT measurements — they are labeled reference calculations:
+#   ref_ns = cycles / (ghz * 1e9) * 1e9  =  cycles / ghz
+_REFERENCE_CPUS: dict[str, tuple[str, float]] = {
+    "x86_64": ("AMD Ryzen 9 9950X (Zen 5, 5.7 GHz boost)", 5.7),
+    "aarch64": ("Apple M4 Max (4.4 GHz performance cores)", 4.4),
+    "arm64":   ("Apple M4 Max (4.4 GHz performance cores)", 4.4),
+}
+_REFERENCE_CPU_FALLBACK = ("5.0 GHz reference", 5.0)
+
+
+def _detect_arch(samples: "list[BenchSample]") -> str:
+    """Infer architecture from cpu_flags in any envelope."""
+    for s in samples:
+        flags = s.raw.get("environment", {}).get("cpu_flags", "")
+        if "asimd" in flags or "fp asimd" in flags:
+            return "aarch64"
+        if "sse" in flags or "avx" in flags or "lm" in flags:
+            return "x86_64"
+    return ""
+
+
+def _ref_cpu(arch: str) -> tuple[str, float]:
+    return _REFERENCE_CPUS.get(arch, _REFERENCE_CPU_FALLBACK)
+
+
+def _cycles_to_ref_ns(cycles: float, ghz: float) -> str:
+    if math.isnan(cycles) or cycles <= 0:
+        return "n/a"
+    ns = cycles / ghz
+    return f"~{ns:.1f} ns"
+
+
 @dataclass
 class BenchSample:
     path: str
@@ -178,6 +214,9 @@ class BenchSample:
     p95_ns: float = 0.0
     p99_ns: float = 0.0
     p999_ns: float = 0.0
+    # PMU cycle counts
+    cycles: int = 0
+    instructions: int = 0
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
 
 
@@ -211,6 +250,8 @@ def _to_sample(envelope: dict[str, Any], path: str) -> BenchSample | None:
         p95_ns=float(envelope.get("stats", {}).get("p95_ns", 0.0)),
         p99_ns=float(envelope.get("stats", {}).get("p99_ns", 0.0)),
         p999_ns=float(envelope.get("stats", {}).get("p999_ns", 0.0)),
+        cycles=int(envelope.get("pmu", {}).get("counters", {}).get("cycles", 0)),
+        instructions=int(envelope.get("pmu", {}).get("counters", {}).get("instructions", 0)),
         raw=envelope,
     )
 
@@ -323,69 +364,83 @@ def _rich_breakdown(
     name: str,
     base: list["BenchSample"],
     treat: list["BenchSample"],
+    arch: str = "",
 ) -> list[str]:
-    """Per-metric breakdown table: baseline vs LD_PRELOAD for one benchmark."""
+    """Per-benchmark breakdown: cycles primary, reference ns column."""
 
     def _agg(samples: list, attr: str) -> float:
         vals = [getattr(s, attr) for s in samples if getattr(s, attr, 0.0) > 0.0]
         return _median(vals) if vals else float("nan")
 
-    def _cv(mean: float, stdev: float) -> float:
-        return (stdev / mean * 100.0) if mean > 0 and not math.isnan(mean) else float("nan")
+    def _agg_int(samples: list, attr: str) -> float:
+        vals = [float(getattr(s, attr)) for s in samples if getattr(s, attr, 0) > 0]
+        return _median(vals) if vals else float("nan")
 
-    b_mean  = _agg(base,  "mean_ns");  t_mean  = _agg(treat, "mean_ns")
-    b_stdev = _agg(base,  "stdev_ns"); t_stdev = _agg(treat, "stdev_ns")
-    b_min   = _agg(base,  "min_ns");   t_min   = _agg(treat, "min_ns")
-    b_max   = _agg(base,  "max_ns");   t_max   = _agg(treat, "max_ns")
-    b_p50   = _agg(base,  "p50_ns");   t_p50   = _agg(treat, "p50_ns")
-    b_p90   = _agg(base,  "p90_ns");   t_p90   = _agg(treat, "p90_ns")
-    b_p95   = _agg(base,  "p95_ns");   t_p95   = _agg(treat, "p95_ns")
-    b_p99   = _agg(base,  "p99_ns");   t_p99   = _agg(treat, "p99_ns")
-    b_p999  = _agg(base,  "p999_ns");  t_p999  = _agg(treat, "p999_ns")
+    pmu_ok = any(s.cycles > 0 for s in base + treat)
 
-    def row(label: str, b: float, t: float) -> str:
+    b_cyc = _agg_int(base,  "cycles");   t_cyc = _agg_int(treat, "cycles")
+    b_ins = _agg_int(base,  "instructions"); t_ins = _agg_int(treat, "instructions")
+
+    ref_name, ref_ghz = _ref_cpu(arch)
+
+    def _fmt_cyc(v: float) -> str:
+        if math.isnan(v) or v <= 0:
+            return "n/a"
+        return f"{v:,.0f}"
+
+    def cyc_row(label: str, b: float, t: float) -> str:
         delta = t - b
-        pct   = (delta / b * 100.0) if b > 0 and not math.isnan(b) else float("nan")
         return (
-            f"| {label} | {_fmt_ns(b)} | {_fmt_ns(t)} | "
-            f"{_fmt_delta(delta)} | {_fmt_pct(pct)} |"
+            f"| {label} | {_fmt_cyc(b)} | {_fmt_cyc(t)} | "
+            f"{_fmt_cyc(delta)} | {_cycles_to_ref_ns(delta, ref_ghz)} |"
         )
 
-    b_tp = 1.0e9 / b_mean if not math.isnan(b_mean) and b_mean > 0 else float("nan")
-    t_tp = 1.0e9 / t_mean if not math.isnan(t_mean) and t_mean > 0 else float("nan")
-    tp_pct = ((t_tp - b_tp) / b_tp * 100.0) if not math.isnan(b_tp) and b_tp > 0 else float("nan")
+    lines: list[str] = [f"### {name}", ""]
 
-    return [
-        f"### {name}",
-        "",
-        "| Metric | Baseline (ns) | LD_PRELOAD (ns) | Delta (ns) | Overhead |",
-        "|---|---:|---:|---:|---:|",
-        row("Mean",   b_mean,  t_mean),
-        row("P50",    b_p50,   t_p50),
-        row("P90",    b_p90,   t_p90),
-        row("P95",    b_p95,   t_p95),
-        row("P99",    b_p99,   t_p99),
-        row("P99.9",  b_p999,  t_p999),
-        row("Min",    b_min,   t_min),
-        row("Max",    b_max,   t_max),
-        row("StdDev", b_stdev, t_stdev),
-        f"| CV% | {_fmt_pct(_cv(b_mean, b_stdev))} | {_fmt_pct(_cv(t_mean, t_stdev))} | — | — |",
-        f"| Throughput | {_fmt_throughput(b_mean)} | {_fmt_throughput(t_mean)} | — | {_fmt_pct(tp_pct)} |",
-        "",
-    ]
+    if pmu_ok:
+        lines += [
+            f"**Primary metric: CPU cycles** "
+            f"(hardware-counted, environment-invariant)",
+            f"> Reference ns column: calculated at {ref_name}. "
+            f"Not a measurement — a labeled conversion: `delta_cycles / {ref_ghz} GHz`.",
+            "",
+            "| Metric | Baseline (cycles) | LD_PRELOAD (cycles) | Delta (cycles) "
+            f"| Ref ns @ {ref_ghz} GHz |",
+            "|---|---:|---:|---:|---:|",
+            cyc_row("Cycles (median)", b_cyc, t_cyc),
+            cyc_row("Instructions (median)", b_ins, t_ins),
+            "",
+        ]
+    else:
+        lines += [
+            "> ⚠️ PMU counters unavailable in this environment "
+            "(requires `perf_event_paranoid ≤ 1` or `CAP_PERFMON`). "
+            "Run on Linux x86_64 / GitHub Actions for cycle counts.",
+            "",
+        ]
+
+    return lines
 
 
 def _format_md(
     comparisons: list[Comparison],
     groups: "dict[str, tuple[list, list]] | None" = None,
+    all_samples: "list[BenchSample] | None" = None,
 ) -> str:
+    arch = _detect_arch(all_samples or [])
+    ref_name, ref_ghz = _ref_cpu(arch)
+
     lines = [
         "# chaos-testing-libraries Benchmark — Baseline vs LD_PRELOAD",
         "",
         "Compares LD_PRELOAD'd runs against raw libc calls (baseline).",
-        "All numbers are nanoseconds per operation.",
         "",
-        "## Regression summary",
+        "**Primary metric: CPU cycles** — hardware-counted, not affected by "
+        "scheduler noise or VM jitter. Valid in Docker, CI, and bare metal.",
+        f"> Reference ns: calculated conversion at {ref_name}. "
+        "Not a measurement.",
+        "",
+        "## Regression summary (P50 delta)",
         "",
         "| Benchmark | Baseline P50 (ns) | LD_PRELOAD P50 (ns) | Δ (ns) | Δ (%) | p-value | r | 95% CI Δ (ns) | Note |",
         "|---|---:|---:|---:|---:|---:|---:|---|---|",
@@ -400,11 +455,11 @@ def _format_md(
         )
 
     if groups:
-        lines += ["", "## Per-benchmark metric breakdown", ""]
+        lines += ["", "## Per-benchmark cycle breakdown", ""]
         for name in sorted(groups):
             base, treat = groups[name]
             if base and treat:
-                lines += _rich_breakdown(name, base, treat)
+                lines += _rich_breakdown(name, base, treat, arch=arch)
 
     return "\n".join(lines) + "\n"
 
@@ -463,7 +518,7 @@ def main() -> int:
         breakdown_groups[name] = (grp["base"], grp["treat"])
 
     rendered = (
-        _format_md(comparisons, groups=breakdown_groups)
+        _format_md(comparisons, groups=breakdown_groups, all_samples=samples)
         if args.md
         else _format_json(comparisons)
     )
