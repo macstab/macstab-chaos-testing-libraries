@@ -221,6 +221,7 @@ void chaos_bench_json_write_envelope(
     fprintf(out, "    \"median_ns\": %.3f,\n", stats->median_ns);
     fprintf(out, "    \"p50_ns\":    %.3f,\n", stats->p50_ns);
     fprintf(out, "    \"p90_ns\":    %.3f,\n", stats->p90_ns);
+    fprintf(out, "    \"p95_ns\":    %.3f,\n", stats->p95_ns);
     fprintf(out, "    \"p99_ns\":    %.3f,\n", stats->p99_ns);
     fprintf(out, "    \"p999_ns\":   %.3f,\n", stats->p999_ns);
     fprintf(out, "    \"p9999_ns\":  %.3f\n",  stats->p9999_ns);

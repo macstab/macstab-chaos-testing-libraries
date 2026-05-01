@@ -160,6 +160,7 @@ typedef struct chaos_bench_stats
     double   stdev_ns;
     double   p50_ns;
     double   p90_ns;
+    double   p95_ns;
     double   p99_ns;
     double   p999_ns;
     double   p9999_ns;

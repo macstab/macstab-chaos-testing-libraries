@@ -136,6 +136,7 @@ void chaos_bench_stats_compute(
     out->median_ns          = chaos_bench_percentile(samples, sample_count, 0.50);
     out->p50_ns             = out->median_ns;
     out->p90_ns             = chaos_bench_percentile(samples, sample_count, 0.90);
+    out->p95_ns             = chaos_bench_percentile(samples, sample_count, 0.95);
     out->p99_ns             = chaos_bench_percentile(samples, sample_count, 0.99);
     out->p999_ns            = chaos_bench_percentile(samples, sample_count, 0.999);
     out->p9999_ns           = chaos_bench_percentile(samples, sample_count, 0.9999);

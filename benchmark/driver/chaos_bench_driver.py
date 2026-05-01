@@ -168,6 +168,16 @@ class BenchSample:
     ld_preload: str
     git_sha: str
     exec_mode: str
+    # full per-envelope stats (used for rich breakdown table)
+    mean_ns: float = 0.0
+    stdev_ns: float = 0.0
+    min_ns: float = 0.0
+    max_ns: float = 0.0
+    p50_ns: float = 0.0
+    p90_ns: float = 0.0
+    p95_ns: float = 0.0
+    p99_ns: float = 0.0
+    p999_ns: float = 0.0
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
 
 
@@ -178,8 +188,9 @@ def _is_treatment(env: dict[str, Any]) -> bool:
 def _to_sample(envelope: dict[str, Any], path: str) -> BenchSample | None:
     try:
         bench = envelope["benchmark"]["name"]
-        median = float(envelope["stats"]["median_ns"])
-        count = int(envelope["stats"]["samples"])
+        st = envelope["stats"]
+        median = float(st["median_ns"])
+        count = int(st["samples"])
     except (KeyError, ValueError, TypeError):
         return None
     return BenchSample(
@@ -191,6 +202,15 @@ def _to_sample(envelope: dict[str, Any], path: str) -> BenchSample | None:
         ld_preload=envelope.get("environment", {}).get("ld_preload", ""),
         git_sha=envelope.get("environment", {}).get("git_sha", ""),
         exec_mode=envelope.get("execution", {}).get("mode", "ADVISORY"),
+        mean_ns=float(envelope.get("stats", {}).get("mean_ns", 0.0)),
+        stdev_ns=float(envelope.get("stats", {}).get("stdev_ns", 0.0)),
+        min_ns=float(envelope.get("stats", {}).get("min_ns", 0.0)),
+        max_ns=float(envelope.get("stats", {}).get("max_ns", 0.0)),
+        p50_ns=float(envelope.get("stats", {}).get("p50_ns", 0.0)),
+        p90_ns=float(envelope.get("stats", {}).get("p90_ns", 0.0)),
+        p95_ns=float(envelope.get("stats", {}).get("p95_ns", 0.0)),
+        p99_ns=float(envelope.get("stats", {}).get("p99_ns", 0.0)),
+        p999_ns=float(envelope.get("stats", {}).get("p999_ns", 0.0)),
         raw=envelope,
     )
 
@@ -268,14 +288,106 @@ def _compare(name: str, base: list[BenchSample], treat: list[BenchSample],
 
 # --------------------------------------------------------------- output ---
 
-def _format_md(comparisons: list[Comparison]) -> str:
+def _fmt_ns(v: float) -> str:
+    if math.isnan(v):
+        return "n/a"
+    return f"{v:.2f}"
+
+
+def _fmt_pct(v: float) -> str:
+    if math.isnan(v):
+        return "n/a"
+    sign = "+" if v >= 0 else ""
+    return f"{sign}{v:.1f}%"
+
+
+def _fmt_delta(v: float) -> str:
+    if math.isnan(v):
+        return "n/a"
+    sign = "+" if v >= 0 else ""
+    return f"{sign}{v:.2f}"
+
+
+def _fmt_throughput(mean_ns: float) -> str:
+    if math.isnan(mean_ns) or mean_ns <= 0:
+        return "n/a"
+    v = 1.0e9 / mean_ns
+    if v >= 1e9:
+        return f"{v/1e9:.2f}G calls/s"
+    if v >= 1e6:
+        return f"{v/1e6:.2f}M calls/s"
+    return f"{v/1e3:.2f}K calls/s"
+
+
+def _rich_breakdown(
+    name: str,
+    base: list["BenchSample"],
+    treat: list["BenchSample"],
+) -> list[str]:
+    """Per-metric breakdown table: baseline vs LD_PRELOAD for one benchmark."""
+
+    def _agg(samples: list, attr: str) -> float:
+        vals = [getattr(s, attr) for s in samples if getattr(s, attr, 0.0) > 0.0]
+        return _median(vals) if vals else float("nan")
+
+    def _cv(mean: float, stdev: float) -> float:
+        return (stdev / mean * 100.0) if mean > 0 and not math.isnan(mean) else float("nan")
+
+    b_mean  = _agg(base,  "mean_ns");  t_mean  = _agg(treat, "mean_ns")
+    b_stdev = _agg(base,  "stdev_ns"); t_stdev = _agg(treat, "stdev_ns")
+    b_min   = _agg(base,  "min_ns");   t_min   = _agg(treat, "min_ns")
+    b_max   = _agg(base,  "max_ns");   t_max   = _agg(treat, "max_ns")
+    b_p50   = _agg(base,  "p50_ns");   t_p50   = _agg(treat, "p50_ns")
+    b_p90   = _agg(base,  "p90_ns");   t_p90   = _agg(treat, "p90_ns")
+    b_p95   = _agg(base,  "p95_ns");   t_p95   = _agg(treat, "p95_ns")
+    b_p99   = _agg(base,  "p99_ns");   t_p99   = _agg(treat, "p99_ns")
+    b_p999  = _agg(base,  "p999_ns");  t_p999  = _agg(treat, "p999_ns")
+
+    def row(label: str, b: float, t: float) -> str:
+        delta = t - b
+        pct   = (delta / b * 100.0) if b > 0 and not math.isnan(b) else float("nan")
+        return (
+            f"| {label} | {_fmt_ns(b)} | {_fmt_ns(t)} | "
+            f"{_fmt_delta(delta)} | {_fmt_pct(pct)} |"
+        )
+
+    b_tp = 1.0e9 / b_mean if not math.isnan(b_mean) and b_mean > 0 else float("nan")
+    t_tp = 1.0e9 / t_mean if not math.isnan(t_mean) and t_mean > 0 else float("nan")
+    tp_pct = ((t_tp - b_tp) / b_tp * 100.0) if not math.isnan(b_tp) and b_tp > 0 else float("nan")
+
+    return [
+        f"### {name}",
+        "",
+        "| Metric | Baseline (ns) | LD_PRELOAD (ns) | Delta (ns) | Overhead |",
+        "|---|---:|---:|---:|---:|",
+        row("Mean",   b_mean,  t_mean),
+        row("P50",    b_p50,   t_p50),
+        row("P90",    b_p90,   t_p90),
+        row("P95",    b_p95,   t_p95),
+        row("P99",    b_p99,   t_p99),
+        row("P99.9",  b_p999,  t_p999),
+        row("Min",    b_min,   t_min),
+        row("Max",    b_max,   t_max),
+        row("StdDev", b_stdev, t_stdev),
+        f"| CV% | {_fmt_pct(_cv(b_mean, b_stdev))} | {_fmt_pct(_cv(t_mean, t_stdev))} | — | — |",
+        f"| Throughput | {_fmt_throughput(b_mean)} | {_fmt_throughput(t_mean)} | — | {_fmt_pct(tp_pct)} |",
+        "",
+    ]
+
+
+def _format_md(
+    comparisons: list[Comparison],
+    groups: "dict[str, tuple[list, list]] | None" = None,
+) -> str:
     lines = [
-        "# chaos-testing-libraries Benchmark — Baseline vs Treatment",
+        "# chaos-testing-libraries Benchmark — Baseline vs LD_PRELOAD",
         "",
-        "Compares LD_PRELOAD'd runs (treatment) against raw libc runs (baseline).",
-        "All numbers are nanoseconds per operation, median across runs.",
+        "Compares LD_PRELOAD'd runs against raw libc calls (baseline).",
+        "All numbers are nanoseconds per operation.",
         "",
-        "| Benchmark | Baseline (ns) | Treatment (ns) | Δ (ns) | Δ (%) | p-value | r | 95% CI Δ (ns) | Note |",
+        "## Regression summary",
+        "",
+        "| Benchmark | Baseline P50 (ns) | LD_PRELOAD P50 (ns) | Δ (ns) | Δ (%) | p-value | r | 95% CI Δ (ns) | Note |",
         "|---|---:|---:|---:|---:|---:|---:|---|---|",
     ]
     for c in sorted(comparisons, key=lambda x: x.benchmark):
@@ -286,6 +398,14 @@ def _format_md(comparisons: list[Comparison]) -> str:
             f"{c.p_value:.4g} | {c.effect_size_r:.3f} | "
             f"[{c.ci_lo_ns:.2f}, {c.ci_hi_ns:.2f}] | {c.note} |"
         )
+
+    if groups:
+        lines += ["", "## Per-benchmark metric breakdown", ""]
+        for name in sorted(groups):
+            base, treat = groups[name]
+            if base and treat:
+                lines += _rich_breakdown(name, base, treat)
+
     return "\n".join(lines) + "\n"
 
 
@@ -331,16 +451,22 @@ def main() -> int:
             by_name[s.benchmark]["base"].append(s)
 
     comparisons: list[Comparison] = []
+    breakdown_groups: dict[str, tuple[list, list]] = {}
     for name in sorted(by_name):
-        groups = by_name[name]
-        if not groups["base"] or not groups["treat"]:
+        grp = by_name[name]
+        if not grp["base"] or not grp["treat"]:
             continue
         comparisons.append(_compare(
-            name, groups["base"], groups["treat"],
+            name, grp["base"], grp["treat"],
             args.regression_p, args.regression_r, args.regression_pct,
         ))
+        breakdown_groups[name] = (grp["base"], grp["treat"])
 
-    rendered = _format_md(comparisons) if args.md else _format_json(comparisons)
+    rendered = (
+        _format_md(comparisons, groups=breakdown_groups)
+        if args.md
+        else _format_json(comparisons)
+    )
     if args.output:
         with open(args.output, "w", encoding="utf-8") as fh:
             fh.write(rendered)
