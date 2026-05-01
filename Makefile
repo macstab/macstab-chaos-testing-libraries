@@ -183,12 +183,14 @@ PROCESS_ACTIONS_TEST := $(BUILD_DIR)/test_process_actions
 PROCESS_CONFIG_TEST := $(BUILD_DIR)/test_process_config
 PROCESS_RUNTIME_TEST := $(BUILD_DIR)/test_process_runtime
 CHAOS_PROCESS_TEST := $(BUILD_DIR)/test_chaos_process
+PROPTEST_TEST := $(BUILD_DIR)/test_config_proptest
 UNIT_TESTS := $(CONFIG_TEST) $(ACTIONS_TEST) $(FDCACHE_TEST) $(CHAOS_IO_TEST) \
 	$(NET_ACTIONS_TEST) $(NET_ENDPOINT_TEST) $(NET_CONFIG_TEST) $(NET_RUNTIME_TEST) $(CHAOS_NET_TEST) \
 	$(DNS_ACTIONS_TEST) $(DNS_CONFIG_TEST) $(DNS_RUNTIME_TEST) $(CHAOS_DNS_TEST) \
 	$(TIME_ACTIONS_TEST) $(TIME_CONFIG_TEST) $(TIME_RUNTIME_TEST) $(CHAOS_TIME_TEST) \
 	$(MEMORY_ACTIONS_TEST) $(MEMORY_CONFIG_TEST) $(MEMORY_RUNTIME_TEST) $(CHAOS_MEMORY_TEST) \
-	$(PROCESS_ACTIONS_TEST) $(PROCESS_CONFIG_TEST) $(PROCESS_RUNTIME_TEST) $(CHAOS_PROCESS_TEST)
+	$(PROCESS_ACTIONS_TEST) $(PROCESS_CONFIG_TEST) $(PROCESS_RUNTIME_TEST) $(CHAOS_PROCESS_TEST) \
+	$(PROPTEST_TEST)
 HOST_RUNTIME_TESTS := \
 	$(TEST_RUNTIME_DIR)/test_integration.sh \
 	$(TEST_RUNTIME_DIR)/test_glibc.sh \
@@ -218,6 +220,7 @@ MATRIX_RUNTIME_TESTS := \
 	$(TEST_RUNTIME_DIR)/test_process_alpine.sh
 
 .PHONY: all check clean coverage native test unit docker-build-all fmt fmt-check qa test-matrix \
+	fuzz fuzz-clean \
 	cross-glibc-amd64 cross-glibc-arm64 cross-musl-amd64 cross-musl-arm64 \
 	$(foreach lib,$(LIB_NAMES),native-$(lib)) \
 	$(foreach lib,$(LIB_NAMES),cross-glibc-amd64-$(lib)) \
@@ -258,6 +261,7 @@ unit: $(UNIT_TESTS)
 	./$(PROCESS_CONFIG_TEST)
 	./$(PROCESS_RUNTIME_TEST)
 	./$(CHAOS_PROCESS_TEST)
+	./$(PROPTEST_TEST)
 
 coverage:
 	BUILD_DIR=$(BUILD_DIR)-coverage CC="$(CC)" CPPFLAGS='$(CPPFLAGS)' CFLAGS='$(CFLAGS)' ./$(TEST_RUNTIME_DIR)/check_coverage.sh
@@ -419,3 +423,31 @@ $(foreach lib,$(LIB_NAMES),$(eval $(call define_lib_rules,$(lib))))
 
 clean:
 	rm -rf $(BUILD_DIR) $(BUILD_DIR)-coverage $(DIST_DIR)
+
+# ---- libFuzzer harnesses ---------------------------------------------------
+# Requires clang with -fsanitize=fuzzer,address (LLVM toolchain).
+# Build:  make fuzz
+# Run:    ./build-fuzz/fuzz_<name> -runs=60 -max_len=512 [corpus_dir]
+# Corpus: create seed directories under test/fuzz/corpus/<name>/ for better
+#         coverage convergence.
+
+FUZZ_CC        ?= clang
+FUZZ_BUILD_DIR  := build-fuzz
+FUZZ_CFLAGS     := $(CPPFLAGS) -std=c99 -Wall -Wextra -O1 -g \
+                   -fsanitize=fuzzer,address -fno-omit-frame-pointer
+FUZZ_HARNESSES  := fuzz_io_config fuzz_net_config fuzz_dns_config \
+                   fuzz_time_config fuzz_memory_config fuzz_process_config
+FUZZ_BINS       := $(patsubst %,$(FUZZ_BUILD_DIR)/%,$(FUZZ_HARNESSES))
+
+fuzz: $(FUZZ_BINS)
+	@echo "Fuzz harnesses built in $(FUZZ_BUILD_DIR)/."
+	@echo "Run one with: ./$(FUZZ_BUILD_DIR)/fuzz_io_config -runs=60 -max_len=512"
+
+$(FUZZ_BUILD_DIR):
+	@mkdir -p $@
+
+$(FUZZ_BUILD_DIR)/fuzz_%: test/fuzz/fuzz_%.c | $(FUZZ_BUILD_DIR)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) -o $@ $<
+
+fuzz-clean:
+	rm -rf $(FUZZ_BUILD_DIR)

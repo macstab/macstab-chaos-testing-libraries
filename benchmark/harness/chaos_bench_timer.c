@@ -213,6 +213,52 @@ static void chaos_bench_timer_calibrate(
 }
 
 /**
+ * @brief Cross-validates the calibrated timer frequency against a second
+ *        independent measurement window.
+ *
+ * @details Performs a second, shorter calibration pass (10 ms) using the same
+ * source and compares the resulting frequency to the primary calibration.  If
+ * the two measurements disagree by more than 1%, the timer is unreliable —
+ * either the TSC is not truly invariant on this host (e.g. P-state transitions
+ * are affecting the counter) or the process is being heavily disturbed by the
+ * hypervisor.  In either case, continuing to produce numbers would be
+ * misleading, so the function aborts.
+ *
+ * The 1% threshold is chosen to be well above the expected jitter from a
+ * 10 ms calibration window (~0.05%) but well below the drift that would
+ * actually affect benchmark results.
+ *
+ * @param[in] source  The same source used for primary calibration.
+ * @param[in] hz      Hz value produced by the primary calibration pass.
+ */
+static void chaos_bench_timer_validate_calibration(
+    chaos_bench_timer_source_t source,
+    double                     hz
+)
+{
+    enum { kValidationWindowNs = 10 * 1000 * 1000 }; /* 10 ms */
+    double hz_check;
+    double drift;
+
+    chaos_bench_timer_calibrate(source, kValidationWindowNs, &hz_check);
+
+    drift = (hz_check - hz) / hz;
+    if (drift < 0.0) drift = -drift;
+
+    if (drift > 0.01)
+    {
+        fprintf(stderr,
+            "chaos_bench: timer calibration disagreement: "
+            "primary=%.0f Hz  check=%.0f Hz  drift=%.2f%%  (threshold 1%%)\n"
+            "chaos_bench: possible causes: P-state transitions, "
+            "virtualised TSC without constant_tsc, or heavy hypervisor steal.\n"
+            "chaos_bench: aborting — benchmark numbers would be unreliable.\n",
+            hz, hz_check, drift * 100.0);
+        abort();
+    }
+}
+
+/**
  * @brief Median of three; used for the timer-overhead self-measurement.
  */
 static uint64_t chaos_bench_median3(uint64_t a, uint64_t b, uint64_t c)
@@ -273,6 +319,7 @@ void chaos_bench_timer_init(
     {
         chaos_bench_timer_calibrate(timer->source, kCalibrationWindowNs, &timer->hz);
         timer->ns_per_cycle = 1.0e9 / timer->hz;
+        chaos_bench_timer_validate_calibration(timer->source, timer->hz);
     }
 
     timer->overhead_ns = chaos_bench_timer_self_overhead(timer);

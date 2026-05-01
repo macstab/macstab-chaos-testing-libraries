@@ -13,6 +13,9 @@
 
 **Pure C99 `LD_PRELOAD` chaos engineering for any Linux process. Kernel-real syscall faults — language-agnostic, zero runtime dependencies beyond libc and libdl, 100% line-coverage gated.**
 
+[![ci](https://github.com/macstab/macstab-chaos-testing-libraries/actions/workflows/ci.yml/badge.svg)](https://github.com/macstab/macstab-chaos-testing-libraries/actions/workflows/ci.yml)
+[![matrix](https://github.com/macstab/macstab-chaos-testing-libraries/actions/workflows/matrix.yml/badge.svg)](https://github.com/macstab/macstab-chaos-testing-libraries/actions/workflows/matrix.yml)
+[![CodeQL](https://github.com/macstab/macstab-chaos-testing-libraries/actions/workflows/codeql.yml/badge.svg)](https://github.com/macstab/macstab-chaos-testing-libraries/actions/workflows/codeql.yml)
 [![C99](https://img.shields.io/badge/C-C99-00599C.svg)](https://en.wikipedia.org/wiki/C99)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
 [![Linux](https://img.shields.io/badge/Linux-LD__PRELOAD-FCC624.svg)](https://man7.org/linux/man-pages/man8/ld.so.8.html)

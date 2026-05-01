@@ -61,14 +61,15 @@ BENCH_BIN_NET     := $(BENCH_BUILD_DIR)/bench_net
 BENCH_BIN_DNS     := $(BENCH_BUILD_DIR)/bench_dns
 BENCH_BIN_MEMORY  := $(BENCH_BUILD_DIR)/bench_memory
 BENCH_BIN_PROCESS := $(BENCH_BUILD_DIR)/bench_process
+BENCH_BIN_META    := $(BENCH_BUILD_DIR)/bench_meta
 
 BENCH_BINS := \
 	$(BENCH_BIN_TIME) $(BENCH_BIN_IO) $(BENCH_BIN_NET) $(BENCH_BIN_DNS) \
-	$(BENCH_BIN_MEMORY) $(BENCH_BIN_PROCESS)
+	$(BENCH_BIN_MEMORY) $(BENCH_BIN_PROCESS) $(BENCH_BIN_META)
 
 # ------------------------------------------------------------------ rules ----
 
-.PHONY: bench-build bench-clean bench-list bench-smoke bench-help
+.PHONY: bench-build bench-clean bench-list bench-smoke bench-validate bench-help
 
 bench-build: $(BENCH_BINS)
 
@@ -87,6 +88,12 @@ $(BENCH_BUILD_DIR)/harness: | $(BENCH_BUILD_DIR)
 	@mkdir -p $@
 $(BENCH_REPORT_DIR):
 	@mkdir -p $@
+
+bench-validate: $(BENCH_BIN_META)
+	@echo "==> nop_loop_1k (expected 300-3000 ns/iter)"
+	@$(BENCH_BIN_META) --benchmark=nop_loop_1k --warmup=1000 --iters=10000
+	@echo "==> clock_overhead (expected 5-30 ns/iter)"
+	@$(BENCH_BIN_META) --benchmark=clock_overhead --warmup=1000 --iters=10000
 
 bench-clean:
 	@rm -rf $(BENCH_BUILD_DIR)
