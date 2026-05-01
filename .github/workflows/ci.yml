@@ -1,0 +1,145 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: clang-format check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-format
+          clang-format --version
+      - name: Check formatting
+        run: make fmt-check
+
+  unit:
+    name: unit tests + coverage
+    runs-on: ubuntu-24.04
+    needs: fmt
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc make lcov gcovr bc
+      - name: Build native libraries
+        run: make native
+      - name: Run unit tests
+        run: make unit
+      - name: Coverage gate
+        run: make coverage
+      - name: Collect coverage artifacts
+        if: always()
+        run: |
+          mkdir -p coverage-out
+          mv -- *.gcov coverage-out/ 2>/dev/null || true
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage-out/
+            build-coverage/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  integration:
+    name: native integration tests
+    runs-on: ubuntu-24.04
+    needs: fmt
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc make
+      - name: Build native libraries
+        run: make native
+      - name: Run integration tests
+        run: |
+          set -eu
+          for script in \
+            test/runtime/test_integration.sh \
+            test/runtime/test_glibc.sh \
+            test/runtime/test_alpine.sh \
+            test/runtime/test_net_glibc.sh \
+            test/runtime/test_net_alpine.sh \
+            test/runtime/test_dns_glibc.sh \
+            test/runtime/test_dns_alpine.sh \
+            test/runtime/test_time_glibc.sh \
+            test/runtime/test_time_alpine.sh \
+            test/runtime/test_memory_glibc.sh \
+            test/runtime/test_memory_alpine.sh \
+            test/runtime/test_process_glibc.sh \
+            test/runtime/test_process_alpine.sh
+          do
+            echo "::group::$script"
+            sh "$script"
+            echo "::endgroup::"
+          done
+
+  sanitizers:
+    name: ${{ matrix.sanitizer }} sanitizer
+    runs-on: ubuntu-24.04
+    needs: fmt
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, undefined]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc make
+      - name: Build and run unit tests with ${{ matrix.sanitizer }}
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          make unit \
+            BUILD_DIR=build-${{ matrix.sanitizer }} \
+            CFLAGS="-std=c99 -Wall -Wextra -Werror -pedantic -O1 -g -fno-omit-frame-pointer -fsanitize=${{ matrix.sanitizer }}" \
+            LDFLAGS="-fsanitize=${{ matrix.sanitizer }}"
+
+  static-analysis:
+    name: clang static analyzer
+    runs-on: ubuntu-24.04
+    needs: fmt
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang-tools clang make
+      - name: Run scan-build
+        run: |
+          scan-build --status-bugs -o scan-build-report \
+            make native BUILD_DIR=build-scan
+      - name: Upload scan-build report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-build-report
+          path: scan-build-report/
+          retention-days: 14

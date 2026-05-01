@@ -1,0 +1,106 @@
+name: bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Number of runs per benchmark cell"
+        type: string
+        default: "5"
+      libc:
+        description: "Build variant"
+        type: choice
+        default: "glibc"
+        options: [glibc, alpine]
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: false  # never abort an in-flight benchmark
+
+jobs:
+  bench:
+    name: full sweep (Linux x86_64, ADVISORY)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Lower perf_event_paranoid for PMU access
+        run: |
+          echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid
+          echo "perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid)"
+
+      - name: Capture host environment
+        run: |
+          echo "::group::lscpu"
+          lscpu
+          echo "::endgroup::"
+          echo "::group::cpuinfo (first 30 lines)"
+          head -30 /proc/cpuinfo
+          echo "::endgroup::"
+          echo "::group::kernel"
+          uname -a
+          echo "::endgroup::"
+
+      - name: Run full benchmark sweep
+        env:
+          BENCH_LIBC: ${{ inputs.libc || 'glibc' }}
+          BENCH_RUNS: ${{ inputs.runs || '5' }}
+        run: |
+          ./benchmark/run-bench.sh \
+            --full \
+            --libc="$BENCH_LIBC" \
+            --runs="$BENCH_RUNS" \
+            --compare
+
+      - name: Show comparison report
+        if: always()
+        run: |
+          GIT_SHA=$(git rev-parse --short HEAD)
+          REPORT="benchmark/reports/$GIT_SHA/comparison.md"
+          if [ -f "$REPORT" ]; then
+            echo "::notice::Benchmark comparison report at $REPORT"
+            echo "::group::comparison.md"
+            cat "$REPORT"
+            echo "::endgroup::"
+          else
+            echo "::warning::No comparison report found at $REPORT"
+          fi
+
+      - name: Generate run summary
+        if: always()
+        run: |
+          GIT_SHA=$(git rev-parse --short HEAD)
+          REPORT="benchmark/reports/$GIT_SHA/comparison.md"
+          {
+            echo "## Benchmark sweep — \`$GIT_SHA\` (Linux x86_64, ADVISORY)"
+            echo ""
+            echo "Runner: $(uname -m) $(uname -s) $(uname -r)"
+            echo ""
+            echo "> Numbers are **ADVISORY** because GitHub-hosted runners are shared VMs"
+            echo "> with non-deterministic CPU steal and no PMU isolation. For OFFICIAL"
+            echo "> Tier-2 numbers, run on a dedicated bare-metal host with isolcpus,"
+            echo "> nohz_full, and governor=performance."
+            echo ""
+            if [ -f "$REPORT" ]; then
+              cat "$REPORT"
+            else
+              echo "_No comparison report produced._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-reports-${{ github.sha }}
+          path: benchmark/reports/
+          retention-days: 90
+          if-no-files-found: warn
