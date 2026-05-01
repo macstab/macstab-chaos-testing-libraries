@@ -118,6 +118,11 @@ static void *chaos_memory_call_real_mmap(
     int previous;
     void *result;
 
+    if (g_chaos_memory_real_mmap == NULL)
+    {
+        errno = ENOMEM;
+        return MAP_FAILED;
+    }
     previous = chaos_memory_enter_internal();
     result = g_chaos_memory_real_mmap(address, length, protection, flags, fd, offset);
     chaos_memory_leave_internal(previous);
@@ -134,6 +139,11 @@ static int chaos_memory_call_real_mprotect(void *address, size_t length, int pro
     int previous;
     int rc;
 
+    if (g_chaos_memory_real_mprotect == NULL)
+    {
+        errno = ENOMEM;
+        return -1;
+    }
     previous = chaos_memory_enter_internal();
     rc = g_chaos_memory_real_mprotect(address, length, protection);
     chaos_memory_leave_internal(previous);
@@ -150,6 +160,11 @@ static int chaos_memory_call_real_munmap(void *address, size_t length)
     int previous;
     int rc;
 
+    if (g_chaos_memory_real_munmap == NULL)
+    {
+        errno = ENOMEM;
+        return -1;
+    }
     previous = chaos_memory_enter_internal();
     rc = g_chaos_memory_real_munmap(address, length);
     chaos_memory_leave_internal(previous);
@@ -166,6 +181,11 @@ static int chaos_memory_call_real_madvise(void *address, size_t length, int advi
     int previous;
     int rc;
 
+    if (g_chaos_memory_real_madvise == NULL)
+    {
+        errno = ENOMEM;
+        return -1;
+    }
     previous = chaos_memory_enter_internal();
     rc = g_chaos_memory_real_madvise(address, length, advice);
     chaos_memory_leave_internal(previous);

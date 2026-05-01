@@ -340,6 +340,28 @@ static void test_call_real_helpers(void)
     assert(chaos_memory_call_real_madvise((void *)(uintptr_t)0x1000U, 4096U, 7) == 0);
     assert(g_real_madvise_calls == 1);
     assert(g_last_madvise_advice == 7);
+
+    /* Cover the NULL-pointer guard paths in each call-real helper. */
+    reset_wrapper_state();
+    errno = 0;
+    assert(chaos_memory_call_real_mmap(NULL, 4096U, PROT_READ, MAP_PRIVATE, -1, 0) == MAP_FAILED);
+    assert(errno == ENOMEM);
+    assert(g_real_mmap_calls == 0);
+
+    errno = 0;
+    assert(chaos_memory_call_real_munmap((void *)(uintptr_t)0x1000U, 4096U) == -1);
+    assert(errno == ENOMEM);
+    assert(g_real_munmap_calls == 0);
+
+    errno = 0;
+    assert(chaos_memory_call_real_mprotect((void *)(uintptr_t)0x1000U, 4096U, PROT_READ) == -1);
+    assert(errno == ENOMEM);
+    assert(g_real_mprotect_calls == 0);
+
+    errno = 0;
+    assert(chaos_memory_call_real_madvise((void *)(uintptr_t)0x1000U, 4096U, 0) == -1);
+    assert(errno == ENOMEM);
+    assert(g_real_madvise_calls == 0);
 }
 
 /**
