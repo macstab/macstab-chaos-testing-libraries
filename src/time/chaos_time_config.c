@@ -91,8 +91,8 @@
 typedef struct chaos_time_config_state
 {
     chaos_time_rule_t rules[CHAOS_TIME_MAX_RULES]; /**< Parsed rules, indices [0, rule_count). */
-    size_t rule_count;                              /**< Number of valid entries in rules[]. */
-    int parse_ok;                                   /**< 1 = config parsed cleanly; 0 = parse error. */
+    size_t rule_count;                             /**< Number of valid entries in rules[]. */
+    int parse_ok; /**< 1 = config parsed cleanly; 0 = parse error. */
 } chaos_time_config_state_t;
 
 /** The two config snapshots; index 0 is the initial active snapshot. */

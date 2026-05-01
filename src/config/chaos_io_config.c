@@ -91,7 +91,7 @@ typedef struct chaos_io_config_state
 {
     chaos_io_rule_t rules[CHAOS_IO_MAX_RULES]; /**< Parsed rule array for this snapshot. */
     size_t rule_count;                         /**< Number of valid entries in `rules`. */
-    int parse_ok;                              /**< Non-zero if the last parse succeeded (including empty file). */
+    int parse_ok; /**< Non-zero if the last parse succeeded (including empty file). */
 } chaos_io_config_state_t;
 
 /** @brief The two interchangeable config snapshots. */

@@ -21,7 +21,8 @@
  *
  * Properties under test:
  * - Primitive helpers: `chaos_memory_is_blank_char`, `chaos_memory_config_reset_state`
- *   (NULL no-op; zeroes rule_count and parse_ok), `chaos_memory_trim`, `chaos_memory_strip_comment`.
+ *   (NULL no-op; zeroes rule_count and parse_ok), `chaos_memory_trim`,
+ * `chaos_memory_strip_comment`.
  * - Parse helpers: `chaos_memory_parse_errno_name` (12 valid names plus numeric fallback,
  *   NULL → -1, unrecognised string → -1), `chaos_memory_parse_probability`,
  *   `chaos_memory_parse_latency`, `chaos_memory_copy_text_value`,
@@ -128,8 +129,8 @@ static int chaos_memory_test_config_open(const char *path, int flags, ...)
 /**
  * @brief Stub read that injects EIO for the fake fd.
  *
- * Returns -1 with EIO when `g_test_config_force_read_fail` is set and `fd == g_test_config_fake_fd`.
- * All other fds pass through to the real `read`.
+ * Returns -1 with EIO when `g_test_config_force_read_fail` is set and `fd ==
+ * g_test_config_fake_fd`. All other fds pass through to the real `read`.
  */
 static ssize_t chaos_memory_test_config_read(int fd, void *buffer, size_t count)
 {
@@ -188,9 +189,9 @@ chaos_memory_test_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, ui
  */
 typedef struct chaos_memory_test_file_backup
 {
-    int existed;   /**< Non-zero if the file existed when the backup was taken. */
-    char *data;    /**< Heap-allocated content copy; NULL if file did not exist. */
-    size_t size;   /**< Byte length of `data`. */
+    int existed; /**< Non-zero if the file existed when the backup was taken. */
+    char *data;  /**< Heap-allocated content copy; NULL if file did not exist. */
+    size_t size; /**< Byte length of `data`. */
 } chaos_memory_test_file_backup_t;
 
 /**

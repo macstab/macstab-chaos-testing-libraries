@@ -223,7 +223,7 @@ int chaos_dns_filter_result_list(struct addrinfo **result, chaos_dns_family_filt
     }
 
     wanted_family = family == CHAOS_DNS_FAMILY_INET4 ? AF_INET : AF_INET6;
-    current       = *result;
+    current = *result;
     while (current != NULL)
     {
         struct addrinfo *next = current->ai_next;
@@ -268,7 +268,7 @@ int chaos_dns_filter_result_list(struct addrinfo **result, chaos_dns_family_filt
 void chaos_dns_limit_result_list(struct addrinfo **result, unsigned int limit)
 {
     struct addrinfo *current;
-    unsigned int     count = 0U;
+    unsigned int count = 0U;
 
     if (result == NULL || *result == NULL || limit == 0U)
     {
@@ -290,7 +290,7 @@ void chaos_dns_limit_result_list(struct addrinfo **result, unsigned int limit)
             /* Detach the tail and free it as a sub-list in a single call. */
             struct addrinfo *tail = current->ai_next;
 
-            current->ai_next = NULL;   /* terminate the kept prefix */
+            current->ai_next = NULL; /* terminate the kept prefix */
             chaos_dns_call_real_freeaddrinfo(tail);
             return;
         }
@@ -322,9 +322,9 @@ void chaos_dns_limit_result_list(struct addrinfo **result, unsigned int limit)
 void chaos_dns_shuffle_result_list(struct addrinfo **result)
 {
     struct addrinfo **nodes;
-    struct addrinfo  *current;
-    size_t            count;
-    size_t            index;
+    struct addrinfo *current;
+    size_t count;
+    size_t index;
 
     if (result == NULL || *result == NULL)
     {
@@ -350,7 +350,7 @@ void chaos_dns_shuffle_result_list(struct addrinfo **result)
     for (index = 0U; index < count; ++index)
     {
         nodes[index] = current;
-        current      = current->ai_next;
+        current = current->ai_next;
     }
 
     /* Step 2: Fisher–Yates descending sweep.
@@ -358,10 +358,10 @@ void chaos_dns_shuffle_result_list(struct addrinfo **result)
      * Modulo bias is negligible for i+1 ≤ 256. */
     for (index = count - 1U; index > 0U; --index)
     {
-        size_t           swap_index = (size_t)(chaos_dns_prng_next_u32() % (uint32_t)(index + 1U));
-        struct addrinfo *tmp        = nodes[index];
+        size_t swap_index = (size_t)(chaos_dns_prng_next_u32() % (uint32_t)(index + 1U));
+        struct addrinfo *tmp = nodes[index];
 
-        nodes[index]      = nodes[swap_index];
+        nodes[index] = nodes[swap_index];
         nodes[swap_index] = tmp;
     }
 

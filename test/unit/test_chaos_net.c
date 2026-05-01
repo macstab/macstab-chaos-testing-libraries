@@ -29,10 +29,11 @@
  * - `shutdown`: passthrough; ERRNO; LATENCY; endpoint via `from_activity_fd`.
  * - `poll` / `ppoll` / `select` / `pselect`: TIMEOUT clears revents/fd-sets and bypasses real
  *   call; ERRNO; LATENCY; passthrough.
- * - Direct helper functions: `chaos_net_apply_pre_call_rule`, `chaos_net_apply_simple_pre_call_rule`,
- *   `chaos_net_wait_pre_call`, `chaos_net_wait_clear_pollfds`, `chaos_net_wait_clear_fdsets`,
- *   all `chaos_net_call_real_*` wrappers, `chaos_net_corrupt_iovecs`,
- *   `chaos_net_wait_match_pollfds`, `chaos_net_wait_match_fdsets`.
+ * - Direct helper functions: `chaos_net_apply_pre_call_rule`,
+ * `chaos_net_apply_simple_pre_call_rule`, `chaos_net_wait_pre_call`,
+ * `chaos_net_wait_clear_pollfds`, `chaos_net_wait_clear_fdsets`, all `chaos_net_call_real_*`
+ * wrappers, `chaos_net_corrupt_iovecs`, `chaos_net_wait_match_pollfds`,
+ * `chaos_net_wait_match_fdsets`.
  * - Passthrough and additional branches: connect ERRNO=ECONNREFUSED; send ERRNO=EPIPE;
  *   sendmsg ERRNO=EHOSTUNREACH; TLS guard on `socket`.
  *

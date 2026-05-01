@@ -1,6 +1,7 @@
 /**
  * @file chaos_net_actions.h
- * @brief Fault-injection primitives: probability sampling, buffer corruption, latency, errno injection.
+ * @brief Fault-injection primitives: probability sampling, buffer corruption, latency, errno
+ * injection.
  *
  * @details
  * This module provides the leaf-level operations that the interposition wrappers invoke

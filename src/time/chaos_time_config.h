@@ -55,10 +55,10 @@
  */
 typedef enum chaos_time_operation
 {
-    CHAOS_TIME_OP_INVALID = -1,   /**< Sentinel — never stored in a valid rule. */
+    CHAOS_TIME_OP_INVALID = -1,      /**< Sentinel — never stored in a valid rule. */
     CHAOS_TIME_OP_CLOCK_GETTIME = 0, /**< Call originated from clock_gettime(2). */
-    CHAOS_TIME_OP_NANOSLEEP,      /**< Call originated from nanosleep(2). */
-    CHAOS_TIME_OP_USLEEP          /**< Call originated from usleep(3). */
+    CHAOS_TIME_OP_NANOSLEEP,         /**< Call originated from nanosleep(2). */
+    CHAOS_TIME_OP_USLEEP             /**< Call originated from usleep(3). */
 } chaos_time_operation_t;
 
 /**
@@ -136,11 +136,13 @@ typedef enum chaos_time_effect
  */
 typedef struct chaos_time_selector
 {
-    chaos_time_selector_kind_t kind;  /**< Selector type; determines which other fields are valid. */
+    chaos_time_selector_kind_t kind; /**< Selector type; determines which other fields are valid. */
     chaos_time_operation_t operation; /**< Intercepted function; INVALID for SELECTOR_ANY. */
-    clockid_t clock_id;               /**< POSIX clock constant; meaningful for SELECTOR_CLOCK_ID only. */
-    size_t selector_len;              /**< Length of the original selector text, used as a specificity tiebreaker. */
-    char text[CHAOS_TIME_MAX_TEXT];   /**< Clock name string for SELECTOR_CLOCK_ID (e.g. "monotonic"); NUL-terminated. */
+    clockid_t clock_id;  /**< POSIX clock constant; meaningful for SELECTOR_CLOCK_ID only. */
+    size_t selector_len; /**< Length of the original selector text, used as a specificity
+                            tiebreaker. */
+    char text[CHAOS_TIME_MAX_TEXT]; /**< Clock name string for SELECTOR_CLOCK_ID (e.g. "monotonic");
+                                       NUL-terminated. */
 } chaos_time_selector_t;
 
 /**
@@ -175,12 +177,12 @@ typedef struct chaos_time_selector
  */
 typedef struct chaos_time_rule
 {
-    chaos_time_selector_t selector;  /**< Identifies the call sites this rule applies to. */
-    chaos_time_effect_t effect;      /**< The fault type to inject. */
-    int errnum;                      /**< Errno value to set for EFFECT_ERRNO; 0 for other effects. */
-    double probability;              /**< Injection probability in [0.0, 1.0]; 1.0 = always inject. */
-    unsigned int latency_ms;         /**< Pre-call delay in milliseconds for EFFECT_LATENCY; 0 otherwise. */
-    int64_t offset_ms;               /**< Signed time shift in milliseconds for EFFECT_OFFSET; 0 otherwise. */
+    chaos_time_selector_t selector; /**< Identifies the call sites this rule applies to. */
+    chaos_time_effect_t effect;     /**< The fault type to inject. */
+    int errnum;              /**< Errno value to set for EFFECT_ERRNO; 0 for other effects. */
+    double probability;      /**< Injection probability in [0.0, 1.0]; 1.0 = always inject. */
+    unsigned int latency_ms; /**< Pre-call delay in milliseconds for EFFECT_LATENCY; 0 otherwise. */
+    int64_t offset_ms; /**< Signed time shift in milliseconds for EFFECT_OFFSET; 0 otherwise. */
 } chaos_time_rule_t;
 
 /**

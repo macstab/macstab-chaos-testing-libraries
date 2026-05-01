@@ -157,9 +157,9 @@ typedef struct chaos_net_endpoint
     /** @brief Address storage; active member determined by @c kind. */
     union
     {
-        struct in_addr ipv4;          /**< IPv4 address; active when kind is TCP4 or UDP4. */
-        struct in6_addr ipv6;         /**< IPv6 address; active when kind is TCP6 or UDP6. */
-        char text[CHAOS_NET_MAX_TEXT];/**< UNIX socket path; active when kind is UNIX. */
+        struct in_addr ipv4;           /**< IPv4 address; active when kind is TCP4 or UDP4. */
+        struct in6_addr ipv6;          /**< IPv6 address; active when kind is TCP6 or UDP6. */
+        char text[CHAOS_NET_MAX_TEXT]; /**< UNIX socket path; active when kind is UNIX. */
     } value;
 } chaos_net_endpoint_t;
 
@@ -185,12 +185,12 @@ typedef struct chaos_net_endpoint
  */
 typedef struct chaos_net_rule
 {
-    chaos_net_endpoint_t selector;  /**< Endpoint pattern this rule applies to. */
-    chaos_net_operation_t operation;/**< Which syscall group to intercept. */
-    chaos_net_effect_t effect;      /**< Fault category to inject when triggered. */
-    int errnum;                     /**< errno value for ERRNO rules; 0 for others. */
-    double probability;             /**< Firing probability [0.0, 1.0]; unused for LATENCY. */
-    unsigned int latency_ms;        /**< Sleep time in ms for LATENCY rules; 0 for others. */
+    chaos_net_endpoint_t selector;   /**< Endpoint pattern this rule applies to. */
+    chaos_net_operation_t operation; /**< Which syscall group to intercept. */
+    chaos_net_effect_t effect;       /**< Fault category to inject when triggered. */
+    int errnum;                      /**< errno value for ERRNO rules; 0 for others. */
+    double probability;              /**< Firing probability [0.0, 1.0]; unused for LATENCY. */
+    unsigned int latency_ms;         /**< Sleep time in ms for LATENCY rules; 0 for others. */
 } chaos_net_rule_t;
 
 /**

@@ -213,9 +213,9 @@ chaos_dns_test_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint6
  */
 typedef struct chaos_dns_test_file_backup
 {
-    int existed;   /**< Non-zero if the file existed when the backup was taken. */
-    char *data;    /**< Heap-allocated copy of the file content; NULL if none. */
-    size_t size;   /**< Byte length of `data`. */
+    int existed; /**< Non-zero if the file existed when the backup was taken. */
+    char *data;  /**< Heap-allocated copy of the file content; NULL if none. */
+    size_t size; /**< Byte length of `data`. */
 } chaos_dns_test_file_backup_t;
 
 /**

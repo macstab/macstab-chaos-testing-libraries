@@ -6,8 +6,9 @@
  * This file implements the full config lifecycle for libchaos-net:
  *
  *   1. **Data structures**: `chaos_net_config_state_t` holds one complete parsed
- *      snapshot (up to CHAOS_NET_MAX_RULES rules). Two instances exist (g_chaos_net_config_states[0/1]);
- *      at most one is "active" at any time, indexed by g_chaos_net_active_config_index.
+ *      snapshot (up to CHAOS_NET_MAX_RULES rules). Two instances exist
+ * (g_chaos_net_config_states[0/1]); at most one is "active" at any time, indexed by
+ * g_chaos_net_active_config_index.
  *
  *   2. **Mtime-based change detection**: On every call to chaos_net_config_prepare(),
  *      stat(2) is called on the config file and its mtime is hashed to a uint64_t.

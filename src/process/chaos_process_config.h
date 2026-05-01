@@ -59,15 +59,15 @@
  */
 typedef enum chaos_process_operation
 {
-    CHAOS_PROCESS_OP_INVALID = -1,    /**< Sentinel: invalid / not set. */
+    CHAOS_PROCESS_OP_INVALID = -1,       /**< Sentinel: invalid / not set. */
     CHAOS_PROCESS_OP_PTHREAD_CREATE = 0, /**< pthread_create(3) — index 0. */
-    CHAOS_PROCESS_OP_FORK,            /**< fork(2) — index 1. */
-    CHAOS_PROCESS_OP_POSIX_SPAWN,     /**< posix_spawn(3) — index 2. */
-    CHAOS_PROCESS_OP_POSIX_SPAWNP,    /**< posix_spawnp(3) — index 3. */
-    CHAOS_PROCESS_OP_EXECVE,          /**< execve(2) — index 4. */
-    CHAOS_PROCESS_OP_EXECVEAT,        /**< execveat(2) — index 5 (Linux only). */
-    CHAOS_PROCESS_OP_WAITPID,         /**< waitpid(2) — index 6. */
-    CHAOS_PROCESS_OP_COUNT            /**< Total number of operations; array size. */
+    CHAOS_PROCESS_OP_FORK,               /**< fork(2) — index 1. */
+    CHAOS_PROCESS_OP_POSIX_SPAWN,        /**< posix_spawn(3) — index 2. */
+    CHAOS_PROCESS_OP_POSIX_SPAWNP,       /**< posix_spawnp(3) — index 3. */
+    CHAOS_PROCESS_OP_EXECVE,             /**< execve(2) — index 4. */
+    CHAOS_PROCESS_OP_EXECVEAT,           /**< execveat(2) — index 5 (Linux only). */
+    CHAOS_PROCESS_OP_WAITPID,            /**< waitpid(2) — index 6. */
+    CHAOS_PROCESS_OP_COUNT               /**< Total number of operations; array size. */
 } chaos_process_operation_t;
 
 /**
@@ -79,9 +79,9 @@ typedef enum chaos_process_operation
  */
 typedef enum chaos_process_selector_kind
 {
-    CHAOS_PROCESS_SELECTOR_INVALID   = -1, /**< Sentinel: invalid / parse error. */
-    CHAOS_PROCESS_SELECTOR_ANY       = 0,  /**< Wildcard `*` — matches any operation. */
-    CHAOS_PROCESS_SELECTOR_OPERATION = 1   /**< Exact operation name match. */
+    CHAOS_PROCESS_SELECTOR_INVALID = -1, /**< Sentinel: invalid / parse error. */
+    CHAOS_PROCESS_SELECTOR_ANY = 0,      /**< Wildcard `*` — matches any operation. */
+    CHAOS_PROCESS_SELECTOR_OPERATION = 1 /**< Exact operation name match. */
 } chaos_process_selector_kind_t;
 
 /**
@@ -91,10 +91,10 @@ typedef enum chaos_process_selector_kind
  */
 typedef enum chaos_process_effect
 {
-    CHAOS_PROCESS_EFFECT_INVALID    = -1, /**< Sentinel: invalid / parse error. */
-    CHAOS_PROCESS_EFFECT_ERRNO      = 0,  /**< Inject an immediate errno failure. */
-    CHAOS_PROCESS_EFFECT_LATENCY    = 1,  /**< Insert an artificial delay (ms). */
-    CHAOS_PROCESS_EFFECT_FAIL_AFTER = 2   /**< Fail after N successful calls. */
+    CHAOS_PROCESS_EFFECT_INVALID = -1,  /**< Sentinel: invalid / parse error. */
+    CHAOS_PROCESS_EFFECT_ERRNO = 0,     /**< Inject an immediate errno failure. */
+    CHAOS_PROCESS_EFFECT_LATENCY = 1,   /**< Insert an artificial delay (ms). */
+    CHAOS_PROCESS_EFFECT_FAIL_AFTER = 2 /**< Fail after N successful calls. */
 } chaos_process_effect_t;
 
 /**

@@ -87,7 +87,8 @@ static int g_config_match_loaded_result = 0;
 static int g_config_match_path_result = 0;
 /** @brief Rule written into the caller's output on a successful config match. */
 static chaos_io_rule_t g_config_rule;
-/** @brief Operation argument captured from the most recent `chaos_io_config_match_loaded()` call. */
+/** @brief Operation argument captured from the most recent `chaos_io_config_match_loaded()` call.
+ */
 static chaos_io_operation_t g_last_match_loaded_operation = CHAOS_IO_OP_INVALID;
 /** @brief Operation argument captured from the most recent `chaos_io_config_match_path()` call. */
 static chaos_io_operation_t g_last_match_path_operation = CHAOS_IO_OP_INVALID;
@@ -147,9 +148,11 @@ static size_t g_last_corrupt_size = 0U;
 static int g_corrupt_sample_calls = 0;
 /** @brief `size` argument captured from the most recent `chaos_io_corrupt_buffer_sample()` call. */
 static size_t g_last_corrupt_sample_size = 0U;
-/** @brief `index_sample` argument captured from the most recent `chaos_io_corrupt_buffer_sample()` call. */
+/** @brief `index_sample` argument captured from the most recent `chaos_io_corrupt_buffer_sample()`
+ * call. */
 static uint32_t g_last_corrupt_index_sample = 0U;
-/** @brief `bit_sample` argument captured from the most recent `chaos_io_corrupt_buffer_sample()` call. */
+/** @brief `bit_sample` argument captured from the most recent `chaos_io_corrupt_buffer_sample()`
+ * call. */
 static uint32_t g_last_corrupt_bit_sample = 0U;
 
 /* -------------------------------------------------------------------------
@@ -1123,7 +1126,8 @@ static ssize_t chaos_test_real_pread_impl(int fd, void *buffer, size_t count, of
     return g_real_pread_return;
 }
 
-/** @brief Stub for the real `preadv` syscall wrapper. Fills iov buffers from `g_real_pread_fill`. */
+/** @brief Stub for the real `preadv` syscall wrapper. Fills iov buffers from `g_real_pread_fill`.
+ */
 static ssize_t
 chaos_test_real_preadv_impl(int fd, const struct iovec *iov, int iovcnt, off_t offset)
 {
@@ -1192,7 +1196,8 @@ static void *chaos_test_dlsym_pointer(const void *function_bytes, size_t functio
 }
 
 /**
- * @brief Macro to produce the `void *` result expected by the `dlsym` stub for a given stub function.
+ * @brief Macro to produce the `void *` result expected by the `dlsym` stub for a given stub
+ * function.
  *
  * Usage: `CHAOS_TEST_DLSYM_RESULT(chaos_io_read_fn, chaos_test_real_read_impl)`
  * returns a `void *` that the production constructor will store in `g_chaos_io_real_read`.

@@ -53,6 +53,8 @@
 
 #include "../../src/process/chaos_process_config.h"
 
+#include <fcntl.h> /* AT_FDCWD */
+
 CHAOS_PROCESS_DEFINE_TEST_GLOBALS();
 
 /**
@@ -258,7 +260,8 @@ static void *stub_start_routine(void *argument)
     return argument;
 }
 
-/** @brief Stub for the real `pthread_create`. Increments counter; returns `g_real_pthread_create_result`. */
+/** @brief Stub for the real `pthread_create`. Increments counter; returns
+ * `g_real_pthread_create_result`. */
 static int stub_pthread_create(
     pthread_t *thread,
     const pthread_attr_t *attributes,

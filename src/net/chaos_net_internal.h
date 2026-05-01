@@ -214,11 +214,14 @@ typedef int (*chaos_net_ppoll_fn)(struct pollfd *, nfds_t, const struct timespec
 typedef int (*chaos_net_select_fn)(int, fd_set *, fd_set *, fd_set *, struct timeval *);
 /** @brief Real pselect(2) pointer; never NULL after library init. */
 typedef int (*chaos_net_pselect_fn)(int, fd_set *, fd_set *, fd_set *, const struct timespec *, const sigset_t *);
-/** @brief Real getsockname(2) pointer; used internally for endpoint resolution; never NULL after init. */
+/** @brief Real getsockname(2) pointer; used internally for endpoint resolution; never NULL after
+ * init. */
 typedef int (*chaos_net_getsockname_fn)(int, struct sockaddr *, socklen_t *);
-/** @brief Real getpeername(2) pointer; used internally for endpoint resolution; never NULL after init. */
+/** @brief Real getpeername(2) pointer; used internally for endpoint resolution; never NULL after
+ * init. */
 typedef int (*chaos_net_getpeername_fn)(int, struct sockaddr *, socklen_t *);
-/** @brief Real getsockopt(2) pointer; used to determine SOCK_STREAM vs SOCK_DGRAM; never NULL after init. */
+/** @brief Real getsockopt(2) pointer; used to determine SOCK_STREAM vs SOCK_DGRAM; never NULL after
+ * init. */
 typedef int (*chaos_net_getsockopt_fn)(int, int, int, void *, socklen_t *);
 #ifdef __linux__
 /** @brief Real accept4(2) pointer; Linux-only; never NULL after library init on Linux. */

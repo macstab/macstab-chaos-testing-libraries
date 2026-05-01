@@ -1,0 +1,30 @@
+# =============================================================================
+# docker/Dockerfile.ci — local CI gate image.
+#
+# Mirrors the toolchain used by .github/workflows/ci.yml (ubuntu-24.04) so
+# developers on macOS / Windows can run the full CI gate locally before
+# pushing.  Drives `make ci-local` and `make ci-local-shell`.
+#
+# This image is for the *correctness* gate only (fmt, unit, coverage,
+# sanitizers, scan-build, native integration test).  Benchmark numbers
+# from this container on a non-Linux host are NOT reliable: Apple Silicon
+# / Windows hosts run Linux through HVF/qemu, which exposes a virtual TSC
+# at ~24 MHz instead of the 1+ GHz invariant TSC of real x86_64.  Use the
+# bench.yml workflow on a real Linux runner for trustworthy numbers.
+# =============================================================================
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        gcc \
+        clang \
+        clang-format \
+        clang-tools \
+        make \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work

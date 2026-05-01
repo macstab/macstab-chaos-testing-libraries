@@ -287,6 +287,78 @@ test-matrix:
 		done; \
 	done
 
+# ---- ci-local ---------------------------------------------------------------
+# Run the same correctness gate that .github/workflows/ci.yml runs, but
+# locally inside a Linux Docker container.  Useful on macOS where the
+# host has neither clang-format nor a Linux toolchain.
+#
+# Note: benchmark numbers from `make bench` inside this image on a
+# non-Linux host are NOT reliable (HVF/qemu virtual TSC).  Use the
+# bench.yml GitHub Actions workflow on a real Linux runner instead.
+
+CI_LOCAL_IMAGE     := chaos-ci-local:latest
+CI_LOCAL_DOCKERFILE := $(DOCKER_DIR)/Dockerfile.ci
+CI_LOCAL_RUN := docker run --rm \
+	--user $(shell id -u):$(shell id -g) \
+	-v $(CURDIR):/work \
+	-w /work \
+	$(CI_LOCAL_IMAGE)
+
+CI_LOCAL_SAN_CFLAGS := -std=c99 -Wall -Wextra -Werror -pedantic -O1 -g -fno-omit-frame-pointer
+
+.PHONY: ci-local ci-local-image ci-local-shell ci-local-fmt ci-local-unit \
+	ci-local-coverage ci-local-asan ci-local-ubsan ci-local-scan ci-local-clean
+
+ci-local-image:
+	docker build -t $(CI_LOCAL_IMAGE) -f $(CI_LOCAL_DOCKERFILE) $(DOCKER_DIR)
+
+ci-local-fmt: ci-local-image
+	@echo ">>> [ci-local] fmt-check"
+	@$(CI_LOCAL_RUN) make fmt-check
+
+ci-local-unit: ci-local-image
+	@echo ">>> [ci-local] unit tests (BUILD_DIR=build-ci)"
+	@$(CI_LOCAL_RUN) make unit BUILD_DIR=build-ci
+
+ci-local-coverage: ci-local-image
+	@echo ">>> [ci-local] coverage gate"
+	@$(CI_LOCAL_RUN) make coverage
+
+ci-local-asan: ci-local-image
+	@echo ">>> [ci-local] ASAN unit tests"
+	@$(CI_LOCAL_RUN) env \
+		ASAN_OPTIONS=detect_leaks=1:abort_on_error=1:strict_string_checks=1 \
+		make unit \
+			BUILD_DIR=build-asan \
+			CFLAGS="$(CI_LOCAL_SAN_CFLAGS) -fsanitize=address" \
+			LDFLAGS="-fsanitize=address"
+
+ci-local-ubsan: ci-local-image
+	@echo ">>> [ci-local] UBSAN unit tests"
+	@$(CI_LOCAL_RUN) env \
+		UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+		make unit \
+			BUILD_DIR=build-ubsan \
+			CFLAGS="$(CI_LOCAL_SAN_CFLAGS) -fsanitize=undefined" \
+			LDFLAGS="-fsanitize=undefined"
+
+ci-local-scan: ci-local-image
+	@echo ">>> [ci-local] clang scan-build static analysis"
+	@$(CI_LOCAL_RUN) scan-build --status-bugs make native BUILD_DIR=build-scan
+
+ci-local-shell: ci-local-image
+	docker run --rm -it \
+		--user $(shell id -u):$(shell id -g) \
+		-v $(CURDIR):/work \
+		-w /work \
+		$(CI_LOCAL_IMAGE) bash
+
+ci-local: ci-local-fmt ci-local-unit ci-local-coverage ci-local-asan ci-local-ubsan ci-local-scan
+	@echo ">>> [ci-local] ALL PASSED"
+
+ci-local-clean:
+	rm -rf build-ci build-asan build-ubsan build-scan
+
 cross-glibc-amd64: $(GLIBC_AMD64_DISTS)
 
 cross-glibc-arm64: $(GLIBC_ARM64_DISTS)

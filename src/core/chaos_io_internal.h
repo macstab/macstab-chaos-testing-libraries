@@ -284,9 +284,10 @@ extern chaos_io_ftruncate_fn g_chaos_io_real_ftruncate; /**< Downstream `ftrunca
 extern chaos_io_unlinkat_fn g_chaos_io_real_unlinkat;   /**< Downstream `unlinkat`. */
 extern chaos_io_renameat_fn g_chaos_io_real_renameat;   /**< Downstream `renameat`. */
 #ifdef __linux__
-extern chaos_io_fallocate_fn g_chaos_io_real_fallocate;               /**< Downstream `fallocate` (Linux). */
-extern chaos_io_sendfile_fn g_chaos_io_real_sendfile;                 /**< Downstream `sendfile` (Linux). */
-extern chaos_io_copy_file_range_fn g_chaos_io_real_copy_file_range;   /**< Downstream `copy_file_range` (Linux). */
+extern chaos_io_fallocate_fn g_chaos_io_real_fallocate; /**< Downstream `fallocate` (Linux). */
+extern chaos_io_sendfile_fn g_chaos_io_real_sendfile;   /**< Downstream `sendfile` (Linux). */
+extern chaos_io_copy_file_range_fn
+    g_chaos_io_real_copy_file_range; /**< Downstream `copy_file_range` (Linux). */
 #endif
 
 /** @} */

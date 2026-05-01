@@ -69,10 +69,10 @@
  * POSIX.1-2008 uses st_mtim; macOS uses st_mtimespec.
  * ------------------------------------------------------------------------- */
 #if defined(__linux__)
-#define CHAOS_DNS_STAT_SEC(st)  ((st)->st_mtim.tv_sec)
+#define CHAOS_DNS_STAT_SEC(st) ((st)->st_mtim.tv_sec)
 #define CHAOS_DNS_STAT_NSEC(st) ((st)->st_mtim.tv_nsec)
 #else
-#define CHAOS_DNS_STAT_SEC(st)  ((st)->st_mtimespec.tv_sec)
+#define CHAOS_DNS_STAT_SEC(st) ((st)->st_mtimespec.tv_sec)
 #define CHAOS_DNS_STAT_NSEC(st) ((st)->st_mtimespec.tv_nsec)
 #endif
 
@@ -94,8 +94,8 @@
 typedef struct chaos_dns_config_state
 {
     chaos_dns_rule_t rules[CHAOS_DNS_MAX_RULES]; /**< Parsed rules in file order. */
-    size_t           rule_count;                 /**< Number of valid entries in rules[]. */
-    int              parse_ok;                   /**< 1 if this snapshot is usable; 0 if parse failed. */
+    size_t rule_count;                           /**< Number of valid entries in rules[]. */
+    int parse_ok; /**< 1 if this snapshot is usable; 0 if parse failed. */
 } chaos_dns_config_state_t;
 
 /* -------------------------------------------------------------------------
@@ -313,7 +313,7 @@ static int chaos_dns_ascii_case_equal(const char *left, const char *right)
 
     while (*left != '\0' && *right != '\0')
     {
-        left_ch  = (unsigned char)*left++;
+        left_ch = (unsigned char)*left++;
         right_ch = (unsigned char)*right++;
         if (tolower(left_ch) != tolower(right_ch))
         {
@@ -346,7 +346,7 @@ static int chaos_dns_ascii_case_ends_with(const char *text, const char *suffix)
         return 0;
     }
 
-    text_len   = strlen(text);
+    text_len = strlen(text);
     suffix_len = strlen(suffix);
     if (text_len < suffix_len)
     {
@@ -382,7 +382,7 @@ static int chaos_dns_ascii_case_ends_with(const char *text, const char *suffix)
 static int chaos_dns_parse_reverse_selector_body(const char *body, chaos_dns_selector_t *selector)
 {
     char host[INET6_ADDRSTRLEN];
-    struct in_addr  ipv4;
+    struct in_addr ipv4;
     struct in6_addr ipv6;
     const char *source = body;
     size_t body_len;
@@ -394,7 +394,7 @@ static int chaos_dns_parse_reverse_selector_body(const char *body, chaos_dns_sel
     if (strcmp(body, "*") == 0)
     {
         selector->domain = CHAOS_DNS_SELECTOR_DOMAIN_REVERSE;
-        selector->kind   = CHAOS_DNS_SELECTOR_ANY;
+        selector->kind = CHAOS_DNS_SELECTOR_ANY;
         return 1;
     }
 
@@ -422,14 +422,14 @@ static int chaos_dns_parse_reverse_selector_body(const char *body, chaos_dns_sel
     if (inet_pton(AF_INET, source, &ipv4) == 1)
     {
         selector->domain = CHAOS_DNS_SELECTOR_DOMAIN_REVERSE;
-        selector->kind   = CHAOS_DNS_SELECTOR_EXACT;
+        selector->kind = CHAOS_DNS_SELECTOR_EXACT;
         /* Canonicalise: re-serialise so that 1.2.3.004 → 1.2.3.4, etc. */
         return inet_ntop(AF_INET, &ipv4, selector->text, sizeof(selector->text)) != NULL;
     }
     if (inet_pton(AF_INET6, source, &ipv6) == 1)
     {
         selector->domain = CHAOS_DNS_SELECTOR_DOMAIN_REVERSE;
-        selector->kind   = CHAOS_DNS_SELECTOR_EXACT;
+        selector->kind = CHAOS_DNS_SELECTOR_EXACT;
         return inet_ntop(AF_INET6, &ipv6, selector->text, sizeof(selector->text)) != NULL;
     }
 
@@ -474,7 +474,7 @@ static int chaos_dns_selector_parse(const char *text, chaos_dns_selector_t *sele
     if (strcmp(text, "*") == 0)
     {
         selector->domain = CHAOS_DNS_SELECTOR_DOMAIN_LOOKUP;
-        selector->kind   = CHAOS_DNS_SELECTOR_ANY;
+        selector->kind = CHAOS_DNS_SELECTOR_ANY;
         return 1;
     }
     if (strncmp(text, "dns://", 6) == 0)
@@ -492,7 +492,7 @@ static int chaos_dns_selector_parse(const char *text, chaos_dns_selector_t *sele
         }
         if (strncmp(body, "*.", 2) == 0)
         {
-            body += 2;                          /* strip the leading "*." */
+            body += 2; /* strip the leading "*." */
             selector->kind = CHAOS_DNS_SELECTOR_SUFFIX;
         }
         else
@@ -581,7 +581,7 @@ static int chaos_dns_selector_matches_domain(
         return 0;
     }
 
-    name_len   = strlen(name);
+    name_len = strlen(name);
     suffix_len = strlen(selector->text);
     if (name_len <= suffix_len)
     {
@@ -733,10 +733,8 @@ static int chaos_dns_effect_allowed(const chaos_dns_selector_t *selector, chaos_
         return 0;
     }
 
-    return effect == CHAOS_DNS_EFFECT_GAI     ||
-           effect == CHAOS_DNS_EFFECT_LATENCY ||
-           effect == CHAOS_DNS_EFFECT_REWRITE ||
-           effect == CHAOS_DNS_EFFECT_SERVICE;
+    return effect == CHAOS_DNS_EFFECT_GAI || effect == CHAOS_DNS_EFFECT_LATENCY ||
+           effect == CHAOS_DNS_EFFECT_REWRITE || effect == CHAOS_DNS_EFFECT_SERVICE;
 }
 
 /**
@@ -915,7 +913,7 @@ static int chaos_dns_parse_payload_probability(
 static int chaos_dns_override_token_valid(const char *token)
 {
     char host[INET6_ADDRSTRLEN];
-    struct in_addr  ipv4;
+    struct in_addr ipv4;
     struct in6_addr ipv6;
     size_t len;
 
@@ -973,7 +971,7 @@ static int chaos_dns_validate_override_value(const char *text)
     cursor = buffer;
     while (*cursor != '\0')
     {
-        char *token     = cursor;
+        char *token = cursor;
         char *separator = strchr(cursor, ',');
 
         if (separator != NULL)
@@ -1016,8 +1014,7 @@ static int chaos_dns_validate_override_value(const char *text)
  */
 static uint64_t chaos_dns_config_normalize_mtime_hash(uint64_t value)
 {
-    if (value == CHAOS_DNS_MTIME_MISSING    ||
-        value == CHAOS_DNS_MTIME_RELOADING  ||
+    if (value == CHAOS_DNS_MTIME_MISSING || value == CHAOS_DNS_MTIME_RELOADING ||
         value == CHAOS_DNS_MTIME_UNKNOWN)
     {
         return value ^ UINT64_C(0x9e3779b97f4a7c15);
@@ -1052,7 +1049,7 @@ static uint64_t chaos_dns_config_hash_mtime(const struct stat *st)
         return CHAOS_DNS_MTIME_MISSING;
     }
 
-    value  = UINT64_C(1469598103934665603);
+    value = UINT64_C(1469598103934665603);
     value ^= (uint64_t)CHAOS_DNS_STAT_SEC(st);
     value *= UINT64_C(1099511628211);
     value ^= (uint64_t)CHAOS_DNS_STAT_NSEC(st);
@@ -1077,7 +1074,7 @@ static uint64_t chaos_dns_config_observed_mtime(void)
     int rc;
 
     previous = chaos_dns_enter_internal();
-    rc       = stat(CHAOS_DNS_CONFIG_PATH, &st);
+    rc = stat(CHAOS_DNS_CONFIG_PATH, &st);
     chaos_dns_leave_internal(previous);
     if (rc != 0)
     {
@@ -1114,7 +1111,7 @@ static int chaos_dns_config_read_file(size_t *size_out)
     }
 
     previous = chaos_dns_enter_internal();
-    fd       = open(CHAOS_DNS_CONFIG_PATH, O_RDONLY);
+    fd = open(CHAOS_DNS_CONFIG_PATH, O_RDONLY);
     if (fd < 0)
     {
         chaos_dns_leave_internal(previous);
@@ -1226,8 +1223,8 @@ chaos_dns_split_rule_fields(char *line, char **selector_text, char **effect_text
     *effect_end++ = '\0';
 
     *selector_text = chaos_dns_trim(line);
-    *effect_text   = chaos_dns_trim(selector_end);
-    *value_text    = chaos_dns_trim(effect_end);
+    *effect_text = chaos_dns_trim(selector_end);
+    *value_text = chaos_dns_trim(effect_end);
     return 1;
 }
 
@@ -1243,7 +1240,7 @@ void chaos_dns_config_init(void)
     chaos_dns_config_reset_state(&g_chaos_dns_config_states[0], 1);
     chaos_dns_config_reset_state(&g_chaos_dns_config_states[1], 1);
     g_chaos_dns_active_config_index = 0U;
-    g_chaos_dns_cached_mtime        = CHAOS_DNS_MTIME_UNKNOWN;
+    g_chaos_dns_cached_mtime = CHAOS_DNS_MTIME_UNKNOWN;
 }
 
 /**
@@ -1292,7 +1289,7 @@ int chaos_dns_config_parse_line(char *line, chaos_dns_rule_t *rule)
     gai_error = chaos_dns_parse_gai_name(effect_text);
     if (gai_error != 0x7fffffff)
     {
-        rule->effect    = CHAOS_DNS_EFFECT_GAI;
+        rule->effect = CHAOS_DNS_EFFECT_GAI;
         rule->gai_error = gai_error;
         if (!chaos_dns_effect_allowed(&rule->selector, rule->effect))
         {
@@ -1487,10 +1484,10 @@ static int chaos_dns_config_select_rule_domain(
     chaos_dns_rule_t *rule
 )
 {
-    size_t       index;
+    size_t index;
     unsigned int best_rank = 0U;
-    size_t       best_len  = 0U;
-    int          found     = 0;
+    size_t best_len = 0U;
+    int found = 0;
 
     if (rules == NULL || name == NULL || rule == NULL)
     {
@@ -1512,10 +1509,10 @@ static int chaos_dns_config_select_rule_domain(
         if (!found || rank > best_rank ||
             (rank == best_rank && rules[index].selector.selector_len > best_len))
         {
-            *rule      = rules[index];
-            best_rank  = rank;
-            best_len   = rules[index].selector.selector_len;
-            found      = 1;
+            *rule = rules[index];
+            best_rank = rank;
+            best_len = rules[index].selector.selector_len;
+            found = 1;
         }
     }
 
@@ -1570,15 +1567,15 @@ int chaos_dns_config_select_reverse_rule(
  */
 int chaos_dns_config_prepare(void)
 {
-    uint64_t                   observed_mtime;
-    uint64_t                   cached_mtime;
-    unsigned int               active_index;
-    unsigned int               next_index;
-    size_t                     config_size;
-    chaos_dns_config_state_t  *next_state;
+    uint64_t observed_mtime;
+    uint64_t cached_mtime;
+    unsigned int active_index;
+    unsigned int next_index;
+    size_t config_size;
+    chaos_dns_config_state_t *next_state;
 
     observed_mtime = chaos_dns_config_observed_mtime();
-    cached_mtime   = chaos_dns_atomic_load_u64(&g_chaos_dns_cached_mtime);
+    cached_mtime = chaos_dns_atomic_load_u64(&g_chaos_dns_cached_mtime);
 
     if (observed_mtime == cached_mtime)
     {
@@ -1593,13 +1590,12 @@ int chaos_dns_config_prepare(void)
     }
 
     active_index = g_chaos_dns_active_config_index;
-    next_index   = active_index == 0U ? 1U : 0U;
-    next_state   = &g_chaos_dns_config_states[next_index];
-    chaos_dns_config_reset_state(next_state, 1);   /* start with a clean, valid-but-empty snapshot */
+    next_index = active_index == 0U ? 1U : 0U;
+    next_state = &g_chaos_dns_config_states[next_index];
+    chaos_dns_config_reset_state(next_state, 1); /* start with a clean, valid-but-empty snapshot */
 
     if (observed_mtime != CHAOS_DNS_MTIME_MISSING &&
-        chaos_dns_config_read_file(&config_size) == 0 &&
-        config_size > 0U &&
+        chaos_dns_config_read_file(&config_size) == 0 && config_size > 0U &&
         chaos_dns_config_parse_buffer(
             g_chaos_dns_config_buffer, next_state->rules, &next_state->rule_count
         ) != 0)

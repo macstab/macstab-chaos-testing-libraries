@@ -89,11 +89,11 @@
  * @{
  */
 /** mtime slot value indicating the config file did not exist on last check. */
-#define CHAOS_DNS_MTIME_MISSING    UINT64_C(0)
+#define CHAOS_DNS_MTIME_MISSING UINT64_C(0)
 /** mtime slot value set by the thread currently performing a reload (CAS lock). */
-#define CHAOS_DNS_MTIME_RELOADING  UINT64_C(0xfffffffffffffffe)
+#define CHAOS_DNS_MTIME_RELOADING UINT64_C(0xfffffffffffffffe)
 /** mtime slot value used at process start before the first stat(2) call. */
-#define CHAOS_DNS_MTIME_UNKNOWN    UINT64_C(0xffffffffffffffff)
+#define CHAOS_DNS_MTIME_UNKNOWN UINT64_C(0xffffffffffffffff)
 /** @} */
 
 /* -------------------------------------------------------------------------

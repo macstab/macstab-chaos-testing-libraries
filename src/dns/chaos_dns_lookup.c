@@ -104,7 +104,7 @@ static int chaos_dns_call_real_getaddrinfo(
     int rc;
 
     previous = chaos_dns_enter_internal();
-    rc       = g_chaos_dns_real_getaddrinfo(node, service, hints, result);
+    rc = g_chaos_dns_real_getaddrinfo(node, service, hints, result);
     chaos_dns_leave_internal(previous);
     return rc;
 }
@@ -125,19 +125,19 @@ static int chaos_dns_call_real_getaddrinfo(
  */
 static int chaos_dns_call_real_getnameinfo(
     const struct sockaddr *address,
-    socklen_t              address_len,
-    char                  *host,
-    socklen_t              host_len,
-    char                  *service,
-    socklen_t              service_len,
-    int                    flags
+    socklen_t address_len,
+    char *host,
+    socklen_t host_len,
+    char *service,
+    socklen_t service_len,
+    int flags
 )
 {
     int previous;
     int rc;
 
     previous = chaos_dns_enter_internal();
-    rc       = g_chaos_dns_real_getnameinfo(
+    rc = g_chaos_dns_real_getnameinfo(
         address, address_len, host, host_len, service, service_len, flags
     );
     chaos_dns_leave_internal(previous);
@@ -396,16 +396,16 @@ static int chaos_dns_strip_ipv6_brackets(const char *token, char *host, size_t h
  */
 static int chaos_dns_apply_override(
     const chaos_dns_rule_t *rule,
-    const char             *service,
-    const struct addrinfo  *hints,
-    struct addrinfo       **result
+    const char *service,
+    const struct addrinfo *hints,
+    struct addrinfo **result
 )
 {
-    char                 override_text[CHAOS_DNS_MAX_VALUE];
-    char                *cursor;
-    struct addrinfo      hints_copy;
+    char override_text[CHAOS_DNS_MAX_VALUE];
+    char *cursor;
+    struct addrinfo hints_copy;
     const struct addrinfo *lookup_hints;
-    struct addrinfo     *combined = NULL;
+    struct addrinfo *combined = NULL;
 
     if (rule == NULL || result == NULL)
     {
@@ -436,11 +436,11 @@ static int chaos_dns_apply_override(
     cursor = override_text;
     while (*cursor != '\0')
     {
-        char            *token     = cursor;
-        char            *separator = strchr(cursor, ',');
-        char             host[CHAOS_DNS_MAX_TEXT];
-        struct addrinfo *partial   = NULL;
-        int              rc;
+        char *token = cursor;
+        char *separator = strchr(cursor, ',');
+        char host[CHAOS_DNS_MAX_TEXT];
+        struct addrinfo *partial = NULL;
+        int rc;
 
         if (separator != NULL)
         {
@@ -560,12 +560,12 @@ CHAOS_DNS_EXPORT int getaddrinfo(
     chaos_dns_rule_t filter_rule;
     chaos_dns_rule_t shuffle_rule;
     chaos_dns_rule_t limit_rule;
-    char             node_buffer[CHAOS_DNS_MAX_VALUE];
-    char             service_buffer[CHAOS_DNS_MAX_VALUE];
-    const char      *effective_node    = node;
-    const char      *effective_service = service;
-    int              rc;
-    int              gai_error;
+    char node_buffer[CHAOS_DNS_MAX_VALUE];
+    char service_buffer[CHAOS_DNS_MAX_VALUE];
+    const char *effective_node = node;
+    const char *effective_service = service;
+    int rc;
+    int gai_error;
 
     /* 1. Reentrancy guard: bypass if already inside the library. */
     if (chaos_dns_in_internal() || node == NULL || *node == '\0')
@@ -714,21 +714,21 @@ CHAOS_DNS_EXPORT int getaddrinfo(
  */
 CHAOS_DNS_EXPORT int getnameinfo(
     const struct sockaddr *address,
-    socklen_t              address_len,
-    char                  *host,
-    socklen_t              host_len,
-    char                  *service,
-    socklen_t              service_len,
-    int                    flags
+    socklen_t address_len,
+    char *host,
+    socklen_t host_len,
+    char *service,
+    socklen_t service_len,
+    int flags
 )
 {
     chaos_dns_rule_t latency_rule;
     chaos_dns_rule_t gai_rule;
     chaos_dns_rule_t rewrite_rule;
     chaos_dns_rule_t service_rule;
-    char             query[CHAOS_DNS_MAX_TEXT];
-    int              rc;
-    int              gai_error;
+    char query[CHAOS_DNS_MAX_TEXT];
+    int rc;
+    int gai_error;
 
     /* 1. Reentrancy guard / NULL address. */
     if (chaos_dns_in_internal() || address == NULL)

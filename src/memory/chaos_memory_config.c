@@ -76,10 +76,10 @@
  * production.
  */
 #if defined(__linux__)
-#define CHAOS_MEMORY_STAT_SEC(st)  ((st)->st_mtim.tv_sec)
+#define CHAOS_MEMORY_STAT_SEC(st) ((st)->st_mtim.tv_sec)
 #define CHAOS_MEMORY_STAT_NSEC(st) ((st)->st_mtim.tv_nsec)
 #else
-#define CHAOS_MEMORY_STAT_SEC(st)  ((st)->st_mtimespec.tv_sec)
+#define CHAOS_MEMORY_STAT_SEC(st) ((st)->st_mtimespec.tv_sec)
 #define CHAOS_MEMORY_STAT_NSEC(st) ((st)->st_mtimespec.tv_nsec)
 #endif
 

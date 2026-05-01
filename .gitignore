@@ -1,5 +1,5 @@
 build/
-build-coverage/
+build-*/
 dist/
 *.gcov
 .idea/

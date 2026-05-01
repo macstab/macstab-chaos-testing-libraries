@@ -63,9 +63,9 @@
 typedef enum chaos_memory_operation
 {
     /** Sentinel: operation field is not meaningful for this selector kind. */
-    CHAOS_MEMORY_OP_INVALID  = -1,
+    CHAOS_MEMORY_OP_INVALID = -1,
     /** Matches calls to mmap(2), potentially further refined by mmap_kind. */
-    CHAOS_MEMORY_OP_MMAP     = 0,
+    CHAOS_MEMORY_OP_MMAP = 0,
     /** Matches calls to mprotect(2). */
     CHAOS_MEMORY_OP_MPROTECT,
     /** Matches calls to madvise(2). */
@@ -92,9 +92,9 @@ typedef enum chaos_memory_operation
 typedef enum chaos_memory_selector_kind
 {
     /** Sentinel: invalid or uninitialised selector. */
-    CHAOS_MEMORY_SELECTOR_INVALID   = -1,
+    CHAOS_MEMORY_SELECTOR_INVALID = -1,
     /** Matches all intercepted operations (wildcard selector `*`). */
-    CHAOS_MEMORY_SELECTOR_ANY       = 0,
+    CHAOS_MEMORY_SELECTOR_ANY = 0,
     /** Matches a specific operation (e.g., `mmap`, `munmap`). */
     CHAOS_MEMORY_SELECTOR_OPERATION,
     /**
@@ -129,7 +129,7 @@ typedef enum chaos_memory_mmap_kind
     /** Sentinel: not applicable or uninitialised. */
     CHAOS_MEMORY_MMAP_KIND_INVALID = -1,
     /** MAP_ANONYMOUS is set — anonymous private or shared mapping. */
-    CHAOS_MEMORY_MMAP_KIND_ANON    = 0,
+    CHAOS_MEMORY_MMAP_KIND_ANON = 0,
     /** MAP_ANONYMOUS is clear — file-backed or device mapping. */
     CHAOS_MEMORY_MMAP_KIND_FILE
 } chaos_memory_mmap_kind_t;
@@ -165,7 +165,7 @@ typedef enum chaos_memory_effect
     /** Sentinel: invalid or uninitialised effect. */
     CHAOS_MEMORY_EFFECT_INVALID = -1,
     /** Pre-call error injection: set errno and return MAP_FAILED / -1. */
-    CHAOS_MEMORY_EFFECT_ERRNO   = 0,
+    CHAOS_MEMORY_EFFECT_ERRNO = 0,
     /** Pre-call latency injection: sleep for latency_ms before the call. */
     CHAOS_MEMORY_EFFECT_LATENCY
 } chaos_memory_effect_t;

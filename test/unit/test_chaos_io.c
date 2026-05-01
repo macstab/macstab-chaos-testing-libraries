@@ -78,7 +78,8 @@
  * Triggering conditions:
  * - `chaos_io_resolve_symbol(&resolved_read, "read")` with a functioning dlsym stub.
  * - `chaos_io_resolve_symbol()` with `g_dlsym_fail_symbol = "read"` and `g_abort_expected = 1`.
- * - `chaos_io_read_seed_material()` with successful open+full read (`g_sys_read_result == sizeof(uint64_t)`).
+ * - `chaos_io_read_seed_material()` with successful open+full read (`g_sys_read_result ==
+ * sizeof(uint64_t)`).
  * - `chaos_io_read_seed_material()` with a short read (`g_sys_read_result == 1`).
  * - `chaos_io_read_seed_material()` with a failed open (`g_sys_open_result == -1`).
  *
@@ -868,7 +869,8 @@ static void test_read_and_write_wrappers(void)
  * - `trim_iovecs`: any NULL input → 0; limit=3 clips first segment to 2, second to 1.
  * - `build_torn_iovecs`: torn count == 0 → 0; iov total == 0 → 0; torn >= total → 0; valid → 1.
  * - `corrupt_iovecs`: NULL iov, zero count, or zero size → no corrupt call.
- * - `corrupt_iovecs` with two 4-byte segments and size=3: exactly one call; `last_corrupt_sample_size == 3`.
+ * - `corrupt_iovecs` with two 4-byte segments and size=3: exactly one call;
+ * `last_corrupt_sample_size == 3`.
  * - `corrupt_iovecs` with two 1-byte segments and an odd PRNG draw: routes to second segment
  *   with `last_corrupt_sample_size == 1`.
  */
@@ -1131,8 +1133,8 @@ static void test_readv_and_writev_wrappers(void)
  * - `sendfile(9, 4, NULL, 2)` with ERRNO/EIO.
  *
  * Expected observable behaviour:
- * - Guard bypass: real sendfile called immediately; guard captured as 1; `g_real_sendfile_out_fd == 8`;
- *   `g_real_sendfile_in_fd == 4`; offset pointer forwarded.
+ * - Guard bypass: real sendfile called immediately; guard captured as 1; `g_real_sendfile_out_fd ==
+ * 8`; `g_real_sendfile_in_fd == 4`; offset pointer forwarded.
  * - TORN: `g_last_torn_requested == 6`; `g_real_sendfile_count == 3`; operation == OP_WRITE.
  * - LATENCY: `g_latency_calls == 1`.
  * - ERRNO: returns -1, errno == EIO; `g_real_sendfile_calls == 0`.
@@ -1207,7 +1209,8 @@ static void test_sendfile_wrapper(void)
  * - Guard bypass: real copy_file_range called; both fd and offset pointers forwarded;
  *   `g_real_copy_file_range_flags == 0`.
  * - TORN: `g_last_torn_requested == 6`; `g_real_copy_file_range_count == 3`; operation == OP_WRITE.
- * - LATENCY: `g_latency_calls == 1`; `g_real_copy_file_range_flags == 7` (non-zero flags preserved).
+ * - LATENCY: `g_latency_calls == 1`; `g_real_copy_file_range_flags == 7` (non-zero flags
+ * preserved).
  * - ERRNO: returns -1, errno == EIO; `g_real_copy_file_range_calls == 0`.
  */
 static void test_copy_file_range_wrapper(void)
@@ -1291,7 +1294,8 @@ static void test_copy_file_range_wrapper(void)
  * - CORRUPT preadv: `g_corrupt_sample_calls == 1`; at least one buffer byte changed.
  * - LATENCY preadv: `g_latency_calls == 1`.
  * - ERRNO preadv: returns -1, errno == ENOSPC; `g_real_preadv_calls == 0`.
- * - Passthrough pwritev: `g_real_pwritev_calls == 1`; guard == 1; offset == 17; iov lengths captured.
+ * - Passthrough pwritev: `g_real_pwritev_calls == 1`; guard == 1; offset == 17; iov lengths
+ * captured.
  * - LATENCY pwritev: `g_latency_calls == 1`.
  * - TORN pwritev: `g_last_torn_requested == 6`; trimmed iov (`lengths[0]==2`, `lengths[1]==1`);
  *   operation == OP_PWRITE; offset == 19.

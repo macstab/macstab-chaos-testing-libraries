@@ -47,9 +47,9 @@
  */
 typedef struct chaos_io_fd_cache_entry
 {
-    int valid;                      /**< Non-zero when this slot holds a live mapping. */
-    int fd;                         /**< The descriptor whose path is cached here. */
-    char path[CHAOS_IO_MAX_PATH];   /**< Null-terminated resolved filesystem path. */
+    int valid;                    /**< Non-zero when this slot holds a live mapping. */
+    int fd;                       /**< The descriptor whose path is cached here. */
+    char path[CHAOS_IO_MAX_PATH]; /**< Null-terminated resolved filesystem path. */
 } chaos_io_fd_cache_entry_t;
 
 /** @brief The per-thread cache array; zero-initialized by the TLS runtime. */

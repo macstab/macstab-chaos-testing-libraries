@@ -89,7 +89,8 @@ static int g_real_usleep_calls = 0;
  * EINTR is the representative usleep error (interrupted by signal).
  */
 static int g_real_usleep_error = 0;
-/** @brief `clock_id` argument captured from the most recent `chaos_time_test_clock_gettime` call. */
+/** @brief `clock_id` argument captured from the most recent `chaos_time_test_clock_gettime` call.
+ */
 static clockid_t g_last_clock_id = (clockid_t)0;
 /** @brief `request` argument captured from the most recent `chaos_time_test_nanosleep` call. */
 static struct timespec g_last_sleep_request;
