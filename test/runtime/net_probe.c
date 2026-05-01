@@ -1,3 +1,53 @@
+/**
+ * @file net_probe.c
+ * @brief Runtime validation probe for libchaos-net under LD_PRELOAD.
+ *
+ * @details
+ * Standalone C program compiled inside a Docker container and executed under
+ * `LD_PRELOAD=libchaos-net.so`. Validates end-to-end fault injection for the
+ * network library's interposed symbols across all supported socket operations.
+ *
+ * Each subtest writes a config rule with a future-mtime timestamp to
+ * `/tmp/.chaos-net.conf`, then exercises the interposed symbol and asserts the
+ * expected behavior. The future-mtime pattern guarantees a config reload cycle
+ * on the first post-write invocation, ensuring the new rule is active. Config
+ * rules use the `proto://host:port:operation:effect:param` format; endpoint
+ * matching is performed by `src/net/chaos_net_endpoint.c` after resolving the
+ * file descriptor to a `host:port` key via `getsockname` or `getpeername`.
+ *
+ * Subtests cover:
+ * - `ERRNO` on `bind` (TCP4, synthetic `EMFILE`)
+ * - `LATENCY` on `listen` (TCP4, ≥ 150 ms added sleep)
+ * - `ERRNO` on `connect` (TCP4, synthetic `EHOSTUNREACH`)
+ * - `ERRNO` on `accept` (TCP4, synthetic `EAGAIN`)
+ * - `ERRNO` on `accept4` (TCP4, synthetic `EAGAIN` via shared `accept` rule)
+ * - `LATENCY` on `send` (TCP4, ≥ 150 ms; measured in child process)
+ * - `CORRUPT` on `recv` (TCP4, single-bit flip verified against known payload)
+ * - `ERRNO` on `sendto` (UDP4, synthetic `EHOSTUNREACH`)
+ * - `CORRUPT` on `recvfrom` (UDP4, single-bit flip)
+ * - `ERRNO` on `sendmsg` (UDP4, synthetic `EHOSTUNREACH`)
+ * - `CORRUPT` on `recvmsg` (UDP4, single-bit flip)
+ * - `ERRNO` on `socket` (TCP4 wildcard, synthetic `EAFNOSUPPORT`)
+ * - `ERRNO` on `socketpair` (UNIX, synthetic `EMFILE`)
+ * - `ERRNO` on `shutdown` (TCP4, synthetic `ENOTCONN`)
+ * - `TIMEOUT` on `poll` (TCP4, suppresses ready event; verified by rc==0 and revents==0)
+ * - `TIMEOUT` on `ppoll` (TCP4, same semantics as `poll`)
+ * - `TIMEOUT` on `select` (TCP4, fd cleared from readfds)
+ * - `TIMEOUT` on `pselect` (TCP4, fd cleared from readfds)
+ * - `TIMEOUT` on `epoll_wait` (TCP4, rc==0 with data in flight)
+ * - `TIMEOUT` on `epoll_pwait` (TCP4, same semantics as `epoll_wait`)
+ * - `ERRNO` on `sendmmsg` (UDP4, synthetic `EHOSTUNREACH`)
+ * - `CORRUPT` on `recvmmsg` (UDP4, single-bit flip)
+ *
+ * Fork-based subtests (`send`, `recv`, `recvfrom`, `recvmsg`, `recvmmsg`)
+ * create a real TCP/UDP connection pair using loopback ports in the 41005–41020
+ * range so that the endpoint resolver can match the injected rule. `SIGPIPE` is
+ * set to `SIG_IGN` in `main()` to avoid termination when writing to a half-closed
+ * connection during chaos injection.
+ *
+ * Returns 0 on success; returns a non-zero numbered exit code identifying
+ * the failing subtest.
+ */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>

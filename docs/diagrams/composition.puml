@@ -1,0 +1,102 @@
+@startuml composition
+'
+' Engineered by  Christian Schnapka
+'                Embedded Principal+ Engineer
+'                Macstab GmbH · Hamburg, Germany
+'                https://macstab.com
+'
+' Multi-library composition via LD_PRELOAD.
+' Shows link-map ordering, per-library RTLD_NEXT chains,
+' and the one-symbol-one-owner invariant.
+'
+' Reference: docs/SYSTEM.md §17, docs/PLATFORM.md §1
+'
+title Multi-Library Composition via LD_PRELOAD — Link-Map and RTLD_NEXT
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam roundCorner 4
+skinparam component {
+  ArrowColor           #2C3E50
+  BorderColor          #2C3E50
+  BackgroundColor      #FFFFFF
+  FontStyle            bold
+}
+
+note as N1
+  LD_PRELOAD="libchaos-io.so libchaos-net.so libchaos-time.so"
+
+  Link-map order (left = lower address, earlier in resolution):
+    [0] libchaos-io.so
+    [1] libchaos-net.so
+    [2] libchaos-time.so
+    [3] target executable
+    [4] libc.so.6
+    [5] libdl.so.2
+    ...
+
+  RTLD_NEXT from libchaos-io → starts from [1], finds libc at [4]
+  RTLD_NEXT from libchaos-net → starts from [2], finds libc at [4]
+  RTLD_NEXT from libchaos-time → starts from [3], finds libc at [4]
+end note
+
+frame "Process Address Space" {
+
+  component "Application Code" as App {
+    [call write()]
+    [call connect()]
+    [call clock_gettime()]
+  }
+
+  component "libchaos-io.so" as IO {
+    [write wrapper]
+    [read wrapper]
+    [fsync wrapper]
+  }
+
+  component "libchaos-net.so" as NET {
+    [connect wrapper]
+    [send wrapper]
+    [recv wrapper]
+  }
+
+  component "libchaos-time.so" as TIME {
+    [clock_gettime wrapper]
+    [nanosleep wrapper]
+  }
+
+  component "libc.so.6 (glibc)" as LIBC {
+    [write → vfs syscall]
+    [connect → socket syscall]
+    [clock_gettime → vDSO / SYS_clock_gettime]
+  }
+
+  database "/tmp/.chaos-io.conf"   as IOCFG
+  database "/tmp/.chaos-net.conf"  as NETCFG
+  database "/tmp/.chaos-time.conf" as TIMECFG
+}
+
+[call write()]          --> [write wrapper]      : PLT slot patched to IO
+[call connect()]        --> [connect wrapper]     : PLT slot patched to NET
+[call clock_gettime()]  --> [clock_gettime wrapper] : PLT slot patched to TIME
+
+[write wrapper]   --> IOCFG   : stat + read on mtime change
+[connect wrapper] --> NETCFG  : stat + read on mtime change
+[clock_gettime wrapper] --> TIMECFG : stat + read on mtime change
+
+[write wrapper]   --> [write → vfs syscall]        : RTLD_NEXT("write") → libc
+[connect wrapper] --> [connect → socket syscall]   : RTLD_NEXT("connect") → libc
+[clock_gettime wrapper] --> [clock_gettime → vDSO / SYS_clock_gettime] : RTLD_NEXT("clock_gettime") → libc
+
+note bottom of LIBC
+  One-symbol-one-owner invariant:
+  write    owned by: libchaos-io   only
+  connect  owned by: libchaos-net  only
+  clock_gettime owned by: libchaos-time only
+
+  If two libraries owned "write", RTLD_NEXT from the
+  second would resolve to the first (not libc), causing
+  double injection. Correctness requires no overlap.
+end note
+
+@enduml

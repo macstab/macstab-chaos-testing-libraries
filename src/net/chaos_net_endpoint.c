@@ -1,3 +1,39 @@
+/**
+ * @file chaos_net_endpoint.c
+ * @brief Endpoint normalisation: parsing selectors and deriving endpoints from sockets.
+ *
+ * @details
+ * This file implements the two-direction translation described in chaos_net_endpoint.h:
+ *
+ *   **Text → endpoint** (chaos_net_endpoint_parse_selector):
+ *   A config selector string is parsed left-to-right. The scheme prefix
+ *   (tcp4://, tcp6://, udp4://, udp6://, unix://) determines the endpoint kind and
+ *   dispatches to a family-specific parser. IPv4 parsing uses a simple strrchr(':')
+ *   to split host and port. IPv6 parsing requires square-bracket notation
+ *   ([addr]:port) because the address itself contains colons.
+ *
+ *   **Socket → endpoint** (chaos_net_endpoint_from_sockaddr_fd, *_from_local_fd,
+ *   *_from_peer_fd):
+ *   Normalisation combines two pieces of information that are available separately:
+ *     1. The address bytes (IP + port) from the sockaddr struct or getsockname/getpeername.
+ *     2. The socket type (SOCK_STREAM vs SOCK_DGRAM) from getsockopt(SO_TYPE).
+ *   Both are required to produce the final endpoint kind (TCP4/UDP4/etc.).
+ *
+ * @par Invariants maintained by this file:
+ *   - All functions that call getsockname, getpeername, or getsockopt set the
+ *     reentrancy guard before the call and restore it on all exit paths,
+ *     preventing libchaos-net from intercepting its own internal queries.
+ *   - Port values are always stored in host byte order (ntohs applied on input).
+ *   - Abstract UNIX socket paths (sun_path[0] == '\0') are rejected because they
+ *     cannot be represented as a printable config selector string.
+ *   - SOCK_CLOEXEC and SOCK_NONBLOCK flags are masked off the SO_TYPE result on
+ *     Linux before comparing to SOCK_STREAM / SOCK_DGRAM, because some kernels
+ *     return these bits set via getsockopt.
+ *
+ * @par Module: chaos-net
+ * @par Stability: private / internal
+ */
+
 #include "chaos_net_endpoint.h"
 
 #include <arpa/inet.h>
@@ -5,6 +41,18 @@
 #include <string.h>
 #include <sys/un.h>
 
+/**
+ * @brief Parses a decimal port number from a NUL-terminated string.
+ *
+ * @details Uses strtoul with strict validation: the entire string must consist of
+ * decimal digits and the value must fit in [0, 65535]. Any trailing non-digit
+ * characters (including whitespace) cause a parse failure, enforcing the contract
+ * that config port fields are exact numeric tokens with no surrounding space.
+ *
+ * @param text  NUL-terminated string containing a decimal port number. Must not be NULL.
+ * @param port  Output: receives the parsed port in host byte order. Must not be NULL.
+ * @return 1 on success; 0 if @p text is NULL, empty, non-numeric, or out of range.
+ */
 static int chaos_net_parse_port(const char *text, uint16_t *port)
 {
     char *end = NULL;
@@ -25,6 +73,19 @@ static int chaos_net_parse_port(const char *text, uint16_t *port)
     return 1;
 }
 
+/**
+ * @brief Parses the body of a tcp4:// or udp4:// selector (the part after the scheme).
+ *
+ * @details The expected format is `HOST:PORT` where HOST is either a dotted-decimal
+ * IPv4 address or the single character `*` (wildcard host). The port is found by
+ * strrchr(':'), so IPv4 addresses (which cannot themselves contain colons) are split
+ * correctly. An empty host field (selector starts with ':') is rejected.
+ *
+ * @param body      Pointer into the selector text after the `tcp4://` or `udp4://` prefix.
+ * @param kind      CHAOS_NET_ENDPOINT_TCP4 or CHAOS_NET_ENDPOINT_UDP4.
+ * @param endpoint  Output endpoint; kind, wildcard_host / value.ipv4, and port are set.
+ * @return 1 on success; 0 on any parse error.
+ */
 static int chaos_net_parse_ipv4_selector(
     const char *body, chaos_net_endpoint_kind_t kind, chaos_net_endpoint_t *endpoint
 )
@@ -62,6 +123,23 @@ static int chaos_net_parse_ipv4_selector(
     return chaos_net_parse_port(port_text + 1, &endpoint->port);
 }
 
+/**
+ * @brief Parses the body of a tcp6:// or udp6:// selector (the part after the scheme).
+ *
+ * @details Two formats are accepted:
+ *   - `*:PORT`     — wildcard host, specific port.
+ *   - `[ADDR]:PORT` — specific IPv6 address (brackets required to avoid ambiguity
+ *                     with the colons in the address itself).
+ *
+ * The bare `"*"` without a port is explicitly rejected (the scheme prefix alone
+ * provides no useful selector). The bracket/colon structure is validated strictly:
+ * the closing `]` must be immediately followed by `:`.
+ *
+ * @param body      Pointer after the `tcp6://` or `udp6://` prefix.
+ * @param kind      CHAOS_NET_ENDPOINT_TCP6 or CHAOS_NET_ENDPOINT_UDP6.
+ * @param endpoint  Output; kind is set first to simplify early-return paths.
+ * @return 1 on success; 0 on any parse error.
+ */
 static int chaos_net_parse_ipv6_selector(
     const char *body, chaos_net_endpoint_kind_t kind, chaos_net_endpoint_t *endpoint
 )
@@ -73,6 +151,7 @@ static int chaos_net_parse_ipv6_selector(
     endpoint->kind = kind;
     if (strcmp(body, "*") == 0)
     {
+        /* Bare "*" without a port is not a valid selector for an address family. */
         return 0;
     }
     if (body[0] == '*')
@@ -111,6 +190,14 @@ static int chaos_net_parse_ipv6_selector(
     return chaos_net_parse_port(port_text + 2, &endpoint->port);
 }
 
+/**
+ * @brief Parses a config selector string into a chaos_net_endpoint_t.
+ *
+ * @details See chaos_net_endpoint.h for the full format specification. This function
+ * zeroes @p endpoint before dispatch to ensure a consistent state on all exit paths.
+ * selector_len is recorded from strlen(text) before any parsing, so it reflects the
+ * original string length and can be used as a tie-breaker in rule selection.
+ */
 int chaos_net_endpoint_parse_selector(const char *text, chaos_net_endpoint_t *endpoint)
 {
     const char *body;
@@ -158,6 +245,22 @@ int chaos_net_endpoint_parse_selector(const char *text, chaos_net_endpoint_t *en
     return 0;
 }
 
+/**
+ * @brief Tests whether a selector endpoint matches a runtime endpoint, with specificity rank.
+ *
+ * @details The matching logic implements a four-level specificity hierarchy:
+ *   - Rank 1: ANY wildcard selector (`"*"`). Matches everything.
+ *   - Rank 2: UNIX selector with `"*"` path, or IPv4/IPv6 with wildcard_host (port must match).
+ *   - Rank 3: IPv4 or IPv6 with exact IP and exact port match.
+ *   - Rank 4: UNIX with exact path match.
+ *
+ * Kind must match exactly (TCP4 ≠ UDP4, TCP4 ≠ TCP6) except that ANY matches all.
+ * For IPv4/IPv6, port is checked before the address bytes to short-circuit early.
+ * memcmp is used for address comparison because in_addr/in6_addr have no padding
+ * bytes on any supported platform and the structs are compared in full.
+ *
+ * @return Non-zero if the selector matches (rank >= 1); 0 if no match.
+ */
 int chaos_net_endpoint_matches(
     const chaos_net_endpoint_t *selector,
     const chaos_net_endpoint_t *endpoint,
@@ -227,6 +330,7 @@ int chaos_net_endpoint_matches(
                 rank = 2U;
                 break;
             }
+            /* in6_addr is 16 bytes with no padding; memcmp is correct and portable. */
             if (memcmp(
                     &selector->value.ipv6, &endpoint->value.ipv6, sizeof(selector->value.ipv6)
                 ) != 0)
@@ -251,6 +355,18 @@ int chaos_net_endpoint_matches(
     return rank != 0U;
 }
 
+/**
+ * @brief Constructs a wildcard endpoint from socket creation parameters.
+ *
+ * @details At socket() time there is no bound or connected address, so the
+ * resulting endpoint uses wildcard_host=1 and port=0 for IP families, or
+ * the path text `"*"` for UNIX. This allows socket-creation rules to use
+ * selectors such as `tcp4://\*:0` (match any TCP4 socket creation) or `"*"`.
+ *
+ * SOCK_CLOEXEC and SOCK_NONBLOCK are masked from @p type before inspection
+ * because Linux allows these flags to be OR'd into the type argument of
+ * socket(2) and they have no bearing on the stream vs. datagram distinction.
+ */
 int chaos_net_endpoint_from_socket_spec(
     int domain, int type, int protocol, chaos_net_endpoint_t *endpoint
 )
@@ -304,6 +420,7 @@ int chaos_net_endpoint_from_socket_spec(
     if (domain == AF_UNIX)
     {
         endpoint->kind = CHAOS_NET_ENDPOINT_UNIX;
+        /* Two-byte copy includes the NUL terminator. */
         (void)memcpy(endpoint->value.text, "*", 2U);
         return 1;
     }
@@ -311,6 +428,14 @@ int chaos_net_endpoint_from_socket_spec(
     return 0;
 }
 
+/**
+ * @brief Tries local address first, then peer address, for shutdown-style operations.
+ *
+ * @details shutdown() may be called on a socket that is bound but not connected
+ * (server-side), connected but not bound to a specific local port (client-side),
+ * or fully connected. Trying getsockname first covers the server case; falling
+ * back to getpeername covers connected-only sockets.
+ */
 int chaos_net_endpoint_from_activity_fd(int fd, chaos_net_endpoint_t *endpoint)
 {
     if (endpoint == NULL)
@@ -325,6 +450,20 @@ int chaos_net_endpoint_from_activity_fd(int fd, chaos_net_endpoint_t *endpoint)
     return chaos_net_endpoint_from_peer_fd(fd, endpoint);
 }
 
+/**
+ * @brief Maps (sa_family, SO_TYPE) to a chaos_net_endpoint_kind_t.
+ *
+ * @details This internal helper factors out the getsockopt(SO_TYPE) call shared
+ * by chaos_net_endpoint_from_sockaddr() and the fd-based resolution functions.
+ * It is called with the reentrancy guard already set by the caller, so the
+ * g_chaos_net_real_getsockopt call will not re-enter the interposition layer.
+ *
+ * @param fd     Socket fd to query.
+ * @param family sa_family_t from the sockaddr (AF_INET, AF_INET6, or AF_UNIX).
+ * @param kind   Output: receives the resulting endpoint kind.
+ * @return 1 on success; 0 if getsockopt fails, kind is NULL, or the type is
+ *         not SOCK_STREAM/SOCK_DGRAM.
+ */
 static int
 chaos_net_endpoint_kind_from_socket(int fd, sa_family_t family, chaos_net_endpoint_kind_t *kind)
 {
@@ -337,6 +476,7 @@ chaos_net_endpoint_kind_from_socket(int fd, sa_family_t family, chaos_net_endpoi
         return 0;
     }
 
+    /* Guard: getsockopt must not re-enter the interposition layer. */
     previous = chaos_net_enter_internal();
     if (g_chaos_net_real_getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &type_len) != 0)
     {
@@ -345,6 +485,7 @@ chaos_net_endpoint_kind_from_socket(int fd, sa_family_t family, chaos_net_endpoi
     }
     chaos_net_leave_internal(previous);
 
+    /* Mask Linux-specific creation-time flags; they are not relevant to stream/dgram. */
 #ifdef SOCK_CLOEXEC
     type &= ~SOCK_CLOEXEC;
 #endif
@@ -388,6 +529,26 @@ chaos_net_endpoint_kind_from_socket(int fd, sa_family_t family, chaos_net_endpoi
     return 0;
 }
 
+/**
+ * @brief Core normalisation function: converts a struct sockaddr + fd into an endpoint.
+ *
+ * @details Dispatches on address->sa_family:
+ *   - AF_INET: validates address_length >= sizeof(sockaddr_in), extracts
+ *     sin_addr and sin_port (ntohs applied). Uses @p fd to query SO_TYPE for kind.
+ *   - AF_INET6: validates address_length >= sizeof(sockaddr_in6), extracts
+ *     sin6_addr and sin6_port. sin6_flowinfo and sin6_scope_id are not stored;
+ *     they are not relevant for config-file matching.
+ *   - AF_UNIX: copies sun_path; rejects abstract paths (sun_path[0] == '\0')
+ *     and paths that would overflow value.text.
+ *   - Other families: rejected (return 0).
+ *
+ * @param fd              Used for SO_TYPE query; must be a valid socket fd.
+ * @param address         Sockaddr to normalise. Must not be NULL and must be at
+ *                        least sizeof(sa_family_t) bytes.
+ * @param address_length  Size of the buffer at @p address in bytes.
+ * @param endpoint        Output; zeroed on entry to this function.
+ * @return 1 on success; 0 on any validation or query failure.
+ */
 static int chaos_net_endpoint_from_sockaddr(
     int fd, const struct sockaddr *address, socklen_t address_length, chaos_net_endpoint_t *endpoint
 )
@@ -414,6 +575,7 @@ static int chaos_net_endpoint_from_sockaddr(
         {
             return 0;
         }
+        /* ntohs: config selectors use host byte order; ensure consistent comparison. */
         endpoint->port = ntohs(ipv4->sin_port);
         endpoint->value.ipv4 = ipv4->sin_addr;
         return 1;
@@ -428,6 +590,8 @@ static int chaos_net_endpoint_from_sockaddr(
             return 0;
         }
         endpoint->port = ntohs(ipv6->sin6_port);
+        /* sin6_flowinfo and sin6_scope_id are intentionally not stored;
+         * config selectors cannot express them and they would break matching. */
         endpoint->value.ipv6 = ipv6->sin6_addr;
         return 1;
     case AF_UNIX:
@@ -436,6 +600,8 @@ static int chaos_net_endpoint_from_sockaddr(
         {
             return 0;
         }
+        /* Abstract UNIX sockets have a NUL as the first byte of sun_path.
+         * They cannot be represented as a config selector string, so reject them. */
         if (unix_address->sun_path[0] == '\0')
         {
             return 0;
@@ -452,6 +618,13 @@ static int chaos_net_endpoint_from_sockaddr(
     }
 }
 
+/**
+ * @brief Public wrapper around the internal sockaddr normaliser.
+ *
+ * @details Provides a stable external interface that the socket interceptors
+ * (bind, connect, sendto, sendmsg) can call when a sockaddr is already available
+ * as a function argument. The fd is still required to resolve SO_TYPE.
+ */
 int chaos_net_endpoint_from_sockaddr_fd(
     int fd, const struct sockaddr *address, socklen_t address_length, chaos_net_endpoint_t *endpoint
 )
@@ -459,6 +632,13 @@ int chaos_net_endpoint_from_sockaddr_fd(
     return chaos_net_endpoint_from_sockaddr(fd, address, address_length, endpoint);
 }
 
+/**
+ * @brief Resolves an endpoint from the local address of a socket fd.
+ *
+ * @details Uses a stack-allocated sockaddr_storage (large enough for any address
+ * family) to receive the getsockname result. The reentrancy guard is set before
+ * and restored after the getsockname call to prevent looping.
+ */
 int chaos_net_endpoint_from_local_fd(int fd, chaos_net_endpoint_t *endpoint)
 {
     struct sockaddr_storage storage;
@@ -484,6 +664,14 @@ int chaos_net_endpoint_from_local_fd(int fd, chaos_net_endpoint_t *endpoint)
     );
 }
 
+/**
+ * @brief Resolves an endpoint from the remote peer address of a connected socket fd.
+ *
+ * @details Uses stack-allocated sockaddr_storage. The reentrancy guard is set
+ * around the getpeername call. If the socket is not connected, getpeername
+ * returns ENOTCONN and this function returns 0, causing the caller to fall
+ * through to the real syscall without fault injection.
+ */
 int chaos_net_endpoint_from_peer_fd(int fd, chaos_net_endpoint_t *endpoint)
 {
     struct sockaddr_storage storage;

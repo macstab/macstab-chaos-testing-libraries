@@ -1,3 +1,54 @@
+/**
+ * @file process_probe.c
+ * @brief Runtime validation probe for libchaos-process under LD_PRELOAD.
+ *
+ * @details
+ * Standalone C program compiled inside a Docker container and executed under
+ * `LD_PRELOAD=libchaos-process.so`. Validates end-to-end fault injection for
+ * the process library's interposed symbols: `pthread_create`, `fork`,
+ * `posix_spawn`, `posix_spawnp`, `execve`, `execveat`, and `waitpid`.
+ *
+ * Each subtest writes a config rule with a future-mtime timestamp to
+ * `/tmp/.chaos-process.conf`, then exercises the interposed symbol and asserts
+ * the expected behavior. This probe uses `utime()` rather than `futimens()` to
+ * advance the mtime, because `futimens()` requires the fd to remain open past
+ * `fclose()`, which conflicts with the write-close-then-stamp ordering needed
+ * for `utime()`. The incrementing `g_config_stamp` still guarantees each
+ * `write_config()` call produces a strictly newer mtime.
+ *
+ * Subtests cover:
+ * - `ERRNO` on `pthread_create` (synthetic `EAGAIN`; returned as errno-style int)
+ * - `LATENCY` on `pthread_create` (≥ 80 ms added sleep before thread creation)
+ * - `FAIL_AFTER` on `pthread_create` (N=1: first call succeeds, second returns `EAGAIN`)
+ * - `ERRNO` on `fork` (synthetic `EAGAIN`)
+ * - `LATENCY` on `fork` (≥ 80 ms added sleep; measured in parent before child reap)
+ * - `ERRNO` on `posix_spawn` (synthetic `EAGAIN`; no process created)
+ * - `LATENCY` on `posix_spawnp` (≥ 80 ms added sleep; spawns `/bin/true`)
+ * - `ERRNO` on `execve` (synthetic `EACCES`; verified in forked child)
+ * - `ERRNO` on `execveat` (synthetic `ENOENT`; skipped gracefully if weak symbol is NULL)
+ * - `ERRNO` on `waitpid` (synthetic `EINTR`; config cleared before reaping zombie)
+ * - `LATENCY` on `waitpid` (≥ 80 ms added sleep; child exits immediately)
+ *
+ * `pthread_create` errors are returned as the function's int return value, not
+ * via `errno` — the probe verifies `rc == EAGAIN && errno == 0` to distinguish
+ * this from POSIX-style syscall errors.
+ *
+ * `posix_spawn` on glibc uses `clone(CLONE_VFORK|CLONE_VM)` internally,
+ * bypassing the libc `fork()` symbol; the interposed `posix_spawn` symbol is
+ * therefore the only reliable injection point on glibc. On musl, `posix_spawn`
+ * calls `fork()` internally, so `fork` rules would also cascade — the probe
+ * tests `posix_spawn` directly to avoid this ambiguity.
+ *
+ * `execveat` is declared as a weak symbol; the probe skips the subtest when
+ * the kernel does not expose it (older kernels, non-Linux containers).
+ *
+ * `waitpid` ERRNO requires a zombie-reap cleanup pass: after confirming the
+ * injected error, the config is cleared and `wait_for_child()` is called in a
+ * retry loop to release the zombie before the process exits.
+ *
+ * Returns 0 on success; returns a non-zero numbered exit code identifying
+ * the failing subtest.
+ */
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>

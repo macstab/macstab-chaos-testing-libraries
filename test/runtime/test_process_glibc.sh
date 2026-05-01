@@ -1,4 +1,19 @@
 #!/bin/sh
+#
+# test_process_glibc.sh — libchaos-process runtime validation on glibc (Docker).
+#
+# Builds libchaos-process.so for the target platform using Docker buildx with a
+# glibc (debian:bookworm) base, then runs the pre-compiled process_probe binary
+# under LD_PRELOAD in a glibc container. Validates pthread_create, fork,
+# posix_spawn, execve, execveat, and waitpid fault injection (ERRNO, LATENCY,
+# FAIL_AFTER) on glibc. Note: on glibc, posix_spawn uses clone(CLONE_VFORK)
+# and does not call the libc fork() symbol — fork rules do not cascade to
+# posix_spawn on glibc.
+#
+# Usage:   test_process_glibc.sh [linux/amd64|linux/arm64]
+# Env:     CHAOS_PROCESS_DOCKER_PLATFORM  platform override
+# Prereqs: docker with buildx and multi-arch support
+
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)

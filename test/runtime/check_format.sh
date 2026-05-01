@@ -1,4 +1,15 @@
 #!/bin/sh
+#
+# check_format.sh — clang-format style gate for all C sources.
+#
+# Scans every .c and .h file under src/ and test/ for clang-format compliance.
+# In --check mode (default) exits non-zero if any file would be reformatted.
+# In --fix mode rewrites files in place.
+#
+# Usage:   check_format.sh [--check|--fix]
+# Env:     CLANG_FORMAT  path override for the clang-format binary
+# Prereqs: clang-format (searched in PATH, then via xcrun on macOS)
+
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)

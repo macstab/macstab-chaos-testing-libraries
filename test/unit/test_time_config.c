@@ -1,3 +1,47 @@
+/**
+ * @file test_time_config.c
+ * @brief Unit tests for TIME-domain config parsing, selector matching, rule selection,
+ *   and reload state machine.
+ *
+ * Subsystem under test: `src/time/chaos_time_config.c`
+ *
+ * Coverage approach:
+ * - Production source is included directly after replacing `open`, `read`, `close`, and
+ *   `chaos_time_atomic_cas_u64` with test-controlled stubs, exercising the full config
+ *   pipeline without LD_PRELOAD.
+ * - `write_config_text()` uses `futimens` to stamp deterministic mtime values so successive
+ *   writes always trigger a reload regardless of wall-clock precision.
+ * - The existing config file at `CHAOS_TIME_CONFIG_PATH` is backed up and restored.
+ *
+ * Properties under test:
+ * - Primitive helpers: `is_blank_char`, `config_reset_state`, `trim`, `strip_comment`,
+ *   `parse_errno_name` (4 symbolic + numeric "4" + NULL + "bad"),
+ *   `parse_probability`, `parse_latency`, `parse_offset` (negative value, NULL args, bad text),
+ *   `copy_text_value`, `parse_payload_probability` (bare / `value@p` / empty / p>1.0),
+ *   `parse_clock_id` (realtime, monotonic, platform conditionals, numeric "7", "bad-clock"),
+ *   `selector_parse` (NULL / "" / "clock_gettime/" / overlong),
+ *   `split_rule_fields` (valid / NULL / one-colon / missing second colon),
+ *   `selector_matches` (NULL selector), `effect_allowed` (NULL / valid / INVALID),
+ *   mtime sentinels (MTIME_MISSING, MTIME_UNKNOWN, MTIME_RELOADING normalization).
+ * - Selector matching: `*` (ANY, rank=1), `clock_gettime` (OPERATION, rank=2),
+ *   `clock_gettime/monotonic` (CLOCK_ID, rank=3); non-matching clock_id → false;
+ *   `nanosleep` and `usleep` selectors; "clock_gettime/", "sleep", "bad-clock" all rejected.
+ * - Line and buffer parsing: ERRNO / LATENCY / OFFSET effects; 11 invalid-line categories
+ *   (OFFSET on wildcard/usleep, out-of-range p, bad clock, unknown effect, etc.);
+ *   buffer with blank/comment lines; no-newline EOF; NULL guards.
+ * - Rule selection: clock_gettime/monotonic beats clock_gettime beats * (rank hierarchy);
+ *   CLOCK_REALTIME falls back to operation selector; usleep falls back to ANY;
+ *   nanosleep LATENCY direct match; NULL guards; `selector_len` tie-break.
+ * - Prepare-and-match state machine: no file → false; valid OFFSET rule; same mtime → no reload;
+ *   new mtime reloads; `match` after new file; `match_loaded` bypass; bad rule → prepare false;
+ *   oversized file → read_file negative; open/read/CAS failures all false.
+ * - Buffer limit: `CHAOS_TIME_MAX_RULES + 1` rules → parse_buffer returns negative.
+ *
+ * What is NOT tested here:
+ * - Action helpers (offset math, latency, errno): tested in test_time_actions.c.
+ * - Wrapper call paths: tested in test_chaos_time.c.
+ */
+
 #include "../support/test_time_support.h"
 
 #include <errno.h>
@@ -8,11 +52,35 @@
 
 CHAOS_TIME_DEFINE_TEST_GLOBALS();
 
+/** @brief When non-zero, the open stub returns ENOENT rather than delegating to the real open. */
 static int g_test_config_force_open_fail = 0;
+/**
+ * @brief When non-zero, the open stub returns `g_test_config_fake_fd`; subsequent reads on
+ *   that fd return EIO.
+ */
 static int g_test_config_force_read_fail = 0;
+/** @brief When non-zero, the CAS stub always returns 0 (failure). */
 static int g_test_config_force_cas_fail = 0;
+/**
+ * @brief Sentinel fd returned by the open stub when `g_test_config_force_read_fail` is set.
+ *   Chosen to be outside normal fd ranges to avoid aliasing.
+ */
 static const int g_test_config_fake_fd = 8124;
 
+/**
+ * @brief Stub for `open(2)` / `open(2)` with O_CREAT.
+ *
+ * Behaviour depends on fault-injection flags:
+ * - `g_test_config_force_open_fail`: returns -1 with errno=ENOENT.
+ * - `g_test_config_force_read_fail`: returns `g_test_config_fake_fd`.
+ * - O_CREAT: extracts mode from va_args and delegates to the real `open`.
+ * - Otherwise: delegates without mode argument.
+ *
+ * @param path   Filesystem path.
+ * @param flags  Open flags.
+ * @param ...    Optional mode_t when flags include O_CREAT.
+ * @return Opened fd, `g_test_config_fake_fd`, or -1.
+ */
 static int chaos_time_test_config_open(const char *path, int flags, ...)
 {
     if (g_test_config_force_open_fail != 0)
@@ -39,6 +107,17 @@ static int chaos_time_test_config_open(const char *path, int flags, ...)
     return open(path, flags);
 }
 
+/**
+ * @brief Stub for `read(2)`.
+ *
+ * When `g_test_config_force_read_fail` is set and @p fd equals `g_test_config_fake_fd`,
+ * returns -1 with errno=EIO. Otherwise delegates to the real read.
+ *
+ * @param fd      File descriptor.
+ * @param buffer  Destination buffer.
+ * @param count   Maximum bytes to read.
+ * @return Bytes read, or -1 with errno=EIO on injected failure.
+ */
 static ssize_t chaos_time_test_config_read(int fd, void *buffer, size_t count)
 {
     if (g_test_config_force_read_fail != 0 && fd == g_test_config_fake_fd)
@@ -51,6 +130,16 @@ static ssize_t chaos_time_test_config_read(int fd, void *buffer, size_t count)
     return read(fd, buffer, count);
 }
 
+/**
+ * @brief Stub for `close(2)`.
+ *
+ * When `g_test_config_force_read_fail` is set and @p fd equals `g_test_config_fake_fd`,
+ * returns 0 without calling the real close (the fd is not a real kernel fd).
+ * Otherwise delegates.
+ *
+ * @param fd  File descriptor to close.
+ * @return 0 on success.
+ */
 static int chaos_time_test_config_close(int fd)
 {
     if (g_test_config_force_read_fail != 0 && fd == g_test_config_fake_fd)
@@ -60,6 +149,18 @@ static int chaos_time_test_config_close(int fd)
     return close(fd);
 }
 
+/**
+ * @brief Stub for `chaos_time_atomic_cas_u64`.
+ *
+ * When `g_test_config_force_cas_fail` is non-zero, returns 0 to simulate a lost CAS race,
+ * causing the prepare call to skip the update and return false. Otherwise delegates to the
+ * real `__sync_bool_compare_and_swap`.
+ *
+ * @param value     Pointer to the target 64-bit word.
+ * @param expected  Value required for success.
+ * @param desired   Value to write on success.
+ * @return 1 on success, 0 on injected failure or value mismatch.
+ */
 static int
 chaos_time_test_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint64_t desired)
 {
@@ -80,13 +181,27 @@ chaos_time_test_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint
 #undef read
 #undef open
 
+/**
+ * @brief Heap snapshot of a config file for backup and restore.
+ */
 typedef struct chaos_time_test_file_backup
 {
+    /** @brief Non-zero if the file existed at backup time. */
     int existed;
+    /** @brief Heap-allocated copy of the file contents. */
     char *data;
+    /** @brief Number of bytes in `data`. */
     size_t size;
 } chaos_time_test_file_backup_t;
 
+/**
+ * @brief Read @p path into a heap snapshot stored in @p backup.
+ *
+ * If the file does not exist, sets `backup->existed = 0` and returns.
+ *
+ * @param path    Path to back up.
+ * @param backup  Output struct to populate; must be zero-initialised by caller.
+ */
 static void backup_file(const char *path, chaos_time_test_file_backup_t *backup)
 {
     FILE *file;
@@ -122,6 +237,14 @@ static void backup_file(const char *path, chaos_time_test_file_backup_t *backup)
     fclose(file);
 }
 
+/**
+ * @brief Restore a file from a heap snapshot created by `backup_file`.
+ *
+ * Removes the file if it did not exist at backup time; otherwise rewrites it verbatim.
+ *
+ * @param path    Filesystem path to restore.
+ * @param backup  Snapshot to write.
+ */
 static void restore_file(const char *path, const chaos_time_test_file_backup_t *backup)
 {
     FILE *file;
@@ -138,6 +261,11 @@ static void restore_file(const char *path, const chaos_time_test_file_backup_t *
     assert(fclose(file) == 0);
 }
 
+/**
+ * @brief Free heap memory held by a backup snapshot.
+ *
+ * @param backup  Snapshot to release.
+ */
 static void free_backup(chaos_time_test_file_backup_t *backup)
 {
     free(backup->data);
@@ -146,6 +274,15 @@ static void free_backup(chaos_time_test_file_backup_t *backup)
     backup->existed = 0;
 }
 
+/**
+ * @brief Write @p text to `CHAOS_TIME_CONFIG_PATH` with a deterministic mtime.
+ *
+ * Uses `futimens` on the open file descriptor before closing so that successive calls
+ * with distinct @p stamp values produce distinct mtime hashes, reliably triggering a reload.
+ *
+ * @param text   NUL-terminated config text to write.
+ * @param stamp  Seconds value used for both atime and mtime.
+ */
 static void write_config_text(const char *text, time_t stamp)
 {
     FILE *file;
@@ -162,6 +299,34 @@ static void write_config_text(const char *text, time_t stamp)
     assert(fclose(file) == 0);
 }
 
+/**
+ * @brief Invariant: all primitive config helpers accept valid input and reject invalid input.
+ *
+ * Triggering conditions: direct calls to every leaf parsing helper with valid, boundary,
+ *   and invalid arguments.
+ *
+ * Expected observable behaviour:
+ * - `is_blank_char(' '/'\\t')` → true; `is_blank_char('x')` → false.
+ * - `config_reset_state(NULL, 1)` does not crash; `reset_state(&state, 0)` zeroes
+ *   `rule_count` and `parse_ok` even when the struct was memset to 0xff.
+ * - `trim` strips leading/trailing whitespace; NULL → NULL.
+ * - `strip_comment` truncates at '#'; NULL is a no-op.
+ * - `parse_errno_name`: EINVAL/EPERM/ENOSYS/EAGAIN return correct values; numeric "4" → 4;
+ *   NULL → -1; "bad" → -1.
+ * - `parse_probability`/`parse_latency`: NULL pointer args → error; valid strings → 0;
+ *   out-of-range → error.
+ * - `parse_offset("-250", ...)` → 0 return; NULL args → error; "bad" → error.
+ * - `copy_text_value`/`parse_payload_probability`: NULL/empty/zero-size → error; valid → 0.
+ * - `parse_clock_id`: realtime, monotonic, platform-conditional IDs, numeric "7" → true;
+ *   NULL output, NULL name, "bad-clock" → false.
+ * - `selector_parse`: NULL / "" / "clock_gettime/" (empty clock part) / overlong → false.
+ * - `split_rule_fields("clock_gettime/monotonic:OFFSET:-250", ...)` → all three pointers set.
+ * - `selector_matches(NULL, ...)` → false; `effect_allowed(NULL, ...)` → false;
+ *   `effect_allowed(&selector, ERRNO/LATENCY)` → true;
+ *   `effect_allowed(&selector, INVALID)` → false.
+ * - `config_hash_mtime(NULL)` → MTIME_MISSING; sentinel normalization of MTIME_UNKNOWN and
+ *   MTIME_RELOADING never returns those sentinel values; `hash_mtime(&zero_stat)` → non-zero.
+ */
 static void test_helper_functions(void)
 {
     char trim_text[] = " \t value \r\n";
@@ -298,6 +463,22 @@ static void test_helper_functions(void)
     assert(chaos_time_config_hash_mtime(&st) != 0U);
 }
 
+/**
+ * @brief Invariant: selector matching respects kind hierarchy and rejects non-matching clock IDs.
+ *
+ * Triggering condition: `chaos_time_selector_parse()` and `chaos_time_selector_matches()`
+ *   called for all four selector variants.
+ *
+ * Expected observable behaviour:
+ * - "*" → kind=ANY, matches USLEEP with rank=1.
+ * - "clock_gettime" → kind=OPERATION, matches CLOCK_GETTIME with any clock_id at rank=2.
+ * - "clock_gettime/monotonic" → kind=CLOCK_ID, matches CLOCK_GETTIME+CLOCK_MONOTONIC at rank=3;
+ *   rejects CLOCK_REALTIME.
+ * - "nanosleep" → matches NANOSLEEP.
+ * - "usleep" → matches USLEEP.
+ * - "clock_gettime/" (empty clock part), "sleep" (unknown op), "clock_gettime/bad-clock"
+ *   (unknown clock) all fail to parse.
+ */
 static void test_selector_matching(void)
 {
     chaos_time_selector_t selector;
@@ -340,6 +521,28 @@ static void test_selector_matching(void)
     assert(!chaos_time_selector_parse("clock_gettime/bad-clock", &selector));
 }
 
+/**
+ * @brief Invariant: line and buffer parsers accept valid rules and reject invalid forms.
+ *
+ * Triggering condition: `chaos_time_config_parse_line()` and
+ *   `chaos_time_config_parse_buffer()` with representative valid and invalid inputs.
+ *
+ * Expected observable behaviour:
+ * - Comment line → returns 0 (skipped).
+ * - `*:ERRNO:EINVAL@0.5` → selector_kind=ANY, effect=ERRNO, errnum=EINVAL, probability=0.5.
+ * - `clock_gettime:LATENCY:25` → effect=LATENCY, latency_ms=25, probability=1.0 (default).
+ * - `clock_gettime/monotonic:OFFSET:-250@0.75` → kind=CLOCK_ID, effect=OFFSET,
+ *   offset_ms=-250, probability=0.75.
+ * - 11 invalid forms: bad selector, empty selector, unknown op "sleep", bad errno name,
+ *   empty errno (via "@0.5"), out-of-range latency probability, bad offset text,
+ *   empty offset (via "@0.25"), OFFSET on "*" (not allowed), OFFSET on "usleep" (not allowed),
+ *   unknown effect name.
+ * - 4-rule buffer → rule_count=4.
+ * - No-newline EOF → 1 rule parsed.
+ * - Buffer with bad line → negative.
+ * - Comment-only buffer with one rule → rule_count=1.
+ * - NULL guards for line and buffer parsers all return negative.
+ */
 static void test_parse_line_and_buffer(void)
 {
     chaos_time_rule_t rule;
@@ -409,10 +612,12 @@ static void test_parse_line_and_buffer(void)
         assert(chaos_time_config_parse_line(invalid_line, &rule) < 0);
     }
     {
+        /* OFFSET is not allowed on the wildcard selector */
         char invalid_line[] = "*:OFFSET:5";
         assert(chaos_time_config_parse_line(invalid_line, &rule) < 0);
     }
     {
+        /* OFFSET is not allowed on usleep (no clock_id) */
         char invalid_line[] = "usleep:OFFSET:5";
         assert(chaos_time_config_parse_line(invalid_line, &rule) < 0);
     }
@@ -447,6 +652,23 @@ static void test_parse_line_and_buffer(void)
     assert(chaos_time_config_parse_buffer(buffer, rules, NULL) < 0);
 }
 
+/**
+ * @brief Invariant: rule selection honours rank hierarchy and `selector_len` tie-break.
+ *
+ * Triggering condition: `chaos_time_config_select_rule()` against a 4-rule set containing
+ *   one ANY rule, one OPERATION rule, one CLOCK_ID rule, and one nanosleep LATENCY rule.
+ *
+ * Expected observable behaviour:
+ * - CLOCK_GETTIME + CLOCK_MONOTONIC with ERRNO effect → clock_gettime/monotonic wins (rank 3),
+ *   returns EINTR.
+ * - CLOCK_GETTIME + CLOCK_REALTIME with ERRNO effect → operation selector wins (rank 2),
+ *   returns EFAULT.
+ * - USLEEP with ERRNO effect → ANY wins (rank 1), returns EINVAL.
+ * - NANOSLEEP with LATENCY effect → direct OPERATION match, returns latency_ms=20.
+ * - NULL rules / NULL output → false.
+ * - Tie-break: two rules for CLOCK_GETTIME/CLOCK_REALTIME with selector_len 10 and 12 →
+ *   the rule with selector_len=12 wins, returning EPERM.
+ */
 static void test_rule_selection(void)
 {
     chaos_time_rule_t rules[4];
@@ -502,6 +724,23 @@ static void test_rule_selection(void)
     assert(rule.errnum == EPERM);
 }
 
+/**
+ * @brief Invariant: the prepare/match pipeline handles all file-system and state-machine paths.
+ *
+ * Triggering condition: `chaos_time_config_prepare()` and `chaos_time_config_match()`
+ *   called under various file conditions with fault flags set and cleared between calls.
+ *
+ * Expected observable behaviour:
+ * - No config file → `prepare` returns false; `match` returns false.
+ * - Valid OFFSET rule → `prepare` true; `match` returns offset_ms=500.
+ * - `match_loaded` returns same; second `prepare` with same mtime → true without reload.
+ * - New mtime (nanosleep:ERRNO:EINTR) → `match` updates; errnum=EINTR.
+ * - `match` for non-loaded effect → false.
+ * - Bad rule → `prepare` false; `match_loaded` false.
+ * - Oversized file → `read_file` returns negative; `read_file(NULL)` negative.
+ * - Open failure → `prepare` false; read failure (EIO) → false; CAS failure → false.
+ * - Config file restored at test end.
+ */
 static void test_prepare_and_match(void)
 {
     chaos_time_test_file_backup_t backup;
@@ -574,6 +813,15 @@ static void test_prepare_and_match(void)
     free_backup(&backup);
 }
 
+/**
+ * @brief Invariant: rule buffer parser rejects input that exceeds `CHAOS_TIME_MAX_RULES`.
+ *
+ * Triggering condition: a dynamically allocated buffer containing exactly
+ *   `CHAOS_TIME_MAX_RULES + 1` valid rule lines.
+ *
+ * Expected observable behaviour: `chaos_time_config_parse_buffer()` returns a negative
+ *   value before the rules array would overflow.
+ */
 static void test_parse_buffer_limit(void)
 {
     chaos_time_rule_t rules[CHAOS_TIME_MAX_RULES + 1U];

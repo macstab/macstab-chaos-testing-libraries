@@ -1,4 +1,17 @@
 #!/bin/sh
+#
+# test_process_alpine.sh — libchaos-process runtime validation on musl/Alpine (Docker).
+#
+# Builds libchaos-process.so for the target platform using Docker buildx with a
+# musl (alpine) base, then runs the pre-compiled process_probe binary under
+# LD_PRELOAD in an Alpine container. Validates process lifecycle fault injection
+# on musl libc. Note: on musl, posix_spawn calls fork() so fork rules cascade
+# to posix_spawn — this is the opposite of glibc behavior.
+#
+# Usage:   test_process_alpine.sh [linux/amd64|linux/arm64]
+# Env:     CHAOS_PROCESS_DOCKER_PLATFORM  platform override
+# Prereqs: docker with buildx and multi-arch support
+
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)

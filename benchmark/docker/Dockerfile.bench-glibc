@@ -1,0 +1,37 @@
+# =============================================================================
+# Dockerfile.bench-glibc  —  Tier 1 benchmark image (glibc / debian).
+#
+# Container caveats (encoded in the harness's ADVISORY mode):
+#   - The host scheduler decides where this container runs; CPU pinning
+#     via --cpuset-cpus is best-effort and inherits host's online CPUs.
+#   - The host's cpufreq governor applies; the container cannot set it.
+#   - Host IRQs may land on the cpuset cores.  This image does not
+#     attempt to mitigate.
+#
+# For OFFICIAL-mode runs, deploy the same image to a Tier 2 host that
+# has been provisioned with isolcpus/nohz_full/governor=performance at
+# the host kernel.  The harness adapts automatically.
+# =============================================================================
+
+FROM debian:12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        build-essential \
+        gcc \
+        make \
+        ca-certificates \
+        git \
+        python3 \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work
+
+# The repo is mounted at /work by the wrapper script; we don't COPY here
+# so the container can rebuild on every source change without an image
+# rebuild.
+
+# Default entry runs the harness in --list mode for sanity.
+CMD ["make", "-f", "benchmark/Makefile.bench", "bench-list"]

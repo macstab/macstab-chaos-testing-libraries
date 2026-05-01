@@ -1,4 +1,17 @@
 #!/bin/sh
+#
+# test_net_glibc.sh — libchaos-net runtime validation on glibc (Docker).
+#
+# Builds libchaos-net.so for the target platform using Docker buildx with a
+# glibc (debian:bookworm) base, then runs the pre-compiled net_probe binary
+# under LD_PRELOAD in a glibc container. Validates connect, send, recv, accept,
+# poll, and epoll_wait fault injection (ERRNO, LATENCY, CORRUPT, TIMEOUT) on
+# glibc amd64 and arm64.
+#
+# Usage:   test_net_glibc.sh [linux/amd64|linux/arm64]
+# Env:     CHAOS_NET_DOCKER_PLATFORM  platform override
+# Prereqs: docker with buildx and multi-arch support
+
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)

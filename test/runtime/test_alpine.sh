@@ -1,4 +1,17 @@
 #!/bin/sh
+#
+# test_alpine.sh — libchaos-io runtime validation on musl/Alpine (Docker).
+#
+# Builds libchaos-io.so for the target platform using Docker buildx with a
+# musl (alpine) base, then runs the pre-compiled probe binary under
+# LD_PRELOAD in an Alpine container. Validates that all interposed IO symbols
+# inject faults correctly on musl libc for amd64 and arm64.
+#
+# Usage:   test_alpine.sh [linux/amd64|linux/arm64]
+#          Defaults to the host architecture when no argument is given.
+# Env:     CHAOS_IO_DOCKER_PLATFORM  platform override
+# Prereqs: docker with buildx and multi-arch support
+
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)

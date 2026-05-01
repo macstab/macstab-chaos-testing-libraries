@@ -1,4 +1,20 @@
 #!/bin/sh
+#
+# test_dns_alpine.sh — libchaos-dns runtime validation on musl/Alpine (Docker).
+#
+# Builds libchaos-dns.so for the target platform using Docker buildx with a
+# musl (alpine) base, then runs the pre-compiled dns_probe binary under
+# LD_PRELOAD in an Alpine container. Validates getaddrinfo and getnameinfo
+# fault injection on musl libc for amd64 and arm64.
+#
+# Note: on musl, getaddrinfo calls do not go through NSS modules; the
+# reentrancy path from getnameinfo→getaddrinfo (glibc aarch64 only) is
+# not triggered. Both paths are independently exercised by dns_probe.
+#
+# Usage:   test_dns_alpine.sh [linux/amd64|linux/arm64]
+# Env:     CHAOS_DNS_DOCKER_PLATFORM  platform override
+# Prereqs: docker with buildx and multi-arch support
+
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)

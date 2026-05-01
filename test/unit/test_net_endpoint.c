@@ -1,16 +1,121 @@
+/**
+ * @file test_net_endpoint.c
+ * @brief Unit tests for network-endpoint parsing, matching, and socket-address resolution.
+ *
+ * Subsystem under test: `src/net/chaos_net_endpoint.c`
+ *
+ * Coverage approach:
+ * - The production source file is included directly. Three real-function-pointer globals
+ *   (`g_chaos_net_real_getsockopt`, `g_chaos_net_real_getsockname`,
+ *   `g_chaos_net_real_getpeername`) are assigned to test stubs in `reset_endpoint_stubs()`
+ *   before each test that needs them. This mirrors how the production library wires the
+ *   function pointers at constructor time.
+ * - `CHAOS_NET_DEFINE_TEST_GLOBALS()` instantiates all real-function-pointer globals.
+ * - Three stubs control the syscall-level responses:
+ *   - `chaos_net_test_getsockopt`: asserts SOL_SOCKET/SO_TYPE parameters; writes
+ *     `g_stub_socket_type` into the value buffer; returns `g_stub_getsockopt_result`.
+ *   - `chaos_net_test_getsockname`: copies `g_stub_sockname_storage` (truncated to
+ *     `g_stub_sockname_length`) into the output; returns `g_stub_getsockname_result`.
+ *   - `chaos_net_test_getpeername`: copies `g_stub_peer_storage` into the output;
+ *     returns `g_stub_getpeername_result`.
+ * - Helper `chaos_net_test_set_ipv4` / `chaos_net_test_set_ipv6` from `test_net_support.h`
+ *   constructs properly-initialised sockaddr_in / sockaddr_in6 values for use in tests.
+ *
+ * Properties under test:
+ * - `chaos_net_endpoint_parse_selector`: all 7 scheme prefixes (tcp4, tcp6, udp4, udp6,
+ *   unix, wildcard *); wildcard-host variants (`*:port`); exact-host variants; NULL, empty,
+ *   unknown scheme, missing port → false.
+ * - `chaos_net_parse_port`: NULL, empty, NULL output, out-of-range, trailing char → false.
+ * - `chaos_net_parse_ipv4_selector`: bare IP without port → false; wildcard with port → true;
+ *   oversized host, invalid IP → false.
+ * - `chaos_net_parse_ipv6_selector`: bracketed IPv6 with port → true; wildcard → true;
+ *   missing port separator, empty brackets, invalid address → false.
+ * - `chaos_net_endpoint_matches`: exact TCP4 match → rank 3; wildcard-host match → rank 2;
+ *   wildcard `*` match → rank 1; UNIX exact match → rank 4; UNIX wildcard → rank 2;
+ *   NULL selector or endpoint → false; kind/address/port mismatches → false;
+ *   INVALID kind → false, rank reset to 0; NULL rank pointer → no crash.
+ * - `chaos_net_endpoint_from_sockaddr_fd`: AF_INET TCP → TCP4; AF_INET UDP → UDP4;
+ *   AF_INET6 TCP → TCP6; AF_INET6 UDP → UDP6; AF_UNIX with path → UNIX; empty sun_path →
+ *   false; oversized unix path → false; truncated sockaddr (too small) → false;
+ *   getsockopt failure → false; unknown socket type → false; NULL address → false;
+ *   address length < `sizeof(sa_family_t)` → false; AF_UNSPEC → false.
+ * - `chaos_net_endpoint_from_sockaddr`: oversized unix path → false.
+ * - `chaos_net_endpoint_from_local_fd`: populates endpoint from getsockname; getsockname
+ *   failure → false; NULL output → false.
+ * - `chaos_net_endpoint_from_peer_fd`: populates endpoint from getpeername; getpeername
+ *   failure → false; NULL output → false.
+ * - `chaos_net_endpoint_from_socket_spec`: all valid AF/type combinations; SOCK_NONBLOCK
+ *   masked on Linux; SOCK_RAW → false; AF_UNSPEC → false; NULL output → false.
+ * - `chaos_net_endpoint_from_activity_fd`: tries getpeername first, falls back to
+ *   getsockname; both failing → false; NULL output → false.
+ * - `chaos_net_endpoint_kind_from_socket`: NULL output → false; NULL getsockopt → false;
+ *   AF_UNSPEC → false; valid AF/type pairs produce correct kinds.
+ *
+ * What is NOT tested here:
+ * - Network wrapper call paths (tested in `test_chaos_net.c`).
+ * - Config file parsing and rule selection (tested in the net-config test).
+ */
+
 #include "../support/test_net_support.h"
 
 CHAOS_NET_DEFINE_TEST_GLOBALS();
 
+/** @brief Return value for `chaos_net_test_getsockopt`; 0 → success. */
 static int g_stub_getsockopt_result = 0;
+
+/**
+ * @brief Socket type written into the getsockopt value buffer.
+ *
+ * Defaults to SOCK_STREAM. Set to SOCK_DGRAM or an invalid value to exercise UDP and
+ * unknown-socket-type paths.
+ */
 static int g_stub_socket_type = SOCK_STREAM;
+
+/** @brief Return value for `chaos_net_test_getsockname`; 0 → success, -1 → failure. */
 static int g_stub_getsockname_result = 0;
+
+/** @brief Return value for `chaos_net_test_getpeername`; 0 → success, -1 → failure. */
 static int g_stub_getpeername_result = 0;
+
+/**
+ * @brief Storage for the sockaddr copied by `chaos_net_test_getsockname`.
+ *
+ * Populated via `memcpy` from a real `sockaddr_in` or `sockaddr_in6` before a test that
+ * exercises `chaos_net_endpoint_from_local_fd`.
+ */
 static struct sockaddr_storage g_stub_sockname_storage;
+
+/**
+ * @brief Byte length of the valid data in `g_stub_sockname_storage`.
+ *
+ * Set to `sizeof(sockaddr_in)` or `sizeof(sockaddr_in6)` as appropriate.
+ */
 static socklen_t g_stub_sockname_length = 0U;
+
+/**
+ * @brief Storage for the sockaddr copied by `chaos_net_test_getpeername`.
+ *
+ * Populated and used identically to `g_stub_sockname_storage` for peer-address tests.
+ */
 static struct sockaddr_storage g_stub_peer_storage;
+
+/** @brief Byte length of valid data in `g_stub_peer_storage`. */
 static socklen_t g_stub_peer_length = 0U;
 
+/**
+ * @brief Stub getsockopt that validates parameters and writes `g_stub_socket_type`.
+ *
+ * Asserts that level is SOL_SOCKET and optname is SO_TYPE. When `g_stub_getsockopt_result`
+ * is non-zero, returns that value without writing. Otherwise writes `g_stub_socket_type`
+ * into `*(int *)value` and sets `*length = sizeof(int)`.
+ *
+ * @param fd      Ignored.
+ * @param level   Asserted to be SOL_SOCKET.
+ * @param optname Asserted to be SO_TYPE.
+ * @param value   Destination for the socket type integer.
+ * @param length  Set to `sizeof(int)` on success.
+ * @return `g_stub_getsockopt_result` (0 = success).
+ */
 static int chaos_net_test_getsockopt(int fd, int level, int optname, void *value, socklen_t *length)
 {
     (void)fd;
@@ -29,6 +134,17 @@ static int chaos_net_test_getsockopt(int fd, int level, int optname, void *value
     return 0;
 }
 
+/**
+ * @brief Stub getsockname that copies `g_stub_sockname_storage` into the output buffer.
+ *
+ * Returns `g_stub_getsockname_result` without writing when non-zero. Otherwise asserts that
+ * `*length >= g_stub_sockname_length` and copies exactly `g_stub_sockname_length` bytes.
+ *
+ * @param fd       Ignored.
+ * @param address  Destination buffer.
+ * @param length   In: caller buffer size. Out: set to `g_stub_sockname_length`.
+ * @return `g_stub_getsockname_result` (0 = success).
+ */
 static int chaos_net_test_getsockname(int fd, struct sockaddr *address, socklen_t *length)
 {
     (void)fd;
@@ -45,6 +161,16 @@ static int chaos_net_test_getsockname(int fd, struct sockaddr *address, socklen_
     return 0;
 }
 
+/**
+ * @brief Stub getpeername that copies `g_stub_peer_storage` into the output buffer.
+ *
+ * Behaves identically to `chaos_net_test_getsockname` but uses the peer storage variables.
+ *
+ * @param fd       Ignored.
+ * @param address  Destination buffer.
+ * @param length   In: caller buffer size. Out: set to `g_stub_peer_length`.
+ * @return `g_stub_getpeername_result` (0 = success).
+ */
 static int chaos_net_test_getpeername(int fd, struct sockaddr *address, socklen_t *length)
 {
     (void)fd;
@@ -63,6 +189,12 @@ static int chaos_net_test_getpeername(int fd, struct sockaddr *address, socklen_
 
 #include "../../src/net/chaos_net_endpoint.c"
 
+/**
+ * @brief Reset all stub variables and function-pointer globals to well-known defaults.
+ *
+ * Calls `chaos_net_test_reset_runtime()` to clear PRNG and function-pointer globals, then
+ * installs the three test stubs and zeroes all storage buffers and result codes.
+ */
 static void reset_endpoint_stubs(void)
 {
     chaos_net_test_reset_runtime();
@@ -79,6 +211,38 @@ static void reset_endpoint_stubs(void)
     g_stub_peer_length = 0U;
 }
 
+/**
+ * @brief Invariant: selector parsing accepts all scheme/host/port combinations and
+ *   rejects all malformed inputs; matching assigns the correct rank for each selector kind.
+ *
+ * Triggering condition: `chaos_net_endpoint_parse_selector` with all valid and invalid
+ *   selector strings; `chaos_net_parse_port`, `chaos_net_parse_ipv4_selector`, and
+ *   `chaos_net_parse_ipv6_selector` with boundary inputs; `chaos_net_endpoint_matches`
+ *   with matching and non-matching endpoint pairs.
+ *
+ * Expected observable behaviour:
+ * - `"*"` → ANY kind.
+ * - `"tcp4://127.0.0.1:5432"` → TCP4, port=5432, wildcard_host=0.
+ * - `"tcp4://\*:5432"` → TCP4, port=5432, wildcard_host=1.
+ * - `"tcp6://[::1]:443"` → TCP6, port=443.
+ * - `"tcp6://\*:8443"` → TCP6, port=8443, wildcard_host=1.
+ * - `"udp4://127.0.0.1:53"` → UDP4, port=53.
+ * - `"udp6://\*:53"` → UDP6, port=53, wildcard_host=1.
+ * - `"udp6://[::1]:53"` → UDP6, port=53.
+ * - `"unix:///tmp/socket"` → UNIX, text="/tmp/socket".
+ * - `"unix://\*"` → UNIX, text="*".
+ * - `parse_port(NULL)`, `("")`, `(80, NULL)`, `("70000")`, `("10x")` → false.
+ * - `parse_ipv4_selector("127.0.0.1", ...)` (no port) → false; `("*:25", ...)` → true,
+ *   wildcard=1, port=25; oversized host → false; invalid IP → false.
+ * - `parse_ipv6_selector("[::1]:443", ...)` → true, port=443; `("*:443", ...)` →
+ *   wildcard=1; missing port sep, empty brackets, invalid address → false.
+ * - NULL, empty, unknown scheme, missing port, unbracketed IPv6 → false.
+ * - Exact TCP4 match (same ip+port) → rank 3; wildcard-host match → rank 2; `*` → rank 1.
+ * - UNIX exact match → rank 4; UNIX wildcard → rank 2; path mismatch → false.
+ * - NULL selector or endpoint → false; kind/address/port/family mismatches → false.
+ * - INVALID kind on both sides → false and rank reset to 0.
+ * - NULL rank pointer in matching call does not crash.
+ */
 static void test_selector_parsing_and_matching(void)
 {
     chaos_net_endpoint_t selector;
@@ -226,6 +390,40 @@ static void test_selector_parsing_and_matching(void)
     assert(rank == 0U);
 }
 
+/**
+ * @brief Invariant: endpoint resolution from sockaddr structures and file descriptors
+ *   produces the correct endpoint kind and handles all failure modes.
+ *
+ * Triggering condition: `chaos_net_endpoint_from_sockaddr_fd`, `chaos_net_endpoint_from_sockaddr`,
+ *   `chaos_net_endpoint_from_local_fd`, `chaos_net_endpoint_from_peer_fd`,
+ *   `chaos_net_endpoint_from_socket_spec`, `chaos_net_endpoint_from_activity_fd`, and
+ *   `chaos_net_endpoint_kind_from_socket` called with various valid and invalid inputs.
+ *
+ * Expected observable behaviour:
+ * - IPv4 address + SOCK_STREAM → TCP4, port matches; truncated sockaddr (size-1) → false.
+ * - IPv4 address + SOCK_DGRAM → UDP4.
+ * - IPv6 address + SOCK_STREAM → TCP6, port matches; truncated → false.
+ * - IPv6 address + SOCK_DGRAM → UDP6.
+ * - AF_UNIX with "/tmp/chaos.sock" → UNIX, path matches; empty sun_path → false;
+ *   oversized unix path (beyond `CHAOS_NET_MAX_TEXT`) → false.
+ * - Local fd resolution via getsockname with IPv4/TCP4: endpoint.kind=TCP4.
+ * - Peer fd resolution via getpeername with IPv4/TCP4: endpoint.kind=TCP4.
+ * - `getsockopt_result=-1` → false for sockaddr_fd.
+ * - Unknown socket type (12345) → false.
+ * - NULL address → false; address length < sizeof(sa_family_t) → false.
+ * - `from_socket_spec(AF_INET, SOCK_STREAM, ...)` → TCP4, port=0, wildcard=1.
+ * - `from_socket_spec(AF_INET, SOCK_DGRAM, ...)` → UDP4.
+ * - `from_socket_spec(AF_INET6, SOCK_STREAM, ...)` → TCP6.
+ * - `from_socket_spec(AF_INET6, SOCK_DGRAM[|SOCK_NONBLOCK], ...)` → UDP6, wildcard=1.
+ * - `from_socket_spec(AF_INET6, SOCK_RAW, ...)` → false.
+ * - `from_socket_spec(AF_UNIX, SOCK_STREAM, ...)` → UNIX, text="*".
+ * - `from_socket_spec(AF_UNSPEC, ...)` and `(AF_INET, SOCK_RAW, ...)` → false.
+ * - NULL output → false.
+ * - `from_activity_fd`: getpeername fails → falls back to getsockname (TCP4 from local);
+ *   getsockname fails → falls back to getpeername; both fail → false; NULL output → false.
+ * - `endpoint_kind_from_socket`: NULL output → false; NULL getsockopt → false;
+ *   AF_UNSPEC → false; valid AF/SOCK_DGRAM pairs → UDP4, UDP6, UNIX.
+ */
 static void test_endpoint_resolution_from_sockaddr_and_fd(void)
 {
     struct sockaddr_in ipv4;

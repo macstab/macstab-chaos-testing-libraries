@@ -1,4 +1,37 @@
+<!--
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Engineered by  Christian Schnapka
+                 Embedded Principal+ Engineer
+                 Macstab GmbH · Hamburg, Germany
+                 https://macstab.com
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-->
+
 # Chaos Testing Libraries System Manual
+
+> *Engineered by* **[Christian Schnapka](https://macstab.com)** — Embedded Principal+ Engineer · [Macstab GmbH](https://macstab.com) · Hamburg, Germany
+
+---
+
+## Table of Contents
+
+- [1. Overview](#1-overview)
+- [2. Architectural Context](#2-architectural-context)
+- [3. Key Concepts and Terminology](#3-key-concepts-and-terminology)
+- [4. End-to-End Behavior](#4-end-to-end-behavior)
+- [5. Architecture Diagrams](#5-architecture-diagrams)
+- [6. Component Breakdown](#6-component-breakdown)
+- [7. Data Model and State](#7-data-model-and-state)
+- [8. Concurrency and Threading Model](#8-concurrency-and-threading-model)
+- [9. Error Handling and Failure Modes](#9-error-handling-and-failure-modes)
+- [10. Security Model](#10-security-model)
+- [11. Performance Model](#11-performance-model)
+- [12. Observability and Operations](#12-observability-and-operations)
+- [13. Configuration Reference](#13-configuration-reference)
+- [14. Extension Points and Compatibility Guarantees](#14-extension-points-and-compatibility-guarantees)
+- [15. Stack Walkdown](#15-stack-walkdown)
+- [16. References](#16-references)
+- [17. Platform Internals Reference](#17-platform-internals-reference)
 
 ## 1. Overview
 
@@ -521,6 +554,104 @@ end note
 
 Main takeaway: Debian/Ubuntu and Alpine differ primarily in loader and libc
 behavior, not in the kernel beneath them.
+
+### Multi-Library LD_PRELOAD Composition
+
+Link-map ordering, per-library RTLD_NEXT chains, and the one-symbol-one-owner
+invariant ([source](diagrams/composition.puml)):
+
+```plantuml
+@startuml composition
+title Multi-Library Composition via LD_PRELOAD — Link-Map and RTLD_NEXT
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam roundCorner 4
+skinparam component {
+  ArrowColor           #2C3E50
+  BorderColor          #2C3E50
+  BackgroundColor      #FFFFFF
+  FontStyle            bold
+}
+
+note as N1
+  LD_PRELOAD="libchaos-io.so libchaos-net.so libchaos-time.so"
+
+  Link-map order (left = lower address, earlier in resolution):
+    [0] libchaos-io.so
+    [1] libchaos-net.so
+    [2] libchaos-time.so
+    [3] target executable
+    [4] libc.so.6
+    [5] libdl.so.2
+    ...
+
+  RTLD_NEXT from libchaos-io → starts from [1], finds libc at [4]
+  RTLD_NEXT from libchaos-net → starts from [2], finds libc at [4]
+  RTLD_NEXT from libchaos-time → starts from [3], finds libc at [4]
+end note
+
+frame "Process Address Space" {
+
+  component "Application Code" as App {
+    [call write()]
+    [call connect()]
+    [call clock_gettime()]
+  }
+
+  component "libchaos-io.so" as IO {
+    [write wrapper]
+    [read wrapper]
+    [fsync wrapper]
+  }
+
+  component "libchaos-net.so" as NET {
+    [connect wrapper]
+    [send wrapper]
+    [recv wrapper]
+  }
+
+  component "libchaos-time.so" as TIME {
+    [clock_gettime wrapper]
+    [nanosleep wrapper]
+  }
+
+  component "libc.so.6 (glibc)" as LIBC {
+    [write → vfs syscall]
+    [connect → socket syscall]
+    [clock_gettime → vDSO / SYS_clock_gettime]
+  }
+
+  database "/tmp/.chaos-io.conf"   as IOCFG
+  database "/tmp/.chaos-net.conf"  as NETCFG
+  database "/tmp/.chaos-time.conf" as TIMECFG
+}
+
+[call write()]          --> [write wrapper]      : PLT slot patched to IO
+[call connect()]        --> [connect wrapper]     : PLT slot patched to NET
+[call clock_gettime()]  --> [clock_gettime wrapper] : PLT slot patched to TIME
+
+[write wrapper]   --> IOCFG   : stat + read on mtime change
+[connect wrapper] --> NETCFG  : stat + read on mtime change
+[clock_gettime wrapper] --> TIMECFG : stat + read on mtime change
+
+[write wrapper]   --> [write → vfs syscall]        : RTLD_NEXT("write") → libc
+[connect wrapper] --> [connect → socket syscall]   : RTLD_NEXT("connect") → libc
+[clock_gettime wrapper] --> [clock_gettime → vDSO / SYS_clock_gettime] : RTLD_NEXT("clock_gettime") → libc
+
+note bottom of LIBC
+  One-symbol-one-owner invariant:
+  write    owned by: libchaos-io   only
+  connect  owned by: libchaos-net  only
+  clock_gettime owned by: libchaos-time only
+
+  If two libraries owned "write", RTLD_NEXT from the
+  second would resolve to the first (not libc), causing
+  double injection. Correctness requires no overlap.
+end note
+
+@enduml
+```
 
 ## 6. Component Breakdown
 
@@ -1199,3 +1330,76 @@ In containerized environments the relevant infrastructure facts are:
 - Reference: `getnameinfo(3)` - reverse DNS lookup boundary used by `libchaos-dns`
 - Reference: `proc(5)` - `/proc` filesystem semantics, including fd and fdinfo
 - Reference: ELF gABI - executable and shared object model
+
+## 17. Platform Internals Reference
+
+The mechanics underlying this entire system — ELF link-map ordering, PLT/GOT
+lazy binding, vDSO dispatch, `AT_SECURE` stripping, glibc/musl divergence, and
+`STT_GNU_IFUNC` resolver interaction — are documented in detail in
+[`docs/PLATFORM.md`](PLATFORM.md).
+
+Key facts from PLATFORM.md that affect every library in this repository:
+
+**Symbol resolution order (ELF gABI §5.2, Chapter 5):**
+The dynamic linker resolves `dlsym(RTLD_NEXT, name)` by walking the link-map
+in load order starting from the DSO _after_ the caller. Because `LD_PRELOAD`
+libraries are loaded before the main executable's `DT_NEEDED` chain, `RTLD_NEXT`
+from any chaos library always reaches glibc/musl first. This is the invariant
+the entire preload model depends on.
+
+**PLT/GOT cold/hot path:** The PLT slot for any interposed symbol is patched to
+point to the chaos library on first call (cold path resolver dance via
+`_dl_runtime_resolve`). All subsequent calls (hot path) go directly to the chaos
+wrapper. The chaos wrapper's `dlsym(RTLD_NEXT, name)` pointer is cached on first
+call. Diagram: `docs/diagrams/linkmap.puml`.
+
+**vDSO and `clock_gettime`:** On Linux, glibc's `clock_gettime` uses the vDSO
+internally (arch-specific, Linux 2.6.22+ on x86_64). Our PLT interposition fires
+_before_ glibc's wrapper, so we own the result regardless of whether glibc used
+the vDSO. Bypass surface: Go runtime (direct syscall), statically linked binaries.
+Diagram: `docs/diagrams/vdso.puml`.
+
+**`AT_SECURE` and LD_PRELOAD stripping:** The Linux kernel sets `AT_SECURE` in
+the auxiliary vector when the target binary has elevated privileges (setuid,
+setgid, file capabilities). The dynamic linker (`ld.so`) reads `AT_SECURE` and
+silently strips `LD_PRELOAD` before mapping any preload DSO. The chaos libraries
+are never loaded. This is a kernel-level security boundary, not a library-level
+one. Reference: `PLATFORM.md` §6.
+
+**glibc vs musl matrix:** PLATFORM.md §7 documents the full divergence matrix:
+symbol versioning (`@@GLIBC_X.Y` vs unversioned musl), `STT_GNU_IFUNC` (glibc
+uses IFUNC for `clock_gettime`, `memcpy`, etc.; musl does not), `execveat`
+availability, `posix_spawn` implementation strategy (vfork+exec on glibc, fork+exec
+on musl), and `madvise(MADV_FREE)` usage in `free()`. Per-library divergence notes
+live in the respective library documents.
+
+**Formal symbol-ownership theorem:**
+
+> For any libc symbol `s`, let `owner(s)` be the unique chaos library that
+> exports an interposed definition of `s`. The system is correct if and only if:
+> - `∀s: |{L : L exports s}| ≤ 1`  (at most one owner per symbol)
+> - `∀s: owner(s)` is defined by the domain table in §1 of this document
+> - `LD_PRELOAD` load order does not change which library reaches glibc first for
+>   any given symbol, because each symbol has exactly one owner by the above
+>
+> If two chaos libraries export the same symbol, the link-map winner is
+> load-order-dependent; the losing library's `dlsym(RTLD_NEXT, s)` resolves to
+> the winning library's interposer, causing double injection. This is the
+> correctness violation the `one symbol, one owner` rule prevents.
+
+This theorem is the formal basis for the architecture. It is enforced by
+convention and audited by the coverage matrix, not by a runtime mechanism.
+
+---
+
+<div align="center">
+
+*Architecture, implementation, and documentation crafted with Love and Passion by*
+
+**[Christian Schnapka](https://macstab.com)**  
+Embedded Principal+ Engineer  
+[Macstab GmbH](https://macstab.com) · Hamburg, Germany
+
+*Building systems that operate correctly at the edges — including the ones you deliberately break.*
+
+</div>

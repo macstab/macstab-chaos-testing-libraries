@@ -1,4 +1,48 @@
-# chaos-testing-libraries
+<!--
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Engineered by  Christian Schnapka
+                 Embedded Principal+ Engineer
+                 Macstab GmbH · Hamburg, Germany
+                 https://macstab.com
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-->
+
+<div align="center">
+
+# macstab-chaos-testing-libraries
+
+**Pure C99 `LD_PRELOAD` chaos engineering for any Linux process. Kernel-real syscall faults — language-agnostic, library-thin, 100% line-coverage gated.**
+
+[![C99](https://img.shields.io/badge/C-C99-00599C.svg)](https://en.wikipedia.org/wiki/C99)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
+[![Linux](https://img.shields.io/badge/Linux-LD__PRELOAD-FCC624.svg)](https://man7.org/linux/man-pages/man8/ld.so.8.html)
+[![libc: glibc + musl](https://img.shields.io/badge/libc-glibc%20%2B%20musl-lightgrey.svg)](https://musl.libc.org/)
+[![arch: amd64 + arm64](https://img.shields.io/badge/arch-amd64%20%2B%20arm64-blue.svg)](https://en.wikipedia.org/wiki/AArch64)
+[![coverage: 100% on shipped sources](https://img.shields.io/badge/coverage-100%25%20shipped%20sources-brightgreen.svg)](#coverage-gate)
+
+*Designed and engineered by* **[Christian Schnapka](https://macstab.com)** —
+Principal+ Engineer · [Macstab GmbH](https://macstab.com) · Hamburg, Germany
+
+</div>
+
+---
+
+<div align="center">
+
+### Part of the Macstab Chaos Engineering Stack
+
+| [**JVM bytecode**](https://github.com/macstab/macstab-chaos-jvm-agent) | [**Container orchestration**](https://github.com/macstab/chaos-testing) |        **`LD_PRELOAD` libc** *(this repo)*        |
+|:----------------------------------------------------------------------:|:-----------------------------------------------------------------------:|:-------------------------------------------------:|
+|                  In-process chaos for JVM applications                 |          Annotation-driven Testcontainers chaos for any service         | Pure C99 syscall-level chaos for any Linux container |
+|          62 JDK call sites · Spring 3/4 · Micronaut · Quarkus          |        Network · disk · DNS · CPU · memory · pre-built scenarios        |    glibc + musl × amd64 + arm64 · 100 % line coverage   |
+
+**One mental model — three layers.** Same selector × effect × policy DSL spans the JVM, the container, and the libc layer. Each layer ships and runs independently; combine them when you need full distributed-system chaos coverage.
+
+</div>
+
+---
+
+## chaos-testing-libraries
 
 `chaos-testing-libraries` is a small collection of Linux `LD_PRELOAD`
 fault-injection libraries. Today, `libchaos-io`, `libchaos-net`,
@@ -9,6 +53,24 @@ There is intentionally no public C API header. Each library surface is its
 interposed libc symbols plus its config file. Today, `libchaos-io`,
 `libchaos-net`, `libchaos-dns`, `libchaos-time`, `libchaos-process`, and
 `libchaos-memory` all interpose real libc symbols.
+
+## Part of a Three-Layer Chaos Engineering Stack
+
+`chaos-testing-libraries` is the **`LD_PRELOAD` libc layer** of a vertically-integrated chaos engineering toolkit. This repo is self-contained — everything in this README works standalone — but it composes with two sibling layers when broader coverage is needed.
+
+| Layer                              | Repo                                                                                                    | What it covers                                                                                                                                                                                                                |
+|------------------------------------|---------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **`LD_PRELOAD` libc** (this repo)  | [`macstab/macstab-chaos-testing-libraries`](https://github.com/macstab/macstab-chaos-testing-libraries) | Pure C99 `LD_PRELOAD` shared objects: file I/O (latency / `errno` / torn / corrupt), network, DNS, clock, process, memory. **glibc + musl × amd64 + arm64**, 100 % line coverage on shipped sources, Docker runtime validation as a quality gate. Language-agnostic — works for any process inside any container. |
+| **JVM bytecode**                   | [`macstab/macstab-chaos-jvm-agent`](https://github.com/macstab/macstab-chaos-jvm-agent)                 | 62 JDK call sites instrumented in-process. Spring Boot 3/4 + Micronaut + Quarkus integration. JUnit 5 `@ChaosTest`. Selector × effect × policy DSL. Live config reload.                                                       |
+| **Container orchestration**        | [`macstab/chaos-testing`](https://github.com/macstab/chaos-testing)                                     | Annotation-driven chaos on top of Testcontainers. CPU throttling, memory pressure, disk I/O, network partitions, DNS failures, pre-built Redis Sentinel + replication-lag scenarios, Toxiproxy adapter, Redis-aware fault injection.                                                                              |
+
+**Start here** if you need failure injection that crosses language boundaries — or if you need *kernel-real* time skew, slow disks, and DNS slowdowns that no in-process agent can fake (e.g. `clock_gettime` is a syscall the JVM cannot intrinsically intercept; the LD_PRELOAD lib can).
+
+**Compose layers** for full distributed-system coverage:
+- Add the JVM agent for selector × effect × policy chaos *inside* JVM call sites — DNS, JDBC, NIO, virtual threads, monitors, GC.
+- Add the orchestration layer to wire chaos directly to Testcontainers-managed Redis, Postgres, Kafka — including pre-built scenarios like *replication lag during pod drainage*.
+
+Three repos, one mental model: **the same selector × effect × policy DSL spans the libc layer, the JVM layer, and the orchestration layer.** No cross-layer coupling — each layer is independently adoptable, independently versioned, independently released.
 
 ## Design Constraints
 
@@ -145,14 +207,27 @@ docker/
   Dockerfile.build
 docs/
   ARCHITECTURE.md
+  BENCHMARKS.md
   DNS.md
+  DSL.md
+  ENGINEERING.md
   IO.md
   MEMORY.md
   NETWORK.md
+  PLATFORM.md
   PROCESS.md
+  SAFETY.md
   SYSTEM.md
   TIME.md
-  ENGINEERING.md
+  diagrams/
+    atsecure.puml
+    composition.puml
+    config_reload.puml
+    dispatch.puml
+    dsl_pipeline.puml
+    fdcache.puml
+    linkmap.puml
+    vdso.puml
 Makefile
 ```
 
@@ -161,21 +236,47 @@ Planned extension work and scope boundaries live in
 
 Deep subsystem references:
 
-- [`docs/SYSTEM.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/docs/SYSTEM.md)
-  Global system manual for symbol ownership, loader/libc/kernel interaction, and
-  cross-library composition
-- [`docs/IO.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/docs/IO.md)
-  Authoritative current-state technical reference for `libchaos-io`
-- [`docs/NETWORK.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/docs/NETWORK.md)
-  Current-state technical reference and forward design for `libchaos-net`
-- [`docs/DNS.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/docs/DNS.md)
-  Current-state technical reference for `libchaos-dns`
-- [`docs/TIME.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/docs/TIME.md)
-  Current-state technical reference for `libchaos-time`
-- [`docs/MEMORY.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/docs/MEMORY.md)
-  Current-state technical reference for `libchaos-memory`
-- [`docs/PROCESS.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/docs/PROCESS.md)
-  Current-state technical reference for `libchaos-process`
+- [`docs/DSL.md`](docs/DSL.md)
+  Cross-layer selector × effect × policy grammar (ABNF); identity proof across all six libraries;
+  specificity ordering; (S × E × P) algebra; full effect taxonomy A–E
+- [`docs/PLATFORM.md`](docs/PLATFORM.md)
+  ELF gABI §5.2 link-map mechanics, PLT/GOT lazy binding, RTLD_NEXT chain, STT_GNU_IFUNC
+  resolver phase, GNU symbol versioning, AT_SECURE auxv, static-binary immunity
+- [`docs/SYSTEM.md`](docs/SYSTEM.md)
+  Global system manual: symbol ownership theorem, loader/libc/kernel interaction,
+  cross-library composition, formal one-symbol-one-owner invariant
+- [`docs/IO.md`](docs/IO.md)
+  `libchaos-io`: FD cache design, /proc/self/fd resolution, pread GNU symbol versioning,
+  splice/tee non-coverage, O_DIRECT alignment hazard
+- [`docs/NETWORK.md`](docs/NETWORK.md)
+  `libchaos-net`: endpoint selector normalisation, SCM_RIGHTS non-coverage,
+  TCP Fast Open, io_uring non-coverage
+- [`docs/DNS.md`](docs/DNS.md)
+  `libchaos-dns`: NSS plumbing (nsswitch.conf, nss_files/nss_dns/nss_resolve),
+  getaddrinfo call flow, FILTER_FAMILY/SHUFFLE/LIMIT post-call mutations
+- [`docs/TIME.md`](docs/TIME.md)
+  `libchaos-time`: full clock taxonomy (9 POSIX + Linux extensions), vDSO offload table
+  per-arch (x86_64/aarch64/riscv64/…), OFFSET monotonicity semantics
+- [`docs/MEMORY.md`](docs/MEMORY.md)
+  `libchaos-memory`: virtual-memory taxonomy, ptmalloc2/mallocng divergence, MAP_ANONYMOUS
+  dispatch, MADVISE hint catalogue, mremap/mlock non-coverage
+- [`docs/PROCESS.md`](docs/PROCESS.md)
+  `libchaos-process`: clone(2) flag taxonomy, NPTL pthread_create internals,
+  posix_spawn glibc/musl cascade gap, FAIL_AFTER atomic counter, exec family matrix
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+  Component map, dispatch pipeline, FD cache, config reload, formal symbol-ownership theorem
+- [`docs/ENGINEERING.md`](docs/ENGINEERING.md)
+  Build flag rationale (`-fvisibility=hidden`, `-fno-stack-protector`, `--gc-sections`, …),
+  ABI commitments, CI gates
+- [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)
+  rdtsc/CNTPCT_EL0 measurement methodology, per-library hot-path overhead tables,
+  cold-path reload cost, libfaketime/toxiproxy comparison
+- [`docs/SAFETY.md`](docs/SAFETY.md)
+  AT_SECURE kernel mechanics, container capability model, seccomp syscall table,
+  fail-open guarantee, sanitiser interactions, config file security
+- [`docs/diagrams/`](docs/diagrams/)
+  PlantUML: `linkmap.puml`, `vdso.puml`, `dispatch.puml`, `fdcache.puml`,
+  `config_reload.puml`, `composition.puml`, `atsecure.puml`, `dsl_pipeline.puml`
 
 ## Libraries
 
@@ -872,6 +973,94 @@ The goal is simple: keep the `.so` small, predictable, and boring.
 
 ## More Detail
 
-- Architecture notes: [`docs/ARCHITECTURE.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/docs/ARCHITECTURE.md)
-- Engineering notes: [`docs/ENGINEERING.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/docs/ENGINEERING.md)
-- Code-level intent lives in the comments on the internal headers under [`src/`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/src)
+| Document | Content |
+|---|---|
+| [`docs/DSL.md`](docs/DSL.md) | Grammar, specificity ordering, identity proof |
+| [`docs/PLATFORM.md`](docs/PLATFORM.md) | ELF, PLT/GOT, RTLD_NEXT, vDSO, AT_SECURE |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Component map, call flow, formal theorems |
+| [`docs/ENGINEERING.md`](docs/ENGINEERING.md) | Build flags, ABI, CI, no-C++ rationale |
+| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Overhead model, rdtsc methodology, comparisons |
+| [`docs/SAFETY.md`](docs/SAFETY.md) | AT_SECURE, seccomp, fail-open, sanitisers |
+| [`docs/SYSTEM.md`](docs/SYSTEM.md) | Global system manual, symbol ownership |
+| [`docs/IO.md`](docs/IO.md) | libchaos-io internals |
+| [`docs/NETWORK.md`](docs/NETWORK.md) | libchaos-net internals |
+| [`docs/DNS.md`](docs/DNS.md) | libchaos-dns internals |
+| [`docs/TIME.md`](docs/TIME.md) | libchaos-time internals |
+| [`docs/MEMORY.md`](docs/MEMORY.md) | libchaos-memory internals |
+| [`docs/PROCESS.md`](docs/PROCESS.md) | libchaos-process internals |
+| [`docs/diagrams/`](docs/diagrams/) | 8 PlantUML architecture diagrams |
+
+Code-level intent lives in the internal headers under [`src/`](src).
+
+---
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE). Use it in production, ship it in your products, fork it, build a business around it. The only thing you cannot do is claim you wrote it.
+
+---
+
+## About the Engineer
+
+This three-repo stack — [`macstab-chaos-jvm-agent`](https://github.com/macstab/macstab-chaos-jvm-agent), [`chaos-testing`](https://github.com/macstab/chaos-testing), `macstab-chaos-testing-libraries` — is the work of one engineer: **Christian Schnapka**, Hamburg, Germany.
+
+### Timeline
+
+| Year                     | What I was shipping                                                                                                                                                                                                        |
+|--------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **1984** *(age 10)*      | 6502 assembler on the Commodore 64                                                                                                                                                                                         |
+| **1987** *(age 14)*      | Motorola 68000 (M68k) assembler / C on the Commodore Amiga                                                                                                                                                                 |
+| **1989** *(from age 15)* | International demoscene — active in **Razor 1911**, **Sanity**, **Anthrox**, **Incal**; multiple demo-competition wins with my groups                                                                                      |
+| **1990**                 | x86 assembler + C / C++ on PC. Part-time at German game studios (**Software 2000**, **Rainbow Arts**) and short stints at studios in Birmingham, UK — shipping on cartridges and floppies, where there was no patch button |
+| **1996**                 | Transitioned to business / enterprise software engineering — the arc that runs to today                                                                                                                                    |
+| **1996**                 | Java — since 1.0, 30 years and counting                                                                                                                                                                                    |
+| **2002**                 | Python — 24 years and counting                                                                                                                                                                                             |
+| **2008**                 | LXC (Linux Containers) — early adopter, production use through to the Docker era and beyond                                                                                                                                |
+| **2013**                 | Docker — since first release; production use across enterprise stacks                                                                                                                                                      |
+| **~2014**                | Kubernetes                                                                                                                                                                                                                 |
+| **~2015**                | Go — distributed-system internals, network programming                                                                                                                                                                     |
+| **2018**                 | Kotlin — JVM ecosystem coverage alongside Java; coroutines, multiplatform, server-side                                                                                                                                     |
+
+**Diplom Informatiker** — German pre-Bologna 5-year computer-science degree, equivalent to a master's. 42 years of programming, 36 years of professional systems work, 30 years of enterprise software, 24 of Python, 10 of Go, 7 of Kotlin.
+
+The depth shown in this project — `LD_PRELOAD` symbol interposition that composes cleanly with `dlsym(RTLD_NEXT, ...)`, lock-free config reload via two-snapshot pointer swap, thread-local fd-path caching that respects `unlinkat()`/`renameat()` invalidation, endpoint-aware wait-path matching derived from `/proc/self/fdinfo/<epfd>`, hand-tuned `.so` outputs with hidden visibility and section-level dead-code elimination, and a 100 % source-line coverage gate enforced across glibc + musl × amd64 + arm64 — comes from a path that started with peeking C64 memory at 10, ran through the demoscene where every cycle counted on the wire, through game studios that shipped on cartridges with no recall option, and then 30 years of production enterprise software. Most engineers enter at the framework layer and look down. **This stack reads from below.** Principal-engineer titles are job descriptions; assembler at 10, the demoscene at 15, and shipping for game studios at 16 — that is a starting line.
+
+### Specific evidence in this project
+
+Concrete artifacts a reviewer can read:
+
+- **Six libraries shipped** — `libchaos-io`, `libchaos-net`, `libchaos-dns`, `libchaos-time`, `libchaos-process`, `libchaos-memory` — each with its own selector grammar, config file, and runtime contract; no shared mutable state across libraries
+- **Cross-libc and cross-arch validation** — `glibc + musl × amd64 + arm64`, every release walked through Docker runtime probes on all four matrix cells
+- **Strict 100 % source-line coverage** on shipped sources for IO, NET, TIME, MEMORY, and PROCESS; DNS at an enforced floor with the strict gate scoped intentionally
+- **Honest documentation** of what *cannot* work and why — every library has an explicit "Important current boundary" section calling out the symbols and edge cases left as future work, not papered over
+- **Composable by design** — `libchaos-net` deliberately does not own `read()`, `write()`, or `close()` so it composes cleanly with `libchaos-io`; DNS interception was extracted out of `libchaos-net` into its own library for the same reason
+- **Apache 2.0 throughout** — usable in production, in commercial products, no lock-in
+
+### Available for senior engineering engagements
+
+Limited capacity. Typically:
+
+- **Fractional / interim Principal Engineer** — architecture, mentoring, hardest-problem ownership
+- **Reliability engineering** — chaos-engineering / SRE-tooling enablement, post-incident systemic fixes, "we keep getting paged for X" investigations
+- **Systems-level work** — C / C++ / assembler-adjacent investigations, native libraries, Linux internals, `LD_PRELOAD` and `ptrace` instrumentation
+- **JVM performance** — agents, GC tuning, instrumentation, deep profiling
+
+If your team is fighting production issues that "more tests" hasn't fixed:
+
+- **[macstab.com](https://macstab.com)** — engagement enquiries
+- **info@macstab.com** — direct contact
+- **[GitHub @macstab](https://github.com/macstab)** — more open-source work
+
+A small number of engagements per year. The work is deep — production systems with receipts in `git log`, not slide decks.
+
+---
+
+<div align="center">
+
+**[Christian Schnapka](https://macstab.com)**
+Principal+ Engineer
+[Macstab GmbH](https://macstab.com) · Hamburg, Germany
+
+*Building systems that operate correctly at the edges — including the ones you deliberately break.*
+
+</div>

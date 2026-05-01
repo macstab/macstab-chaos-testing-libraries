@@ -1,4 +1,19 @@
 #!/bin/sh
+#
+# test_time_glibc.sh — libchaos-time runtime validation on glibc (Docker).
+#
+# Builds libchaos-time.so for the target platform using Docker buildx with a
+# glibc (debian:bookworm) base, then runs the pre-compiled time_probe binary
+# under LD_PRELOAD in a glibc container. Validates clock_gettime, clock_getres,
+# nanosleep, and usleep fault injection (ERRNO, LATENCY, OFFSET) on glibc.
+# Note: libchaos-time wraps the glibc PLT slot; the vDSO path for
+# CLOCK_MONOTONIC/CLOCK_REALTIME is bypassed because glibc calls the wrapper
+# before dispatching to vDSO.
+#
+# Usage:   test_time_glibc.sh [linux/amd64|linux/arm64]
+# Env:     CHAOS_TIME_DOCKER_PLATFORM  platform override
+# Prereqs: docker with buildx and multi-arch support
+
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)

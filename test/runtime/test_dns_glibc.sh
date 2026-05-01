@@ -1,4 +1,18 @@
 #!/bin/sh
+#
+# test_dns_glibc.sh — libchaos-dns runtime validation on glibc (Docker).
+#
+# Builds libchaos-dns.so for the target platform using Docker buildx with a
+# glibc (debian:bookworm) base, then runs the pre-compiled dns_probe binary
+# under LD_PRELOAD in a glibc container. Validates getaddrinfo and getnameinfo
+# fault injection (EAI_*, LATENCY, REWRITE, OVERRIDE, FILTER_FAMILY, SHUFFLE,
+# LIMIT) on glibc amd64 and arm64.
+#
+# Usage:   test_dns_glibc.sh [linux/amd64|linux/arm64]
+#          Defaults to the host architecture when no argument is given.
+# Env:     CHAOS_DNS_DOCKER_PLATFORM  platform override
+# Prereqs: docker with buildx and multi-arch support
+
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)

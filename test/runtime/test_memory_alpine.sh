@@ -1,4 +1,17 @@
 #!/bin/sh
+#
+# test_memory_alpine.sh — libchaos-memory runtime validation on musl/Alpine (Docker).
+#
+# Builds libchaos-memory.so for the target platform using Docker buildx with a
+# musl (alpine) base, then runs the pre-compiled memory_probe binary under
+# LD_PRELOAD in an Alpine container. Validates mmap, munmap, mprotect, and
+# madvise fault injection on musl mallocng where mmap is used for all allocation
+# sizes (no brk/sbrk path).
+#
+# Usage:   test_memory_alpine.sh [linux/amd64|linux/arm64]
+# Env:     CHAOS_MEMORY_DOCKER_PLATFORM  platform override
+# Prereqs: docker with buildx and multi-arch support
+
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)

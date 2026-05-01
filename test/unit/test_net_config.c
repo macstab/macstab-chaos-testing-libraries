@@ -1,18 +1,88 @@
+/**
+ * @file test_net_config.c
+ * @brief Unit tests for NET-domain configuration parsing, rule selection, and reload state machine.
+ *
+ * Subsystem under test: `src/net/chaos_net_config.c` and `src/net/chaos_net_endpoint.c`
+ *
+ * Coverage approach:
+ * - `chaos_net_endpoint.c` is included inline (no `#define` overrides needed) to give
+ *   access to endpoint parsing helpers used by the config subsystem.
+ * - `open`, `read`, and `close` are `#define`-overridden before including
+ *   `chaos_net_config.c` so tests can inject file-I/O failures without real filesystem
+ *   dependency. The `chaos_process_atomic_cas_u64` CAS primitive is similarly overridden
+ *   to simulate CAS race failures.
+ * - Config file content is written via local `write_config_text()` helpers with
+ *   `futimens` to control the mtime precisely, allowing the reload state machine to be
+ *   driven deterministically.
+ * - The net config file is backed up before and restored after any test that writes to it.
+ *
+ * Properties under test:
+ * - Helper primitives: trim, strip_comment, blank_char, all nine operation names, all 19
+ *   errno names, probability/latency parsing edge cases, effect_allowed and selector_allowed
+ *   matrices, mtime hashing and sentinel normalisation.
+ * - Rule parsing: valid rules covering all seven supported net effect types across multiple
+ *   operation/selector combinations.
+ * - Rule selection: exact endpoint match beats wildcard; `selector_len` tie-breaking selects
+ *   the longer (more specific) rule.
+ * - Selection edges: NULL pointer arguments rejected, no-match returns 0.
+ * - Invalid rule lines: 18+ rejection cases covering bad effects, invalid op/effect
+ *   combinations, empty fields, and malformed values.
+ * - Reload state machine: no-file returns false; successful load and match; repeated
+ *   prepare with same mtime skips reload; bad rule clears rules and returns false; CAS
+ *   failure falls through to old state; forced open/read failures.
+ *
+ * What is NOT tested here:
+ * - Concurrent config reload races under real multi-thread access.
+ * - Endpoint resolution from live socket file descriptors.
+ * - LD_PRELOAD wrapper call paths.
+ */
+
 #include "../support/test_net_support.h"
 
+#include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <stdarg.h>
 #include <sys/stat.h>
 
 CHAOS_NET_DEFINE_TEST_GLOBALS();
 
-#include "../../src/net/chaos_net_endpoint.c"
-
+/**
+ * @brief When non-zero, causes the test `open` stub to return -1 with ENOENT.
+ *
+ * Used to exercise the config-file-not-found path in `chaos_net_config_prepare()`.
+ */
 static int g_test_config_force_open_fail = 0;
-static int g_test_config_force_read_fail = 0;
-static int g_test_config_force_cas_fail = 0;
-static const int g_test_config_fake_fd = 9123;
 
+/**
+ * @brief When non-zero, causes the test `read` stub to return -1 with EIO.
+ *
+ * The test `open` stub returns a fake fd (`g_test_config_fake_fd`) when this
+ * flag is set. The test `read` stub intercepts reads on that fd and injects an
+ * EIO error. The test `close` stub swallows closes of the fake fd without
+ * touching the real filesystem.
+ */
+static int g_test_config_force_read_fail = 0;
+
+/**
+ * @brief When non-zero, causes the CAS stub to return 0 (failure).
+ *
+ * Simulates the lost-race scenario in `chaos_net_config_prepare()` where another
+ * thread atomically updates the mtime before this thread can commit its reload.
+ */
+static int g_test_config_force_cas_fail = 0;
+
+/** @brief Fake fd returned by the test `open` stub when read-fail mode is active. */
+static const int g_test_config_fake_fd = 7331;
+
+/**
+ * @brief Test-controlled `open(2)` stub for the net config subsystem.
+ *
+ * When `g_test_config_force_open_fail != 0`, returns -1 with ENOENT without
+ * touching the filesystem. When `g_test_config_force_read_fail != 0`, returns
+ * `g_test_config_fake_fd` without opening a real file. Otherwise delegates to
+ * the real `open(2)`, forwarding the variadic `mode` argument for O_CREAT paths.
+ */
 static int chaos_net_test_config_open(const char *path, int flags, ...)
 {
     if (g_test_config_force_open_fail != 0)
@@ -39,6 +109,12 @@ static int chaos_net_test_config_open(const char *path, int flags, ...)
     return open(path, flags);
 }
 
+/**
+ * @brief Test-controlled `read(2)` stub for the net config subsystem.
+ *
+ * When `g_test_config_force_read_fail != 0` and the fd matches the fake fd,
+ * returns -1 with EIO. Otherwise delegates to the real `read(2)`.
+ */
 static ssize_t chaos_net_test_config_read(int fd, void *buffer, size_t count)
 {
     if (g_test_config_force_read_fail != 0 && fd == g_test_config_fake_fd)
@@ -51,6 +127,12 @@ static ssize_t chaos_net_test_config_read(int fd, void *buffer, size_t count)
     return read(fd, buffer, count);
 }
 
+/**
+ * @brief Test-controlled `close(2)` stub for the net config subsystem.
+ *
+ * Swallows closes of the fake fd (returns 0) to avoid EBADF from closing a
+ * file descriptor that was never opened. Otherwise delegates to `close(2)`.
+ */
 static int chaos_net_test_config_close(int fd)
 {
     if (g_test_config_force_read_fail != 0 && fd == g_test_config_fake_fd)
@@ -60,6 +142,12 @@ static int chaos_net_test_config_close(int fd)
     return close(fd);
 }
 
+/**
+ * @brief Test-controlled CAS stub for the net config mtime update.
+ *
+ * When `g_test_config_force_cas_fail != 0`, returns 0 (failure) to simulate a
+ * concurrent mtime update. Otherwise performs the real GCC built-in CAS.
+ */
 static int
 chaos_net_test_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint64_t desired)
 {
@@ -69,6 +157,9 @@ chaos_net_test_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint6
     }
     return __sync_bool_compare_and_swap(value, expected, desired);
 }
+
+/* Include endpoint parsing inline first (no overrides needed). */
+#include "../../src/net/chaos_net_endpoint.c"
 
 #define open chaos_net_test_config_open
 #define read chaos_net_test_config_read
@@ -80,6 +171,16 @@ chaos_net_test_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint6
 #undef read
 #undef open
 
+/* -------------------------------------------------------------------------
+ * Local backup/restore helpers
+ * --------------------------------------------------------------------- */
+
+/**
+ * @brief Simple backup record for the net config file.
+ *
+ * Used by tests that write to CHAOS_NET_CONFIG_PATH to restore the original
+ * content when the test completes.
+ */
 typedef struct chaos_net_test_file_backup
 {
     int existed;
@@ -87,6 +188,16 @@ typedef struct chaos_net_test_file_backup
     size_t size;
 } chaos_net_test_file_backup_t;
 
+/**
+ * @brief Read and preserve the current net config file content.
+ *
+ * If the file does not exist, sets `backup->existed = 0`. Otherwise reads the
+ * entire file into a heap buffer. The caller must call `free_backup()` after
+ * `restore_file()`.
+ *
+ * @param path    File path to back up (typically CHAOS_NET_CONFIG_PATH).
+ * @param backup  Output record to populate.
+ */
 static void backup_file(const char *path, chaos_net_test_file_backup_t *backup)
 {
     FILE *file;
@@ -122,6 +233,15 @@ static void backup_file(const char *path, chaos_net_test_file_backup_t *backup)
     fclose(file);
 }
 
+/**
+ * @brief Restore the net config file from a backup record.
+ *
+ * If `backup->existed == 0`, removes the file if it currently exists.
+ * Otherwise overwrites the file with the backed-up content.
+ *
+ * @param path    File path to restore.
+ * @param backup  Backup record produced by `backup_file()`.
+ */
 static void restore_file(const char *path, const chaos_net_test_file_backup_t *backup)
 {
     FILE *file;
@@ -138,6 +258,11 @@ static void restore_file(const char *path, const chaos_net_test_file_backup_t *b
     assert(fclose(file) == 0);
 }
 
+/**
+ * @brief Release heap memory owned by a backup record.
+ *
+ * @param backup  Backup record to release.
+ */
 static void free_backup(chaos_net_test_file_backup_t *backup)
 {
     free(backup->data);
@@ -146,6 +271,15 @@ static void free_backup(chaos_net_test_file_backup_t *backup)
     backup->existed = 0;
 }
 
+/**
+ * @brief Write config text to CHAOS_NET_CONFIG_PATH with a precise mtime.
+ *
+ * Uses `futimens(2)` to set the file mtime to @p stamp seconds (nanoseconds=0),
+ * making config-reload decisions deterministic regardless of real wall-clock time.
+ *
+ * @param text   Config file content to write.
+ * @param stamp  Desired mtime in seconds since the epoch.
+ */
 static void write_config_text(const char *text, time_t stamp)
 {
     FILE *file;
@@ -162,6 +296,33 @@ static void write_config_text(const char *text, time_t stamp)
     assert(fclose(file) == 0);
 }
 
+/* -------------------------------------------------------------------------
+ * Test functions
+ * --------------------------------------------------------------------- */
+
+/**
+ * @brief Invariant: low-level parsing helpers handle NULL, boundary values, and valid inputs.
+ *
+ * Triggering conditions: direct calls to `chaos_net_is_blank_char`, `chaos_net_trim`,
+ *   `chaos_net_strip_comment`, `chaos_net_parse_operation`, `chaos_net_parse_errno_name`,
+ *   `chaos_net_parse_probability`, `chaos_net_parse_latency`, `chaos_net_effect_allowed`,
+ *   `chaos_net_selector_allowed`, `chaos_net_config_normalize_mtime_hash`,
+ *   `chaos_net_config_hash_mtime`, `chaos_net_split_rule_fields`.
+ *
+ * Expected observable behaviour:
+ * - Blank chars: space and tab return true; 'x' returns false.
+ * - trim(NULL) returns NULL; trim of padded text returns the inner word.
+ * - strip_comment on "abc#def" leaves "abc".
+ * - All nine operation name strings map to their enum values; NULL and "bogus" map to INVALID.
+ * - All 19 errno names map to their correct values; NULL and "ENOPE" return -1.
+ * - Probability: 0.25 parses correctly; NULL, >1.0, non-numeric return -1.
+ * - Latency: 25 parses correctly; NULL, overflow, non-numeric return -1.
+ * - effect_allowed and selector_allowed matrices match documented constraints.
+ * - Mtime sentinel normalisation: none of the three sentinels collide with the
+ *   normalized output.
+ * - split_rule_fields correctly splits "tcp4://127.0.0.1:5432:connect:LATENCY:5"
+ *   into its four components; bad inputs return false.
+ */
 static void test_helper_functions(void)
 {
     char trim_text[] = " \t value \r\n";
@@ -270,6 +431,9 @@ static void test_helper_functions(void)
     assert(!chaos_net_effect_allowed(CHAOS_NET_OP_INVALID, CHAOS_NET_EFFECT_LATENCY));
     assert(!chaos_net_effect_allowed(CHAOS_NET_OP_CONNECT, (chaos_net_effect_t)9999));
 
+    /* Selector-allowed: NULL selector is always rejected. Wildcard and exact-IP
+     * selectors are allowed for data operations; SOCKET only allows wildcard-host
+     * or UNIX wildcard selectors. */
     assert(!chaos_net_selector_allowed(CHAOS_NET_OP_CONNECT, NULL));
     assert(chaos_net_endpoint_parse_selector("*", &selector));
     assert(chaos_net_selector_allowed(CHAOS_NET_OP_CONNECT, &selector));
@@ -285,6 +449,7 @@ static void test_helper_functions(void)
     assert(chaos_net_endpoint_parse_selector("unix:///tmp/app.sock", &selector));
     assert(!chaos_net_selector_allowed(CHAOS_NET_OP_SOCKET, &selector));
 
+    /* Mtime sentinel normalisation: each sentinel must map to a different value. */
     assert(
         chaos_net_config_normalize_mtime_hash(CHAOS_NET_MTIME_MISSING) != CHAOS_NET_MTIME_MISSING
     );
@@ -328,6 +493,21 @@ static void test_helper_functions(void)
     assert(strcmp(value_text, "5") == 0);
 }
 
+/**
+ * @brief Invariant: a seven-rule buffer is parsed correctly and endpoint rule selection
+ *   returns the highest-specificity match.
+ *
+ * Triggering condition: `chaos_net_config_parse_buffer()` on a multi-rule buffer,
+ *   followed by `chaos_net_config_select_endpoint_rule()` with various endpoints and
+ *   operations.
+ *
+ * Expected observable behaviour:
+ * - All seven rules are parsed; specific field values are preserved (operation, effect, errnum).
+ * - Exact-IP endpoint tcp4://127.0.0.1:5432 on OP_CONNECT picks the LATENCY rule, not
+ *   the wildcard-host ECONNREFUSED rule.
+ * - Wildcard-host tcp4://\*:0 on OP_SOCKET picks the EAFNOSUPPORT rule.
+ * - No match for OP_POLL on a tcp4 wildcard endpoint returns 0.
+ */
 static void test_parse_and_select_rules(void)
 {
     chaos_net_rule_t rules[7];
@@ -371,6 +551,24 @@ static void test_parse_and_select_rules(void)
     );
 }
 
+/**
+ * @brief Invariant: buffer overflow, NULL pointer arguments, and selector_len tie-breaking.
+ *
+ * Triggering conditions:
+ * - `chaos_net_config_parse_buffer()` on a buffer with CHAOS_NET_MAX_RULES+1 identical rules.
+ * - `chaos_net_config_select_endpoint_rule()` with NULL rules, endpoint, or output pointers.
+ * - Rule selection with two rules sharing the same endpoint but different `selector_len`;
+ *   the rule with the larger `selector_len` must win.
+ *
+ * Expected observable behaviour:
+ * - A four-rule buffer (with comments and blank lines) parses to exactly four rules.
+ * - NULL arguments to select_endpoint_rule all return false.
+ * - Exact match on tcp4://127.0.0.1:80 returns EHOSTUNREACH (not ECONNREFUSED from
+ *   the wildcard-host rule).
+ * - No match for OP_RECV on a TCP4 endpoint returns false.
+ * - Overflow buffer (MAX_RULES+1 identical lines) causes `parse_buffer` to return -1.
+ * - Tie-break selects the rule with selector_len=12 over selector_len=10.
+ */
 static void test_selection_and_buffer_edges(void)
 {
     static const char overflow_line[] = "tcp4://127.0.0.1:80:connect:ECONNREFUSED:1.0\n";
@@ -443,6 +641,24 @@ static void test_selection_and_buffer_edges(void)
     assert(rule.latency_ms == 7U);
 }
 
+/**
+ * @brief Invariant: all 18 classes of invalid rule lines are rejected by `parse_line`.
+ *
+ * Triggering condition: `chaos_net_config_parse_line()` called on each malformed string.
+ *
+ * Expected observable behaviour: every call returns -1. The blank/comment line
+ * returns 0 (skipped, not an error). NULL line or NULL rule pointer returns -1.
+ *
+ * Invalid cases exercised:
+ * - Missing fields (no colon separators)
+ * - Empty selector, operation, effect, or value fields
+ * - Unknown operation ("nope"), unknown effect ("BOOM")
+ * - CORRUPT on a connect operation (only allowed on recv)
+ * - Invalid selector (tcp4 URL with no port component)
+ * - TIMEOUT on a connect operation (only allowed on poll)
+ * - SOCKET with a specific UNIX path (only wildcard UNIX allowed for socket)
+ * - Non-numeric probability, latency, corrupt threshold, and timeout values
+ */
 static void test_invalid_lines(void)
 {
     char blank_line[] = "  # ignored";
@@ -483,6 +699,27 @@ static void test_invalid_lines(void)
     assert(chaos_net_config_parse_line(invalid_timeout_value, &rule) == -1);
 }
 
+/**
+ * @brief Invariant: file-I/O failure modes and mtime-driven reload state machine.
+ *
+ * Triggering conditions:
+ * - `g_test_config_force_open_fail = 1` causes `chaos_net_config_read_file()` to return -1.
+ * - `g_test_config_force_read_fail = 1` causes `chaos_net_config_read_file()` to return -1.
+ * - A file of exactly CHAOS_NET_MAX_CONFIG_BYTES bytes causes `read_file` to return -1.
+ * - A valid config file with mtime=30 loads successfully.
+ * - Repeating `prepare()` with the same cached mtime skips the reload.
+ * - `g_test_config_force_cas_fail = 1` causes `prepare()` to return true (old rules retained).
+ * - A syntactically invalid config file causes `prepare()` to return false and clears rules.
+ *
+ * Expected observable behaviour per path:
+ * - open fail and read fail both cause `read_file` to return -1 without panicking.
+ * - Oversized file: `read_file` returns -1 without reading data.
+ * - Successful load: `config_match_endpoint_loaded` finds the expected rule.
+ * - Repeated prepare at same mtime: returns true without triggering another file read.
+ * - CAS fail: returns true (falling through to old state without clearing rules).
+ * - Invalid config write: `prepare()` returns false; subsequent match returns false.
+ * - reset_state with `clear=0` leaves rule_count unchanged; matched returns false.
+ */
 static void test_file_and_state_edges(void)
 {
     chaos_net_test_file_backup_t backup;
@@ -547,6 +784,20 @@ static void test_file_and_state_edges(void)
     free_backup(&backup);
 }
 
+/**
+ * @brief Invariant: the public `chaos_net_config_match_endpoint()` API drives the full
+ *   prepare→match pipeline and correctly propagates parse failures.
+ *
+ * Triggering condition: `write_config_text()` with different rules between calls to
+ *   `chaos_net_config_match_endpoint()`.
+ *
+ * Expected observable behaviour:
+ * - With no config file: `prepare()` returns false; match returns false.
+ * - NULL endpoint or NULL rule pointer to `match_endpoint` both return false.
+ * - After writing a valid ECONNREFUSED rule: match succeeds, effect and errnum verified.
+ * - After writing a CORRUPT rule for the same endpoint+operation (which is invalid):
+ *   `match_endpoint` returns false (parse error invalidates rules).
+ */
 static void test_prepare_and_match(void)
 {
     chaos_net_test_file_backup_t backup;

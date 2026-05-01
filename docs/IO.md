@@ -1,9 +1,44 @@
+<!--
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Engineered by  Christian Schnapka
+                 Embedded Principal+ Engineer
+                 Macstab GmbH · Hamburg, Germany
+                 https://macstab.com
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-->
+
 # libchaos-io Technical Reference
+
+> *Engineered by* **[Christian Schnapka](https://macstab.com)** — Embedded Principal+ Engineer · [Macstab GmbH](https://macstab.com) · Hamburg, Germany
+
+---
 
 This document is the authoritative engineering reference for the implemented
 `libchaos-io` runtime in this repository. It describes the current code, not an
 aspirational design. Where behavior depends on Linux, glibc, musl, or `LD_PRELOAD`
 mechanics, those dependencies are called out explicitly.
+
+## Table of Contents
+
+- [1. Overview](#1-overview)
+- [2. Architectural Context](#2-architectural-context)
+- [3. Key Concepts and Terminology](#3-key-concepts-and-terminology)
+- [4. End-to-End Behavior](#4-end-to-end-behavior)
+- [5. Architecture Diagrams](#5-architecture-diagrams)
+- [6. Component Breakdown](#6-component-breakdown)
+- [7. Data Model and State](#7-data-model-and-state)
+- [8. Concurrency and Threading Model](#8-concurrency-and-threading-model)
+- [9. Error Handling and Failure Modes](#9-error-handling-and-failure-modes)
+- [10. Security Model](#10-security-model)
+- [11. Performance Model](#11-performance-model)
+- [12. Observability and Operations](#12-observability-and-operations)
+- [13. Configuration Reference](#13-configuration-reference)
+- [14. Extension Points and Compatibility Guarantees](#14-extension-points-and-compatibility-guarantees)
+- [15. Stack Walkdown](#15-stack-walkdown)
+- [16a. Symbol Versioning — pread and the GLIBC_2.2 Divergence](#16a-symbol-versioning--pread-and-the-glibc_22-divergence)
+- [16b. Non-Coverage: splice, tee, vmsplice](#16b-non-coverage-splice-tee-vmsplice)
+- [16c. O_DIRECT and Kernel Bypass Implications](#16c-o_direct-and-kernel-bypass-implications)
+- [16. References](#16-references)
 
 ## 1. Overview
 
@@ -456,6 +491,104 @@ Trade-off:
 - cache correctness is only thread-local, not process-global
 - collisions are possible by construction
 - fd reuse across threads can observe stale path identity
+
+Full lookup, seeding, and invalidation flow ([source](diagrams/fdcache.puml)):
+
+```plantuml
+@startuml fdcache
+title libchaos-io Thread-Local FD Cache — Lookup and Invalidation
+
+skinparam sequenceMessageAlign center
+skinparam shadowing false
+skinparam roundCorner 4
+skinparam sequence {
+  ArrowColor                 #2C3E50
+  LifeLineBorderColor        #2C3E50
+  LifeLineBackgroundColor    #ECF0F1
+  ParticipantBorderColor     #2C3E50
+  ParticipantBackgroundColor #FFFFFF
+  ParticipantFontStyle       bold
+  GroupBackgroundColor       #FDFEFE
+  GroupBorderColor           #95A5A6
+}
+hide footbox
+
+participant "Wrapper\n(read/write/fsync/…)" as Wrap
+participant "FD Cache\n(TLS, direct-mapped)" as Cache
+participant "/proc/self/fd\n<fd>" as Proc
+participant "Config Engine" as Config
+participant "Real libc" as Real
+
+== Normal read/write call ==
+
+Wrap -> Cache : lookup(fd)
+note right of Cache
+  slot = fd % CACHE_SLOTS
+  if cache[slot].fd == fd:
+    return cache[slot].path  (hit)
+  else:
+    return NULL              (miss)
+end note
+
+alt Cache hit
+  Cache --> Wrap : cached_path
+else Cache miss
+  Cache --> Wrap : NULL
+  Wrap -> Proc : readlink("/proc/self/fd/<fd>", buf)
+  note right of Proc
+    Returns canonical path or socket pseudo-path.
+    Filtered: /proc, /sys, /dev, config path,
+    fd 0/1/2 are excluded from injection.
+  end note
+  Proc --> Wrap : path_string
+  Wrap -> Cache : store(fd, path_string)
+end
+
+Wrap -> Config : select_rule(op, path_string)
+Config --> Wrap : rule or null
+Wrap -> Real : real_symbol(fd, …)
+Real --> Wrap : result
+
+== open() seeds the cache ==
+
+note over Wrap, Cache
+  open(path, flags) / openat(dirfd, path, flags):
+    resolve match_path (pre-open)
+    call real_open()
+    if succeeded: store(returned_fd, match_path)
+end note
+
+== close() invalidates ==
+
+note over Wrap, Cache
+  close(fd):
+    call real_close(fd)
+    if succeeded: cache[fd % SLOTS].fd = -1  (invalidate)
+    ONLY invalidate after successful close.
+    A failed close leaves the cache entry intact
+    because the fd is still valid.
+end note
+
+== renameat() / unlinkat() reset ==
+
+note over Wrap, Cache
+  renameat() / unlinkat() success:
+    memset(cache, 0, sizeof(cache))  (full reset)
+    Reason: previously resolved /proc/self/fd paths
+    may now point to different inodes or be stale.
+end note
+
+note across
+  Thread-local scope: only the calling thread's cache
+  is affected by close/rename/unlink.
+  Cross-thread stale path hazard: Thread A closes fd 7;
+  Thread B still has fd 7 cached with old path.
+  If kernel reuses fd 7 for a new file, Thread B
+  may match wrong rules until its slot is evicted.
+end note
+
+@enduml
+```
 
 ### Effect engine
 
@@ -1025,6 +1158,101 @@ The repository validates runtime behavior in Docker across:
 That matrix is part of the library's engineering contract because preload
 behavior is sensitive to libc and architecture differences.
 
+## 16a. Symbol Versioning — pread and the GLIBC_2.2 Divergence
+
+On 32-bit x86 glibc, `pread()` is exported in two symbol versions:
+
+- `pread@GLIBC_2.0` — historical; takes `off_t` (32-bit on 32-bit platforms)
+- `pread64@GLIBC_2.1` — explicit 64-bit offset; recommended for LFS (Large File
+  Support, `_FILE_OFFSET_BITS=64`)
+
+On 64-bit targets (x86_64, aarch64), `off_t` is 64 bits unconditionally.
+`pread@@GLIBC_2.2` is the versioned default symbol. The `@@` suffix (double-at)
+denotes the default binding version in GNU symbol versioning (`.gnu.version_d`
+section; see ELF gABI § Symbol Versioning and glibc ABI changelog).
+
+`dlsym(RTLD_NEXT, "pread")` on 64-bit glibc returns `pread@@GLIBC_2.2` — which
+is the same underlying function. No version ambiguity on 64-bit. On 32-bit glibc,
+`dlsym(RTLD_NEXT, "pread")` returns `pread@GLIBC_2.0` (the unversioned default),
+which has 32-bit `off_t`. Code that compiles with `_FILE_OFFSET_BITS=64` on
+32-bit calls `pread64` instead.
+
+This repository does not ship 32-bit builds. The four release tuples are all
+64-bit (`amd64`, `arm64`). The symbol versioning issue is documented here because:
+1. It would become relevant if a 32-bit build were ever added.
+2. It illustrates why `dlsym` on versioned symbols must be audited per-arch.
+
+For musl, symbols are not versioned. `dlsym(RTLD_NEXT, "pread")` returns the
+single musl implementation regardless of `off_t` width. Musl uses `off_t` =
+`long` (64-bit on 64-bit platforms, 32-bit on 32-bit platforms) with no `pread64`
+alias exported.
+
+Reference: ELF gABI §2-13 "Symbol Table"; glibc ABI changelog; musl
+`src/unistd/pread.c`.
+
+## 16b. Non-Coverage: splice, tee, vmsplice
+
+Linux provides three zero-copy I/O primitives that move data between file
+descriptors and/or kernel pipe buffers without crossing user space:
+
+| Syscall    | Linux version | Operation                                               |
+|------------|---------------|---------------------------------------------------------|
+| `splice(2)`| 2.6.17        | Move data between fd and pipe (or pipe to pipe)         |
+| `tee(2)`   | 2.6.17        | Duplicate pipe content without consuming it             |
+| `vmsplice(2)`| 2.6.17      | Map user-space pages into a pipe buffer                 |
+
+These are Linux-specific and not in POSIX.1-2017. They are not interposed by
+`libchaos-io` for the following reasons:
+
+1. `splice()` operates on pipe buffers. The destination of a `splice(pipe, file)`
+   call is visible via the destination fd, but the source is a kernel pipe buffer
+   not a user-space buffer. Injecting a torn splice requires partial pipe-buffer
+   semantics that are kernel-internal.
+2. `tee()` only duplicates between pipes. It has no user-space data surface for
+   corruption or torn-write injection.
+3. `vmsplice()` maps user pages into a pipe buffer. After `vmsplice()`, the page
+   may still be readable from user space or not depending on `SPLICE_F_GIFT`.
+   Injecting a torn write would require understanding whether the page ownership
+   has been transferred.
+4. All three use the `SYS_splice`, `SYS_tee`, `SYS_vmsplice` syscall numbers
+   directly in some paths (e.g., `cp --reflink` on btrfs). Those paths bypass the
+   PLT entirely.
+5. The practical chaos coverage for zero-copy paths is achieved via `sendfile()` and
+   `copy_file_range()`, which are already interposed.
+
+Reference: `splice(2)`, `tee(2)`, `vmsplice(2)` Linux man-pages.
+
+## 16c. O_DIRECT and Kernel Bypass Implications
+
+`O_DIRECT` (Linux `fcntl.h`, not in POSIX.1-2017) opens a file with direct
+I/O: data bypasses the kernel page cache and goes directly between the user-space
+buffer and the storage device (via DMA). Requirements: buffer alignment (typically
+512-byte or 4096-byte), length alignment, offset alignment.
+
+**Injection surface:** `libchaos-io` intercepts `open()`/`openat()` with
+`O_DIRECT` in the `flags` argument. The open wrapper matches the path and can
+inject `ERRNO:EINVAL` (the common O_DIRECT rejection error) before the real open.
+
+After a successful `open(O_DIRECT)`, subsequent `read()`, `write()`, `pread()`,
+`pwrite()` calls on that fd are also interposed. `ERRNO:EIO` injection on a
+direct-I/O write models a device-level error returning to user space.
+
+**Torn write with O_DIRECT:** The `TORN` effect reduces the write length. With
+O_DIRECT, the kernel requires that the write length be a multiple of the block
+size. A torn write to a partial block will cause the real libc `write()` to return
+`EINVAL` (unaligned length). This is not special-cased by the library. If you
+use `TORN` on a path known to be opened with `O_DIRECT`, verify that torn lengths
+still satisfy alignment constraints.
+
+**Corrupt read with O_DIRECT:** The `CORRUPT` effect flips one bit in the returned
+read buffer. With O_DIRECT, the buffer is DMA-filled from the device. The bit flip
+happens after the real `read()` returns, in user space, before the application
+sees the data. This is the correct injection model — it simulates data corruption
+at the user-space ABI boundary, not at the storage layer.
+
+Reference: `open(2)`, `NOTES` section on `O_DIRECT`; `ioctl_fslabel(2)` for
+block device alignment queries.
+
 ## 16. References
 
 - Reference: POSIX.1-2017
@@ -1052,3 +1280,17 @@ behavior is sensitive to libc and architecture differences.
 - Reference: `renameat(2)`
 - Reference: `readlink(2)`
 - Reference: `stat(2)`
+
+---
+
+<div align="center">
+
+*Architecture, implementation, and documentation crafted with Love and Passion by*
+
+**[Christian Schnapka](https://macstab.com)**  
+Embedded Principal+ Engineer  
+[Macstab GmbH](https://macstab.com) · Hamburg, Germany
+
+*Building systems that operate correctly at the edges — including the ones you deliberately break.*
+
+</div>

@@ -1,0 +1,30 @@
+# =============================================================================
+# Dockerfile.bench-alpine  —  Tier 1 benchmark image (musl / alpine).
+#
+# Sibling of Dockerfile.bench-glibc.  Same caveats apply (host scheduler
+# / governor / IRQs are out of our control); the harness flags ADVISORY
+# mode automatically.  Differences from glibc:
+#  - Compiler: musl-gcc via gcc-default; pthread/clock_gettime live in
+#    libc.musl-*.so.1 and need no separate -lrt.
+#  - musl's posix_spawn calls fork(); the chaos-process bench therefore
+#    sees a different cascade than on glibc.  This is intentional.
+#  - musl's getaddrinfo path is simpler (no NSS); chaos-dns numbers run
+#    faster than glibc.  This is also intentional and documented in
+#    BENCHMARKS.md.
+# =============================================================================
+
+FROM alpine:3.19
+
+RUN apk add --no-cache \
+        build-base \
+        gcc \
+        make \
+        ca-certificates \
+        git \
+        python3 \
+        bash \
+        linux-headers
+
+WORKDIR /work
+
+CMD ["make", "-f", "benchmark/Makefile.bench", "bench-list"]

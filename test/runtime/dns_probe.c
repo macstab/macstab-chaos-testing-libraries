@@ -1,3 +1,36 @@
+/**
+ * @file dns_probe.c
+ * @brief Runtime validation probe for libchaos-dns under LD_PRELOAD.
+ *
+ * @details
+ * Standalone C program compiled inside a Docker container and executed under
+ * `LD_PRELOAD=libchaos-dns.so`. Validates end-to-end fault injection for the
+ * DNS library's interposed symbols: `getaddrinfo` and `getnameinfo`.
+ *
+ * Each subtest writes a config rule with a future-mtime timestamp to
+ * `/tmp/.chaos-dns.conf`, then exercises the interposed symbol and asserts the
+ * expected behavior. The future-mtime pattern guarantees a config reload cycle
+ * on the first post-write invocation, ensuring the new rule is active.
+ *
+ * Subtests cover:
+ * - `EAI_AGAIN` injection on `getaddrinfo` (synthetic transient failure)
+ * - `LATENCY` injection on `getaddrinfo` (≥ 150 ms added sleep)
+ * - `REWRITE` on `getaddrinfo` (hostname substitution: example.invalid → localhost)
+ * - `SERVICE` rewrite on `getaddrinfo` (port override: 80 → 8081)
+ * - `OVERRIDE` + `FILTER_FAMILY` + `LIMIT` pipeline (synthetic address list,
+ *   IPv4-only, single result)
+ * - `EAI_AGAIN` injection on `getnameinfo` (synthetic transient failure)
+ * - `LATENCY` injection on `getnameinfo` (≥ 150 ms added sleep)
+ * - `REWRITE` + `SERVICE` on `getnameinfo` (PTR hostname and service name override)
+ *
+ * The `OVERRIDE` subtest exercises the full FILTER→SHUFFLE→LIMIT transform
+ * pipeline in a single call: the injected address list [127.0.0.1, ::1] is
+ * filtered to IPv4-only by `FILTER_FAMILY:inet4`, then trimmed to one result
+ * by `LIMIT:1`. All three rules are written as a multi-line config block.
+ *
+ * Returns 0 on success; returns a non-zero numbered exit code identifying
+ * the failing subtest.
+ */
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>

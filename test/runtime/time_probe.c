@@ -1,3 +1,37 @@
+/**
+ * @file time_probe.c
+ * @brief Runtime validation probe for libchaos-time under LD_PRELOAD.
+ *
+ * @details
+ * Standalone C program compiled inside a Docker container and executed under
+ * `LD_PRELOAD=libchaos-time.so`. Validates end-to-end fault injection for
+ * the time library's interposed symbols: `clock_gettime`, `clock_getres`,
+ * `nanosleep`, and `usleep`.
+ *
+ * Each subtest writes a config rule with a future-mtime timestamp to
+ * `/tmp/.chaos-time.conf`, then exercises the interposed symbol and asserts
+ * the expected behavior. The future-mtime pattern guarantees a config reload
+ * cycle on the first post-write invocation, ensuring the new rule is active.
+ *
+ * Subtests cover:
+ * - `ERRNO` injection on `clock_gettime` (synthetic `EINVAL` return)
+ * - `LATENCY` injection on `clock_gettime` (≥ 150 ms added sleep)
+ * - `OFFSET` applied to `CLOCK_MONOTONIC` result (signed ms added to tv_sec/tv_nsec)
+ * - `ERRNO` injection on `nanosleep` (synthetic `EINVAL` return)
+ * - `LATENCY` injection on `nanosleep` (additive to requested sleep)
+ * - `ERRNO` injection on `usleep` (synthetic `EINVAL` return)
+ *
+ * On glibc, `clock_gettime`/`clock_getres` for `CLOCK_MONOTONIC` and
+ * `CLOCK_REALTIME` are normally serviced through the vDSO fast path without
+ * trapping into libc.  libchaos-time interposes the libc PLT entry, which is
+ * resolved before any vDSO dispatch occurs in user-space, so injection still
+ * fires for these clock IDs.  The probe relies on this property: a CI
+ * environment where the vDSO bypass were exposed (e.g. raw `__vdso_clock_gettime`
+ * lookup via `getauxval(AT_SYSINFO_EHDR)`) would not trigger the rule.
+ *
+ * Returns 0 on success; returns a non-zero numbered exit code identifying
+ * the failing subtest.
+ */
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>

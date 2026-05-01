@@ -1,4 +1,16 @@
 #!/bin/sh
+#
+# check_coverage.sh — Source-line coverage gate for libchaos-io.
+#
+# Compiles all src/ and test/ files with --coverage (gcov instrumentation),
+# runs the unit tests, then calls gcov on each instrumented object and asserts
+# that each source file meets its minimum per-file line-coverage percentage.
+# Exits non-zero if any threshold is not met.
+#
+# Usage:   check_coverage.sh
+# Env:     CC, CPPFLAGS, CFLAGS, BUILD_DIR  (forwarded to make(1))
+# Prereqs: gcc or clang with gcov support; make
+
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)

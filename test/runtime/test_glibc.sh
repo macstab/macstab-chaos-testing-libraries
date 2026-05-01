@@ -1,4 +1,18 @@
 #!/bin/sh
+#
+# test_glibc.sh — libchaos-io runtime validation on glibc (Docker).
+#
+# Builds libchaos-io.so for the target platform using Docker buildx with a
+# glibc (debian:bookworm) base, compiles an inline C probe that exercises
+# every interposed IO symbol with ERRNO, TORN, CORRUPT, and LATENCY effects,
+# then runs the probe in a minimal glibc container with LD_PRELOAD set.
+# Validates that all fault effects fire correctly on glibc amd64 and arm64.
+#
+# Usage:   test_glibc.sh [linux/amd64|linux/arm64]
+#          Defaults to the host architecture when no argument is given.
+# Env:     CHAOS_IO_DOCKER_PLATFORM  platform override (e.g. linux/arm64)
+# Prereqs: docker with buildx and multi-arch support (linux/amd64, linux/arm64)
+
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)

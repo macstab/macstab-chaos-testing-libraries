@@ -1,3 +1,39 @@
+/**
+ * @file memory_probe.c
+ * @brief Runtime validation probe for libchaos-memory under LD_PRELOAD.
+ *
+ * @details
+ * Standalone C program compiled inside a Docker container and executed under
+ * `LD_PRELOAD=libchaos-memory.so`. Validates end-to-end fault injection for
+ * the memory library's interposed symbols: `mmap`, `mprotect`, `madvise`,
+ * and `munmap`.
+ *
+ * Each subtest writes a config rule with a future-mtime timestamp to
+ * `/tmp/.chaos-memory.conf`, then exercises the interposed symbol and asserts
+ * the expected behavior. The future-mtime pattern guarantees a config reload
+ * cycle on the first post-write invocation, ensuring the new rule is active.
+ *
+ * Subtests cover:
+ * - `ERRNO` injection on anonymous `mmap` (`mmap/anon` selector, synthetic `ENOMEM`)
+ * - `ERRNO` injection on file-backed `mmap` (`mmap/file` selector, synthetic `EACCES`)
+ * - `LATENCY` injection on `mmap` (≥ 120 ms added sleep on anonymous mapping)
+ * - `ERRNO` injection on `mprotect` (synthetic `EACCES`)
+ * - `LATENCY` injection on `mprotect` (≥ 90 ms added sleep)
+ * - `ERRNO` injection on `madvise` (synthetic `EINVAL`)
+ * - `LATENCY` injection on `madvise` (≥ 80 ms added sleep)
+ * - `ERRNO` injection on `munmap` (synthetic `EINVAL`; chaos cleared before cleanup)
+ * - `LATENCY` injection on `munmap` (≥ 80 ms added sleep)
+ *
+ * The `MAP_ANONYMOUS` portability shim (`MAP_ANON` fallback) allows the probe
+ * to compile on macOS for development, though the library itself targets Linux.
+ *
+ * The `munmap` ERRNO subtest requires a two-phase config pattern: inject the
+ * error, confirm it fires, then clear the config and call `munmap` again to
+ * release the intentionally retained mapping without triggering another fault.
+ *
+ * Returns 0 on success; returns a non-zero numbered exit code identifying
+ * the failing subtest.
+ */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>

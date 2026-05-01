@@ -1,11 +1,47 @@
+<!--
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Engineered by  Christian Schnapka
+                 Embedded Principal+ Engineer
+                 Macstab GmbH · Hamburg, Germany
+                 https://macstab.com
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-->
+
 # libchaos-net Technical Reference
+
+> *Engineered by* **[Christian Schnapka](https://macstab.com)** — Embedded Principal+ Engineer · [Macstab GmbH](https://macstab.com) · Hamburg, Germany
+
+---
 
 This document is the engineering reference for the current `libchaos-net`
 implementation and its explicit extension boundary. The repository-wide
 ownership, loader, libc, kernel, distro, and documentation model is defined in
-[`docs/SYSTEM.md`](/Users/nolem/dev/macstab/projects/oss/chaos-testing-libraries/docs/SYSTEM.md). That
+[`docs/SYSTEM.md`](SYSTEM.md). That
 global document is authoritative when subsystem references would otherwise
 drift.
+
+## Table of Contents
+
+- [1. Overview](#1-overview)
+- [2. Architectural Context](#2-architectural-context)
+- [3. Key Concepts and Terminology](#3-key-concepts-and-terminology)
+- [4. End-to-End Behavior](#4-end-to-end-behavior)
+- [5. Architecture Diagrams](#5-architecture-diagrams)
+- [6. Component Breakdown](#6-component-breakdown)
+- [7. Data Model and State](#7-data-model-and-state)
+- [8. Concurrency and Threading Model](#8-concurrency-and-threading-model)
+- [9. Error Handling and Failure Modes](#9-error-handling-and-failure-modes)
+- [10. Security Model](#10-security-model)
+- [11. Performance Model](#11-performance-model)
+- [12. Observability and Operations](#12-observability-and-operations)
+- [13. Configuration Reference](#13-configuration-reference)
+- [14. Extension Points and Compatibility Guarantees](#14-extension-points-and-compatibility-guarantees)
+- [15. Stack Walkdown](#15-stack-walkdown)
+- [16a. SCM_RIGHTS and fd Passing — Non-Coverage](#16a-scm_rights-and-fd-passing--non-coverage)
+- [16b. SO_REUSEPORT — Injection Consideration](#16b-so_reuseport--injection-consideration)
+- [16c. TCP Fast Open — Non-Coverage](#16c-tcp-fast-open--non-coverage)
+- [16d. io_uring — Non-Coverage](#16d-io_uring--non-coverage)
+- [16. References](#16-references)
 
 Status is important:
 
@@ -1041,6 +1077,97 @@ Cross-libc and cross-architecture Docker validation is required because
 preloading behavior, libc symbol exposure, and resolver behavior can diverge
 between glibc and musl and between amd64 and arm64.
 
+## 16a. SCM_RIGHTS and fd Passing — Non-Coverage
+
+`SCM_RIGHTS` is a Unix-domain socket ancillary data type that passes open file
+descriptors between processes over a `sendmsg()`/`recvmsg()` call. The kernel
+duplicates the descriptor into the receiving process's descriptor table as part
+of the `SYS_sendmsg` / `SYS_recvmsg` syscall pair.
+
+`libchaos-net` intercepts `sendmsg()` and `recvmsg()` at the libc PLT. The
+effect surface is:
+
+- `LATENCY` and `ERRNO` on `sendmsg()` fire before the real call; the fd
+  transfer never occurs on synthetic failure.
+- `CORRUPT` on `recvmsg()` flips one bit in the _payload_ (`msg_iov`) bytes,
+  but does not touch the ancillary data (`msg_control`). The received fd
+  in `SCM_RIGHTS` is untouched.
+- There is no selector for "this `sendmsg` carries SCM_RIGHTS". The rule matches
+  the endpoint selector only.
+
+Scenarios not covered:
+- Injecting a bad fd into the received `SCM_RIGHTS` control message.
+- Injecting partial delivery of fds when multiple are sent in one ancillary block.
+- Testing the receiver's handling of `msg_ctrunc` (control buffer too small).
+
+These require post-call mutation of the `msg_control` buffer, which is not in
+the current effect repertoire. Reference: `unix(7)`, `cmsg(3)`.
+
+## 16b. SO_REUSEPORT — Injection Consideration
+
+`SO_REUSEPORT` (Linux 3.9) allows multiple processes/threads to bind to the same
+IP+port combination. The kernel distributes incoming connections/datagrams across
+all listening sockets using a hash of source IP+port.
+
+`libchaos-net` does not treat `SO_REUSEPORT` sockets differently from regular
+sockets. If `bind:ERRNO:EADDRINUSE` is injected on a port used by multiple
+`SO_REUSEPORT` listeners, the application's handling of bind failure (usually
+fatal) is tested — which is a valid scenario for testing port-sharing setup code.
+
+There is no selector for "sockets sharing this port via SO_REUSEPORT". The
+endpoint selector matches on IP:port only, not on socket option state.
+
+Reference: `socket(7)`, `ip(7)`.
+
+## 16c. TCP Fast Open — Non-Coverage
+
+TCP Fast Open (TFO, RFC 7413, Linux 3.6+) allows data to be sent in the
+SYN packet by adding a Fast Open cookie. The application uses `sendto()` with
+`MSG_FASTOPEN` flag, or `connect()` followed by `send()`.
+
+The `MSG_FASTOPEN` path is detectable in `sendto()` via `flags & MSG_FASTOPEN`.
+`libchaos-net` currently matches the `send` logical operation for `sendto()` by
+endpoint selector, without regard to `MSG_FASTOPEN`. Therefore:
+
+- `tcp4://host:port:send:ERRNO:ECONNREFUSED` will match a TFO-`sendto()` and
+  inject failure before the real call.
+- The library cannot distinguish TFO from regular `sendto()` in the selector.
+
+Non-coverage: the library does not model TFO cookie negotiation failures (the
+first TFO connection failing and falling back to regular connect, then subsequent
+connections succeeding with the cached cookie). This is a kernel-internal
+mechanism not visible at the libc `sendto()` boundary.
+
+Reference: RFC 7413; `tcp(7)` Linux man-page; `TCP_FASTOPEN_CONNECT`.
+
+## 16d. io_uring — Non-Coverage
+
+`io_uring` (Linux 5.1+) is an asynchronous I/O interface based on two
+shared-memory ring buffers (submission queue SQ, completion queue CQ). It uses
+two syscalls: `io_uring_setup(2)` and `io_uring_enter(2)`. Applications submit
+operations (read, write, send, recv, accept, connect) as SQEs (submission queue
+entries) and harvest completions as CQEs.
+
+`libchaos-net` does not cover `io_uring` for the following reasons:
+
+1. `io_uring` operations are submitted as operation codes in SQEs, not as libc
+   function calls. There is no `send()` PLT entry involved.
+2. The `io_uring_setup()` and `io_uring_enter()` syscalls have no libc wrapper
+   in glibc (they are accessed via `liburing` or raw `syscall()`). PLT
+   interposition is inapplicable.
+3. `liburing` (the userspace API library for io_uring) is a third-party library,
+   not libc. Interposing its symbols would require a separate preload targeting
+   `liburing.so`.
+4. `IORING_OP_RECV`, `IORING_OP_SEND`, `IORING_OP_ACCEPT`, `IORING_OP_CONNECT`
+   are kernel-internal operation codes, not libc symbols.
+
+Applications using `io_uring` directly (or via `liburing`) for network I/O are
+outside the `LD_PRELOAD` fault surface for both `libchaos-net` and `libchaos-io`.
+This is a declared coverage limitation, not an implementation omission.
+
+Reference: `io_uring(7)` Linux man-page; `io_uring_setup(2)`; Jens Axboe,
+"Efficient IO with io_uring" (2019).
+
 ## 16. References
 
 - Reference: POSIX.1-2017
@@ -1060,3 +1187,20 @@ between glibc and musl and between amd64 and arm64.
 - Reference: `getaddrinfo(3)`
 - Reference: `sendmmsg(2)`
 - Reference: `recvmmsg(2)`
+- Reference: `unix(7)` — Unix-domain socket and SCM_RIGHTS
+- Reference: RFC 7413 — TCP Fast Open
+- Reference: `io_uring(7)` — async I/O interface
+
+---
+
+<div align="center">
+
+*Architecture, implementation, and documentation crafted with Love and Passion by*
+
+**[Christian Schnapka](https://macstab.com)**  
+Embedded Principal+ Engineer  
+[Macstab GmbH](https://macstab.com) · Hamburg, Germany
+
+*Building systems that operate correctly at the edges — including the ones you deliberately break.*
+
+</div>

@@ -1,4 +1,17 @@
 #!/bin/sh
+#
+# test_memory_glibc.sh — libchaos-memory runtime validation on glibc (Docker).
+#
+# Builds libchaos-memory.so for the target platform using Docker buildx with a
+# glibc (debian:bookworm) base, then runs the pre-compiled memory_probe binary
+# under LD_PRELOAD in a glibc container. Validates mmap, munmap, mprotect, and
+# madvise fault injection (ERRNO, LATENCY) on glibc ptmalloc2 where mmap is
+# triggered only above the MMAP_THRESHOLD (default 128 KiB).
+#
+# Usage:   test_memory_glibc.sh [linux/amd64|linux/arm64]
+# Env:     CHAOS_MEMORY_DOCKER_PLATFORM  platform override
+# Prereqs: docker with buildx and multi-arch support
+
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)

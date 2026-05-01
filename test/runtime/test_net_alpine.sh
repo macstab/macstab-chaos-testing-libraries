@@ -1,4 +1,16 @@
 #!/bin/sh
+#
+# test_net_alpine.sh — libchaos-net runtime validation on musl/Alpine (Docker).
+#
+# Builds libchaos-net.so for the target platform using Docker buildx with a
+# musl (alpine) base, then runs the pre-compiled net_probe binary under
+# LD_PRELOAD in an Alpine container. Validates network fault injection on
+# musl libc for amd64 and arm64.
+#
+# Usage:   test_net_alpine.sh [linux/amd64|linux/arm64]
+# Env:     CHAOS_NET_DOCKER_PLATFORM  platform override
+# Prereqs: docker with buildx and multi-arch support
+
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)

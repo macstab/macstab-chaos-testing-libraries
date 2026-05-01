@@ -1,4 +1,20 @@
 #!/bin/sh
+#
+# test_integration.sh — Native libchaos-io integration test (no Docker).
+#
+# Builds libchaos-io.so natively via make, compiles a C probe from an inline
+# heredoc, and runs the probe under LD_PRELOAD on the host Linux system.
+# Validates end-to-end fault injection for: write, read, readv, writev, pread,
+# pwrite, preadv, pwritev, sendfile, copy_file_range, ftruncate, fallocate,
+# unlinkat, renameat, and fsync. Each subtest writes a config rule with a
+# future mtime to guarantee a reload cycle before the injected call.
+#
+# Exits 0 on success; exits with a numbered non-zero code identifying the
+# failing subtest on any assertion failure.
+#
+# Usage:   test_integration.sh
+# Prereqs: Linux, cc, make; exits cleanly (exit 0) on non-Linux.
+
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)

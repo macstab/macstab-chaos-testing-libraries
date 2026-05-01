@@ -1,0 +1,123 @@
+@startuml dispatch
+'
+' Engineered by  Christian Schnapka
+'                Embedded Principal+ Engineer
+'                Macstab GmbH · Hamburg, Germany
+'                https://macstab.com
+'
+' Full dispatcher call flow for a matched interposed symbol.
+' Shows TLS guard, config reload, rule evaluation, effect dispatch,
+' real-symbol call, and post-call mutation path.
+'
+' Reference: docs/ARCHITECTURE.md, docs/MEMORY.md §14, docs/TIME.md §9
+'
+title Full Dispatcher Flow — Interposed Symbol with Matched Rule
+
+skinparam sequenceMessageAlign center
+skinparam shadowing false
+skinparam roundCorner 4
+skinparam sequence {
+  ArrowColor                 #2C3E50
+  LifeLineBorderColor        #2C3E50
+  LifeLineBackgroundColor    #ECF0F1
+  ParticipantBorderColor     #2C3E50
+  ParticipantBackgroundColor #FFFFFF
+  ParticipantFontStyle       bold
+  GroupBackgroundColor       #FDFEFE
+  GroupBorderColor           #95A5A6
+}
+hide footbox
+
+participant "Application"    as App
+participant "Wrapper"        as Wrap
+participant "TLS Guard"      as Guard
+participant "Config Engine"  as Config
+participant "Selector\nResolver" as Sel
+participant "Effect Engine"  as FX
+participant "Real Symbol\n(libc)"  as Real
+
+App -> Wrap : symbol(args…)
+
+Wrap -> Guard : enter_internal()
+note right of Guard
+  __thread int guard;
+  previous = guard;
+  guard = 1;
+  if previous != 0: bypass all injection
+end note
+
+alt Guard was already set (reentrancy)
+  Wrap -> Real : direct call, no injection
+  Real --> Wrap : result
+  Wrap -> Guard : leave_internal(previous)
+  Wrap --> App : result
+else Guard was clear (normal path)
+
+  Wrap -> Config : check_config()
+  note right of Config
+    stat(config_path)
+    if mtime changed:
+      CAS(mtime, old, RELOADING)
+      reload + parse
+      CAS(mtime, RELOADING, new)
+  end note
+  Config --> Wrap : active_snapshot
+
+  Wrap -> Sel : resolve_selector(args…)
+  note right of Sel
+    IO: fd → /proc/self/fd path
+    NET: sockaddr → endpoint string
+    TIME: clockid → clock name
+    MEM: MAP_ANONYMOUS bit
+    PROC: symbol name
+  end note
+  Sel --> Wrap : selector_string
+
+  Wrap -> Config : select_rule(op, selector)
+  Config --> Wrap : matched_rule (or null)
+
+  alt No rule matched
+    Wrap -> Real : real_symbol(args…)
+    Real --> Wrap : result
+    Wrap -> Guard : leave_internal(previous)
+    Wrap --> App : result
+  else Rule matched
+    Wrap -> FX : apply_latency(rule)
+    note right of FX
+      if rule.effect == LATENCY:
+        real_nanosleep(ms → ns)
+      (reentrancy guard already set;
+       nanosleep bypasses own wrapper)
+    end note
+
+    Wrap -> FX : apply_pre_errno(rule)
+    note right of FX
+      if rule.effect == ERRNO and
+         PRNG()/UINT32_MAX ≤ probability:
+        errno = rule.errnum; return fail
+    end note
+
+    alt ERRNO triggered
+      FX --> Wrap : inject failure
+      Wrap -> Guard : leave_internal(previous)
+      Wrap --> App : -1 or error code, errno set
+    else No pre-call failure
+      Wrap -> Real : real_symbol(args…)
+      Real --> Wrap : result
+
+      alt Post-call mutation (OFFSET / CORRUPT)
+        Wrap -> FX : apply_post_mutation(rule, result)
+        note right of FX
+          OFFSET: ts += offset_ms
+          CORRUPT: flip one bit in read buffer
+        end note
+        FX --> Wrap : mutated result
+      end
+
+      Wrap -> Guard : leave_internal(previous)
+      Wrap --> App : result (possibly mutated)
+    end
+  end
+end
+
+@enduml

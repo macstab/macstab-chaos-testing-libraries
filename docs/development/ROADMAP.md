@@ -1,4 +1,17 @@
+<!--
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Engineered by  Christian Schnapka
+                 Embedded Principal+ Engineer
+                 Macstab GmbH · Hamburg, Germany
+                 https://macstab.com
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-->
+
 # Roadmap
+
+> *Engineered by* **[Christian Schnapka](https://macstab.com)** — Embedded Principal+ Engineer · [Macstab GmbH](https://macstab.com) · Hamburg, Germany
+
+---
 
 This repository currently ships implemented `libchaos-io`, `libchaos-net`,
 `libchaos-dns`, `libchaos-time`, `libchaos-process`, and `libchaos-memory`
@@ -489,3 +502,17 @@ Recommended implementation order:
 6. file lifecycle and capacity operations with the cross-target completion gate enforced
 7. mapped file I/O design with the cross-target completion gate enforced
 8. separate sibling libraries for network, time, memory, and process chaos, each with their own cross-target completion gate
+
+---
+
+<div align="center">
+
+*Architecture, implementation, and documentation crafted with Love and Passion by*
+
+**[Christian Schnapka](https://macstab.com)**  
+Embedded Principal+ Engineer  
+[Macstab GmbH](https://macstab.com) · Hamburg, Germany
+
+*Building systems that operate correctly at the edges — including the ones you deliberately break.*
+
+</div>
