@@ -3,3 +3,4 @@ build-*/
 dist/
 *.gcov
 .idea/
+.claude/
