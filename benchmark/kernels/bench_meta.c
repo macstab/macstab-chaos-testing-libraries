@@ -71,7 +71,7 @@ static void bench_meta_clock_iter(void *user_state)
 /* ---- registration ------------------------------------------------------- */
 
 CHAOS_BENCH("meta", nop_loop_1k, bench_meta_loop_state_t,
-            bench_meta_loop_setup, bench_meta_loop_iter, NULL);
+            bench_meta_loop_setup, bench_meta_loop_iter, NULL)
 
 CHAOS_BENCH("meta", clock_overhead, bench_meta_clock_state_t,
-            NULL, bench_meta_clock_iter, NULL);
+            NULL, bench_meta_clock_iter, NULL)
