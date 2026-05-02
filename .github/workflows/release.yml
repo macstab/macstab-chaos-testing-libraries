@@ -163,8 +163,8 @@ jobs:
       - name: Commit CHANGELOG.md back to main
         run: |
           TAG=${GITHUB_REF#refs/tags/}
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name  "${{ secrets.BOT_USER_NAME }}"
+          git config user.email "${{ secrets.BOT_USER_EMAIL }}"
           git remote set-url origin https://x-access-token:${{ secrets.BOT_GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
           git fetch origin main
           git stash -- CHANGELOG.md
