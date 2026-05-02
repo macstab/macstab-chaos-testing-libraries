@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci:** Fixing the workflow ([#3](https://github.com/macstab/macstab-chaos-testing-libraries/issues/3)) ([4f38268](https://github.com/macstab/macstab-chaos-testing-libraries/commit/4f38268e9e8eedb2ff9ed47037e3bbc01a6363c6))
 - Correct release ([#8](https://github.com/macstab/macstab-chaos-testing-libraries/issues/8)) ([6b0a232](https://github.com/macstab/macstab-chaos-testing-libraries/commit/6b0a232a341574a14f1aa05f2792bae5daa0bc22))
 - Refactor release workflow to improve changelog automation and remove unused bot token checks. ([11646f1](https://github.com/macstab/macstab-chaos-testing-libraries/commit/11646f109d340d0848c4496bcd9988ed99c16e1e))
+- Refactor release workflow to improve changelog automation and remove unused bot token checks. ([4e9c301](https://github.com/macstab/macstab-chaos-testing-libraries/commit/4e9c301c9ba56f219a4a39ddf6f1d87ba8487cb5))
 
 ### CI
 
