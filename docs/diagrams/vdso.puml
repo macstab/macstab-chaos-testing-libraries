@@ -1,0 +1,68 @@
+@startuml vdso
+'
+' Engineered by  Christian Schnapka
+'                Embedded Principal+ Engineer
+'                Macstab GmbH · Hamburg, Germany
+'                https://macstab.com
+'
+' clock_gettime(2) dispatch with libchaos-time.so preloaded.
+'
+' Key fact: the vDSO is invoked INSIDE glibc, downstream of our wrapper.
+' Our interposition stays intact for the common case.
+'
+' Reference: docs/PLATFORM.md §5.2
+'             docs/TIME.md §"Bypass surfaces"
+'             vdso(7) Linux man-pages
+'
+title clock_gettime dispatch with libchaos-time.so preloaded
+
+skinparam sequenceMessageAlign center
+skinparam shadowing false
+skinparam roundCorner 4
+skinparam sequence {
+  ArrowColor                 #2C3E50
+  LifeLineBorderColor        #2C3E50
+  LifeLineBackgroundColor    #ECF0F1
+  ParticipantBorderColor     #2C3E50
+  ParticipantBackgroundColor #FFFFFF
+  ParticipantFontStyle       bold
+  GroupBackgroundColor       #FDFEFE
+  GroupBorderColor           #95A5A6
+}
+hide footbox
+
+participant App
+participant "libchaos-time.so" as Wrapper
+participant "libc.so.6"        as Glibc
+participant "kernel vDSO"      as Vdso
+participant "kernel syscall"   as Kernel
+
+App     ->  Wrapper : clock_gettime(CLOCK_MONOTONIC, &ts)
+Wrapper ->  Wrapper : match config,\nmaybe LATENCY/ERRNO
+
+alt Synthetic ERRNO fires
+    Wrapper --> App : -1, errno set
+else Passthrough to real
+    Wrapper ->  Glibc  : real_clock_gettime(...)
+    alt vDSO available on this arch
+        Glibc -> Vdso   : __vdso_clock_gettime
+        Vdso  --> Glibc : ts
+    else syscall fallback
+        Glibc -> Kernel : SYS_clock_gettime
+        Kernel --> Glibc: ts
+    end
+    Glibc   --> Wrapper : 0, ts
+    Wrapper ->  Wrapper : maybe OFFSET\n(post-call mutation)
+    Wrapper --> App     : 0, possibly-mutated ts
+end
+
+note across
+  Bypass cases — wrapper NOT invoked:
+  • Application calls syscall(SYS_clock_gettime, ...) directly
+    (Go runtime, hardened daemons, sanitizer interceptors).
+  • Application resolves __vdso_clock_gettime via getauxval(AT_SYSINFO_EHDR)
+    and calls it directly (vanishingly rare in user code).
+  • Statically-linked binary (no dynamic loader → no LD_PRELOAD).
+end note
+
+@enduml

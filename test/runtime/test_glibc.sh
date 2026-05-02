@@ -1,0 +1,1202 @@
+#!/bin/sh
+#
+# test_glibc.sh — libchaos-io runtime validation on glibc (Docker).
+#
+# Builds libchaos-io.so for the target platform using Docker buildx with a
+# glibc (debian:bookworm) base, compiles an inline C probe that exercises
+# every interposed IO symbol with ERRNO, TORN, CORRUPT, and LATENCY effects,
+# then runs the probe in a minimal glibc container with LD_PRELOAD set.
+# Validates that all fault effects fire correctly on glibc amd64 and arm64.
+#
+# Usage:   test_glibc.sh [linux/amd64|linux/arm64]
+#          Defaults to the host architecture when no argument is given.
+# Env:     CHAOS_IO_DOCKER_PLATFORM  platform override (e.g. linux/arm64)
+# Prereqs: docker with buildx and multi-arch support (linux/amd64, linux/arm64)
+
+set -eu
+
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+TMP_DIR=$(mktemp -d)
+IMAGE_TAG=libchaos-io-glibc-probe:local
+
+if [ "$#" -gt 1 ]; then
+    echo "usage: $0 [linux/amd64|linux/arm64]" >&2
+    exit 2
+fi
+
+# Allow an explicit Docker target so glibc checks do not silently track the host arch.
+DOCKER_PLATFORM=${1:-${CHAOS_IO_DOCKER_PLATFORM:-}}
+if [ -z "$DOCKER_PLATFORM" ]; then
+    case "$(uname -m)" in
+        x86_64|amd64)
+            DOCKER_PLATFORM=linux/amd64
+            ;;
+        arm64|aarch64)
+            DOCKER_PLATFORM=linux/arm64
+            ;;
+        *)
+            echo "glibc test skipped: unsupported host architecture $(uname -m)" >&2
+            exit 0
+            ;;
+    esac
+fi
+
+case "$DOCKER_PLATFORM" in
+    linux/amd64)
+        DOCKER_PLATFORM=linux/amd64
+        MAKE_TARGET=cross-glibc-amd64
+        OUTPUT_LIB=libchaos-io-glibc-amd64.so
+        ;;
+    linux/arm64)
+        DOCKER_PLATFORM=linux/arm64
+        MAKE_TARGET=cross-glibc-arm64
+        OUTPUT_LIB=libchaos-io-glibc-arm64.so
+        ;;
+    *)
+        echo "glibc test skipped: unsupported docker platform $DOCKER_PLATFORM" >&2
+        exit 0
+        ;;
+esac
+
+cleanup() {
+    docker image rm -f "$IMAGE_TAG" >/dev/null 2>&1 || true
+    rm -rf "$TMP_DIR"
+}
+
+trap cleanup EXIT INT TERM
+
+if ! command -v docker >/dev/null 2>&1; then
+    echo "glibc test skipped: docker not available" >&2
+    exit 0
+fi
+
+if ! docker version >/dev/null 2>&1; then
+    echo "glibc test skipped: docker daemon not accessible" >&2
+    exit 0
+fi
+
+docker buildx build \
+    --platform "$DOCKER_PLATFORM" \
+    --build-arg BASE_IMAGE=gcc:bookworm \
+    --build-arg MAKE_TARGET="$MAKE_TARGET" \
+    --output "type=local,dest=$TMP_DIR/out" \
+    -f "$ROOT_DIR/docker/Dockerfile.build" \
+    "$ROOT_DIR" >/dev/null
+
+[ -f "$TMP_DIR/out/$OUTPUT_LIB" ]
+cp "$TMP_DIR/out/$OUTPUT_LIB" "$TMP_DIR/libchaos-io.so"
+
+cat >"$TMP_DIR/probe.c" <<'EOF'
+#define _GNU_SOURCE
+
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/sendfile.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
+#include <time.h>
+#include <unistd.h>
+
+static long long elapsed_ms(const struct timespec *start, const struct timespec *end)
+{
+    long long seconds = (long long)(end->tv_sec - start->tv_sec);
+    long long nanos = (long long)(end->tv_nsec - start->tv_nsec);
+
+    return seconds * 1000LL + nanos / 1000000LL;
+}
+
+static int write_config(const char *line, time_t stamp)
+{
+    struct timespec times[2];
+    FILE *config = fopen("/tmp/.chaos-io.conf", "w");
+
+    if (config == NULL) {
+        return 30;
+    }
+    if (fprintf(config, "%s\n", line) < 0) {
+        fclose(config);
+        return 31;
+    }
+    if (fflush(config) != 0) {
+        fclose(config);
+        return 32;
+    }
+
+    times[0].tv_sec = stamp;
+    times[0].tv_nsec = 0L;
+    times[1] = times[0];
+    if (futimens(fileno(config), times) != 0) {
+        fclose(config);
+        return 33;
+    }
+    if (fclose(config) != 0) {
+        return 34;
+    }
+
+    return 0;
+}
+
+static int write_payload(const char *path, const char *payload)
+{
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    size_t len = strlen(payload);
+    ssize_t rc;
+
+    if (fd < 0) {
+        return 10;
+    }
+
+    rc = write(fd, payload, len);
+    if (rc < 0) {
+        int saved = errno;
+        close(fd);
+        return saved;
+    }
+
+    if ((size_t)rc != len) {
+        close(fd);
+        return 11;
+    }
+
+    if (close(fd) != 0) {
+        return 12;
+    }
+
+    return 0;
+}
+
+static int openat_write_payload(const char *dir_path, const char *name, const char *payload)
+{
+    int dirfd = open(dir_path, O_RDONLY);
+    int fd;
+    size_t len = strlen(payload);
+    ssize_t rc;
+
+    if (dirfd < 0) {
+        return 44;
+    }
+
+    fd = openat(dirfd, name, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (fd < 0) {
+        int saved = errno;
+        close(dirfd);
+        return saved == 0 ? 45 : saved;
+    }
+
+    rc = write(fd, payload, len);
+    if (rc < 0) {
+        int saved = errno;
+        close(fd);
+        close(dirfd);
+        return saved == 0 ? 46 : saved;
+    }
+
+    if ((size_t)rc != len) {
+        close(fd);
+        close(dirfd);
+        return 47;
+    }
+
+    if (close(fd) != 0) {
+        close(dirfd);
+        return 48;
+    }
+    if (close(dirfd) != 0) {
+        return 49;
+    }
+
+    return 0;
+}
+
+static int torn_write_payload(const char *path, const char *payload)
+{
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    size_t len = strlen(payload);
+    ssize_t rc;
+
+    if (fd < 0) {
+        return 40;
+    }
+
+    rc = write(fd, payload, len);
+    if (rc < 0) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 41 : saved;
+    }
+
+    if (rc <= 0 || (size_t)rc >= len) {
+        close(fd);
+        return 42;
+    }
+
+    if (close(fd) != 0) {
+        return 43;
+    }
+
+    return 0;
+}
+
+static int writev_payload(const char *path, const char *first, const char *second)
+{
+    struct iovec iov[2];
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    size_t first_len = strlen(first);
+    size_t second_len = strlen(second);
+    ssize_t rc;
+
+    if (fd < 0) {
+        return 44;
+    }
+
+    iov[0].iov_base = (void *)first;
+    iov[0].iov_len = first_len;
+    iov[1].iov_base = (void *)second;
+    iov[1].iov_len = second_len;
+    rc = writev(fd, iov, 2);
+    if (rc < 0) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 45 : saved;
+    }
+    if ((size_t)rc != first_len + second_len) {
+        close(fd);
+        return 46;
+    }
+
+    if (close(fd) != 0) {
+        return 47;
+    }
+
+    return 0;
+}
+
+static int torn_writev_payload(const char *path, const char *first, const char *second)
+{
+    struct iovec iov[2];
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    size_t first_len = strlen(first);
+    size_t second_len = strlen(second);
+    size_t total = first_len + second_len;
+    ssize_t rc;
+
+    if (fd < 0) {
+        return 48;
+    }
+
+    iov[0].iov_base = (void *)first;
+    iov[0].iov_len = first_len;
+    iov[1].iov_base = (void *)second;
+    iov[1].iov_len = second_len;
+    rc = writev(fd, iov, 2);
+    if (rc < 0) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 49 : saved;
+    }
+    if (rc <= 0 || (size_t)rc >= total) {
+        close(fd);
+        return 50;
+    }
+
+    if (close(fd) != 0) {
+        return 51;
+    }
+
+    return 0;
+}
+
+static int readv_check_payload(const char *path, const char *expected, int expect_difference)
+{
+    size_t len = strlen(expected);
+    size_t first_len = len > 1U ? len / 2U : len;
+    size_t second_len = len - first_len;
+    char first_buf[(first_len == 0U) ? 1U : first_len];
+    char second_buf[(second_len == 0U) ? 1U : second_len];
+    struct iovec iov[2];
+    int fd = open(path, O_RDONLY);
+    ssize_t rc;
+    int same;
+
+    if (fd < 0) {
+        return 52;
+    }
+
+    iov[0].iov_base = first_buf;
+    iov[0].iov_len = first_len;
+    iov[1].iov_base = second_buf;
+    iov[1].iov_len = second_len;
+    rc = readv(fd, iov, 2);
+    if (rc < 0) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 53 : saved;
+    }
+    if ((size_t)rc != len) {
+        close(fd);
+        return 54;
+    }
+
+    same = memcmp(first_buf, expected, first_len) == 0
+        && memcmp(second_buf, expected + first_len, second_len) == 0;
+    if (close(fd) != 0) {
+        return 55;
+    }
+
+    if (expect_difference) {
+        return same ? 56 : 0;
+    }
+    return same ? 0 : 57;
+}
+
+static int preadv_check_payload(
+    const char *path,
+    off_t offset,
+    const char *expected,
+    int expect_difference)
+{
+    size_t len = strlen(expected);
+    size_t first_len = len > 1U ? len / 2U : len;
+    size_t second_len = len - first_len;
+    char first_buf[(first_len == 0U) ? 1U : first_len];
+    char second_buf[(second_len == 0U) ? 1U : second_len];
+    struct iovec iov[2];
+    int fd = open(path, O_RDONLY);
+    ssize_t rc;
+    int same;
+
+    if (fd < 0) {
+        return 58;
+    }
+
+    iov[0].iov_base = first_buf;
+    iov[0].iov_len = first_len;
+    iov[1].iov_base = second_buf;
+    iov[1].iov_len = second_len;
+    rc = preadv(fd, iov, 2, offset);
+    if (rc < 0) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 59 : saved;
+    }
+    if ((size_t)rc != len) {
+        close(fd);
+        return 60;
+    }
+
+    same = memcmp(first_buf, expected, first_len) == 0
+        && memcmp(second_buf, expected + first_len, second_len) == 0;
+    if (close(fd) != 0) {
+        return 61;
+    }
+
+    if (expect_difference) {
+        return same ? 62 : 0;
+    }
+    return same ? 0 : 63;
+}
+
+static int pwritev_payload(const char *path, off_t offset, const char *first, const char *second)
+{
+    struct iovec iov[2];
+    int fd = open(path, O_WRONLY);
+    size_t first_len = strlen(first);
+    size_t second_len = strlen(second);
+    ssize_t rc;
+
+    if (fd < 0) {
+        return 64;
+    }
+
+    iov[0].iov_base = (void *)first;
+    iov[0].iov_len = first_len;
+    iov[1].iov_base = (void *)second;
+    iov[1].iov_len = second_len;
+    rc = pwritev(fd, iov, 2, offset);
+    if (rc < 0) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 65 : saved;
+    }
+    if ((size_t)rc != first_len + second_len) {
+        close(fd);
+        return 66;
+    }
+
+    if (close(fd) != 0) {
+        return 67;
+    }
+
+    return 0;
+}
+
+static int torn_pwritev_payload(const char *path, off_t offset, const char *first, const char *second)
+{
+    struct iovec iov[2];
+    int fd = open(path, O_WRONLY);
+    size_t first_len = strlen(first);
+    size_t second_len = strlen(second);
+    size_t total = first_len + second_len;
+    ssize_t rc;
+
+    if (fd < 0) {
+        return 68;
+    }
+
+    iov[0].iov_base = (void *)first;
+    iov[0].iov_len = first_len;
+    iov[1].iov_base = (void *)second;
+    iov[1].iov_len = second_len;
+    rc = pwritev(fd, iov, 2, offset);
+    if (rc < 0) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 69 : saved;
+    }
+    if (rc <= 0 || (size_t)rc >= total) {
+        close(fd);
+        return 70;
+    }
+
+    if (close(fd) != 0) {
+        return 71;
+    }
+
+    return 0;
+}
+
+static int sendfile_copy_payload(const char *source_path, const char *target_path)
+{
+    int in_fd = open(source_path, O_RDONLY);
+    int out_fd;
+    struct stat st;
+    ssize_t rc;
+
+    if (in_fd < 0) {
+        return 50;
+    }
+    if (fstat(in_fd, &st) != 0) {
+        close(in_fd);
+        return 51;
+    }
+
+    out_fd = open(target_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (out_fd < 0) {
+        close(in_fd);
+        return 52;
+    }
+
+    rc = sendfile(out_fd, in_fd, NULL, (size_t)st.st_size);
+    if (rc < 0) {
+        int saved = errno;
+        close(out_fd);
+        close(in_fd);
+        return saved == 0 ? 53 : saved;
+    }
+    if ((size_t)rc != (size_t)st.st_size) {
+        close(out_fd);
+        close(in_fd);
+        return 54;
+    }
+
+    if (close(out_fd) != 0) {
+        close(in_fd);
+        return 55;
+    }
+    if (close(in_fd) != 0) {
+        return 56;
+    }
+
+    return 0;
+}
+
+static int torn_sendfile_copy_payload(const char *source_path, const char *target_path)
+{
+    int in_fd = open(source_path, O_RDONLY);
+    int out_fd;
+    struct stat st;
+    ssize_t rc;
+
+    if (in_fd < 0) {
+        return 57;
+    }
+    if (fstat(in_fd, &st) != 0) {
+        close(in_fd);
+        return 58;
+    }
+
+    out_fd = open(target_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (out_fd < 0) {
+        close(in_fd);
+        return 59;
+    }
+
+    rc = sendfile(out_fd, in_fd, NULL, (size_t)st.st_size);
+    if (rc < 0) {
+        int saved = errno;
+        close(out_fd);
+        close(in_fd);
+        return saved == 0 ? 60 : saved;
+    }
+    if (rc <= 0 || (size_t)rc >= (size_t)st.st_size) {
+        close(out_fd);
+        close(in_fd);
+        return 61;
+    }
+
+    if (close(out_fd) != 0) {
+        close(in_fd);
+        return 62;
+    }
+    if (close(in_fd) != 0) {
+        return 63;
+    }
+
+    return 0;
+}
+
+static int copy_file_range_copy_payload(const char *source_path, const char *target_path)
+{
+    int in_fd = open(source_path, O_RDONLY);
+    int out_fd;
+    struct stat st;
+    ssize_t rc;
+
+    if (in_fd < 0) {
+        return 64;
+    }
+    if (fstat(in_fd, &st) != 0) {
+        close(in_fd);
+        return 65;
+    }
+
+    out_fd = open(target_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (out_fd < 0) {
+        close(in_fd);
+        return 66;
+    }
+
+    rc = copy_file_range(in_fd, NULL, out_fd, NULL, (size_t)st.st_size, 0U);
+    if (rc < 0) {
+        int saved = errno;
+        close(out_fd);
+        close(in_fd);
+        return saved == 0 ? 67 : saved;
+    }
+    if ((size_t)rc != (size_t)st.st_size) {
+        close(out_fd);
+        close(in_fd);
+        return 68;
+    }
+
+    if (close(out_fd) != 0) {
+        close(in_fd);
+        return 69;
+    }
+    if (close(in_fd) != 0) {
+        return 70;
+    }
+
+    return 0;
+}
+
+static int torn_copy_file_range_copy_payload(const char *source_path, const char *target_path)
+{
+    int in_fd = open(source_path, O_RDONLY);
+    int out_fd;
+    struct stat st;
+    ssize_t rc;
+
+    if (in_fd < 0) {
+        return 71;
+    }
+    if (fstat(in_fd, &st) != 0) {
+        close(in_fd);
+        return 72;
+    }
+
+    out_fd = open(target_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (out_fd < 0) {
+        close(in_fd);
+        return 73;
+    }
+
+    rc = copy_file_range(in_fd, NULL, out_fd, NULL, (size_t)st.st_size, 0U);
+    if (rc < 0) {
+        int saved = errno;
+        close(out_fd);
+        close(in_fd);
+        return saved == 0 ? 74 : saved;
+    }
+    if (rc <= 0 || (size_t)rc >= (size_t)st.st_size) {
+        close(out_fd);
+        close(in_fd);
+        return 75;
+    }
+
+    if (close(out_fd) != 0) {
+        close(in_fd);
+        return 76;
+    }
+    if (close(in_fd) != 0) {
+        return 77;
+    }
+
+    return 0;
+}
+
+static int ftruncate_payload(const char *path, off_t length)
+{
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+
+    if (fd < 0) {
+        return 78;
+    }
+    if (write(fd, "truncate", 8) != 8) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 79 : saved;
+    }
+    if (ftruncate(fd, length) != 0) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 80 : saved;
+    }
+    if (close(fd) != 0) {
+        return 81;
+    }
+
+    return 0;
+}
+
+static int ftruncate_with_latency(const char *path, off_t length)
+{
+    struct timespec start;
+    struct timespec end;
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+
+    if (fd < 0) {
+        return 82;
+    }
+    if (write(fd, "truncate", 8) != 8) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 83 : saved;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        close(fd);
+        return 84;
+    }
+    if (ftruncate(fd, length) != 0) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 85 : saved;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        close(fd);
+        return 86;
+    }
+    if (close(fd) != 0) {
+        return 87;
+    }
+
+    return elapsed_ms(&start, &end) >= 150LL ? 0 : 88;
+}
+
+static int fallocate_payload(const char *path, off_t length)
+{
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+
+    if (fd < 0) {
+        return 89;
+    }
+    if (fallocate(fd, 0, 0, length) != 0) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 90 : saved;
+    }
+    if (close(fd) != 0) {
+        return 91;
+    }
+
+    return 0;
+}
+
+static int fallocate_with_latency(const char *path, off_t length)
+{
+    struct timespec start;
+    struct timespec end;
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    int rc;
+    int saved = 0;
+
+    if (fd < 0) {
+        return 92;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        close(fd);
+        return 93;
+    }
+
+    rc = fallocate(fd, 0, 0, length);
+    if (rc != 0) {
+        saved = errno;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        close(fd);
+        return 94;
+    }
+    if (close(fd) != 0) {
+        return 95;
+    }
+    if (elapsed_ms(&start, &end) < 150LL) {
+        return 96;
+    }
+    if (rc != 0 && saved == 0) {
+        return 97;
+    }
+
+    return 0;
+}
+
+static int unlinkat_payload(const char *dir_path, const char *name)
+{
+    int dirfd = open(dir_path, O_RDONLY);
+
+    if (dirfd < 0) {
+        return 98;
+    }
+    if (unlinkat(dirfd, name, 0) != 0) {
+        int saved = errno;
+        close(dirfd);
+        return saved == 0 ? 99 : saved;
+    }
+    if (close(dirfd) != 0) {
+        return 100;
+    }
+
+    return 0;
+}
+
+static int unlinkat_with_latency(const char *dir_path, const char *name)
+{
+    struct timespec start;
+    struct timespec end;
+    int dirfd = open(dir_path, O_RDONLY);
+
+    if (dirfd < 0) {
+        return 101;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        close(dirfd);
+        return 102;
+    }
+    if (unlinkat(dirfd, name, 0) != 0) {
+        int saved = errno;
+        close(dirfd);
+        return saved == 0 ? 103 : saved;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        close(dirfd);
+        return 104;
+    }
+    if (close(dirfd) != 0) {
+        return 105;
+    }
+
+    return elapsed_ms(&start, &end) >= 150LL ? 0 : 106;
+}
+
+static int renameat_payload(
+    const char *old_dir,
+    const char *old_name,
+    const char *new_dir,
+    const char *new_name)
+{
+    int olddirfd = open(old_dir, O_RDONLY);
+    int newdirfd;
+
+    if (olddirfd < 0) {
+        return 107;
+    }
+
+    newdirfd = open(new_dir, O_RDONLY);
+    if (newdirfd < 0) {
+        close(olddirfd);
+        return 108;
+    }
+    if (renameat(olddirfd, old_name, newdirfd, new_name) != 0) {
+        int saved = errno;
+        close(newdirfd);
+        close(olddirfd);
+        return saved == 0 ? 109 : saved;
+    }
+    if (close(newdirfd) != 0) {
+        close(olddirfd);
+        return 110;
+    }
+    if (close(olddirfd) != 0) {
+        return 111;
+    }
+
+    return 0;
+}
+
+static int renameat_with_latency(
+    const char *old_dir,
+    const char *old_name,
+    const char *new_dir,
+    const char *new_name)
+{
+    struct timespec start;
+    struct timespec end;
+    int olddirfd = open(old_dir, O_RDONLY);
+    int newdirfd;
+
+    if (olddirfd < 0) {
+        return 112;
+    }
+
+    newdirfd = open(new_dir, O_RDONLY);
+    if (newdirfd < 0) {
+        close(olddirfd);
+        return 113;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        close(newdirfd);
+        close(olddirfd);
+        return 114;
+    }
+    if (renameat(olddirfd, old_name, newdirfd, new_name) != 0) {
+        int saved = errno;
+        close(newdirfd);
+        close(olddirfd);
+        return saved == 0 ? 115 : saved;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        close(newdirfd);
+        close(olddirfd);
+        return 116;
+    }
+    if (close(newdirfd) != 0) {
+        close(olddirfd);
+        return 117;
+    }
+    if (close(olddirfd) != 0) {
+        return 118;
+    }
+
+    return elapsed_ms(&start, &end) >= 150LL ? 0 : 119;
+}
+
+static int fsync_with_latency(const char *path)
+{
+    struct timespec start;
+    struct timespec end;
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+
+    if (fd < 0) {
+        return 20;
+    }
+    if (write(fd, "abc", 3) != 3) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 21 : saved;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        close(fd);
+        return 22;
+    }
+    if (fsync(fd) != 0) {
+        int saved = errno;
+        close(fd);
+        return saved == 0 ? 23 : saved;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        close(fd);
+        return 24;
+    }
+    if (close(fd) != 0) {
+        return 25;
+    }
+
+    return elapsed_ms(&start, &end) >= 150LL ? 0 : 26;
+}
+
+int main(void)
+{
+    time_t now = time(NULL);
+
+    if (write_payload("/tmp/target.bin", "hello") != 0) {
+        return 1;
+    }
+
+    if (write_config("/tmp/target.bin:write:EIO:1.0", now + 1) != 0) {
+        return 3;
+    }
+
+    if (write_payload("/tmp/target.bin", "hello") != EIO) {
+        return 4;
+    }
+
+    if (mkdir("/tmp/openat-dir", 0700) != 0 && errno != EEXIST) {
+        return 5;
+    }
+
+    if (write_config("/tmp/openat-dir/child.bin:open:EIO:1.0", now + 2) != 0) {
+        return 6;
+    }
+
+    if (openat_write_payload("/tmp/openat-dir", "child.bin", "hello") != EIO) {
+        return 7;
+    }
+
+    if (write_payload("/tmp/readv-src.bin", "readv") != 0) {
+        return 8;
+    }
+
+    if (readv_check_payload("/tmp/readv-src.bin", "readv", 0) != 0) {
+        return 9;
+    }
+
+    if (write_config("/tmp/readv-src.bin:read:CORRUPT:1.0", now + 3) != 0) {
+        return 10;
+    }
+
+    if (readv_check_payload("/tmp/readv-src.bin", "readv", 1) != 0) {
+        return 11;
+    }
+
+    if (write_config("/tmp/writev-target.bin:write:EIO:1.0", now + 4) != 0) {
+        return 12;
+    }
+
+    if (writev_payload("/tmp/writev-target.bin", "wr", "itev") != EIO) {
+        return 13;
+    }
+
+    if (write_config("/tmp/writev-target.bin:write:TORN:1.0", now + 5) != 0) {
+        return 14;
+    }
+
+    if (torn_writev_payload("/tmp/writev-target.bin", "wr", "itev") != 0) {
+        return 15;
+    }
+
+    if (write_payload("/tmp/preadv-src.bin", "preadv") != 0) {
+        return 16;
+    }
+
+    if (preadv_check_payload("/tmp/preadv-src.bin", 1, "read", 0) != 0) {
+        return 17;
+    }
+
+    if (write_config("/tmp/preadv-src.bin:pread:CORRUPT:1.0", now + 6) != 0) {
+        return 18;
+    }
+
+    if (preadv_check_payload("/tmp/preadv-src.bin", 1, "read", 1) != 0) {
+        return 19;
+    }
+
+    if (write_payload("/tmp/pwritev-target.bin", "........") != 0) {
+        return 20;
+    }
+
+    if (write_config("/tmp/pwritev-target.bin:pwrite:EIO:1.0", now + 7) != 0) {
+        return 21;
+    }
+
+    if (pwritev_payload("/tmp/pwritev-target.bin", 1, "pw", "rite") != EIO) {
+        return 22;
+    }
+
+    if (write_config("/tmp/pwritev-target.bin:pwrite:TORN:1.0", now + 8) != 0) {
+        return 23;
+    }
+
+    if (torn_pwritev_payload("/tmp/pwritev-target.bin", 1, "pw", "rite") != 0) {
+        return 24;
+    }
+
+    if (write_payload("/tmp/sendfile-src.bin", "sendfile") != 0) {
+        return 25;
+    }
+
+    if (write_config("/tmp/sendfile-dst.bin:write:EIO:1.0", now + 9) != 0) {
+        return 26;
+    }
+
+    if (sendfile_copy_payload("/tmp/sendfile-src.bin", "/tmp/sendfile-dst.bin") != EIO) {
+        return 27;
+    }
+
+    if (write_config("/tmp/sendfile-dst.bin:write:TORN:1.0", now + 10) != 0) {
+        return 28;
+    }
+
+    if (torn_sendfile_copy_payload("/tmp/sendfile-src.bin", "/tmp/sendfile-dst.bin") != 0) {
+        return 29;
+    }
+
+    if (write_payload("/tmp/copy-range-src.bin", "copy-range") != 0) {
+        return 30;
+    }
+
+    if (write_config("/tmp/copy-range-dst.bin:write:EIO:1.0", now + 11) != 0) {
+        return 31;
+    }
+
+    if (copy_file_range_copy_payload("/tmp/copy-range-src.bin", "/tmp/copy-range-dst.bin") != EIO) {
+        return 32;
+    }
+
+    if (write_config("/tmp/copy-range-dst.bin:write:TORN:1.0", now + 12) != 0) {
+        return 33;
+    }
+
+    if (torn_copy_file_range_copy_payload("/tmp/copy-range-src.bin", "/tmp/copy-range-dst.bin") != 0) {
+        return 34;
+    }
+
+    if (write_config("/tmp/target.bin:write:TORN:1.0", now + 13) != 0) {
+        return 35;
+    }
+
+    if (torn_write_payload("/tmp/target.bin", "hello") != 0) {
+        return 36;
+    }
+
+    if (write_config("/tmp/target.bin:fsync:LATENCY:200", now + 14) != 0) {
+        return 37;
+    }
+
+    if (fsync_with_latency("/tmp/target.bin") != 0) {
+        return 38;
+    }
+
+    if (write_config("/tmp/truncate.bin:truncate:EIO:1.0", now + 15) != 0) {
+        return 39;
+    }
+
+    if (ftruncate_payload("/tmp/truncate.bin", 3) != EIO) {
+        return 40;
+    }
+
+    if (write_config("/tmp/truncate.bin:truncate:LATENCY:200", now + 16) != 0) {
+        return 41;
+    }
+
+    if (ftruncate_with_latency("/tmp/truncate.bin", 3) != 0) {
+        return 42;
+    }
+
+    if (write_config("/tmp/allocate.bin:allocate:EIO:1.0", now + 17) != 0) {
+        return 43;
+    }
+
+    if (fallocate_payload("/tmp/allocate.bin", 4096) != EIO) {
+        return 44;
+    }
+
+    if (write_config("/tmp/allocate.bin:allocate:LATENCY:200", now + 18) != 0) {
+        return 45;
+    }
+
+    if (fallocate_with_latency("/tmp/allocate.bin", 4096) != 0) {
+        return 46;
+    }
+
+    if (mkdir("/tmp/unlink-dir", 0700) != 0 && errno != EEXIST) {
+        return 47;
+    }
+
+    if (openat_write_payload("/tmp/unlink-dir", "victim.bin", "unlink") != 0) {
+        return 48;
+    }
+
+    if (write_config("/tmp/unlink-dir/victim.bin:unlink:EIO:1.0", now + 19) != 0) {
+        return 49;
+    }
+
+    if (unlinkat_payload("/tmp/unlink-dir", "victim.bin") != EIO) {
+        return 50;
+    }
+
+    if (openat_write_payload("/tmp/unlink-dir", "victim.bin", "unlink") != 0) {
+        return 51;
+    }
+
+    if (write_config("/tmp/unlink-dir/victim.bin:unlink:LATENCY:200", now + 20) != 0) {
+        return 52;
+    }
+
+    if (unlinkat_with_latency("/tmp/unlink-dir", "victim.bin") != 0) {
+        return 53;
+    }
+
+    if (mkdir("/tmp/rename-old", 0700) != 0 && errno != EEXIST) {
+        return 54;
+    }
+    if (mkdir("/tmp/rename-new", 0700) != 0 && errno != EEXIST) {
+        return 55;
+    }
+    if (openat_write_payload("/tmp/rename-old", "source.bin", "rename") != 0) {
+        return 56;
+    }
+
+    if (write_config("/tmp/rename-old/source.bin:rename_from:EIO:1.0", now + 21) != 0) {
+        return 57;
+    }
+
+    if (renameat_payload("/tmp/rename-old", "source.bin", "/tmp/rename-new", "dest.bin") != EIO) {
+        return 58;
+    }
+
+    if (openat_write_payload("/tmp/rename-old", "source.bin", "rename") != 0) {
+        return 59;
+    }
+
+    if (write_config("/tmp/rename-new/dest.bin:rename_to:LATENCY:200", now + 22) != 0) {
+        return 60;
+    }
+
+    if (renameat_with_latency("/tmp/rename-old", "source.bin", "/tmp/rename-new", "dest.bin") != 0) {
+        return 61;
+    }
+
+    return 0;
+}
+EOF
+
+cat >"$TMP_DIR/Dockerfile.runtime" <<'EOF'
+# syntax=docker/dockerfile:1.7
+
+FROM --platform=$TARGETPLATFORM gcc:bookworm AS build
+
+WORKDIR /src
+COPY probe.c ./probe.c
+RUN mkdir -p /out && gcc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o /out/probe ./probe.c
+
+FROM --platform=$TARGETPLATFORM debian:bookworm-slim
+
+COPY libchaos-io.so /tmp/libchaos-io.so
+COPY --from=build /out/probe /tmp/probe
+
+CMD ["sh", "-eu", "-c", "LD_PRELOAD=/tmp/libchaos-io.so /tmp/probe"]
+EOF
+
+docker buildx build \
+    --platform "$DOCKER_PLATFORM" \
+    --load \
+    -t "$IMAGE_TAG" \
+    -f "$TMP_DIR/Dockerfile.runtime" \
+    "$TMP_DIR" >/dev/null
+
+docker run --rm --platform "$DOCKER_PLATFORM" "$IMAGE_TAG"
+
+echo "glibc runtime test passed ($OUTPUT_LIB)"

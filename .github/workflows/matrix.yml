@@ -1,0 +1,92 @@
+name: matrix
+
+on:
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  cross-build:
+    name: ${{ matrix.target.libc }}-${{ matrix.target.arch }} (${{ matrix.target.runner }})
+    runs-on: ${{ matrix.target.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { libc: glibc, arch: amd64, runner: ubuntu-24.04 }
+          - { libc: glibc, arch: arm64, runner: ubuntu-24.04-arm }
+          - { libc: musl,  arch: amd64, runner: ubuntu-24.04 }
+          - { libc: musl,  arch: arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          PKGS="build-essential gcc make"
+          if [ "${{ matrix.target.libc }}" = "musl" ]; then
+            PKGS="$PKGS musl-tools"
+          fi
+          sudo apt-get install -y --no-install-recommends $PKGS
+
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cross-build ${{ matrix.target.libc }}-${{ matrix.target.arch }}
+        run: |
+          # On native arm64 runners musl-tools ships musl-gcc (not aarch64-linux-musl-gcc)
+          EXTRA_ARGS=""
+          if [ "${{ matrix.target.libc }}" = "musl" ] && \
+             [ "${{ matrix.target.arch }}" = "arm64" ]; then
+            EXTRA_ARGS="MUSL_ARM64_CC=musl-gcc"
+          fi
+          make cross-${{ matrix.target.libc }}-${{ matrix.target.arch }} $EXTRA_ARGS
+
+      - name: List built shared objects
+        run: |
+          ls -lah dist/libchaos-*-${{ matrix.target.libc }}-${{ matrix.target.arch }}.so
+          file  dist/libchaos-*-${{ matrix.target.libc }}-${{ matrix.target.arch }}.so
+
+      - name: Run integration tests
+        run: |
+          set -eu
+          case "${{ matrix.target.libc }}" in
+            glibc)
+              SCRIPTS="test/runtime/test_glibc.sh
+                       test/runtime/test_net_glibc.sh
+                       test/runtime/test_dns_glibc.sh
+                       test/runtime/test_time_glibc.sh
+                       test/runtime/test_memory_glibc.sh
+                       test/runtime/test_process_glibc.sh"
+              ;;
+            musl)
+              SCRIPTS="test/runtime/test_alpine.sh
+                       test/runtime/test_net_alpine.sh
+                       test/runtime/test_dns_alpine.sh
+                       test/runtime/test_time_alpine.sh
+                       test/runtime/test_memory_alpine.sh
+                       test/runtime/test_process_alpine.sh"
+              ;;
+          esac
+          for script in $SCRIPTS; do
+            echo "::group::$script linux/${{ matrix.target.arch }}"
+            sh "$script" linux/${{ matrix.target.arch }}
+            echo "::endgroup::"
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target.libc }}-${{ matrix.target.arch }}
+          path: dist/libchaos-*-${{ matrix.target.libc }}-${{ matrix.target.arch }}.so
+          retention-days: 14
+          if-no-files-found: error

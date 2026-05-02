@@ -1,0 +1,106 @@
+@startuml fdcache
+'
+' Engineered by  Christian Schnapka
+'                Embedded Principal+ Engineer
+'                Macstab GmbH · Hamburg, Germany
+'                https://macstab.com
+'
+' libchaos-io thread-local FD cache — direct-mapped lookup,
+' /proc/self/fd miss resolution, and invalidation triggers.
+'
+' Reference: docs/IO.md §6 (Component Breakdown → FD cache)
+'            docs/ARCHITECTURE.md §FD Path Resolution
+'            src/config/chaos_io_fdcache.c
+'
+title libchaos-io Thread-Local FD Cache — Lookup and Invalidation
+
+skinparam sequenceMessageAlign center
+skinparam shadowing false
+skinparam roundCorner 4
+skinparam sequence {
+  ArrowColor                 #2C3E50
+  LifeLineBorderColor        #2C3E50
+  LifeLineBackgroundColor    #ECF0F1
+  ParticipantBorderColor     #2C3E50
+  ParticipantBackgroundColor #FFFFFF
+  ParticipantFontStyle       bold
+  GroupBackgroundColor       #FDFEFE
+  GroupBorderColor           #95A5A6
+}
+hide footbox
+
+participant "Wrapper\n(read/write/fsync/…)" as Wrap
+participant "FD Cache\n(TLS, direct-mapped)" as Cache
+participant "/proc/self/fd\n<fd>" as Proc
+participant "Config Engine" as Config
+participant "Real libc" as Real
+
+== Normal read/write call ==
+
+Wrap -> Cache : lookup(fd)
+note right of Cache
+  slot = fd % CACHE_SLOTS
+  if cache[slot].fd == fd:
+    return cache[slot].path  (hit)
+  else:
+    return NULL              (miss)
+end note
+
+alt Cache hit
+  Cache --> Wrap : cached_path
+else Cache miss
+  Cache --> Wrap : NULL
+  Wrap -> Proc : readlink("/proc/self/fd/<fd>", buf)
+  note right of Proc
+    Returns canonical path or socket pseudo-path.
+    Filtered: /proc, /sys, /dev, config path,
+    fd 0/1/2 are excluded from injection.
+  end note
+  Proc --> Wrap : path_string
+  Wrap -> Cache : store(fd, path_string)
+end
+
+Wrap -> Config : select_rule(op, path_string)
+Config --> Wrap : rule or null
+Wrap -> Real : real_symbol(fd, …)
+Real --> Wrap : result
+
+== open() seeds the cache ==
+
+note over Wrap, Cache
+  open(path, flags) / openat(dirfd, path, flags):
+    resolve match_path (pre-open)
+    call real_open()
+    if succeeded: store(returned_fd, match_path)
+end note
+
+== close() invalidates ==
+
+note over Wrap, Cache
+  close(fd):
+    call real_close(fd)
+    if succeeded: cache[fd % SLOTS].fd = -1  (invalidate)
+    ONLY invalidate after successful close.
+    A failed close leaves the cache entry intact
+    because the fd is still valid.
+end note
+
+== renameat() / unlinkat() reset ==
+
+note over Wrap, Cache
+  renameat() / unlinkat() success:
+    memset(cache, 0, sizeof(cache))  (full reset)
+    Reason: previously resolved /proc/self/fd paths
+    may now point to different inodes or be stale.
+end note
+
+note across
+  Thread-local scope: only the calling thread's cache
+  is affected by close/rename/unlink.
+  Cross-thread stale path hazard: Thread A closes fd 7;
+  Thread B still has fd 7 cached with old path.
+  If kernel reuses fd 7 for a new file, Thread B
+  may match wrong rules until its slot is evicted.
+end note
+
+@enduml

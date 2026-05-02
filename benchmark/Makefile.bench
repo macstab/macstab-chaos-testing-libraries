@@ -1,0 +1,110 @@
+# =============================================================================
+# benchmark/Makefile.bench  —  Stage 2/3 build rules for the chaos-bench harness.
+#
+# Designed to be `-include`d from the root Makefile (or invoked directly
+# via `make -f benchmark/Makefile.bench`).  Self-contained: depends only
+# on a hosted POSIX toolchain plus the host CC.
+#
+# Targets:
+#   bench-build      Build all kernel binaries (bench_time, bench_io, ...)
+#   bench-clean      Remove all generated artifacts
+#   bench-list       List registered benchmarks per binary
+#   bench-smoke      Quick sanity run of bench_time
+#   bench-help       Show this help
+# =============================================================================
+
+BENCH_DIR        ?= benchmark
+BENCH_BUILD_DIR  ?= $(BENCH_DIR)/build
+BENCH_REPORT_DIR ?= $(BENCH_DIR)/reports
+
+BENCH_HARNESS_DIR := $(BENCH_DIR)/harness
+BENCH_KERNELS_DIR := $(BENCH_DIR)/kernels
+
+BENCH_HARNESS_SRC := \
+	$(BENCH_HARNESS_DIR)/chaos_bench_register.c \
+	$(BENCH_HARNESS_DIR)/chaos_bench_timer.c \
+	$(BENCH_HARNESS_DIR)/chaos_bench_stats.c \
+	$(BENCH_HARNESS_DIR)/chaos_bench_env.c \
+	$(BENCH_HARNESS_DIR)/chaos_bench_isolation.c \
+	$(BENCH_HARNESS_DIR)/chaos_bench_perf.c \
+	$(BENCH_HARNESS_DIR)/chaos_bench_json.c \
+	$(BENCH_HARNESS_DIR)/chaos_bench_runner.c
+
+BENCH_HARNESS_OBJ := $(patsubst $(BENCH_HARNESS_DIR)/%.c,$(BENCH_BUILD_DIR)/harness/%.o,$(BENCH_HARNESS_SRC))
+
+BENCH_GIT_SHA   := $(shell git -C . rev-parse --short HEAD 2>/dev/null || echo unknown)
+BENCH_CFLAGS_RAW := -std=c99 -Wall -Wextra -Werror -pedantic -O2 -g3
+BENCH_CPPFLAGS  := -D_GNU_SOURCE \
+                   -I$(BENCH_HARNESS_DIR) \
+                   -DCHAOS_BENCH_GIT_SHA=\"$(BENCH_GIT_SHA)\" \
+                   -DCHAOS_BENCH_CFLAGS="\"$(BENCH_CFLAGS_RAW)\""
+
+# Harness ≠ kernel CFLAGS by design: kernels are NOT built with LTO so
+# the optimizer cannot inline iter callbacks across the kernel/harness
+# boundary, which would defeat the noinline assumption inside the
+# measurement loop.
+BENCH_HARNESS_CFLAGS := $(BENCH_CFLAGS_RAW)
+BENCH_KERNEL_CFLAGS  := $(BENCH_CFLAGS_RAW) -fno-lto
+
+BENCH_UNAME_S := $(shell uname -s)
+ifeq ($(BENCH_UNAME_S),Linux)
+BENCH_LDFLAGS_BASE := -lm -lrt -lpthread
+else
+BENCH_LDFLAGS_BASE := -lm -lpthread
+endif
+
+# bench_process needs -lpthread which is already in BASE.
+
+BENCH_BIN_TIME    := $(BENCH_BUILD_DIR)/bench_time
+BENCH_BIN_IO      := $(BENCH_BUILD_DIR)/bench_io
+BENCH_BIN_NET     := $(BENCH_BUILD_DIR)/bench_net
+BENCH_BIN_DNS     := $(BENCH_BUILD_DIR)/bench_dns
+BENCH_BIN_MEMORY  := $(BENCH_BUILD_DIR)/bench_memory
+BENCH_BIN_PROCESS := $(BENCH_BUILD_DIR)/bench_process
+BENCH_BIN_META    := $(BENCH_BUILD_DIR)/bench_meta
+
+BENCH_BINS := \
+	$(BENCH_BIN_TIME) $(BENCH_BIN_IO) $(BENCH_BIN_NET) $(BENCH_BIN_DNS) \
+	$(BENCH_BIN_MEMORY) $(BENCH_BIN_PROCESS) $(BENCH_BIN_META)
+
+# ------------------------------------------------------------------ rules ----
+
+.PHONY: bench-build bench-clean bench-list bench-smoke bench-validate bench-help
+
+bench-build: $(BENCH_BINS)
+
+# Pattern rule for any kernel source -> binary.  Each kernel binary
+# links the entire harness archive plus its own kernel .c.
+$(BENCH_BUILD_DIR)/bench_%: $(BENCH_KERNELS_DIR)/bench_%.c $(BENCH_HARNESS_OBJ) | $(BENCH_BUILD_DIR)
+	$(CC) $(BENCH_CPPFLAGS) $(BENCH_KERNEL_CFLAGS) -o $@ \
+	    $< $(BENCH_HARNESS_OBJ) $(BENCH_LDFLAGS_BASE)
+
+$(BENCH_BUILD_DIR)/harness/%.o: $(BENCH_HARNESS_DIR)/%.c | $(BENCH_BUILD_DIR)/harness
+	$(CC) $(BENCH_CPPFLAGS) $(BENCH_HARNESS_CFLAGS) -c -o $@ $<
+
+$(BENCH_BUILD_DIR):
+	@mkdir -p $@
+$(BENCH_BUILD_DIR)/harness: | $(BENCH_BUILD_DIR)
+	@mkdir -p $@
+$(BENCH_REPORT_DIR):
+	@mkdir -p $@
+
+bench-validate: $(BENCH_BIN_META)
+	@echo "==> nop_loop_1k (expected 300-3000 ns/iter)"
+	@$(BENCH_BIN_META) --benchmark=nop_loop_1k --warmup=1000 --iters=10000
+	@echo "==> clock_overhead (expected 5-30 ns/iter)"
+	@$(BENCH_BIN_META) --benchmark=clock_overhead --warmup=1000 --iters=10000
+
+bench-clean:
+	@rm -rf $(BENCH_BUILD_DIR)
+
+bench-list: bench-build
+	@for b in $(BENCH_BINS); do \
+	    echo "==> $$b"; $$b --list; \
+	done
+
+bench-smoke: bench-build
+	@$(BENCH_BIN_TIME) --benchmark=clock_gettime_baseline --warmup=1000 --iters=10000
+
+bench-help:
+	@grep -E '^#( |$$)' $(BENCH_DIR)/Makefile.bench | sed -E 's/^#( |$$)?//'

@@ -1,0 +1,190 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build all variants
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc make docker-buildx
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build all four variants
+        run: make docker-build-all
+
+      - name: Generate checksums
+        working-directory: dist
+        run: |
+          sha256sum libchaos-*.so > SHA256SUMS
+          echo "::group::SHA256SUMS"
+          cat SHA256SUMS
+          echo "::endgroup::"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binaries
+          path: |
+            dist/libchaos-*.so
+            dist/SHA256SUMS
+          retention-days: 7
+          if-no-files-found: error
+
+  bench:
+    name: release benchmark sweep
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Lower perf_event_paranoid
+        run: echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid
+
+      - name: Run full benchmark sweep
+        run: ./benchmark/run-bench.sh --full --runs=5 --compare
+
+      - name: Collect comparison report
+        run: |
+          GIT_SHA=$(git rev-parse --short HEAD)
+          mkdir -p release-bench
+          if [ -f "benchmark/reports/$GIT_SHA/comparison.md" ]; then
+            cp "benchmark/reports/$GIT_SHA/comparison.md" release-bench/benchmark-comparison.md
+          else
+            echo "_No comparison report produced for $GIT_SHA._" > release-bench/benchmark-comparison.md
+          fi
+
+      - name: Upload benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bench
+          path: release-bench/
+          retention-days: 7
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub release
+    runs-on: ubuntu-24.04
+    needs: [build, bench]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-binaries
+          path: release-assets/
+
+      - name: Download bench artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-bench
+          path: release-assets/
+
+      - name: Generate CHANGELOG.md with git-cliff
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --verbose
+        env:
+          OUTPUT: CHANGELOG.md
+          GITHUB_REPO: ${{ github.repository }}
+
+      - name: Generate release notes
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          {
+            echo "## chaos-testing-libraries $TAG"
+            echo ""
+            echo "Six \`LD_PRELOAD\` chaos engineering libraries:"
+            echo "\`libchaos-io\`, \`libchaos-net\`, \`libchaos-dns\`,"
+            echo "\`libchaos-time\`, \`libchaos-memory\`, \`libchaos-process\`."
+            echo ""
+            echo "### Binaries"
+            echo ""
+            echo "Each library is shipped in four Linux variants:"
+            echo ""
+            echo "| File suffix    | Distros                              |"
+            echo "|----------------|--------------------------------------|"
+            echo "| \`glibc-amd64\` | Debian / Ubuntu / RHEL on x86_64     |"
+            echo "| \`glibc-arm64\` | Debian / Ubuntu / RHEL on ARM64      |"
+            echo "| \`musl-amd64\`  | Alpine on x86_64                     |"
+            echo "| \`musl-arm64\`  | Alpine on ARM64                      |"
+            echo ""
+            echo "Verify downloads against \`SHA256SUMS\`:"
+            echo "\`\`\`sh"
+            echo "sha256sum -c SHA256SUMS --ignore-missing"
+            echo "\`\`\`"
+            echo ""
+            echo "### Quick start"
+            echo ""
+            echo "\`\`\`sh"
+            echo "echo '*:pread:EIO:1.0' > /tmp/.chaos-io.conf"
+            echo "LD_PRELOAD=./libchaos-io-glibc-amd64.so ./your-app"
+            echo "\`\`\`"
+            echo ""
+            echo "See [docs/IO.md](https://github.com/${{ github.repository }}/blob/${TAG}/docs/IO.md)"
+            echo "and the per-library reference under [docs/](https://github.com/${{ github.repository }}/tree/${TAG}/docs)"
+            echo "for the full DSL."
+            echo ""
+            echo "### Benchmark numbers"
+            echo ""
+            echo "Tier-1 ADVISORY benchmark numbers from a GitHub Actions Linux x86_64"
+            echo "runner are attached as \`benchmark-comparison.md\`. These are useful"
+            echo "for relative comparison only — for OFFICIAL-grade absolute numbers,"
+            echo "deploy the harness to a dedicated bare-metal host with isolated CPUs."
+            echo ""
+            echo "See [docs/BENCHMARKS.md](https://github.com/${{ github.repository }}/blob/${TAG}/docs/BENCHMARKS.md)"
+            echo "for methodology."
+          } > release-notes.md
+
+      - name: Commit CHANGELOG.md back to main
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          git config user.name  "${{ secrets.BOT_USER_NAME }}"
+          git config user.email "${{ secrets.BOT_USER_EMAIL }}"
+          cp CHANGELOG.md /tmp/CHANGELOG_release.md
+          git remote set-url origin https://x-access-token:${{ secrets.BOT_GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          git fetch origin main
+          git checkout main
+          cp /tmp/CHANGELOG_release.md CHANGELOG.md
+          git add CHANGELOG.md
+          git diff --cached --quiet && exit 0
+          git commit -m "docs: update CHANGELOG for $TAG"
+          git push origin main
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          gh release create "$TAG" \
+            --title "chaos-testing-libraries $TAG" \
+            --notes-file release-notes.md \
+            --verify-tag \
+            release-assets/libchaos-*.so \
+            release-assets/SHA256SUMS \
+            release-assets/benchmark-comparison.md \
+            CHANGELOG.md

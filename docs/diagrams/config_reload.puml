@@ -1,0 +1,108 @@
+@startuml config_reload
+'
+' Engineered by  Christian Schnapka
+'                Embedded Principal+ Engineer
+'                Macstab GmbH · Hamburg, Germany
+'                https://macstab.com
+'
+' Two-snapshot CAS config reload protocol.
+' Shows the mtime state machine, CAS winner/loser paths,
+' and the spin-wait on MTIME_RELOADING.
+'
+' Reference: docs/MEMORY.md §16
+'            src/*/chaos_*_config.c  (all libraries use the same pattern)
+'
+title Two-Snapshot CAS Config Reload — Winner and Loser Threads
+
+skinparam sequenceMessageAlign center
+skinparam shadowing false
+skinparam roundCorner 4
+skinparam sequence {
+  ArrowColor                 #2C3E50
+  LifeLineBorderColor        #2C3E50
+  LifeLineBackgroundColor    #ECF0F1
+  ParticipantBorderColor     #2C3E50
+  ParticipantBackgroundColor #FFFFFF
+  ParticipantFontStyle       bold
+  GroupBackgroundColor       #FDFEFE
+  GroupBorderColor           #95A5A6
+}
+hide footbox
+
+participant "Thread A\n(reload winner)" as A
+participant "mtime_slot\n(volatile uint64)" as Slot
+participant "Config Store\n(two snapshots)" as Store
+participant "Thread B\n(concurrent caller)" as B
+
+note over Slot
+  State encoding:
+  MISSING    = 0x0000…0000  (file absent)
+  UNKNOWN    = 0xffff…ffff  (initial sentinel)
+  RELOADING  = 0xffff…fffe  (reload in progress)
+  <timestamp>               (loaded + cached)
+end note
+
+== Thread A: Reload Trigger ==
+
+A -> Slot : __sync_synchronize(); load(mtime_slot)
+Slot --> A : old_mtime (e.g., UNKNOWN or stale timestamp)
+A -> A : stat(config_path) → new_mtime
+note right of A
+  If new_mtime == old_mtime: done, no reload needed.
+end note
+
+A -> Slot : CAS(old_mtime, MTIME_RELOADING)
+note right of Slot
+  __sync_bool_compare_and_swap(
+    &mtime_slot, old_mtime, MTIME_RELOADING)
+  Returns true for exactly one winner thread.
+end note
+
+== Concurrent Thread B encounters MTIME_RELOADING ==
+
+B -> Slot : load(mtime_slot) → MTIME_RELOADING
+note right of B
+  Spin: keep re-loading mtime_slot until
+  it is no longer MTIME_RELOADING.
+  (Reload window is < 15 µs for typical configs.)
+end note
+
+loop while mtime_slot == MTIME_RELOADING
+  B -> Slot : load(mtime_slot)
+  Slot --> B : MTIME_RELOADING
+end
+
+Slot --> B : new_mtime (reload complete)
+B -> Store : read active_snapshot_index
+Store --> B : active_snapshot
+note right of B
+  Thread B now uses the freshly loaded config.
+end note
+
+== Thread A: Winner completes reload ==
+
+A -> Store : open+read config_path into INACTIVE snapshot
+A -> Store : parse rules into inactive snapshot buffer
+note right of Store
+  Inactive snapshot is written without a lock.
+  Thread B is spinning; it does not read inactive.
+  The active_snapshot_index still points to old snapshot.
+end note
+
+A -> Store : __sync_synchronize() (write barrier)
+A -> Store : swap active_snapshot_index
+A -> Store : __sync_synchronize() (read barrier for others)
+
+note right of Store
+  After the index swap, new callers see the new snapshot.
+  Old snapshot (now inactive) is not freed; it leaks
+  one struct per reload. Acceptable: reloads are rare,
+  process lifetime is bounded.
+end note
+
+A -> Slot : CAS(MTIME_RELOADING, new_mtime)
+note right of Slot
+  Releases the reload lock. Spinning threads unblock.
+end note
+
+@enduml

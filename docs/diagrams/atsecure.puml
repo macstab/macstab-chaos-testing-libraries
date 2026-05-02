@@ -1,0 +1,93 @@
+@startuml atsecure
+'
+' Engineered by  Christian Schnapka
+'                Embedded Principal+ Engineer
+'                Macstab GmbH · Hamburg, Germany
+'                https://macstab.com
+'
+' AT_SECURE auxv flag flow: how the kernel sets it,
+' how ld.so reads it, and how LD_PRELOAD is stripped.
+'
+' Reference: docs/SAFETY.md §1
+'            ld.so(8) "Secure-execution mode"
+'            Linux kernel fs/binfmt_elf.c
+'
+title AT_SECURE Auxv Flag — Privilege Strip for LD_PRELOAD
+
+skinparam sequenceMessageAlign center
+skinparam shadowing false
+skinparam roundCorner 4
+skinparam sequence {
+  ArrowColor                 #2C3E50
+  LifeLineBorderColor        #2C3E50
+  LifeLineBackgroundColor    #ECF0F1
+  ParticipantBorderColor     #2C3E50
+  ParticipantBackgroundColor #FFFFFF
+  ParticipantFontStyle       bold
+  GroupBackgroundColor       #FDFEFE
+  GroupBorderColor           #95A5A6
+}
+hide footbox
+
+participant "execve() caller\n(user process)" as Caller
+participant "Linux kernel\nbinfmt_elf.c"      as Kernel
+participant "ld.so\n(dynamic linker)"          as Ldso
+participant "libchaos-*.so\n(LD_PRELOAD lib)"  as Chaos
+participant "libc.so.6\n(glibc)"               as Libc
+
+Caller -> Kernel : execve("/path/to/target", argv, envp)
+note right of Caller
+  envp contains: LD_PRELOAD=libchaos-io.so
+  LD_PRELOAD will be stripped if AT_SECURE=1.
+end note
+
+Kernel -> Kernel : load_elf_binary()
+note right of Kernel
+  Check privilege escalation:
+  - ruid != euid (setuid binary)?
+  - rgid != egid (setgid binary)?
+  - file capabilities > inheritable set?
+  If any: AT_SECURE = 1 in auxv.
+  Else:   AT_SECURE = 0 in auxv.
+end note
+
+Kernel -> Ldso : transfer control to ld.so entry point\nwith auxv on stack
+
+Ldso -> Ldso : _dl_sysdep_start() / _dl_start()
+Ldso -> Ldso : getauxval(AT_SECURE)
+
+alt AT_SECURE == 1 (privileged binary)
+  Ldso -> Ldso : ignore LD_PRELOAD, LD_LIBRARY_PATH,\nLD_AUDIT, LD_DEBUG, LD_ORIGIN_PATH
+  note right of Ldso
+    LD_PRELOAD is cleared from the effective
+    search list. libchaos-*.so is NEVER loaded.
+    Kernel-enforced: not overrideable by the caller.
+  end note
+  Ldso -> Libc : load libc normally
+  Libc -> Caller : process runs without any preload injection
+else AT_SECURE == 0 (normal binary)
+  Ldso -> Ldso : process LD_PRELOAD list
+  Ldso -> Chaos : dlopen(libchaos-*.so) for each LD_PRELOAD entry
+  note right of Chaos
+    Library constructor runs:
+    - dlsym(RTLD_NEXT, …) for real symbols
+    - Seed PRNG
+    - Reset config state
+  end note
+  Chaos --> Ldso : constructor complete
+  Ldso -> Libc : load libc (DT_NEEDED resolution)
+  Libc --> Ldso : loaded
+  Ldso -> Caller : transfer to _start / main
+  note right of Caller
+    Process runs with interposed libc symbols.
+    LD_PRELOAD injection is active.
+  end note
+end
+
+note across
+  Verification: cat /proc/self/auxv | xxd | grep AT_SECURE (tag 23)
+  Or: #include <sys/auxv.h>; getauxval(AT_SECURE) == 1 means stripped.
+  To reproduce: chmod +s ./target && ./target → AT_SECURE=1, no preload.
+end note
+
+@enduml

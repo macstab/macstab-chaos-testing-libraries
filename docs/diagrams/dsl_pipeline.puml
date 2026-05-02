@@ -1,0 +1,145 @@
+@startuml dsl_pipeline
+'
+' Engineered by  Christian Schnapka
+'                Embedded Principal+ Engineer
+'                Macstab GmbH · Hamburg, Germany
+'                https://macstab.com
+'
+' DSL rule evaluation pipeline: from raw config line to
+' applied effect. Shows selector resolution, specificity
+' ordering, effect taxonomy, and the (S × E × P) algebra.
+'
+' Reference: docs/DSL.md
+'            docs/MEMORY.md §15 (PRNG), docs/MEMORY.md §3 (grammar)
+'
+title DSL Rule Evaluation Pipeline — Selector × Effect × Activation Policy
+
+skinparam shadowing false
+skinparam roundCorner 4
+skinparam activityDiamondBackgroundColor #ECF0F1
+skinparam activityBorderColor #2C3E50
+skinparam activityBackgroundColor #FFFFFF
+skinparam arrowColor #2C3E50
+
+start
+
+:Config text line;
+note right
+  Grammar (RFC 5234 ABNF):
+    selector ":" effect ":" value [ "@" probability ]
+  Examples:
+    mmap/anon:ERRNO:ENOMEM@0.01
+    clock_gettime/monotonic:OFFSET:-500
+    pthread_create:FAIL_AFTER:EAGAIN,128
+    tcp4://10.0.0.15:5432:connect:LATENCY:100
+end note
+
+:Parse selector;
+note right
+  Selector classes by library:
+  IO:   path prefix (/data/wal)
+  NET:  endpoint (tcp4://host:port)
+  DNS:  dns://name, rdns://addr
+  TIME: symbol (clock_gettime/monotonic)
+  MEM:  symbol (mmap/anon)
+  PROC: symbol (pthread_create)
+end note
+
+:Parse effect;
+note right
+  Effect taxonomy:
+  A — Pre-call failure (ERRNO, FAIL_AFTER)
+  B — Pre-call latency (LATENCY)
+  C — Post-call result mutation (OFFSET)
+  D — Post-call result-set transform (CORRUPT,
+      FILTER_FAMILY, SHUFFLE, LIMIT — DNS/IO)
+  E — Counter-driven (FAIL_AFTER count gate)
+end note
+
+:Parse activation policy\n(probability @P, FAIL_AFTER N);
+note right
+  Probability: [0.0, 1.0]
+    0.0 = never fire
+    1.0 = always fire
+    0.05 = fire 5% of calls (PRNG gated)
+  FAIL_AFTER N: fire after N successful calls
+end note
+
+:Store rule in snapshot\n(inactive buffer);
+
+' --- Call time ---
+
+:Interposed symbol called;
+
+:Resolve concrete selector\nfor this call instance;
+note right
+  IO: fd → /proc/self/fd path
+  NET: sockaddr → normalized endpoint
+  TIME: clockid → clock name
+  MEM: MAP_ANONYMOUS bit test
+  PROC: always the symbol name
+end note
+
+:Selector specificity ordering\n(most specific wins);
+note right
+  mmap/anon > mmap > *
+  dns://api.example.com > dns://*.example.com > dns://* > *
+  tcp4://10.0.0.15:5432 > tcp4://*:5432 > *
+  clock_gettime/monotonic > clock_gettime > *
+end note
+
+if (Any rule matched?) then (yes)
+  :Apply LATENCY (effect B)\nbefore real call;
+  note right
+    real_nanosleep(latency_ms * 1e6)
+    Reentrancy guard set → bypass own wrapper
+  end note
+
+  if (ERRNO rule matched?) then (yes)
+    :Sample PRNG\nu32 / UINT32_MAX ≤ probability?;
+    if (Probability gate fires?) then (yes)
+      :Return synthetic errno\n(pre-call failure);
+      note right
+        IO/NET/TIME: return -1, errno = errnum
+        pthread_create, posix_spawn: return errnum directly
+        FAIL_AFTER: return errnum after N-th call
+      end note
+      stop
+    endif
+  endif
+
+  :Call real libc symbol;
+  note right
+    real_symbol(args) — resolved via
+    dlsym(RTLD_NEXT, name) at library load time
+  end note
+
+  if (Post-call mutation rule?) then (yes)
+    :Apply post-call mutation\n(effect C or D);
+    note right
+      OFFSET: ts += offset_ms (TIME)
+      CORRUPT: flip one bit in read buffer (IO, NET recv)
+      FILTER_FAMILY/SHUFFLE/LIMIT: mutate addrinfo list (DNS)
+    end note
+  endif
+
+  :Return result to application;
+else (no match → passthrough)
+  :Call real libc symbol;
+  :Return result unchanged;
+endif
+
+stop
+
+note as legend
+  (S × E × P) Identity Laws (from docs/DSL.md):
+  1. ∀ s ∈ S: "*" ∈ S (wildcard always in selector set)
+  2. Specificity is a total order on selectors
+  3. LATENCY and ERRNO are orthogonal (both may apply to same call)
+  4. OFFSET only valid post-call; ERRNO only valid pre-call
+  5. FAIL_AFTER counter is per-symbol, not per-thread
+  6. Probability=0.0 makes a rule a no-op (but it still matches for ordering)
+  7. Passthrough is the identity: real(args) == wrapped(args) when no rule fires
+end note
+
+@enduml

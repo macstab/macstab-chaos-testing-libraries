@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "benchmark": {
+    "name": "getaddrinfo_passthrough",
+    "category": "dns"
+  },
+  "config": {
+    "mode": "AVG_TIME",
+    "warmup_iters": 10000,
+    "measurement_iters": 200000,
+    "batch_size": 1
+  },
+  "execution": {
+    "mode": "ADVISORY",
+    "warnings": [{"check": "governor", "detail": "governor=<absent> (need performance)"}, {"check": "isolcpus", "detail": "isolated_cpus=<empty> (need isolcpus= boot param)"}, {"check": "container", "detail": "running in container (host policies apply)"}]
+  },
+  "timer": {
+    "source": "cntvct_el0",
+    "calibrated_hz": 24000530.000,
+    "ns_per_cycle": 41.665747,
+    "calibration_window_ns": 100000000,
+    "overhead_ns": 0
+  },
+  "scenario": {
+    "path": "/work/benchmark/scenarios/dns-empty.conf",
+    "active": true
+  },
+  "stats": {
+    "samples": 200000,
+    "samples_after_trim": 200000,
+    "min_ns":    9708.119,
+    "max_ns":    451448.364,
+    "mean_ns":   11158.114,
+    "stdev_ns":  3532.417,
+    "median_ns": 10458.102,
+    "p50_ns":    10458.102,
+    "p90_ns":    12624.721,
+    "p99_ns":    20541.213,
+    "p999_ns":   34207.703,
+    "p9999_ns":  141414.381
+  },
+  "pmu": {
+    "available": true,
+    "counters": {
+      "cycles": 0,
+      "instructions": 0,
+      "branches": 0,
+      "branch_misses": 0,
+      "cache_references": 0,
+      "cache_misses": 0,
+      "dtlb_load_misses": 0,
+      "context_switches": 0,
+      "cpu_migrations": 0,
+      "page_faults": 390
+    }
+  },
+  "environment": {
+    "kernel_release": "6.10.14-linuxkit",
+    "kernel_version": "Linux version 6.10.14-linuxkit (root@buildkitsandbox) (gcc (Alpine 13.2.1_git20240309) 13.2.1 20240309, GNU ld (GNU Binutils) 2.42) #1 SMP Sat May 17 08:28:57 UTC 2025",
+    "cpu_model": "",
+    "cpu_flags": "fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 asimddp sha512 asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp flagm2 frint i8mm bf16 bti",
+    "governor": "",
+    "isolated_cpus": "",
+    "thp_enabled": "[always] madvise never",
+    "libc": "glibc",
+    "git_sha": "4809d25",
+    "build_cflags": "-std=c99 -Wall -Wextra -Werror -pedantic -O2 -g3",
+    "ld_preload": "/work/build/libchaos-dns.so",
+    "smt_active": false,
+    "container": true,
+    "constant_tsc": false,
+    "nonstop_tsc": false
+  }
+}
