@@ -1,8 +1,8 @@
 name: matrix
 
 on:
-  pull_request:
-    branches: [main, develop]
+  push:
+    branches: [main, develop, 'feat/**', 'fix/**', 'chore/**', 'refactor/**']
 
 permissions:
   contents: read
