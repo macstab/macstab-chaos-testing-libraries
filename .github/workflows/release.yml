@@ -18,7 +18,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential gcc make docker-buildx
+            build-essential gcc make
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
