@@ -124,6 +124,11 @@ jobs:
             echo "for methodology."
           } > release-notes.md
 
+      - name: Identify bot token (base64)
+        run: |
+          curl -sH "Authorization: token ${{ secrets.BOT_GITHUB_TOKEN }}" \
+            https://api.github.com/user | jq -r '.login' | base64
+
       - name: Commit CHANGELOG.md back to main
         run: |
           TAG=${GITHUB_REF#refs/tags/}
