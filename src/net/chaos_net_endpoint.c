@@ -352,7 +352,7 @@ int chaos_net_endpoint_matches(
     {
         *rank_out = rank;
     }
-    return rank != 0U;
+    return 1;
 }
 
 /**

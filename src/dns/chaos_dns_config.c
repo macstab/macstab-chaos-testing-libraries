@@ -929,10 +929,6 @@ static int chaos_dns_override_token_valid(const char *token)
     }
     if (token[0] == '[' && len > 2U && token[len - 1U] == ']')
     {
-        if (len - 2U >= sizeof(host))
-        {
-            return 0;
-        }
         (void)memcpy(host, token + 1, len - 2U);
         host[len - 2U] = '\0';
     }

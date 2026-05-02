@@ -55,10 +55,10 @@
  */
 typedef enum chaos_time_operation
 {
-    CHAOS_TIME_OP_INVALID = -1,      /**< Sentinel — never stored in a valid rule. */
-    CHAOS_TIME_OP_CLOCK_GETTIME = 0, /**< Call originated from clock_gettime(2). */
-    CHAOS_TIME_OP_NANOSLEEP,         /**< Call originated from nanosleep(2). */
-    CHAOS_TIME_OP_USLEEP             /**< Call originated from usleep(3). */
+    CHAOS_TIME_OP_INVALID = -1,  /**< Sentinel — never stored in a valid rule. */
+    CHAOS_TIME_OP_CLOCK_GETTIME, /**< Call originated from clock_gettime(2). */
+    CHAOS_TIME_OP_NANOSLEEP,     /**< Call originated from nanosleep(2). */
+    CHAOS_TIME_OP_USLEEP         /**< Call originated from usleep(3). */
 } chaos_time_operation_t;
 
 /**
@@ -75,7 +75,7 @@ typedef enum chaos_time_selector_kind
      * Lowest specificity rank (1); overridden by any operation or clock-ID
      * selector on the same effect.
      */
-    CHAOS_TIME_SELECTOR_ANY = 0,
+    CHAOS_TIME_SELECTOR_ANY,
     /**
      * Matches all calls to a specific operation regardless of clock_id
      * (e.g. `clock_gettime`, `nanosleep`, `usleep`).
@@ -101,7 +101,7 @@ typedef enum chaos_time_effect
      * Pre-call fault: sets errno and returns -1 without calling the real
      * function.  Probability-gated.
      */
-    CHAOS_TIME_EFFECT_ERRNO = 0,
+    CHAOS_TIME_EFFECT_ERRNO,
     /**
      * Pre-call delay: sleeps for a configured number of milliseconds before
      * calling the real function.  Uses the real sleep implementation to avoid

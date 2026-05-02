@@ -63,7 +63,7 @@
 typedef enum chaos_io_operation
 {
     CHAOS_IO_OP_INVALID = -1, /**< Sentinel: parse failure; not a valid rule operation. */
-    CHAOS_IO_OP_READ = 0,     /**< `read(2)` and `readv(2)`. */
+    CHAOS_IO_OP_READ,         /**< `read(2)` and `readv(2)`. */
     CHAOS_IO_OP_WRITE,        /**< `write(2)`, `writev(2)`, `sendfile(2)`, `copy_file_range(2)`. */
     CHAOS_IO_OP_OPEN,         /**< `open(2)` and `openat(2)`. */
     CHAOS_IO_OP_CLOSE,        /**< `close(2)`. */
@@ -95,7 +95,7 @@ typedef enum chaos_io_operation
 typedef enum chaos_io_effect
 {
     CHAOS_IO_EFFECT_INVALID = -1, /**< Sentinel: parse failure; not a valid effect. */
-    CHAOS_IO_EFFECT_ERRNO = 0,    /**< Pre-call synthetic error: sets `errno` and returns -1. */
+    CHAOS_IO_EFFECT_ERRNO,        /**< Pre-call synthetic error: sets `errno` and returns -1. */
     CHAOS_IO_EFFECT_LATENCY,      /**< Pre-call blocking delay of `latency_ms` milliseconds. */
     CHAOS_IO_EFFECT_TORN,         /**< Partial write: real call with shortened byte count. */
     CHAOS_IO_EFFECT_CORRUPT       /**< Post-read single-bit flip in the returned buffer. */

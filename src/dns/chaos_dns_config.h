@@ -82,7 +82,7 @@
 typedef enum chaos_dns_selector_kind
 {
     CHAOS_DNS_SELECTOR_INVALID = -1, /**< Parse error sentinel; never stored in a live rule. */
-    CHAOS_DNS_SELECTOR_ANY = 0,      /**< Matches any query in the selector's domain. */
+    CHAOS_DNS_SELECTOR_ANY,          /**< Matches any query in the selector's domain. */
     CHAOS_DNS_SELECTOR_EXACT,        /**< Case-insensitive exact match against text. */
     CHAOS_DNS_SELECTOR_SUFFIX        /**< Dot-anchored suffix match (LOOKUP domain only). */
 } chaos_dns_selector_kind_t;
@@ -102,7 +102,7 @@ typedef enum chaos_dns_selector_kind
 typedef enum chaos_dns_selector_domain
 {
     CHAOS_DNS_SELECTOR_DOMAIN_INVALID = -1, /**< Parse error sentinel. */
-    CHAOS_DNS_SELECTOR_DOMAIN_LOOKUP = 0,   /**< Applies to getaddrinfo calls. */
+    CHAOS_DNS_SELECTOR_DOMAIN_LOOKUP,       /**< Applies to getaddrinfo calls. */
     CHAOS_DNS_SELECTOR_DOMAIN_REVERSE       /**< Applies to getnameinfo calls. */
 } chaos_dns_selector_domain_t;
 
@@ -138,7 +138,7 @@ typedef enum chaos_dns_selector_domain
 typedef enum chaos_dns_effect
 {
     CHAOS_DNS_EFFECT_INVALID = -1,  /**< Parse error sentinel; never stored in a live rule. */
-    CHAOS_DNS_EFFECT_GAI = 0,       /**< Synthetic EAI_* failure before calling resolver. */
+    CHAOS_DNS_EFFECT_GAI,           /**< Synthetic EAI_* failure before calling resolver. */
     CHAOS_DNS_EFFECT_LATENCY,       /**< Artificial sleep before calling resolver. */
     CHAOS_DNS_EFFECT_REWRITE,       /**< Substitute hostname in lookup or reverse result. */
     CHAOS_DNS_EFFECT_SERVICE,       /**< Substitute service/port string. */
@@ -158,7 +158,7 @@ typedef enum chaos_dns_effect
 typedef enum chaos_dns_family_filter
 {
     CHAOS_DNS_FAMILY_INVALID = -1, /**< Parse error sentinel; rule is rejected if set. */
-    CHAOS_DNS_FAMILY_ANY = 0,      /**< No filtering; all address families are kept. */
+    CHAOS_DNS_FAMILY_ANY,          /**< No filtering; all address families are kept. */
     CHAOS_DNS_FAMILY_INET4,        /**< Keep only AF_INET nodes; free all AF_INET6 nodes. */
     CHAOS_DNS_FAMILY_INET6         /**< Keep only AF_INET6 nodes; free all AF_INET nodes. */
 } chaos_dns_family_filter_t;
