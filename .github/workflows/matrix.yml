@@ -1,8 +1,6 @@
 name: matrix
 
 on:
-  push:
-    branches: [main, develop, 'feat/**', 'fix/**', 'chore/**', 'refactor/**']
   pull_request:
     branches: [main, develop]
 
