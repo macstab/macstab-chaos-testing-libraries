@@ -51,12 +51,6 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [build]
     steps:
-      - name: Identify bot token
-        run: |
-          curl -sH "Authorization: token ${{ secrets.BOT_GITHUB_TOKEN }}" \
-          https://api.github.com/user | jq '.login // "no user (likely GitHub App token)"'                                                                                                                                                                                                                           
-            
-
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -124,25 +118,30 @@ jobs:
             echo "for methodology."
           } > release-notes.md
 
-      - name: Identify bot token (base64)
-        run: |
-          curl -sH "Authorization: token ${{ secrets.BOT_GITHUB_TOKEN }}" \
-            https://api.github.com/user | jq -r '.login' | base64
-
-      - name: Commit CHANGELOG.md back to main
+      - name: Open auto-merged PR with CHANGELOG.md
+        env:
+          GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
         run: |
           TAG=${GITHUB_REF#refs/tags/}
+          BRANCH="chore/changelog-${TAG}"
           git config user.name  "${{ secrets.BOT_USER_NAME }}"
           git config user.email "${{ secrets.BOT_USER_EMAIL }}"
           cp CHANGELOG.md /tmp/CHANGELOG_release.md
           git remote set-url origin https://x-access-token:${{ secrets.BOT_GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
           git fetch origin main
-          git checkout main
+          git checkout -B "$BRANCH" origin/main
           cp /tmp/CHANGELOG_release.md CHANGELOG.md
           git add CHANGELOG.md
-          git diff --cached --quiet && exit 0
+          if git diff --cached --quiet; then
+            echo "No changelog changes — skipping PR"
+            exit 0
+          fi
           git commit -m "docs: update CHANGELOG for $TAG"
-          git push origin main
+          git push origin "$BRANCH"
+          gh pr create --base main --head "$BRANCH" \
+            --title "docs: update CHANGELOG for $TAG" \
+            --body "Auto-generated changelog update for release $TAG."
+          gh pr merge "$BRANCH" --squash --admin --delete-branch
 
       - name: Create GitHub release
         env:
