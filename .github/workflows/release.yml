@@ -46,43 +46,10 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-  bench:
-    name: release benchmark sweep
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Lower perf_event_paranoid
-        run: echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid
-
-      - name: Run full benchmark sweep
-        run: ./benchmark/run-bench.sh --full --runs=5 --compare
-
-      - name: Collect comparison report
-        run: |
-          GIT_SHA=$(git rev-parse --short HEAD)
-          mkdir -p release-bench
-          if [ -f "benchmark/reports/$GIT_SHA/comparison.md" ]; then
-            cp "benchmark/reports/$GIT_SHA/comparison.md" release-bench/benchmark-comparison.md
-          else
-            echo "_No comparison report produced for $GIT_SHA._" > release-bench/benchmark-comparison.md
-          fi
-
-      - name: Upload benchmark artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-bench
-          path: release-bench/
-          retention-days: 7
-          if-no-files-found: error
-
   release:
     name: publish GitHub release
     runs-on: ubuntu-24.04
-    needs: [build, bench]
+    needs: [build]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -92,12 +59,6 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: release-binaries
-          path: release-assets/
-
-      - name: Download bench artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: release-bench
           path: release-assets/
 
       - name: Generate CHANGELOG.md with git-cliff
@@ -183,5 +144,45 @@ jobs:
             --verify-tag \
             release-assets/libchaos-*.so \
             release-assets/SHA256SUMS \
-            release-assets/benchmark-comparison.md \
             CHANGELOG.md
+
+  bench:
+    name: release benchmark sweep
+    runs-on: ubuntu-24.04
+    needs: [release]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Lower perf_event_paranoid
+        run: echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid
+
+      - name: Run full benchmark sweep
+        run: ./benchmark/run-bench.sh --full --runs=5 --compare
+
+      - name: Collect comparison report
+        run: |
+          GIT_SHA=$(git rev-parse --short HEAD)
+          mkdir -p release-bench
+          if [ -f "benchmark/reports/$GIT_SHA/comparison.md" ]; then
+            cp "benchmark/reports/$GIT_SHA/comparison.md" release-bench/benchmark-comparison.md
+          else
+            echo "_No comparison report produced for $GIT_SHA._" > release-bench/benchmark-comparison.md
+          fi
+
+      - name: Upload benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bench
+          path: release-bench/
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Attach benchmark report to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          gh release upload "$TAG" release-bench/benchmark-comparison.md --clobber
