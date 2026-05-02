@@ -1,8 +1,8 @@
 name: codeql
 
 on:
-  pull_request:
-    branches: [main, develop]
+  push:
+    branches: [main, develop, 'feat/**', 'fix/**', 'chore/**', 'refactor/**']
   schedule:
     - cron: '0 6 * * 1'
 
