@@ -55,7 +55,7 @@
 typedef enum chaos_net_operation
 {
     CHAOS_NET_OP_INVALID = -1, /**< Parse failure or unrecognised token. */
-    CHAOS_NET_OP_BIND = 0,     /**< Targets bind(2). */
+    CHAOS_NET_OP_BIND,         /**< Targets bind(2). */
     CHAOS_NET_OP_LISTEN,       /**< Targets listen(2). */
     CHAOS_NET_OP_CONNECT,      /**< Targets connect(2). */
     CHAOS_NET_OP_ACCEPT,       /**< Targets accept(2) / accept4(2). */
@@ -86,7 +86,7 @@ typedef enum chaos_net_operation
 typedef enum chaos_net_effect
 {
     CHAOS_NET_EFFECT_INVALID = -1, /**< Parse failure or unrecognised token. */
-    CHAOS_NET_EFFECT_ERRNO = 0,    /**< Pre-call: set errno and return -1. */
+    CHAOS_NET_EFFECT_ERRNO,        /**< Pre-call: set errno and return -1. */
     CHAOS_NET_EFFECT_LATENCY,      /**< Pre-call: sleep for latency_ms milliseconds. */
     CHAOS_NET_EFFECT_CORRUPT,      /**< Post-call: flip one bit in the receive buffer. */
     CHAOS_NET_EFFECT_TIMEOUT       /**< POLL-only: return 0 with all events cleared. */
@@ -109,7 +109,7 @@ typedef enum chaos_net_effect
 typedef enum chaos_net_endpoint_kind
 {
     CHAOS_NET_ENDPOINT_INVALID = -1, /**< Parse failure. */
-    CHAOS_NET_ENDPOINT_ANY = 0,      /**< Wildcard: matches any family/protocol. */
+    CHAOS_NET_ENDPOINT_ANY,          /**< Wildcard: matches any family/protocol. */
     CHAOS_NET_ENDPOINT_TCP4,         /**< IPv4 TCP (AF_INET + SOCK_STREAM). */
     CHAOS_NET_ENDPOINT_TCP6,         /**< IPv6 TCP (AF_INET6 + SOCK_STREAM). */
     CHAOS_NET_ENDPOINT_UDP4,         /**< IPv4 UDP (AF_INET + SOCK_DGRAM). */

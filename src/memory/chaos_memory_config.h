@@ -65,7 +65,7 @@ typedef enum chaos_memory_operation
     /** Sentinel: operation field is not meaningful for this selector kind. */
     CHAOS_MEMORY_OP_INVALID = -1,
     /** Matches calls to mmap(2), potentially further refined by mmap_kind. */
-    CHAOS_MEMORY_OP_MMAP = 0,
+    CHAOS_MEMORY_OP_MMAP,
     /** Matches calls to mprotect(2). */
     CHAOS_MEMORY_OP_MPROTECT,
     /** Matches calls to madvise(2). */
@@ -94,7 +94,7 @@ typedef enum chaos_memory_selector_kind
     /** Sentinel: invalid or uninitialised selector. */
     CHAOS_MEMORY_SELECTOR_INVALID = -1,
     /** Matches all intercepted operations (wildcard selector `*`). */
-    CHAOS_MEMORY_SELECTOR_ANY = 0,
+    CHAOS_MEMORY_SELECTOR_ANY,
     /** Matches a specific operation (e.g., `mmap`, `munmap`). */
     CHAOS_MEMORY_SELECTOR_OPERATION,
     /**
