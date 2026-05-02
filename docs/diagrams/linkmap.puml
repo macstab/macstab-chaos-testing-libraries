@@ -1,0 +1,72 @@
+@startuml linkmap
+'
+' Engineered by  Christian Schnapka
+'                Embedded Principal+ Engineer
+'                Macstab GmbH · Hamburg, Germany
+'                https://macstab.com
+'
+' ELF lazy binding via PLT/GOT — first call (cold path) vs hot path
+' under LD_PRELOAD interposition.
+'
+' Reference: docs/PLATFORM.md §1.4
+'
+title ELF lazy binding via PLT/GOT — first call (cold) vs hot path
+
+skinparam sequenceMessageAlign center
+skinparam shadowing false
+skinparam roundCorner 4
+skinparam sequence {
+  ArrowColor                 #2C3E50
+  LifeLineBorderColor        #2C3E50
+  LifeLineBackgroundColor    #ECF0F1
+  ParticipantBorderColor     #2C3E50
+  ParticipantBackgroundColor #FFFFFF
+  ParticipantFontStyle       bold
+}
+hide footbox
+
+participant "Application\ncode"            as App
+participant "read@plt"                     as PLT
+participant "GOT[read]"                    as GOT
+participant "ld.so /\n_dl_runtime_resolve" as Ldso
+participant "do_lookup_x()"                as Lookup
+participant "libchaos-io.so:read"          as Chaos
+participant "libc.so.6:read"               as Glibc
+
+== First call — cold path ==
+App    ->  PLT    : call read
+PLT    ->  GOT    : jmp *GOT[read]\n(resolver stub)
+GOT    ->  Ldso   : bounce into resolver
+Ldso   ->  Lookup : walk link-map
+note over Lookup
+  Order:
+  1. main exe
+  2. LD_PRELOAD entries
+  3. DT_NEEDED transitively
+  First match wins.
+end note
+Lookup --> Ldso   : found in libchaos-io.so
+Ldso   ->  GOT    : patch slot → libchaos-io.so:read
+Ldso   ->  Chaos  : tail-call wrapper
+Chaos  ->  Chaos  : dlsym(RTLD_NEXT, "read")
+Chaos  ->  Glibc  : cache real_read pointer
+Chaos  ->  Chaos  : match config, maybe inject
+Chaos  ->  Glibc  : real_read(fd, buf, n)
+Glibc  --> Chaos  : result
+Chaos  --> App    : return
+
+== Second call onward — hot path ==
+App    ->  PLT    : call read
+PLT    ->  GOT    : jmp *GOT[read]\n(now → Chaos)
+GOT    ->  Chaos  : direct
+Chaos  ->  Chaos  : match config, maybe inject
+Chaos  ->  Glibc  : real_read(fd, buf, n)
+Glibc  --> Chaos  : result
+Chaos  --> App    : return
+
+note across
+  Hot path overhead: one extra indirect branch (the patched GOT slot)
+  plus the wrapper body. Resolver dance and dlsym are one-time cold cost.
+end note
+
+@enduml

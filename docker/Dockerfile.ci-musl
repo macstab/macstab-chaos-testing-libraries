@@ -1,0 +1,20 @@
+# =============================================================================
+# docker/Dockerfile.ci-musl — local CI gate image, musl/Alpine variant.
+#
+# Sibling of Dockerfile.ci (glibc/Ubuntu).  Drives `make ci-local-coverage-musl-*`
+# so the 100% line-coverage gate is verified against musl headers, not just
+# glibc.  musl exposes a different subset of CLOCK_*, CAP_*, and other
+# preprocessor symbols, so coverage on glibc alone does not prove coverage
+# on Alpine.
+# =============================================================================
+
+FROM alpine:3.19
+
+RUN apk add --no-cache \
+        build-base \
+        gcc \
+        make \
+        bash \
+        ca-certificates
+
+WORKDIR /work

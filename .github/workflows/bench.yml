@@ -1,0 +1,170 @@
+name: bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Number of runs per benchmark cell"
+        type: string
+        default: "5"
+      libc:
+        description: "Build variant"
+        type: choice
+        default: "glibc"
+        options: [glibc, alpine]
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: false  # never abort an in-flight benchmark
+
+jobs:
+  bench:
+    name: full sweep (Linux x86_64, ADVISORY)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Lower perf_event_paranoid for PMU access
+        run: |
+          echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid
+          echo "perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid)"
+
+      - name: Capture host environment
+        run: |
+          echo "::group::lscpu"
+          lscpu
+          echo "::endgroup::"
+          echo "::group::cpuinfo (first 30 lines)"
+          head -30 /proc/cpuinfo
+          echo "::endgroup::"
+          echo "::group::kernel"
+          uname -a
+          echo "::endgroup::"
+
+      - name: Run full benchmark sweep
+        env:
+          BENCH_LIBC: ${{ inputs.libc || 'glibc' }}
+          BENCH_RUNS: ${{ inputs.runs || '5' }}
+        run: |
+          ./benchmark/run-bench.sh \
+            --full \
+            --libc="$BENCH_LIBC" \
+            --runs="$BENCH_RUNS" \
+            --compare
+
+      - name: Show comparison report
+        if: always()
+        run: |
+          GIT_SHA=$(git rev-parse --short HEAD)
+          REPORT="benchmark/reports/$GIT_SHA/comparison.md"
+          if [ -f "$REPORT" ]; then
+            echo "::notice::Benchmark comparison report at $REPORT"
+            echo "::group::comparison.md"
+            cat "$REPORT"
+            echo "::endgroup::"
+          else
+            echo "::warning::No comparison report found at $REPORT"
+          fi
+
+      - name: Generate run summary
+        if: always()
+        run: |
+          GIT_SHA=$(git rev-parse --short HEAD)
+          REPORT="benchmark/reports/$GIT_SHA/comparison.md"
+          {
+            echo "## Benchmark sweep — \`$GIT_SHA\` (Linux x86_64, ADVISORY)"
+            echo ""
+            echo "Runner: $(uname -m) $(uname -s) $(uname -r)"
+            echo ""
+            echo "> Numbers are **ADVISORY** because GitHub-hosted runners are shared VMs"
+            echo "> with non-deterministic CPU steal and no PMU isolation. For OFFICIAL"
+            echo "> Tier-2 numbers, run on a dedicated bare-metal host with isolcpus,"
+            echo "> nohz_full, and governor=performance."
+            echo ""
+            if [ -f "$REPORT" ]; then
+              cat "$REPORT"
+            else
+              echo "_No comparison report produced._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install hyperfine
+        run: |
+          HYPERFINE_VER=1.18.0
+          wget -qO /tmp/hyperfine.deb \
+            "https://github.com/sharkdp/hyperfine/releases/download/v${HYPERFINE_VER}/hyperfine_${HYPERFINE_VER}_amd64.deb"
+          sudo dpkg -i /tmp/hyperfine.deb
+          hyperfine --version
+
+      - name: Cross-validate clock_gettime_baseline with hyperfine
+        if: always()
+        run: |
+          BIN=benchmark/build/bench_time
+          if [ ! -f "$BIN" ]; then
+            echo "::warning::bench_time not found — skipping hyperfine cross-validation"
+            exit 0
+          fi
+
+          BENCH=clock_gettime_baseline
+          ITERS=100000
+          CALIB_NS=100000000  # ~100ms calibration window
+
+          # Run 5 trials; hyperfine measures total wall time per invocation.
+          hyperfine --runs 5 --warmup 2 \
+            --export-json /tmp/hyperfine.json \
+            "$BIN --benchmark=$BENCH --warmup=1000 --iters=$ITERS"
+
+          HF_MEAN_S=$(jq '.results[0].mean' /tmp/hyperfine.json)
+          echo "Hyperfine mean wall time per invocation: ${HF_MEAN_S}s"
+
+          # Subtract calibration overhead and divide by iteration count to
+          # get an approximate per-operation time.  This is a broad sanity
+          # check — the calibration constant is ~100ms but may vary.
+          HF_PER_OP_NS=$(awk "BEGIN {
+            bench_ns = ($HF_MEAN_S * 1e9) - $CALIB_NS
+            if (bench_ns < 1) bench_ns = 1
+            printf \"%.2f\", bench_ns / $ITERS
+          }")
+          echo "Hyperfine estimated per-op: ${HF_PER_OP_NS} ns"
+
+          # Find the harness JSON for this benchmark.
+          GIT_SHA=$(git rev-parse --short HEAD)
+          HARNESS_JSON=$(find benchmark/reports/$GIT_SHA -name "${BENCH}.json" 2>/dev/null | head -1)
+
+          if [ -n "$HARNESS_JSON" ] && command -v jq >/dev/null 2>&1; then
+            HARNESS_MEDIAN=$(jq '.stats.median_ns' "$HARNESS_JSON")
+            echo "Harness median: ${HARNESS_MEDIAN} ns/op"
+
+            # Ratio check: allow up to 10× difference given calibration noise.
+            RATIO=$(awk "BEGIN {
+              r = $HF_PER_OP_NS / $HARNESS_MEDIAN
+              if (r < 1) r = 1/r
+              printf \"%.2f\", r
+            }")
+            echo "Ratio (hyperfine/harness): ${RATIO}x"
+
+            if awk "BEGIN { exit ($RATIO + 0 > 10.0) ? 0 : 1 }"; then
+              echo "::error::Hyperfine/harness ratio ${RATIO}x exceeds 10x threshold — timer may be mis-calibrated"
+              exit 1
+            fi
+            echo "::notice::Hyperfine cross-validation passed (ratio: ${RATIO}x)"
+          else
+            echo "::warning::Harness JSON not found — reporting hyperfine time only (${HF_PER_OP_NS} ns/op estimate)"
+          fi
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-reports-${{ github.sha }}
+          path: benchmark/reports/
+          retention-days: 90
+          if-no-files-found: warn
