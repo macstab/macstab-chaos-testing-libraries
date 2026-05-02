@@ -8,6 +8,38 @@ permissions:
   contents: write
 
 jobs:
+  changelog:
+    name: generate CHANGELOG
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Use a PAT so the commit can trigger subsequent workflows.
+          # Falls back to GITHUB_TOKEN (push still works, but won't re-trigger CI).
+          token: ${{ secrets.BOT_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Install git-cliff
+        uses: kenji-miyake/setup-git-cliff@v2
+
+      - name: Generate CHANGELOG.md
+        run: git cliff --output CHANGELOG.md
+
+      - name: Commit CHANGELOG.md to main
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout main
+          cp CHANGELOG.md /tmp/CHANGELOG.md
+          git checkout main -- .
+          cp /tmp/CHANGELOG.md CHANGELOG.md
+          git add CHANGELOG.md
+          git diff --cached --quiet && echo "no changes" && exit 0
+          git commit -m "docs: update CHANGELOG for $TAG"
+          git push origin main
+
   build:
     name: build all variants
     runs-on: ubuntu-24.04
@@ -85,7 +117,7 @@ jobs:
   release:
     name: publish GitHub release
     runs-on: ubuntu-24.04
-    needs: [build, bench]
+    needs: [changelog, build, bench]
     steps:
       - uses: actions/checkout@v4
 
@@ -158,10 +190,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG=${GITHUB_REF#refs/tags/}
+          # Download the generated CHANGELOG so it can be attached as an asset.
+          git fetch origin main
+          git checkout origin/main -- CHANGELOG.md || true
+
           gh release create "$TAG" \
             --title "chaos-testing-libraries $TAG" \
             --notes-file release-notes.md \
             --verify-tag \
             release-assets/libchaos-*.so \
             release-assets/SHA256SUMS \
-            release-assets/benchmark-comparison.md
+            release-assets/benchmark-comparison.md \
+            CHANGELOG.md
