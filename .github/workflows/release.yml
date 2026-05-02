@@ -51,6 +51,12 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [build]
     steps:
+      - name: Identify bot token
+        run: |
+          curl -sH "Authorization: token ${{ secrets.BOT_GITHUB_TOKEN }}" \
+          https://api.github.com/user | jq '.login // "no user (likely GitHub App token)"'                                                                                                                                                                                                                           
+            
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
