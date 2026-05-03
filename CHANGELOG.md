@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Update CHANGELOG for 1.0.0 ([#11](https://github.com/macstab/macstab-chaos-testing-libraries/issues/11)) ([ffc58a5](https://github.com/macstab/macstab-chaos-testing-libraries/commit/ffc58a519ceacf651bc143e9f517e4a6859d5ec7))
 - Update CHANGELOG for 1.0.0 ([#12](https://github.com/macstab/macstab-chaos-testing-libraries/issues/12)) ([e5bcc75](https://github.com/macstab/macstab-chaos-testing-libraries/commit/e5bcc7502d476d9787bfe44818684a6b06afe31c))
 - **bench:** Add 1.0.0-benchmarks.md ([#13](https://github.com/macstab/macstab-chaos-testing-libraries/issues/13)) ([a0278d0](https://github.com/macstab/macstab-chaos-testing-libraries/commit/a0278d0d1fb19d7e9fce70b8a13f737982f34f69))
+- Update CHANGELOG for 1.0.0 ([#15](https://github.com/macstab/macstab-chaos-testing-libraries/issues/15)) ([5509824](https://github.com/macstab/macstab-chaos-testing-libraries/commit/5509824a452ee26c3acac71ece3eab4d40a41c38))
+- **bench:** Add 1.0.0-benchmarks.md ([#16](https://github.com/macstab/macstab-chaos-testing-libraries/issues/16)) ([3be92ac](https://github.com/macstab/macstab-chaos-testing-libraries/commit/3be92ac243557c412791792db871b6955948870c))
+- **bench:** Add 1.0.0-benchmarks.md ([#18](https://github.com/macstab/macstab-chaos-testing-libraries/issues/18)) ([f8e468e](https://github.com/macstab/macstab-chaos-testing-libraries/commit/f8e468e1af13c727c4c76baea092f52cc50c83ad))
 
 ### Features
 
@@ -34,5 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add benchmark matrix generation and upload to release workflow ([ee1b015](https://github.com/macstab/macstab-chaos-testing-libraries/commit/ee1b015ea4fd19a9c1f454d3426787586d569634))
 - Add benchmarking matrix with multi-variant support to release workflow ([35a86dd](https://github.com/macstab/macstab-chaos-testing-libraries/commit/35a86dd50a4decc09111589d2817d77f165d0e90))
 - Add benchmarking matrix with multi-variant support to release workflow ([9cf2e23](https://github.com/macstab/macstab-chaos-testing-libraries/commit/9cf2e234e9c0007620968725c99cd1e4e0bc62e3))
+- Add benchmarking matrix with multi-variant support to release workflow ([3e875b6](https://github.com/macstab/macstab-chaos-testing-libraries/commit/3e875b667ecb2b730c3be90156847a6ad26eb12d))
+
+### Miscellaneous
+
+- Sync main into develop after 1.0.0 ([#14](https://github.com/macstab/macstab-chaos-testing-libraries/issues/14)) ([26b8831](https://github.com/macstab/macstab-chaos-testing-libraries/commit/26b8831d4cbc739aee9bec908603344137d3d7e8))
 
 
