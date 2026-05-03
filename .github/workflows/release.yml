@@ -51,12 +51,6 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [build]
     steps:
-      - name: Identify bot token
-        run: |
-          curl -sH "Authorization: token ${{ secrets.BOT_GITHUB_TOKEN }}" \
-          https://api.github.com/user | jq '.login // "no user (likely GitHub App token)"'                                                                                                                                                                                                                           
-            
-
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -124,44 +118,77 @@ jobs:
             echo "for methodology."
           } > release-notes.md
 
-      - name: Identify bot token (base64)
-        run: |
-          curl -sH "Authorization: token ${{ secrets.BOT_GITHUB_TOKEN }}" \
-            https://api.github.com/user | jq -r '.login' | base64
-
-      - name: Commit CHANGELOG.md back to main
+      - name: Open auto-merged PR with CHANGELOG.md
+        env:
+          GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
         run: |
           TAG=${GITHUB_REF#refs/tags/}
+          BRANCH="chore/changelog-${TAG}"
           git config user.name  "${{ secrets.BOT_USER_NAME }}"
           git config user.email "${{ secrets.BOT_USER_EMAIL }}"
           cp CHANGELOG.md /tmp/CHANGELOG_release.md
+          rm -f CHANGELOG.md
           git remote set-url origin https://x-access-token:${{ secrets.BOT_GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
           git fetch origin main
-          git checkout main
+          git checkout -B "$BRANCH" origin/main
           cp /tmp/CHANGELOG_release.md CHANGELOG.md
           git add CHANGELOG.md
-          git diff --cached --quiet && exit 0
+          if git diff --cached --quiet; then
+            echo "No changelog changes — skipping PR"
+            exit 0
+          fi
           git commit -m "docs: update CHANGELOG for $TAG"
-          git push origin main
+          git push origin "$BRANCH"
+          gh pr create --base main --head "$BRANCH" \
+            --title "docs: update CHANGELOG for $TAG" \
+            --body "Auto-generated changelog update for release $TAG."
+          gh pr merge "$BRANCH" --squash --admin --delete-branch
 
-      - name: Create GitHub release
+      - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG=${GITHUB_REF#refs/tags/}
-          gh release create "$TAG" \
-            --title "chaos-testing-libraries $TAG" \
-            --notes-file release-notes.md \
-            --verify-tag \
-            release-assets/libchaos-*.so \
-            release-assets/SHA256SUMS \
-            CHANGELOG.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --title "chaos-testing-libraries $TAG" \
+              --notes-file release-notes.md
+            gh release upload "$TAG" \
+              release-assets/libchaos-*.so \
+              release-assets/SHA256SUMS \
+              CHANGELOG.md \
+              --clobber
+          else
+            gh release create "$TAG" \
+              --title "chaos-testing-libraries $TAG" \
+              --notes-file release-notes.md \
+              --verify-tag \
+              release-assets/libchaos-*.so \
+              release-assets/SHA256SUMS \
+              CHANGELOG.md
+          fi
 
-  bench:
-    name: release benchmark sweep
-    runs-on: ubuntu-24.04
+  bench-sweep:
+    name: bench (${{ matrix.libc }}-${{ matrix.arch }})
     needs: [release]
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - libc: glibc
+            arch: amd64
+            runner: ubuntu-24.04
+          - libc: musl
+            arch: amd64
+            runner: ubuntu-24.04
+          - libc: glibc
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - libc: musl
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -170,20 +197,164 @@ jobs:
       - name: Lower perf_event_paranoid
         run: echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid
 
-      - name: Run full benchmark sweep
-        run: ./benchmark/run-bench.sh --full --runs=5 --compare
+      - name: Run benchmark sweep (${{ matrix.libc }}-${{ matrix.arch }})
+        run: |
+          ./benchmark/run-bench.sh \
+            --full --runs=5 --libc=${{ matrix.libc }} --compare || true
 
-      - name: Collect comparison report
+      - name: Stage variant outputs
         run: |
           GIT_SHA=$(git rev-parse --short HEAD)
-          mkdir -p release-bench
-          if [ -f "benchmark/reports/$GIT_SHA/comparison.md" ]; then
-            cp "benchmark/reports/$GIT_SHA/comparison.md" release-bench/benchmark-comparison.md
+          TAG=${GITHUB_REF#refs/tags/}
+          VARIANT=${{ matrix.libc }}-${{ matrix.arch }}
+          mkdir -p out
+          if [ -d "benchmark/reports/$GIT_SHA" ]; then
+            tar -C "benchmark/reports/$GIT_SHA" -czf \
+              "out/bench-envelopes-${TAG}-${VARIANT}.tar.gz" .
+            if [ -f "benchmark/reports/$GIT_SHA/comparison.md" ]; then
+              cp "benchmark/reports/$GIT_SHA/comparison.md" \
+                 "out/benchmark-comparison-${VARIANT}.md"
+            else
+              echo "_No comparison report for ${VARIANT}._" \
+                > "out/benchmark-comparison-${VARIANT}.md"
+            fi
           else
-            echo "_No comparison report produced for $GIT_SHA._" > release-bench/benchmark-comparison.md
+            echo "_No sweep output for ${VARIANT}._" \
+              > "out/benchmark-comparison-${VARIANT}.md"
           fi
 
-      - name: Upload benchmark artifact
+      - name: Upload variant artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.libc }}-${{ matrix.arch }}
+          path: out/
+          retention-days: 7
+          if-no-files-found: error
+
+  bench-aggregate:
+    name: bench aggregate, gate, commit
+    runs-on: ubuntu-24.04
+    needs: [bench-sweep]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all variant artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bench-artifacts/
+          pattern: bench-*
+
+      - name: Stage envelopes per variant
+        run: |
+          mkdir -p envelopes/glibc-amd64 envelopes/musl-amd64 \
+                   envelopes/glibc-arm64 envelopes/musl-arm64
+          for v in glibc-amd64 musl-amd64 glibc-arm64 musl-arm64; do
+            tar=$(ls "bench-artifacts/bench-${v}/bench-envelopes-"*"-${v}.tar.gz" 2>/dev/null | head -1 || true)
+            if [ -n "$tar" ]; then
+              tar -xzf "$tar" -C "envelopes/${v}"
+              echo "${v}: $(ls envelopes/${v}/*.json 2>/dev/null | wc -l) envelopes"
+            else
+              echo "${v}: no envelopes (variant did not produce data)"
+            fi
+          done
+
+      - name: Download previous release envelopes (per variant)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          PREV=$(gh release list --limit 20 \
+                   --json tagName,isDraft,publishedAt \
+                   --jq "[.[] | select(.tagName != \"$TAG\" and .isDraft == false)]
+                         | sort_by(.publishedAt) | reverse
+                         | .[0].tagName // \"\"")
+          mkdir -p prev/glibc-amd64 prev/musl-amd64 prev/glibc-arm64 prev/musl-arm64
+          if [ -z "$PREV" ]; then
+            echo "No previous release; skipping vs-prev gate"
+            exit 0
+          fi
+          echo "Previous release: $PREV"
+          mkdir -p prev-dl
+          gh release download "$PREV" --pattern 'bench-envelopes-*.tar.gz' \
+            --dir prev-dl 2>/dev/null || true
+          for f in prev-dl/*.tar.gz; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f")
+            matched=""
+            for v in glibc-amd64 musl-amd64 glibc-arm64 musl-arm64; do
+              if echo "$base" | grep -q -- "-${v}\.tar\.gz$"; then
+                tar -xzf "$f" -C "prev/${v}"
+                echo "Loaded ${v} from $base"
+                matched=1
+                break
+              fi
+            done
+            # Legacy single-variant tarball (pre-matrix releases) → glibc-amd64
+            if [ -z "$matched" ] && \
+               echo "$base" | grep -qE "^bench-envelopes-[^-]+\.tar\.gz$"; then
+              tar -xzf "$f" -C "prev/glibc-amd64"
+              echo "Loaded glibc-amd64 (legacy filename) from $base"
+            fi
+          done
+
+      - name: Run vs-prev gate per variant
+        id: vs_prev
+        run: |
+          mkdir -p reports
+          ANY=0
+          for v in glibc-amd64 musl-amd64 glibc-arm64 musl-arm64; do
+            if [ -z "$(ls envelopes/${v}/*.json 2>/dev/null)" ]; then
+              continue
+            fi
+            if [ -z "$(ls prev/${v}/*.json 2>/dev/null)" ]; then
+              echo "_Release-over-release gate skipped for ${v}: no previous envelopes._" \
+                > "reports/benchmark-vs-prev-${v}.md"
+              continue
+            fi
+            set +e
+            python3 benchmark/driver/chaos_bench_driver.py \
+              --vs-prev "prev/${v}" \
+              --vs-prev-pct 15 \
+              --md \
+              --output "reports/benchmark-vs-prev-${v}.md" \
+              "envelopes/${v}"
+            rc=$?
+            set -e
+            if [ "$rc" -eq 1 ]; then
+              echo "::error::vs-prev regression on ${v} (>15%)"
+              ANY=1
+            fi
+          done
+          echo "any_regression=$ANY" >> "$GITHUB_OUTPUT"
+
+      - name: Generate benchmark matrix
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          ARGS=""
+          for v in musl-arm64 musl-amd64 glibc-arm64 glibc-amd64; do
+            if [ -n "$(ls envelopes/${v}/*.json 2>/dev/null)" ]; then
+              ARGS="$ARGS --variant $v envelopes/${v}"
+            fi
+          done
+          python3 benchmark/driver/build_matrix.py \
+            $ARGS \
+            --output "reports/${TAG}-benchmarks.md" \
+            --version "$TAG"
+
+      - name: Stage release-bench artifacts
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          mkdir -p release-bench
+          find bench-artifacts -name 'benchmark-comparison-*.md' \
+            -exec cp {} release-bench/ \;
+          find bench-artifacts -name 'bench-envelopes-*.tar.gz' \
+            -exec cp {} release-bench/ \;
+          cp reports/benchmark-vs-prev-*.md release-bench/ 2>/dev/null || true
+          cp "reports/${TAG}-benchmarks.md" release-bench/
+
+      - name: Upload aggregate artifact
         uses: actions/upload-artifact@v4
         with:
           name: release-bench
@@ -191,9 +362,84 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-      - name: Attach benchmark report to release
+      - name: Attach reports + envelopes to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG=${GITHUB_REF#refs/tags/}
-          gh release upload "$TAG" release-bench/benchmark-comparison.md --clobber
+          for f in release-bench/*; do
+            [ -f "$f" ] || continue
+            gh release upload "$TAG" "$f" --clobber
+          done
+
+      - name: Commit benchmark matrix to main (auto-merged PR)
+        env:
+          GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          BRANCH="chore/benchmarks-${TAG}"
+          MATRIX_FILE="${TAG}-benchmarks.md"
+          git config user.name  "${{ secrets.BOT_USER_NAME }}"
+          git config user.email "${{ secrets.BOT_USER_EMAIL }}"
+          cp "release-bench/${MATRIX_FILE}" "/tmp/${MATRIX_FILE}"
+          git remote set-url origin https://x-access-token:${{ secrets.BOT_GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          git fetch origin main
+          git checkout -B "$BRANCH" origin/main
+          cp "/tmp/${MATRIX_FILE}" "${MATRIX_FILE}"
+          git add "${MATRIX_FILE}"
+          if git diff --cached --quiet; then
+            echo "No changes to ${MATRIX_FILE} — skipping PR"
+            exit 0
+          fi
+          git commit -m "docs(bench): add ${MATRIX_FILE}"
+          git push --force origin "$BRANCH"
+          gh pr create --base main --head "$BRANCH" \
+            --title "docs(bench): add ${MATRIX_FILE}" \
+            --body "Auto-generated benchmark matrix for release ${TAG}." \
+            || echo "PR may already exist; continuing"
+          gh pr merge "$BRANCH" --squash --admin --delete-branch
+
+      - name: Sync main into develop (auto-merged PR)
+        env:
+          GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          if ! gh api "repos/${{ github.repository }}/branches/develop" >/dev/null 2>&1; then
+            echo "develop branch missing; skipping sync"
+            exit 0
+          fi
+          AHEAD=$(gh api "repos/${{ github.repository }}/compare/develop...main" --jq '.ahead_by')
+          if [ "$AHEAD" = "0" ]; then
+            echo "develop already contains main; skipping sync PR"
+            exit 0
+          fi
+          gh pr create --base develop --head main \
+            --title "chore: sync main into develop after ${TAG}" \
+            --body "Auto-generated sync after release ${TAG} (changelog + benchmark matrix)." \
+            || echo "PR may already exist; continuing"
+          gh pr merge main --squash --admin
+
+      - name: Flag release as bad on regression
+        if: steps.vs_prev.outputs.any_regression == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          {
+            echo "## ⚠️ PERFORMANCE REGRESSION DETECTED"
+            echo ""
+            echo "The release-over-release benchmark gate flagged this release"
+            echo "on at least one variant: chaos-hook overhead exceeds the previous"
+            echo "release by more than 15% on at least one benchmark."
+            echo ""
+            echo "See the per-variant \`benchmark-vs-prev-*.md\` (attached) for"
+            echo "the breakdown. This release has been marked **prerelease** automatically."
+            echo ""
+            echo "---"
+            echo ""
+            gh release view "$TAG" --json body --jq '.body'
+          } > release-notes-warned.md
+          gh release edit "$TAG" \
+            --prerelease \
+            --notes-file release-notes-warned.md
+          exit 1
