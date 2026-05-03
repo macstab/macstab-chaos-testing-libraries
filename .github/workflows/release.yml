@@ -122,7 +122,34 @@ jobs:
             echo "for methodology."
           } > release-notes.md
 
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --title "chaos-testing-libraries $TAG" \
+              --notes-file release-notes.md \
+              --draft=false
+            gh release upload "$TAG" \
+              release-assets/libchaos-*.so \
+              release-assets/SHA256SUMS \
+              CHANGELOG.md \
+              --clobber
+          else
+            gh release create "$TAG" \
+              --title "chaos-testing-libraries $TAG" \
+              --notes-file release-notes.md \
+              --verify-tag \
+              release-assets/libchaos-*.so \
+              release-assets/SHA256SUMS \
+              CHANGELOG.md
+          fi
+
       - name: Open auto-merged PR with CHANGELOG.md
+        # Runs AFTER the release is published, so a PR-merge failure
+        # (conflicts, perms, etc.) does not block the release itself.
         env:
           GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
         run: |
@@ -142,34 +169,23 @@ jobs:
             exit 0
           fi
           git commit -m "docs: update CHANGELOG for $TAG"
-          git push origin "$BRANCH"
-          gh pr create --base main --head "$BRANCH" \
-            --title "docs: update CHANGELOG for $TAG" \
-            --body "Auto-generated changelog update for release $TAG."
-          gh pr merge "$BRANCH" --squash --admin --delete-branch
-
-      - name: Create or update GitHub release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG=${GITHUB_REF#refs/tags/}
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" \
-              --title "chaos-testing-libraries $TAG" \
-              --notes-file release-notes.md
-            gh release upload "$TAG" \
-              release-assets/libchaos-*.so \
-              release-assets/SHA256SUMS \
-              CHANGELOG.md \
-              --clobber
-          else
-            gh release create "$TAG" \
-              --title "chaos-testing-libraries $TAG" \
-              --notes-file release-notes.md \
-              --verify-tag \
-              release-assets/libchaos-*.so \
-              release-assets/SHA256SUMS \
-              CHANGELOG.md
+          # Force-push so a stale chore/changelog-${TAG} branch from a
+          # prior failed run doesn't block the push.
+          git push --force origin "$BRANCH"
+          # Best-effort PR + merge: release is already published, so any
+          # failure here is housekeeping and must not fail the workflow.
+          if ! gh pr create --base main --head "$BRANCH" \
+                --title "docs: update CHANGELOG for $TAG" \
+                --body "Auto-generated changelog update for release $TAG." 2>/tmp/pr.err; then
+            cat /tmp/pr.err
+            echo "::warning::changelog PR could not be created — continuing"
+            exit 0
+          fi
+          if ! gh pr merge "$BRANCH" --squash --admin --delete-branch 2>/tmp/merge.err; then
+            cat /tmp/merge.err
+            echo "::warning::changelog PR could not be auto-merged — continuing"
+            gh pr merge "$BRANCH" --squash --admin --auto --delete-branch \
+              || echo "::warning::could not enable --auto either; manual resolution required"
           fi
 
   bench-sweep:
