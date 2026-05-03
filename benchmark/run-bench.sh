@@ -170,23 +170,6 @@ run_trio() {
     BENCH_ITERS="$saved"
 }
 
-# Run a baseline + 3-scenario trio for one hooked function with optional
-# per-call iter throttling.  Heavy hooks like fork/execve/getaddrinfo
-# pass an "iters" override; cheap hooks pass "" to keep BENCH_ITERS.
-# Args: bench_prefix, iters_override, binary, lib, empty_conf, conf_stem, target
-run_trio() {
-    pfx="$1"; iters="$2"; bin="$3"; lib="$4"; empty="$5"; stem="$6"; tgt="$7"
-    saved="$BENCH_ITERS"
-    [ -n "$iters" ] && BENCH_ITERS="$iters"
-    run_one "${pfx}_passthrough"    "$bin" "" "" "" baseline
-    run_one "${pfx}_passthrough"    "$bin" "$lib" "$SCEN_DIR/$empty" "$tgt" passthrough
-    run_one "${pfx}_match_no_fire"  "$bin" "" "" "" baseline
-    run_one "${pfx}_match_no_fire"  "$bin" "$lib" "$SCEN_DIR/${stem}-match-no-fire.conf" "$tgt" match-no-fire
-    run_one "${pfx}_errno"          "$bin" "" "" "" baseline
-    run_one "${pfx}_errno"          "$bin" "$lib" "$SCEN_DIR/${stem}-errno.conf" "$tgt" errno
-    BENCH_ITERS="$saved"
-}
-
 run_idx=0
 while [ "$run_idx" -lt "$runs" ]; do
     run_idx=$((run_idx + 1))
