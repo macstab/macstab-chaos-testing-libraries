@@ -7,6 +7,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: build all variants
@@ -171,7 +175,7 @@ jobs:
   bench-sweep:
     name: bench (${{ matrix.libc }}-${{ matrix.arch }})
     needs: [release]
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -198,9 +202,23 @@ jobs:
         run: echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid
 
       - name: Run benchmark sweep (${{ matrix.libc }}-${{ matrix.arch }})
+        env:
+          BENCH_WARMUP: 5000
+          BENCH_ITERS: 100000
         run: |
+          set +e
           ./benchmark/run-bench.sh \
-            --full --runs=5 --libc=${{ matrix.libc }} --compare || true
+            --full --runs=5 --libc=${{ matrix.libc }} --compare
+          rc=$?
+          set -e
+          # The comparison driver returns 1 when it detects a regression
+          # (chaos hooks always slow things down by design vs no-preload).
+          # Only that exit code is acceptable; any other non-zero means the
+          # sweep itself crashed and the rest of this cell is meaningless.
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
+            echo "::error::run-bench.sh failed with exit $rc — sweep did not produce envelopes"
+            exit "$rc"
+          fi
 
       - name: Stage variant outputs
         run: |
@@ -417,7 +435,14 @@ jobs:
             --title "chore: sync main into develop after ${TAG}" \
             --body "Auto-generated sync after release ${TAG} (changelog + benchmark matrix)." \
             || echo "PR may already exist; continuing"
-          gh pr merge main --squash --admin
+          # Try to auto-merge; if conflicts (or any other non-mergeable reason),
+          # fall back to enabling --auto so it merges once conflicts are resolved
+          # by a human, and never fail the workflow on this step.
+          if ! gh pr merge main --squash --admin 2>/tmp/merge.err; then
+            cat /tmp/merge.err
+            echo "::warning::main->develop PR could not be auto-merged (likely conflicts on develop); enabling --auto so it merges once resolved."
+            gh pr merge main --squash --admin --auto || echo "::warning::Could not enable --auto either; manual resolution required."
+          fi
 
       - name: Flag release as bad on regression
         if: steps.vs_prev.outputs.any_regression == '1'

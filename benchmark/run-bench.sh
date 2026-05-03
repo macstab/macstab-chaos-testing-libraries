@@ -139,6 +139,23 @@ run_one() {
     fi
 }
 
+# Run a baseline + 3-scenario trio for one hooked function with optional
+# per-call iter throttling.  Heavy hooks like fork/execve/getaddrinfo
+# pass an "iters" override; cheap hooks pass "" to keep BENCH_ITERS.
+# Args: bench_prefix, iters_override, binary, lib, empty_conf, conf_stem, target
+run_trio() {
+    pfx="$1"; iters="$2"; bin="$3"; lib="$4"; empty="$5"; stem="$6"; tgt="$7"
+    saved="$BENCH_ITERS"
+    [ -n "$iters" ] && BENCH_ITERS="$iters"
+    run_one "${pfx}_passthrough"    "$bin" "" "" "" baseline
+    run_one "${pfx}_passthrough"    "$bin" "$lib" "$SCEN_DIR/$empty" "$tgt" passthrough
+    run_one "${pfx}_match_no_fire"  "$bin" "" "" "" baseline
+    run_one "${pfx}_match_no_fire"  "$bin" "$lib" "$SCEN_DIR/${stem}-match-no-fire.conf" "$tgt" match-no-fire
+    run_one "${pfx}_errno"          "$bin" "" "" "" baseline
+    run_one "${pfx}_errno"          "$bin" "$lib" "$SCEN_DIR/${stem}-errno.conf" "$tgt" errno
+    BENCH_ITERS="$saved"
+}
+
 run_idx=0
 while [ "$run_idx" -lt "$runs" ]; do
     run_idx=$((run_idx + 1))
@@ -157,6 +174,8 @@ while [ "$run_idx" -lt "$runs" ]; do
         run_one clock_gettime_errno "$BIN" "" "" "" baseline
         run_one clock_gettime_errno "$BIN" "$LIB" \
                 "$SCEN_DIR/clock_gettime-errno.conf" "$TGT" errno
+        run_trio nanosleep_zero "" "$BIN" "$LIB" empty.conf time-nanosleep "$TGT"
+        run_trio usleep_zero    "" "$BIN" "$LIB" empty.conf time-usleep    "$TGT"
     fi
 
     if [ "$mode" = smoke ]; then continue; fi
@@ -165,60 +184,57 @@ while [ "$run_idx" -lt "$runs" ]; do
     BIN=/work/benchmark/build/bench_io
     LIB=/work/build/libchaos-io.so
     TGT=/tmp/.chaos-io.conf
-    run_one pread_passthrough   "$BIN" "" "" "" baseline
-    run_one pread_passthrough   "$BIN" "$LIB" "$SCEN_DIR/io-empty.conf" "$TGT" passthrough
-    run_one pread_match_no_fire "$BIN" "" "" "" baseline
-    run_one pread_match_no_fire "$BIN" "$LIB" "$SCEN_DIR/io-pread-match-no-fire.conf" "$TGT" match-no-fire
-    run_one pread_errno         "$BIN" "" "" "" baseline
-    run_one pread_errno         "$BIN" "$LIB" "$SCEN_DIR/io-pread-errno.conf" "$TGT" errno
+    run_trio pread        ""      "$BIN" "$LIB" io-empty.conf io-pread        "$TGT"
+    run_trio read         ""      "$BIN" "$LIB" io-empty.conf io-read         "$TGT"
+    run_trio write        ""      "$BIN" "$LIB" io-empty.conf io-write        "$TGT"
+    run_trio readv        ""      "$BIN" "$LIB" io-empty.conf io-readv        "$TGT"
+    run_trio writev       ""      "$BIN" "$LIB" io-empty.conf io-writev       "$TGT"
+    run_trio open_close   20000   "$BIN" "$LIB" io-empty.conf io-open-close   "$TGT"
+    run_trio openat_close 20000   "$BIN" "$LIB" io-empty.conf io-openat-close "$TGT"
+    run_trio fsync        20000   "$BIN" "$LIB" io-empty.conf io-fsync        "$TGT"
+    run_trio fdatasync    20000   "$BIN" "$LIB" io-empty.conf io-fdatasync    "$TGT"
+    run_trio ftruncate    ""      "$BIN" "$LIB" io-empty.conf io-ftruncate    "$TGT"
+    # Linux-only kernels (compiled out on Darwin); the binary returns
+    # "unknown benchmark" silently if absent — `|| true` gates that.
+    run_trio fallocate    20000   "$BIN" "$LIB" io-empty.conf io-fallocate    "$TGT" || true
+    run_trio sendfile     ""      "$BIN" "$LIB" io-empty.conf io-sendfile     "$TGT" || true
 
     # ---- libchaos-net ----------------------------------------------------
     BIN=/work/benchmark/build/bench_net
     LIB=/work/build/libchaos-net.so
     TGT=/tmp/.chaos-net.conf
-    run_one send_passthrough   "$BIN" "" "" "" baseline
-    run_one send_passthrough   "$BIN" "$LIB" "$SCEN_DIR/net-empty.conf" "$TGT" passthrough
-    run_one send_match_no_fire "$BIN" "" "" "" baseline
-    run_one send_match_no_fire "$BIN" "$LIB" "$SCEN_DIR/net-send-match-no-fire.conf" "$TGT" match-no-fire
-    run_one send_errno         "$BIN" "" "" "" baseline
-    run_one send_errno         "$BIN" "$LIB" "$SCEN_DIR/net-send-errno.conf" "$TGT" errno
+    run_trio send         ""      "$BIN" "$LIB" net-empty.conf net-send         "$TGT"
+    run_trio recv         ""      "$BIN" "$LIB" net-empty.conf net-recv         "$TGT"
+    run_trio sendto       ""      "$BIN" "$LIB" net-empty.conf net-sendto       "$TGT"
+    run_trio recvfrom     ""      "$BIN" "$LIB" net-empty.conf net-recvfrom     "$TGT"
+    run_trio sendmsg      ""      "$BIN" "$LIB" net-empty.conf net-sendmsg      "$TGT"
+    run_trio recvmsg      ""      "$BIN" "$LIB" net-empty.conf net-recvmsg      "$TGT"
+    run_trio socket_close 20000   "$BIN" "$LIB" net-empty.conf net-socket-close "$TGT"
+    run_trio shutdown     20000   "$BIN" "$LIB" net-empty.conf net-shutdown     "$TGT"
 
     # ---- libchaos-dns ----------------------------------------------------
     BIN=/work/benchmark/build/bench_dns
     LIB=/work/build/libchaos-dns.so
     TGT=/tmp/.chaos-dns.conf
-    run_one getaddrinfo_passthrough   "$BIN" "" "" "" baseline
-    run_one getaddrinfo_passthrough   "$BIN" "$LIB" "$SCEN_DIR/dns-empty.conf" "$TGT" passthrough
-    run_one getaddrinfo_match_no_fire "$BIN" "" "" "" baseline
-    run_one getaddrinfo_match_no_fire "$BIN" "$LIB" "$SCEN_DIR/dns-getaddrinfo-match-no-fire.conf" "$TGT" match-no-fire
-    run_one getaddrinfo_errno         "$BIN" "" "" "" baseline
-    run_one getaddrinfo_errno         "$BIN" "$LIB" "$SCEN_DIR/dns-getaddrinfo-errno.conf" "$TGT" errno
+    run_trio getaddrinfo 20000  "$BIN" "$LIB" dns-empty.conf dns-getaddrinfo "$TGT"
+    run_trio getnameinfo 20000  "$BIN" "$LIB" dns-empty.conf dns-getnameinfo "$TGT"
 
     # ---- libchaos-memory -------------------------------------------------
     BIN=/work/benchmark/build/bench_memory
     LIB=/work/build/libchaos-memory.so
     TGT=/tmp/.chaos-memory.conf
-    run_one madvise_passthrough   "$BIN" "" "" "" baseline
-    run_one madvise_passthrough   "$BIN" "$LIB" "$SCEN_DIR/memory-empty.conf" "$TGT" passthrough
-    run_one madvise_match_no_fire "$BIN" "" "" "" baseline
-    run_one madvise_match_no_fire "$BIN" "$LIB" "$SCEN_DIR/memory-madvise-match-no-fire.conf" "$TGT" match-no-fire
-    run_one madvise_errno         "$BIN" "" "" "" baseline
-    run_one madvise_errno         "$BIN" "$LIB" "$SCEN_DIR/memory-madvise-errno.conf" "$TGT" errno
+    run_trio madvise  ""  "$BIN" "$LIB" memory-empty.conf memory-madvise  "$TGT"
+    run_trio mprotect ""  "$BIN" "$LIB" memory-empty.conf memory-mprotect "$TGT"
+    run_trio munmap   ""  "$BIN" "$LIB" memory-empty.conf memory-munmap   "$TGT"
 
     # ---- libchaos-process ------------------------------------------------
     BIN=/work/benchmark/build/bench_process
     LIB=/work/build/libchaos-process.so
     TGT=/tmp/.chaos-process.conf
-    # pthread_create is ~10 µs/op; run with fewer iters to keep wall time reasonable.
-    SAVED_ITERS="$BENCH_ITERS"
-    BENCH_ITERS=20000
-    run_one pthread_create_passthrough   "$BIN" "" "" "" baseline
-    run_one pthread_create_passthrough   "$BIN" "$LIB" "$SCEN_DIR/process-empty.conf" "$TGT" passthrough
-    run_one pthread_create_match_no_fire "$BIN" "" "" "" baseline
-    run_one pthread_create_match_no_fire "$BIN" "$LIB" "$SCEN_DIR/process-pthread-match-no-fire.conf" "$TGT" match-no-fire
-    run_one pthread_create_errno         "$BIN" "" "" "" baseline
-    run_one pthread_create_errno         "$BIN" "$LIB" "$SCEN_DIR/process-pthread-errno.conf" "$TGT" errno
-    BENCH_ITERS="$SAVED_ITERS"
+    run_trio pthread_create  20000 "$BIN" "$LIB" process-empty.conf process-pthread "$TGT"
+    run_trio waitpid_nohang  ""    "$BIN" "$LIB" process-empty.conf process-waitpid "$TGT"
+    run_trio fork_wait       5000  "$BIN" "$LIB" process-empty.conf process-fork    "$TGT"
+    run_trio execve_short    1000  "$BIN" "$LIB" process-empty.conf process-execve  "$TGT"
 done
 
 echo ">>> [container] reports collected:"

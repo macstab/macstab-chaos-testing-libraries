@@ -53,6 +53,7 @@
 
 #include <errno.h>
 #include <time.h>
+#include <unistd.h>
 
 /**
  * @brief Per-benchmark state: a single timespec result slot.
@@ -94,3 +95,56 @@ CHAOS_BENCH("time", clock_gettime_match_no_fire,
 CHAOS_BENCH("time", clock_gettime_errno,
             bench_time_state_t,
             NULL, bench_time_iter_clock_gettime, NULL)
+
+/* ---------------------------------------------------------- nanosleep_zero ---
+ * `nanosleep` with a {0,0} timespec.  Linux returns immediately without
+ * scheduling away.  Tests the chaos hook on the cheapest possible
+ * `nanosleep` invocation.
+ */
+typedef struct bench_time_sleep_state
+{
+    struct timespec req;
+    struct timespec rem;
+    int             rc;
+} bench_time_sleep_state_t;
+
+static void bench_time_iter_nanosleep_zero(void *user_state)
+{
+    bench_time_sleep_state_t *s = (bench_time_sleep_state_t *)user_state;
+    s->req.tv_sec  = 0;
+    s->req.tv_nsec = 0;
+    s->rc = nanosleep(&s->req, &s->rem);
+    CHAOS_BENCH_DO_NOT_OPTIMIZE(s->rc);
+}
+
+CHAOS_BENCH("time", nanosleep_zero_passthrough,    bench_time_sleep_state_t,
+            NULL, bench_time_iter_nanosleep_zero, NULL)
+CHAOS_BENCH("time", nanosleep_zero_match_no_fire,  bench_time_sleep_state_t,
+            NULL, bench_time_iter_nanosleep_zero, NULL)
+CHAOS_BENCH("time", nanosleep_zero_errno,          bench_time_sleep_state_t,
+            NULL, bench_time_iter_nanosleep_zero, NULL)
+
+/* ------------------------------------------------------------- usleep_zero ---
+ * `usleep(0)` — POSIX micro-sleep with zero microseconds.  Maps onto
+ * nanosleep on Linux but goes through the libc usleep wrapper, exercising
+ * the libchaos-time `usleep` hook specifically (separate dispatch from
+ * `nanosleep`).
+ */
+typedef struct bench_time_usleep_state
+{
+    int rc;
+} bench_time_usleep_state_t;
+
+static void bench_time_iter_usleep_zero(void *user_state)
+{
+    bench_time_usleep_state_t *s = (bench_time_usleep_state_t *)user_state;
+    s->rc = usleep(0);
+    CHAOS_BENCH_DO_NOT_OPTIMIZE(s->rc);
+}
+
+CHAOS_BENCH("time", usleep_zero_passthrough,    bench_time_usleep_state_t,
+            NULL, bench_time_iter_usleep_zero, NULL)
+CHAOS_BENCH("time", usleep_zero_match_no_fire,  bench_time_usleep_state_t,
+            NULL, bench_time_iter_usleep_zero, NULL)
+CHAOS_BENCH("time", usleep_zero_errno,          bench_time_usleep_state_t,
+            NULL, bench_time_iter_usleep_zero, NULL)

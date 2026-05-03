@@ -90,3 +90,53 @@ CHAOS_BENCH("memory", madvise_match_no_fire,  bench_memory_state_t,
             bench_memory_setup, bench_memory_iter_madvise, bench_memory_teardown)
 CHAOS_BENCH("memory", madvise_errno,          bench_memory_state_t,
             bench_memory_setup, bench_memory_iter_madvise, bench_memory_teardown)
+
+/* --------------------------------------------------------------- mprotect ---
+ * Toggle PROT_READ on/off on a single page each iter.  Two calls per iter
+ * to leave the page in the original state (PROT_READ|PROT_WRITE), so
+ * iters don't drift.
+ */
+static void bench_memory_iter_mprotect(void *user_state)
+{
+    bench_memory_state_t *s = (bench_memory_state_t *)user_state;
+    int rc = mprotect(s->mapping, BENCH_MEMORY_HINT_BYTES, PROT_READ);
+    CHAOS_BENCH_DO_NOT_OPTIMIZE(rc);
+    rc = mprotect(s->mapping, BENCH_MEMORY_HINT_BYTES, PROT_READ | PROT_WRITE);
+    CHAOS_BENCH_DO_NOT_OPTIMIZE(rc);
+}
+
+CHAOS_BENCH("memory", mprotect_passthrough,    bench_memory_state_t,
+            bench_memory_setup, bench_memory_iter_mprotect, bench_memory_teardown)
+CHAOS_BENCH("memory", mprotect_match_no_fire,  bench_memory_state_t,
+            bench_memory_setup, bench_memory_iter_mprotect, bench_memory_teardown)
+CHAOS_BENCH("memory", mprotect_errno,          bench_memory_state_t,
+            bench_memory_setup, bench_memory_iter_mprotect, bench_memory_teardown)
+
+/* ----------------------------------------------------------------- munmap ---
+ * Per-iter `mmap` 1 page anonymous + immediate `munmap`.  Pairs the two
+ * but only `munmap` is hooked by libchaos-memory; the mmap is overhead.
+ */
+typedef struct bench_memory_munmap_state
+{
+    int unused;
+} bench_memory_munmap_state_t;
+
+static void bench_memory_iter_munmap(void *user_state)
+{
+    (void)user_state;
+    void *p = mmap(NULL, BENCH_MEMORY_HINT_BYTES,
+                   PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p != MAP_FAILED) {
+        int rc = munmap(p, BENCH_MEMORY_HINT_BYTES);
+        CHAOS_BENCH_DO_NOT_OPTIMIZE(rc);
+    }
+    CHAOS_BENCH_DO_NOT_OPTIMIZE(p);
+}
+
+CHAOS_BENCH("memory", munmap_passthrough,    bench_memory_munmap_state_t,
+            NULL, bench_memory_iter_munmap, NULL)
+CHAOS_BENCH("memory", munmap_match_no_fire,  bench_memory_munmap_state_t,
+            NULL, bench_memory_iter_munmap, NULL)
+CHAOS_BENCH("memory", munmap_errno,          bench_memory_munmap_state_t,
+            NULL, bench_memory_iter_munmap, NULL)
