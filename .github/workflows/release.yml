@@ -168,11 +168,27 @@ jobs:
               CHANGELOG.md
           fi
 
-  bench:
-    name: release benchmark sweep
-    runs-on: ubuntu-24.04
+  bench-sweep:
+    name: bench (${{ matrix.libc }}-${{ matrix.arch }})
     needs: [release]
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - libc: glibc
+            arch: amd64
+            runner: ubuntu-24.04
+          - libc: musl
+            arch: amd64
+            runner: ubuntu-24.04
+          - libc: glibc
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - libc: musl
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -181,29 +197,70 @@ jobs:
       - name: Lower perf_event_paranoid
         run: echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid
 
-      - name: Run full benchmark sweep
-        run: ./benchmark/run-bench.sh --full --runs=5 --compare || true
-
-      - name: Collect comparison report
+      - name: Run benchmark sweep (${{ matrix.libc }}-${{ matrix.arch }})
         run: |
-          GIT_SHA=$(git rev-parse --short HEAD)
-          mkdir -p release-bench
-          if [ -f "benchmark/reports/$GIT_SHA/comparison.md" ]; then
-            cp "benchmark/reports/$GIT_SHA/comparison.md" release-bench/benchmark-comparison.md
-          else
-            echo "_No comparison report produced for $GIT_SHA._" > release-bench/benchmark-comparison.md
-          fi
+          ./benchmark/run-bench.sh \
+            --full --runs=5 --libc=${{ matrix.libc }} --compare || true
 
-      - name: Package current envelopes
+      - name: Stage variant outputs
         run: |
           GIT_SHA=$(git rev-parse --short HEAD)
           TAG=${GITHUB_REF#refs/tags/}
+          VARIANT=${{ matrix.libc }}-${{ matrix.arch }}
+          mkdir -p out
           if [ -d "benchmark/reports/$GIT_SHA" ]; then
             tar -C "benchmark/reports/$GIT_SHA" -czf \
-              "release-bench/bench-envelopes-${TAG}.tar.gz" .
+              "out/bench-envelopes-${TAG}-${VARIANT}.tar.gz" .
+            if [ -f "benchmark/reports/$GIT_SHA/comparison.md" ]; then
+              cp "benchmark/reports/$GIT_SHA/comparison.md" \
+                 "out/benchmark-comparison-${VARIANT}.md"
+            else
+              echo "_No comparison report for ${VARIANT}._" \
+                > "out/benchmark-comparison-${VARIANT}.md"
+            fi
+          else
+            echo "_No sweep output for ${VARIANT}._" \
+              > "out/benchmark-comparison-${VARIANT}.md"
           fi
 
-      - name: Download previous release envelopes
+      - name: Upload variant artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.libc }}-${{ matrix.arch }}
+          path: out/
+          retention-days: 7
+          if-no-files-found: error
+
+  bench-aggregate:
+    name: bench aggregate, gate, commit
+    runs-on: ubuntu-24.04
+    needs: [bench-sweep]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all variant artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bench-artifacts/
+          pattern: bench-*
+
+      - name: Stage envelopes per variant
+        run: |
+          mkdir -p envelopes/glibc-amd64 envelopes/musl-amd64 \
+                   envelopes/glibc-arm64 envelopes/musl-arm64
+          for v in glibc-amd64 musl-amd64 glibc-arm64 musl-arm64; do
+            tar=$(ls "bench-artifacts/bench-${v}/bench-envelopes-"*"-${v}.tar.gz" 2>/dev/null | head -1 || true)
+            if [ -n "$tar" ]; then
+              tar -xzf "$tar" -C "envelopes/${v}"
+              echo "${v}: $(ls envelopes/${v}/*.json 2>/dev/null | wc -l) envelopes"
+            else
+              echo "${v}: no envelopes (variant did not produce data)"
+            fi
+          done
+
+      - name: Download previous release envelopes (per variant)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -213,59 +270,91 @@ jobs:
                    --jq "[.[] | select(.tagName != \"$TAG\" and .isDraft == false)]
                          | sort_by(.publishedAt) | reverse
                          | .[0].tagName // \"\"")
-          mkdir -p prev-envelopes
-          if [ -n "$PREV" ]; then
-            echo "Previous release: $PREV"
-            if gh release download "$PREV" \
-                 --pattern 'bench-envelopes-*.tar.gz' \
-                 --dir prev-envelopes 2>/dev/null; then
-              tar -xzf prev-envelopes/bench-envelopes-*.tar.gz -C prev-envelopes
-              rm -f prev-envelopes/bench-envelopes-*.tar.gz
-              echo "Loaded $(ls prev-envelopes/*.json 2>/dev/null | wc -l) envelopes from $PREV"
-            else
-              echo "No bench-envelopes asset on $PREV; skipping vs-prev gate"
-              rm -rf prev-envelopes
-              mkdir -p prev-envelopes
-            fi
-          else
-            echo "No previous release found; skipping vs-prev gate"
+          mkdir -p prev/glibc-amd64 prev/musl-amd64 prev/glibc-arm64 prev/musl-arm64
+          if [ -z "$PREV" ]; then
+            echo "No previous release; skipping vs-prev gate"
+            exit 0
           fi
+          echo "Previous release: $PREV"
+          mkdir -p prev-dl
+          gh release download "$PREV" --pattern 'bench-envelopes-*.tar.gz' \
+            --dir prev-dl 2>/dev/null || true
+          for f in prev-dl/*.tar.gz; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f")
+            matched=""
+            for v in glibc-amd64 musl-amd64 glibc-arm64 musl-arm64; do
+              if echo "$base" | grep -q -- "-${v}\.tar\.gz$"; then
+                tar -xzf "$f" -C "prev/${v}"
+                echo "Loaded ${v} from $base"
+                matched=1
+                break
+              fi
+            done
+            # Legacy single-variant tarball (pre-matrix releases) → glibc-amd64
+            if [ -z "$matched" ] && \
+               echo "$base" | grep -qE "^bench-envelopes-[^-]+\.tar\.gz$"; then
+              tar -xzf "$f" -C "prev/glibc-amd64"
+              echo "Loaded glibc-amd64 (legacy filename) from $base"
+            fi
+          done
 
-      - name: Release-over-release regression gate
+      - name: Run vs-prev gate per variant
         id: vs_prev
         run: |
-          GIT_SHA=$(git rev-parse --short HEAD)
-          if ls prev-envelopes/*.json >/dev/null 2>&1; then
+          mkdir -p reports
+          ANY=0
+          for v in glibc-amd64 musl-amd64 glibc-arm64 musl-arm64; do
+            if [ -z "$(ls envelopes/${v}/*.json 2>/dev/null)" ]; then
+              continue
+            fi
+            if [ -z "$(ls prev/${v}/*.json 2>/dev/null)" ]; then
+              echo "_Release-over-release gate skipped for ${v}: no previous envelopes._" \
+                > "reports/benchmark-vs-prev-${v}.md"
+              continue
+            fi
             set +e
             python3 benchmark/driver/chaos_bench_driver.py \
-              --vs-prev prev-envelopes \
+              --vs-prev "prev/${v}" \
               --vs-prev-pct 15 \
               --md \
-              --output release-bench/benchmark-vs-prev.md \
-              "benchmark/reports/$GIT_SHA"
+              --output "reports/benchmark-vs-prev-${v}.md" \
+              "envelopes/${v}"
             rc=$?
             set -e
-            echo "driver_rc=$rc" >> "$GITHUB_OUTPUT"
             if [ "$rc" -eq 1 ]; then
-              echo "::error::release-over-release regression detected (>15% slowdown vs previous release)"
+              echo "::error::vs-prev regression on ${v} (>15%)"
+              ANY=1
             fi
-          else
-            echo "Skipping vs-prev gate (no prev envelopes)."
-            echo "driver_rc=0" >> "$GITHUB_OUTPUT"
-            echo "_Release-over-release gate skipped: no previous release envelopes._" \
-              > release-bench/benchmark-vs-prev.md
-          fi
+          done
+          echo "any_regression=$ANY" >> "$GITHUB_OUTPUT"
 
       - name: Generate benchmark matrix
         run: |
-          GIT_SHA=$(git rev-parse --short HEAD)
           TAG=${GITHUB_REF#refs/tags/}
+          ARGS=""
+          for v in musl-arm64 musl-amd64 glibc-arm64 glibc-amd64; do
+            if [ -n "$(ls envelopes/${v}/*.json 2>/dev/null)" ]; then
+              ARGS="$ARGS --variant $v envelopes/${v}"
+            fi
+          done
           python3 benchmark/driver/build_matrix.py \
-            --variant glibc-amd64 "benchmark/reports/$GIT_SHA" \
-            --output "release-bench/${TAG}-benchmarks.md" \
+            $ARGS \
+            --output "reports/${TAG}-benchmarks.md" \
             --version "$TAG"
 
-      - name: Upload benchmark artifact
+      - name: Stage release-bench artifacts
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          mkdir -p release-bench
+          find bench-artifacts -name 'benchmark-comparison-*.md' \
+            -exec cp {} release-bench/ \;
+          find bench-artifacts -name 'bench-envelopes-*.tar.gz' \
+            -exec cp {} release-bench/ \;
+          cp reports/benchmark-vs-prev-*.md release-bench/ 2>/dev/null || true
+          cp "reports/${TAG}-benchmarks.md" release-bench/
+
+      - name: Upload aggregate artifact
         uses: actions/upload-artifact@v4
         with:
           name: release-bench
@@ -273,17 +362,15 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-      - name: Attach benchmark reports to release
+      - name: Attach reports + envelopes to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG=${GITHUB_REF#refs/tags/}
-          gh release upload "$TAG" release-bench/benchmark-comparison.md --clobber
-          gh release upload "$TAG" release-bench/benchmark-vs-prev.md --clobber
-          gh release upload "$TAG" "release-bench/${TAG}-benchmarks.md" --clobber
-          if [ -f "release-bench/bench-envelopes-${TAG}.tar.gz" ]; then
-            gh release upload "$TAG" "release-bench/bench-envelopes-${TAG}.tar.gz" --clobber
-          fi
+          for f in release-bench/*; do
+            [ -f "$f" ] || continue
+            gh release upload "$TAG" "$f" --clobber
+          done
 
       - name: Commit benchmark matrix to main (auto-merged PR)
         env:
@@ -321,7 +408,6 @@ jobs:
             echo "develop branch missing; skipping sync"
             exit 0
           fi
-          # If develop is already up-to-date with main, skip cleanly.
           AHEAD=$(gh api "repos/${{ github.repository }}/compare/develop...main" --jq '.ahead_by')
           if [ "$AHEAD" = "0" ]; then
             echo "develop already contains main; skipping sync PR"
@@ -331,11 +417,10 @@ jobs:
             --title "chore: sync main into develop after ${TAG}" \
             --body "Auto-generated sync after release ${TAG} (changelog + benchmark matrix)." \
             || echo "PR may already exist; continuing"
-          # Merge by head-branch name; --delete-branch is omitted since main must not be deleted.
           gh pr merge main --squash --admin
 
       - name: Flag release as bad on regression
-        if: steps.vs_prev.outputs.driver_rc == '1'
+        if: steps.vs_prev.outputs.any_regression == '1'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -343,12 +428,12 @@ jobs:
           {
             echo "## ⚠️ PERFORMANCE REGRESSION DETECTED"
             echo ""
-            echo "Release-over-release benchmark gate flagged this release:"
-            echo "current chaos-hook overhead exceeds the previous release by"
-            echo "more than 15% on at least one benchmark."
+            echo "The release-over-release benchmark gate flagged this release"
+            echo "on at least one variant: chaos-hook overhead exceeds the previous"
+            echo "release by more than 15% on at least one benchmark."
             echo ""
-            echo "See \`benchmark-vs-prev.md\` (attached) for the per-benchmark breakdown."
-            echo "This release has been marked **prerelease** automatically."
+            echo "See the per-variant \`benchmark-vs-prev-*.md\` (attached) for"
+            echo "the breakdown. This release has been marked **prerelease** automatically."
             echo ""
             echo "---"
             echo ""
