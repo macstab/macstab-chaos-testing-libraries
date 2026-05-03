@@ -137,6 +137,20 @@ run_one() {
                   --warmup="$BENCH_WARMUP" --iters="$BENCH_ITERS" \
                   --output="$out"
     fi
+    # Sanity check: the bench harness always writes a JSON envelope on
+    # successful completion.  Empty/missing file means the binary
+    # crashed before reaching the runner output stage — usually a chaos
+    # rule self-DOS'd a libc call at startup, a scenario syntax error,
+    # or an unknown --benchmark name.  Set -e will already have aborted
+    # on non-zero exit; this guards the "exit 0, no output" case.
+    if [ ! -s "$out" ]; then
+        echo "run-bench.sh: ERROR: $bench_name ($tag) produced no envelope" >&2
+        echo "  output:    $out" >&2
+        echo "  scenario:  ${scenario:-<none>}" >&2
+        echo "  target:    ${target:-<none>}" >&2
+        echo "  preload:   ${ld_preload:-<none>}" >&2
+        return 1
+    fi
 }
 
 # Run a baseline + 3-scenario trio for one hooked function with optional
