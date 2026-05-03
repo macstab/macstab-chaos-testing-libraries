@@ -22,9 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Update CHANGELOG for 1.0.0 ([#9](https://github.com/macstab/macstab-chaos-testing-libraries/issues/9)) ([450b48b](https://github.com/macstab/macstab-chaos-testing-libraries/commit/450b48b6e535a19e293293657e950e3204c2e200))
 - Update CHANGELOG for 1.0.0 ([#10](https://github.com/macstab/macstab-chaos-testing-libraries/issues/10)) ([433dd9b](https://github.com/macstab/macstab-chaos-testing-libraries/commit/433dd9b665d87e52bf2215fabebff6aa054b7cb7))
+- Update CHANGELOG for 1.0.0 ([#11](https://github.com/macstab/macstab-chaos-testing-libraries/issues/11)) ([ffc58a5](https://github.com/macstab/macstab-chaos-testing-libraries/commit/ffc58a519ceacf651bc143e9f517e4a6859d5ec7))
 
 ### Features
 
 - Initial release  ([ecf0e0e](https://github.com/macstab/macstab-chaos-testing-libraries/commit/ecf0e0ea16aae0ce8c94f1f0e04e05bd8484c402))
+- Add benchmark matrix generation and upload to release workflow ([ee1b015](https://github.com/macstab/macstab-chaos-testing-libraries/commit/ee1b015ea4fd19a9c1f454d3426787586d569634))
+- Add benchmarking matrix with multi-variant support to release workflow ([35a86dd](https://github.com/macstab/macstab-chaos-testing-libraries/commit/35a86dd50a4decc09111589d2817d77f165d0e90))
 
 
