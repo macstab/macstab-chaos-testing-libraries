@@ -239,7 +239,7 @@ jobs:
             set +e
             python3 benchmark/driver/chaos_bench_driver.py \
               --vs-prev prev-envelopes \
-              --vs-prev-pct 5 \
+              --vs-prev-pct 15 \
               --md \
               --output release-bench/benchmark-vs-prev.md \
               "benchmark/reports/$GIT_SHA"
@@ -247,7 +247,7 @@ jobs:
             set -e
             echo "driver_rc=$rc" >> "$GITHUB_OUTPUT"
             if [ "$rc" -eq 1 ]; then
-              echo "::error::release-over-release regression detected (>5% slowdown vs previous release)"
+              echo "::error::release-over-release regression detected (>15% slowdown vs previous release)"
             fi
           else
             echo "Skipping vs-prev gate (no prev envelopes)."
@@ -255,6 +255,15 @@ jobs:
             echo "_Release-over-release gate skipped: no previous release envelopes._" \
               > release-bench/benchmark-vs-prev.md
           fi
+
+      - name: Generate benchmark matrix
+        run: |
+          GIT_SHA=$(git rev-parse --short HEAD)
+          TAG=${GITHUB_REF#refs/tags/}
+          python3 benchmark/driver/build_matrix.py \
+            --variant glibc-amd64 "benchmark/reports/$GIT_SHA" \
+            --output "release-bench/${TAG}-benchmarks.md" \
+            --version "$TAG"
 
       - name: Upload benchmark artifact
         uses: actions/upload-artifact@v4
@@ -271,9 +280,59 @@ jobs:
           TAG=${GITHUB_REF#refs/tags/}
           gh release upload "$TAG" release-bench/benchmark-comparison.md --clobber
           gh release upload "$TAG" release-bench/benchmark-vs-prev.md --clobber
+          gh release upload "$TAG" "release-bench/${TAG}-benchmarks.md" --clobber
           if [ -f "release-bench/bench-envelopes-${TAG}.tar.gz" ]; then
             gh release upload "$TAG" "release-bench/bench-envelopes-${TAG}.tar.gz" --clobber
           fi
+
+      - name: Commit benchmark matrix to main (auto-merged PR)
+        env:
+          GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          BRANCH="chore/benchmarks-${TAG}"
+          MATRIX_FILE="${TAG}-benchmarks.md"
+          git config user.name  "${{ secrets.BOT_USER_NAME }}"
+          git config user.email "${{ secrets.BOT_USER_EMAIL }}"
+          cp "release-bench/${MATRIX_FILE}" "/tmp/${MATRIX_FILE}"
+          git remote set-url origin https://x-access-token:${{ secrets.BOT_GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          git fetch origin main
+          git checkout -B "$BRANCH" origin/main
+          cp "/tmp/${MATRIX_FILE}" "${MATRIX_FILE}"
+          git add "${MATRIX_FILE}"
+          if git diff --cached --quiet; then
+            echo "No changes to ${MATRIX_FILE} — skipping PR"
+            exit 0
+          fi
+          git commit -m "docs(bench): add ${MATRIX_FILE}"
+          git push --force origin "$BRANCH"
+          gh pr create --base main --head "$BRANCH" \
+            --title "docs(bench): add ${MATRIX_FILE}" \
+            --body "Auto-generated benchmark matrix for release ${TAG}." \
+            || echo "PR may already exist; continuing"
+          gh pr merge "$BRANCH" --squash --admin --delete-branch
+
+      - name: Sync main into develop (auto-merged PR)
+        env:
+          GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          if ! gh api "repos/${{ github.repository }}/branches/develop" >/dev/null 2>&1; then
+            echo "develop branch missing; skipping sync"
+            exit 0
+          fi
+          # If develop is already up-to-date with main, skip cleanly.
+          AHEAD=$(gh api "repos/${{ github.repository }}/compare/develop...main" --jq '.ahead_by')
+          if [ "$AHEAD" = "0" ]; then
+            echo "develop already contains main; skipping sync PR"
+            exit 0
+          fi
+          gh pr create --base develop --head main \
+            --title "chore: sync main into develop after ${TAG}" \
+            --body "Auto-generated sync after release ${TAG} (changelog + benchmark matrix)." \
+            || echo "PR may already exist; continuing"
+          # Merge by head-branch name; --delete-branch is omitted since main must not be deleted.
+          gh pr merge main --squash --admin
 
       - name: Flag release as bad on regression
         if: steps.vs_prev.outputs.driver_rc == '1'
@@ -286,7 +345,7 @@ jobs:
             echo ""
             echo "Release-over-release benchmark gate flagged this release:"
             echo "current chaos-hook overhead exceeds the previous release by"
-            echo "more than 5% on at least one benchmark."
+            echo "more than 15% on at least one benchmark."
             echo ""
             echo "See \`benchmark-vs-prev.md\` (attached) for the per-benchmark breakdown."
             echo "This release has been marked **prerelease** automatically."

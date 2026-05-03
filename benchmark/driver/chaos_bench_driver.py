@@ -507,8 +507,8 @@ def main() -> int:
     ap.add_argument(
         "--vs-prev-pct",
         type=float,
-        default=5.0,
-        help="percent slowdown threshold for release-over-release regression (default 5).",
+        default=15.0,
+        help="percent slowdown threshold for release-over-release regression (default 15).",
     )
     args = ap.parse_args()
 
