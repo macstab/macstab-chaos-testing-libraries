@@ -137,6 +137,37 @@ run_one() {
                   --warmup="$BENCH_WARMUP" --iters="$BENCH_ITERS" \
                   --output="$out"
     fi
+    # Sanity check: the bench harness always writes a JSON envelope on
+    # successful completion.  Empty/missing file means the binary
+    # crashed before reaching the runner output stage — usually a chaos
+    # rule self-DOS'd a libc call at startup, a scenario syntax error,
+    # or an unknown --benchmark name.  Set -e will already have aborted
+    # on non-zero exit; this guards the "exit 0, no output" case.
+    if [ ! -s "$out" ]; then
+        echo "run-bench.sh: ERROR: $bench_name ($tag) produced no envelope" >&2
+        echo "  output:    $out" >&2
+        echo "  scenario:  ${scenario:-<none>}" >&2
+        echo "  target:    ${target:-<none>}" >&2
+        echo "  preload:   ${ld_preload:-<none>}" >&2
+        return 1
+    fi
+}
+
+# Run a baseline + 3-scenario trio for one hooked function with optional
+# per-call iter throttling.  Heavy hooks like fork/execve/getaddrinfo
+# pass an "iters" override; cheap hooks pass "" to keep BENCH_ITERS.
+# Args: bench_prefix, iters_override, binary, lib, empty_conf, conf_stem, target
+run_trio() {
+    pfx="$1"; iters="$2"; bin="$3"; lib="$4"; empty="$5"; stem="$6"; tgt="$7"
+    saved="$BENCH_ITERS"
+    [ -n "$iters" ] && BENCH_ITERS="$iters"
+    run_one "${pfx}_passthrough"    "$bin" "" "" "" baseline
+    run_one "${pfx}_passthrough"    "$bin" "$lib" "$SCEN_DIR/$empty" "$tgt" passthrough
+    run_one "${pfx}_match_no_fire"  "$bin" "" "" "" baseline
+    run_one "${pfx}_match_no_fire"  "$bin" "$lib" "$SCEN_DIR/${stem}-match-no-fire.conf" "$tgt" match-no-fire
+    run_one "${pfx}_errno"          "$bin" "" "" "" baseline
+    run_one "${pfx}_errno"          "$bin" "$lib" "$SCEN_DIR/${stem}-errno.conf" "$tgt" errno
+    BENCH_ITERS="$saved"
 }
 
 # Run a baseline + 3-scenario trio for one hooked function with optional
