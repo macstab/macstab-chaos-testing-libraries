@@ -426,14 +426,27 @@ def _format_md(
     comparisons: list[Comparison],
     groups: "dict[str, tuple[list, list]] | None" = None,
     all_samples: "list[BenchSample] | None" = None,
+    mode: str = "baseline-vs-treat",
 ) -> str:
     arch = _detect_arch(all_samples or [])
     ref_name, ref_ghz = _ref_cpu(arch)
 
+    if mode == "vs-prev":
+        title = "chaos-testing-libraries Benchmark — Release-over-release"
+        intro = (
+            "Compares LD_PRELOAD'd runs in the **current release** against the "
+            "**previous release**. Used as the release-gating signal."
+        )
+        col_a, col_b = "Prev release P50 (ns)", "Current release P50 (ns)"
+    else:
+        title = "chaos-testing-libraries Benchmark — Baseline vs LD_PRELOAD"
+        intro = "Compares LD_PRELOAD'd runs against raw libc calls (baseline)."
+        col_a, col_b = "Baseline P50 (ns)", "LD_PRELOAD P50 (ns)"
+
     lines = [
-        "# chaos-testing-libraries Benchmark — Baseline vs LD_PRELOAD",
+        f"# {title}",
         "",
-        "Compares LD_PRELOAD'd runs against raw libc calls (baseline).",
+        intro,
         "",
         "**Primary metric: CPU cycles** — hardware-counted, not affected by "
         "scheduler noise or VM jitter. Valid in Docker, CI, and bare metal.",
@@ -442,7 +455,7 @@ def _format_md(
         "",
         "## Regression summary (P50 delta)",
         "",
-        "| Benchmark | Baseline P50 (ns) | LD_PRELOAD P50 (ns) | Δ (ns) | Δ (%) | p-value | r | 95% CI Δ (ns) | Note |",
+        f"| Benchmark | {col_a} | {col_b} | Δ (ns) | Δ (%) | p-value | r | 95% CI Δ (ns) | Note |",
         "|---|---:|---:|---:|---:|---:|---:|---|---|",
     ]
     for c in sorted(comparisons, key=lambda x: x.benchmark):
@@ -478,12 +491,25 @@ def _format_json(comparisons: list[Comparison]) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="A/B comparison driver for chaos bench JSON envelopes.")
-    ap.add_argument("input_dir", help="directory of *.json envelopes")
+    ap.add_argument("input_dir", help="directory of *.json envelopes (current sweep)")
     ap.add_argument("--output", help="output file (default: stdout)")
     ap.add_argument("--md", action="store_true", help="emit Markdown instead of JSON")
     ap.add_argument("--regression-p", type=float, default=0.01)
     ap.add_argument("--regression-r", type=float, default=0.5)
     ap.add_argument("--regression-pct", type=float, default=3.0)
+    ap.add_argument(
+        "--vs-prev",
+        help=(
+            "directory of envelopes from the previous release; switches driver "
+            "to release-over-release mode (compares treatment-vs-treatment)."
+        ),
+    )
+    ap.add_argument(
+        "--vs-prev-pct",
+        type=float,
+        default=5.0,
+        help="percent slowdown threshold for release-over-release regression (default 5).",
+    )
     args = ap.parse_args()
 
     envelopes = _load_dir(args.input_dir)
@@ -496,6 +522,65 @@ def main() -> int:
         s = _to_sample(env, str(path_idx))
         if s is not None:
             samples.append(s)
+
+    if args.vs_prev:
+        prev_envelopes = _load_dir(args.vs_prev)
+        if not prev_envelopes:
+            print(
+                f"chaos_bench_driver: no envelopes in --vs-prev {args.vs_prev} "
+                "(first release? skipping gate)",
+                file=sys.stderr,
+            )
+            # Write an explicit "skipped" report so the workflow has something to attach.
+            skipped = (
+                "# Release-over-release benchmark gate — skipped\n\n"
+                "_No envelopes found from a previous release; nothing to compare against._\n"
+            )
+            if args.output:
+                with open(args.output, "w", encoding="utf-8") as fh:
+                    fh.write(skipped)
+            return 0
+
+        prev_samples: list[BenchSample] = []
+        for idx, env in enumerate(prev_envelopes):
+            s = _to_sample(env, f"prev:{idx}")
+            if s is not None and s.is_treatment:
+                prev_samples.append(s)
+        curr_treat = [s for s in samples if s.is_treatment]
+
+        by_prev: dict[str, list[BenchSample]] = {}
+        by_curr: dict[str, list[BenchSample]] = {}
+        for s in prev_samples:
+            by_prev.setdefault(s.benchmark, []).append(s)
+        for s in curr_treat:
+            by_curr.setdefault(s.benchmark, []).append(s)
+
+        common = sorted(set(by_prev) & set(by_curr))
+        comparisons: list[Comparison] = []
+        breakdown_groups: dict[str, tuple[list, list]] = {}
+        for name in common:
+            comparisons.append(_compare(
+                name, by_prev[name], by_curr[name],
+                args.regression_p, args.regression_r, args.vs_prev_pct,
+            ))
+            breakdown_groups[name] = (by_prev[name], by_curr[name])
+
+        rendered = (
+            _format_md(
+                comparisons,
+                groups=breakdown_groups,
+                all_samples=prev_samples + curr_treat,
+                mode="vs-prev",
+            )
+            if args.md
+            else _format_json(comparisons)
+        )
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as fh:
+                fh.write(rendered)
+        else:
+            sys.stdout.write(rendered)
+        return 1 if any(c.regression for c in comparisons) else 0
 
     by_name: dict[str, dict[str, list[BenchSample]]] = {}
     for s in samples:

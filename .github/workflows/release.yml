@@ -182,7 +182,7 @@ jobs:
         run: echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid
 
       - name: Run full benchmark sweep
-        run: ./benchmark/run-bench.sh --full --runs=5 --compare
+        run: ./benchmark/run-bench.sh --full --runs=5 --compare || true
 
       - name: Collect comparison report
         run: |
@@ -194,6 +194,68 @@ jobs:
             echo "_No comparison report produced for $GIT_SHA._" > release-bench/benchmark-comparison.md
           fi
 
+      - name: Package current envelopes
+        run: |
+          GIT_SHA=$(git rev-parse --short HEAD)
+          TAG=${GITHUB_REF#refs/tags/}
+          if [ -d "benchmark/reports/$GIT_SHA" ]; then
+            tar -C "benchmark/reports/$GIT_SHA" -czf \
+              "release-bench/bench-envelopes-${TAG}.tar.gz" .
+          fi
+
+      - name: Download previous release envelopes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          PREV=$(gh release list --limit 20 \
+                   --json tagName,isDraft,publishedAt \
+                   --jq "[.[] | select(.tagName != \"$TAG\" and .isDraft == false)]
+                         | sort_by(.publishedAt) | reverse
+                         | .[0].tagName // \"\"")
+          mkdir -p prev-envelopes
+          if [ -n "$PREV" ]; then
+            echo "Previous release: $PREV"
+            if gh release download "$PREV" \
+                 --pattern 'bench-envelopes-*.tar.gz' \
+                 --dir prev-envelopes 2>/dev/null; then
+              tar -xzf prev-envelopes/bench-envelopes-*.tar.gz -C prev-envelopes
+              rm -f prev-envelopes/bench-envelopes-*.tar.gz
+              echo "Loaded $(ls prev-envelopes/*.json 2>/dev/null | wc -l) envelopes from $PREV"
+            else
+              echo "No bench-envelopes asset on $PREV; skipping vs-prev gate"
+              rm -rf prev-envelopes
+              mkdir -p prev-envelopes
+            fi
+          else
+            echo "No previous release found; skipping vs-prev gate"
+          fi
+
+      - name: Release-over-release regression gate
+        id: vs_prev
+        run: |
+          GIT_SHA=$(git rev-parse --short HEAD)
+          if ls prev-envelopes/*.json >/dev/null 2>&1; then
+            set +e
+            python3 benchmark/driver/chaos_bench_driver.py \
+              --vs-prev prev-envelopes \
+              --vs-prev-pct 5 \
+              --md \
+              --output release-bench/benchmark-vs-prev.md \
+              "benchmark/reports/$GIT_SHA"
+            rc=$?
+            set -e
+            echo "driver_rc=$rc" >> "$GITHUB_OUTPUT"
+            if [ "$rc" -eq 1 ]; then
+              echo "::error::release-over-release regression detected (>5% slowdown vs previous release)"
+            fi
+          else
+            echo "Skipping vs-prev gate (no prev envelopes)."
+            echo "driver_rc=0" >> "$GITHUB_OUTPUT"
+            echo "_Release-over-release gate skipped: no previous release envelopes._" \
+              > release-bench/benchmark-vs-prev.md
+          fi
+
       - name: Upload benchmark artifact
         uses: actions/upload-artifact@v4
         with:
@@ -202,9 +264,38 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-      - name: Attach benchmark report to release
+      - name: Attach benchmark reports to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG=${GITHUB_REF#refs/tags/}
           gh release upload "$TAG" release-bench/benchmark-comparison.md --clobber
+          gh release upload "$TAG" release-bench/benchmark-vs-prev.md --clobber
+          if [ -f "release-bench/bench-envelopes-${TAG}.tar.gz" ]; then
+            gh release upload "$TAG" "release-bench/bench-envelopes-${TAG}.tar.gz" --clobber
+          fi
+
+      - name: Flag release as bad on regression
+        if: steps.vs_prev.outputs.driver_rc == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          {
+            echo "## ⚠️ PERFORMANCE REGRESSION DETECTED"
+            echo ""
+            echo "Release-over-release benchmark gate flagged this release:"
+            echo "current chaos-hook overhead exceeds the previous release by"
+            echo "more than 5% on at least one benchmark."
+            echo ""
+            echo "See \`benchmark-vs-prev.md\` (attached) for the per-benchmark breakdown."
+            echo "This release has been marked **prerelease** automatically."
+            echo ""
+            echo "---"
+            echo ""
+            gh release view "$TAG" --json body --jq '.body'
+          } > release-notes-warned.md
+          gh release edit "$TAG" \
+            --prerelease \
+            --notes-file release-notes-warned.md
+          exit 1
