@@ -7,6 +7,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: build all variants
@@ -171,7 +175,7 @@ jobs:
   bench-sweep:
     name: bench (${{ matrix.libc }}-${{ matrix.arch }})
     needs: [release]
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -198,6 +202,9 @@ jobs:
         run: echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid
 
       - name: Run benchmark sweep (${{ matrix.libc }}-${{ matrix.arch }})
+        env:
+          BENCH_WARMUP: 5000
+          BENCH_ITERS: 100000
         run: |
           ./benchmark/run-bench.sh \
             --full --runs=5 --libc=${{ matrix.libc }} --compare || true
