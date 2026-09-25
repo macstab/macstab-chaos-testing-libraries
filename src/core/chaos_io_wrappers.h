@@ -63,8 +63,8 @@
  *         zero when no rule matched or when the fd is excluded.
  *
  * @pre  `rule != NULL`.
- * @pre  The library constructor has already resolved all `g_chaos_io_real_*`
- *       symbols.
+ * @pre  `chaos_io_ensure_symbols()` has been called, so every
+ *       `g_chaos_io_real_*` pointer is populated.
  *
  * @note Returns 0 (passthrough) rather than propagating errors on any
  *       internal failure (config read error, fd resolution failure, empty

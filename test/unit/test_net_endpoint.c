@@ -404,8 +404,11 @@ static void test_selector_parsing_and_matching(void)
  * - IPv4 address + SOCK_DGRAM → UDP4.
  * - IPv6 address + SOCK_STREAM → TCP6, port matches; truncated → false.
  * - IPv6 address + SOCK_DGRAM → UDP6.
- * - AF_UNIX with "/tmp/chaos.sock" → UNIX, path matches; empty sun_path → false;
- *   oversized unix path (beyond `CHAOS_NET_MAX_TEXT`) → false.
+ * - AF_UNIX with "/tmp/chaos.sock" → UNIX, path matches; empty sun_path → false.
+ * - AF_UNIX sun_path is bounded by address_length and by sizeof(sun_path): a fully
+ *   filled, unterminated sun_path → UNIX with exactly sizeof(sun_path) characters;
+ *   address_length == sizeof(sa_family_t) (unnamed socket) → false; a short
+ *   address_length → path truncated to what address_length covers.
  * - Local fd resolution via getsockname with IPv4/TCP4: endpoint.kind=TCP4.
  * - Peer fd resolution via getpeername with IPv4/TCP4: endpoint.kind=TCP4.
  * - `getsockopt_result=-1` → false for sockaddr_fd.
@@ -483,14 +486,44 @@ static void test_endpoint_resolution_from_sockaddr_and_fd(void)
     assert(!chaos_net_endpoint_from_sockaddr_fd(
         7, (const struct sockaddr *)&unix_address, (socklen_t)sizeof(unix_address), &endpoint
     ));
+    /* sun_path is bounded by address_length and by sizeof(sun_path) -- never by the
+     * first NUL that happens to lie after the struct in memory. Here the bytes that
+     * follow sun_path are also non-NUL, so an unbounded scan would run past the
+     * field and produce an oversized path. A completely filled, unterminated
+     * sun_path is a legal path of exactly sizeof(sun_path) characters. */
     (void)memset(&long_unix, 0, sizeof(long_unix));
     long_unix.base.sun_family = AF_UNIX;
     (void)memset(long_unix.base.sun_path, 'x', sizeof(long_unix.base.sun_path));
     (void)memset(long_unix.extra, 'x', sizeof(long_unix.extra) - 1U);
     long_unix.extra[sizeof(long_unix.extra) - 1U] = '\0';
-    assert(!chaos_net_endpoint_from_sockaddr(
+    assert(chaos_net_endpoint_from_sockaddr(
         7, (const struct sockaddr *)&long_unix, (socklen_t)sizeof(long_unix), &endpoint
     ));
+    assert(endpoint.kind == CHAOS_NET_ENDPOINT_UNIX);
+    assert(strlen(endpoint.value.text) == sizeof(long_unix.base.sun_path));
+
+    /* An unnamed socket -- socketpair(2), or one that was never bound -- reports
+     * address_length == sizeof(sa_family_t) and carries no sun_path at all. Nothing
+     * past address_length may be read, so the endpoint is not resolvable even when
+     * the memory behind the struct is non-NUL. */
+    (void)memset(&unix_address, 'x', sizeof(unix_address));
+    unix_address.sun_family = AF_UNIX;
+    assert(!chaos_net_endpoint_from_sockaddr(
+        7, (const struct sockaddr *)&unix_address, (socklen_t)sizeof(sa_family_t), &endpoint
+    ));
+
+    /* A caller may supply a sun_path with no NUL terminator as long as
+     * address_length accounts for exactly the path bytes; the path ends there. */
+    (void)memset(&unix_address, 'x', sizeof(unix_address));
+    unix_address.sun_family = AF_UNIX;
+    (void)memcpy(unix_address.sun_path, "/tmp/a.sock", 11U);
+    assert(chaos_net_endpoint_from_sockaddr(
+        7,
+        (const struct sockaddr *)&unix_address,
+        (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 11U),
+        &endpoint
+    ));
+    assert(strcmp(endpoint.value.text, "/tmp/a.sock") == 0);
 
     (void)memcpy(&g_stub_sockname_storage, &ipv4, sizeof(ipv4));
     g_stub_sockname_length = (socklen_t)sizeof(ipv4);

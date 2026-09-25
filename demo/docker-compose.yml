@@ -1,0 +1,211 @@
+# Macstab Chaos Stack 00-1 — runnable demos, one docker compose PROFILE per fault.
+#
+#   export CHAOS_REPO=/path/to/chaos-testing-libraries      # source checkout (defaults below)
+#   docker compose -f demo/docker-compose.yml run --rm mem1
+#   docker compose -f demo/docker-compose.yml run --rm io1
+#   ... etc. Profiles: io1 io2 io3 net1 net2 net3 dns1 dns2 dns3 time1 time2 mem1 mem2 proc1 proc2
+#   (io3 / net3 / dns3 are the exact faults written up in the blog: torn WAL, mid-stream reset, OVERRIDE.)
+#
+# The `build` service (no profile) always runs: it compiles all six .so from source into a
+# shared volume — guaranteed to work on any host with Docker, no published release required.
+# Every target image is Debian-bookworm (glibc), matching the built objects.
+name: chaos-00-1-demo
+
+x-probe: &probe
+  image: gcc:bookworm
+  depends_on:
+    build: { condition: service_completed_successfully }
+  volumes:
+    - "chaoslibs:/libs:ro"
+    - "./probes:/probes:ro"
+
+services:
+  build:
+    image: gcc:bookworm
+    volumes:
+      - "${CHAOS_REPO:-..}:/src"
+      - "chaoslibs:/libs"
+    working_dir: /src
+    command: bash -lc "rm -f build/libchaos-*.so; make native && cp build/libchaos-*.so /libs/ && ls -1 /libs"
+
+  # ---- io ----
+  io1:                                   # a read that returns EIO
+    <<: *probe
+    profiles: ["io1"]
+    command:
+      - bash
+      - -lc
+      - |
+        mkdir -p /data && echo 'durable, right?' > /data/f
+        printf '/data:read:EIO:1.0\n' > /tmp/.chaos-io.conf
+        echo '# baseline:'; cat /data/f
+        echo '# with libchaos-io:'; LD_PRELOAD=/libs/libchaos-io.so cat /data/f || true
+
+  io2:                                   # bit-flip on read → checksum mismatch
+    <<: *probe
+    profiles: ["io2"]
+    command:
+      - bash
+      - -lc
+      - |
+        mkdir -p /data
+        printf '/data:read:CORRUPT:0.5\n' > /tmp/.chaos-io.conf
+        gcc -O2 -o /io /probes/io_check.c
+        exec env LD_PRELOAD=/libs/libchaos-io.so /io
+
+  io3:                                   # torn write → short count (blog fault 1)
+    <<: *probe
+    profiles: ["io3"]
+    command:
+      - bash
+      - -lc
+      - |
+        mkdir -p /data
+        printf '/data:write:TORN:1.0\n' > /tmp/.chaos-io.conf
+        gcc -O2 -o /io /probes/io_torn.c
+        exec env LD_PRELOAD=/libs/libchaos-io.so /io
+
+  # ---- net ----
+  net1:                                  # connect() refused (no server needed)
+    <<: *probe
+    profiles: ["net1"]
+    command:
+      - bash
+      - -lc
+      - |
+        printf 'tcp4://127.0.0.1:6379:connect:ECONNREFUSED:1.0\n' > /tmp/.chaos-net.conf
+        gcc -O2 -o /net /probes/net_connect.c
+        exec env LD_PRELOAD=/libs/libchaos-net.so /net 127.0.0.1 6379
+
+  net2:                                  # a connection that HANGS and times out (vs net1's instant refusal)
+    <<: *probe
+    profiles: ["net2"]
+    command:
+      - bash
+      - -lc
+      - |
+        printf 'tcp4://127.0.0.1:6379:connect:ETIMEDOUT:1.0\n' > /tmp/.chaos-net.conf
+        gcc -O2 -o /net /probes/net_connect.c
+        exec env LD_PRELOAD=/libs/libchaos-net.so /net 127.0.0.1 6379
+
+  net3:                                  # one send() on a live session → ECONNRESET (blog fault 2)
+    <<: *probe
+    profiles: ["net3"]
+    command:
+      - bash
+      - -lc
+      - |
+        printf 'tcp4://*:9092:send:ECONNRESET:1.0\n' > /tmp/.chaos-net.conf
+        gcc -O2 -o /tmp/srv /probes/net_server.c
+        gcc -O2 -o /tmp/cli /probes/net_send.c
+        /tmp/srv 9092 &                    # server WITHOUT preload — only the client's send faults
+        sleep 1
+        echo '# connection establishes, then the first send() is reset:'
+        exec env LD_PRELOAD=/libs/libchaos-net.so /tmp/cli 127.0.0.1 9092
+
+  # ---- dns ----
+  dns1:                                  # rewrite example.com → localhost
+    <<: *probe
+    profiles: ["dns1"]
+    command:
+      - bash
+      - -lc
+      - |
+        printf 'dns://example.com:REWRITE:localhost\n' > /tmp/.chaos-dns.conf
+        echo '# asked for example.com, resolves to:'
+        LD_PRELOAD=/libs/libchaos-dns.so getent ahosts example.com || true
+
+  dns2:                                  # transient EAI_AGAIN
+    <<: *probe
+    profiles: ["dns2"]
+    command:
+      - bash
+      - -lc
+      - |
+        printf 'dns://example.com:EAI_AGAIN:1.0\n' > /tmp/.chaos-dns.conf
+        LD_PRELOAD=/libs/libchaos-dns.so getent ahosts example.com; echo "exit=$? (2 = resolution failed)"
+
+  dns3:                                  # OVERRIDE — replace the answer with a literal IP (blog fault 3)
+    <<: *probe
+    profiles: ["dns3"]
+    command:
+      - bash
+      - -lc
+      - |
+        printf 'dns://example.com:OVERRIDE:127.0.0.1\n' > /tmp/.chaos-dns.conf
+        echo '# asked for example.com, answer overridden to:'
+        LD_PRELOAD=/libs/libchaos-dns.so getent ahosts example.com || true
+
+  # ---- time ----
+  time1:                                 # CLOCK_REALTIME +1h → a fresh token reads as expired
+    <<: *probe
+    profiles: ["time1"]
+    command:
+      - bash
+      - -lc
+      - |
+        gcc -O2 -o /clk /probes/clock.c
+        base=$$(/clk)
+        printf 'clock_gettime/realtime:OFFSET:3600000\n' > /tmp/.chaos-time.conf
+        skew=$$(LD_PRELOAD=/libs/libchaos-time.so /clk)
+        echo "realtime baseline=$$base  skewed=$$skew  delta=$$((skew-base))s (expect ~3600)"
+
+  time2:                                 # CLOCK_MONOTONIC steps backward
+    <<: *probe
+    profiles: ["time2"]
+    command:
+      - bash
+      - -lc
+      - |
+        printf 'clock_gettime/monotonic:OFFSET:0\n' > /tmp/.chaos-time.conf
+        gcc -O2 -o /mono /probes/mono.c
+        exec env LD_PRELOAD=/libs/libchaos-time.so /mono
+
+  # ---- memory ----
+  mem1:                                  # anonymous mmap → ENOMEM
+    <<: *probe
+    profiles: ["mem1"]
+    command:
+      - bash
+      - -lc
+      - |
+        printf 'mmap/anon:ERRNO:ENOMEM\n' > /tmp/.chaos-memory.conf
+        gcc -O2 -o /mm /probes/mmap.c
+        exec env LD_PRELOAD=/libs/libchaos-memory.so /mm
+
+  mem2:                                  # mmap +150 ms latency
+    <<: *probe
+    profiles: ["mem2"]
+    command:
+      - bash
+      - -lc
+      - |
+        printf 'mmap:LATENCY:150\n' > /tmp/.chaos-memory.conf
+        gcc -O2 -o /mm /probes/mmap_lat.c
+        exec env LD_PRELOAD=/libs/libchaos-memory.so /mm
+
+  # ---- process ----
+  proc1:                                 # pthread_create succeeds N times, then EAGAIN
+    <<: *probe
+    profiles: ["proc1"]
+    command:
+      - bash
+      - -lc
+      - |
+        printf 'pthread_create:FAIL_AFTER:EAGAIN,8\n' > /tmp/.chaos-process.conf
+        gcc -O2 -pthread -o /th /probes/thread.c
+        exec env LD_PRELOAD=/libs/libchaos-process.so /th
+
+  proc2:                                 # execve blocked (EACCES), parent survives
+    <<: *probe
+    profiles: ["proc2"]
+    command:
+      - bash
+      - -lc
+      - |
+        printf 'execve:ERRNO:EACCES\nposix_spawn:ERRNO:EACCES\nposix_spawnp:ERRNO:EACCES\n' > /tmp/.chaos-process.conf
+        gcc -O2 -o /sp /probes/subprocess.c
+        exec env LD_PRELOAD=/libs/libchaos-process.so /sp
+
+volumes:
+  chaoslibs: {}

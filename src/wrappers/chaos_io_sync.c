@@ -71,6 +71,7 @@ CHAOS_IO_EXPORT int close(int fd)
     int rc;
     int previous;
 
+    chaos_io_ensure_symbols();
     if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_CLOSE, &rule))
     {
         previous = chaos_io_enter_internal();
@@ -119,6 +120,7 @@ CHAOS_IO_EXPORT int fsync(int fd)
     int rc;
     int previous;
 
+    chaos_io_ensure_symbols();
     if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_FSYNC, &rule))
     {
         previous = chaos_io_enter_internal();
@@ -158,6 +160,7 @@ CHAOS_IO_EXPORT int fdatasync(int fd)
     int rc;
     int previous;
 
+    chaos_io_ensure_symbols();
     if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_FDATASYNC, &rule))
     {
         previous = chaos_io_enter_internal();

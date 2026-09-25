@@ -26,6 +26,9 @@
  *   - Port values are always stored in host byte order (ntohs applied on input).
  *   - Abstract UNIX socket paths (sun_path[0] == '\0') are rejected because they
  *     cannot be represented as a printable config selector string.
+ *   - UNIX sun_path is never scanned beyond what address_length accounts for. The
+ *     field is neither guaranteed to be present (unnamed sockets report
+ *     address_length == sizeof(sa_family_t)) nor guaranteed to be NUL-terminated.
  *   - SOCK_CLOEXEC and SOCK_NONBLOCK flags are masked off the SO_TYPE result on
  *     Linux before comparing to SOCK_STREAM / SOCK_DGRAM, because some kernels
  *     return these bits set via getsockopt.
@@ -37,9 +40,26 @@
 #include "chaos_net_endpoint.h"
 
 #include <arpa/inet.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/un.h>
+
+/**
+ * @brief Compile-time assertion that a full sun_path always fits in endpoint text storage.
+ *
+ * @details chaos_net_endpoint_from_sockaddr bounds the UNIX path by sizeof(sun_path),
+ * so the copy into value.text cannot overflow as long as the destination is strictly
+ * larger (strictly, because the NUL terminator is added on top of the path bytes).
+ * Both sizes are fixed at compile time -- sun_path is 108 bytes on Linux and 104 on
+ * the BSDs, against CHAOS_NET_MAX_TEXT -- so this is checked here rather than with an
+ * unreachable runtime branch. Shrinking CHAOS_NET_MAX_TEXT below sun_path breaks the
+ * build with a negative array size instead of silently truncating paths.
+ */
+typedef char chaos_net_sun_path_fits_endpoint_text
+    [sizeof(((struct sockaddr_un *)0)->sun_path) < sizeof(((chaos_net_endpoint_t *)0)->value.text)
+         ? 1
+         : -1];
 
 /**
  * @brief Parses a decimal port number from a NUL-terminated string.
@@ -538,8 +558,11 @@ chaos_net_endpoint_kind_from_socket(int fd, sa_family_t family, chaos_net_endpoi
  *   - AF_INET6: validates address_length >= sizeof(sockaddr_in6), extracts
  *     sin6_addr and sin6_port. sin6_flowinfo and sin6_scope_id are not stored;
  *     they are not relevant for config-file matching.
- *   - AF_UNIX: copies sun_path; rejects abstract paths (sun_path[0] == '\0')
- *     and paths that would overflow value.text.
+ *   - AF_UNIX: copies sun_path, bounded by both address_length and sizeof(sun_path)
+ *     and terminated explicitly, because the field is neither guaranteed to be
+ *     present nor guaranteed to be NUL-terminated. Rejects abstract paths
+ *     (sun_path[0] == '\0') and an address_length that covers no path byte at all
+ *     (unnamed sockets report address_length == sizeof(sa_family_t)).
  *   - Other families: rejected (return 0).
  *
  * @param fd              Used for SO_TYPE query; must be a valid socket fd.
@@ -556,6 +579,9 @@ static int chaos_net_endpoint_from_sockaddr(
     const struct sockaddr_in *ipv4;
     const struct sockaddr_in6 *ipv6;
     const struct sockaddr_un *unix_address;
+    const char *path_end;
+    size_t path_max;
+    size_t path_len;
 
     if (address == NULL || endpoint == NULL || address_length < (socklen_t)sizeof(sa_family_t))
     {
@@ -596,6 +622,27 @@ static int chaos_net_endpoint_from_sockaddr(
         return 1;
     case AF_UNIX:
         unix_address = (const struct sockaddr_un *)address;
+        /* sun_path is NOT guaranteed to be NUL-terminated and is NOT guaranteed to be
+         * present at all. Two cases force a bounded scan instead of strlen():
+         *   1. Unnamed sockets (socketpair(2), or an AF_UNIX socket that was never
+         *      bound): getsockname/getpeername return address_length ==
+         *      sizeof(sa_family_t) and write no sun_path bytes at all. The caller's
+         *      sockaddr_storage is uninitialised stack, so strlen() would read
+         *      uninitialised memory and can run past the end of the object.
+         *   2. A caller may pass a sun_path that fills the field without a terminator,
+         *      as long as address_length accounts for exactly the path bytes. This is
+         *      legal on Linux, and strlen() would read past the caller's buffer.
+         * address_length therefore bounds the path; anything at or below the sun_path
+         * offset carries no path and is rejected. */
+        if ((size_t)address_length <= offsetof(struct sockaddr_un, sun_path))
+        {
+            return 0;
+        }
+        path_max = (size_t)address_length - offsetof(struct sockaddr_un, sun_path);
+        if (path_max > sizeof(unix_address->sun_path))
+        {
+            path_max = sizeof(unix_address->sun_path);
+        }
         if (!chaos_net_endpoint_kind_from_socket(fd, AF_UNIX, &endpoint->kind))
         {
             return 0;
@@ -606,12 +653,14 @@ static int chaos_net_endpoint_from_sockaddr(
         {
             return 0;
         }
-        if (strlen(unix_address->sun_path) >= sizeof(endpoint->value.text))
-        {
-            return 0;
-        }
-        (void
-        )memcpy(endpoint->value.text, unix_address->sun_path, strlen(unix_address->sun_path) + 1U);
+        /* memchr rather than strnlen: it is C89 and carries no feature-test
+         * visibility question across the glibc/musl build matrix. */
+        path_end = (const char *)memchr(unix_address->sun_path, '\0', path_max);
+        path_len = path_end != NULL ? (size_t)(path_end - unix_address->sun_path) : path_max;
+        /* No length check: path_len <= sizeof(sun_path), which
+         * chaos_net_sun_path_fits_endpoint_text asserts is smaller than value.text. */
+        (void)memcpy(endpoint->value.text, unix_address->sun_path, path_len);
+        endpoint->value.text[path_len] = '\0';
         return 1;
     default:
         return 0;

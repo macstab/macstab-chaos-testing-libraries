@@ -372,6 +372,7 @@ CHAOS_IO_EXPORT int open(const char *path, int flags, ...)
     int has_mode;
     int fd;
 
+    chaos_io_ensure_symbols();
     has_mode = chaos_io_open_needs_mode(flags);
 
     if (has_mode != 0)
@@ -436,6 +437,7 @@ CHAOS_IO_EXPORT int openat(int dirfd, const char *path, int flags, ...)
     int has_mode;
     int fd;
 
+    chaos_io_ensure_symbols();
     has_mode = chaos_io_open_needs_mode(flags);
     if (has_mode != 0)
     {

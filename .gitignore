@@ -4,3 +4,4 @@ dist/
 *.gcov
 .idea/
 .claude/
+__pycache__/
