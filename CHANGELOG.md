@@ -9,17 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - **ci:** Fixing the workflow ([#3](https://github.com/macstab/macstab-chaos-testing-libraries/issues/3)) ([4f38268](https://github.com/macstab/macstab-chaos-testing-libraries/commit/4f38268e9e8eedb2ff9ed47037e3bbc01a6363c6))
+- Make release workable ([#7](https://github.com/macstab/macstab-chaos-testing-libraries/issues/7)) ([68429c4](https://github.com/macstab/macstab-chaos-testing-libraries/commit/68429c4d65a6a25bf7613f1222e0f73105f64120))
 - Correct release ([#8](https://github.com/macstab/macstab-chaos-testing-libraries/issues/8)) ([6b0a232](https://github.com/macstab/macstab-chaos-testing-libraries/commit/6b0a232a341574a14f1aa05f2792bae5daa0bc22))
 - Refactor release workflow to improve changelog automation and remove unused bot token checks. ([11646f1](https://github.com/macstab/macstab-chaos-testing-libraries/commit/11646f109d340d0848c4496bcd9988ed99c16e1e))
 - Refactor release workflow to improve changelog automation and remove unused bot token checks. ([f58fedb](https://github.com/macstab/macstab-chaos-testing-libraries/commit/f58fedb55671383ffcef1880893552bdc875b736))
 - Add release-over-release benchmarking and regression gating to release workflow ([9c72734](https://github.com/macstab/macstab-chaos-testing-libraries/commit/9c72734045f5803ab57a6e959a72a4aebe4af513))
-- Make release workable ([#7](https://github.com/macstab/macstab-chaos-testing-libraries/issues/7)) ([68429c4](https://github.com/macstab/macstab-chaos-testing-libraries/commit/68429c4d65a6a25bf7613f1222e0f73105f64120))
 - Scope chaos rules to target-specific patterns to avoid matching harness calls ([7d2f39d](https://github.com/macstab/macstab-chaos-testing-libraries/commit/7d2f39d416504da6f9e5dae6c2de0b4e15740e48))
+- Improve changelog PR creation to handle post-release automation edge cases ([4b93329](https://github.com/macstab/macstab-chaos-testing-libraries/commit/4b93329c158b7c8fa0cce37e29b4e75cb802299e))
+- **net:** Bound UNIX sun_path scan by address_length ([7140af3](https://github.com/macstab/macstab-chaos-testing-libraries/commit/7140af3e92af0937b8427c7c2f95a31913ed41d7))
 
 ### CI
 
-- Use semver glob tag trigger without v prefix ([#5](https://github.com/macstab/macstab-chaos-testing-libraries/issues/5)) ([#6](https://github.com/macstab/macstab-chaos-testing-libraries/issues/6)) ([9065d2a](https://github.com/macstab/macstab-chaos-testing-libraries/commit/9065d2ae260b8237ce66fc7dad9999b4300aa336))
 - Use semver glob tag trigger without v prefix ([#5](https://github.com/macstab/macstab-chaos-testing-libraries/issues/5)) ([724dd81](https://github.com/macstab/macstab-chaos-testing-libraries/commit/724dd81dd1fa2fd77bc673242ee6a424da146ab9))
+- Use semver glob tag trigger without v prefix ([#5](https://github.com/macstab/macstab-chaos-testing-libraries/issues/5)) ([#6](https://github.com/macstab/macstab-chaos-testing-libraries/issues/6)) ([9065d2a](https://github.com/macstab/macstab-chaos-testing-libraries/commit/9065d2ae260b8237ce66fc7dad9999b4300aa336))
 
 ### Documentation
 
@@ -32,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **bench:** Add 1.0.0-benchmarks.md ([#16](https://github.com/macstab/macstab-chaos-testing-libraries/issues/16)) ([3be92ac](https://github.com/macstab/macstab-chaos-testing-libraries/commit/3be92ac243557c412791792db871b6955948870c))
 - **bench:** Add 1.0.0-benchmarks.md ([#18](https://github.com/macstab/macstab-chaos-testing-libraries/issues/18)) ([f8e468e](https://github.com/macstab/macstab-chaos-testing-libraries/commit/f8e468e1af13c727c4c76baea092f52cc50c83ad))
 - Update CHANGELOG for 1.0.0 ([#19](https://github.com/macstab/macstab-chaos-testing-libraries/issues/19)) ([b135ac5](https://github.com/macstab/macstab-chaos-testing-libraries/commit/b135ac5f18d0b5be6d38b1ca9fd4ae71dd558175))
+- Update CHANGELOG for 1.0.0 ([#20](https://github.com/macstab/macstab-chaos-testing-libraries/issues/20)) ([ba054b4](https://github.com/macstab/macstab-chaos-testing-libraries/commit/ba054b4e5c857cb01093a504ba74add672b4de87))
+- **bench:** Add 1.0.0-benchmarks.md ([#21](https://github.com/macstab/macstab-chaos-testing-libraries/issues/21)) ([41e0c2f](https://github.com/macstab/macstab-chaos-testing-libraries/commit/41e0c2f6ce9166f28f0d8b830ab3d9701bdc43f9))
+- **demo:** Add runnable per-fault demo profiles ([4162de0](https://github.com/macstab/macstab-chaos-testing-libraries/commit/4162de0d0e7ba1cdc91635ef34b9c14ed479325f))
 
 ### Features
 
@@ -44,5 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Miscellaneous
 
 - Sync main into develop after 1.0.0 ([#14](https://github.com/macstab/macstab-chaos-testing-libraries/issues/14)) ([26b8831](https://github.com/macstab/macstab-chaos-testing-libraries/commit/26b8831d4cbc739aee9bec908603344137d3d7e8))
+- Sync main into develop after 1.0.0 ([46eec28](https://github.com/macstab/macstab-chaos-testing-libraries/commit/46eec28679528989cfdddb613cf7c9b646693d3e))
+- Add Apache-2.0 LICENSE file ([9513472](https://github.com/macstab/macstab-chaos-testing-libraries/commit/9513472745a16dc8994567faa190c8e41575b0c0))
+- Ignore Python bytecode caches ([597f7c7](https://github.com/macstab/macstab-chaos-testing-libraries/commit/597f7c7d388a8c31ee8b329542da2c7ab69880d7))
+
+### Refactoring
+
+- Remove unused `run_trio` function from benchmarking script ([8429118](https://github.com/macstab/macstab-chaos-testing-libraries/commit/8429118b32a57bfe6c8e167a1d91e726ec28a2f8))
 
 
