@@ -512,7 +512,7 @@ static void test_parse_and_select_rules(void)
 {
     chaos_net_rule_t rules[7];
     chaos_net_rule_t rule;
-    chaos_net_endpoint_t endpoint;
+    chaos_net_endpoint_t endpoint = {0};
     size_t rule_count = 0U;
     char buffer[] = "tcp4://*:5432:connect:ECONNREFUSED:0.5\n"
                     "tcp4://127.0.0.1:5432:connect:LATENCY:10\n"
@@ -575,7 +575,7 @@ static void test_selection_and_buffer_edges(void)
     chaos_net_rule_t rules[CHAOS_NET_MAX_RULES];
     chaos_net_rule_t tie_rules[2];
     chaos_net_rule_t rule;
-    chaos_net_endpoint_t endpoint;
+    chaos_net_endpoint_t endpoint = {0};
     size_t rule_count = 0U;
     size_t index;
     char overflow_buffer[(CHAOS_NET_MAX_RULES + 1U) * sizeof(overflow_line)];
@@ -724,7 +724,7 @@ static void test_file_and_state_edges(void)
 {
     chaos_net_test_file_backup_t backup;
     chaos_net_rule_t rule;
-    chaos_net_endpoint_t endpoint;
+    chaos_net_endpoint_t endpoint = {0};
     FILE *file;
     size_t index;
 
@@ -802,7 +802,7 @@ static void test_prepare_and_match(void)
 {
     chaos_net_test_file_backup_t backup;
     chaos_net_rule_t rule;
-    chaos_net_endpoint_t endpoint;
+    chaos_net_endpoint_t endpoint = {0};
 
     backup_file(CHAOS_NET_CONFIG_PATH, &backup);
 

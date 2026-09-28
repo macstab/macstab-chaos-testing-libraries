@@ -257,14 +257,15 @@ typedef ssize_t (*chaos_io_copy_file_range_fn)(int, off_t *, int, off_t *, size_
  * @defgroup chaos_io_real_symbols Resolved downstream libc symbols
  * @{
  *
- * @details These globals are populated once by `chaos_io_init()` using
- * `dlsym(RTLD_NEXT, name)` before any wrapper can reach them.  After
- * construction they are effectively read-only: no wrapper ever writes to
- * them again, so no synchronization is needed for reads.
+ * @details These globals are populated by `chaos_io_ensure_symbols()` using
+ * `dlsym(RTLD_NEXT, name)`.  Once populated they are effectively read-only:
+ * nothing writes to them again, so no synchronization is needed for reads.
  *
- * All pointers default to `NULL` in BSS.  Any wrapper that observes a NULL
- * pointer before calling it indicates a constructor ordering bug and will
- * segfault intentionally rather than silently misbehave.
+ * All pointers default to `NULL` in BSS.  The library constructor alone is
+ * not a sufficient guarantee that they are set: ELF initialisers run in
+ * dependency order, so another object's constructor can reach an interposed
+ * wrapper before `chaos_io_init()` has run.  Every wrapper therefore calls
+ * `chaos_io_ensure_symbols()` before dereferencing one of these pointers.
  */
 
 extern chaos_io_read_fn g_chaos_io_real_read;           /**< Downstream `read`. */
@@ -288,6 +289,21 @@ extern chaos_io_fallocate_fn g_chaos_io_real_fallocate; /**< Downstream `falloca
 extern chaos_io_sendfile_fn g_chaos_io_real_sendfile;   /**< Downstream `sendfile` (Linux). */
 extern chaos_io_copy_file_range_fn
     g_chaos_io_real_copy_file_range; /**< Downstream `copy_file_range` (Linux). */
+
+/**
+ * @brief Ensures every downstream libc symbol is resolved.  Idempotent.
+ *
+ * @details Must be the first statement of every interposed wrapper, before any
+ * `g_chaos_io_real_*` pointer is dereferenced.  The library constructor is not
+ * a sufficient guarantee on its own: ELF initialisers run in dependency order,
+ * so another object's constructor can reach a wrapper before `chaos_io_init()`
+ * has run.  `libcap-ng` does exactly this — its initialiser performs file I/O —
+ * which made every `setpriv`, `su` and `runuser` invocation under this preload
+ * jump through a NULL pointer and abort with SIGSEGV.
+ *
+ * After the first call this is a single load and a predictable branch.
+ */
+void chaos_io_ensure_symbols(void);
 #endif
 
 /** @} */

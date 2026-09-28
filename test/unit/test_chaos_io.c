@@ -1663,10 +1663,61 @@ static void test_close_sync_and_positioned_wrappers(void)
     assert(errno == ENOSPC);
 }
 
+/**
+ * @brief Regression: wrappers must survive being reached before the constructor.
+ *
+ * @details `LD_PRELOAD` maps this object before the executable's own
+ * `DT_NEEDED` libraries, but ELF initialisers run in dependency order, so
+ * another library's constructor can call an interposed symbol while
+ * `chaos_io_init()` is still pending.  `libcap-ng` does exactly this — its
+ * initialiser performs file I/O — which made every `setpriv`, `su` and
+ * `runuser` invocation under libchaos-io abort with SIGSEGV.
+ *
+ * Each case below puts the library back into its pre-constructor state
+ * (`chaos_test_reset_state()` clears the pointer table and the ready flag),
+ * then calls a wrapper directly.  Before the fix these dereferenced NULL.
+ */
+static void test_wrappers_resolve_symbols_before_constructor(void)
+{
+    char buffer[4];
+
+    /* close(): the first wrapper libcap-ng's initialiser can reach. */
+    chaos_test_reset_state();
+    assert(g_chaos_io_real_close == NULL);
+    (void)close(13);
+    assert(g_chaos_io_real_close != NULL);
+
+    /* open(): path-based wrappers take a different entry path. */
+    chaos_test_reset_state();
+    assert(g_chaos_io_real_open == NULL);
+    (void)open("/tmp/chaos-init-order", O_RDONLY);
+    assert(g_chaos_io_real_open != NULL);
+
+    /* read()/write(): the fd-based hot path. */
+    chaos_test_reset_state();
+    assert(g_chaos_io_real_read == NULL);
+    (void)read(13, buffer, sizeof(buffer));
+    assert(g_chaos_io_real_read != NULL);
+
+    chaos_test_reset_state();
+    assert(g_chaos_io_real_write == NULL);
+    (void)write(13, "x", 1U);
+    assert(g_chaos_io_real_write != NULL);
+
+    /* Resolution is idempotent: a second call must not re-resolve or fault. */
+    chaos_test_reset_state();
+    chaos_io_ensure_symbols();
+    assert(g_chaos_io_symbols_ready == 1);
+    chaos_io_ensure_symbols();
+    assert(g_chaos_io_symbols_ready == 1);
+    assert(g_chaos_io_real_read != NULL);
+}
+
 int main(void)
 {
     test_resolve_symbol_and_seed_material();
     test_call_real_open_and_match_fd_rule();
+    test_wrappers_resolve_symbols_before_constructor();
     test_init_runtime();
     test_open_wrapper();
     test_openat_wrapper();

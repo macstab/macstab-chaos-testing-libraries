@@ -1627,6 +1627,10 @@ static void chaos_test_reset_state(void)
     g_dlerror_pending = NULL;
     g_abort_expected = 0;
     g_abort_called = 0;
+    /* Cleared alongside the pointer table so the library is returned to its
+     * pre-constructor state.  Without this a test cannot exercise the lazy
+     * resolution path in chaos_io_ensure_symbols(). */
+    g_chaos_io_symbols_ready = 0;
     g_chaos_io_real_read = NULL;
     g_chaos_io_real_write = NULL;
     g_chaos_io_real_readv = NULL;
