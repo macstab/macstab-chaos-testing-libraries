@@ -1725,11 +1725,92 @@ static void test_wrappers_resolve_symbols_before_constructor(void)
     assert(g_chaos_io_real_close != NULL);
 }
 
+/** @brief Number of threads racing on symbol resolution. */
+#define CHAOS_TEST_ENSURE_THREADS 8
+
+/** @brief Per-thread failure slots; slot @c i is written only by thread @c i. */
+static int g_ensure_worker_failed[CHAOS_TEST_ENSURE_THREADS];
+
+/** @brief Thread indices, passed by address so each worker knows its slot. */
+static int g_ensure_worker_index[CHAOS_TEST_ENSURE_THREADS];
+
+/**
+ * @brief Hammers `chaos_io_ensure_symbols()` and checks the table is fully published.
+ *
+ * @details Observing a NULL pointer after the call has returned means the
+ * readiness signal became visible before the pointer stores did — precisely the
+ * failure a non-synchronising guard permits.
+ */
+static void *chaos_test_ensure_worker(void *argument)
+{
+    const int slot = *(const int *)argument;
+    int iteration;
+
+    for (iteration = 0; iteration < 64; ++iteration)
+    {
+        chaos_io_ensure_symbols();
+        if (g_chaos_io_real_read == NULL || g_chaos_io_real_write == NULL ||
+            g_chaos_io_real_open == NULL || g_chaos_io_real_close == NULL)
+        {
+            g_ensure_worker_failed[slot] = 1;
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+/**
+ * @brief Regression: concurrent resolution must never expose a half-built table.
+ *
+ * @details `chaos_io_ensure_symbols()` is reached from every interposed wrapper
+ * on every thread, so its guard has to order the pointer stores against the
+ * readiness signal.  A plain `volatile` flag does not: on a weakly ordered
+ * architecture a second thread can observe the flag set while some stores are
+ * still invisible to it, and call through NULL.  `pthread_once` supplies the
+ * release/acquire pairing that makes this safe.
+ *
+ * A passing run cannot prove the absence of a race, but the test does fail
+ * outright if the guard is replaced by something that publishes readiness
+ * without ordering the stores behind it.
+ */
+static void test_ensure_symbols_is_thread_safe(void)
+{
+    pthread_t threads[CHAOS_TEST_ENSURE_THREADS];
+    int index;
+
+    chaos_test_reset_state();
+
+    for (index = 0; index < CHAOS_TEST_ENSURE_THREADS; ++index)
+    {
+        g_ensure_worker_failed[index] = 0;
+        g_ensure_worker_index[index] = index;
+        assert(
+            pthread_create(
+                &threads[index], NULL, chaos_test_ensure_worker, &g_ensure_worker_index[index]
+            ) == 0
+        );
+    }
+
+    for (index = 0; index < CHAOS_TEST_ENSURE_THREADS; ++index)
+    {
+        assert(pthread_join(threads[index], NULL) == 0);
+    }
+
+    for (index = 0; index < CHAOS_TEST_ENSURE_THREADS; ++index)
+    {
+        assert(g_ensure_worker_failed[index] == 0);
+    }
+
+    assert(g_chaos_io_real_read != NULL);
+    assert(g_chaos_io_real_close != NULL);
+}
+
 int main(void)
 {
     test_resolve_symbol_and_seed_material();
     test_call_real_open_and_match_fd_rule();
     test_wrappers_resolve_symbols_before_constructor();
+    test_ensure_symbols_is_thread_safe();
     test_init_runtime();
     test_open_wrapper();
     test_openat_wrapper();

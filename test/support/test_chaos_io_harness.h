@@ -61,6 +61,7 @@
 #include "../../src/config/chaos_io_fdcache.h"
 
 #include <dlfcn.h>
+#include <pthread.h>
 #include <setjmp.h>
 #include <sys/syscall.h>
 
