@@ -51,6 +51,7 @@
 
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
@@ -211,28 +212,39 @@ int chaos_io_match_fd_rule(int fd, chaos_io_operation_t operation, chaos_io_rule
     return chaos_io_config_match_loaded(operation, path, rule);
 }
 
-/* --- Library constructor --------------------------------------------------------- */
+/* --- Symbol resolution ------------------------------------------------------------ */
 
 /**
- * @brief Library constructor executed when the preload object is mapped.
+ * @brief Tracks whether every `g_chaos_io_real_*` pointer has been populated.
  *
- * @details Initialization order is fixed:
- * - resolve downstream libc symbols first
- * - establish process and current-thread PRNG state second
- * - reset config and fd-cache state last
- *
- * The ordering is required for correctness:
- * 1. `g_chaos_io_real_*` pointers must be set before any helper that calls
- *    through them (including `chaos_io_config_read_file`).
- * 2. `g_chaos_io_process_seed` must be set before `chaos_io_prng_seed_thread`
- *    so the first thread's PRNG starts from real entropy.
- * 3. `chaos_io_config_init()` resets the mtime to `CHAOS_IO_MTIME_UNKNOWN`,
- *    which triggers a fresh config read on the very first wrapper call.
- * 4. `chaos_io_fdcache_reset()` clears any residual fd-cache data from a
- *    previous constructor run (relevant in tests that reload the library).
+ * @details Written only by `chaos_io_ensure_symbols()`, and only after every
+ * pointer is in place, so a reader that observes a non-zero value is
+ * guaranteed to see a fully populated symbol table.
  */
-CHAOS_IO_CONSTRUCTOR
-static void chaos_io_init(void)
+/**
+ * @brief One-shot control guarding symbol resolution.
+ *
+ * @details `pthread_once` rather than a plain flag because the guard is read
+ * from every interposed wrapper on every thread.  A `volatile int` would order
+ * nothing: on a weakly ordered architecture (aarch64 is the one that matters
+ * here) a second thread could observe the flag set while some of the pointer
+ * stores were still invisible to it, and call through a NULL pointer — exactly
+ * the fault this whole mechanism exists to prevent.  `pthread_once` provides
+ * the release/acquire pairing that makes the completed table visible.
+ *
+ * It resolves from libc on both glibc and musl, so no `-lpthread` is required.
+ */
+static pthread_once_t g_chaos_io_symbols_once = PTHREAD_ONCE_INIT;
+
+/**
+ * @brief Resolves the full downstream libc symbol table.  Runs exactly once.
+ *
+ * @details Invoked only through `chaos_io_ensure_symbols()`.  Must not call any
+ * interposed wrapper: a wrapper would re-enter `pthread_once` on the same
+ * control and deadlock.  `dlsym(RTLD_NEXT, …)` walks the already-loaded link
+ * map and performs no file I/O, so it does not re-enter.
+ */
+static void chaos_io_resolve_all_symbols(void)
 {
     chaos_io_resolve_symbol(&g_chaos_io_real_read, "read");
     chaos_io_resolve_symbol(&g_chaos_io_real_write, "write");
@@ -255,6 +267,55 @@ static void chaos_io_init(void)
     chaos_io_resolve_symbol(&g_chaos_io_real_sendfile, "sendfile");
     chaos_io_resolve_symbol(&g_chaos_io_real_copy_file_range, "copy_file_range");
 #endif
+}
+
+/**
+ * @brief Ensures every downstream libc symbol is resolved.  Idempotent.
+ *
+ * @details The constructor cannot be relied upon to run first.  `LD_PRELOAD`
+ * maps this object before the executable's own `DT_NEEDED` libraries, but ELF
+ * initialisers execute in dependency order, so another library's constructor
+ * can reach an interposed symbol while `chaos_io_init()` is still pending.
+ * `libcap-ng` does exactly this — its initialiser performs file I/O — which
+ * made every `setpriv`, `su` and `runuser` invocation under this preload abort
+ * with SIGSEGV.
+ *
+ * Every interposed wrapper calls this before touching a `g_chaos_io_real_*`
+ * pointer.  After the first call it is an already-satisfied `pthread_once`,
+ * which is a load and a predictable branch.
+ */
+void chaos_io_ensure_symbols(void)
+{
+    (void)pthread_once(&g_chaos_io_symbols_once, chaos_io_resolve_all_symbols);
+}
+
+/* --- Library constructor --------------------------------------------------------- */
+
+/**
+ * @brief Library constructor executed when the preload object is mapped.
+ *
+ * @details Initialization order is fixed:
+ * - resolve downstream libc symbols first
+ * - establish process and current-thread PRNG state second
+ * - reset config and fd-cache state last
+ *
+ * The ordering is required for correctness:
+ * 1. `g_chaos_io_real_*` pointers must be set before any helper that calls
+ *    through them (including `chaos_io_config_read_file`).
+ * 2. `g_chaos_io_process_seed` must be set before `chaos_io_prng_seed_thread`
+ *    so the first thread's PRNG starts from real entropy.
+ * 3. `chaos_io_config_init()` resets the mtime to `CHAOS_IO_MTIME_UNKNOWN`,
+ *    which triggers a fresh config read on the very first wrapper call.
+ * 4. `chaos_io_fdcache_reset()` clears any residual fd-cache data from a
+ *    previous constructor run (relevant in tests that reload the library).
+ *
+ * Symbol resolution is delegated to `chaos_io_ensure_symbols()`, which the
+ * wrappers also call, so the table is populated whichever runs first.
+ */
+CHAOS_IO_CONSTRUCTOR
+static void chaos_io_init(void)
+{
+    chaos_io_ensure_symbols();
 
     g_chaos_io_process_seed = chaos_io_read_seed_material();
     chaos_io_prng_seed_thread(g_chaos_io_process_seed);

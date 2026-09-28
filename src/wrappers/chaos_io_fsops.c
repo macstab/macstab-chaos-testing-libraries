@@ -233,6 +233,7 @@ CHAOS_IO_EXPORT int ftruncate(int fd, off_t length)
 {
     chaos_io_rule_t rule;
 
+    chaos_io_ensure_symbols();
     if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_TRUNCATE, &rule))
     {
         return chaos_io_call_real_ftruncate(fd, length);
@@ -268,6 +269,7 @@ CHAOS_IO_EXPORT int fallocate(int fd, int mode, off_t offset, off_t length)
 {
     chaos_io_rule_t rule;
 
+    chaos_io_ensure_symbols();
     if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_ALLOCATE, &rule))
     {
         return chaos_io_call_real_fallocate(fd, mode, offset, length);
@@ -311,6 +313,7 @@ CHAOS_IO_EXPORT int unlinkat(int dirfd, const char *path, int flags)
     chaos_io_rule_t rule;
     int rc;
 
+    chaos_io_ensure_symbols();
     if (chaos_io_in_internal() ||
         !chaos_io_resolve_at_path(dirfd, path, resolved_path, sizeof(resolved_path)) ||
         chaos_io_is_excluded_path(resolved_path) || !chaos_io_config_prepare() ||
@@ -370,6 +373,7 @@ CHAOS_IO_EXPORT int renameat(int olddirfd, const char *oldpath, int newdirfd, co
     chaos_io_rule_t rule;
     int rc;
 
+    chaos_io_ensure_symbols();
     if (chaos_io_in_internal() ||
         !chaos_io_match_rename_rule(olddirfd, oldpath, newdirfd, newpath, &rule))
     {

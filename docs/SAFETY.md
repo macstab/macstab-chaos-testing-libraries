@@ -290,6 +290,23 @@ The fail-open guarantee means that removing the config file restores normal
 behaviour immediately (on the next config mtime check, which happens on the
 next interposed call).
 
+### 5.1 The One Exception: Unresolvable Symbols
+
+Fail-open covers every *operational* error. It does not cover a downstream libc
+symbol that cannot be resolved at all: `chaos_io_resolve_symbol()` calls
+`abort()` when `dlsym(RTLD_NEXT, ...)` reports a symbol missing. There is no
+real function to fall through *to*, and returning a fabricated error would
+violate the "never fabricates a synthetic failure" half of the guarantee.
+
+This path is not reachable on any supported platform — all interposed symbols
+are present in both glibc and musl. It is documented because the abort can now
+occur at the first interposed call rather than only at load time, following the
+move to lazy resolution (§ IO.md, "Symbol resolution is lazy").
+
+If you are porting to a libc that lacks one of the interposed symbols, this is
+the first thing that will bite, and it will present as the target process
+aborting rather than as a load failure.
+
 ---
 
 ## 6. Reentrancy Invariant

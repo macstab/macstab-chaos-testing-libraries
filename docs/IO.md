@@ -123,6 +123,31 @@ dynamic linker and the libc symbol table:
 - Kernel boundary: the real libc symbol eventually issues the actual system
   call sequence.
 
+### Symbol resolution is lazy, not constructor-only
+
+The library constructor is not a sufficient guarantee that the downstream
+symbol table is populated. `LD_PRELOAD` maps this object before the
+executable's own `DT_NEEDED` libraries, but ELF initialisers run in dependency
+order, so an object loaded *after* the preload can still reach an interposed
+symbol *before* `chaos_io_init()` has run.
+
+`libcap-ng` is the practical case: its initialiser performs file I/O, so under
+this preload every `setpriv`, `su` and `runuser` invocation entered a wrapper
+while the pointer table was still NULL and died with SIGSEGV.
+
+Every interposed wrapper therefore calls `chaos_io_ensure_symbols()` as its
+first action. It is idempotent and guarded by `pthread_once`, so:
+
+- resolution happens exactly once per process, whichever caller arrives first;
+- the completed table is published with release/acquire ordering. This matters
+  on weakly ordered architectures such as aarch64: a plain `volatile` flag
+  would permit a second thread to observe readiness before the pointer stores
+  became visible to it, and call through NULL;
+- after the first call the cost is one already-satisfied `pthread_once`.
+
+`pthread_once` resolves from libc on both glibc and musl, so this adds no link
+dependency.
+
 ### Dependencies
 
 Hard runtime dependencies are deliberately narrow:

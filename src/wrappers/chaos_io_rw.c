@@ -351,6 +351,7 @@ CHAOS_IO_EXPORT ssize_t read(int fd, void *buffer, size_t count)
     ssize_t rc;
     int previous;
 
+    chaos_io_ensure_symbols();
     if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_READ, &rule))
     {
         previous = chaos_io_enter_internal();
@@ -394,6 +395,7 @@ CHAOS_IO_EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
     chaos_io_rule_t rule;
     ssize_t rc;
 
+    chaos_io_ensure_symbols();
     if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_READ, &rule))
     {
         return chaos_io_call_real_readv(fd, iov, iovcnt);
@@ -436,6 +438,7 @@ CHAOS_IO_EXPORT ssize_t write(int fd, const void *buffer, size_t count)
     ssize_t rc;
     int previous;
 
+    chaos_io_ensure_symbols();
     if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_WRITE, &rule))
     {
         previous = chaos_io_enter_internal();
@@ -483,6 +486,7 @@ CHAOS_IO_EXPORT ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
 {
     chaos_io_rule_t rule;
 
+    chaos_io_ensure_symbols();
     if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_WRITE, &rule))
     {
         return chaos_io_call_real_writev(fd, iov, iovcnt);
@@ -558,6 +562,7 @@ CHAOS_IO_EXPORT ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t co
 {
     chaos_io_rule_t rule;
 
+    chaos_io_ensure_symbols();
     if (chaos_io_in_internal() || !chaos_io_match_fd_rule(out_fd, CHAOS_IO_OP_WRITE, &rule))
     {
         return chaos_io_call_real_sendfile(out_fd, in_fd, offset, count);
@@ -622,6 +627,8 @@ CHAOS_IO_EXPORT ssize_t copy_file_range(
 {
     chaos_io_rule_t rule;
 
+    chaos_io_ensure_symbols();
+
     if (chaos_io_in_internal() || !chaos_io_match_fd_rule(out_fd, CHAOS_IO_OP_WRITE, &rule))
     {
         return chaos_io_call_real_copy_file_range(
@@ -665,6 +672,7 @@ CHAOS_IO_EXPORT ssize_t pread(int fd, void *buffer, size_t count, off_t offset)
     ssize_t rc;
     int previous;
 
+    chaos_io_ensure_symbols();
     if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_PREAD, &rule))
     {
         previous = chaos_io_enter_internal();
@@ -709,6 +717,7 @@ CHAOS_IO_EXPORT ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_
     chaos_io_rule_t rule;
     ssize_t rc;
 
+    chaos_io_ensure_symbols();
     if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_PREAD, &rule))
     {
         return chaos_io_call_real_preadv(fd, iov, iovcnt, offset);
@@ -751,6 +760,7 @@ CHAOS_IO_EXPORT ssize_t pwrite(int fd, const void *buffer, size_t count, off_t o
     ssize_t rc;
     int previous;
 
+    chaos_io_ensure_symbols();
     if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_PWRITE, &rule))
     {
         previous = chaos_io_enter_internal();
@@ -797,6 +807,7 @@ CHAOS_IO_EXPORT ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off
 {
     chaos_io_rule_t rule;
 
+    chaos_io_ensure_symbols();
     if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_PWRITE, &rule))
     {
         return chaos_io_call_real_pwritev(fd, iov, iovcnt, offset);
