@@ -1680,37 +1680,49 @@ static void test_close_sync_and_positioned_wrappers(void)
 static void test_wrappers_resolve_symbols_before_constructor(void)
 {
     char buffer[4];
+    ssize_t transferred;
+    int rc;
+
+    /* Results are captured rather than cast to void: glibc marks read() and
+     * write() warn_unused_result, and a (void) cast does not suppress that
+     * under GCC.  The values themselves are irrelevant here -- the assertion
+     * is that the call resolved its symbol instead of faulting. */
 
     /* close(): the first wrapper libcap-ng's initialiser can reach. */
     chaos_test_reset_state();
     assert(g_chaos_io_real_close == NULL);
-    (void)close(13);
+    rc = close(13);
+    (void)rc;
     assert(g_chaos_io_real_close != NULL);
 
     /* open(): path-based wrappers take a different entry path. */
     chaos_test_reset_state();
     assert(g_chaos_io_real_open == NULL);
-    (void)open("/tmp/chaos-init-order", O_RDONLY);
+    rc = open("/tmp/chaos-init-order", O_RDONLY);
+    (void)rc;
     assert(g_chaos_io_real_open != NULL);
 
     /* read()/write(): the fd-based hot path. */
     chaos_test_reset_state();
     assert(g_chaos_io_real_read == NULL);
-    (void)read(13, buffer, sizeof(buffer));
+    transferred = read(13, buffer, sizeof(buffer));
+    (void)transferred;
     assert(g_chaos_io_real_read != NULL);
 
     chaos_test_reset_state();
     assert(g_chaos_io_real_write == NULL);
-    (void)write(13, "x", 1U);
+    transferred = write(13, "x", 1U);
+    (void)transferred;
     assert(g_chaos_io_real_write != NULL);
 
     /* Resolution is idempotent: a second call must not re-resolve or fault. */
     chaos_test_reset_state();
     chaos_io_ensure_symbols();
-    assert(g_chaos_io_symbols_ready == 1);
-    chaos_io_ensure_symbols();
-    assert(g_chaos_io_symbols_ready == 1);
     assert(g_chaos_io_real_read != NULL);
+    assert(g_chaos_io_real_close != NULL);
+    chaos_io_ensure_symbols();
+    assert(g_chaos_io_real_read != NULL);
+    assert(g_chaos_io_real_close != NULL);
 }
 
 int main(void)
