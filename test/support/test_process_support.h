@@ -19,9 +19,9 @@
  *   3. `CHAOS_PROCESS_TEST_DLSYM_RESULT(type, function)` -- type-safe function
  *      pointer to `void *` conversion for dlsym stubs.
  *
- * The PROCESS domain intercepts nine functions: pthread_create, fork, posix_spawn,
- * posix_spawnp, execve, execveat (Linux only), waitpid, nanosleep, and usleep.
- * The nanosleep/usleep interceptions support the LATENCY effect.
+ * The PROCESS domain intercepts pthread_create, fork, posix_spawn, posix_spawnp,
+ * execve, execveat (Linux only) and waitpid. Its LATENCY effect sleeps through
+ * chaos_sleep_ms(); see test_sleep_support.h.
  *
  * Coverage approach:
  * - Tests directly `#include` production `.c` files after symbol overrides.
@@ -76,8 +76,6 @@
     chaos_process_execve_fn g_chaos_process_real_execve = NULL;                                    \
     chaos_process_execveat_fn g_chaos_process_real_execveat = NULL;                                \
     chaos_process_waitpid_fn g_chaos_process_real_waitpid = NULL;                                  \
-    chaos_process_nanosleep_fn g_chaos_process_real_nanosleep = NULL;                              \
-    chaos_process_usleep_fn g_chaos_process_real_usleep = NULL;                                    \
     __thread int g_chaos_process_tls_guard = 0;                                                    \
     __thread uint64_t g_chaos_process_tls_prng_state = 0U;                                         \
     uint64_t g_chaos_process_process_seed = 1U;                                                    \
@@ -104,8 +102,6 @@ static inline void chaos_process_test_reset_runtime(void)
     g_chaos_process_real_execve = NULL;
     g_chaos_process_real_execveat = NULL;
     g_chaos_process_real_waitpid = NULL;
-    g_chaos_process_real_nanosleep = NULL;
-    g_chaos_process_real_usleep = NULL;
     g_chaos_process_tls_guard = 0;
     g_chaos_process_tls_prng_state = 0U;
     g_chaos_process_process_seed = 1U;

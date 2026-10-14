@@ -166,26 +166,6 @@ typedef int (*chaos_memory_mprotect_fn)(void *, size_t, int);
 /** @brief Signature of the real madvise(2). */
 typedef int (*chaos_memory_madvise_fn)(void *, size_t, int);
 
-/**
- * @brief Signature of the real nanosleep(2).
- *
- * @details
- * Used as a fallback sleep primitive when usleep is unavailable.  The
- * implementation restarts on EINTR by passing the @c rem argument back as
- * @c req.
- */
-typedef int (*chaos_memory_nanosleep_fn)(const struct timespec *, struct timespec *);
-
-/**
- * @brief Signature of the real usleep(3).
- *
- * @details
- * Preferred sleep primitive for LATENCY injection because it accepts a
- * microsecond granularity directly.  Resolved at constructor time; if NULL
- * the implementation falls back to nanosleep.
- */
-typedef int (*chaos_memory_usleep_fn)(useconds_t);
-
 /* =========================================================================
  * Resolved real-symbol pointers
  * =========================================================================
@@ -206,12 +186,6 @@ extern chaos_memory_mprotect_fn g_chaos_memory_real_mprotect;
 
 /** @brief Pointer to the real madvise(2) resolved via RTLD_NEXT. */
 extern chaos_memory_madvise_fn g_chaos_memory_real_madvise;
-
-/** @brief Pointer to the real nanosleep(2) resolved via RTLD_NEXT. */
-extern chaos_memory_nanosleep_fn g_chaos_memory_real_nanosleep;
-
-/** @brief Pointer to the real usleep(3) resolved via RTLD_NEXT. */
-extern chaos_memory_usleep_fn g_chaos_memory_real_usleep;
 
 /* =========================================================================
  * TLS reentrancy guard and PRNG state

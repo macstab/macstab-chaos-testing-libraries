@@ -6,8 +6,8 @@
  * Subsystem under test: `src/process/chaos_process.c` (the `chaos_process_init()` constructor).
  *
  * Coverage approach:
- * - All nine intercepted symbols (pthread_create, fork, posix_spawn, posix_spawnp, execve,
- *   execveat, waitpid, nanosleep, usleep) are mapped to local stubs via a test-controlled
+ * - All intercepted symbols (pthread_create, fork, posix_spawn, posix_spawnp, execve,
+ *   execveat, waitpid) are mapped to local stubs via a test-controlled
  *   `dlsym` stub.
  * - `dlerror`, `abort`, and (on Linux) `syscall` are overridden via `#define` before
  *   `chaos_process.c` is included, exercising the constructor without LD_PRELOAD.
@@ -192,21 +192,6 @@ static pid_t stub_waitpid(pid_t pid, int *status, int options)
     return pid;
 }
 
-/** @brief Stub for `nanosleep(2)`. Returns 0 (success, no sleep). */
-static int stub_nanosleep(const struct timespec *request, struct timespec *remaining)
-{
-    (void)request;
-    (void)remaining;
-    return 0;
-}
-
-/** @brief Stub for `usleep(3)`. Returns 0 (success, no sleep). */
-static int stub_usleep(useconds_t usec)
-{
-    (void)usec;
-    return 0;
-}
-
 /**
  * @brief Stub for `chaos_process_config_init()`.
  *
@@ -256,10 +241,6 @@ static void *chaos_process_test_dlsym(void *handle, const char *symbol)
         return CHAOS_PROCESS_TEST_DLSYM_RESULT(chaos_process_execveat_fn, stub_execveat);
     if (strcmp(symbol, "waitpid") == 0)
         return CHAOS_PROCESS_TEST_DLSYM_RESULT(chaos_process_waitpid_fn, stub_waitpid);
-    if (strcmp(symbol, "nanosleep") == 0)
-        return CHAOS_PROCESS_TEST_DLSYM_RESULT(chaos_process_nanosleep_fn, stub_nanosleep);
-    if (strcmp(symbol, "usleep") == 0)
-        return CHAOS_PROCESS_TEST_DLSYM_RESULT(chaos_process_usleep_fn, stub_usleep);
     return NULL;
 }
 
@@ -501,8 +482,6 @@ static void test_constructor_init(void)
     assert(g_chaos_process_real_execveat == stub_execveat);
 #endif
     assert(g_chaos_process_real_waitpid == stub_waitpid);
-    assert(g_chaos_process_real_nanosleep == stub_nanosleep);
-    assert(g_chaos_process_real_usleep == stub_usleep);
     assert(g_config_init_calls == config_calls_before + 1);
     assert(g_chaos_process_process_seed != 0U);
     assert(g_chaos_process_tls_prng_state != 0U);

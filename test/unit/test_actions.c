@@ -6,9 +6,9 @@
  * Subsystem under test: `src/effects/chaos_io_actions.c`
  *
  * Coverage approach:
- * - The production source file is included directly after replacing `usleep` with a
- *   test-controlled stub that records each sleep duration. This lets tests assert on
- *   the exact microsecond values generated for a given `latency_ms` without real sleeps.
+ * - The production source file is included after test_sleep_support.h, which replaces the
+ *   sleep system call with a stub that records each request, so tests assert on the exact
+ *   sleep generated for a given `latency_ms` without real sleeps.
  * - The `CHAOS_IO_DEFINE_TEST_GLOBALS()` macro instantiates all real-function-pointer
  *   globals required by the production action helpers.
  *
@@ -23,8 +23,8 @@
  *   flipped by index_sample=1, bit_sample=5 gives {0, 0x20, 0};
  *   `corrupt_buffer()` produces the same result as calling `corrupt_buffer_sample()`
  *   with the two next PRNG values after a common seed.
- * - Latency decomposition: 2500 ms → three usleep calls: 1 000 000 + 1 000 000 + 500 000 µs;
- *   NULL and zero-initialised rules produce no sleep calls.
+ * - Latency: 2500 ms → one sleep of {2 s, 500 ms}, resumed after EINTR with errno kept;
+ *   NULL and zero-initialised rules produce no sleep.
  * - `chaos_io_rule_should_trigger()`: NULL → 0; LATENCY effect → 1 unconditionally;
  *   ERRNO with probability=0.0 → 0; ERRNO with probability=1.0 → 1.
  * - Errno application: NULL rule → 0; zero-initialised rule → 0; probability=0.0 → 0,
@@ -41,51 +41,9 @@
 
 CHAOS_IO_DEFINE_TEST_GLOBALS();
 
-/**
- * @brief Captured usleep durations from the test-local sleep stub.
- *
- * Populated in call order. The array size (8) is deliberately small relative to the
- * maximum possible chunk count to catch excessive sleep decompositions via the assert
- * inside the stub.
- */
-static useconds_t g_sleep_chunks[8];
-/** @brief Number of usleep calls recorded since the last reset. */
-static size_t g_sleep_count = 0U;
+#include "../support/test_sleep_support.h"
 
-/**
- * @brief Test-local usleep stub that records durations instead of sleeping.
- *
- * Asserts that the call array has not overflowed. Returns 0 (success) always.
- *
- * @param usec  Sleep duration in microseconds, recorded at `g_sleep_chunks[g_sleep_count]`.
- * @return 0 (success, never fails).
- */
-static int chaos_test_usleep(useconds_t usec)
-{
-    assert(g_sleep_count < sizeof(g_sleep_chunks) / sizeof(g_sleep_chunks[0]));
-    g_sleep_chunks[g_sleep_count++] = usec;
-    return 0;
-}
-
-#define usleep chaos_test_usleep
 #include "../../src/effects/chaos_io_actions.c"
-#undef usleep
-
-/**
- * @brief Reset sleep-tracking state between test functions.
- *
- * Zeroes `g_sleep_count` and clears all recorded chunk values.
- */
-static void chaos_test_reset_sleep_state(void)
-{
-    size_t index;
-
-    g_sleep_count = 0U;
-    for (index = 0U; index < sizeof(g_sleep_chunks) / sizeof(g_sleep_chunks[0]); ++index)
-    {
-        g_sleep_chunks[index] = 0U;
-    }
-}
 
 /**
  * @brief Invariant: probability sampling produces correct 0/1 decisions at boundary and midpoint.
@@ -193,7 +151,7 @@ static void test_corrupt_helpers(void)
 }
 
 /**
- * @brief Invariant: latency decomposes into usleep chunks and trigger logic respects
+ * @brief Invariant: latency sleeps for exactly the rule's duration and trigger logic respects
  *   effect type vs probability.
  *
  * Triggering conditions:
@@ -202,8 +160,9 @@ static void test_corrupt_helpers(void)
  * - `chaos_io_rule_should_trigger()` with NULL, LATENCY, ERRNO+p=0, ERRNO+p=1.
  *
  * Expected observable behaviour:
- * - NULL rule and zero-initialised rule → `g_sleep_count == 0`.
- * - 2500 ms → exactly 3 usleep calls: 1 000 000 + 1 000 000 + 500 000 µs.
+ * - NULL rule, zero-initialised rule and 0 ms → no sleep.
+ * - 2500 ms → one sleep of {2 s, 500 ms}; an EINTR resumes with the remaining time and
+ *   leaves errno untouched.
  * - `should_trigger(NULL)` → 0.
  * - LATENCY effect → 1 (unconditional).
  * - ERRNO + probability=0.0 → 0; ERRNO + probability=1.0 → 1.
@@ -214,18 +173,31 @@ static void test_latency_and_trigger_helpers(void)
 
     (void)memset(&rule, 0, sizeof(rule));
 
-    chaos_test_reset_sleep_state();
+    chaos_test_sleep_reset();
     chaos_io_rule_apply_latency(NULL);
     chaos_io_rule_apply_latency(&rule);
-    assert(g_sleep_count == 0U);
+    assert(g_test_sleep_calls == 0U);
 
     rule.effect = CHAOS_IO_EFFECT_LATENCY;
+    chaos_io_rule_apply_latency(&rule);
+    assert(g_test_sleep_calls == 0U);
+
     rule.latency_ms = 2500U;
     chaos_io_rule_apply_latency(&rule);
-    assert(g_sleep_count == 3U);
-    assert(g_sleep_chunks[0] == 1000000U);
-    assert(g_sleep_chunks[1] == 1000000U);
-    assert(g_sleep_chunks[2] == 500000U);
+    assert(g_test_sleep_calls == 1U);
+    assert(g_test_sleep_requests[0].tv_sec == 2);
+    assert(g_test_sleep_requests[0].tv_nsec == 500000000L);
+
+    /* A signal interrupts the sleep: it resumes with the remaining time, and the
+     * caller's errno is untouched. */
+    chaos_test_sleep_reset();
+    g_test_sleep_interruptions = 1;
+    errno = 4242;
+    chaos_io_rule_apply_latency(&rule);
+    assert(errno == 4242);
+    assert(g_test_sleep_calls == 2U);
+    assert(g_test_sleep_requests[1].tv_sec == 0);
+    assert(g_test_sleep_requests[1].tv_nsec == 1000000L);
 
     assert(chaos_io_rule_should_trigger(NULL) == 0);
     assert(chaos_io_rule_should_trigger(&rule) == 1);

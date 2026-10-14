@@ -21,17 +21,16 @@
  * that would exist if a single 64-bit value were split.
  *
  * @par Latency injection:
- * usleep() is called in chunks of at most 1,000,000 µs. POSIX states that usleep()
- * with an argument >= 1,000,000 has undefined behaviour on some implementations.
- * The loop does not account for EINTR reducing the actual sleep; on EINTR, the
- * remaining time equals the full chunk. This is intentional: injected latency should
- * be approximately rule->latency_ms regardless of signal delivery.
+ * chaos_sleep_ms() sleeps with a direct clock_nanosleep system call, restarted on
+ * EINTR, so the delay is exactly rule->latency_ms and no other preloaded library
+ * can change it.
  *
  * @par Module: chaos-net
  * @par Stability: private / internal
  */
 
 #include "chaos_net_actions.h"
+#include "chaos_sleep.h"
 
 #include <errno.h>
 #include <stdint.h>
@@ -112,36 +111,19 @@ void chaos_net_corrupt_buffer(void *buffer, size_t size)
 }
 
 /**
- * @brief Sleeps for rule->latency_ms milliseconds using usleep() in 1-second chunks.
+ * @brief Applies a configured latency before the real libc call.
  *
- * @details The chunk limit of 1,000,000 µs avoids the undefined behaviour of
- * usleep(n) with n >= 1,000,000 on non-POSIX-compliant implementations (some
- * BSDs document this restriction). The loop condition `remaining_us > 0ULL`
- * terminates naturally when the full duration has elapsed. EINTR is not handled
- * explicitly; usleep() may return early on signal delivery, and the remaining
- * time calculation still yields the correct value because `remaining_us` is
- * decremented by the requested chunk, not the actual sleep.
+ * @details Sleeps with chaos_sleep_ms(), a direct system call, so that no other
+ * preloaded library (libchaos-time in particular) can shorten or lengthen the
+ * delay. The full latency always elapses, and errno is preserved.
  */
 void chaos_net_rule_apply_latency(const chaos_net_rule_t *rule)
 {
-    uint64_t remaining_us;
-    int saved_errno;
-
     if (rule == NULL || rule->effect != CHAOS_NET_EFFECT_LATENCY)
     {
         return;
     }
-
-    /* An interrupted sleep sets EINTR; the delay is ours, so the caller's errno stays. */
-    saved_errno = errno;
-    remaining_us = (uint64_t)rule->latency_ms * 1000ULL;
-    while (remaining_us > 0ULL)
-    {
-        useconds_t chunk = remaining_us > 1000000ULL ? 1000000U : (useconds_t)remaining_us;
-        (void)usleep(chunk);
-        remaining_us -= (uint64_t)chunk;
-    }
-    errno = saved_errno;
+    chaos_sleep_ms((uint64_t)rule->latency_ms);
 }
 
 /**

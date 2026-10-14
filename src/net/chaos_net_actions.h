@@ -7,7 +7,7 @@
  * This module provides the leaf-level operations that the interposition wrappers invoke
  * after a rule has been matched. Every function in this module is stateless with respect
  * to shared memory: probability samples draw from the per-thread PRNG, buffer corruption
- * operates on caller-supplied memory, and latency injection uses usleep.
+ * operates on caller-supplied memory, and latency injection uses chaos_sleep_ms().
  *
  * The module deliberately exposes both "raw sample" variants (taking an explicit
  * uint32_t random value) and "live" variants (calling the PRNG internally). The raw
@@ -109,19 +109,17 @@ void chaos_net_corrupt_buffer(void *buffer, size_t size);
 /**
  * @brief Introduces a blocking delay for the duration specified in a LATENCY rule.
  *
- * @details Calls usleep() in a loop, sleeping in chunks of at most 1 second
- * (1,000,000 µs) to avoid the implementation-defined behaviour of usleep()
- * for values >= 1,000,000 on some platforms. The loop handles the case where
- * usleep() is interrupted by a signal (EINTR): the remaining time is recalculated
- * from the original total on each iteration, so signal delivery does not reduce
- * the injected delay below rule->latency_ms.
+ * @details Sleeps with chaos_sleep_ms() (`src/common/chaos_sleep.h`): a direct clock_nanosleep
+ * system call on CLOCK_MONOTONIC, restarted on EINTR, so the full delay always
+ * elapses, errno is preserved, and no other preloaded library (libchaos-time in
+ * particular) can shorten or lengthen it.
  *
  * The function is a no-op if @p rule is NULL or rule->effect != CHAOS_NET_EFFECT_LATENCY.
  * Latency rules always fire (no probability check); the "should this fire" decision is
  * made by chaos_net_rule_should_trigger(), which returns 1 unconditionally for LATENCY.
  *
  * @param rule  Matched rule with effect == LATENCY. May be NULL (no-op).
- * @par Thread-safety: usleep is per-thread; safe.
+ * @par Thread-safety: blocks only the calling thread; safe.
  * @par Blocking: always blocks for approximately rule->latency_ms milliseconds.
  */
 void chaos_net_rule_apply_latency(const chaos_net_rule_t *rule);

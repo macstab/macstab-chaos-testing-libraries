@@ -158,20 +158,17 @@ void chaos_io_corrupt_buffer(void *buffer, size_t size);
 /**
  * @brief Applies a blocking delay for a matched latency rule.
  *
- * @details Sleeps in bounded chunks of at most one second (`usleep` accepts at
- * most 999999 µs on many implementations; the loop uses 1 000 000 µs as the
- * per-chunk cap because `useconds_t` on Linux is at least 32 bits and the
- * POSIX maximum is explicitly 1 000 000 µs).  Looping avoids the risk of an
- * overflowed `useconds_t` on platforms where the type is narrower than the
- * configured delay.
+ * @details Sleeps with chaos_sleep_ms() (`src/common/chaos_sleep.h`): a direct clock_nanosleep
+ * system call on CLOCK_MONOTONIC, restarted on EINTR, so the full delay always
+ * elapses, errno is preserved, and no other preloaded library (libchaos-time in
+ * particular) can shorten or lengthen it.
  *
  * No-op when `rule == NULL` or `rule->effect != CHAOS_IO_EFFECT_LATENCY`.
  *
  * @param[in] rule  The matched latency rule.  May be NULL.
  *
- * @note This function blocks the calling thread.  It does not enter internal
- *       mode, so `usleep` calls are visible to the reentrancy guard if `usleep`
- *       is ever interposed.  `usleep` is not currently interposed.
+ * @note This function blocks the calling thread.  The sleep enters no
+ *       interposed symbol, so it needs no internal mode.
  */
 void chaos_io_rule_apply_latency(const chaos_io_rule_t *rule);
 

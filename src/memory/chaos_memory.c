@@ -7,7 +7,7 @@
  * This translation unit owns three things:
  *
  *  1. **Global storage** for all process-wide and thread-local state declared
- *     as @c extern in chaos_memory_internal.h: the six real-symbol function
+ *     as @c extern in chaos_memory_internal.h: the real-symbol function
  *     pointers, the TLS reentrancy guard, the TLS PRNG state, and the
  *     process-wide seed.
  *
@@ -17,15 +17,12 @@
  *
  *  3. **chaos_memory_init()** — the GCC constructor that runs before main()
  *     (and before most of the application's own constructors, depending on
- *     link order).  It resolves all six real symbols, reads entropy, seeds
+ *     link order).  It resolves the real symbols, reads entropy, seeds
  *     the main-thread PRNG, and initialises the config subsystem.
  *
  * @par Invariants
  * After chaos_memory_init() returns:
  *  - g_chaos_memory_real_mmap, _munmap, _mprotect, _madvise are non-NULL.
- *  - g_chaos_memory_real_nanosleep and _usleep may be NULL only if libc does
- *    not export those symbols (practically never); the latency action handles
- *    NULL gracefully.
  *  - g_chaos_memory_process_seed is non-zero.
  *  - The main thread's TLS PRNG is seeded.
  *  - The config subsystem is in a clean, zero-rule state ready for its first
@@ -76,12 +73,6 @@ chaos_memory_mprotect_fn g_chaos_memory_real_mprotect = NULL;
 
 /** @brief Real madvise(2) function pointer, resolved via RTLD_NEXT at startup. */
 chaos_memory_madvise_fn g_chaos_memory_real_madvise = NULL;
-
-/** @brief Real nanosleep(2) function pointer, resolved via RTLD_NEXT at startup. */
-chaos_memory_nanosleep_fn g_chaos_memory_real_nanosleep = NULL;
-
-/** @brief Real usleep(3) function pointer, resolved via RTLD_NEXT at startup. */
-chaos_memory_usleep_fn g_chaos_memory_real_usleep = NULL;
 
 /**
  * @brief Per-thread reentrancy guard.
@@ -287,8 +278,6 @@ static void chaos_memory_resolve_all_symbols(void)
     chaos_memory_resolve_symbol(&g_chaos_memory_real_munmap, "munmap");
     chaos_memory_resolve_symbol(&g_chaos_memory_real_mprotect, "mprotect");
     chaos_memory_resolve_symbol(&g_chaos_memory_real_madvise, "madvise");
-    chaos_memory_resolve_symbol(&g_chaos_memory_real_nanosleep, "nanosleep");
-    chaos_memory_resolve_symbol(&g_chaos_memory_real_usleep, "usleep");
 }
 
 void chaos_memory_ensure_symbols(void)
@@ -308,7 +297,7 @@ void chaos_memory_ensure_symbols(void)
  * constructors.
  *
  * Sequence:
- *  1. Resolve the six real libc symbols via RTLD_NEXT.  Failure of any
+ *  1. Resolve the real libc symbols via RTLD_NEXT.  Failure of any
  *     mandatory symbol (mmap, munmap, mprotect, madvise) calls abort().
  *  2. Collect entropy from /dev/urandom via raw syscalls (see
  *     chaos_memory_read_seed_material() for the reentrancy rationale).

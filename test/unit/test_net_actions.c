@@ -6,17 +6,15 @@
  *
  * Coverage approach:
  * - Includes production source directly via `#include "../../src/net/chaos_net_actions.c"`
- *   after defining `usleep` to a test-controlled stub. This gives access to all static
- *   helper functions without LD_PRELOAD.
- * - The `usleep` macro override redirects sleep calls into a local array so tests can
- *   assert on the exact useconds values generated for a given latency_ms setting.
+ *   after test_sleep_support.h, which records each sleep request instead of sleeping.
+ *   This gives access to all static helper functions without LD_PRELOAD.
  *
  * Properties under test:
  * - Probability sampling: boundary values (0.0, 1.0) and mid-range determinism.
  * - `chaos_net_probability_hit()` reproduces a seeded sample reproducibly.
  * - Buffer corruption: single-bit flip at a deterministic index+bit position.
  * - `chaos_net_corrupt_buffer()` and `chaos_net_corrupt_buffer_sample()` equivalence.
- * - Latency decomposition: 2500 ms becomes exactly three usleep calls of 1s, 1s, 0.5s.
+ * - Latency: 2500 ms becomes exactly one sleep of {2 s, 500 ms}.
  * - `chaos_net_rule_should_trigger()` unconditional for LATENCY effect, probability-gated
  *   for ERRNO effect.
  * - Errno application: ECONNREFUSED injected at probability 1.0; skipped at 0.0.
@@ -29,60 +27,11 @@
 
 #include "../support/test_net_support.h"
 
-/**
- * @brief Captured usleep durations from the test-local sleep stub.
- *
- * Populated in call order. The array size (8) is deliberately small relative to
- * the maximum possible chunk count to catch excessive sleep decompositions via
- * the assert inside the stub.
- */
-static useconds_t g_sleep_chunks[8];
-
-/**
- * @brief Number of usleep calls recorded since the last reset.
- *
- * Used by tests to assert the exact number of sleep intervals generated.
- */
-static size_t g_sleep_count = 0U;
-
-/**
- * @brief Test-local usleep stub that records durations instead of sleeping.
- *
- * Asserts that the call array has not overflowed. Returns 0 (success) always.
- *
- * @param usec  Sleep duration in microseconds, recorded at `g_sleep_chunks[g_sleep_count]`.
- * @return 0 (success, never fails).
- */
-static int chaos_net_test_usleep(useconds_t usec)
-{
-    assert(g_sleep_count < sizeof(g_sleep_chunks) / sizeof(g_sleep_chunks[0]));
-    g_sleep_chunks[g_sleep_count++] = usec;
-    return 0;
-}
-
 CHAOS_NET_DEFINE_TEST_GLOBALS();
 
-/* Override usleep before including the production implementation. */
-#define usleep chaos_net_test_usleep
+#include "../support/test_sleep_support.h"
+
 #include "../../src/net/chaos_net_actions.c"
-#undef usleep
-
-/**
- * @brief Reset sleep-tracking state between test functions.
- *
- * Zeroes `g_sleep_count` and clears all recorded chunk values. Called at the
- * start of any test that exercises the latency code path.
- */
-static void chaos_net_test_reset_sleep_state(void)
-{
-    size_t index;
-
-    g_sleep_count = 0U;
-    for (index = 0U; index < sizeof(g_sleep_chunks) / sizeof(g_sleep_chunks[0]); ++index)
-    {
-        g_sleep_chunks[index] = 0U;
-    }
-}
 
 /**
  * @brief Invariant: probability sampling produces correct 0/1 decisions at boundary and midpoint.
@@ -160,7 +109,7 @@ static void test_corrupt_helpers(void)
 }
 
 /**
- * @brief Invariant: latency of 2500ms decomposes into three usleep intervals and trigger
+ * @brief Invariant: latency of 2500ms is one sleep of that duration and trigger
  *   logic respects effect type vs probability.
  *
  * Triggering condition:
@@ -170,7 +119,7 @@ static void test_corrupt_helpers(void)
  * Expected observable behaviour:
  * - NULL rule pointer to `apply_latency`: no crash, no sleep calls.
  * - Zero-initialised rule to `apply_latency`: no crash, no sleep calls (no effect set).
- * - 2500 ms generates exactly 3 usleep calls: 1 000 000 + 1 000 000 + 500 000 µs.
+ * - 2500 ms generates exactly one sleep of {2 s, 500 ms}.
  * - `chaos_net_rule_should_trigger(NULL)` returns 0.
  * - LATENCY effect triggers unconditionally (returns 1 regardless of probability).
  * - ERRNO effect with probability=0.0 does not trigger (returns 0).
@@ -182,18 +131,17 @@ static void test_latency_and_trigger_helpers(void)
 
     (void)memset(&rule, 0, sizeof(rule));
 
-    chaos_net_test_reset_sleep_state();
+    chaos_test_sleep_reset();
     chaos_net_rule_apply_latency(NULL);
     chaos_net_rule_apply_latency(&rule);
-    assert(g_sleep_count == 0U);
+    assert(g_test_sleep_calls == 0U);
 
     rule.effect = CHAOS_NET_EFFECT_LATENCY;
     rule.latency_ms = 2500U;
     chaos_net_rule_apply_latency(&rule);
-    assert(g_sleep_count == 3U);
-    assert(g_sleep_chunks[0] == 1000000U);
-    assert(g_sleep_chunks[1] == 1000000U);
-    assert(g_sleep_chunks[2] == 500000U);
+    assert(g_test_sleep_calls == 1U);
+    assert(g_test_sleep_requests[0].tv_sec == 2);
+    assert(g_test_sleep_requests[0].tv_nsec == 500000000L);
 
     assert(chaos_net_rule_should_trigger(NULL) == 0);
     assert(chaos_net_rule_should_trigger(&rule) == 1);

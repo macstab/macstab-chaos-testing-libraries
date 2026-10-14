@@ -46,6 +46,7 @@
  */
 
 #include "chaos_dns_actions.h"
+#include "chaos_sleep.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -89,35 +90,17 @@ int chaos_dns_probability_hit(double probability)
  * @brief Sleep for the duration specified in a LATENCY rule.
  *        See chaos_dns_actions.h for the full contract.
  *
- * @details usleep(3) accepts at most 999999 µs on POSIX systems.  The loop
- * divides the total into chunks of at most 1,000,000 µs to avoid exceeding
- * this limit, and continues until the full latency has been injected.
- * A SIGALRM or other signal interrupting usleep will cause an early return
- * from that chunk; the remaining microseconds are re-attempted in the next
- * iteration, so the effective latency is at least the requested value minus
- * signal handling overhead.
+ * @details Sleeps with chaos_sleep_ms(), a direct system call, so that no other
+ * preloaded library (libchaos-time in particular) can shorten or lengthen the
+ * delay. The full latency always elapses, and errno is preserved.
  */
 void chaos_dns_rule_apply_latency(const chaos_dns_rule_t *rule)
 {
-    uint64_t remaining_us;
-    int saved_errno;
-
     if (rule == NULL || rule->effect != CHAOS_DNS_EFFECT_LATENCY)
     {
         return;
     }
-
-    /* An interrupted sleep sets EINTR; the delay is ours, so the caller's errno stays. */
-    saved_errno = errno;
-    remaining_us = (uint64_t)rule->latency_ms * 1000ULL;
-    while (remaining_us > 0ULL)
-    {
-        /* usleep takes useconds_t; cap each sleep at 1,000,000 µs (= 1 s). */
-        useconds_t chunk = remaining_us > 1000000ULL ? 1000000U : (useconds_t)remaining_us;
-        (void)usleep(chunk);
-        remaining_us -= (uint64_t)chunk;
-    }
-    errno = saved_errno;
+    chaos_sleep_ms((uint64_t)rule->latency_ms);
 }
 
 /**

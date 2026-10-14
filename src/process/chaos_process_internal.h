@@ -177,12 +177,6 @@ typedef int (*chaos_process_execveat_fn)(int, const char *, char *const[], char 
 /** Signature of the real `waitpid(2)`. */
 typedef pid_t (*chaos_process_waitpid_fn)(pid_t, int *, int);
 
-/** Signature of the real `nanosleep(2)`, used for latency injection. */
-typedef int (*chaos_process_nanosleep_fn)(const struct timespec *, struct timespec *);
-
-/** Signature of the real `usleep(3)`, used for latency injection. */
-typedef int (*chaos_process_usleep_fn)(useconds_t);
-
 /** @} */
 
 /** @defgroup chaos_process_globals Global state variables
@@ -217,12 +211,6 @@ extern chaos_process_execveat_fn g_chaos_process_real_execveat;
 
 /** Pointer to the real `waitpid` resolved via RTLD_NEXT. */
 extern chaos_process_waitpid_fn g_chaos_process_real_waitpid;
-
-/** Pointer to the real `nanosleep` resolved via RTLD_NEXT. */
-extern chaos_process_nanosleep_fn g_chaos_process_real_nanosleep;
-
-/** Pointer to the real `usleep` resolved via RTLD_NEXT. */
-extern chaos_process_usleep_fn g_chaos_process_real_usleep;
 
 /**
  * Per-thread re-entrancy guard.

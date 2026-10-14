@@ -29,8 +29,8 @@
  *
  * @par Thread safety
  * All functions are thread-safe.  Probability sampling reads the per-thread
- * TLS PRNG state (no synchronisation needed).  Sleep uses the reentrancy guard
- * to avoid recursive hook invocations through usleep/nanosleep.
+ * TLS PRNG state (no synchronisation needed).  The sleep is a direct system
+ * call and enters no interposed symbol.
  *
  * @par Stability
  * Internal — do not include from outside the memory chaos module.
@@ -101,11 +101,10 @@ int chaos_memory_rule_should_trigger(const chaos_memory_rule_t *rule);
  *        the rule fires.
  *
  * @details
- * The sleep is performed as a series of up to 1-second chunks using the real
- * usleep(3) (preferred) or nanosleep(2) (fallback), always under the TLS
- * reentrancy guard.  Chunking prevents a single call from consuming more than
- * 1 second of PRNG-decided sleep per chunk without the guard, and handles
- * the EINTR restart requirement for nanosleep transparently.
+ * The sleep is chaos_sleep_ms() (`src/common/chaos_sleep.h`): a direct clock_nanosleep
+ * system call on CLOCK_MONOTONIC, restarted on EINTR, so the full delay always
+ * elapses, errno is preserved, and no other preloaded library (libchaos-time in
+ * particular) can shorten or lengthen it.
  *
  * Does nothing if:
  *  - @p rule is NULL.

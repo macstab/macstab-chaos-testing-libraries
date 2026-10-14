@@ -20,9 +20,8 @@
  *      of a typed function pointer to `void *` via `memcpy`, used in dlsym
  *      stubs to map symbol names to test stub functions.
  *
- * The memory domain intercepts six functions: mmap, munmap, mprotect, madvise,
- * nanosleep, and usleep. The last two are intercepted so the latency injection
- * path can be tested without real sleeps.
+ * The memory domain intercepts four functions: mmap, munmap, mprotect and madvise.
+ * Its LATENCY effect sleeps through chaos_sleep_ms(); see test_sleep_support.h.
  *
  * Coverage approach:
  * - Tests directly `#include` production `.c` files after `#define`-overriding
@@ -53,8 +52,7 @@
  *
  * Must be expanded exactly once at file scope. Defines:
  * - `g_chaos_memory_real_mmap`, `g_chaos_memory_real_munmap`,
- *   `g_chaos_memory_real_mprotect`, `g_chaos_memory_real_madvise`,
- *   `g_chaos_memory_real_nanosleep`, `g_chaos_memory_real_usleep` -- all NULL.
+ *   `g_chaos_memory_real_mprotect`, `g_chaos_memory_real_madvise` -- all NULL.
  * - `__thread int g_chaos_memory_tls_guard` -- per-thread re-entrancy guard.
  * - `__thread uint64_t g_chaos_memory_tls_prng_state` -- per-thread PRNG state.
  * - `uint64_t g_chaos_memory_process_seed` -- process-wide PRNG seed (1).
@@ -65,8 +63,6 @@
     chaos_memory_munmap_fn g_chaos_memory_real_munmap = NULL;                                      \
     chaos_memory_mprotect_fn g_chaos_memory_real_mprotect = NULL;                                  \
     chaos_memory_madvise_fn g_chaos_memory_real_madvise = NULL;                                    \
-    chaos_memory_nanosleep_fn g_chaos_memory_real_nanosleep = NULL;                                \
-    chaos_memory_usleep_fn g_chaos_memory_real_usleep = NULL;                                      \
     __thread int g_chaos_memory_tls_guard = 0;                                                     \
     __thread uint64_t g_chaos_memory_tls_prng_state = 0U;                                          \
     uint64_t g_chaos_memory_process_seed = 1U
@@ -74,7 +70,7 @@
 /**
  * @brief Reset all memory-domain runtime globals to their initial state.
  *
- * Sets all six real-function-pointer globals to NULL, zeroes the TLS guard, TLS
+ * Sets all real-function-pointer globals to NULL, zeroes the TLS guard, TLS
  * PRNG state, and resets the process seed to 1. Call at the start of each test
  * function to prevent cross-test contamination.
  */
@@ -84,8 +80,6 @@ static inline void chaos_memory_test_reset_runtime(void)
     g_chaos_memory_real_munmap = NULL;
     g_chaos_memory_real_mprotect = NULL;
     g_chaos_memory_real_madvise = NULL;
-    g_chaos_memory_real_nanosleep = NULL;
-    g_chaos_memory_real_usleep = NULL;
     g_chaos_memory_tls_guard = 0;
     g_chaos_memory_tls_prng_state = 0U;
     g_chaos_memory_process_seed = 1U;

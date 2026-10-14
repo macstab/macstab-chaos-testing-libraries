@@ -6,7 +6,7 @@
  * Subsystem under test: `src/memory/chaos_memory.c` (the `chaos_memory_init()` constructor).
  *
  * Coverage approach:
- * - All six intercepted symbols (mmap, munmap, mprotect, madvise, nanosleep, usleep) are
+ * - All intercepted symbols (mmap, munmap, mprotect, madvise) are
  *   mapped to local stubs via a test-controlled `dlsym` stub.
  * - `dlerror`, `abort`, and (on Linux) `syscall` are overridden via `#define` before
  *   `chaos_memory.c` is included, exercising the constructor without LD_PRELOAD.
@@ -126,21 +126,6 @@ static int stub_madvise(void *address, size_t length, int advice)
     return 0;
 }
 
-/** @brief Stub for `nanosleep(2)`. Returns 0 (success, no sleep). */
-static int stub_nanosleep(const struct timespec *request, struct timespec *remaining)
-{
-    (void)request;
-    (void)remaining;
-    return 0;
-}
-
-/** @brief Stub for `usleep(3)`. Returns 0 (success, no sleep). */
-static int stub_usleep(useconds_t usec)
-{
-    (void)usec;
-    return 0;
-}
-
 /**
  * @brief Stub for `chaos_memory_config_init()`.
  *
@@ -181,10 +166,6 @@ static void *chaos_memory_test_dlsym(void *handle, const char *symbol)
         return CHAOS_MEMORY_TEST_DLSYM_RESULT(chaos_memory_mprotect_fn, stub_mprotect);
     if (strcmp(symbol, "madvise") == 0)
         return CHAOS_MEMORY_TEST_DLSYM_RESULT(chaos_memory_madvise_fn, stub_madvise);
-    if (strcmp(symbol, "nanosleep") == 0)
-        return CHAOS_MEMORY_TEST_DLSYM_RESULT(chaos_memory_nanosleep_fn, stub_nanosleep);
-    if (strcmp(symbol, "usleep") == 0)
-        return CHAOS_MEMORY_TEST_DLSYM_RESULT(chaos_memory_usleep_fn, stub_usleep);
     return NULL;
 }
 
@@ -390,8 +371,6 @@ static void test_constructor_init(void)
     assert(g_chaos_memory_real_munmap == stub_munmap);
     assert(g_chaos_memory_real_mprotect == stub_mprotect);
     assert(g_chaos_memory_real_madvise == stub_madvise);
-    assert(g_chaos_memory_real_nanosleep == stub_nanosleep);
-    assert(g_chaos_memory_real_usleep == stub_usleep);
     assert(g_config_init_calls == config_calls_before + 1);
     assert(g_chaos_memory_process_seed != 0U);
     assert(g_chaos_memory_tls_prng_state != 0U);

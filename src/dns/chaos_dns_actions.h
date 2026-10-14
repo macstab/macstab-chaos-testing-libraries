@@ -120,12 +120,10 @@ int chaos_dns_probability_hit(double probability);
 /**
  * @brief Sleep for the duration specified in a LATENCY rule.
  *
- * @details Sleeps for `rule->latency_ms` milliseconds using usleep(3) in a
- * loop to work around the POSIX limit of 1,000,000 µs per usleep call.  Each
- * iteration sleeps at most 1,000,000 µs (one second); the loop continues
- * until the full duration has elapsed.  Signals that interrupt usleep are
- * not retried; the effective latency may be slightly shorter than configured
- * if the process receives a signal during sleep.
+ * @details Sleeps for `rule->latency_ms` milliseconds with chaos_sleep_ms()
+ * (`src/common/chaos_sleep.h`): a direct clock_nanosleep system call on CLOCK_MONOTONIC, restarted
+ * on EINTR, so the full delay always elapses, errno is preserved, and no other preloaded library
+ * (libchaos-time in particular) can shorten or lengthen it.
  *
  * @param rule  Rule with effect == CHAOS_DNS_EFFECT_LATENCY and a valid
  *              `latency_ms` field.  No-op if NULL or wrong effect.

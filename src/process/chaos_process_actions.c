@@ -18,17 +18,9 @@
  *
  * ## Latency injection
  *
- * The sleep is implemented via the real `usleep` (preferred, lower overhead)
- * or the real `nanosleep` (fallback), called under the re-entrancy guard to
- * prevent the sleep call from re-entering the chaos wrappers.
- *
- * Long delays (> 1 second) are broken into 1-second chunks because POSIX
- * specifies that `usleep` accepts a maximum of 999,999 microseconds; values
- * >= 1,000,000 are undefined behaviour on strict implementations.
- *
- * `nanosleep` is retried on EINTR (signal interruption) to ensure the full
- * requested delay is delivered.  The remaining time is read from the
- * `rmtp` output parameter of `nanosleep` and fed back as the next request.
+ * The sleep is chaos_sleep_ms(): a direct clock_nanosleep system call,
+ * restarted on EINTR with the remaining time, which no other preloaded library
+ * can intercept and which enters no wrapper of this one.
  *
  * ## FAIL_AFTER counter
  *
@@ -45,6 +37,7 @@
  */
 
 #include "chaos_process_actions.h"
+#include "chaos_sleep.h"
 
 #include <errno.h>
 #include <stdint.h>
@@ -92,43 +85,6 @@ int chaos_process_probability_hit(double probability)
 }
 
 /**
- * @brief Sleeps for `usec` microseconds using the real sleep primitive.
- *
- * Tries `g_chaos_process_real_usleep` first.  Falls back to
- * `g_chaos_process_real_nanosleep` with EINTR retry if `usleep` is not
- * available.  The entire call is wrapped in the re-entrancy guard so that
- * the underlying libc `usleep`/`nanosleep` implementation cannot re-enter
- * our chaos wrappers.
- *
- * @param usec Microseconds to sleep (must be < 1,000,000; callers break
- *             longer delays into chunks before calling this function).
- */
-static void chaos_process_sleep_chunk(useconds_t usec)
-{
-    /* An interrupted sleep sets EINTR; the delay is ours, so the caller's errno stays. */
-    const int saved_errno = errno;
-    int previous;
-
-    previous = chaos_process_enter_internal();
-    if (g_chaos_process_real_usleep != NULL)
-    {
-        (void)g_chaos_process_real_usleep(usec);
-    }
-    else if (g_chaos_process_real_nanosleep != NULL)
-    {
-        struct timespec request;
-
-        request.tv_sec = (time_t)(usec / 1000000U);
-        request.tv_nsec = (long)((usec % 1000000U) * 1000U);
-        while (g_chaos_process_real_nanosleep(&request, &request) != 0 && errno == EINTR)
-        {
-        }
-    }
-    chaos_process_leave_internal(previous);
-    errno = saved_errno;
-}
-
-/**
  * @brief Samples the probability of a rule and returns whether it should
  *        trigger on this call.
  */
@@ -145,32 +101,19 @@ int chaos_process_rule_should_trigger(const chaos_process_rule_t *rule)
 /**
  * @brief Applies the LATENCY effect of a rule if the probability fires.
  *
- * Converts `rule->latency_ms` (milliseconds) to microseconds and iterates
- * in 1-second chunks via `chaos_process_sleep_chunk()`.  The loop ensures
- * that each `usleep` call receives a value < 1,000,000 microseconds,
- * satisfying the POSIX constraint.
- *
- * The probability is sampled once at the start; the full delay is either
- * applied or not — there is no partial application.
+ * @details Sleeps with chaos_sleep_ms(), a direct system call: no other
+ * preloaded library (libchaos-time in particular) can shorten or lengthen the
+ * delay, and no interposed symbol is entered, so no reentrancy guard is needed.
+ * The probability is sampled once; the full delay is either applied or not.
  */
 void chaos_process_rule_apply_latency(const chaos_process_rule_t *rule)
 {
-    uint64_t remaining_us;
-
     if (rule == NULL || rule->effect != CHAOS_PROCESS_EFFECT_LATENCY ||
         !chaos_process_rule_should_trigger(rule))
     {
         return;
     }
-
-    remaining_us = (uint64_t)rule->latency_ms * 1000ULL;
-    while (remaining_us > 0ULL)
-    {
-        useconds_t chunk = remaining_us > 1000000ULL ? 1000000U : (useconds_t)remaining_us;
-
-        chaos_process_sleep_chunk(chunk);
-        remaining_us -= (uint64_t)chunk;
-    }
+    chaos_sleep_ms((uint64_t)rule->latency_ms);
 }
 
 /**

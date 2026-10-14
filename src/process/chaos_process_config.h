@@ -174,8 +174,7 @@ typedef struct chaos_process_rule
 
     /**
      * Latency to inject in milliseconds (LATENCY effect only).
-     * Applied before calling the real function.  The delay is broken into
-     * 1-second chunks to avoid exceeding `usleep`'s POSIX maximum.
+     * Applied before calling the real function, with chaos_sleep_ms().
      *
      * @warning For the `fork` wrapper, latency is applied in the *parent*
      *          before the real `fork()` call.  The child inherits the

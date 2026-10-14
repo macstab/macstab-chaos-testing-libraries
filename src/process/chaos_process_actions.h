@@ -77,10 +77,10 @@ int chaos_process_rule_should_trigger(const chaos_process_rule_t *rule);
 /**
  * @brief Applies the LATENCY effect of a rule if the probability fires.
  *
- * Sleeps for `rule->latency_ms` milliseconds by calling the real `usleep`
- * (preferred) or `nanosleep` (fallback) via the re-entrancy guard.  The
- * delay is broken into 1-second chunks to stay within `usleep`'s POSIX
- * limit of 1,000,000 microseconds per call.
+ * Sleeps for `rule->latency_ms` milliseconds with chaos_sleep_ms() (`src/common/chaos_sleep.h`): a
+ * direct clock_nanosleep system call on CLOCK_MONOTONIC, restarted on EINTR, so the full delay
+ * always elapses, errno is preserved, and no other preloaded library (libchaos-time in particular)
+ * can shorten or lengthen it.
  *
  * This function is a no-op if:
  *   - `rule` is NULL.
@@ -90,8 +90,8 @@ int chaos_process_rule_should_trigger(const chaos_process_rule_t *rule);
  * @warning Callers in the `vfork` path must NOT call this function.  The
  *          vfork window (between `vfork()` return in the child and the
  *          child's `exec`/`_exit`) requires strictly async-signal-safe
- *          functions.  `usleep` and `nanosleep` are not async-signal-safe
- *          and must not be called while sharing the parent's address space.
+ *          functions, and no delay may run while the child shares the
+ *          parent's address space.
  *          See `chaos_process_hooks.c` for how the `vfork` wrapper handles
  *          this constraint.
  *

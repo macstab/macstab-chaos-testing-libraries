@@ -15,8 +15,8 @@
  *   to `chaos_io_corrupt_buffer_sample()`, ensuring the byte-index and
  *   bit-position selections are stable regardless of compiler argument
  *   evaluation order.
- * - `chaos_io_rule_apply_latency()` never sleeps for more than one second per
- *   loop iteration to avoid `useconds_t` overflow.
+ * - `chaos_io_rule_apply_latency()` sleeps with a direct system call, so no other
+ *   preloaded library can shorten or lengthen the delay.
  *
  * **Module ownership:** effects/
  * **Stability:** internal
@@ -31,6 +31,7 @@
  */
 
 #include "chaos_io_actions.h"
+#include "chaos_sleep.h"
 
 #include <errno.h>
 #include <stdint.h>
@@ -163,36 +164,17 @@ void chaos_io_corrupt_buffer(void *buffer, size_t size)
 /**
  * @brief Applies a configured latency before the real libc call.
  *
- * @details Loops calling `usleep()` in chunks of at most 1 000 000 µs (1 s)
- * until `remaining_us` reaches zero.  The per-chunk cap avoids overflowing
- * `useconds_t`, which is required by POSIX to hold values up to at least
- * 1 000 000 but may be a narrower type (e.g. `unsigned int` on some
- * platforms) than the full `uint64_t` accumulated delay.
- *
- * `usleep` return values are discarded; a signal interruption
- * (`EINTR`-equivalent) would manifest as a shorter-than-requested sleep,
- * which is acceptable for a fault-injection library.
+ * @details Sleeps with chaos_sleep_ms(), a direct system call, so that no other
+ * preloaded library (libchaos-time in particular) can shorten or lengthen the
+ * delay. The full latency always elapses, and errno is preserved.
  */
 void chaos_io_rule_apply_latency(const chaos_io_rule_t *rule)
 {
-    uint64_t remaining_us;
-    int saved_errno;
-
     if (rule == NULL || rule->effect != CHAOS_IO_EFFECT_LATENCY)
     {
         return;
     }
-
-    /* An interrupted sleep sets EINTR; the delay is ours, so the caller's errno stays. */
-    saved_errno = errno;
-    remaining_us = (uint64_t)rule->latency_ms * 1000ULL;
-    while (remaining_us > 0ULL)
-    {
-        useconds_t chunk = remaining_us > 1000000ULL ? 1000000U : (useconds_t)remaining_us;
-        (void)usleep(chunk);
-        remaining_us -= (uint64_t)chunk;
-    }
-    errno = saved_errno;
+    chaos_sleep_ms((uint64_t)rule->latency_ms);
 }
 
 /**

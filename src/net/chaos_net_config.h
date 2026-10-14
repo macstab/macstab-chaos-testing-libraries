@@ -73,7 +73,7 @@ typedef enum chaos_net_operation
  * @details Effect semantics:
  *   - ERRNO:   The interposed function returns -1 with errno set before the
  *              real syscall is made. The real call is skipped entirely.
- *   - LATENCY: usleep() is called for rule->latency_ms milliseconds before
+ *   - LATENCY: the thread sleeps for rule->latency_ms milliseconds before
  *              the real call. The real call always executes afterwards.
  *   - CORRUPT: After the real call completes and returns bytes > 0, a single
  *              bit in the receive buffer is flipped. Only valid for RECV ops.
