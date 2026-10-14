@@ -387,8 +387,8 @@ One exception applies to the OVERRIDE path, covered in the next section.
 
 The transform functions FILTER_FAMILY and LIMIT free nodes by calling
 `g_chaos_dns_real_freeaddrinfo` — the cached pointer to the real libc
-`freeaddrinfo`, resolved at constructor time via `dlsym(RTLD_NEXT,
-"freeaddrinfo")`. Using the real symbol rather than the interposed entry point
+`freeaddrinfo`, resolved once via `dlsym(RTLD_NEXT, "freeaddrinfo")` by the
+first interposed call or the constructor, whichever runs first. Using the real symbol rather than the interposed entry point
 avoids re-entering the library's own reentrancy guard path during node
 disposal.
 

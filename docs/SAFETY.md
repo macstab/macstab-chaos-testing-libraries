@@ -307,6 +307,16 @@ If you are porting to a libc that lacks one of the interposed symbols, this is
 the first thing that will bite, and it will present as the target process
 aborting rather than as a load failure.
 
+`pthread_create` is the deliberate exception. Before glibc 2.34 it lives in
+libpthread, so in a program that never links libpthread it does not exist when
+libchaos-process loads; aborting there killed every such program (`cat`, `sh`)
+before `main()`. libchaos-process therefore resolves it optionally: a missing
+symbol leaves the pointer NULL, the wrapper retries the lookup on each call (the
+program may have loaded libpthread later through `dlopen`), and if it is still
+absent the call returns `EAGAIN`, the error `pthread_create` itself reports when
+a thread cannot be created. A program that can reach the wrapper has libpthread
+loaded, so in practice the lookup succeeds.
+
 ---
 
 ## 6. Reentrancy Invariant

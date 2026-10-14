@@ -136,17 +136,29 @@ this preload every `setpriv`, `su` and `runuser` invocation entered a wrapper
 while the pointer table was still NULL and died with SIGSEGV.
 
 Every interposed wrapper therefore calls `chaos_io_ensure_symbols()` as its
-first action. It is idempotent and guarded by `pthread_once`, so:
+first action. It is idempotent and guarded by `chaos_once()`
+(`src/common/chaos_once.h`), so:
 
 - resolution happens exactly once per process, whichever caller arrives first;
 - the completed table is published with release/acquire ordering. This matters
   on weakly ordered architectures such as aarch64: a plain `volatile` flag
   would permit a second thread to observe readiness before the pointer stores
   became visible to it, and call through NULL;
-- after the first call the cost is one already-satisfied `pthread_once`.
+- after the first call the cost is one acquire load.
 
-`pthread_once` resolves from libc on both glibc and musl, so this adds no link
-dependency.
+`chaos_once()` is a three-state atomic flag (unset, running, done) rather than
+`pthread_once`. Before glibc 2.34 `pthread_once` lives in libpthread, not libc,
+so a library built against glibc 2.31 that referenced it could not even be
+loaded into a program that does not link libpthread: `cat`, `sh` and most other
+tools failed with `undefined symbol: pthread_once`. A caller that finds the
+initialiser running yields until it is done; the initialiser itself only calls
+`dlsym`, which never re-enters an interposed wrapper of this library.
+
+All six libraries resolve their downstream symbols this way, so the same
+guarantee holds for libchaos-net, -time, -process, -dns and -memory.
+`test/runtime/test_baseline_glibc.sh` builds the release configuration (gcc:10,
+glibc 2.31) and preloads every library, alone and together, into `cat`, `sh`
+and a threaded program.
 
 ### Dependencies
 
