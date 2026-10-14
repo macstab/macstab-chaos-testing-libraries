@@ -309,7 +309,9 @@ usleep:ERRNO:EINTR@0.1
 Exact interposed symbols today:
 
 - `clock_gettime()`
+- `gettimeofday()` and `time()` (governed by the `clock_gettime/realtime` rules)
 - `nanosleep()`
+- `clock_nanosleep()` (governed by the `nanosleep` rules)
 - `usleep()`
 
 Supported selectors:

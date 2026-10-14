@@ -750,7 +750,8 @@ Intended responsibility:
 - `clock_gettime`
 - `nanosleep`
 - `usleep`
-- related time-domain hooks such as future `clock_nanosleep`
+- `gettimeofday` and `time`, through the `clock_gettime/realtime` rules
+- `clock_nanosleep`, through the `nanosleep` rules
 
 ### `libchaos-process`
 

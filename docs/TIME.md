@@ -22,7 +22,8 @@ kernel source table are embedded inline in §2 of this document.
 
 Current implementation status:
 
-- interposed symbols: `clock_gettime()`, `nanosleep()`, `usleep()`
+- interposed symbols: `clock_gettime()`, `gettimeofday()`, `time()`, `nanosleep()`,
+  `clock_nanosleep()`, `usleep()`
 - config path: `/tmp/.chaos-time.conf`
 - unit-tested; runtime probe for glibc/musl and amd64/arm64 validation
 
@@ -401,6 +402,16 @@ simulates an NTP step or a leap-second smear event. This is the intended use:
 exercise certificate expiry, session timeout, lease renewal, and log timestamp
 correlation logic without actually modifying the system time.
 
+A realtime rule covers every way of reading the wall clock. glibc and musl serve
+`gettimeofday()` and `time()` from the vDSO without calling `clock_gettime`, so
+without their own wrappers a process under a realtime OFFSET would see two wall
+clocks at once: `clock_gettime(CLOCK_REALTIME)` shifted, `gettimeofday()` and
+`time()` not. Both wrappers read `CLOCK_REALTIME` through the `clock_gettime`
+rules, so LATENCY, ERRNO and OFFSET apply to them exactly as to
+`clock_gettime/realtime` (and to a rule without a clock selector). An ERRNO rule
+makes `time()` return `(time_t)-1`. `gettimeofday()` with a non-NULL timezone
+argument still fills it from the real call.
+
 ### 5.4 Thread Safety of OFFSET
 
 The OFFSET value is per-rule, read from the config. Config is reloaded atomically
@@ -547,6 +558,15 @@ backward. Positive values move it forward. Zero is a no-op but legal.
 | `clock_gettime/<clock>` | yes     | yes   | yes    | Sub-selector; same effect availability           |
 | `nanosleep`             | yes     | yes   | no     | No timestamp return value to mutate              |
 | `usleep`                | yes     | yes   | no     | Same; no remaining-time output                   |
+
+No selector names `gettimeofday`, `time` or `clock_nanosleep`; they are governed
+by the rules of the call they are a form of:
+
+| Symbol            | Follows rules of          | Notes                                                    |
+|-------------------|---------------------------|----------------------------------------------------------|
+| `gettimeofday`    | `clock_gettime/realtime`  | Microseconds derived from the shifted timespec           |
+| `time`            | `clock_gettime/realtime`  | ERRNO returns `(time_t)-1`                               |
+| `clock_nanosleep` | `nanosleep`               | Error returned as the result, errno untouched; EINTR fills `remaining` only for a relative sleep |
 
 ### 8.3 Valid errno Values
 
@@ -864,14 +884,15 @@ symbols traversed via the PLT.
 Covered:
 
 - `clock_gettime()` — with sub-selector per clock ID; ERRNO, LATENCY, OFFSET effects
+- `gettimeofday()`, `time()` — the `clock_gettime/realtime` rules
 - `nanosleep()` — ERRNO, LATENCY
+- `clock_nanosleep()` — the `nanosleep` rules
 - `usleep()` — ERRNO, LATENCY
 
 Not covered:
 
-- `clock_nanosleep()` — richer sleep API, not yet interposed
-- `gettimeofday()` — legacy; vDSO-only on glibc; candidates for future expansion
-- `sleep()` — covered transitively via `nanosleep` on glibc/musl ≥ 2.3
+- `sleep()` — glibc and musl implement it with their internal nanosleep, which
+  never passes through the exported symbol, so no wrapper sees it
 - `alarm()` / `setitimer()` — signal-domain timers; outside scope
 - POSIX timer APIs (`timer_create`, `timer_settime`, etc.) — outside scope
 - `timerfd_create` / `timerfd_settime` — IO-domain timer fds; outside scope
