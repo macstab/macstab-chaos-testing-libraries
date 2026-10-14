@@ -671,7 +671,7 @@ Examples:
   Applies to `write()`, `writev()`, Linux `sendfile()`, and Linux
   `copy_file_range()` destination paths.
 - `open`
-  Applies to both `open()` and `openat()`.
+  Applies to `open()`, `openat()` and `creat()`.
 - `close`
 - `fsync`
 - `fdatasync`
@@ -680,15 +680,15 @@ Examples:
 - `pwrite`
   Applies to `pwrite()` and `pwritev()`.
 - `truncate`
-  Applies to `ftruncate()`.
+  Applies to `ftruncate()` and `truncate()`.
 - `allocate`
   Applies to Linux `fallocate()`.
 - `unlink`
-  Applies to `unlinkat()`.
+  Applies to `unlinkat()`, `unlink()` and `rmdir()`.
 - `rename_from`
-  Applies to `renameat()` source paths.
+  Applies to `renameat()` and `rename()` source paths.
 - `rename_to`
-  Applies to `renameat()` destination paths.
+  Applies to `renameat()` and `rename()` destination paths.
 
 ### Effects
 
@@ -725,7 +725,7 @@ Examples:
 
 ## Runtime Behavior
 
-- The intercepted libc entry points are `read`, `readv`, `write`, `writev`, `open`, `openat`, `close`, `fsync`, `fdatasync`, `pread`, `preadv`, `pwrite`, `pwritev`, `ftruncate`, `unlinkat`, `renameat`, and Linux `sendfile`, `copy_file_range`, plus `fallocate`.
+- The intercepted libc entry points are `read`, `readv`, `write`, `writev`, `open`, `openat`, `close`, `fsync`, `fdatasync`, `pread`, `preadv`, `pwrite`, `pwritev`, `ftruncate`, `truncate`, `unlinkat`, `unlink`, `rmdir`, `renameat`, `rename`, `creat`, and Linux `sendfile`, `copy_file_range`, plus `fallocate`.
 - `close()` keeps Linux semantics: the descriptor is always released, and an injected error is reported after the real close (a synthetic error that left it open would leak it in programs that, correctly, never retry close).
 - `dup2`, `dup3` and `close_range` are forwarded unchanged; they only keep the fd-to-path cache correct for the descriptors they free or reassign. The cache is one lazily mapped table per process (no per-thread memory), so a close on one thread is seen by all.
 - On 64-bit glibc the large-file names `open64`, `openat64`, `pread64`, `pwrite64`, `preadv64`, `pwritev64`, `ftruncate64`, `fallocate64` and `sendfile64` are the same wrappers, and the fortified `__read_chk`, `__pread_chk`, `__pread64_chk`, `__open_2`, `__open64_2`, `__openat_2` and `__openat64_2` check the buffer like glibc and then run them. Programs bind to whichever name their build chose (the JDK, Redis, nginx and MySQL use the `64` names; `_FORTIFY_SOURCE` builds use the fortified ones), so each is intercepted.

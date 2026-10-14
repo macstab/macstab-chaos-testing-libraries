@@ -131,7 +131,7 @@ Current ownership boundary:
 
 | Library | Owns | Must Not Own |
 | --- | --- | --- |
-| `libchaos-io` | file symbols such as `open`, `openat`, `pread`, `pwrite`, `fsync`, `fdatasync`, `sendfile`, `copy_file_range`, `ftruncate`, `fallocate`, `renameat`, `unlinkat`, `dup2`, `dup3`, `close_range`; and `read`, `write`, `readv`, `writev`, `close` **for files** | socket/DNS/wait symbols; any decision on a socket |
+| `libchaos-io` | file symbols such as `open`, `openat`, `pread`, `pwrite`, `fsync`, `fdatasync`, `sendfile`, `copy_file_range`, `ftruncate`, `truncate`, `fallocate`, `renameat`, `rename`, `unlinkat`, `unlink`, `rmdir`, `creat`, `dup2`, `dup3`, `close_range`; and `read`, `write`, `readv`, `writev`, `close` **for files** | socket/DNS/wait symbols; any decision on a socket |
 | `libchaos-net` | socket/wait symbols such as `socket`, `socketpair`, `bind`, `listen`, `connect`, `accept`, `accept4`, `shutdown`, `send*`, `recv*`, `poll`, `ppoll`, `select`, `pselect`, `epoll_wait`, `epoll_pwait`; and `read`, `write`, `readv`, `writev`, `close` **for sockets** | any decision on a file; DNS symbols |
 | `libchaos-dns` | resolver symbols such as `getaddrinfo` and `getnameinfo` | generic fd/file symbols, socket symbols, wait symbols |
 | `libchaos-time` | clock/sleep symbols such as `clock_gettime`, `nanosleep`, `usleep` | any symbol already owned by IO, NET, or DNS |

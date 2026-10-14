@@ -63,7 +63,7 @@ it does not try to simulate every kernel or filesystem behavior.
 The implemented logical operation surface is:
 
 - `open`
-  Backed by `open()` and `openat()`
+  Backed by `open()`, `openat()` and `creat()`
 - `read`
   Backed by `read()` and `readv()`
 - `write`
@@ -77,15 +77,23 @@ The implemented logical operation surface is:
 - `pwrite`
   Backed by `pwrite()` and `pwritev()`
 - `truncate`
-  Backed by `ftruncate()`
+  Backed by `ftruncate()` and the path form `truncate()`
 - `allocate`
   Backed by Linux `fallocate()`
 - `unlink`
-  Backed by `unlinkat()`
+  Backed by `unlinkat()`, `unlink()` and `rmdir()`
 - `rename_from`
-  Backed by `renameat()` source-path matching
+  Backed by `renameat()` and `rename()` source-path matching
 - `rename_to`
-  Backed by `renameat()` destination-path matching
+  Backed by `renameat()` and `rename()` destination-path matching
+
+glibc and musl implement `unlink()`, `rmdir()`,
+`rename()`, `truncate()` and `creat()` with their own system calls, not through the
+`*at` or descriptor forms, so each has its own wrapper. They are the forms most
+programs use: the JDK deletes with `unlink()` and moves with `rename()`. The first
+four forward to `unlinkat(AT_FDCWD, ...)`, `renameat(AT_FDCWD, ...)` and `open()`,
+which Linux defines them to be; `truncate()` matches the `truncate` rules by path.
+`test/runtime/test_path_forms.sh` checks all five on glibc and musl.
 
 ### Assumptions
 
