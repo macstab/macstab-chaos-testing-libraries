@@ -92,10 +92,12 @@ Deferred behavior described here remains explicitly future work:
 
 ### Global ownership rule
 
-`libchaos-net` is subordinate to the repository-wide symbol ownership rule:
+`libchaos-net` is subordinate to the repository-wide ownership rule:
 
-- one symbol, one owner
-- no overlapping interposition across chaos libraries
+- one owner per fault decision: net decides for sockets only
+- every wrapper forwards along the chain (`RTLD_NEXT`), never straight to libc
+- `read`, `write`, `readv`, `writev` and `close` are shared with `libchaos-io`,
+  which decides for files
 
 That means:
 
@@ -213,10 +215,7 @@ Deferred extension areas:
 - Kernel traffic control replacement.
 - TLS handshake emulation.
 - Stateful TCP reassembly.
-- Interposing `read()` and `write()` on sockets.
-- Owning `close()` or other symbols already better left to another library.
-- Owning `read()` or `write()` on sockets in a way that collides with
-  `libchaos-io`.
+- Deciding anything for a descriptor that is not a socket.
 
 ### Current implementation boundary
 
@@ -618,9 +617,13 @@ Current logical operations:
   Backed by `accept()` and Linux `accept4()`
 - `shutdown`
 - `send`
-  Backed by `send()`, `sendto()`, `sendmsg()`, and Linux `sendmmsg()`
+  Backed by `send()`, `sendto()`, `sendmsg()`, Linux `sendmmsg()`, and
+  `write()`/`writev()` on sockets
 - `recv`
-  Backed by `recv()`, `recvfrom()`, `recvmsg()`, and Linux `recvmmsg()`
+  Backed by `recv()`, `recvfrom()`, `recvmsg()`, Linux `recvmmsg()`, and
+  `read()`/`readv()` on sockets
+- `close`
+  Backed by `close()` on sockets
 - `poll`
   Backed by `poll()`, `ppoll()`, `select()`, `pselect()`, Linux
   `epoll_wait()`, and Linux `epoll_pwait()`
@@ -633,6 +636,7 @@ Current effects:
 - `LATENCY`
 - `CORRUPT`
 - `TIMEOUT`
+- `RESET`
 
 Intentional omission:
 
@@ -648,13 +652,20 @@ Reason:
 
 - `ERRNO`
   valid for `socket`, `bind`, `listen`, `connect`, `accept`, `shutdown`,
-  `send`, `recv`, and `poll`
+  `send`, `recv`, `poll`, and `close` (on `close` the socket is closed first,
+  then the error is reported: Linux releases the descriptor even when close
+  fails, and programs never retry it)
 - `LATENCY`
   valid for all implemented operations
 - `CORRUPT`
   valid only for `recv`
 - `TIMEOUT`
   valid only for `poll`
+- `RESET`
+  valid only for `close`: arms `SO_LINGER` with a zero timeout before the close,
+  so the connection is aborted and the peer receives an RST (`ECONNRESET`)
+  instead of an orderly end of stream -- what a crashed or killed process, or a
+  load balancer dropping the connection, looks like from the other side
 - `GAI`
   valid only for `dns`
 

@@ -227,7 +227,8 @@ Internal implementation detail:
   The thread-local recursion guard state that suppresses re-interposition when
   the library itself calls into libc.
 - FD cache
-  The thread-local mapping from file descriptor number to resolved path string.
+  The process-wide mapping from file descriptor number to resolved path string,
+  mapped lazily on first use.
 - Excluded path
   A path the library will never inject into: the config file, `/proc`, `/sys`,
   `/dev`, or an empty/invalid path.
@@ -262,8 +263,10 @@ For a typical descriptor-backed call such as `write(fd, buf, count)`:
 8. The wrapper restores the previous recursion state.
 9. Any post-call state updates occur:
    - `CORRUPT` may mutate the returned read buffer
-   - successful `close()` invalidates the current thread's fd-cache entry
-   - successful `renameat()` and `unlinkat()` reset the current thread cache
+   - `close()` invalidates the fd-cache entry for every thread, whatever the real
+     close returned (Linux releases the descriptor either way); `dup2()`, `dup3()`
+     and `close_range()` invalidate the descriptors they free or reassign
+   - successful `renameat()` and `unlinkat()` reset the whole cache
 
 ### What happens on `open()` and `openat()`
 
@@ -320,7 +323,7 @@ component "Target Application" as App
 component "Wrapper Layer\n(open/rw/sync/fsops)" as Wrappers
 component "Runtime Core\n(symbols, guard, PRNG)" as Core
 component "Config Engine\n(parse + snapshots)" as Config
-component "FD Cache\nthread-local fd->path" as Cache
+component "FD Cache\nprocess-wide fd->path" as Cache
 component "Effect Engine\nerrno/latency/torn/corrupt" as Effects
 component "Real libc symbols" as Libc
 database "/tmp/.chaos-io.conf" as ConfigFile
@@ -501,7 +504,8 @@ Responsibility:
 
 Owned concerns:
 
-- thread-local direct-mapped cache slots
+- process-wide direct-mapped cache slots, mapped on first store with a raw
+  `mmap` system call (no allocator, not visible to libchaos-memory)
 - fd-number hashing
 - exclusion filtering before storing
 
@@ -513,15 +517,17 @@ Why this design exists:
 
 Trade-off:
 
-- cache correctness is only thread-local, not process-global
 - collisions are possible by construction
-- fd reuse across threads can observe stale path identity
+- a slot held by another writer is skipped (best effort); lookups never block
+- descriptors freed by calls the library does not see (raw system calls, stdio's
+  internal `close`) are not invalidated; those descriptors were never cached
+  through an interposed call in the first place in the common case
 
 Full lookup, seeding, and invalidation flow ([source](diagrams/fdcache.puml)):
 
 ```plantuml
 @startuml fdcache
-title libchaos-io Thread-Local FD Cache — Lookup and Invalidation
+title libchaos-io Process-Wide FD Cache — Lookup and Invalidation
 
 skinparam sequenceMessageAlign center
 skinparam shadowing false
@@ -539,7 +545,7 @@ skinparam sequence {
 hide footbox
 
 participant "Wrapper\n(read/write/fsync/…)" as Wrap
-participant "FD Cache\n(TLS, direct-mapped)" as Cache
+participant "FD Cache\n(process-wide, direct-mapped)" as Cache
 participant "/proc/self/fd\n<fd>" as Proc
 participant "Config Engine" as Config
 participant "Real libc" as Real
@@ -588,28 +594,26 @@ end note
 note over Wrap, Cache
   close(fd):
     call real_close(fd)
-    if succeeded: cache[fd % SLOTS].fd = -1  (invalidate)
-    ONLY invalidate after successful close.
-    A failed close leaves the cache entry intact
-    because the fd is still valid.
+    generation[fd % SLOTS] += 1  (invalidate, all threads)
+    Always invalidate: Linux releases the descriptor
+    even when close() reports an error.
 end note
 
 == renameat() / unlinkat() reset ==
 
 note over Wrap, Cache
   renameat() / unlinkat() success:
-    memset(cache, 0, sizeof(cache))  (full reset)
+    generation[every slot] += 1  (full reset)
     Reason: previously resolved /proc/self/fd paths
     may now point to different inodes or be stale.
 end note
 
 note across
-  Thread-local scope: only the calling thread's cache
-  is affected by close/rename/unlink.
-  Cross-thread stale path hazard: Thread A closes fd 7;
-  Thread B still has fd 7 cached with old path.
-  If kernel reuses fd 7 for a new file, Thread B
-  may match wrong rules until its slot is evicted.
+  Process-wide scope: one table for all threads. An entry
+  records the slot generation it was resolved under and is
+  valid only while that is still current, so a close on
+  Thread A is seen by Thread B at once, and a lookup that
+  raced with the close can never re-store the stale path.
 end note
 
 @enduml
@@ -715,8 +719,8 @@ FD-cache entry transitions:
 
 1. empty
 2. populated on successful open or first `/proc/self/fd` resolution
-3. invalidated by same-thread successful `close()`
-4. fully reset by same-thread successful `renameat()` or `unlinkat()`
+3. invalidated for every thread by `close()`, `dup2()`, `dup3()` or `close_range()`
+4. fully reset by a successful `renameat()` or `unlinkat()`
 
 ### Consistency model
 

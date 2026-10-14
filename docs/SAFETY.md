@@ -563,10 +563,10 @@ counter sharing.
 The `LD_PRELOAD` string lists DSOs left-to-right. The dynamic linker adds them
 to the link-map in that order (before the executable's `DT_NEEDED` entries).
 
-For the `one symbol, one owner` invariant: since no two chaos libraries own the
-same symbol, load order does not affect which library owns each interposed call.
-Load order only matters if two libraries owned the same symbol (which is the
-prohibited state).
+For the ownership invariant: libraries that share a symbol decide for disjoint
+descriptor kinds and forward everything along the chain, so load order does not
+affect which library faults a call. It would matter only if two libraries decided
+for the same descriptor kind (which is the prohibited state).
 
 For `RTLD_NEXT` resolution: each library calls `dlsym(RTLD_NEXT, name)` in its
 constructor. RTLD_NEXT starts from the caller's position in the link-map and

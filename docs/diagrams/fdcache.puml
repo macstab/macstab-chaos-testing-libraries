@@ -5,14 +5,14 @@
 '                Macstab GmbH · Hamburg, Germany
 '                https://macstab.com
 '
-' libchaos-io thread-local FD cache — direct-mapped lookup,
+' libchaos-io process-wide FD cache — direct-mapped lookup,
 ' /proc/self/fd miss resolution, and invalidation triggers.
 '
 ' Reference: docs/IO.md §6 (Component Breakdown → FD cache)
 '            docs/ARCHITECTURE.md §FD Path Resolution
 '            src/config/chaos_io_fdcache.c
 '
-title libchaos-io Thread-Local FD Cache — Lookup and Invalidation
+title libchaos-io Process-Wide FD Cache — Lookup and Invalidation
 
 skinparam sequenceMessageAlign center
 skinparam shadowing false
@@ -30,7 +30,7 @@ skinparam sequence {
 hide footbox
 
 participant "Wrapper\n(read/write/fsync/…)" as Wrap
-participant "FD Cache\n(TLS, direct-mapped)" as Cache
+participant "FD Cache\n(process-wide, direct-mapped)" as Cache
 participant "/proc/self/fd\n<fd>" as Proc
 participant "Config Engine" as Config
 participant "Real libc" as Real
@@ -79,28 +79,26 @@ end note
 note over Wrap, Cache
   close(fd):
     call real_close(fd)
-    if succeeded: cache[fd % SLOTS].fd = -1  (invalidate)
-    ONLY invalidate after successful close.
-    A failed close leaves the cache entry intact
-    because the fd is still valid.
+    generation[fd % SLOTS] += 1  (invalidate, all threads)
+    Always invalidate: Linux releases the descriptor
+    even when close() reports an error.
+    dup2/dup3 invalidate the target, close_range the range.
 end note
 
 == renameat() / unlinkat() reset ==
 
 note over Wrap, Cache
   renameat() / unlinkat() success:
-    memset(cache, 0, sizeof(cache))  (full reset)
+    generation[every slot] += 1  (full reset)
     Reason: previously resolved /proc/self/fd paths
     may now point to different inodes or be stale.
 end note
 
 note across
-  Thread-local scope: only the calling thread's cache
-  is affected by close/rename/unlink.
-  Cross-thread stale path hazard: Thread A closes fd 7;
-  Thread B still has fd 7 cached with old path.
-  If kernel reuses fd 7 for a new file, Thread B
-  may match wrong rules until its slot is evicted.
+  Process-wide scope: one lazily mapped table for all threads.
+  An entry is valid only while its slot generation is current,
+  so a close on Thread A is seen by Thread B at once, and a
+  lookup that raced with the close never re-stores a stale path.
 end note
 
 @enduml

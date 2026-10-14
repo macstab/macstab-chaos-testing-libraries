@@ -575,10 +575,13 @@ Implemented logical operations:
   Applies to `poll()`, `ppoll()`, `select()`, `pselect()`, and Linux
   `epoll_wait()` plus `epoll_pwait()`
 - `send`
-  Applies to `send()`, `sendto()`, `sendmsg()`, and Linux `sendmmsg()`
+  Applies to `send()`, `sendto()`, `sendmsg()`, and Linux `sendmmsg()`; also to
+  `write()` and `writev()` on sockets
 - `recv`
   Applies to `recv()`, `recvfrom()`, `recvmsg()`, and Linux `recvmmsg()`, and on glibc to the fortified
-  `__recv_chk()` and `__recvfrom_chk()`
+  `__recv_chk()` and `__recvfrom_chk()`; also to `read()` and `readv()` on sockets
+- `close`
+  Applies to `close()` on sockets
 
 Exact interposed symbols today:
 
@@ -588,6 +591,8 @@ Exact interposed symbols today:
 - `recv()`, `recvfrom()`, `recvmsg()`, Linux `recvmmsg()`
 - `poll()`, `ppoll()`, `select()`, `pselect()`, Linux `epoll_wait()`, Linux
   `epoll_pwait()`
+- `read()`, `readv()`, `write()`, `writev()`, `close()`, shared with
+  `libchaos-io`: net decides for sockets, io for files
 
 Implemented effects:
 
@@ -599,6 +604,10 @@ Implemented effects:
   Probability from `0.0` to `1.0`; valid only for `recv`
 - `TIMEOUT`
   Probability from `0.0` to `1.0`; valid only for `poll`
+- `RESET`
+  Probability from `0.0` to `1.0`; valid only for `close`. The socket is closed
+  abortively (`SO_LINGER` 0), so the peer receives an RST (`ECONNRESET`) instead
+  of an orderly end of stream.
 
 Supported endpoint selectors:
 
@@ -613,8 +622,10 @@ Supported endpoint selectors:
 
 Important current boundary:
 
-- `libchaos-net` deliberately does not own `read()`, `write()`, or `close()`
-  so it composes cleanly with `libchaos-io`
+- `libchaos-net` shares `read()`, `write()`, `readv()`, `writev()` and
+  `close()` with `libchaos-io`: it decides for sockets, io for files, and each
+  forwards everything else down the chain, so the two compose in either
+  `LD_PRELOAD` order (`test/runtime/test_sharing_glibc.sh` checks every order)
 - `libchaos-net` no longer owns DNS lookup interception; that surface now lives
   in `libchaos-dns`
 - wait-path matching is endpoint-aware and best-effort; Linux `epoll_*`
@@ -713,6 +724,8 @@ Examples:
 ## Runtime Behavior
 
 - The intercepted libc entry points are `read`, `readv`, `write`, `writev`, `open`, `openat`, `close`, `fsync`, `fdatasync`, `pread`, `preadv`, `pwrite`, `pwritev`, `ftruncate`, `unlinkat`, `renameat`, and Linux `sendfile`, `copy_file_range`, plus `fallocate`.
+- `close()` keeps Linux semantics: the descriptor is always released, and an injected error is reported after the real close (a synthetic error that left it open would leak it in programs that, correctly, never retry close).
+- `dup2`, `dup3` and `close_range` are forwarded unchanged; they only keep the fd-to-path cache correct for the descriptors they free or reassign. The cache is one lazily mapped table per process (no per-thread memory), so a close on one thread is seen by all.
 - On 64-bit glibc the large-file names `open64`, `openat64`, `pread64`, `pwrite64`, `preadv64`, `pwritev64`, `ftruncate64`, `fallocate64` and `sendfile64` are the same wrappers, and the fortified `__read_chk`, `__pread_chk`, `__pread64_chk`, `__open_2`, `__open64_2`, `__openat_2` and `__openat64_2` check the buffer like glibc and then run them. Programs bind to whichever name their build chose (the JDK, Redis, nginx and MySQL use the `64` names; `_FORTIFY_SOURCE` builds use the fortified ones), so each is intercepted.
 - The config file is checked with `stat()` on each intercepted call.
 - Reload is lock-free for readers and swaps between two config snapshots.

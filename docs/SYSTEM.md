@@ -115,9 +115,12 @@ debugging, and incident analysis.
 
 The most important repository rule is:
 
-`one symbol, one owner`
+`every fault decision has exactly one owner, and every wrapper forwards along the chain`
 
-No interposed libc symbol may be owned by more than one chaos library.
+A libc symbol may be exported by more than one chaos library only when their
+domains are disjoint by descriptor kind; the shared symbols are `read`, `write`,
+`readv`, `writev` and `close`, owned by `libchaos-io` for files and by
+`libchaos-net` for sockets. Every other symbol has exactly one owner.
 
 That rule is not style guidance. It is a hard correctness boundary. It exists to
 avoid preload-order-dependent behavior, double injection, inconsistent matching,
@@ -128,8 +131,8 @@ Current ownership boundary:
 
 | Library | Owns | Must Not Own |
 | --- | --- | --- |
-| `libchaos-io` | generic fd/file symbols such as `open`, `openat`, `close`, `read`, `write`, `pread`, `pwrite`, `fsync`, `fdatasync`, `readv`, `writev`, `sendfile`, `copy_file_range`, `ftruncate`, `fallocate`, `renameat`, `unlinkat` | socket/DNS/wait symbols |
-| `libchaos-net` | socket/wait symbols such as `socket`, `socketpair`, `bind`, `listen`, `connect`, `accept`, `accept4`, `shutdown`, `send*`, `recv*`, `poll`, `ppoll`, `select`, `pselect`, `epoll_wait`, `epoll_pwait` | generic `read`, `write`, `readv`, `writev`, `close`, DNS symbols |
+| `libchaos-io` | file symbols such as `open`, `openat`, `pread`, `pwrite`, `fsync`, `fdatasync`, `sendfile`, `copy_file_range`, `ftruncate`, `fallocate`, `renameat`, `unlinkat`, `dup2`, `dup3`, `close_range`; and `read`, `write`, `readv`, `writev`, `close` **for files** | socket/DNS/wait symbols; any decision on a socket |
+| `libchaos-net` | socket/wait symbols such as `socket`, `socketpair`, `bind`, `listen`, `connect`, `accept`, `accept4`, `shutdown`, `send*`, `recv*`, `poll`, `ppoll`, `select`, `pselect`, `epoll_wait`, `epoll_pwait`; and `read`, `write`, `readv`, `writev`, `close` **for sockets** | any decision on a file; DNS symbols |
 | `libchaos-dns` | resolver symbols such as `getaddrinfo` and `getnameinfo` | generic fd/file symbols, socket symbols, wait symbols |
 | `libchaos-time` | clock/sleep symbols such as `clock_gettime`, `nanosleep`, `usleep` | any symbol already owned by IO, NET, or DNS |
 | `libchaos-process` | process lifecycle symbols such as `pthread_create`, `fork`, `posix_spawn`, `posix_spawnp`, `execve`, `execveat`, and `waitpid` | any symbol already owned by IO or NET |
@@ -446,8 +449,8 @@ MEM --> LIBC : resolve RTLD_NEXT
 LIBC --> KERNEL
 
 note bottom
-Global rule: one symbol, one owner.
-read()/write()/close() remain outside libchaos-net.
+Global rule: one owner per fault decision, every wrapper forwards.
+read()/write()/close(): io decides for files, net for sockets.
 end note
 @enduml
 ```
@@ -861,7 +864,8 @@ IO-only mutable state:
 
 NET-specific design choice:
 
-- no persistent socket identity cache that depends on owning `close()`
+- no persistent socket identity cache: net shares `close()` with io and does not
+  see every way a descriptor is freed, so identity is never cached
 - endpoint identity is derived per call whenever possible
 - Linux epoll watch identity is derived on demand from `/proc/self/fdinfo`
 
@@ -1375,17 +1379,24 @@ live in the respective library documents.
 
 **Formal symbol-ownership theorem:**
 
-> For any libc symbol `s`, let `owner(s)` be the unique chaos library that
-> exports an interposed definition of `s`. The system is correct if and only if:
-> - `∀s: |{L : L exports s}| ≤ 1`  (at most one owner per symbol)
-> - `∀s: owner(s)` is defined by the domain table in §1 of this document
-> - `LD_PRELOAD` load order does not change which library reaches glibc first for
->   any given symbol, because each symbol has exactly one owner by the above
+> For a call `c` on symbol `s` with descriptor `d`, let `decides(L, c)` hold when
+> chaos library `L` may fault `c`. The system is correct if:
+> - `∀c: |{L : decides(L, c)}| ≤ 1` -- for every symbol exported by several
+>   libraries, their domains (files for io, sockets for net) are disjoint, so at
+>   most one library decides any call
+> - every exported wrapper forwards a call it does not decide, and the call it
+>   decides after applying its effect, to `dlsym(RTLD_NEXT, s)` -- the next
+>   definition in the link map -- and never to libc directly
 >
-> If two chaos libraries export the same symbol, the link-map winner is
-> load-order-dependent; the losing library's `dlsym(RTLD_NEXT, s)` resolves to
-> the winning library's interposer, causing double injection. This is the
-> correctness violation the `one symbol, one owner` rule prevents.
+> Then the call reaches libc exactly once, is faulted by at most one library, and
+> the outcome does not depend on `LD_PRELOAD` order: the chain visits every
+> library in whichever order, and only the deciding one acts. The only exception
+> to forwarding is a synthetic failure that performs no call at all (an `open`
+> that fails with EIO): nothing happened that another library needs to see.
+> `close` has no such exception -- it always closes, as on Linux.
+>
+> Exporting a symbol from two libraries with *overlapping* domains remains the
+> violation this rule prevents: both would fault the same call.
 
 This theorem is the formal basis for the architecture. It is enforced by
 convention and audited by the coverage matrix, not by a runtime mechanism.

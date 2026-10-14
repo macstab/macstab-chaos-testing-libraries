@@ -535,8 +535,8 @@ Key facts that affect every wrapper in this repository:
 **Link-map order and RTLD_NEXT:** `dlsym(RTLD_NEXT, name)` walks the link-map
 starting from the DSO _after_ the caller. LD_PRELOAD libraries appear before
 `DT_NEEDED` entries in the link-map. Therefore `RTLD_NEXT` from any chaos library
-always reaches glibc/musl, regardless of LD_PRELOAD load order — provided no two
-chaos libraries own the same symbol (the `one symbol, one owner` rule).
+reaches the next definition in the chain: another chaos library that shares the
+symbol, or glibc/musl. See the ownership rule below for why that is safe.
 
 **PLT hot path cost:** After the first call (cold resolver dance), the GOT slot
 for an interposed symbol points directly to the chaos library wrapper. The hot
@@ -551,18 +551,23 @@ correct. The chaos wrapper caches this resolved pointer.
 
 ## Formal Symbol-Ownership Theorem
 
-This theorem is the mathematical basis for the architecture. See §17 of
-[`docs/SYSTEM.md`](SYSTEM.md) for the complete proof. Short form:
+See §17 of [`docs/SYSTEM.md`](SYSTEM.md) for the full statement. Short form:
 
-> The interposition is correct if and only if every symbol is owned by at most
-> one chaos library. If two libraries export the same symbol, RTLD_NEXT from the
-> losing library resolves to the winning library's wrapper, not to glibc, causing
-> double injection and preload-order-dependent behaviour.
+> **Every fault decision has exactly one owner, and every wrapper forwards along the
+> chain.** A symbol may be exported by more than one chaos library only when their
+> domains are disjoint by descriptor kind -- `read`, `write`, `readv`, `writev` and
+> `close` belong to `libchaos-io` for files and to `libchaos-net` for sockets. Each
+> wrapper acts only on its own kind and always calls the next definition
+> (`dlsym(RTLD_NEXT, ...)`), never libc directly. Whatever the `LD_PRELOAD` order,
+> a call is faulted by at most one library, and every library sees every call (so
+> `libchaos-io` keeps its fd cache right for sockets too).
 
-The theorem's contrapositive is a direct rationale for the domain split:
-`libchaos-net` must not own `read()` or `write()` because they are owned by
-`libchaos-io`, and double ownership would make behaviour depend on LD_PRELOAD
-order.
+The original rule was stricter -- "one symbol, one owner" -- and it is still what
+prevents double injection when two libraries would fault the same call. It left
+socket `read`/`write` unreachable, though: Redis and the JDK's NIO channels do
+socket I/O with `read`/`write`, so `recv`/`send` rules never touched them, and a
+socket `close` could not be faulted at all. Splitting the decision by descriptor
+kind keeps the guarantee and closes that gap.
 
 ## Maintenance Rules
 
