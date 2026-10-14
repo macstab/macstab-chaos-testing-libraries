@@ -157,6 +157,14 @@ static int chaos_process_call_real_pthread_create(
     int previous;
     int rc;
 
+    if (g_chaos_process_real_pthread_create == NULL)
+    {
+        chaos_process_resolve_pthread_create();
+        if (g_chaos_process_real_pthread_create == NULL)
+        {
+            return EAGAIN;
+        }
+    }
     previous = chaos_process_enter_internal();
     rc = g_chaos_process_real_pthread_create(thread, attributes, start_routine, argument);
     chaos_process_leave_internal(previous);
@@ -337,6 +345,8 @@ CHAOS_PROCESS_EXPORT int pthread_create(
     chaos_process_rule_t fail_after_rule;
     int error_code;
 
+    chaos_process_ensure_symbols();
+
     if (chaos_process_in_internal())
     {
         return chaos_process_call_real_pthread_create(thread, attributes, start_routine, argument);
@@ -392,6 +402,8 @@ CHAOS_PROCESS_EXPORT pid_t fork(void)
     chaos_process_rule_t errno_rule;
     chaos_process_rule_t fail_after_rule;
     int error_code;
+
+    chaos_process_ensure_symbols();
 
     if (chaos_process_in_internal())
     {
@@ -462,6 +474,8 @@ CHAOS_PROCESS_EXPORT int posix_spawn(
     chaos_process_rule_t fail_after_rule;
     int error_code;
 
+    chaos_process_ensure_symbols();
+
     if (chaos_process_in_internal())
     {
         return chaos_process_call_real_posix_spawn(pid, path, file_actions, attributes, argv, envp);
@@ -524,6 +538,8 @@ CHAOS_PROCESS_EXPORT int posix_spawnp(
     chaos_process_rule_t fail_after_rule;
     int error_code;
 
+    chaos_process_ensure_symbols();
+
     if (chaos_process_in_internal())
     {
         return chaos_process_call_real_posix_spawnp(
@@ -584,6 +600,8 @@ CHAOS_PROCESS_EXPORT int execve(const char *path, char *const argv[], char *cons
     chaos_process_rule_t fail_after_rule;
     int error_code;
 
+    chaos_process_ensure_symbols();
+
     if (chaos_process_in_internal())
     {
         return chaos_process_call_real_execve(path, argv, envp);
@@ -641,6 +659,8 @@ execveat(int directory_fd, const char *path, char *const argv[], char *const env
     chaos_process_rule_t errno_rule;
     chaos_process_rule_t fail_after_rule;
     int error_code;
+
+    chaos_process_ensure_symbols();
 
     if (chaos_process_in_internal())
     {
@@ -708,6 +728,8 @@ CHAOS_PROCESS_EXPORT pid_t waitpid(pid_t pid, int *status, int options)
     chaos_process_rule_t errno_rule;
     chaos_process_rule_t fail_after_rule;
     int error_code;
+
+    chaos_process_ensure_symbols();
 
     if (chaos_process_in_internal())
     {

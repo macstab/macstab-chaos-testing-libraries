@@ -60,6 +60,7 @@
  * - `uint64_t g_chaos_memory_process_seed` -- process-wide PRNG seed (1).
  */
 #define CHAOS_MEMORY_DEFINE_TEST_GLOBALS()                                                         \
+    void chaos_memory_ensure_symbols(void) {}                                                      \
     chaos_memory_mmap_fn g_chaos_memory_real_mmap = NULL;                                          \
     chaos_memory_munmap_fn g_chaos_memory_real_munmap = NULL;                                      \
     chaos_memory_mprotect_fn g_chaos_memory_real_mprotect = NULL;                                  \

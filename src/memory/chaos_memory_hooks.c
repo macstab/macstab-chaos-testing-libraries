@@ -251,6 +251,8 @@ mmap(void *address, size_t length, int protection, int flags, int fd, off_t offs
     chaos_memory_rule_t latency_rule;
     chaos_memory_rule_t errno_rule;
 
+    chaos_memory_ensure_symbols();
+
     if (chaos_memory_in_internal())
     {
         return chaos_memory_call_real_mmap(address, length, protection, flags, fd, offset);
@@ -298,6 +300,8 @@ CHAOS_MEMORY_EXPORT int munmap(void *address, size_t length)
     chaos_memory_rule_t latency_rule;
     chaos_memory_rule_t errno_rule;
 
+    chaos_memory_ensure_symbols();
+
     if (chaos_memory_in_internal())
     {
         return chaos_memory_call_real_munmap(address, length);
@@ -340,6 +344,8 @@ CHAOS_MEMORY_EXPORT int mprotect(void *address, size_t length, int protection)
 {
     chaos_memory_rule_t latency_rule;
     chaos_memory_rule_t errno_rule;
+
+    chaos_memory_ensure_symbols();
 
     if (chaos_memory_in_internal())
     {
@@ -384,6 +390,8 @@ CHAOS_MEMORY_EXPORT int madvise(void *address, size_t length, int advice)
 {
     chaos_memory_rule_t latency_rule;
     chaos_memory_rule_t errno_rule;
+
+    chaos_memory_ensure_symbols();
 
     if (chaos_memory_in_internal())
     {

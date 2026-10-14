@@ -567,6 +567,8 @@ CHAOS_DNS_EXPORT int getaddrinfo(
     int rc;
     int gai_error;
 
+    chaos_dns_ensure_symbols();
+
     /* 1. Reentrancy guard: bypass if already inside the library. */
     if (chaos_dns_in_internal() || node == NULL || *node == '\0')
     {
@@ -729,6 +731,8 @@ CHAOS_DNS_EXPORT int getnameinfo(
     char query[CHAOS_DNS_MAX_TEXT];
     int rc;
     int gai_error;
+
+    chaos_dns_ensure_symbols();
 
     /* 1. Reentrancy guard / NULL address. */
     if (chaos_dns_in_internal() || address == NULL)

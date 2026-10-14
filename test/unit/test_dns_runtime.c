@@ -339,6 +339,11 @@ static void test_resolve_symbol_and_seed_helpers(void)
     assert(getaddrinfo_fn == stub_getaddrinfo);
     assert(g_dlerror_calls == 1);
 
+    /* A pointer that is already wired is left alone: no dlsym, no dlerror. */
+    chaos_dns_resolve_symbol(&getaddrinfo_fn, "missing-symbol");
+    assert(getaddrinfo_fn == stub_getaddrinfo);
+    assert(g_dlerror_calls == 1);
+
 #ifdef __linux__
     assert(chaos_dns_read_seed_material() == UINT64_C(0x1122334455667788));
     assert(g_syscall_open_calls == 1);
@@ -433,6 +438,7 @@ static void test_constructor_init(void)
 
     reset_test_state();
     config_calls_before = g_config_init_calls;
+    g_chaos_dns_symbols_once = CHAOS_ONCE_INIT;
     chaos_dns_init();
     assert(g_chaos_dns_real_getaddrinfo == stub_getaddrinfo);
     assert(g_chaos_dns_real_getnameinfo == stub_getnameinfo);

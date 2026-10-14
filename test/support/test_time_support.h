@@ -56,6 +56,7 @@
  * - `uint64_t g_chaos_time_process_seed` -- process-wide PRNG seed (1).
  */
 #define CHAOS_TIME_DEFINE_TEST_GLOBALS()                                                           \
+    void chaos_time_ensure_symbols(void) {}                                                        \
     chaos_time_clock_gettime_fn g_chaos_time_real_clock_gettime = NULL;                            \
     chaos_time_nanosleep_fn g_chaos_time_real_nanosleep = NULL;                                    \
     chaos_time_usleep_fn g_chaos_time_real_usleep = NULL;                                          \

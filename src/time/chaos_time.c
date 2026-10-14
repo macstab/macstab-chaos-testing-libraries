@@ -37,6 +37,7 @@
  * @stability Internal.
  */
 
+#include "chaos_once.h"
 #include "chaos_time_config.h"
 #include "chaos_time_internal.h"
 
@@ -122,6 +123,15 @@ uint64_t g_chaos_time_process_seed = UINT64_C(0x2545f4914f6cdd1d);
 static void chaos_time_resolve_symbol(void *target, const char *symbol)
 {
     void *resolved;
+    void *current;
+
+    /* Only fill what is still unset, so a pointer already wired (by an earlier call,
+     * or by a test harness) is never replaced. */
+    (void)memcpy(&current, target, sizeof(current));
+    if (current != NULL)
+    {
+        return;
+    }
 
     (void)dlerror();
     resolved = dlsym(RTLD_NEXT, symbol);
@@ -198,6 +208,33 @@ static uint64_t chaos_time_read_seed_material(void)
 }
 
 /**
+ * @brief Run-once state of the symbol table resolution.
+ *
+ * @details `chaos_once()`, not `pthread_once()`: before glibc 2.34 the latter lives
+ * in libpthread, which programs such as `cat` and `sh` do not load.
+ */
+static volatile chaos_once_t g_chaos_time_symbols_once = CHAOS_ONCE_INIT;
+
+/**
+ * @brief Resolves the full downstream symbol table. Runs exactly once.
+ *
+ * @details Invoked only through `chaos_time_ensure_symbols()`. Must not call any
+ * interposed wrapper of this library. `dlsym(RTLD_NEXT, ...)` walks the
+ * already-loaded link map and performs no file I/O, so it does not re-enter.
+ */
+static void chaos_time_resolve_all_symbols(void)
+{
+    chaos_time_resolve_symbol(&g_chaos_time_real_clock_gettime, "clock_gettime");
+    chaos_time_resolve_symbol(&g_chaos_time_real_nanosleep, "nanosleep");
+    chaos_time_resolve_symbol(&g_chaos_time_real_usleep, "usleep");
+}
+
+void chaos_time_ensure_symbols(void)
+{
+    chaos_once(&g_chaos_time_symbols_once, chaos_time_resolve_all_symbols);
+}
+
+/**
  * ELF constructor: initialises the entire libchaos-time subsystem.
  *
  * Execution order:
@@ -215,10 +252,7 @@ static uint64_t chaos_time_read_seed_material(void)
 CHAOS_TIME_CONSTRUCTOR
 static void chaos_time_init(void)
 {
-    chaos_time_resolve_symbol(&g_chaos_time_real_clock_gettime, "clock_gettime");
-    chaos_time_resolve_symbol(&g_chaos_time_real_nanosleep, "nanosleep");
-    chaos_time_resolve_symbol(&g_chaos_time_real_usleep, "usleep");
-
+    chaos_time_ensure_symbols();
     g_chaos_time_process_seed = chaos_time_read_seed_material();
     chaos_time_prng_seed_thread(g_chaos_time_process_seed);
     chaos_time_config_init();

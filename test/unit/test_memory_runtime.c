@@ -299,6 +299,11 @@ static void test_resolve_symbol_and_seed_helpers(void)
     assert(mmap_fn == stub_mmap);
     assert(g_dlerror_calls == 1);
 
+    /* A pointer that is already wired is left alone: no dlsym, no dlerror. */
+    chaos_memory_resolve_symbol(&mmap_fn, "missing-symbol");
+    assert(mmap_fn == stub_mmap);
+    assert(g_dlerror_calls == 1);
+
 #ifdef __linux__
     assert(chaos_memory_read_seed_material() == UINT64_C(0x1122334455667788));
     assert(g_syscall_open_calls == 1);
@@ -379,6 +384,7 @@ static void test_constructor_init(void)
 
     reset_test_state();
     config_calls_before = g_config_init_calls;
+    g_chaos_memory_symbols_once = CHAOS_ONCE_INIT;
     chaos_memory_init();
     assert(g_chaos_memory_real_mmap == stub_mmap);
     assert(g_chaos_memory_real_munmap == stub_munmap);

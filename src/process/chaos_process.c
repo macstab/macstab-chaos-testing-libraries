@@ -56,6 +56,7 @@
  * Private implementation — not part of the public API.
  */
 
+#include "chaos_once.h"
 #include "chaos_process_config.h"
 #include "chaos_process_internal.h"
 
@@ -124,6 +125,15 @@ volatile uint64_t g_chaos_process_fail_after_counters[CHAOS_PROCESS_OP_COUNT] = 
 static void chaos_process_resolve_symbol(void *target, const char *symbol)
 {
     void *resolved;
+    void *current;
+
+    /* Only fill what is still unset, so a pointer already wired (by an earlier call,
+     * or by a test harness) is never replaced. */
+    (void)memcpy(&current, target, sizeof(current));
+    if (current != NULL)
+    {
+        return;
+    }
 
     (void)dlerror();
     resolved = dlsym(RTLD_NEXT, symbol);
@@ -135,7 +145,6 @@ static void chaos_process_resolve_symbol(void *target, const char *symbol)
     (void)memcpy(target, &resolved, sizeof(resolved));
 }
 
-#ifdef __linux__
 /**
  * @brief Like `chaos_process_resolve_symbol()` but does not abort on failure.
  *
@@ -150,6 +159,13 @@ static void chaos_process_resolve_symbol(void *target, const char *symbol)
 static void chaos_process_try_resolve_symbol(void *target, const char *symbol)
 {
     void *resolved;
+    void *current;
+
+    (void)memcpy(&current, target, sizeof(current));
+    if (current != NULL)
+    {
+        return;
+    }
 
     (void)dlerror();
     resolved = dlsym(RTLD_NEXT, symbol);
@@ -160,7 +176,6 @@ static void chaos_process_try_resolve_symbol(void *target, const char *symbol)
 
     (void)memcpy(target, &resolved, sizeof(resolved));
 }
-#endif
 
 /**
  * @brief Reads 8 bytes of entropy from `/dev/urandom` using raw syscalls.
@@ -221,6 +236,55 @@ static uint64_t chaos_process_read_seed_material(void)
 }
 
 /**
+ * @brief Resolves `pthread_create`, which may be absent until libpthread is loaded.
+ *
+ * @details Before glibc 2.34 `pthread_create` lives in libpthread. A program that
+ * does not link it never calls it, but resolving it eagerly aborted that program
+ * at start-up. Unresolved, the pointer stays NULL and the wrapper retries here: a
+ * library loaded later with `dlopen()` can bring libpthread in.
+ */
+void chaos_process_resolve_pthread_create(void)
+{
+    chaos_process_try_resolve_symbol(&g_chaos_process_real_pthread_create, "pthread_create");
+}
+
+/**
+ * @brief Run-once state of the symbol table resolution.
+ *
+ * @details `chaos_once()`, not `pthread_once()`: before glibc 2.34 the latter lives
+ * in libpthread, which programs such as `cat` and `sh` do not load.
+ */
+static volatile chaos_once_t g_chaos_process_symbols_once = CHAOS_ONCE_INIT;
+
+/**
+ * @brief Resolves the full downstream symbol table. Runs exactly once.
+ *
+ * @details Invoked only through `chaos_process_ensure_symbols()`. Must not call any
+ * interposed wrapper of this library. `dlsym(RTLD_NEXT, ...)` walks the
+ * already-loaded link map and performs no file I/O, so it does not re-enter.
+ */
+static void chaos_process_resolve_all_symbols(void)
+{
+    chaos_process_resolve_pthread_create();
+    chaos_process_resolve_symbol(&g_chaos_process_real_fork, "fork");
+    chaos_process_resolve_symbol(&g_chaos_process_real_posix_spawn, "posix_spawn");
+    chaos_process_resolve_symbol(&g_chaos_process_real_posix_spawnp, "posix_spawnp");
+    chaos_process_resolve_symbol(&g_chaos_process_real_execve, "execve");
+#ifdef __linux__
+    /* musl does not consistently expose execveat as a public libc symbol. */
+    chaos_process_try_resolve_symbol(&g_chaos_process_real_execveat, "execveat");
+#endif
+    chaos_process_resolve_symbol(&g_chaos_process_real_waitpid, "waitpid");
+    chaos_process_resolve_symbol(&g_chaos_process_real_nanosleep, "nanosleep");
+    chaos_process_resolve_symbol(&g_chaos_process_real_usleep, "usleep");
+}
+
+void chaos_process_ensure_symbols(void)
+{
+    chaos_once(&g_chaos_process_symbols_once, chaos_process_resolve_all_symbols);
+}
+
+/**
  * @brief Library constructor: resolves symbols, seeds entropy, and
  *        bootstraps the config subsystem.
  *
@@ -240,19 +304,7 @@ static uint64_t chaos_process_read_seed_material(void)
 CHAOS_PROCESS_CONSTRUCTOR
 static void chaos_process_init(void)
 {
-    chaos_process_resolve_symbol(&g_chaos_process_real_pthread_create, "pthread_create");
-    chaos_process_resolve_symbol(&g_chaos_process_real_fork, "fork");
-    chaos_process_resolve_symbol(&g_chaos_process_real_posix_spawn, "posix_spawn");
-    chaos_process_resolve_symbol(&g_chaos_process_real_posix_spawnp, "posix_spawnp");
-    chaos_process_resolve_symbol(&g_chaos_process_real_execve, "execve");
-#ifdef __linux__
-    /* musl does not consistently expose execveat as a public libc symbol. */
-    chaos_process_try_resolve_symbol(&g_chaos_process_real_execveat, "execveat");
-#endif
-    chaos_process_resolve_symbol(&g_chaos_process_real_waitpid, "waitpid");
-    chaos_process_resolve_symbol(&g_chaos_process_real_nanosleep, "nanosleep");
-    chaos_process_resolve_symbol(&g_chaos_process_real_usleep, "usleep");
-
+    chaos_process_ensure_symbols();
     g_chaos_process_process_seed = chaos_process_read_seed_material();
     chaos_process_prng_seed_thread(g_chaos_process_process_seed);
     chaos_process_config_init();

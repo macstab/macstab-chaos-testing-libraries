@@ -60,6 +60,15 @@
  *   the error once it reaches zero.
  */
 #define CHAOS_PROCESS_DEFINE_TEST_GLOBALS()                                                        \
+    void chaos_process_ensure_symbols(void) {}                                                     \
+    chaos_process_pthread_create_fn g_test_late_pthread_create = NULL;                             \
+    void chaos_process_resolve_pthread_create(void)                                                \
+    {                                                                                              \
+        if (g_chaos_process_real_pthread_create == NULL)                                           \
+        {                                                                                          \
+            g_chaos_process_real_pthread_create = g_test_late_pthread_create;                      \
+        }                                                                                          \
+    }                                                                                              \
     chaos_process_pthread_create_fn g_chaos_process_real_pthread_create = NULL;                    \
     chaos_process_fork_fn g_chaos_process_real_fork = NULL;                                        \
     chaos_process_posix_spawn_fn g_chaos_process_real_posix_spawn = NULL;                          \

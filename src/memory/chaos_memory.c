@@ -48,6 +48,7 @@
  * the memory chaos module.
  */
 
+#include "chaos_once.h"
 #include "chaos_memory_config.h"
 #include "chaos_memory_internal.h"
 
@@ -158,6 +159,15 @@ uint64_t g_chaos_memory_process_seed = UINT64_C(0x2545f4914f6cdd1d);
 static void chaos_memory_resolve_symbol(void *target, const char *symbol)
 {
     void *resolved;
+    void *current;
+
+    /* Only fill what is still unset, so a pointer already wired (by an earlier call,
+     * or by a test harness) is never replaced. */
+    (void)memcpy(&current, target, sizeof(current));
+    if (current != NULL)
+    {
+        return;
+    }
 
     (void)dlerror();
     resolved = dlsym(RTLD_NEXT, symbol);
@@ -257,6 +267,36 @@ static uint64_t chaos_memory_read_seed_material(void)
  */
 
 /**
+ * @brief Run-once state of the symbol table resolution.
+ *
+ * @details `chaos_once()`, not `pthread_once()`: before glibc 2.34 the latter lives
+ * in libpthread, which programs such as `cat` and `sh` do not load.
+ */
+static volatile chaos_once_t g_chaos_memory_symbols_once = CHAOS_ONCE_INIT;
+
+/**
+ * @brief Resolves the full downstream symbol table. Runs exactly once.
+ *
+ * @details Invoked only through `chaos_memory_ensure_symbols()`. Must not call any
+ * interposed wrapper of this library. `dlsym(RTLD_NEXT, ...)` walks the
+ * already-loaded link map and performs no file I/O, so it does not re-enter.
+ */
+static void chaos_memory_resolve_all_symbols(void)
+{
+    chaos_memory_resolve_symbol(&g_chaos_memory_real_mmap, "mmap");
+    chaos_memory_resolve_symbol(&g_chaos_memory_real_munmap, "munmap");
+    chaos_memory_resolve_symbol(&g_chaos_memory_real_mprotect, "mprotect");
+    chaos_memory_resolve_symbol(&g_chaos_memory_real_madvise, "madvise");
+    chaos_memory_resolve_symbol(&g_chaos_memory_real_nanosleep, "nanosleep");
+    chaos_memory_resolve_symbol(&g_chaos_memory_real_usleep, "usleep");
+}
+
+void chaos_memory_ensure_symbols(void)
+{
+    chaos_once(&g_chaos_memory_symbols_once, chaos_memory_resolve_all_symbols);
+}
+
+/**
  * @brief Module constructor: resolve real symbols, seed entropy, initialise
  *        the config subsystem.
  *
@@ -286,13 +326,7 @@ static uint64_t chaos_memory_read_seed_material(void)
 CHAOS_MEMORY_CONSTRUCTOR
 static void chaos_memory_init(void)
 {
-    chaos_memory_resolve_symbol(&g_chaos_memory_real_mmap, "mmap");
-    chaos_memory_resolve_symbol(&g_chaos_memory_real_munmap, "munmap");
-    chaos_memory_resolve_symbol(&g_chaos_memory_real_mprotect, "mprotect");
-    chaos_memory_resolve_symbol(&g_chaos_memory_real_madvise, "madvise");
-    chaos_memory_resolve_symbol(&g_chaos_memory_real_nanosleep, "nanosleep");
-    chaos_memory_resolve_symbol(&g_chaos_memory_real_usleep, "usleep");
-
+    chaos_memory_ensure_symbols();
     g_chaos_memory_process_seed = chaos_memory_read_seed_material();
     chaos_memory_prng_seed_thread(g_chaos_memory_process_seed);
     chaos_memory_config_init();

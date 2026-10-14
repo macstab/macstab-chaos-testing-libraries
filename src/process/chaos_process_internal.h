@@ -539,4 +539,16 @@ static inline uint32_t chaos_process_prng_next_u32(void)
 
 /** @} */
 
+/**
+ * @brief Resolves every downstream symbol once, whichever caller comes first.
+ *
+ * @details The constructor alone is not enough: ELF initialisers run in dependency
+ * order, so another object's constructor can reach an interposed wrapper before
+ * this library's constructor has run. Every exported wrapper calls this first.
+ */
+void chaos_process_ensure_symbols(void);
+
+/** @brief Resolves `pthread_create` on demand; see chaos_process.c. */
+void chaos_process_resolve_pthread_create(void);
+
 #endif

@@ -466,6 +466,21 @@ static void test_call_real_helpers(void)
     assert(chaos_process_call_real_pthread_create(&thread, NULL, stub_start_routine, NULL) == 0);
     assert(g_real_pthread_create_calls == 1);
 
+    /* Resolved late: a program that loads libpthread after startup gets it on first use. */
+    g_chaos_process_real_pthread_create = NULL;
+    g_test_late_pthread_create = stub_pthread_create;
+    assert(chaos_process_call_real_pthread_create(&thread, NULL, stub_start_routine, NULL) == 0);
+    assert(g_real_pthread_create_calls == 2);
+
+    /* Still absent: the thread cannot be created, reported as a resource shortage. */
+    g_chaos_process_real_pthread_create = NULL;
+    g_test_late_pthread_create = NULL;
+    assert(
+        chaos_process_call_real_pthread_create(&thread, NULL, stub_start_routine, NULL) == EAGAIN
+    );
+    assert(g_real_pthread_create_calls == 2);
+    g_chaos_process_real_pthread_create = stub_pthread_create;
+
     assert(chaos_process_call_real_fork() == 123);
     assert(g_real_fork_calls == 1);
 

@@ -254,6 +254,11 @@ static void test_resolve_symbol_and_seed_helpers(void)
     assert(clock_gettime_fn == stub_clock_gettime);
     assert(g_dlerror_calls == 1);
 
+    /* A pointer that is already wired is left alone: no dlsym, no dlerror. */
+    chaos_time_resolve_symbol(&clock_gettime_fn, "missing-symbol");
+    assert(clock_gettime_fn == stub_clock_gettime);
+    assert(g_dlerror_calls == 1);
+
 #ifdef __linux__
     assert(chaos_time_read_seed_material() == UINT64_C(0x1122334455667788));
     assert(g_syscall_open_calls == 1);
@@ -334,6 +339,7 @@ static void test_constructor_init(void)
 
     reset_test_state();
     config_calls_before = g_config_init_calls;
+    g_chaos_time_symbols_once = CHAOS_ONCE_INIT;
     chaos_time_init();
     assert(g_chaos_time_real_clock_gettime == stub_clock_gettime);
     assert(g_chaos_time_real_nanosleep == stub_nanosleep);

@@ -374,6 +374,11 @@ static void test_resolve_symbol_and_seed_helpers(void)
     assert(fork_fn == stub_fork);
     assert(g_dlerror_calls == 1);
 
+    /* A pointer that is already wired is left alone: no dlsym, no dlerror. */
+    chaos_process_resolve_symbol(&fork_fn, "missing-symbol");
+    assert(fork_fn == stub_fork);
+    assert(g_dlerror_calls == 1);
+
 #ifdef __linux__
     assert(chaos_process_read_seed_material() == UINT64_C(0x1122334455667788));
     assert(g_syscall_open_calls == 1);
@@ -416,19 +421,27 @@ static void test_resolve_symbol_abort_path(void)
  * Triggering condition: stub `dlsym` returns NULL for any unrecognised symbol;
  *   `g_dlerror_text` may be set or NULL — the `try` variant does not abort.
  *
- * Expected observable behaviour: the target pointer is NULL after the call,
+ * Expected observable behaviour: an unset target stays NULL after the call,
  *   and the second `dlerror()` call (the "clear" call inside the NULL branch)
- *   has incremented `g_dlerror_calls` from 1 to 2.
+ *   has incremented `g_dlerror_calls` from 1 to 2; an already wired target is
+ *   left untouched without calling dlsym.
  */
 static void test_try_resolve_symbol_missing(void)
 {
-    chaos_process_execveat_fn execveat_fn = (chaos_process_execveat_fn)(uintptr_t)0xdead;
+    chaos_process_execveat_fn execveat_fn = NULL;
+    chaos_process_execveat_fn wired = (chaos_process_execveat_fn)(uintptr_t)0xdead;
 
     reset_test_state();
     g_dlerror_text = "missing-on-musl";
     chaos_process_try_resolve_symbol(&execveat_fn, "this-symbol-does-not-exist");
     assert(execveat_fn == NULL);
     assert(g_dlerror_calls == 2);
+
+    /* An already wired pointer is never replaced. */
+    reset_test_state();
+    chaos_process_try_resolve_symbol(&wired, "this-symbol-does-not-exist");
+    assert(wired == (chaos_process_execveat_fn)(uintptr_t)0xdead);
+    assert(g_dlerror_calls == 0);
 }
 
 /**
@@ -477,6 +490,7 @@ static void test_constructor_init(void)
 
     reset_test_state();
     config_calls_before = g_config_init_calls;
+    g_chaos_process_symbols_once = CHAOS_ONCE_INIT;
     chaos_process_init();
     assert(g_chaos_process_real_pthread_create == stub_pthread_create);
     assert(g_chaos_process_real_fork == stub_fork);

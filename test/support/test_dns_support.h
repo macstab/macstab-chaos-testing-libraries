@@ -59,6 +59,7 @@
  *   to 1 (non-zero) so PRNG operations are defined without calling the constructor.
  */
 #define CHAOS_DNS_DEFINE_TEST_GLOBALS()                                                            \
+    void chaos_dns_ensure_symbols(void) {}                                                         \
     chaos_dns_getaddrinfo_fn g_chaos_dns_real_getaddrinfo = NULL;                                  \
     chaos_dns_getnameinfo_fn g_chaos_dns_real_getnameinfo = NULL;                                  \
     chaos_dns_freeaddrinfo_fn g_chaos_dns_real_freeaddrinfo = NULL;                                \

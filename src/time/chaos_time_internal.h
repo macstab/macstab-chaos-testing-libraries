@@ -494,4 +494,13 @@ static inline uint32_t chaos_time_prng_next_u32(void)
 
 /** @} */
 
+/**
+ * @brief Resolves every downstream symbol once, whichever caller comes first.
+ *
+ * @details The constructor alone is not enough: ELF initialisers run in dependency
+ * order, so another object's constructor can reach an interposed wrapper before
+ * this library's constructor has run. Every exported wrapper calls this first.
+ */
+void chaos_time_ensure_symbols(void);
+
 #endif

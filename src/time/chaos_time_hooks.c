@@ -174,6 +174,8 @@ CHAOS_TIME_EXPORT int clock_gettime(clockid_t clock_id, struct timespec *value)
     uintptr_t value_bits = (uintptr_t)(void *)value;
     int rc;
 
+    chaos_time_ensure_symbols();
+
     if (chaos_time_in_internal() || value_bits == 0U)
     {
         return chaos_time_call_real_clock_gettime(clock_id, value);
@@ -234,6 +236,8 @@ CHAOS_TIME_EXPORT int nanosleep(const struct timespec *request, struct timespec 
     chaos_time_rule_t errno_rule;
     uintptr_t request_bits = (uintptr_t)(const void *)request;
 
+    chaos_time_ensure_symbols();
+
     if (chaos_time_in_internal() || request_bits == 0U)
     {
         return chaos_time_call_real_nanosleep(request, remaining);
@@ -274,6 +278,8 @@ CHAOS_TIME_EXPORT int usleep(useconds_t usec)
 {
     chaos_time_rule_t latency_rule;
     chaos_time_rule_t errno_rule;
+
+    chaos_time_ensure_symbols();
 
     if (chaos_time_in_internal())
     {

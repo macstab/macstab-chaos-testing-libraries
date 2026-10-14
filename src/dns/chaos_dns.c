@@ -40,6 +40,7 @@
  * @stability  Private
  */
 
+#include "chaos_once.h"
 #include "chaos_dns_config.h"
 #include "chaos_dns_internal.h"
 
@@ -94,6 +95,15 @@ uint64_t g_chaos_dns_process_seed = UINT64_C(0x2545f4914f6cdd1d);
 static void chaos_dns_resolve_symbol(void *target, const char *symbol)
 {
     void *resolved;
+    void *current;
+
+    /* Only fill what is still unset, so a pointer already wired (by an earlier call,
+     * or by a test harness) is never replaced. */
+    (void)memcpy(&current, target, sizeof(current));
+    if (current != NULL)
+    {
+        return;
+    }
 
     (void)dlerror();
     resolved = dlsym(RTLD_NEXT, symbol);
@@ -171,6 +181,33 @@ static uint64_t chaos_dns_read_seed_material(void)
 }
 
 /**
+ * @brief Run-once state of the symbol table resolution.
+ *
+ * @details `chaos_once()`, not `pthread_once()`: before glibc 2.34 the latter lives
+ * in libpthread, which programs such as `cat` and `sh` do not load.
+ */
+static volatile chaos_once_t g_chaos_dns_symbols_once = CHAOS_ONCE_INIT;
+
+/**
+ * @brief Resolves the full downstream symbol table. Runs exactly once.
+ *
+ * @details Invoked only through `chaos_dns_ensure_symbols()`. Must not call any
+ * interposed wrapper of this library. `dlsym(RTLD_NEXT, ...)` walks the
+ * already-loaded link map and performs no file I/O, so it does not re-enter.
+ */
+static void chaos_dns_resolve_all_symbols(void)
+{
+    chaos_dns_resolve_symbol(&g_chaos_dns_real_getaddrinfo, "getaddrinfo");
+    chaos_dns_resolve_symbol(&g_chaos_dns_real_getnameinfo, "getnameinfo");
+    chaos_dns_resolve_symbol(&g_chaos_dns_real_freeaddrinfo, "freeaddrinfo");
+}
+
+void chaos_dns_ensure_symbols(void)
+{
+    chaos_once(&g_chaos_dns_symbols_once, chaos_dns_resolve_all_symbols);
+}
+
+/**
  * @brief Library constructor: resolve symbols, seed PRNG, load initial config.
  *
  * @details Executed by the dynamic linker before main() (or before the
@@ -195,10 +232,7 @@ static uint64_t chaos_dns_read_seed_material(void)
 CHAOS_DNS_CONSTRUCTOR
 static void chaos_dns_init(void)
 {
-    chaos_dns_resolve_symbol(&g_chaos_dns_real_getaddrinfo, "getaddrinfo");
-    chaos_dns_resolve_symbol(&g_chaos_dns_real_getnameinfo, "getnameinfo");
-    chaos_dns_resolve_symbol(&g_chaos_dns_real_freeaddrinfo, "freeaddrinfo");
-
+    chaos_dns_ensure_symbols();
     g_chaos_dns_process_seed = chaos_dns_read_seed_material();
     chaos_dns_prng_seed_thread(g_chaos_dns_process_seed);
     chaos_dns_config_init();
