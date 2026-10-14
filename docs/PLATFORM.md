@@ -366,6 +366,23 @@ The wrappers themselves don't need this check — if they're not loaded, they're
 
 ---
 
+### 6.1. Alternate entry names: large-file and fortified variants
+
+The dynamic linker binds by name, and glibc exports several names for one operation:
+
+- **Large-file names.** On 64-bit glibc `open64`, `pread64`, `mmap64` and the rest are separate
+  symbols with the base function's signature. Programs built with large-file support, and the JDK,
+  Redis, nginx and MySQL, bind to them. A wrapper exported only as `open` never sees those calls.
+  Each library therefore exports the `64` names as aliases of the base wrapper (same address).
+- **Fortified variants.** `_FORTIFY_SOURCE` builds, the default for Debian and Ubuntu packages, call
+  `__read_chk`, `__pread_chk`, `__open_2`, `__recv_chk` and similar instead of the base function.
+  glibc's own versions call internal symbols, so they bypass interposition entirely. The libraries
+  export them too: each checks the buffer exactly as glibc does (calling `__chk_fail()` on overflow)
+  and then runs the base wrapper.
+
+musl has neither, so both are glibc-only. `test/runtime/test_variants_glibc.sh` faults every variant
+through the built `.so`.
+
 ## 7. Statically linked binaries
 
 A statically-linked binary has libc baked into the executable image. There is no `PT_INTERP`; the kernel doesn't invoke `ld.so`; `LD_PRELOAD` is irrelevant.

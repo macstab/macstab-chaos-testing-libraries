@@ -577,7 +577,8 @@ Implemented logical operations:
 - `send`
   Applies to `send()`, `sendto()`, `sendmsg()`, and Linux `sendmmsg()`
 - `recv`
-  Applies to `recv()`, `recvfrom()`, `recvmsg()`, and Linux `recvmmsg()`
+  Applies to `recv()`, `recvfrom()`, `recvmsg()`, and Linux `recvmmsg()`, and on glibc to the fortified
+  `__recv_chk()` and `__recvfrom_chk()`
 
 Exact interposed symbols today:
 
@@ -712,6 +713,7 @@ Examples:
 ## Runtime Behavior
 
 - The intercepted libc entry points are `read`, `readv`, `write`, `writev`, `open`, `openat`, `close`, `fsync`, `fdatasync`, `pread`, `preadv`, `pwrite`, `pwritev`, `ftruncate`, `unlinkat`, `renameat`, and Linux `sendfile`, `copy_file_range`, plus `fallocate`.
+- On 64-bit glibc the large-file names `open64`, `openat64`, `pread64`, `pwrite64`, `preadv64`, `pwritev64`, `ftruncate64`, `fallocate64` and `sendfile64` are the same wrappers, and the fortified `__read_chk`, `__pread_chk`, `__pread64_chk`, `__open_2`, `__open64_2`, `__openat_2` and `__openat64_2` check the buffer like glibc and then run them. Programs bind to whichever name their build chose (the JDK, Redis, nginx and MySQL use the `64` names; `_FORTIFY_SOURCE` builds use the fortified ones), so each is intercepted.
 - The config file is checked with `stat()` on each intercepted call.
 - Reload is lock-free for readers and swaps between two config snapshots.
 - FD-backed operations resolve paths through `/proc/self/fd/<fd>` and cache them in thread-local storage.
