@@ -416,6 +416,17 @@ CHAOS_IO_EXPORT int open(const char *path, int flags, ...)
 }
 
 /**
+ * @brief Interposed `creat(2)`: `open(path, O_CREAT | O_WRONLY | O_TRUNC, mode)`.
+ *
+ * @details glibc and musl implement creat() with their own system call, not
+ * through open(), so without this wrapper `open` rules would never see it.
+ */
+CHAOS_IO_EXPORT int creat(const char *path, mode_t mode)
+{
+    return open(path, O_CREAT | O_WRONLY | O_TRUNC, mode);
+}
+
+/**
  * @brief Interposed `openat(2)` entry point.
  *
  * @details `openat()` reuses the logical `open` rule class. The only extra
@@ -498,6 +509,7 @@ extern void __chk_fail(void) __attribute__((__noreturn__));
 static void (*g_chaos_io_open_chk_fail)(void) = __chk_fail;
 
 CHAOS_IO_EXPORT int open64(const char *path, int flags, ...) __attribute__((alias("open")));
+CHAOS_IO_EXPORT int creat64(const char *path, mode_t mode) __attribute__((alias("creat")));
 CHAOS_IO_EXPORT int openat64(int dirfd, const char *path, int flags, ...)
     __attribute__((alias("openat")));
 

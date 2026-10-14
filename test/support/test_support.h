@@ -116,6 +116,7 @@
     chaos_io_pwritev_fn g_chaos_io_real_pwritev = NULL;                                            \
     chaos_io_ftruncate_fn g_chaos_io_real_ftruncate = NULL;                                        \
     chaos_io_unlinkat_fn g_chaos_io_real_unlinkat = NULL;                                          \
+    chaos_io_truncate_fn g_chaos_io_real_truncate = NULL;                                          \
     chaos_io_renameat_fn g_chaos_io_real_renameat = NULL;                                          \
     CHAOS_IO_DEFINE_TEST_LINUX_COPY_GLOBALS()                                                      \
     __thread int g_chaos_io_tls_guard = 0;                                                         \
@@ -323,6 +324,17 @@ static inline int chaos_test_real_ftruncate(int fd, off_t length)
 }
 
 /**
+ * @brief Truncate a file by path using the real libc `truncate`.
+ * @param path    File to truncate.
+ * @param length  New size in bytes.
+ * @return 0 on success, -1 on error with `errno` set.
+ */
+static inline int chaos_test_real_truncate(const char *path, off_t length)
+{
+    return truncate(path, length);
+}
+
+/**
  * @brief Remove a directory entry using the real libc `unlinkat`.
  * @param dirfd  Directory file descriptor or AT_FDCWD.
  * @param path   Path to the entry to remove.
@@ -376,6 +388,7 @@ static inline void chaos_test_use_real_io(void)
     g_chaos_io_real_pwritev = chaos_test_real_pwritev;
     g_chaos_io_real_ftruncate = chaos_test_real_ftruncate;
     g_chaos_io_real_unlinkat = chaos_test_real_unlinkat;
+    g_chaos_io_real_truncate = chaos_test_real_truncate;
     g_chaos_io_real_renameat = chaos_test_real_renameat;
     CHAOS_IO_TEST_ASSIGN_REAL_LINUX_COPY()
 }
@@ -405,6 +418,7 @@ static inline void chaos_test_reset_runtime(void)
     g_chaos_io_real_pwritev = NULL;
     g_chaos_io_real_ftruncate = NULL;
     g_chaos_io_real_unlinkat = NULL;
+    g_chaos_io_real_truncate = NULL;
     g_chaos_io_real_renameat = NULL;
     CHAOS_IO_TEST_RESET_REAL_LINUX_COPY()
     g_chaos_io_tls_guard = 0;

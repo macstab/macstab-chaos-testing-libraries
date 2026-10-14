@@ -311,7 +311,7 @@ static unsigned int g_real_copy_file_range_flags = 0U;
 #endif
 
 /* -------------------------------------------------------------------------
- * Real-function stubs: close / fsync / fdatasync / ftruncate / unlinkat / renameat
+ * Real-function stubs: close / fsync / fdatasync / ftruncate / truncate / unlinkat / renameat
  * --------------------------------------------------------------------- */
 
 /** @brief Number of times the stub close function was called. */
@@ -355,6 +355,15 @@ static int g_real_ftruncate_guard = 0;
 static int g_real_ftruncate_fd = -1;
 /** @brief `length` argument captured from the most recent stub ftruncate call. */
 static off_t g_real_ftruncate_length = 0;
+
+/** @brief Number of times the stub truncate function was called. */
+static int g_real_truncate_calls = 0;
+/** @brief Return value for the stub truncate function. */
+static int g_real_truncate_return = 0;
+/** @brief TLS guard value observed inside the stub truncate function. */
+static int g_real_truncate_guard = 0;
+/** @brief `length` argument captured from the most recent stub truncate call. */
+static off_t g_real_truncate_length = 0;
 
 /** @brief Number of times the stub unlinkat function was called. */
 static int g_real_unlinkat_calls = 0;
@@ -1096,6 +1105,16 @@ static int chaos_test_real_ftruncate_impl(int fd, off_t length)
     return g_real_ftruncate_return;
 }
 
+/** @brief Stub for the real `truncate` call. Captures length and TLS guard. */
+static int chaos_test_real_truncate_impl(const char *path, off_t length)
+{
+    (void)path;
+    ++g_real_truncate_calls;
+    g_real_truncate_length = length;
+    g_real_truncate_guard = g_chaos_io_tls_guard;
+    return g_real_truncate_return;
+}
+
 /** @brief Stub for the real `unlinkat` syscall wrapper. Captures dirfd, path, flags. */
 static int chaos_test_real_unlinkat_impl(int dirfd, const char *path, int flags)
 {
@@ -1334,6 +1353,10 @@ static void *chaos_test_dlsym(void *handle, const char *symbol)
     if (strcmp(symbol, "ftruncate") == 0)
     {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_ftruncate_fn, chaos_test_real_ftruncate_impl);
+    }
+    if (strcmp(symbol, "truncate") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_truncate_fn, chaos_test_real_truncate_impl);
     }
     if (strcmp(symbol, "unlinkat") == 0)
     {
@@ -1623,6 +1646,11 @@ static void chaos_test_reset_state(void)
     g_real_ftruncate_fd = -1;
     g_real_ftruncate_length = 0;
 
+    g_real_truncate_calls = 0;
+    g_real_truncate_return = 0;
+    g_real_truncate_guard = 0;
+    g_real_truncate_length = 0;
+
     g_real_unlinkat_calls = 0;
     g_real_unlinkat_return = 0;
     g_real_unlinkat_guard = 0;
@@ -1700,6 +1728,7 @@ static void chaos_test_reset_state(void)
     g_chaos_io_real_pwritev = NULL;
     g_chaos_io_real_ftruncate = NULL;
     g_chaos_io_real_unlinkat = NULL;
+    g_chaos_io_real_truncate = NULL;
     g_chaos_io_real_renameat = NULL;
 #ifdef __linux__
     g_chaos_io_real_fallocate = NULL;
@@ -1742,6 +1771,7 @@ static void chaos_test_bind_real_functions(void)
     g_chaos_io_real_pwritev = chaos_test_real_pwritev_impl;
     g_chaos_io_real_ftruncate = chaos_test_real_ftruncate_impl;
     g_chaos_io_real_unlinkat = chaos_test_real_unlinkat_impl;
+    g_chaos_io_real_truncate = chaos_test_real_truncate_impl;
     g_chaos_io_real_renameat = chaos_test_real_renameat_impl;
 #ifdef __linux__
     g_chaos_io_real_fallocate = chaos_test_real_fallocate_impl;
@@ -1807,6 +1837,10 @@ static void chaos_test_bind_libc_functions_for_exit(void)
     resolved = dlsym(RTLD_NEXT, "ftruncate");
     assert(resolved != NULL);
     (void)memcpy(&g_chaos_io_real_ftruncate, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "truncate");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_truncate, &resolved, sizeof(resolved));
 
     resolved = dlsym(RTLD_NEXT, "unlinkat");
     assert(resolved != NULL);

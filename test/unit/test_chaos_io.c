@@ -279,6 +279,7 @@ static void test_init_runtime(void)
     assert(g_chaos_io_real_pwrite == chaos_test_real_pwrite_impl);
     assert(g_chaos_io_real_ftruncate == chaos_test_real_ftruncate_impl);
     assert(g_chaos_io_real_unlinkat == chaos_test_real_unlinkat_impl);
+    assert(g_chaos_io_real_truncate == chaos_test_real_truncate_impl);
     assert(g_chaos_io_real_renameat == chaos_test_real_renameat_impl);
     assert(g_chaos_io_real_preadv == chaos_test_real_preadv_impl);
     assert(g_chaos_io_real_pwritev == chaos_test_real_pwritev_impl);
@@ -1841,6 +1842,8 @@ static void test_glibc_alternate_entries(void)
     ssize_t (*pwritev_fn)(int, const struct iovec *, int, off_t) = pwritev64;
     ssize_t (*sendfile_fn)(int, int, off_t *, size_t) = sendfile64;
     int (*ftruncate_fn)(int, off_t) = ftruncate64;
+    int (*truncate_fn)(const char *, off_t) = truncate64;
+    int (*creat_fn)(const char *, mode_t) = creat64;
     int (*fallocate_fn)(int, int, off_t, off_t) = fallocate64;
     int (*open2_fn)(const char *, int) = __open64_2;
     int (*openat2_fn)(int, const char *, int) = __openat64_2;
@@ -1854,6 +1857,8 @@ static void test_glibc_alternate_entries(void)
     assert(pwritev_fn == pwritev);
     assert(sendfile_fn == sendfile);
     assert(ftruncate_fn == ftruncate);
+    assert(truncate_fn == truncate);
+    assert(creat_fn == creat);
     assert(fallocate_fn == fallocate);
     assert(open2_fn == __open_2);
     assert(openat2_fn == __openat_2);
@@ -1972,6 +1977,94 @@ static void test_descriptor_reassignment_wrappers(void)
     chaos_test_bind_real_functions();
 }
 
+/**
+ * @brief Invariant: the path forms reach the same rules as the descriptor and *at forms.
+ *
+ * Expected observable behaviour:
+ * - `unlink(p)` → real unlinkat(AT_FDCWD, p, 0); `rmdir(p)` → flags AT_REMOVEDIR; both
+ *   match the `unlink` rules.
+ * - `rename(a, b)` → real renameat(AT_FDCWD, a, AT_FDCWD, b) under the rename rules.
+ * - `creat(p, m)` → real open(p, O_CREAT | O_WRONLY | O_TRUNC, m) under the open rules.
+ * - `truncate(p, n)`: passthrough under the guard, for excluded or unmatched paths;
+ *   matched by path against the `truncate` rules; LATENCY then real call; ERRNO fails
+ *   without the real call.
+ */
+static void test_path_form_wrappers(void)
+{
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
+    g_config_rule.errnum = EACCES;
+    g_rule_apply_errno_result = 1;
+    assert(unlink("/tmp/path-form.bin") == -1);
+    assert(errno == EACCES);
+    assert(g_last_match_loaded_operation == CHAOS_IO_OP_UNLINK);
+    assert(g_real_unlinkat_calls == 0);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    assert(unlink("/tmp/path-form.bin") == 0);
+    assert(g_real_unlinkat_dirfd == AT_FDCWD);
+    assert(g_real_unlinkat_flags == 0);
+    assert(rmdir("/tmp/path-form.d") == 0);
+    assert(g_real_unlinkat_flags == AT_REMOVEDIR);
+    assert(strcmp(g_real_unlinkat_path, "/tmp/path-form.d") == 0);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    assert(rename("/tmp/path-form.a", "/tmp/path-form.b") == 0);
+    assert(g_real_renameat_olddirfd == AT_FDCWD);
+    assert(g_real_renameat_newdirfd == AT_FDCWD);
+    assert(strcmp(g_real_renameat_newpath, "/tmp/path-form.b") == 0);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_open_return = 21;
+    assert(creat("/tmp/path-form.new", 0640) == 21);
+    assert(g_real_open_flags == (O_CREAT | O_WRONLY | O_TRUNC));
+    assert(g_real_open_mode == 0640);
+    assert(g_last_match_path_operation == CHAOS_IO_OP_OPEN);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_chaos_io_tls_guard = 1;
+    assert(truncate("/tmp/path-form.bin", 7) == 0);
+    assert(g_real_truncate_calls == 1);
+    assert(g_real_truncate_guard == 1);
+    assert(g_config_match_path_calls == 0);
+    g_chaos_io_tls_guard = 0;
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    assert(truncate("/proc/self/fd/0", 0) == 0);
+    assert(g_config_match_path_calls == 0);
+    assert(truncate("/tmp/path-form.bin", 7) == 0);
+    assert(g_last_match_path_operation == CHAOS_IO_OP_TRUNCATE);
+    assert(strcmp(g_last_match_path, "/tmp/path-form.bin") == 0);
+    assert(g_real_truncate_calls == 2);
+    assert(g_real_truncate_length == 7);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_match_path_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_LATENCY;
+    assert(truncate("/tmp/path-form.bin", 3) == 0);
+    assert(g_latency_calls == 1);
+    assert(g_real_truncate_calls == 1);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_match_path_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
+    g_config_rule.errnum = ENOSPC;
+    g_rule_apply_errno_result = 1;
+    assert(truncate("/tmp/path-form.bin", 3) == -1);
+    assert(errno == ENOSPC);
+    assert(g_real_truncate_calls == 0);
+}
+
 int main(void)
 {
     test_resolve_symbol_and_seed_material();
@@ -1982,6 +2075,7 @@ int main(void)
     test_open_wrapper();
     test_openat_wrapper();
     test_fsops_helpers_and_wrappers();
+    test_path_form_wrappers();
     test_read_and_write_wrappers();
     test_vectored_helpers();
     test_readv_and_writev_wrappers();

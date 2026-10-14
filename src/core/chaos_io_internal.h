@@ -240,6 +240,9 @@ typedef ssize_t (*chaos_io_pwritev_fn)(int, const struct iovec *, int, off_t);
 /** @brief Type of the real `ftruncate(2)` libc symbol. */
 typedef int (*chaos_io_ftruncate_fn)(int, off_t);
 
+/** @brief Type of the real `truncate(2)` libc symbol. */
+typedef int (*chaos_io_truncate_fn)(const char *, off_t);
+
 /** @brief Type of the real `unlinkat(2)` libc symbol. */
 typedef int (*chaos_io_unlinkat_fn)(int, const char *, int);
 
@@ -295,6 +298,7 @@ extern chaos_io_preadv_fn g_chaos_io_real_preadv;       /**< Downstream `preadv`
 extern chaos_io_pwritev_fn g_chaos_io_real_pwritev;     /**< Downstream `pwritev`. */
 extern chaos_io_ftruncate_fn g_chaos_io_real_ftruncate; /**< Downstream `ftruncate`. */
 extern chaos_io_unlinkat_fn g_chaos_io_real_unlinkat;   /**< Downstream `unlinkat`. */
+extern chaos_io_truncate_fn g_chaos_io_real_truncate;   /**< Downstream `truncate`. */
 extern chaos_io_renameat_fn g_chaos_io_real_renameat;   /**< Downstream `renameat`. */
 #ifdef __linux__
 extern chaos_io_fallocate_fn g_chaos_io_real_fallocate; /**< Downstream `fallocate` (Linux). */

@@ -5,7 +5,8 @@
  * @details
  * This unit owns the interposed entry points for file-system–level operations
  * that are neither ordinary fd I/O nor sync boundaries: `ftruncate(2)`,
- * `fallocate(2)` (Linux only), `unlinkat(2)`, and `renameat(2)`.
+ * `truncate(2)`, `fallocate(2)` (Linux only), `unlinkat(2)`, `unlink(2)`,
+ * `rmdir(2)`, `renameat(2)` and `rename(2)`.
  *
  * **Rule matching differences from read/write wrappers.**
  * `ftruncate` and `fallocate` arrive with a file descriptor and use the
@@ -84,6 +85,18 @@ static int chaos_io_call_real_fallocate(int fd, int mode, off_t offset, off_t le
     return result;
 }
 #endif
+
+/** @brief Calls the real `truncate()` while preserving the recursion guard. */
+static int chaos_io_call_real_truncate(const char *path, off_t length)
+{
+    int previous;
+    int result;
+
+    previous = chaos_io_enter_internal();
+    result = g_chaos_io_real_truncate(path, length);
+    chaos_io_leave_internal(previous);
+    return result;
+}
 
 /** @brief Calls the real `unlinkat()` while preserving the recursion guard. */
 static int chaos_io_call_real_unlinkat(int dirfd, const char *path, int flags)
@@ -404,6 +417,78 @@ CHAOS_IO_EXPORT int renameat(int olddirfd, const char *oldpath, int newdirfd, co
 }
 
 /* ---------------------------------------------------------------------------
+ * Path forms of the same operations
+ *
+ * glibc and musl implement unlink(), rmdir(), rename() and truncate() with their
+ * own system calls, not through unlinkat(), renameat() or ftruncate(), so a rule
+ * for these operations would otherwise never see them -- and they are the forms
+ * most programs use: the JDK's File.delete() and Files.delete() call unlink(),
+ * Files.move() calls rename(). Linux defines unlink(p) as unlinkat(AT_FDCWD, p, 0),
+ * rmdir(p) as unlinkat(AT_FDCWD, p, AT_REMOVEDIR) and rename(a, b) as
+ * renameat(AT_FDCWD, a, AT_FDCWD, b), so those forward to the *at wrappers and keep
+ * the kernel's exact semantics. truncate() matches the `truncate` rules by path.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * @brief Interposed `unlink(2)`: the `unlink` rules, through unlinkat().
+ */
+CHAOS_IO_EXPORT int unlink(const char *path)
+{
+    return unlinkat(AT_FDCWD, path, 0);
+}
+
+/**
+ * @brief Interposed `rmdir(2)`: the `unlink` rules, through unlinkat(AT_REMOVEDIR).
+ */
+CHAOS_IO_EXPORT int rmdir(const char *path)
+{
+    return unlinkat(AT_FDCWD, path, AT_REMOVEDIR);
+}
+
+/**
+ * @brief Interposed `rename(2)`: the `rename_from`/`rename_to` rules, through renameat().
+ */
+CHAOS_IO_EXPORT int rename(const char *oldpath, const char *newpath)
+{
+    return renameat(AT_FDCWD, oldpath, AT_FDCWD, newpath);
+}
+
+/**
+ * @brief Interposed `truncate(2)`: the `truncate` rules, matched by path.
+ *
+ * @details The path form of ftruncate(). LATENCY delays the call and ERRNO fails
+ * it without touching the file; otherwise the real truncate() runs.
+ *
+ * @param[in] path    File to truncate.
+ * @param[in] length  New file size in bytes.
+ * @return 0 on success; -1 with `errno` set on failure.
+ */
+CHAOS_IO_EXPORT int truncate(const char *path, off_t length)
+{
+    char resolved_path[CHAOS_IO_MAX_PATH];
+    chaos_io_rule_t rule;
+
+    chaos_io_ensure_symbols();
+    if (chaos_io_in_internal() ||
+        !chaos_io_resolve_at_path(AT_FDCWD, path, resolved_path, sizeof(resolved_path)) ||
+        chaos_io_is_excluded_path(resolved_path) ||
+        !chaos_io_config_match_path(CHAOS_IO_OP_TRUNCATE, resolved_path, &rule))
+    {
+        return chaos_io_call_real_truncate(path, length);
+    }
+
+    if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
+    {
+        chaos_io_rule_apply_latency(&rule);
+    }
+    else if (chaos_io_rule_apply_errno(&rule))
+    {
+        return -1;
+    }
+    return chaos_io_call_real_truncate(path, length);
+}
+
+/* ---------------------------------------------------------------------------
  * glibc alternate entry points
  *
  * On 64-bit glibc the large-file names (`open64`, `pread64`, ...) are separate
@@ -415,6 +500,7 @@ CHAOS_IO_EXPORT int renameat(int olddirfd, const char *oldpath, int newdirfd, co
 #if defined(__GLIBC__) && defined(__LP64__)
 
 CHAOS_IO_EXPORT int ftruncate64(int fd, off_t length) __attribute__((alias("ftruncate")));
+CHAOS_IO_EXPORT int truncate64(const char *path, off_t length) __attribute__((alias("truncate")));
 CHAOS_IO_EXPORT int fallocate64(int fd, int mode, off_t offset, off_t length)
     __attribute__((alias("fallocate")));
 
