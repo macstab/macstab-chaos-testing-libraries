@@ -71,6 +71,15 @@ chaos_time_nanosleep_fn g_chaos_time_real_nanosleep = NULL;
  */
 chaos_time_usleep_fn g_chaos_time_real_usleep = NULL;
 
+/** Resolved pointer to the real gettimeofday(2); NULL until first resolution. */
+chaos_time_gettimeofday_fn g_chaos_time_real_gettimeofday = NULL;
+
+/** Resolved pointer to the real time(2); NULL until first resolution. */
+chaos_time_time_fn g_chaos_time_real_time = NULL;
+
+/** Resolved pointer to the real clock_nanosleep(2); NULL until first resolution. */
+chaos_time_clock_nanosleep_fn g_chaos_time_real_clock_nanosleep = NULL;
+
 /**
  * Per-thread reentrancy guard; 0 = not inside the library, 1 = inside.
  *
@@ -227,6 +236,9 @@ static void chaos_time_resolve_all_symbols(void)
     chaos_time_resolve_symbol(&g_chaos_time_real_clock_gettime, "clock_gettime");
     chaos_time_resolve_symbol(&g_chaos_time_real_nanosleep, "nanosleep");
     chaos_time_resolve_symbol(&g_chaos_time_real_usleep, "usleep");
+    chaos_time_resolve_symbol(&g_chaos_time_real_gettimeofday, "gettimeofday");
+    chaos_time_resolve_symbol(&g_chaos_time_real_time, "time");
+    chaos_time_resolve_symbol(&g_chaos_time_real_clock_nanosleep, "clock_nanosleep");
 }
 
 void chaos_time_ensure_symbols(void)
@@ -239,7 +251,7 @@ void chaos_time_ensure_symbols(void)
  *
  * Execution order:
  *
- *  1. Resolve the three real function pointers via RTLD_NEXT.
+ *  1. Resolve the real function pointers via RTLD_NEXT.
  *  2. Collect entropy from /dev/urandom and write it to g_chaos_time_process_seed.
  *  3. Seed the main thread's PRNG state from the process seed.
  *  4. Initialise the config subsystem (zeros both snapshots, sets cached mtime

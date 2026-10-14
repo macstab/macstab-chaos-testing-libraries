@@ -101,6 +101,33 @@ static int stub_usleep(useconds_t usec)
     return 0;
 }
 
+/** @brief Stub for `gettimeofday(2)`. Returns 0. */
+static int stub_gettimeofday(struct timeval *value, void *zone)
+{
+    (void)value;
+    (void)zone;
+    return 0;
+}
+
+/** @brief Stub for `time(2)`. Returns 0. */
+static time_t stub_time(time_t *out)
+{
+    (void)out;
+    return 0;
+}
+
+/** @brief Stub for `clock_nanosleep(2)`. Returns 0 (success, no sleep). */
+static int stub_clock_nanosleep(
+    clockid_t clock_id, int flags, const struct timespec *request, struct timespec *remaining
+)
+{
+    (void)clock_id;
+    (void)flags;
+    (void)request;
+    (void)remaining;
+    return 0;
+}
+
 /**
  * @brief Stub for `chaos_time_config_init()`.
  *
@@ -126,7 +153,7 @@ static char *chaos_time_test_dlerror(void)
 /**
  * @brief Stub for `dlsym(RTLD_NEXT, symbol)`.
  *
- * Maps each of the three expected symbol names to the corresponding stub via
+ * Maps each expected symbol name to the corresponding stub via
  * `CHAOS_TIME_TEST_DLSYM_RESULT`. Returns NULL for unrecognised symbols, which triggers
  * the abort path in the production resolver.
  */
@@ -140,6 +167,12 @@ static void *chaos_time_test_dlsym(void *handle, const char *symbol)
         return CHAOS_TIME_TEST_DLSYM_RESULT(chaos_time_nanosleep_fn, stub_nanosleep);
     if (strcmp(symbol, "usleep") == 0)
         return CHAOS_TIME_TEST_DLSYM_RESULT(chaos_time_usleep_fn, stub_usleep);
+    if (strcmp(symbol, "gettimeofday") == 0)
+        return CHAOS_TIME_TEST_DLSYM_RESULT(chaos_time_gettimeofday_fn, stub_gettimeofday);
+    if (strcmp(symbol, "time") == 0)
+        return CHAOS_TIME_TEST_DLSYM_RESULT(chaos_time_time_fn, stub_time);
+    if (strcmp(symbol, "clock_nanosleep") == 0)
+        return CHAOS_TIME_TEST_DLSYM_RESULT(chaos_time_clock_nanosleep_fn, stub_clock_nanosleep);
     return NULL;
 }
 
@@ -322,7 +355,7 @@ static void test_seed_fallback_paths(void)
 #endif
 
 /**
- * @brief Invariant: `chaos_time_init()` wires all three function pointers and seeds the PRNG.
+ * @brief Invariant: `chaos_time_init()` wires every function pointer and seeds the PRNG.
  *
  * Triggering condition: `chaos_time_init()` called after `reset_test_state()`.
  *
@@ -344,6 +377,9 @@ static void test_constructor_init(void)
     assert(g_chaos_time_real_clock_gettime == stub_clock_gettime);
     assert(g_chaos_time_real_nanosleep == stub_nanosleep);
     assert(g_chaos_time_real_usleep == stub_usleep);
+    assert(g_chaos_time_real_gettimeofday == stub_gettimeofday);
+    assert(g_chaos_time_real_time == stub_time);
+    assert(g_chaos_time_real_clock_nanosleep == stub_clock_nanosleep);
     assert(g_config_init_calls == config_calls_before + 1);
     assert(g_chaos_time_process_seed != 0U);
     assert(g_chaos_time_tls_prng_state != 0U);

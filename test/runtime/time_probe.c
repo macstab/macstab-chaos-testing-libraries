@@ -20,6 +20,8 @@
  * - `ERRNO` injection on `nanosleep` (synthetic `EINVAL` return)
  * - `LATENCY` injection on `nanosleep` (additive to requested sleep)
  * - `ERRNO` injection on `usleep` (synthetic `EINVAL` return)
+ * - a realtime `OFFSET` shifts `clock_gettime`, `gettimeofday` and `time` alike
+ * - `ERRNO` on `nanosleep` also fails `clock_nanosleep`, reported by return value
  *
  * On glibc, `clock_gettime`/`clock_getres` for `CLOCK_MONOTONIC` and
  * `CLOCK_REALTIME` are normally serviced through the vDSO fast path without
@@ -36,6 +38,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -227,6 +230,82 @@ static int probe_usleep_latency(void)
     return duration_ms >= 120LL ? 0 : 63;
 }
 
+/*
+ * gettimeofday and time read the realtime clock from the vDSO without calling
+ * clock_gettime, so they need their own wrappers to see a realtime OFFSET. All
+ * three must report the same shifted wall clock.
+ */
+static int probe_wall_clocks_agree(void)
+{
+    struct timespec realtime;
+    struct timeval timeofday;
+    time_t baseline;
+    time_t seconds;
+    int rc = write_config("# clear");
+
+    if (rc != 0)
+    {
+        return rc;
+    }
+    baseline = time(NULL);
+
+    rc = write_config("clock_gettime/realtime:OFFSET:86400000");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    if (clock_gettime(CLOCK_REALTIME, &realtime) != 0)
+    {
+        return 70;
+    }
+    if (gettimeofday(&timeofday, NULL) != 0)
+    {
+        return 71;
+    }
+    seconds = time(NULL);
+
+    if (realtime.tv_sec < baseline + 86400 - 5 || realtime.tv_sec > baseline + 86400 + 5)
+    {
+        return 72;
+    }
+    if (timeofday.tv_sec < realtime.tv_sec - 2 || timeofday.tv_sec > realtime.tv_sec + 2)
+    {
+        return 73;
+    }
+    if (seconds < realtime.tv_sec - 2 || seconds > realtime.tv_sec + 2)
+    {
+        return 74;
+    }
+    return 0;
+}
+
+/*
+ * clock_nanosleep follows the nanosleep rules. It reports failure by return
+ * value and must leave errno alone; an interrupted relative sleep reports the
+ * whole request as remaining.
+ */
+static int probe_clock_nanosleep_errno(void)
+{
+    struct timespec request = {1, 0L};
+    struct timespec remaining = {0, 0L};
+    int rc = write_config("nanosleep:ERRNO:EINTR");
+
+    if (rc != 0)
+    {
+        return rc;
+    }
+    errno = 4242;
+    if (clock_nanosleep(CLOCK_MONOTONIC, 0, &request, &remaining) != EINTR)
+    {
+        return 80;
+    }
+    if (errno != 4242)
+    {
+        return 81;
+    }
+    return remaining.tv_sec == request.tv_sec && remaining.tv_nsec == request.tv_nsec ? 0 : 82;
+}
+
 int main(void)
 {
     int rc;
@@ -257,6 +336,16 @@ int main(void)
         return rc;
     }
     rc = probe_usleep_latency();
+    if (rc != 0)
+    {
+        return rc;
+    }
+    rc = probe_wall_clocks_agree();
+    if (rc != 0)
+    {
+        return rc;
+    }
+    rc = probe_clock_nanosleep_errno();
     if (rc != 0)
     {
         return rc;

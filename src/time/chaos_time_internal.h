@@ -27,6 +27,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -143,6 +144,15 @@ typedef int (*chaos_time_nanosleep_fn)(const struct timespec *, struct timespec 
 /** Function-pointer type matching the POSIX usleep(3) signature. */
 typedef int (*chaos_time_usleep_fn)(useconds_t);
 
+/** Function-pointer type matching gettimeofday(2) as declared by glibc and musl. */
+typedef int (*chaos_time_gettimeofday_fn)(struct timeval *, void *);
+
+/** Function-pointer type matching the POSIX time(2) signature. */
+typedef time_t (*chaos_time_time_fn)(time_t *);
+
+/** Function-pointer type matching the POSIX clock_nanosleep(2) signature. */
+typedef int (*chaos_time_clock_nanosleep_fn)(clockid_t, int, const struct timespec *, struct timespec *);
+
 /**
  * Resolved pointer to the real clock_gettime implementation.
  *
@@ -166,6 +176,15 @@ extern chaos_time_nanosleep_fn g_chaos_time_real_nanosleep;
  * Read-only from all other translation units.
  */
 extern chaos_time_usleep_fn g_chaos_time_real_usleep;
+
+/** Resolved pointer to the real gettimeofday implementation. */
+extern chaos_time_gettimeofday_fn g_chaos_time_real_gettimeofday;
+
+/** Resolved pointer to the real time implementation. */
+extern chaos_time_time_fn g_chaos_time_real_time;
+
+/** Resolved pointer to the real clock_nanosleep implementation. */
+extern chaos_time_clock_nanosleep_fn g_chaos_time_real_clock_nanosleep;
 
 /** @} */
 

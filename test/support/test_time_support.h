@@ -60,6 +60,9 @@
     chaos_time_clock_gettime_fn g_chaos_time_real_clock_gettime = NULL;                            \
     chaos_time_nanosleep_fn g_chaos_time_real_nanosleep = NULL;                                    \
     chaos_time_usleep_fn g_chaos_time_real_usleep = NULL;                                          \
+    chaos_time_gettimeofday_fn g_chaos_time_real_gettimeofday = NULL;                              \
+    chaos_time_time_fn g_chaos_time_real_time = NULL;                                              \
+    chaos_time_clock_nanosleep_fn g_chaos_time_real_clock_nanosleep = NULL;                        \
     __thread int g_chaos_time_tls_guard = 0;                                                       \
     __thread uint64_t g_chaos_time_tls_prng_state = 0U;                                            \
     uint64_t g_chaos_time_process_seed = 1U
@@ -76,6 +79,9 @@ static inline void chaos_time_test_reset_runtime(void)
     g_chaos_time_real_clock_gettime = NULL;
     g_chaos_time_real_nanosleep = NULL;
     g_chaos_time_real_usleep = NULL;
+    g_chaos_time_real_gettimeofday = NULL;
+    g_chaos_time_real_time = NULL;
+    g_chaos_time_real_clock_nanosleep = NULL;
     g_chaos_time_tls_guard = 0;
     g_chaos_time_tls_prng_state = 0U;
     g_chaos_time_process_seed = 1U;

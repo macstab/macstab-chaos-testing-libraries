@@ -96,6 +96,14 @@ static clockid_t g_last_clock_id = (clockid_t)0;
 static struct timespec g_last_sleep_request;
 /** @brief `usec` argument captured from the most recent `chaos_time_test_usleep` call. */
 static useconds_t g_last_usleep = 0U;
+/** @brief Number of times `chaos_time_test_gettimeofday` was called. */
+static int g_real_gettimeofday_calls = 0;
+/** @brief Number of times `chaos_time_test_time` was called. */
+static int g_real_time_calls = 0;
+/** @brief Number of times `chaos_time_test_clock_nanosleep` was called. */
+static int g_real_clock_nanosleep_calls = 0;
+/** @brief When non-zero, `chaos_time_test_gettimeofday` fails with this errno. */
+static int g_real_gettimeofday_error = 0;
 
 /**
  * @brief Reset all wrapper-layer test state between test functions and scenarios.
@@ -130,6 +138,10 @@ static void reset_wrapper_state(void)
     g_real_nanosleep_error = 0;
     g_real_usleep_calls = 0;
     g_real_usleep_error = 0;
+    g_real_gettimeofday_calls = 0;
+    g_real_time_calls = 0;
+    g_real_clock_nanosleep_calls = 0;
+    g_real_gettimeofday_error = 0;
     g_last_clock_id = (clockid_t)0;
     g_last_sleep_request.tv_sec = 0;
     g_last_sleep_request.tv_nsec = 0L;
@@ -285,6 +297,53 @@ static int chaos_time_test_usleep(useconds_t usec)
         return -1;
     }
     return 0;
+}
+
+/**
+ * @brief Stub for the real `gettimeofday(2)`.
+ *
+ * Fills @p value with `{77s, 5us}` and zeroes a non-NULL @p zone, so a test can
+ * tell a value produced by the real call from one derived from clock_gettime.
+ */
+static int chaos_time_test_gettimeofday(struct timeval *value, void *zone)
+{
+    ++g_real_gettimeofday_calls;
+    if (g_real_gettimeofday_error != 0)
+    {
+        errno = g_real_gettimeofday_error;
+        return -1;
+    }
+    value->tv_sec = 77;
+    value->tv_usec = 5;
+    if (zone != NULL)
+    {
+        (void)memset(zone, 0, sizeof(int) * 2U);
+    }
+    return 0;
+}
+
+/** @brief Stub for the real `time(2)`. Returns 77. */
+static time_t chaos_time_test_time(time_t *out)
+{
+    ++g_real_time_calls;
+    if (out != NULL)
+    {
+        *out = 77;
+    }
+    return 77;
+}
+
+/** @brief Stub for the real `clock_nanosleep(2)`. Returns 0 or `g_real_nanosleep_error`. */
+static int chaos_time_test_clock_nanosleep(
+    clockid_t clock_id, int flags, const struct timespec *request, struct timespec *remaining
+)
+{
+    (void)clock_id;
+    (void)flags;
+    (void)request;
+    (void)remaining;
+    ++g_real_clock_nanosleep_calls;
+    return g_real_nanosleep_error;
 }
 
 #include "../../src/time/chaos_time_hooks.c"
@@ -517,11 +576,196 @@ static void test_usleep_paths(void)
     assert(g_real_usleep_calls == 0);
 }
 
+/**
+ * @brief Invariant: gettimeofday reads CLOCK_REALTIME through the clock_gettime rules.
+ *
+ * Triggering conditions: guard set; NULL value; OFFSET rule (+1500ms on {10s, 250ms});
+ * non-NULL timezone; ERRNO rule; real clock_gettime failing; real gettimeofday failing
+ * while filling the timezone.
+ *
+ * Expected observable behaviour:
+ * - Guard or NULL value: the real gettimeofday runs, its value is returned unchanged.
+ * - OFFSET: `{11s, 750000us}` from the shifted clock_gettime; real gettimeofday not called;
+ *   the clock read is CLOCK_REALTIME.
+ * - Non-NULL timezone: filled by the real gettimeofday; the value still comes from the rules.
+ * - ERRNO or a failing real call: -1 with the errno of the failure.
+ */
+static void test_gettimeofday_paths(void)
+{
+    struct timeval value;
+    /* Called through a pointer: the libc declaration marks the value nonnull, and
+     * the NULL case is exactly what this test exercises. */
+    chaos_time_gettimeofday_fn volatile call_gettimeofday = gettimeofday;
+    int zone[2] = {7, 7};
+
+    reset_wrapper_state();
+    g_chaos_time_real_gettimeofday = chaos_time_test_gettimeofday;
+    g_chaos_time_tls_guard = 1;
+    assert(gettimeofday(&value, NULL) == 0);
+    assert(value.tv_sec == 77);
+    assert(g_real_gettimeofday_calls == 1);
+
+    reset_wrapper_state();
+    g_chaos_time_real_gettimeofday = chaos_time_test_gettimeofday;
+    g_real_gettimeofday_error = EFAULT;
+    errno = 0;
+    assert(call_gettimeofday(NULL, NULL) == -1);
+    assert(errno == EFAULT);
+
+    reset_wrapper_state();
+    g_chaos_time_real_clock_gettime = chaos_time_test_clock_gettime;
+    g_chaos_time_real_gettimeofday = chaos_time_test_gettimeofday;
+    g_stub_match[CHAOS_TIME_EFFECT_OFFSET][CHAOS_TIME_OP_CLOCK_GETTIME] = 1;
+    g_stub_rules[CHAOS_TIME_EFFECT_OFFSET][CHAOS_TIME_OP_CLOCK_GETTIME].effect =
+        CHAOS_TIME_EFFECT_OFFSET;
+    g_stub_rules[CHAOS_TIME_EFFECT_OFFSET][CHAOS_TIME_OP_CLOCK_GETTIME].offset_ms = 1500;
+    assert(gettimeofday(&value, NULL) == 0);
+    assert(value.tv_sec == 11);
+    assert(value.tv_usec == 750000);
+    assert(g_last_clock_id == CLOCK_REALTIME);
+    assert(g_real_gettimeofday_calls == 0);
+
+    assert(gettimeofday(&value, zone) == 0);
+    assert(value.tv_sec == 11);
+    assert(zone[0] == 0 && zone[1] == 0);
+    assert(g_real_gettimeofday_calls == 1);
+
+    g_real_gettimeofday_error = EFAULT;
+    errno = 0;
+    assert(gettimeofday(&value, zone) == -1);
+    assert(errno == EFAULT);
+
+    reset_wrapper_state();
+    g_chaos_time_real_clock_gettime = chaos_time_test_clock_gettime;
+    g_stub_match[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_CLOCK_GETTIME] = 1;
+    g_stub_rules[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_CLOCK_GETTIME].effect =
+        CHAOS_TIME_EFFECT_ERRNO;
+    g_stub_rules[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_CLOCK_GETTIME].errnum = EINVAL;
+    g_errno_trigger = 1;
+    errno = 0;
+    assert(gettimeofday(&value, NULL) == -1);
+    assert(errno == EINVAL);
+    assert(g_real_clock_gettime_calls == 0);
+}
+
+/**
+ * @brief Invariant: time reads CLOCK_REALTIME through the clock_gettime rules.
+ *
+ * Expected observable behaviour:
+ * - Guard set: the real time runs (77).
+ * - OFFSET +1500ms on {10s, 250ms}: returns 11 and stores it through a non-NULL pointer;
+ *   a NULL pointer is allowed.
+ * - ERRNO: returns (time_t)-1 with errno set.
+ */
+static void test_time_paths(void)
+{
+    time_t out = 0;
+
+    reset_wrapper_state();
+    g_chaos_time_real_time = chaos_time_test_time;
+    g_chaos_time_tls_guard = 1;
+    assert(time(&out) == 77);
+    assert(out == 77);
+    assert(g_real_time_calls == 1);
+
+    reset_wrapper_state();
+    g_chaos_time_real_clock_gettime = chaos_time_test_clock_gettime;
+    g_stub_match[CHAOS_TIME_EFFECT_OFFSET][CHAOS_TIME_OP_CLOCK_GETTIME] = 1;
+    g_stub_rules[CHAOS_TIME_EFFECT_OFFSET][CHAOS_TIME_OP_CLOCK_GETTIME].effect =
+        CHAOS_TIME_EFFECT_OFFSET;
+    g_stub_rules[CHAOS_TIME_EFFECT_OFFSET][CHAOS_TIME_OP_CLOCK_GETTIME].offset_ms = 1500;
+    assert(time(&out) == 11);
+    assert(out == 11);
+    assert(time(NULL) == 11);
+    assert(g_last_clock_id == CLOCK_REALTIME);
+    assert(g_real_time_calls == 0);
+
+    reset_wrapper_state();
+    g_chaos_time_real_clock_gettime = chaos_time_test_clock_gettime;
+    g_stub_match[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_CLOCK_GETTIME] = 1;
+    g_stub_rules[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_CLOCK_GETTIME].effect =
+        CHAOS_TIME_EFFECT_ERRNO;
+    g_stub_rules[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_CLOCK_GETTIME].errnum = EOVERFLOW;
+    g_errno_trigger = 1;
+    errno = 0;
+    out = 5;
+    assert(time(&out) == (time_t)-1);
+    assert(errno == EOVERFLOW);
+    assert(out == 5);
+}
+
+/**
+ * @brief Invariant: clock_nanosleep follows the nanosleep rules and reports errors by value.
+ *
+ * Expected observable behaviour:
+ * - Guard set or NULL request: the real clock_nanosleep runs.
+ * - LATENCY: applied, then the real call runs.
+ * - ERRNO EINTR, relative: returns EINTR, errno untouched, remaining = request.
+ * - ERRNO EINTR, TIMER_ABSTIME: returns EINTR, remaining not written.
+ * - ERRNO EINVAL: returns EINVAL, remaining not written; the real call never runs.
+ */
+static void test_clock_nanosleep_paths(void)
+{
+    struct timespec request;
+    struct timespec remaining;
+
+    request.tv_sec = 2;
+    request.tv_nsec = 300000000L;
+
+    reset_wrapper_state();
+    g_chaos_time_real_clock_nanosleep = chaos_time_test_clock_nanosleep;
+    g_chaos_time_tls_guard = 1;
+    assert(clock_nanosleep(CLOCK_MONOTONIC, 0, &request, &remaining) == 0);
+    assert(g_real_clock_nanosleep_calls == 1);
+
+    reset_wrapper_state();
+    g_chaos_time_real_clock_nanosleep = chaos_time_test_clock_nanosleep;
+    g_real_nanosleep_error = EFAULT;
+    assert(clock_nanosleep(CLOCK_MONOTONIC, 0, NULL, &remaining) == EFAULT);
+    assert(g_real_clock_nanosleep_calls == 1);
+
+    reset_wrapper_state();
+    g_chaos_time_real_clock_nanosleep = chaos_time_test_clock_nanosleep;
+    g_stub_match[CHAOS_TIME_EFFECT_LATENCY][CHAOS_TIME_OP_NANOSLEEP] = 1;
+    g_stub_rules[CHAOS_TIME_EFFECT_LATENCY][CHAOS_TIME_OP_NANOSLEEP].effect =
+        CHAOS_TIME_EFFECT_LATENCY;
+    assert(clock_nanosleep(CLOCK_MONOTONIC, 0, &request, &remaining) == 0);
+    assert(g_latency_calls == 1);
+    assert(g_real_clock_nanosleep_calls == 1);
+
+    reset_wrapper_state();
+    g_chaos_time_real_clock_nanosleep = chaos_time_test_clock_nanosleep;
+    g_stub_match[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_NANOSLEEP] = 1;
+    g_stub_rules[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_NANOSLEEP].effect = CHAOS_TIME_EFFECT_ERRNO;
+    g_stub_rules[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_NANOSLEEP].errnum = EINTR;
+    g_errno_trigger = 1;
+    remaining.tv_sec = 0;
+    remaining.tv_nsec = 0L;
+    errno = 4242;
+    assert(clock_nanosleep(CLOCK_MONOTONIC, 0, &request, &remaining) == EINTR);
+    assert(errno == 4242);
+    assert(remaining.tv_sec == request.tv_sec);
+    assert(remaining.tv_nsec == request.tv_nsec);
+
+    remaining.tv_sec = 0;
+    remaining.tv_nsec = 0L;
+    assert(clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &request, &remaining) == EINTR);
+    assert(remaining.tv_sec == 0);
+
+    g_stub_rules[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_NANOSLEEP].errnum = EINVAL;
+    assert(clock_nanosleep(CLOCK_MONOTONIC, 0, &request, &remaining) == EINVAL);
+    assert(remaining.tv_sec == 0);
+    assert(g_real_clock_nanosleep_calls == 0);
+}
+
 int main(void)
 {
     test_call_real_helpers();
     test_clock_gettime_paths();
     test_nanosleep_paths();
     test_usleep_paths();
+    test_gettimeofday_paths();
+    test_time_paths();
+    test_clock_nanosleep_paths();
     return 0;
 }

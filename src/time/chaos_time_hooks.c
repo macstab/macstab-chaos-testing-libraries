@@ -1,11 +1,14 @@
 /**
  * @file chaos_time_hooks.c
- * @brief LD_PRELOAD interceptor wrappers for clock_gettime(2), nanosleep(2),
- *        and usleep(3).
+ * @brief LD_PRELOAD interceptor wrappers for clock_gettime(2), gettimeofday(2),
+ *        time(2), nanosleep(2), clock_nanosleep(2) and usleep(3).
  *
- * This translation unit contains the three exported symbols that the dynamic
- * linker resolves instead of the libc originals when the library is loaded via
- * LD_PRELOAD.  Each wrapper follows the same structure:
+ * This translation unit contains the exported symbols that the dynamic linker
+ * resolves instead of the libc originals when the library is loaded via
+ * LD_PRELOAD.  gettimeofday and time read the realtime clock through the
+ * clock_gettime rules, and clock_nanosleep follows the nanosleep rules, so a
+ * rule applies however the program reads the clock or sleeps.  Each wrapper
+ * follows the same structure:
  *
  *  1. **Bypass check** — if the per-thread reentrancy guard is set, or if a
  *     mandatory pointer argument is NULL, forward directly to the real
@@ -118,6 +121,65 @@ static int chaos_time_call_real_usleep(useconds_t usec)
 }
 
 /**
+ * Calls the real gettimeofday with the reentrancy guard raised.
+ *
+ * @param value     Output timeval.
+ * @param zone      Obsolete timezone output; may be NULL.
+ * @return          The return value of the real gettimeofday.
+ */
+static int chaos_time_call_real_gettimeofday(struct timeval *value, void *zone)
+{
+    int previous;
+    int rc;
+
+    previous = chaos_time_enter_internal();
+    rc = g_chaos_time_real_gettimeofday(value, zone);
+    chaos_time_leave_internal(previous);
+    return rc;
+}
+
+/**
+ * Calls the real time with the reentrancy guard raised.
+ *
+ * @param out  Optional output; may be NULL.
+ * @return     The return value of the real time.
+ */
+static time_t chaos_time_call_real_time(time_t *out)
+{
+    int previous;
+    time_t result;
+
+    previous = chaos_time_enter_internal();
+    result = g_chaos_time_real_time(out);
+    chaos_time_leave_internal(previous);
+    return result;
+}
+
+/**
+ * Calls the real clock_nanosleep with the reentrancy guard raised.
+ *
+ * @param clock_id   Clock to sleep against.
+ * @param flags      0 or TIMER_ABSTIME.
+ * @param request    Requested duration or absolute deadline.
+ * @param remaining  Output: remaining time if interrupted.  May be NULL.
+ * @return           The return value of the real clock_nanosleep.
+ */
+static int chaos_time_call_real_clock_nanosleep(
+    clockid_t clock_id, int flags, const struct timespec *request, struct timespec *remaining
+)
+{
+    int previous;
+    int rc;
+
+    previous = chaos_time_enter_internal();
+    rc = g_chaos_time_real_clock_nanosleep(clock_id, flags, request, remaining);
+    chaos_time_leave_internal(previous);
+    return rc;
+}
+
+static int chaos_time_read_clock(clockid_t clock_id, struct timespec *value);
+
+/**
  * Copies the request timespec into the remaining output when an ERRNO rule
  * simulates EINTR.
  *
@@ -168,11 +230,7 @@ static void chaos_time_copy_remaining(const struct timespec *request, struct tim
  */
 CHAOS_TIME_EXPORT int clock_gettime(clockid_t clock_id, struct timespec *value)
 {
-    chaos_time_rule_t latency_rule;
-    chaos_time_rule_t errno_rule;
-    chaos_time_rule_t offset_rule;
     uintptr_t value_bits = (uintptr_t)(void *)value;
-    int rc;
 
     chaos_time_ensure_symbols();
 
@@ -180,6 +238,102 @@ CHAOS_TIME_EXPORT int clock_gettime(clockid_t clock_id, struct timespec *value)
     {
         return chaos_time_call_real_clock_gettime(clock_id, value);
     }
+    return chaos_time_read_clock(clock_id, value);
+}
+
+/**
+ * Interceptor for gettimeofday(2).
+ *
+ * gettimeofday reads the realtime clock, and glibc and musl serve it from the
+ * vDSO without calling clock_gettime, so an OFFSET rule on clock_gettime alone
+ * would leave it unshifted: one process would see two different wall clocks.
+ * The wrapper therefore reads CLOCK_REALTIME through the clock_gettime rules
+ * (LATENCY, ERRNO, OFFSET) and converts the result. A non-NULL @p zone is
+ * still filled by the real gettimeofday, which is all it is used for.
+ *
+ * @param value     Output timeval.  Must not be NULL for chaos injection.
+ * @param zone      Obsolete timezone output; may be NULL.
+ * @return          0 on success, -1 with errno set on failure.
+ */
+CHAOS_TIME_EXPORT int gettimeofday(struct timeval *value, void *zone)
+{
+    struct timeval unused;
+    struct timespec now;
+    /* glibc declares the value argument nonnull, which lets the compiler drop a
+     * plain NULL test. Reading it through a volatile keeps the test, so a NULL
+     * value reaches the real call (and its EFAULT) instead of being written to. */
+    struct timeval *volatile checked_value = value;
+    uintptr_t value_bits = (uintptr_t)(void *)checked_value;
+    uintptr_t zone_bits = (uintptr_t)zone;
+
+    chaos_time_ensure_symbols();
+
+    if (chaos_time_in_internal() || value_bits == 0U)
+    {
+        return chaos_time_call_real_gettimeofday(value, zone);
+    }
+    if (chaos_time_read_clock(CLOCK_REALTIME, &now) != 0)
+    {
+        return -1;
+    }
+    if (zone_bits != 0U && chaos_time_call_real_gettimeofday(&unused, zone) != 0)
+    {
+        return -1;
+    }
+    value->tv_sec = now.tv_sec;
+    value->tv_usec = (suseconds_t)(now.tv_nsec / 1000L);
+    return 0;
+}
+
+/**
+ * Interceptor for time(2).
+ *
+ * Like gettimeofday, time is served from the vDSO without calling
+ * clock_gettime, so it reads CLOCK_REALTIME through the clock_gettime rules.
+ * An ERRNO rule makes it return (time_t)-1 with errno set, its only failure
+ * report.
+ *
+ * @param out  Optional output for the result; may be NULL.
+ * @return     Seconds since the Epoch, or (time_t)-1 on failure.
+ */
+CHAOS_TIME_EXPORT time_t time(time_t *out)
+{
+    struct timespec now;
+    uintptr_t out_bits = (uintptr_t)(void *)out;
+
+    chaos_time_ensure_symbols();
+
+    if (chaos_time_in_internal())
+    {
+        return chaos_time_call_real_time(out);
+    }
+    if (chaos_time_read_clock(CLOCK_REALTIME, &now) != 0)
+    {
+        return (time_t)-1;
+    }
+    if (out_bits != 0U)
+    {
+        *out = now.tv_sec;
+    }
+    return now.tv_sec;
+}
+
+/**
+ * Applies the clock_gettime rules to one read of @p clock_id.
+ *
+ * Shared by clock_gettime, gettimeofday and time so that every way of reading
+ * a clock sees the same LATENCY, ERRNO and OFFSET.
+ *
+ * @param clock_id  Clock to read.
+ * @param value     Output timespec; not NULL.
+ * @return          0 on success, -1 with errno set on failure.
+ */
+static int chaos_time_read_clock(clockid_t clock_id, struct timespec *value)
+{
+    chaos_time_rule_t latency_rule;
+    chaos_time_rule_t errno_rule;
+    chaos_time_rule_t offset_rule;
+    int rc;
 
     if (chaos_time_config_match(
             CHAOS_TIME_EFFECT_LATENCY, CHAOS_TIME_OP_CLOCK_GETTIME, clock_id, &latency_rule
@@ -260,6 +414,61 @@ CHAOS_TIME_EXPORT int nanosleep(const struct timespec *request, struct timespec 
     }
 
     return chaos_time_call_real_nanosleep(request, remaining);
+}
+
+/**
+ * Interceptor for clock_nanosleep(2).
+ *
+ * clock_nanosleep is the general form of nanosleep (and what glibc's own
+ * nanosleep calls internally, bypassing this symbol), so it follows the
+ * nanosleep rules: LATENCY and ERRNO.  Unlike nanosleep it reports failure by
+ * returning the error number and leaves errno untouched.  An injected EINTR
+ * fills @p remaining for a relative sleep only; POSIX does not write it for
+ * TIMER_ABSTIME.
+ *
+ * @param clock_id   Clock to sleep against.
+ * @param flags      0 or TIMER_ABSTIME.
+ * @param request    Requested duration or absolute deadline.
+ * @param remaining  Output: remaining time if interrupted.  May be NULL.
+ * @return           0 on success, or a positive error number.
+ */
+CHAOS_TIME_EXPORT int clock_nanosleep(
+    clockid_t clock_id, int flags, const struct timespec *request, struct timespec *remaining
+)
+{
+    chaos_time_rule_t latency_rule;
+    chaos_time_rule_t errno_rule;
+    uintptr_t request_bits = (uintptr_t)(const void *)request;
+    int saved_errno;
+    int injected;
+
+    chaos_time_ensure_symbols();
+
+    if (chaos_time_in_internal() || request_bits == 0U)
+    {
+        return chaos_time_call_real_clock_nanosleep(clock_id, flags, request, remaining);
+    }
+
+    if (chaos_time_config_match(
+            CHAOS_TIME_EFFECT_LATENCY, CHAOS_TIME_OP_NANOSLEEP, 0, &latency_rule
+        ))
+    {
+        chaos_time_rule_apply_latency(&latency_rule);
+    }
+    saved_errno = errno;
+    if (chaos_time_config_match(CHAOS_TIME_EFFECT_ERRNO, CHAOS_TIME_OP_NANOSLEEP, 0, &errno_rule) &&
+        chaos_time_rule_apply_errno(&errno_rule))
+    {
+        injected = errno;
+        errno = saved_errno;
+        if (injected == EINTR && (flags & TIMER_ABSTIME) == 0)
+        {
+            chaos_time_copy_remaining(request, remaining);
+        }
+        return injected;
+    }
+
+    return chaos_time_call_real_clock_nanosleep(clock_id, flags, request, remaining);
 }
 
 /**
