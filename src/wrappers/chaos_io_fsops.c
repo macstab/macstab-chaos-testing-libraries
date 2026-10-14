@@ -402,3 +402,20 @@ CHAOS_IO_EXPORT int renameat(int olddirfd, const char *oldpath, int newdirfd, co
     }
     return rc;
 }
+
+/* ---------------------------------------------------------------------------
+ * glibc alternate entry points
+ *
+ * On 64-bit glibc the large-file names (`open64`, `pread64`, ...) are separate
+ * symbols with the same signature as the base functions, and binaries built with
+ * large-file support or by the JDK bind to them. Without these aliases every such
+ * call would bypass the library. musl has no
+ * large-file names, so this is glibc-only.
+ * ------------------------------------------------------------------------- */
+#if defined(__GLIBC__) && defined(__LP64__)
+
+CHAOS_IO_EXPORT int ftruncate64(int fd, off_t length) __attribute__((alias("ftruncate")));
+CHAOS_IO_EXPORT int fallocate64(int fd, int mode, off_t offset, off_t length)
+    __attribute__((alias("fallocate")));
+
+#endif

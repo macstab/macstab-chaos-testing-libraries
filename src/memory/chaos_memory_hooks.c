@@ -406,3 +406,12 @@ CHAOS_MEMORY_EXPORT int madvise(void *address, size_t length, int advice)
 
     return chaos_memory_call_real_madvise(address, length, advice);
 }
+
+/* On 64-bit glibc mmap64() is a separate symbol with mmap()'s signature; the JVM,
+ * Redis, nginx and MySQL bind to it, and without this alias their mappings would
+ * bypass the library. musl has no mmap64, so this is glibc-only. */
+#if defined(__GLIBC__) && defined(__LP64__)
+CHAOS_MEMORY_EXPORT void *
+mmap64(void *address, size_t length, int protection, int flags, int fd, off_t offset)
+    __attribute__((alias("mmap")));
+#endif

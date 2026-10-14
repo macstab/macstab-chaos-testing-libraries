@@ -1805,6 +1805,107 @@ static void test_ensure_symbols_is_thread_safe(void)
     assert(g_chaos_io_real_close != NULL);
 }
 
+#if defined(__GLIBC__) && defined(__LP64__)
+/** Times the stubbed overflow handler of the fortified variants ran. */
+static int g_chk_fail_calls = 0;
+
+/** Stands in for glibc's `__chk_fail()`, which would abort the test. */
+static void chaos_test_chk_fail(void)
+{
+    ++g_chk_fail_calls;
+}
+
+/**
+ * @brief Invariant: glibc's alternate entry points run the same wrappers.
+ *
+ * Triggering conditions: the large-file names are taken by address, and each
+ * fortified variant is called within and beyond its buffer.
+ *
+ * Expected observable behaviour:
+ * - Every large-file name is the base wrapper itself (same address).
+ * - A fortified call within the buffer reaches the real function through the wrapper.
+ * - A fortified call beyond the buffer, or `__open_2()` with flags that need a mode,
+ *   goes to the overflow handler and never reaches the real function.
+ */
+static void test_glibc_alternate_entries(void)
+{
+    char buffer[8] = {0};
+    int (*open_fn)(const char *, int, ...) = open64;
+    int (*openat_fn)(int, const char *, int, ...) = openat64;
+    ssize_t (*pread_fn)(int, void *, size_t, off_t) = pread64;
+    ssize_t (*pwrite_fn)(int, const void *, size_t, off_t) = pwrite64;
+    ssize_t (*preadv_fn)(int, const struct iovec *, int, off_t) = preadv64;
+    ssize_t (*pwritev_fn)(int, const struct iovec *, int, off_t) = pwritev64;
+    ssize_t (*sendfile_fn)(int, int, off_t *, size_t) = sendfile64;
+    int (*ftruncate_fn)(int, off_t) = ftruncate64;
+    int (*fallocate_fn)(int, int, off_t, off_t) = fallocate64;
+    int (*open2_fn)(const char *, int) = __open64_2;
+    int (*openat2_fn)(int, const char *, int) = __openat64_2;
+    ssize_t (*pread_chk_fn)(int, void *, size_t, off_t, size_t) = __pread64_chk;
+
+    assert(open_fn == open);
+    assert(openat_fn == openat);
+    assert(pread_fn == pread);
+    assert(pwrite_fn == pwrite);
+    assert(preadv_fn == preadv);
+    assert(pwritev_fn == pwritev);
+    assert(sendfile_fn == sendfile);
+    assert(ftruncate_fn == ftruncate);
+    assert(fallocate_fn == fallocate);
+    assert(open2_fn == __open_2);
+    assert(openat2_fn == __openat_2);
+    assert(pread_chk_fn == __pread_chk);
+
+    g_chaos_io_rw_chk_fail = chaos_test_chk_fail;
+    g_chaos_io_open_chk_fail = chaos_test_chk_fail;
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_read_return = 4;
+    assert(__read_chk(5, buffer, 4U, sizeof(buffer)) == 4);
+    assert(g_real_read_calls == 1);
+    g_chk_fail_calls = 0;
+    /* The declared buffer size is the check's input: a count beyond it trips the
+     * check without writing past the real buffer, which the compiler would reject. */
+    assert(__read_chk(5, buffer, 4U, 2U) == -1);
+    assert(g_chk_fail_calls == 1);
+    assert(g_real_read_calls == 1);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_pread_return = 3;
+    assert(__pread_chk(5, buffer, 4U, 0, sizeof(buffer)) == 3);
+    assert(g_real_pread_calls == 1);
+    g_chk_fail_calls = 0;
+    assert(__pread_chk(5, buffer, 4U, 0, 2U) == -1);
+    assert(g_chk_fail_calls == 1);
+    assert(g_real_pread_calls == 1);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_open_return = 21;
+    assert(__open_2("/tmp/fortified.bin", O_RDONLY) == 21);
+    assert(g_real_open_calls == 1);
+    g_chk_fail_calls = 0;
+    assert(__open_2("/tmp/fortified.bin", O_RDWR | O_CREAT) == -1);
+    assert(g_chk_fail_calls == 1);
+    assert(g_real_open_calls == 1);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_openat_return = 22;
+    assert(__openat_2(AT_FDCWD, "/tmp/fortified.bin", O_RDONLY) == 22);
+    assert(g_real_openat_calls == 1);
+    g_chk_fail_calls = 0;
+    assert(__openat_2(AT_FDCWD, "/tmp/fortified.bin", O_RDWR | O_CREAT) == -1);
+    assert(g_chk_fail_calls == 1);
+    assert(g_real_openat_calls == 1);
+
+    g_chaos_io_rw_chk_fail = __chk_fail;
+    g_chaos_io_open_chk_fail = __chk_fail;
+}
+#endif
+
 int main(void)
 {
     test_resolve_symbol_and_seed_material();
@@ -1824,6 +1925,9 @@ int main(void)
 #endif
     test_preadv_and_pwritev_wrappers();
     test_close_sync_and_positioned_wrappers();
+#if defined(__GLIBC__) && defined(__LP64__)
+    test_glibc_alternate_entries();
+#endif
     chaos_test_bind_libc_functions_for_exit();
     return 0;
 }

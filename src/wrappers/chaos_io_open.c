@@ -478,3 +478,60 @@ CHAOS_IO_EXPORT int openat(int dirfd, const char *path, int flags, ...)
     chaos_io_cache_open_result(fd, match_path);
     return fd;
 }
+
+/* ---------------------------------------------------------------------------
+ * glibc alternate entry points
+ *
+ * On 64-bit glibc the large-file names (`open64`, `pread64`, ...) are separate
+ * symbols with the same signature as the base functions, and binaries built with
+ * large-file support or by the JDK bind to them. Without these aliases every such
+ * call would bypass the library. The fortified `_chk`/`_2` variants are what
+ * `_FORTIFY_SOURCE` builds (Debian and Ubuntu packages) call instead of the base
+ * function; they check the buffer the way glibc does and then run the wrapper.
+ * musl has neither, so all of this is glibc-only.
+ * ------------------------------------------------------------------------- */
+#if defined(__GLIBC__) && defined(__LP64__)
+
+extern void __chk_fail(void) __attribute__((__noreturn__));
+
+/** Overflow handler of the fortified variants; replaceable so tests can observe it. */
+static void (*g_chaos_io_open_chk_fail)(void) = __chk_fail;
+
+CHAOS_IO_EXPORT int open64(const char *path, int flags, ...) __attribute__((alias("open")));
+CHAOS_IO_EXPORT int openat64(int dirfd, const char *path, int flags, ...)
+    __attribute__((alias("openat")));
+
+/**
+ * @brief Fortified `open()` without a mode argument.
+ *
+ * @details glibc aborts when flags that need a mode arrive without one; so does
+ * this wrapper, through `__chk_fail()`. Otherwise it is `open()`.
+ */
+CHAOS_IO_EXPORT int __open_2(const char *path, int flags)
+{
+    if (chaos_io_open_needs_mode(flags))
+    {
+        g_chaos_io_open_chk_fail();
+        return -1;
+    }
+    return open(path, flags);
+}
+
+/**
+ * @brief Fortified `openat()` without a mode argument; see `__open_2()`.
+ */
+CHAOS_IO_EXPORT int __openat_2(int dirfd, const char *path, int flags)
+{
+    if (chaos_io_open_needs_mode(flags))
+    {
+        g_chaos_io_open_chk_fail();
+        return -1;
+    }
+    return openat(dirfd, path, flags);
+}
+
+CHAOS_IO_EXPORT int __open64_2(const char *path, int flags) __attribute__((alias("__open_2")));
+CHAOS_IO_EXPORT int __openat64_2(int dirfd, const char *path, int flags)
+    __attribute__((alias("__openat_2")));
+
+#endif

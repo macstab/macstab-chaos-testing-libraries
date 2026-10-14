@@ -2308,11 +2308,61 @@ static void test_epoll_wrapper_paths(void)
 }
 #endif
 
+#if defined(__GLIBC__)
+/** Times the stubbed overflow handler of the fortified variants ran. */
+static int g_chk_fail_calls = 0;
+
+/** Stands in for glibc's `__chk_fail()`, which would abort the test. */
+static void chaos_net_test_chk_fail(void)
+{
+    ++g_chk_fail_calls;
+}
+
+/**
+ * @brief Invariant: the fortified receive variants run the receive wrappers.
+ *
+ * Triggering condition: `__recv_chk()` / `__recvfrom_chk()` within and beyond the buffer.
+ *
+ * Expected observable behaviour: within the buffer the real call is reached through
+ * the wrapper; beyond it the overflow handler runs and the real call is not made.
+ */
+static void test_fortified_receive(void)
+{
+    char buffer[8] = "xxxxxxx";
+
+    g_chaos_net_chk_fail = chaos_net_test_chk_fail;
+
+    reset_wrapper_stubs();
+    assert(__recv_chk(5, buffer, 4U, sizeof(buffer), 0) == 4);
+    assert(g_recv_calls == 1);
+    g_chk_fail_calls = 0;
+    /* A count beyond the declared buffer size trips the check without overflowing. */
+    assert(__recv_chk(5, buffer, 4U, 2U, 0) == -1);
+    assert(g_chk_fail_calls == 1);
+    assert(g_recv_calls == 1);
+
+    reset_wrapper_stubs();
+    /* __extension__: NULL converts to glibc's transparent sockaddr union, which
+     * -pedantic only accepts silently for prototypes from system headers. */
+    assert(__extension__ __recvfrom_chk(5, buffer, 4U, sizeof(buffer), 0, NULL, NULL) == 4);
+    assert(g_recvfrom_calls == 1);
+    g_chk_fail_calls = 0;
+    assert(__extension__ __recvfrom_chk(5, buffer, 4U, 2U, 0, NULL, NULL) == -1);
+    assert(g_chk_fail_calls == 1);
+    assert(g_recvfrom_calls == 1);
+
+    g_chaos_net_chk_fail = __chk_fail;
+}
+#endif
+
 int main(void)
 {
     test_bind_and_connect_paths();
     test_accept_and_send_paths();
     test_recv_paths();
+#if defined(__GLIBC__)
+    test_fortified_receive();
+#endif
     test_socket_and_shutdown_paths();
     test_wait_paths();
     test_direct_helper_paths();

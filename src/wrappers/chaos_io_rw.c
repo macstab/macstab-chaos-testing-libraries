@@ -837,3 +837,67 @@ CHAOS_IO_EXPORT ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off
 
     return chaos_io_call_real_pwritev(fd, iov, iovcnt, offset);
 }
+
+/* ---------------------------------------------------------------------------
+ * glibc alternate entry points
+ *
+ * On 64-bit glibc the large-file names (`open64`, `pread64`, ...) are separate
+ * symbols with the same signature as the base functions, and binaries built with
+ * large-file support or by the JDK bind to them. Without these aliases every such
+ * call would bypass the library. The fortified `_chk`/`_2` variants are what
+ * `_FORTIFY_SOURCE` builds (Debian and Ubuntu packages) call instead of the base
+ * function; they check the buffer the way glibc does and then run the wrapper.
+ * musl has neither, so all of this is glibc-only.
+ * ------------------------------------------------------------------------- */
+#if defined(__GLIBC__) && defined(__LP64__)
+
+extern void __chk_fail(void) __attribute__((__noreturn__));
+
+/** Overflow handler of the fortified variants; replaceable so tests can observe it. */
+static void (*g_chaos_io_rw_chk_fail)(void) = __chk_fail;
+
+CHAOS_IO_EXPORT ssize_t pread64(int fd, void *buffer, size_t count, off_t offset)
+    __attribute__((alias("pread")));
+CHAOS_IO_EXPORT ssize_t pwrite64(int fd, const void *buffer, size_t count, off_t offset)
+    __attribute__((alias("pwrite")));
+CHAOS_IO_EXPORT ssize_t preadv64(int fd, const struct iovec *iov, int iovcnt, off_t offset)
+    __attribute__((alias("preadv")));
+CHAOS_IO_EXPORT ssize_t pwritev64(int fd, const struct iovec *iov, int iovcnt, off_t offset)
+    __attribute__((alias("pwritev")));
+CHAOS_IO_EXPORT ssize_t sendfile64(int out_fd, int in_fd, off_t *offset, size_t count)
+    __attribute__((alias("sendfile")));
+
+/**
+ * @brief Fortified `read()`: aborts like glibc when @p count exceeds the buffer,
+ * otherwise `read()`.
+ */
+CHAOS_IO_EXPORT ssize_t __read_chk(int fd, void *buffer, size_t count, size_t buffer_size)
+{
+    if (count > buffer_size)
+    {
+        g_chaos_io_rw_chk_fail();
+        return -1;
+    }
+    return read(fd, buffer, count);
+}
+
+/**
+ * @brief Fortified `pread()`: aborts like glibc when @p count exceeds the buffer,
+ * otherwise `pread()`.
+ */
+CHAOS_IO_EXPORT ssize_t
+__pread_chk(int fd, void *buffer, size_t count, off_t offset, size_t buffer_size)
+{
+    if (count > buffer_size)
+    {
+        g_chaos_io_rw_chk_fail();
+        return -1;
+    }
+    return pread(fd, buffer, count, offset);
+}
+
+CHAOS_IO_EXPORT ssize_t
+__pread64_chk(int fd, void *buffer, size_t count, off_t offset, size_t buffer_size)
+    __attribute__((alias("__pread_chk")));
+
+#endif

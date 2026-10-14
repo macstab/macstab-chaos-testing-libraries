@@ -716,3 +716,50 @@ CHAOS_NET_EXPORT ssize_t recvmsg(int sockfd, struct msghdr *message, int flags)
     }
     return rc;
 }
+
+/* ---------------------------------------------------------------------------
+ * glibc fortified entry points
+ *
+ * `_FORTIFY_SOURCE` builds call `__recv_chk()` / `__recvfrom_chk()` instead of
+ * `recv()` / `recvfrom()` when the buffer size is known. They check the buffer the
+ * way glibc does and then run the wrapper. musl has no fortified variants.
+ * ------------------------------------------------------------------------- */
+#if defined(__GLIBC__)
+
+extern void __chk_fail(void) __attribute__((__noreturn__));
+
+/** Overflow handler of the fortified variants; replaceable so tests can observe it. */
+static void (*g_chaos_net_chk_fail)(void) = __chk_fail;
+
+/** @brief Fortified `recv()`: aborts like glibc when @p size exceeds the buffer. */
+CHAOS_NET_EXPORT ssize_t
+__recv_chk(int sockfd, void *buffer, size_t size, size_t buffer_size, int flags)
+{
+    if (size > buffer_size)
+    {
+        g_chaos_net_chk_fail();
+        return -1;
+    }
+    return recv(sockfd, buffer, size, flags);
+}
+
+/** @brief Fortified `recvfrom()`: aborts like glibc when @p size exceeds the buffer. */
+CHAOS_NET_EXPORT ssize_t __recvfrom_chk(
+    int sockfd,
+    void *buffer,
+    size_t size,
+    size_t buffer_size,
+    int flags,
+    CHAOS_NET_SOCKADDR_PARAM address,
+    socklen_t *address_length
+)
+{
+    if (size > buffer_size)
+    {
+        g_chaos_net_chk_fail();
+        return -1;
+    }
+    return recvfrom(sockfd, buffer, size, flags, address, address_length);
+}
+
+#endif
