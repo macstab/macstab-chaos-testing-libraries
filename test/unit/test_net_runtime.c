@@ -561,9 +561,7 @@ static void chaos_net_test_abort(void)
  */
 static void reset_symbols_once(void)
 {
-    static const pthread_once_t fresh_once = PTHREAD_ONCE_INIT;
-
-    g_chaos_net_symbols_once = fresh_once;
+    g_chaos_net_symbols_once = CHAOS_ONCE_INIT;
 }
 
 /**

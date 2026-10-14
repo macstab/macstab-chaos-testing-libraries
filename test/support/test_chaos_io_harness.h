@@ -1683,8 +1683,7 @@ static void chaos_test_reset_state(void)
      * pre-constructor state.  Without this a test cannot exercise the lazy
      * resolution path in chaos_io_ensure_symbols(). */
     {
-        pthread_once_t fresh_once = PTHREAD_ONCE_INIT;
-        g_chaos_io_symbols_once = fresh_once;
+        g_chaos_io_symbols_once = CHAOS_ONCE_INIT;
     }
     g_chaos_io_real_read = NULL;
     g_chaos_io_real_write = NULL;

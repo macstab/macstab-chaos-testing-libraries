@@ -33,13 +33,13 @@
  * @par Stability: private / internal
  */
 
+#include "chaos_once.h"
 #include "chaos_net_config.h"
 #include "chaos_net_internal.h"
 
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -79,7 +79,7 @@ chaos_net_readv_fn g_chaos_net_real_writev = NULL;
 chaos_net_close_fn g_chaos_net_real_close = NULL;
 
 /** @brief Runs the symbol table resolution exactly once. */
-static pthread_once_t g_chaos_net_symbols_once = PTHREAD_ONCE_INIT;
+static volatile chaos_once_t g_chaos_net_symbols_once = CHAOS_ONCE_INIT;
 #ifdef __linux__
 chaos_net_accept4_fn g_chaos_net_real_accept4 = NULL;
 chaos_net_sendmmsg_fn g_chaos_net_real_sendmmsg = NULL;
@@ -241,7 +241,7 @@ static uint64_t chaos_net_read_seed_material(void)
  * @brief Resolves the full downstream symbol table. Runs exactly once.
  *
  * @details Invoked only through `chaos_net_ensure_symbols()`. Must not call any
- * interposed wrapper: a wrapper would re-enter `pthread_once` on the same control
+ * interposed wrapper: a wrapper would re-enter `chaos_once` on the same control
  * and deadlock. `dlsym(RTLD_NEXT, ...)` walks the already-loaded link map and
  * performs no file I/O, so it does not re-enter.
  */
@@ -284,7 +284,7 @@ static void chaos_net_resolve_all_symbols(void)
 
 void chaos_net_ensure_symbols(void)
 {
-    (void)pthread_once(&g_chaos_net_symbols_once, chaos_net_resolve_all_symbols);
+    chaos_once(&g_chaos_net_symbols_once, chaos_net_resolve_all_symbols);
 }
 
 /**

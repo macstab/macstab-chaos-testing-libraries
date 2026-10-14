@@ -44,6 +44,7 @@
  * genuinely shared across those wrapper families.
  */
 
+#include "chaos_once.h"
 #include "chaos_io_config.h"
 #include "chaos_io_fdcache.h"
 #include "chaos_io_internal.h"
@@ -52,7 +53,6 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
@@ -261,23 +261,25 @@ int chaos_io_match_fd_rule(int fd, chaos_io_operation_t operation, chaos_io_rule
 /**
  * @brief One-shot control guarding symbol resolution.
  *
- * @details `pthread_once` rather than a plain flag because the guard is read
+ * @details `chaos_once()` rather than a plain flag because the guard is read
  * from every interposed wrapper on every thread.  A `volatile int` would order
  * nothing: on a weakly ordered architecture (aarch64 is the one that matters
  * here) a second thread could observe the flag set while some of the pointer
  * stores were still invisible to it, and call through a NULL pointer — exactly
- * the fault this whole mechanism exists to prevent.  `pthread_once` provides
+ * the fault this whole mechanism exists to prevent.  `chaos_once()` provides
  * the release/acquire pairing that makes the completed table visible.
  *
- * It resolves from libc on both glibc and musl, so no `-lpthread` is required.
+ * Not `pthread_once()`: before glibc 2.34 it lives in libpthread, and a program
+ * that does not load libpthread (`cat`, `sh`) failed with "undefined symbol:
+ * pthread_once" under the preload.
  */
-static pthread_once_t g_chaos_io_symbols_once = PTHREAD_ONCE_INIT;
+static volatile chaos_once_t g_chaos_io_symbols_once = CHAOS_ONCE_INIT;
 
 /**
  * @brief Resolves the full downstream libc symbol table.  Runs exactly once.
  *
  * @details Invoked only through `chaos_io_ensure_symbols()`.  Must not call any
- * interposed wrapper: a wrapper would re-enter `pthread_once` on the same
+ * interposed wrapper: a wrapper would re-enter `chaos_once` on the same
  * control and deadlock.  `dlsym(RTLD_NEXT, …)` walks the already-loaded link
  * map and performs no file I/O, so it does not re-enter.
  */
@@ -321,12 +323,12 @@ static void chaos_io_resolve_all_symbols(void)
  * with SIGSEGV.
  *
  * Every interposed wrapper calls this before touching a `g_chaos_io_real_*`
- * pointer.  After the first call it is an already-satisfied `pthread_once`,
+ * pointer.  After the first call it is an already-satisfied `chaos_once`,
  * which is a load and a predictable branch.
  */
 void chaos_io_ensure_symbols(void)
 {
-    (void)pthread_once(&g_chaos_io_symbols_once, chaos_io_resolve_all_symbols);
+    chaos_once(&g_chaos_io_symbols_once, chaos_io_resolve_all_symbols);
 }
 
 /* --- Library constructor --------------------------------------------------------- */
