@@ -49,8 +49,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <unistd.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <sys/uio.h>
+#include <sys/syscall.h>
 
 /**
  * @defgroup chaos_net_test_linux_globals Linux-only NET test globals
@@ -111,6 +116,13 @@
     chaos_net_getsockname_fn g_chaos_net_real_getsockname = NULL;                                  \
     chaos_net_getpeername_fn g_chaos_net_real_getpeername = NULL;                                  \
     chaos_net_getsockopt_fn g_chaos_net_real_getsockopt = NULL;                                    \
+    chaos_net_setsockopt_fn g_chaos_net_real_setsockopt = NULL;                                    \
+    chaos_net_read_fn g_chaos_net_real_read = NULL;                                                \
+    chaos_net_write_fn g_chaos_net_real_write = NULL;                                              \
+    chaos_net_readv_fn g_chaos_net_real_readv = NULL;                                              \
+    chaos_net_readv_fn g_chaos_net_real_writev = NULL;                                             \
+    chaos_net_close_fn g_chaos_net_real_close = NULL;                                              \
+    void chaos_net_ensure_symbols(void) {}                                                         \
     CHAOS_NET_DEFINE_TEST_ACCEPT4_GLOBAL()                                                         \
     __thread int g_chaos_net_tls_guard = 0;                                                        \
     __thread uint64_t g_chaos_net_tls_prng_state = 0U;                                             \
@@ -123,6 +135,47 @@
  * PRNG state, and resets the process seed to 1. Call at the start of each test
  * function that modifies NET runtime state.
  */
+/**
+ * @name Descriptor calls for tests
+ *
+ * libchaos-net interposes read/write/readv/writev/close for sockets, and a test
+ * binary that includes the wrappers routes its own descriptor I/O through them.
+ * These helpers go straight to the kernel, so the "real" pointers can be bound
+ * without dlsym (which some tests stub) and without pointing a wrapper at itself.
+ * @{
+ */
+static ssize_t chaos_net_test_kernel_read(int fd, void *buffer, size_t size)
+{
+    return (ssize_t)syscall(SYS_read, fd, buffer, size);
+}
+
+static ssize_t chaos_net_test_kernel_write(int fd, const void *buffer, size_t size)
+{
+    return (ssize_t)syscall(SYS_write, fd, buffer, size);
+}
+
+static ssize_t chaos_net_test_kernel_readv(int fd, const struct iovec *iov, int iovcnt)
+{
+    return (ssize_t)syscall(SYS_readv, fd, iov, iovcnt);
+}
+
+static ssize_t chaos_net_test_kernel_writev(int fd, const struct iovec *iov, int iovcnt)
+{
+    return (ssize_t)syscall(SYS_writev, fd, iov, iovcnt);
+}
+
+static int chaos_net_test_kernel_close(int fd)
+{
+    return (int)syscall(SYS_close, fd);
+}
+
+static int
+chaos_net_test_kernel_setsockopt(int fd, int level, int name, const void *value, socklen_t length)
+{
+    return (int)syscall(SYS_setsockopt, fd, level, name, value, length);
+}
+/** @} */
+
 static inline void chaos_net_test_reset_runtime(void)
 {
     g_chaos_net_real_bind = NULL;
@@ -145,6 +198,12 @@ static inline void chaos_net_test_reset_runtime(void)
     g_chaos_net_real_getsockname = NULL;
     g_chaos_net_real_getpeername = NULL;
     g_chaos_net_real_getsockopt = NULL;
+    g_chaos_net_real_setsockopt = chaos_net_test_kernel_setsockopt;
+    g_chaos_net_real_read = chaos_net_test_kernel_read;
+    g_chaos_net_real_write = chaos_net_test_kernel_write;
+    g_chaos_net_real_readv = chaos_net_test_kernel_readv;
+    g_chaos_net_real_writev = chaos_net_test_kernel_writev;
+    g_chaos_net_real_close = chaos_net_test_kernel_close;
     CHAOS_NET_RESET_TEST_ACCEPT4_GLOBAL()
     g_chaos_net_tls_guard = 0;
     g_chaos_net_tls_prng_state = 0U;

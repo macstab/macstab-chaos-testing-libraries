@@ -62,8 +62,9 @@ typedef enum chaos_net_operation
     CHAOS_NET_OP_SOCKET,       /**< Targets socket(2) / socketpair(2). */
     CHAOS_NET_OP_SHUTDOWN,     /**< Targets shutdown(2). */
     CHAOS_NET_OP_POLL,         /**< Targets poll/ppoll/select/pselect/epoll_wait/epoll_pwait. */
-    CHAOS_NET_OP_SEND,         /**< Targets send/sendto/sendmsg/sendmmsg. */
-    CHAOS_NET_OP_RECV          /**< Targets recv/recvfrom/recvmsg/recvmmsg. */
+    CHAOS_NET_OP_SEND, /**< Targets send/sendto/sendmsg/sendmmsg, and write/writev on sockets. */
+    CHAOS_NET_OP_RECV, /**< Targets recv/recvfrom/recvmsg/recvmmsg, and read/readv on sockets. */
+    CHAOS_NET_OP_CLOSE /**< Targets close(2) on sockets. */
 } chaos_net_operation_t;
 
 /**
@@ -89,7 +90,8 @@ typedef enum chaos_net_effect
     CHAOS_NET_EFFECT_ERRNO,        /**< Pre-call: set errno and return -1. */
     CHAOS_NET_EFFECT_LATENCY,      /**< Pre-call: sleep for latency_ms milliseconds. */
     CHAOS_NET_EFFECT_CORRUPT,      /**< Post-call: flip one bit in the receive buffer. */
-    CHAOS_NET_EFFECT_TIMEOUT       /**< POLL-only: return 0 with all events cleared. */
+    CHAOS_NET_EFFECT_TIMEOUT,      /**< POLL-only: return 0 with all events cleared. */
+    CHAOS_NET_EFFECT_RESET         /**< CLOSE-only: abortive close, the peer receives an RST. */
 } chaos_net_effect_t;
 
 /**

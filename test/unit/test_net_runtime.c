@@ -553,6 +553,20 @@ static void chaos_net_test_abort(void)
  * --------------------------------------------------------------------- */
 
 /**
+ * @brief Lets the next call resolve the symbol table again.
+ *
+ * @details Production resolves it once per process; each test here needs a fresh
+ * resolution, and the abort test leaves the once-control mid-initialisation when
+ * it longjmps out of it.
+ */
+static void reset_symbols_once(void)
+{
+    static const pthread_once_t fresh_once = PTHREAD_ONCE_INIT;
+
+    g_chaos_net_symbols_once = fresh_once;
+}
+
+/**
  * @brief Invariant: `chaos_net_resolve_symbol()` wires a single symbol and calls dlerror once.
  *
  * Triggering condition: `chaos_net_resolve_symbol(&bind_fn, "bind")` with a clean state.
@@ -659,6 +673,7 @@ static void test_constructor_init(void)
     int config_calls_before;
 
     reset_test_state();
+    reset_symbols_once();
     config_calls_before = g_config_init_calls;
     chaos_net_init();
     assert(g_chaos_net_real_bind == stub_bind);

@@ -2355,11 +2355,205 @@ static void test_fortified_receive(void)
 }
 #endif
 
+/** Calls made through the stubbed next read/write/readv/writev/close. */
+static int g_descriptor_calls = 0;
+/** Calls made through the stubbed setsockopt, and the linger it was given. */
+static int g_setsockopt_calls = 0;
+static struct linger g_setsockopt_linger;
+
+static ssize_t chaos_net_test_next_read(int fd, void *buffer, size_t size)
+{
+    (void)fd;
+    ++g_descriptor_calls;
+    if (buffer != NULL && size >= 4U)
+    {
+        (void)memcpy(buffer, "data", 4U);
+        return 4;
+    }
+    return 0;
+}
+
+static ssize_t chaos_net_test_next_write(int fd, const void *buffer, size_t size)
+{
+    (void)fd;
+    (void)buffer;
+    ++g_descriptor_calls;
+    return (ssize_t)size;
+}
+
+static ssize_t chaos_net_test_next_readv(int fd, const struct iovec *iov, int iovcnt)
+{
+    (void)fd;
+    (void)iovcnt;
+    ++g_descriptor_calls;
+    return (ssize_t)iov[0].iov_len;
+}
+
+static int chaos_net_test_next_close(int fd)
+{
+    (void)fd;
+    ++g_descriptor_calls;
+    return 0;
+}
+
+static int
+chaos_net_test_next_setsockopt(int fd, int level, int name, const void *value, socklen_t length)
+{
+    (void)fd;
+    assert(level == SOL_SOCKET && name == SO_LINGER && length == sizeof(struct linger));
+    ++g_setsockopt_calls;
+    (void)memcpy(&g_setsockopt_linger, value, sizeof(g_setsockopt_linger));
+    return 0;
+}
+
+/** Resets the stubs and wires the descriptor calls to the counting stubs. */
+static void reset_descriptor_stubs(void)
+{
+    reset_wrapper_stubs();
+    g_chaos_net_real_read = chaos_net_test_next_read;
+    g_chaos_net_real_write = chaos_net_test_next_write;
+    g_chaos_net_real_readv = chaos_net_test_next_readv;
+    g_chaos_net_real_writev = chaos_net_test_next_readv;
+    g_chaos_net_real_close = chaos_net_test_next_close;
+    g_chaos_net_real_setsockopt = chaos_net_test_next_setsockopt;
+    g_descriptor_calls = 0;
+    g_setsockopt_calls = 0;
+    (void)memset(&g_setsockopt_linger, 0, sizeof(g_setsockopt_linger));
+}
+
+/**
+ * @brief Invariant: read/write/readv/writev/close act on sockets with net rules only.
+ *
+ * Triggering conditions: no rules, a non-socket descriptor, the internal guard, and
+ * sockets with recv/send/close rules of every allowed effect.
+ *
+ * Expected observable behaviour:
+ * - Without rules, for a non-socket, or inside the library, the call is forwarded
+ *   unchanged to the next definition in the chain.
+ * - recv rules apply to read/readv (latency, errno, corruption), send rules to
+ *   write/writev (latency, errno).
+ * - close: RESET arms a zero linger before the close, LATENCY delays it, and an
+ *   errno is reported only after the descriptor was really closed.
+ */
+static void test_descriptor_calls_on_sockets(void)
+{
+    char buffer[8] = "xxxxxxx";
+    struct iovec iov;
+
+    iov.iov_base = buffer;
+    iov.iov_len = sizeof(buffer);
+
+    /* No rules: forwarded without a socket lookup. */
+    reset_descriptor_stubs();
+    assert(read(5, buffer, sizeof(buffer)) == 4);
+    assert(write(5, buffer, 4U) == 4);
+    assert(readv(5, &iov, 1) == (ssize_t)sizeof(buffer));
+    assert(writev(5, &iov, 1) == (ssize_t)sizeof(buffer));
+    assert(close(5) == 0);
+    assert(g_descriptor_calls == 5);
+
+    /* Rules exist, but the descriptor is not a socket (endpoint lookup fails). */
+    reset_descriptor_stubs();
+    g_stub_prepare = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_ERRNO;
+    g_stub_rule.errnum = ECONNRESET;
+    g_errno_trigger = 1;
+    assert(read(5, buffer, sizeof(buffer)) == 4);
+    assert(write(5, buffer, 4U) == 4);
+    assert(close(5) == 0);
+    assert(g_descriptor_calls == 3);
+
+    /* Inside the library: forwarded. */
+    reset_descriptor_stubs();
+    g_stub_prepare = 1;
+    g_stub_endpoint_from_local = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_ERRNO;
+    g_errno_trigger = 1;
+    g_chaos_net_tls_guard = 1;
+    assert(read(5, buffer, sizeof(buffer)) == 4);
+    g_chaos_net_tls_guard = 0;
+
+    /* recv rules on read and readv. */
+    reset_descriptor_stubs();
+    g_stub_prepare = 1;
+    g_stub_endpoint_from_local = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_ERRNO;
+    g_stub_rule.errnum = ECONNRESET;
+    g_errno_trigger = 1;
+    errno = 0;
+    assert(read(5, buffer, sizeof(buffer)) == -1);
+    assert(errno == ECONNRESET);
+    assert(readv(5, &iov, 1) == -1);
+    assert(g_descriptor_calls == 0);
+    g_errno_trigger = 0;
+    assert(read(5, buffer, sizeof(buffer)) == 4);
+    assert(readv(5, &iov, 1) == (ssize_t)sizeof(buffer));
+    g_stub_rule.effect = CHAOS_NET_EFFECT_LATENCY;
+    assert(read(5, buffer, sizeof(buffer)) == 4);
+    assert(readv(5, &iov, 1) == (ssize_t)sizeof(buffer));
+    assert(g_latency_calls == 2);
+    g_stub_rule.effect = CHAOS_NET_EFFECT_CORRUPT;
+    g_should_trigger = 1;
+    assert(read(5, buffer, sizeof(buffer)) == 4);
+    assert(g_corrupt_calls == 1);
+    assert(readv(5, &iov, 1) == (ssize_t)sizeof(buffer));
+
+    /* send rules on write and writev. */
+    reset_descriptor_stubs();
+    g_stub_prepare = 1;
+    g_stub_endpoint_from_peer = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_ERRNO;
+    g_stub_rule.errnum = EPIPE;
+    g_errno_trigger = 1;
+    assert(write(5, buffer, 4U) == -1);
+    assert(errno == EPIPE);
+    assert(writev(5, &iov, 1) == -1);
+    assert(g_descriptor_calls == 0);
+    g_stub_rule.effect = CHAOS_NET_EFFECT_LATENCY;
+    assert(write(5, buffer, 4U) == 4);
+    assert(writev(5, &iov, 1) == (ssize_t)sizeof(buffer));
+    assert(g_latency_calls == 2);
+
+    /* close rules. */
+    reset_descriptor_stubs();
+    g_stub_prepare = 1;
+    g_stub_endpoint_from_activity = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_RESET;
+    g_should_trigger = 1;
+    assert(close(5) == 0);
+    assert(g_setsockopt_calls == 1);
+    assert(g_setsockopt_linger.l_onoff == 1 && g_setsockopt_linger.l_linger == 0);
+    assert(g_descriptor_calls == 1);
+    g_should_trigger = 0;
+    assert(close(5) == 0);
+    assert(g_setsockopt_calls == 1);
+    g_stub_rule.effect = CHAOS_NET_EFFECT_LATENCY;
+    assert(close(5) == 0);
+    assert(g_latency_calls == 1);
+    g_stub_rule.effect = CHAOS_NET_EFFECT_ERRNO;
+    g_stub_rule.errnum = EINTR;
+    g_errno_trigger = 1;
+    g_descriptor_calls = 0;
+    assert(close(5) == -1);
+    assert(errno == EINTR);
+    assert(g_descriptor_calls == 1);
+    g_errno_trigger = 0;
+    assert(close(5) == 0);
+
+    reset_wrapper_stubs();
+}
+
 int main(void)
 {
     test_bind_and_connect_paths();
     test_accept_and_send_paths();
     test_recv_paths();
+    test_descriptor_calls_on_sockets();
 #if defined(__GLIBC__)
     test_fortified_receive();
 #endif

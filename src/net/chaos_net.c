@@ -39,6 +39,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -70,6 +71,15 @@ chaos_net_pselect_fn g_chaos_net_real_pselect = NULL;
 chaos_net_getsockname_fn g_chaos_net_real_getsockname = NULL;
 chaos_net_getpeername_fn g_chaos_net_real_getpeername = NULL;
 chaos_net_getsockopt_fn g_chaos_net_real_getsockopt = NULL;
+chaos_net_setsockopt_fn g_chaos_net_real_setsockopt = NULL;
+chaos_net_read_fn g_chaos_net_real_read = NULL;
+chaos_net_write_fn g_chaos_net_real_write = NULL;
+chaos_net_readv_fn g_chaos_net_real_readv = NULL;
+chaos_net_readv_fn g_chaos_net_real_writev = NULL;
+chaos_net_close_fn g_chaos_net_real_close = NULL;
+
+/** @brief Runs the symbol table resolution exactly once. */
+static pthread_once_t g_chaos_net_symbols_once = PTHREAD_ONCE_INIT;
 #ifdef __linux__
 chaos_net_accept4_fn g_chaos_net_real_accept4 = NULL;
 chaos_net_sendmmsg_fn g_chaos_net_real_sendmmsg = NULL;
@@ -138,6 +148,15 @@ uint64_t g_chaos_net_process_seed = UINT64_C(0x2545f4914f6cdd1d);
 static void chaos_net_resolve_symbol(void *target, const char *symbol)
 {
     void *resolved;
+    void *current;
+
+    /* Only fill what is still unset, so a pointer already wired (by an earlier call,
+     * or by a test harness) is never replaced. */
+    (void)memcpy(&current, target, sizeof(current));
+    if (current != NULL)
+    {
+        return;
+    }
 
     (void)dlerror();
     resolved = dlsym(RTLD_NEXT, symbol);
@@ -219,27 +238,14 @@ static uint64_t chaos_net_read_seed_material(void)
 }
 
 /**
- * @brief Library constructor: resolves all real symbols, seeds the PRNG, and
- *        triggers the initial config load.
+ * @brief Resolves the full downstream symbol table. Runs exactly once.
  *
- * @details Executed by the dynamic linker before any application code in the
- * process. The order of operations is significant:
- *   1. Resolve all real symbols first, because every subsequent step (including
- *      chaos_net_config_init → stat → getsockname etc.) may indirectly invoke
- *      one of the resolved pointers.
- *   2. Seed the PRNG: both the process seed (from /dev/urandom) and the main
- *      thread's per-thread state are set. Worker threads seed themselves lazily
- *      on first use.
- *   3. Initialise the config subsystem, which sets both snapshots to empty and
- *      marks the mtime as UNKNOWN so the first call to chaos_net_config_prepare()
- *      performs a real stat/load.
- *
- * @post All g_chaos_net_real_* pointers are non-NULL.
- * @post g_chaos_net_process_seed holds entropy from /dev/urandom (or fallback).
- * @post Config subsystem is in a clean state ready for the first reload.
+ * @details Invoked only through `chaos_net_ensure_symbols()`. Must not call any
+ * interposed wrapper: a wrapper would re-enter `pthread_once` on the same control
+ * and deadlock. `dlsym(RTLD_NEXT, ...)` walks the already-loaded link map and
+ * performs no file I/O, so it does not re-enter.
  */
-CHAOS_NET_CONSTRUCTOR
-static void chaos_net_init(void)
+static void chaos_net_resolve_all_symbols(void)
 {
     chaos_net_resolve_symbol(&g_chaos_net_real_bind, "bind");
     chaos_net_resolve_symbol(&g_chaos_net_real_listen, "listen");
@@ -261,6 +267,12 @@ static void chaos_net_init(void)
     chaos_net_resolve_symbol(&g_chaos_net_real_getsockname, "getsockname");
     chaos_net_resolve_symbol(&g_chaos_net_real_getpeername, "getpeername");
     chaos_net_resolve_symbol(&g_chaos_net_real_getsockopt, "getsockopt");
+    chaos_net_resolve_symbol(&g_chaos_net_real_setsockopt, "setsockopt");
+    chaos_net_resolve_symbol(&g_chaos_net_real_read, "read");
+    chaos_net_resolve_symbol(&g_chaos_net_real_write, "write");
+    chaos_net_resolve_symbol(&g_chaos_net_real_readv, "readv");
+    chaos_net_resolve_symbol(&g_chaos_net_real_writev, "writev");
+    chaos_net_resolve_symbol(&g_chaos_net_real_close, "close");
 #ifdef __linux__
     chaos_net_resolve_symbol(&g_chaos_net_real_accept4, "accept4");
     chaos_net_resolve_symbol(&g_chaos_net_real_sendmmsg, "sendmmsg");
@@ -268,7 +280,38 @@ static void chaos_net_init(void)
     chaos_net_resolve_symbol(&g_chaos_net_real_epoll_wait, "epoll_wait");
     chaos_net_resolve_symbol(&g_chaos_net_real_epoll_pwait, "epoll_pwait");
 #endif
+}
 
+void chaos_net_ensure_symbols(void)
+{
+    (void)pthread_once(&g_chaos_net_symbols_once, chaos_net_resolve_all_symbols);
+}
+
+/**
+ * @brief Library constructor: resolves all real symbols, seeds the PRNG, and
+ *        triggers the initial config load.
+ *
+ * @details Executed by the dynamic linker before any application code in the
+ * process. The order of operations is significant:
+ *   1. Resolve all real symbols first (unless a wrapper that ran before the
+ *      constructor already did), because every subsequent step (including
+ *      chaos_net_config_init → stat → getsockname etc.) may indirectly invoke
+ *      one of the resolved pointers.
+ *   2. Seed the PRNG: both the process seed (from /dev/urandom) and the main
+ *      thread's per-thread state are set. Worker threads seed themselves lazily
+ *      on first use.
+ *   3. Initialise the config subsystem, which sets both snapshots to empty and
+ *      marks the mtime as UNKNOWN so the first call to chaos_net_config_prepare()
+ *      performs a real stat/load.
+ *
+ * @post All g_chaos_net_real_* pointers are non-NULL.
+ * @post g_chaos_net_process_seed holds entropy from /dev/urandom (or fallback).
+ * @post Config subsystem is in a clean state ready for the first reload.
+ */
+CHAOS_NET_CONSTRUCTOR
+static void chaos_net_init(void)
+{
+    chaos_net_ensure_symbols();
     g_chaos_net_process_seed = chaos_net_read_seed_material();
     chaos_net_prng_seed_thread(g_chaos_net_process_seed);
     chaos_net_config_init();

@@ -351,6 +351,10 @@ static chaos_net_operation_t chaos_net_parse_operation(const char *text)
     {
         return CHAOS_NET_OP_RECV;
     }
+    if (strcmp(text, "close") == 0)
+    {
+        return CHAOS_NET_OP_CLOSE;
+    }
     return CHAOS_NET_OP_INVALID;
 }
 
@@ -545,7 +549,7 @@ static int chaos_net_effect_allowed(chaos_net_operation_t operation, chaos_net_e
                operation == CHAOS_NET_OP_CONNECT || operation == CHAOS_NET_OP_ACCEPT ||
                operation == CHAOS_NET_OP_SOCKET || operation == CHAOS_NET_OP_SHUTDOWN ||
                operation == CHAOS_NET_OP_POLL || operation == CHAOS_NET_OP_SEND ||
-               operation == CHAOS_NET_OP_RECV;
+               operation == CHAOS_NET_OP_RECV || operation == CHAOS_NET_OP_CLOSE;
     }
     if (effect == CHAOS_NET_EFFECT_CORRUPT)
     {
@@ -554,6 +558,10 @@ static int chaos_net_effect_allowed(chaos_net_operation_t operation, chaos_net_e
     if (effect == CHAOS_NET_EFFECT_TIMEOUT)
     {
         return operation == CHAOS_NET_OP_POLL;
+    }
+    if (effect == CHAOS_NET_EFFECT_RESET)
+    {
+        return operation == CHAOS_NET_OP_CLOSE;
     }
     return 0;
 }
@@ -935,6 +943,14 @@ int chaos_net_config_parse_line(char *line, chaos_net_rule_t *rule)
     else if (strcmp(effect_text, "TIMEOUT") == 0)
     {
         rule->effect = CHAOS_NET_EFFECT_TIMEOUT;
+        if (chaos_net_parse_probability(value_text, &rule->probability) != 0)
+        {
+            return -1;
+        }
+    }
+    else if (strcmp(effect_text, "RESET") == 0)
+    {
+        rule->effect = CHAOS_NET_EFFECT_RESET;
         if (chaos_net_parse_probability(value_text, &rule->probability) != 0)
         {
             return -1;

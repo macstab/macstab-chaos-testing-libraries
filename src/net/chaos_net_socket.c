@@ -362,6 +362,8 @@ bind(int sockfd, CHAOS_NET_CONST_SOCKADDR_PARAM address, socklen_t address_lengt
     chaos_net_endpoint_t endpoint;
     chaos_net_rule_t rule;
 
+    chaos_net_ensure_symbols();
+
     if (chaos_net_in_internal() ||
         !chaos_net_endpoint_from_sockaddr_fd(sockfd, address_ptr, address_length, &endpoint) ||
         !chaos_net_config_match_endpoint(CHAOS_NET_OP_BIND, &endpoint, &rule))
@@ -388,6 +390,8 @@ CHAOS_NET_EXPORT int listen(int sockfd, int backlog)
 {
     chaos_net_endpoint_t endpoint;
     chaos_net_rule_t rule;
+
+    chaos_net_ensure_symbols();
 
     if (chaos_net_in_internal() || !chaos_net_endpoint_from_local_fd(sockfd, &endpoint) ||
         !chaos_net_config_match_endpoint(CHAOS_NET_OP_LISTEN, &endpoint, &rule))
@@ -416,6 +420,8 @@ connect(int sockfd, CHAOS_NET_CONST_SOCKADDR_PARAM address, socklen_t address_le
     chaos_net_endpoint_t endpoint;
     chaos_net_rule_t rule;
 
+    chaos_net_ensure_symbols();
+
     if (chaos_net_in_internal() ||
         !chaos_net_endpoint_from_sockaddr_fd(sockfd, address_ptr, address_length, &endpoint) ||
         !chaos_net_config_match_endpoint(CHAOS_NET_OP_CONNECT, &endpoint, &rule))
@@ -443,6 +449,8 @@ CHAOS_NET_EXPORT int accept(int sockfd, CHAOS_NET_SOCKADDR_PARAM address, sockle
     struct sockaddr *address_ptr = CHAOS_NET_SOCKADDR_VALUE(address);
     chaos_net_endpoint_t endpoint;
     chaos_net_rule_t rule;
+
+    chaos_net_ensure_symbols();
 
     if (chaos_net_in_internal() || !chaos_net_endpoint_from_local_fd(sockfd, &endpoint) ||
         !chaos_net_config_match_endpoint(CHAOS_NET_OP_ACCEPT, &endpoint, &rule))
@@ -473,6 +481,8 @@ accept4(int sockfd, CHAOS_NET_SOCKADDR_PARAM address, socklen_t *address_length,
     chaos_net_endpoint_t endpoint;
     chaos_net_rule_t rule;
 
+    chaos_net_ensure_symbols();
+
     if (chaos_net_in_internal() || !chaos_net_endpoint_from_local_fd(sockfd, &endpoint) ||
         !chaos_net_config_match_endpoint(CHAOS_NET_OP_ACCEPT, &endpoint, &rule))
     {
@@ -498,6 +508,8 @@ CHAOS_NET_EXPORT ssize_t send(int sockfd, const void *buffer, size_t size, int f
 {
     chaos_net_endpoint_t endpoint;
     chaos_net_rule_t rule;
+
+    chaos_net_ensure_symbols();
 
     if (chaos_net_in_internal() || !chaos_net_endpoint_from_peer_fd(sockfd, &endpoint) ||
         !chaos_net_config_match_endpoint(CHAOS_NET_OP_SEND, &endpoint, &rule))
@@ -536,6 +548,8 @@ CHAOS_NET_EXPORT ssize_t sendto(
     chaos_net_rule_t rule;
     int matched;
 
+    chaos_net_ensure_symbols();
+
     /* Use the explicit destination if provided; fall back to getpeername for connected mode. */
     matched =
         address_ptr != NULL
@@ -566,6 +580,8 @@ CHAOS_NET_EXPORT ssize_t sendmsg(int sockfd, const struct msghdr *message, int f
     chaos_net_endpoint_t endpoint;
     chaos_net_rule_t rule;
     int matched;
+
+    chaos_net_ensure_symbols();
 
     matched = message != NULL && message->msg_name != NULL
                   ? chaos_net_endpoint_from_sockaddr_fd(
@@ -605,6 +621,8 @@ CHAOS_NET_EXPORT ssize_t recv(int sockfd, void *buffer, size_t size, int flags)
     chaos_net_endpoint_t endpoint;
     chaos_net_rule_t rule;
     ssize_t rc;
+
+    chaos_net_ensure_symbols();
 
     if (chaos_net_in_internal() || !chaos_net_endpoint_from_local_fd(sockfd, &endpoint) ||
         !chaos_net_config_match_endpoint(CHAOS_NET_OP_RECV, &endpoint, &rule))
@@ -651,6 +669,8 @@ CHAOS_NET_EXPORT ssize_t recvfrom(
     chaos_net_rule_t rule;
     ssize_t rc;
 
+    chaos_net_ensure_symbols();
+
     if (chaos_net_in_internal() || !chaos_net_endpoint_from_local_fd(sockfd, &endpoint) ||
         !chaos_net_config_match_endpoint(CHAOS_NET_OP_RECV, &endpoint, &rule))
     {
@@ -689,6 +709,8 @@ CHAOS_NET_EXPORT ssize_t recvmsg(int sockfd, struct msghdr *message, int flags)
     chaos_net_endpoint_t endpoint;
     chaos_net_rule_t rule;
     ssize_t rc;
+
+    chaos_net_ensure_symbols();
 
     if (chaos_net_in_internal() || !chaos_net_endpoint_from_local_fd(sockfd, &endpoint) ||
         !chaos_net_config_match_endpoint(CHAOS_NET_OP_RECV, &endpoint, &rule))
@@ -735,6 +757,7 @@ static void (*g_chaos_net_chk_fail)(void) = __chk_fail;
 CHAOS_NET_EXPORT ssize_t
 __recv_chk(int sockfd, void *buffer, size_t size, size_t buffer_size, int flags)
 {
+    chaos_net_ensure_symbols();
     if (size > buffer_size)
     {
         g_chaos_net_chk_fail();
@@ -754,6 +777,7 @@ CHAOS_NET_EXPORT ssize_t __recvfrom_chk(
     socklen_t *address_length
 )
 {
+    chaos_net_ensure_symbols();
     if (size > buffer_size)
     {
         g_chaos_net_chk_fail();
@@ -763,3 +787,262 @@ CHAOS_NET_EXPORT ssize_t __recvfrom_chk(
 }
 
 #endif
+
+/*---------------------------------------------------------------------------
+ * Generic descriptor calls on sockets: read, write, readv, writev, close
+ *
+ * libchaos-io interposes the same symbols for files. Each library acts only on
+ * its own kind of descriptor -- here sockets, recognised by the endpoint lookup
+ * that fails with ENOTSOCK for anything else -- and always forwards the call to
+ * the next definition in the chain (`RTLD_NEXT`), never straight to libc. So
+ * whichever library is preloaded first, a file reaches libchaos-io's rules, a
+ * socket reaches these, and every library sees every call.
+ *
+ * read/readv on a socket count as `recv`, write/writev as `send`, so a rule such
+ * as `tcp4://10.0.0.5:6379:recv:ECONNRESET:1.0` applies whichever call the
+ * program uses. Without any net rule the wrappers forward without a socket
+ * lookup.
+ *---------------------------------------------------------------------------*/
+
+/** @brief Calls the next read(2) in the chain with the reentrancy guard set. */
+static ssize_t chaos_net_call_real_read(int fd, void *buffer, size_t size)
+{
+    int previous;
+    ssize_t result;
+
+    previous = chaos_net_enter_internal();
+    result = g_chaos_net_real_read(fd, buffer, size);
+    chaos_net_leave_internal(previous);
+    return result;
+}
+
+/** @brief Calls the next write(2) in the chain with the reentrancy guard set. */
+static ssize_t chaos_net_call_real_write(int fd, const void *buffer, size_t size)
+{
+    int previous;
+    ssize_t result;
+
+    previous = chaos_net_enter_internal();
+    result = g_chaos_net_real_write(fd, buffer, size);
+    chaos_net_leave_internal(previous);
+    return result;
+}
+
+/** @brief Calls the next readv(2) in the chain with the reentrancy guard set. */
+static ssize_t chaos_net_call_real_readv(int fd, const struct iovec *iov, int iovcnt)
+{
+    int previous;
+    ssize_t result;
+
+    previous = chaos_net_enter_internal();
+    result = g_chaos_net_real_readv(fd, iov, iovcnt);
+    chaos_net_leave_internal(previous);
+    return result;
+}
+
+/** @brief Calls the next writev(2) in the chain with the reentrancy guard set. */
+static ssize_t chaos_net_call_real_writev(int fd, const struct iovec *iov, int iovcnt)
+{
+    int previous;
+    ssize_t result;
+
+    previous = chaos_net_enter_internal();
+    result = g_chaos_net_real_writev(fd, iov, iovcnt);
+    chaos_net_leave_internal(previous);
+    return result;
+}
+
+/** @brief Calls the next close(2) in the chain with the reentrancy guard set. */
+static int chaos_net_call_real_close(int fd)
+{
+    int previous;
+    int result;
+
+    previous = chaos_net_enter_internal();
+    result = g_chaos_net_real_close(fd);
+    chaos_net_leave_internal(previous);
+    return result;
+}
+
+/**
+ * @brief Finds the rule for a generic descriptor call, if @p fd is a socket.
+ *
+ * @details The config is consulted first, so without rules no socket lookup is
+ * made. For a file, the endpoint lookup fails (ENOTSOCK) and the call is not
+ * ours; errno is preserved by the lookup.
+ *
+ * @param fd         Descriptor of the call.
+ * @param operation  RECV, SEND or CLOSE.
+ * @param rule       Output: the matching rule.
+ * @return Non-zero when @p fd is a socket with a matching rule.
+ */
+static int
+chaos_net_match_descriptor_rule(int fd, chaos_net_operation_t operation, chaos_net_rule_t *rule)
+{
+    chaos_net_endpoint_t endpoint;
+    int found;
+
+    if (chaos_net_in_internal() || !chaos_net_config_prepare())
+    {
+        return 0;
+    }
+    if (operation == CHAOS_NET_OP_SEND)
+    {
+        found = chaos_net_endpoint_from_peer_fd(fd, &endpoint);
+    }
+    else if (operation == CHAOS_NET_OP_RECV)
+    {
+        found = chaos_net_endpoint_from_local_fd(fd, &endpoint);
+    }
+    else
+    {
+        found = chaos_net_endpoint_from_activity_fd(fd, &endpoint);
+    }
+    return found && chaos_net_config_match_endpoint_loaded(operation, &endpoint, rule);
+}
+
+/**
+ * @brief Interposed read(2): `recv` rules for sockets, anything else forwarded.
+ */
+CHAOS_NET_EXPORT ssize_t read(int fd, void *buffer, size_t size)
+{
+    chaos_net_rule_t rule;
+    ssize_t rc;
+
+    chaos_net_ensure_symbols();
+    if (!chaos_net_match_descriptor_rule(fd, CHAOS_NET_OP_RECV, &rule))
+    {
+        return chaos_net_call_real_read(fd, buffer, size);
+    }
+
+    if (rule.effect == CHAOS_NET_EFFECT_LATENCY)
+    {
+        chaos_net_rule_apply_latency(&rule);
+    }
+    else if (rule.effect == CHAOS_NET_EFFECT_ERRNO && chaos_net_rule_apply_errno(&rule))
+    {
+        return -1;
+    }
+
+    rc = chaos_net_call_real_read(fd, buffer, size);
+    if (rc > 0 && rule.effect == CHAOS_NET_EFFECT_CORRUPT && chaos_net_rule_should_trigger(&rule))
+    {
+        chaos_net_corrupt_buffer(buffer, (size_t)rc);
+    }
+    return rc;
+}
+
+/**
+ * @brief Interposed readv(2): `recv` rules for sockets, anything else forwarded.
+ */
+CHAOS_NET_EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
+{
+    chaos_net_rule_t rule;
+    ssize_t rc;
+
+    chaos_net_ensure_symbols();
+    if (!chaos_net_match_descriptor_rule(fd, CHAOS_NET_OP_RECV, &rule))
+    {
+        return chaos_net_call_real_readv(fd, iov, iovcnt);
+    }
+
+    if (rule.effect == CHAOS_NET_EFFECT_LATENCY)
+    {
+        chaos_net_rule_apply_latency(&rule);
+    }
+    else if (rule.effect == CHAOS_NET_EFFECT_ERRNO && chaos_net_rule_apply_errno(&rule))
+    {
+        return -1;
+    }
+
+    rc = chaos_net_call_real_readv(fd, iov, iovcnt);
+    if (rc > 0 && rule.effect == CHAOS_NET_EFFECT_CORRUPT && chaos_net_rule_should_trigger(&rule))
+    {
+        chaos_net_corrupt_iovecs(iov, iovcnt, (size_t)rc);
+    }
+    return rc;
+}
+
+/**
+ * @brief Interposed write(2): `send` rules for sockets, anything else forwarded.
+ */
+CHAOS_NET_EXPORT ssize_t write(int fd, const void *buffer, size_t size)
+{
+    chaos_net_rule_t rule;
+
+    chaos_net_ensure_symbols();
+    if (chaos_net_match_descriptor_rule(fd, CHAOS_NET_OP_SEND, &rule) &&
+        chaos_net_apply_pre_call_rule(&rule) != 0)
+    {
+        return -1;
+    }
+    return chaos_net_call_real_write(fd, buffer, size);
+}
+
+/**
+ * @brief Interposed writev(2): `send` rules for sockets, anything else forwarded.
+ */
+CHAOS_NET_EXPORT ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
+{
+    chaos_net_rule_t rule;
+
+    chaos_net_ensure_symbols();
+    if (chaos_net_match_descriptor_rule(fd, CHAOS_NET_OP_SEND, &rule) &&
+        chaos_net_apply_pre_call_rule(&rule) != 0)
+    {
+        return -1;
+    }
+    return chaos_net_call_real_writev(fd, iov, iovcnt);
+}
+
+/**
+ * @brief Interposed close(2): `close` rules for sockets, anything else forwarded.
+ *
+ * @details The endpoint is resolved before the descriptor goes away. Effects:
+ *   - RESET: arms SO_LINGER with a zero timeout, so the close aborts the
+ *     connection and the peer receives an RST (ECONNRESET) instead of a FIN.
+ *     This is how a crashed or killed process, or a load balancer dropping a
+ *     connection, looks from the other side.
+ *   - LATENCY: delays the close.
+ *   - ERRNO: closes, then reports the error. Linux releases the descriptor even
+ *     when close reports an error, and programs never retry it, so a synthetic
+ *     error that kept the descriptor open would leak it.
+ * The close itself always runs through the chain, so a library that shares
+ * `close` (libchaos-io keeps an fd cache) sees every call.
+ */
+CHAOS_NET_EXPORT int close(int fd)
+{
+    chaos_net_rule_t rule;
+    struct linger abort_linger;
+    int matched;
+    int previous;
+    int saved_errno;
+    int rc;
+
+    chaos_net_ensure_symbols();
+    matched = chaos_net_match_descriptor_rule(fd, CHAOS_NET_OP_CLOSE, &rule);
+    if (matched && rule.effect == CHAOS_NET_EFFECT_LATENCY)
+    {
+        chaos_net_rule_apply_latency(&rule);
+    }
+    else if (matched && rule.effect == CHAOS_NET_EFFECT_RESET &&
+             chaos_net_rule_should_trigger(&rule))
+    {
+        abort_linger.l_onoff = 1;
+        abort_linger.l_linger = 0;
+        saved_errno = errno;
+        previous = chaos_net_enter_internal();
+        (void)g_chaos_net_real_setsockopt(
+            fd, SOL_SOCKET, SO_LINGER, &abort_linger, (socklen_t)sizeof(abort_linger)
+        );
+        chaos_net_leave_internal(previous);
+        errno = saved_errno;
+    }
+
+    rc = chaos_net_call_real_close(fd);
+    if (matched && rule.effect == CHAOS_NET_EFFECT_ERRNO && chaos_net_rule_apply_errno(&rule))
+    {
+        return -1;
+    }
+    return rc;
+}

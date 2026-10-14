@@ -239,6 +239,8 @@ CHAOS_NET_EXPORT int socket(int domain, int type, int protocol)
     chaos_net_endpoint_t endpoint;
     chaos_net_rule_t rule;
 
+    chaos_net_ensure_symbols();
+
     if (chaos_net_in_internal() ||
         !chaos_net_endpoint_from_socket_spec(domain, type, protocol, &endpoint) ||
         !chaos_net_config_match_endpoint(CHAOS_NET_OP_SOCKET, &endpoint, &rule))
@@ -265,6 +267,8 @@ CHAOS_NET_EXPORT int socketpair(int domain, int type, int protocol, int sv[2])
     chaos_net_endpoint_t endpoint;
     chaos_net_rule_t rule;
 
+    chaos_net_ensure_symbols();
+
     if (chaos_net_in_internal() ||
         !chaos_net_endpoint_from_socket_spec(domain, type, protocol, &endpoint) ||
         !chaos_net_config_match_endpoint(CHAOS_NET_OP_SOCKET, &endpoint, &rule))
@@ -289,6 +293,8 @@ CHAOS_NET_EXPORT int shutdown(int sockfd, int how)
 {
     chaos_net_endpoint_t endpoint;
     chaos_net_rule_t rule;
+
+    chaos_net_ensure_symbols();
 
     if (chaos_net_in_internal() || !chaos_net_endpoint_from_activity_fd(sockfd, &endpoint) ||
         !chaos_net_config_match_endpoint(CHAOS_NET_OP_SHUTDOWN, &endpoint, &rule))
@@ -323,6 +329,8 @@ sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, CHAOS_NET_MMSG_F
     chaos_net_rule_t rule;
     unsigned int index;
     int matched = 0;
+
+    chaos_net_ensure_symbols();
 
     if (chaos_net_in_internal())
     {
@@ -378,6 +386,8 @@ CHAOS_NET_EXPORT int recvmmsg(
     chaos_net_endpoint_t endpoint;
     chaos_net_rule_t rule;
     int rc;
+
+    chaos_net_ensure_symbols();
 
     if (chaos_net_in_internal() || !chaos_net_endpoint_from_local_fd(sockfd, &endpoint) ||
         !chaos_net_config_match_endpoint(CHAOS_NET_OP_RECV, &endpoint, &rule))

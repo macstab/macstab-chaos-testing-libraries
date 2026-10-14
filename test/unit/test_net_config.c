@@ -1021,6 +1021,37 @@ static void test_interrupted_read_is_retried(void)
     free_backup(&backup);
 }
 
+/**
+ * @brief Invariant: socket close rules parse, and RESET exists only for close.
+ *
+ * Triggering condition: `close` rules with RESET, an errno and LATENCY; RESET on
+ * another operation; RESET with an invalid probability.
+ *
+ * Expected observable behaviour: the close rules parse with operation CLOSE and the
+ * named effect; the other two lines are rejected.
+ */
+static void test_close_rules(void)
+{
+    char reset_line[] = "tcp4://127.0.0.1:9010:close:RESET:1.0";
+    char errno_line[] = "tcp4://127.0.0.1:9010:close:EINTR:0.5";
+    char latency_line[] = "tcp4://127.0.0.1:9010:close:LATENCY:25";
+    char reset_on_recv[] = "tcp4://127.0.0.1:9010:recv:RESET:1.0";
+    char reset_bad_probability[] = "tcp4://127.0.0.1:9010:close:RESET:2.0";
+    chaos_net_rule_t rule;
+
+    assert(chaos_net_config_parse_line(reset_line, &rule) == 1);
+    assert(rule.operation == CHAOS_NET_OP_CLOSE);
+    assert(rule.effect == CHAOS_NET_EFFECT_RESET);
+    assert(chaos_net_config_parse_line(errno_line, &rule) == 1);
+    assert(rule.operation == CHAOS_NET_OP_CLOSE);
+    assert(rule.effect == CHAOS_NET_EFFECT_ERRNO);
+    assert(rule.errnum == EINTR);
+    assert(chaos_net_config_parse_line(latency_line, &rule) == 1);
+    assert(rule.effect == CHAOS_NET_EFFECT_LATENCY);
+    assert(chaos_net_config_parse_line(reset_on_recv, &rule) == -1);
+    assert(chaos_net_config_parse_line(reset_bad_probability, &rule) == -1);
+}
+
 int main(void)
 {
     test_helper_functions();
@@ -1034,6 +1065,7 @@ int main(void)
     test_change_stamp_beyond_mtime();
     test_fork_takes_over_orphaned_reload();
     test_prepare_preserves_errno();
+    test_close_rules();
     test_interrupted_read_is_retried();
     return 0;
 }

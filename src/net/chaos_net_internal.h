@@ -223,6 +223,21 @@ typedef int (*chaos_net_getpeername_fn)(int, struct sockaddr *, socklen_t *);
 /** @brief Real getsockopt(2) pointer; used to determine SOCK_STREAM vs SOCK_DGRAM; never NULL after
  * init. */
 typedef int (*chaos_net_getsockopt_fn)(int, int, int, void *, socklen_t *);
+
+/** @brief Type of the real setsockopt(2); resolved, not interposed. */
+typedef int (*chaos_net_setsockopt_fn)(int, int, int, const void *, socklen_t);
+
+/** @brief Type of the real read(2); interposed for sockets only. */
+typedef ssize_t (*chaos_net_read_fn)(int, void *, size_t);
+
+/** @brief Type of the real write(2); interposed for sockets only. */
+typedef ssize_t (*chaos_net_write_fn)(int, const void *, size_t);
+
+/** @brief Type of the real readv(2) and writev(2); interposed for sockets only. */
+typedef ssize_t (*chaos_net_readv_fn)(int, const struct iovec *, int);
+
+/** @brief Type of the real close(2); interposed for sockets only. */
+typedef int (*chaos_net_close_fn)(int);
 #ifdef __linux__
 /** @brief Real accept4(2) pointer; Linux-only; never NULL after library init on Linux. */
 typedef int (*chaos_net_accept4_fn)(int, struct sockaddr *, socklen_t *, int);
@@ -262,6 +277,22 @@ extern chaos_net_pselect_fn g_chaos_net_real_pselect;
 extern chaos_net_getsockname_fn g_chaos_net_real_getsockname;
 extern chaos_net_getpeername_fn g_chaos_net_real_getpeername;
 extern chaos_net_getsockopt_fn g_chaos_net_real_getsockopt;
+extern chaos_net_setsockopt_fn g_chaos_net_real_setsockopt;
+extern chaos_net_read_fn g_chaos_net_real_read;
+extern chaos_net_write_fn g_chaos_net_real_write;
+extern chaos_net_readv_fn g_chaos_net_real_readv;
+extern chaos_net_readv_fn g_chaos_net_real_writev;
+extern chaos_net_close_fn g_chaos_net_real_close;
+
+/**
+ * @brief Resolves every downstream symbol once, whichever caller comes first.
+ *
+ * @details The constructor alone is not enough: ELF initialisers run in dependency
+ * order, so another object's constructor can reach an interposed wrapper (read,
+ * close, ...) before `chaos_net_init()` has run. Every exported wrapper calls this
+ * first; after the first call it is an already-satisfied `pthread_once`.
+ */
+void chaos_net_ensure_symbols(void);
 #ifdef __linux__
 extern chaos_net_accept4_fn g_chaos_net_real_accept4;
 extern chaos_net_sendmmsg_fn g_chaos_net_real_sendmmsg;

@@ -480,6 +480,8 @@ CHAOS_NET_EXPORT int poll(struct pollfd *fds, nfds_t nfds, int timeout)
     chaos_net_rule_t rule;
     int synthetic_timeout = 0;
 
+    chaos_net_ensure_symbols();
+
     if (chaos_net_in_internal() || !chaos_net_wait_match_pollfds(fds, nfds, &rule))
     {
         return chaos_net_call_real_poll(fds, nfds, timeout);
@@ -508,6 +510,8 @@ ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout, const sig
     chaos_net_rule_t rule;
     int synthetic_timeout = 0;
 
+    chaos_net_ensure_symbols();
+
     if (chaos_net_in_internal() || !chaos_net_wait_match_pollfds(fds, nfds, &rule))
     {
         return chaos_net_call_real_ppoll(fds, nfds, timeout, sigmask);
@@ -535,6 +539,8 @@ select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct ti
 {
     chaos_net_rule_t rule;
     int synthetic_timeout = 0;
+
+    chaos_net_ensure_symbols();
 
     if (chaos_net_in_internal() ||
         !chaos_net_wait_match_fdsets(nfds, readfds, writefds, exceptfds, &rule))
@@ -571,6 +577,8 @@ CHAOS_NET_EXPORT int pselect(
     chaos_net_rule_t rule;
     int synthetic_timeout = 0;
 
+    chaos_net_ensure_symbols();
+
     if (chaos_net_in_internal() ||
         !chaos_net_wait_match_fdsets(nfds, readfds, writefds, exceptfds, &rule))
     {
@@ -602,6 +610,8 @@ CHAOS_NET_EXPORT int epoll_wait(int epfd, struct epoll_event *events, int maxeve
     chaos_net_rule_t rule;
     int synthetic_timeout = 0;
 
+    chaos_net_ensure_symbols();
+
     if (chaos_net_in_internal() || !chaos_net_wait_match_epoll(epfd, &rule))
     {
         return chaos_net_call_real_epoll_wait(epfd, events, maxevents, timeout);
@@ -629,6 +639,8 @@ CHAOS_NET_EXPORT int epoll_pwait(
 {
     chaos_net_rule_t rule;
     int synthetic_timeout = 0;
+
+    chaos_net_ensure_symbols();
 
     if (chaos_net_in_internal() || !chaos_net_wait_match_epoll(epfd, &rule))
     {
