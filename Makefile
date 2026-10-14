@@ -372,9 +372,9 @@ cross-musl-amd64: $(MUSL_AMD64_DISTS)
 cross-musl-arm64: $(MUSL_ARM64_DISTS)
 
 docker-build-all: | $(BUILD_DIR) $(DIST_DIR)
-	docker buildx build --platform linux/amd64 --build-arg BASE_IMAGE=gcc:bookworm --build-arg MAKE_TARGET=cross-glibc-amd64 --output type=local,dest=$(BUILD_DIR)/docker-glibc-amd64 -f $(DOCKER_DIR)/Dockerfile.build .
+	docker buildx build --platform linux/amd64 --build-arg BASE_IMAGE=gcc:10 --build-arg MAKE_TARGET=cross-glibc-amd64 --output type=local,dest=$(BUILD_DIR)/docker-glibc-amd64 -f $(DOCKER_DIR)/Dockerfile.build .
 	cp $(BUILD_DIR)/docker-glibc-amd64/*.so $(DIST_DIR)/
-	docker buildx build --platform linux/arm64 --build-arg BASE_IMAGE=gcc:bookworm --build-arg MAKE_TARGET=cross-glibc-arm64 --output type=local,dest=$(BUILD_DIR)/docker-glibc-arm64 -f $(DOCKER_DIR)/Dockerfile.build .
+	docker buildx build --platform linux/arm64 --build-arg BASE_IMAGE=gcc:10 --build-arg MAKE_TARGET=cross-glibc-arm64 --output type=local,dest=$(BUILD_DIR)/docker-glibc-arm64 -f $(DOCKER_DIR)/Dockerfile.build .
 	cp $(BUILD_DIR)/docker-glibc-arm64/*.so $(DIST_DIR)/
 	docker buildx build --platform linux/amd64 --build-arg BASE_IMAGE=alpine:3.20 --build-arg MAKE_TARGET=cross-musl-amd64 --output type=local,dest=$(BUILD_DIR)/docker-musl-amd64 -f $(DOCKER_DIR)/Dockerfile.build .
 	cp $(BUILD_DIR)/docker-musl-amd64/*.so $(DIST_DIR)/
