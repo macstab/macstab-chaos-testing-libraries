@@ -47,6 +47,8 @@
 
 #include "../support/test_support.h"
 
+#include <sys/mman.h>
+
 CHAOS_IO_DEFINE_TEST_GLOBALS();
 
 /**
@@ -297,9 +299,87 @@ static void test_resolve_paths(void)
     assert(chaos_io_fdcache_resolve(10, path, 4U) == 0);
 }
 
+/** A table that "another thread" published first, for the lost-race path. */
+static chaos_io_fd_cache_entry_t g_test_rival_table[CHAOS_IO_FD_CACHE_SLOTS];
+
+/** Times the stub unmap ran. */
+static int g_test_unmap_calls = 0;
+
+/** Simulates a failed anonymous mapping. */
+static void *chaos_test_map_fails(void)
+{
+    return MAP_FAILED;
+}
+
+/** Maps for real, but lets a rival publish its table first. */
+static void *chaos_test_map_loses_race(void)
+{
+    void *mapping = chaos_io_fdcache_default_map();
+
+    g_chaos_io_fd_cache = g_test_rival_table;
+    return mapping;
+}
+
+/** Releases the losing mapping through the real unmap and counts the call. */
+static void chaos_test_count_unmap(void *mapping)
+{
+    ++g_test_unmap_calls;
+    chaos_io_fdcache_default_unmap(mapping);
+}
+
+/**
+ * @brief Invariant: the lazily mapped table degrades safely under contention and failure.
+ *
+ * Triggering conditions: the mapping fails, a rival publishes its table first, a slot
+ * is held by another writer, and an entry outlives an invalidation.
+ *
+ * Expected observable behaviour:
+ * - With no table, stores are skipped and lookups miss; nothing crashes.
+ * - A lost publication race releases the losing mapping and uses the rival's table.
+ * - A slot held by another writer is skipped by stores and missed by lookups.
+ * - An entry resolved before an invalidation is never returned after it.
+ */
+static void test_lazy_table_contention_and_failure(void)
+{
+    chaos_io_fd_cache_entry_t *saved = g_chaos_io_fd_cache;
+    char path[CHAOS_IO_MAX_PATH];
+    unsigned int generation;
+
+    g_chaos_io_fd_cache = NULL;
+    g_chaos_io_fdcache_map = chaos_test_map_fails;
+    chaos_io_fdcache_store(7, "/tmp/data.bin");
+    assert(g_chaos_io_fd_cache == NULL);
+    assert(chaos_io_fdcache_lookup(7, path, sizeof(path)) == 0);
+
+    (void)memset(g_test_rival_table, 0, sizeof(g_test_rival_table));
+    g_chaos_io_fdcache_map = chaos_test_map_loses_race;
+    g_chaos_io_fdcache_unmap = chaos_test_count_unmap;
+    chaos_io_fdcache_store(7, "/tmp/data.bin");
+    assert(g_test_unmap_calls == 1);
+    assert(g_chaos_io_fd_cache == g_test_rival_table);
+    assert(chaos_io_fdcache_lookup(7, path, sizeof(path)) == 1);
+
+    g_test_rival_table[7].sequence |= 1U;
+    chaos_io_fdcache_store(7, "/tmp/other.bin");
+    assert(chaos_io_fdcache_lookup(7, path, sizeof(path)) == 0);
+    g_test_rival_table[7].sequence += 1U;
+    assert(chaos_io_fdcache_lookup(7, path, sizeof(path)) == 1);
+    assert(strcmp(path, "/tmp/data.bin") == 0);
+
+    generation = chaos_io_fdcache_generation(chaos_io_fdcache_slot(8));
+    chaos_io_fdcache_invalidate(8);
+    chaos_io_fdcache_store_at(8, "/tmp/stale.bin", generation);
+    assert(chaos_io_fdcache_lookup(8, path, sizeof(path)) == 0);
+
+    g_chaos_io_fdcache_map = chaos_io_fdcache_default_map;
+    g_chaos_io_fdcache_unmap = chaos_io_fdcache_default_unmap;
+    g_chaos_io_fd_cache = saved;
+}
+
 int main(void)
 {
     test_store_lookup_and_invalidate();
     test_resolve_paths();
+    test_lazy_table_contention_and_failure();
     return 0;
 }

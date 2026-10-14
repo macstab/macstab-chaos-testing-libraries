@@ -1,14 +1,13 @@
 /**
  * @file chaos_io_fdcache.h
- * @brief Thread-local fd-to-path cache declarations.
+ * @brief Process-wide fd-to-path cache declarations.
  *
  * @details
  * Config matching is path-based, but most interposed operations arrive as
  * file descriptors.  Resolving a descriptor to its filesystem path on every
  * call via `readlink("/proc/self/fd/<fd>")` would be prohibitively expensive.
- * This module provides a tiny per-thread direct-mapped cache that eliminates
- * that round-trip for the common case where the same small set of descriptors
- * is used repeatedly within a thread.
+ * This module provides a tiny direct-mapped cache shared by all threads of the
+ * process, mapped lazily on first use.
  *
  * **Cache design.**
  * The cache is a fixed-size array of `CHAOS_IO_FD_CACHE_SLOTS` entries
@@ -17,45 +16,30 @@
  * requested fd; a mismatch is a natural eviction (the slot was used by a
  * different fd that mapped to the same slot modulo the table size).
  *
- * A 32-slot table means any two descriptors that differ by exactly 32 share a
- * slot.  This is intentional: the cache is designed for workloads that hold a
- * small number of files open concurrently, not for programs that rapidly
- * cycle through hundreds of descriptors.
- *
  * **Excluded paths.**
  * Entries for excluded paths (config file, `/proc`, `/sys`, `/dev`) are
  * never stored.  The resolve path falls back to `/proc/self/fd` on every call
  * for those paths, but the internal guard prevents reentrancy.
  *
  * **Cache invalidation discipline.**
- * - `close(2)` invalidates the specific entry for the closed fd, but only on
- *   a successful return from the real libc `close()`.  Invalidating before
- *   the close would lose the path mapping for a descriptor that is still live
- *   if libc returns an error.
+ * - Every call that frees or reassigns a descriptor invalidates it: `close(2)`
+ *   (after the real close, whatever it returned, because Linux releases the
+ *   descriptor even when close reports an error), `dup2(2)` and `dup3(2)` for
+ *   the target descriptor, and `close_range(2)` for the closed range.
  * - `unlinkat(2)` and `renameat(2)` call `chaos_io_fdcache_reset()` on
  *   success rather than trying to identify which entries may have become
- *   stale.  Rename can make an arbitrary path alias change, so a full reset
- *   is the only safe option.  Unlink does not change any live fd's target,
- *   but the library resets anyway because a subsequently reopened fd would
- *   get the same path back via `/proc/self/fd` – the correctness is
- *   conservative rather than optimal.
+ *   stale: a rename can change an arbitrary path alias.
+ * - Invalidation bumps a per-slot generation; it is one atomic increment and
+ *   takes effect for every thread at once.
  *
  * **Module ownership:** config/
  * **Stability:** internal – not part of any public ABI
- * **Thread-safety:** all operations act only on TLS; they are trivially safe
- * to call from multiple threads simultaneously.
+ * **Thread-safety:** safe from any thread; readers use a per-slot seqlock and
+ * never block, writers skip a slot another writer holds.
  */
 
 #ifndef CHAOS_IO_FDCACHE_H
 #define CHAOS_IO_FDCACHE_H
-
-/*
- * Thread-local fd-to-path cache declarations.
- *
- * Most interposed operations arrive as file descriptors, but config matching is
- * path-based. This module bridges that mismatch with a very small per-thread
- * cache so hot paths do not repeatedly readlink `/proc/self/fd/<fd>`.
- */
 
 #include "chaos_io_internal.h"
 

@@ -106,12 +106,12 @@
 #define CHAOS_IO_MAX_CONFIG_BYTES (CHAOS_IO_MAX_RULES * CHAOS_IO_MAX_LINE_LENGTH)
 
 /**
- * @brief Number of direct-mapped slots in the per-thread fd-to-path cache.
+ * @brief Number of direct-mapped slots in the process-wide fd-to-path cache.
  *
  * @details The cache is indexed by `fd % CHAOS_IO_FD_CACHE_SLOTS`, so any
  * two descriptors whose values differ by this modulus share a slot and the
- * later one evicts the earlier one.  32 slots covers the typical fd range of
- * a single-threaded I/O loop without bloating per-thread storage.
+ * later one evicts the earlier one.  The table is mapped once per process on
+ * first use (about 128 KiB at 32 slots); no thread carries any of it.
  */
 #define CHAOS_IO_FD_CACHE_SLOTS 32U
 
