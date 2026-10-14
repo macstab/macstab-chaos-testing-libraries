@@ -948,7 +948,7 @@ That means:
 
 Expected and intentionally handled failures:
 
-- config open/read failure
+- config open/read failure (the active rules stay; the read is retried on the next call)
 - invalid rule parse
 - endpoint parse failure
 - unsupported socket family

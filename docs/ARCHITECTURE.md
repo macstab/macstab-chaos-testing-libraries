@@ -74,11 +74,24 @@ For each intercepted operation:
 
 1. If the thread is already inside library internals, call straight through.
 2. Ignore excluded paths and excluded fds.
-3. Refresh config if the config mtime changed.
+3. Refresh config if the config file's change stamp (mtime, size, inode, device) changed.
 4. Match the path and operation against the active rules.
 5. Apply latency, errno injection, torn writes, or read corruption.
 6. Call the real libc symbol.
 7. Update the fd cache when needed.
+
+Config refresh guarantees, identical in every library:
+
+- **Writes within one mtime tick are seen.** File systems stamp mtime from a coarse clock, so the
+  change stamp also covers size (an append) and inode (a rewrite through rename, e.g. `sed -i`).
+- **A failed read keeps the rules.** If the file cannot be opened or read, the active snapshot stays
+  and the claim is released with the previous stamp, so the next call retries; `EINTR` is retried
+  inside the read loop. Only a missing file or a file that fails to parse changes the rules.
+- **A fork during a reload does not freeze the child.** The reload claim records the claiming
+  process id; a child that inherits a claim from its parent releases it and reloads itself.
+- **errno is the caller's.** The library's own `stat`/`open`/`read`, socket lookups, `/proc` reads,
+  seeding and latency sleeps restore errno, so a successful interposed call never reports an
+  errno the library caused. `test/runtime/test_errno_glibc.sh` checks this for every library.
 
 Wrapper families are split by responsibility:
 
@@ -141,10 +154,10 @@ else Guard was clear (normal path)
   Wrap -> Config : check_config()
   note right of Config
     stat(config_path)
-    if mtime changed:
-      CAS(mtime, old, RELOADING)
-      reload + parse
-      CAS(mtime, RELOADING, new)
+    if change stamp changed:
+      CAS(stamp, old, RELOADING)
+      read ok: parse, publish new stamp
+      read failed: keep rules, restore old stamp
   end note
   Config --> Wrap : active_snapshot
 
