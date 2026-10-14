@@ -211,6 +211,12 @@ typedef int (*chaos_io_openat_fn)(int, const char *, int, ...);
 /** @brief Type of the real `close(2)` libc symbol. */
 typedef int (*chaos_io_close_fn)(int);
 
+/** @brief Type of the real `dup2(2)` libc symbol. */
+typedef int (*chaos_io_dup2_fn)(int, int);
+
+/** @brief Type of the real `close_range(2)` libc symbol (glibc 2.34+; may be absent). */
+typedef int (*chaos_io_close_range_fn)(unsigned int, unsigned int, int);
+
 /**
  * @brief Type shared by the real `fsync(2)` and `fdatasync(2)` libc symbols.
  *
@@ -247,6 +253,9 @@ typedef int (*chaos_io_fallocate_fn)(int, int, off_t, off_t);
 /** @brief Type of the real Linux `sendfile(2)` libc symbol. */
 typedef ssize_t (*chaos_io_sendfile_fn)(int, int, off_t *, size_t);
 
+/** @brief Type of the real Linux `dup3(2)` libc symbol. */
+typedef int (*chaos_io_dup3_fn)(int, int, int);
+
 /** @brief Type of the real Linux `copy_file_range(2)` libc symbol. */
 typedef ssize_t (*chaos_io_copy_file_range_fn)(int, off_t *, int, off_t *, size_t, unsigned int);
 #endif
@@ -268,13 +277,16 @@ typedef ssize_t (*chaos_io_copy_file_range_fn)(int, off_t *, int, off_t *, size_
  * `chaos_io_ensure_symbols()` before dereferencing one of these pointers.
  */
 
-extern chaos_io_read_fn g_chaos_io_real_read;           /**< Downstream `read`. */
-extern chaos_io_write_fn g_chaos_io_real_write;         /**< Downstream `write`. */
-extern chaos_io_readv_fn g_chaos_io_real_readv;         /**< Downstream `readv`. */
-extern chaos_io_writev_fn g_chaos_io_real_writev;       /**< Downstream `writev`. */
-extern chaos_io_open_fn g_chaos_io_real_open;           /**< Downstream `open`. */
-extern chaos_io_openat_fn g_chaos_io_real_openat;       /**< Downstream `openat`. */
-extern chaos_io_close_fn g_chaos_io_real_close;         /**< Downstream `close`. */
+extern chaos_io_read_fn g_chaos_io_real_read;     /**< Downstream `read`. */
+extern chaos_io_write_fn g_chaos_io_real_write;   /**< Downstream `write`. */
+extern chaos_io_readv_fn g_chaos_io_real_readv;   /**< Downstream `readv`. */
+extern chaos_io_writev_fn g_chaos_io_real_writev; /**< Downstream `writev`. */
+extern chaos_io_open_fn g_chaos_io_real_open;     /**< Downstream `open`. */
+extern chaos_io_openat_fn g_chaos_io_real_openat; /**< Downstream `openat`. */
+extern chaos_io_close_fn g_chaos_io_real_close;   /**< Downstream `close`. */
+extern chaos_io_dup2_fn g_chaos_io_real_dup2;     /**< Downstream `dup2`. */
+extern chaos_io_close_range_fn
+    g_chaos_io_real_close_range; /**< Downstream `close_range`; NULL when libc lacks it. */
 extern chaos_io_sync_fn g_chaos_io_real_fsync;          /**< Downstream `fsync`. */
 extern chaos_io_sync_fn g_chaos_io_real_fdatasync;      /**< Downstream `fdatasync`. */
 extern chaos_io_pread_fn g_chaos_io_real_pread;         /**< Downstream `pread`. */
@@ -287,6 +299,7 @@ extern chaos_io_renameat_fn g_chaos_io_real_renameat;   /**< Downstream `renamea
 #ifdef __linux__
 extern chaos_io_fallocate_fn g_chaos_io_real_fallocate; /**< Downstream `fallocate` (Linux). */
 extern chaos_io_sendfile_fn g_chaos_io_real_sendfile;   /**< Downstream `sendfile` (Linux). */
+extern chaos_io_dup3_fn g_chaos_io_real_dup3;           /**< Downstream `dup3` (Linux). */
 extern chaos_io_copy_file_range_fn
     g_chaos_io_real_copy_file_range; /**< Downstream `copy_file_range` (Linux). */
 

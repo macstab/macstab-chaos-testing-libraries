@@ -66,6 +66,8 @@ chaos_io_writev_fn g_chaos_io_real_writev = NULL;
 chaos_io_open_fn g_chaos_io_real_open = NULL;
 chaos_io_openat_fn g_chaos_io_real_openat = NULL;
 chaos_io_close_fn g_chaos_io_real_close = NULL;
+chaos_io_dup2_fn g_chaos_io_real_dup2 = NULL;
+chaos_io_close_range_fn g_chaos_io_real_close_range = NULL;
 chaos_io_sync_fn g_chaos_io_real_fsync = NULL;
 chaos_io_sync_fn g_chaos_io_real_fdatasync = NULL;
 chaos_io_pread_fn g_chaos_io_real_pread = NULL;
@@ -78,6 +80,7 @@ chaos_io_renameat_fn g_chaos_io_real_renameat = NULL;
 #ifdef __linux__
 chaos_io_fallocate_fn g_chaos_io_real_fallocate = NULL;
 chaos_io_sendfile_fn g_chaos_io_real_sendfile = NULL;
+chaos_io_dup3_fn g_chaos_io_real_dup3 = NULL;
 chaos_io_copy_file_range_fn g_chaos_io_real_copy_file_range = NULL;
 #endif
 
@@ -129,6 +132,24 @@ static void chaos_io_resolve_symbol(void *target, const char *symbol)
     if (resolved == NULL && dlerror() != NULL)
         abort();
 
+    (void)memcpy(target, &resolved, sizeof(resolved));
+}
+
+/**
+ * @brief Resolves a downstream symbol that older C libraries may not provide.
+ *
+ * @details Unlike `chaos_io_resolve_symbol()` a missing symbol is not fatal: the
+ * target stays NULL and the wrapper reports ENOSYS, exactly what the caller would
+ * see from a libc without it. `close_range` arrived in glibc 2.34; the libraries
+ * are built against 2.31.
+ */
+static void chaos_io_resolve_optional_symbol(void *target, const char *symbol)
+{
+    void *resolved;
+
+    (void)dlerror();
+    resolved = dlsym(RTLD_NEXT, symbol);
+    (void)dlerror();
     (void)memcpy(target, &resolved, sizeof(resolved));
 }
 
@@ -269,6 +290,8 @@ static void chaos_io_resolve_all_symbols(void)
     chaos_io_resolve_symbol(&g_chaos_io_real_open, "open");
     chaos_io_resolve_symbol(&g_chaos_io_real_openat, "openat");
     chaos_io_resolve_symbol(&g_chaos_io_real_close, "close");
+    chaos_io_resolve_symbol(&g_chaos_io_real_dup2, "dup2");
+    chaos_io_resolve_optional_symbol(&g_chaos_io_real_close_range, "close_range");
     chaos_io_resolve_symbol(&g_chaos_io_real_fsync, "fsync");
     chaos_io_resolve_symbol(&g_chaos_io_real_fdatasync, "fdatasync");
     chaos_io_resolve_symbol(&g_chaos_io_real_pread, "pread");
@@ -281,6 +304,7 @@ static void chaos_io_resolve_all_symbols(void)
 #ifdef __linux__
     chaos_io_resolve_symbol(&g_chaos_io_real_fallocate, "fallocate");
     chaos_io_resolve_symbol(&g_chaos_io_real_sendfile, "sendfile");
+    chaos_io_resolve_symbol(&g_chaos_io_real_dup3, "dup3");
     chaos_io_resolve_symbol(&g_chaos_io_real_copy_file_range, "copy_file_range");
 #endif
 }

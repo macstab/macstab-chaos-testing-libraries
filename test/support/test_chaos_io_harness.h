@@ -322,6 +322,10 @@ static int g_real_close_return = 0;
 static int g_real_close_guard = 0;
 /** @brief `fd` argument captured from the most recent stub close call. */
 static int g_real_close_fd = -1;
+/** @brief Number of times the stub dup2 / dup3 / close_range functions were called. */
+static int g_real_dup_calls = 0;
+/** @brief Return value for the stub dup2 / dup3 / close_range functions. */
+static int g_real_dup_return = 0;
 
 /** @brief Number of times the stub fsync function was called. */
 static int g_real_fsync_calls = 0;
@@ -1033,6 +1037,37 @@ static int chaos_test_real_close_impl(int fd)
     return g_real_close_return;
 }
 
+/** @brief Stub for the real `dup2`; counts calls. */
+static int chaos_test_real_dup2_impl(int oldfd, int newfd)
+{
+    (void)oldfd;
+    (void)newfd;
+    ++g_real_dup_calls;
+    return g_real_dup_return;
+}
+
+/** @brief Stub for the real `close_range`; counts calls. */
+static int chaos_test_real_close_range_impl(unsigned int first, unsigned int last, int flags)
+{
+    (void)first;
+    (void)last;
+    (void)flags;
+    ++g_real_dup_calls;
+    return g_real_dup_return;
+}
+
+#ifdef __linux__
+/** @brief Stub for the real Linux `dup3`; counts calls. */
+static int chaos_test_real_dup3_impl(int oldfd, int newfd, int flags)
+{
+    (void)oldfd;
+    (void)newfd;
+    (void)flags;
+    ++g_real_dup_calls;
+    return g_real_dup_return;
+}
+#endif
+
 /** @brief Stub for the real `fsync` syscall wrapper. Captures fd and TLS guard. */
 static int chaos_test_real_fsync_impl(int fd)
 {
@@ -1274,6 +1309,20 @@ static void *chaos_test_dlsym(void *handle, const char *symbol)
     {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_close_fn, chaos_test_real_close_impl);
     }
+    if (strcmp(symbol, "dup2") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_dup2_fn, chaos_test_real_dup2_impl);
+    }
+    if (strcmp(symbol, "close_range") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_close_range_fn, chaos_test_real_close_range_impl);
+    }
+#ifdef __linux__
+    if (strcmp(symbol, "dup3") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_dup3_fn, chaos_test_real_dup3_impl);
+    }
+#endif
     if (strcmp(symbol, "fsync") == 0)
     {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_sync_fn, chaos_test_real_fsync_impl);
@@ -1554,6 +1603,8 @@ static void chaos_test_reset_state(void)
     g_real_close_calls = 0;
     g_real_close_return = 0;
     g_real_close_guard = 0;
+    g_real_dup_calls = 0;
+    g_real_dup_return = 0;
     g_real_close_fd = -1;
 
     g_real_fsync_calls = 0;
@@ -1679,6 +1730,11 @@ static void chaos_test_bind_real_functions(void)
     g_chaos_io_real_open = chaos_test_real_open_impl;
     g_chaos_io_real_openat = chaos_test_real_openat_impl;
     g_chaos_io_real_close = chaos_test_real_close_impl;
+    g_chaos_io_real_dup2 = chaos_test_real_dup2_impl;
+    g_chaos_io_real_close_range = chaos_test_real_close_range_impl;
+#ifdef __linux__
+    g_chaos_io_real_dup3 = chaos_test_real_dup3_impl;
+#endif
     g_chaos_io_real_fsync = chaos_test_real_fsync_impl;
     g_chaos_io_real_fdatasync = chaos_test_real_fdatasync_impl;
     g_chaos_io_real_pread = chaos_test_real_pread_impl;
@@ -1760,6 +1816,10 @@ static void chaos_test_bind_libc_functions_for_exit(void)
     resolved = dlsym(RTLD_NEXT, "renameat");
     assert(resolved != NULL);
     (void)memcpy(&g_chaos_io_real_renameat, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "dup2");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_dup2, &resolved, sizeof(resolved));
 
     resolved = dlsym(RTLD_NEXT, "pread");
     assert(resolved != NULL);

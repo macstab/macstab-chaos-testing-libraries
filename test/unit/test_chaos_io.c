@@ -1488,7 +1488,8 @@ static void test_close_sync_and_positioned_wrappers(void)
     chaos_test_bind_real_functions();
     g_real_close_return = -1;
     assert(close(11) == -1);
-    assert(g_fdcache_invalidate_calls == 0);
+    /* Linux releases the descriptor even when close reports an error. */
+    assert(g_fdcache_invalidate_calls == 1);
 
     chaos_test_reset_state();
     chaos_test_bind_real_functions();
@@ -1501,7 +1502,9 @@ static void test_close_sync_and_positioned_wrappers(void)
     g_rule_apply_errno_result = 1;
     assert(close(11) == -1);
     assert(errno == EACCES);
-    assert(g_real_close_calls == 0);
+    /* The injected error is reported after a real close, as Linux reports EIO. */
+    assert(g_real_close_calls == 1);
+    assert(g_fdcache_invalidate_calls == 1);
 
     chaos_test_reset_state();
     chaos_test_bind_real_functions();
@@ -1906,6 +1909,69 @@ static void test_glibc_alternate_entries(void)
 }
 #endif
 
+/**
+ * @brief Invariant: calls that free or reassign a descriptor invalidate its cache entry.
+ *
+ * Triggering conditions: `dup2`, `dup3` and `close_range` with successful and failing
+ * real calls, `close_range` with CLOSE_RANGE_CLOEXEC, a reversed range, a narrow and a
+ * wide range, and a C library without `close_range`.
+ *
+ * Expected observable behaviour:
+ * - A successful dup2/dup3 invalidates the target descriptor; dup2 onto itself and a
+ *   failed call invalidate nothing.
+ * - A successful close_range invalidates each descriptor of a narrow range and resets
+ *   the whole cache for a wide one; CLOEXEC, a reversed range and a failure invalidate
+ *   nothing.
+ * - Without a real close_range the wrapper fails with ENOSYS.
+ */
+static void test_descriptor_reassignment_wrappers(void)
+{
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_dup_return = 9;
+    assert(dup2(4, 9) == 9);
+    assert(g_fdcache_invalidate_calls == 1);
+    assert(g_last_invalidate_fd == 9);
+    assert(dup2(9, 9) == 9);
+    assert(g_fdcache_invalidate_calls == 1);
+    g_real_dup_return = -1;
+    assert(dup2(4, 9) == -1);
+    assert(g_fdcache_invalidate_calls == 1);
+
+#ifdef __linux__
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_dup_return = 10;
+    assert(dup3(4, 10, 0) == 10);
+    assert(g_fdcache_invalidate_calls == 1);
+    assert(g_last_invalidate_fd == 10);
+    g_real_dup_return = -1;
+    assert(dup3(4, 10, 0) == -1);
+    assert(g_fdcache_invalidate_calls == 1);
+#endif
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_dup_return = 0;
+    assert(close_range(5U, 7U, 0) == 0);
+    assert(g_fdcache_invalidate_calls == 3);
+    assert(close_range(3U, ~0U, 0) == 0);
+    assert(g_fdcache_reset_calls == 1);
+    assert(close_range(5U, 7U, (int)CLOSE_RANGE_CLOEXEC) == 0);
+    assert(close_range(7U, 5U, 0) == 0);
+    assert(g_fdcache_invalidate_calls == 3);
+    g_real_dup_return = -1;
+    assert(close_range(5U, 7U, 0) == -1);
+    assert(g_fdcache_invalidate_calls == 3);
+    assert(g_real_dup_calls == 5);
+
+    g_chaos_io_real_close_range = NULL;
+    errno = 0;
+    assert(close_range(5U, 7U, 0) == -1);
+    assert(errno == ENOSYS);
+    chaos_test_bind_real_functions();
+}
+
 int main(void)
 {
     test_resolve_symbol_and_seed_material();
@@ -1925,6 +1991,7 @@ int main(void)
 #endif
     test_preadv_and_pwritev_wrappers();
     test_close_sync_and_positioned_wrappers();
+    test_descriptor_reassignment_wrappers();
 #if defined(__GLIBC__) && defined(__LP64__)
     test_glibc_alternate_entries();
 #endif
