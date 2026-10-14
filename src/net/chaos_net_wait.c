@@ -57,6 +57,7 @@
 #include "chaos_net_endpoint.h"
 #include "chaos_net_internal.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -174,7 +175,7 @@ static int chaos_net_wait_match_fdsets(
  * @par Thread-safety: reentrancy guard prevents recursive interposition; safe.
  * @par Blocking: reads from /proc (in-kernel VFS); should not block in practice.
  */
-static int chaos_net_wait_match_epoll(int epfd, chaos_net_rule_t *rule)
+static int chaos_net_wait_match_epoll_fdinfo(int epfd, chaos_net_rule_t *rule)
 {
     char path[64];
     char buffer[16384];
@@ -255,6 +256,21 @@ static int chaos_net_wait_match_epoll(int epfd, chaos_net_rule_t *rule)
     }
 
     return 0;
+}
+
+/**
+ * @brief Matches a rule for an epoll instance, leaving errno untouched.
+ *
+ * @details Reading /proc/self/fdinfo is the library's own business; its open and
+ * read calls must not change the errno the caller sees.
+ */
+static int chaos_net_wait_match_epoll(int epfd, chaos_net_rule_t *rule)
+{
+    const int saved_errno = errno;
+    const int result = chaos_net_wait_match_epoll_fdinfo(epfd, rule);
+
+    errno = saved_errno;
+    return result;
 }
 #endif
 

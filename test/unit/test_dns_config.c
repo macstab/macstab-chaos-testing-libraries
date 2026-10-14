@@ -77,6 +77,9 @@ static int g_test_config_force_open_fail = 0;
  */
 static int g_test_config_force_read_fail = 0;
 
+/** Number of upcoming config reads that fail with EINTR, as a signal would make them. */
+static int g_test_config_read_eintr = 0;
+
 /**
  * @brief When non-zero, the CAS stub always returns 0 (CAS fails).
  *
@@ -146,6 +149,12 @@ static int chaos_dns_test_config_open(const char *path, int flags, ...)
  */
 static ssize_t chaos_dns_test_config_read(int fd, void *buffer, size_t count)
 {
+    if (g_test_config_read_eintr > 0)
+    {
+        --g_test_config_read_eintr;
+        errno = EINTR;
+        return -1;
+    }
     if (g_test_config_force_read_fail != 0 && fd == g_test_config_fake_fd)
     {
         (void)buffer;
@@ -696,8 +705,7 @@ static void test_rule_selection(void)
  *   text="ptr.example"; `match_reverse_loaded` → true.
  * - CAS failure (`g_test_config_force_cas_fail = 1`): `prepare()` → true (CAS failure is a
  *   benign lost race; the loaded state from a prior successful load is still usable).
- * - Open failure (`g_test_config_force_open_fail = 1`): `prepare()` → false.
- * - Read failure (`g_test_config_force_read_fail = 1`): `prepare()` → false.
+ * - Open or read failure: `prepare()` keeps the active rules → true; the next call retries.
  * - Invalid content (non-IP OVERRIDE value): `prepare()` → false; `match_loaded` → false.
  * - NULL hostname to `match` and `match_reverse` → false.
  */
@@ -731,15 +739,21 @@ static void test_prepare_and_match(void)
     assert(chaos_dns_config_prepare());
     g_test_config_force_cas_fail = 0;
 
+    /* A failed open or read keeps the active rules and is retried on the next call. */
     g_test_config_force_open_fail = 1;
     write_config_text("dns://api.example.com:LATENCY:20\n", 13);
-    assert(!chaos_dns_config_prepare());
+    assert(chaos_dns_config_prepare());
+    assert(chaos_dns_config_match_reverse_loaded(CHAOS_DNS_EFFECT_REWRITE, "127.0.0.1", &rule));
     g_test_config_force_open_fail = 0;
 
     g_test_config_force_read_fail = 1;
     write_config_text("dns://api.example.com:LATENCY:20\n", 14);
-    assert(!chaos_dns_config_prepare());
+    assert(chaos_dns_config_prepare());
+    assert(chaos_dns_config_match_reverse_loaded(CHAOS_DNS_EFFECT_REWRITE, "127.0.0.1", &rule));
     g_test_config_force_read_fail = 0;
+
+    assert(chaos_dns_config_prepare());
+    assert(chaos_dns_config_match_loaded(CHAOS_DNS_EFFECT_LATENCY, "api.example.com", &rule));
 
     write_config_text("dns://api.example.com:OVERRIDE:not-a-host\n", 15);
     assert(!chaos_dns_config_prepare());
@@ -780,6 +794,160 @@ static void test_reload_in_progress_is_not_joined(void)
     g_chaos_dns_cached_mtime = CHAOS_DNS_MTIME_UNKNOWN;
 }
 
+/**
+ * @brief Invariant: a failed config read keeps the active rules and is retried.
+ *
+ * Triggering condition: the file changes while `read()` fails.
+ *
+ * Expected observable behaviour: the previously loaded rule set stays active, the
+ * cached stamp is not advanced, and the next call loads the new content.
+ */
+static void test_read_failure_keeps_rules_and_retries(void)
+{
+    chaos_dns_test_file_backup_t backup;
+
+    backup_file(CHAOS_DNS_CONFIG_PATH, &backup);
+    chaos_dns_config_init();
+
+    write_config_text("dns://api.example.com:LATENCY:20\n", 40);
+    assert(chaos_dns_config_prepare());
+    assert(chaos_dns_config_active_state()->rule_count == 1U);
+
+    write_config_text(
+        "dns://api.example.com:LATENCY:20\nrdns://127.0.0.1:REWRITE:ptr.example\n", 41
+    );
+    g_test_config_force_read_fail = 1;
+    assert(chaos_dns_config_prepare());
+    assert(chaos_dns_config_active_state()->rule_count == 1U);
+    assert(g_chaos_dns_cached_mtime != chaos_dns_config_observed_mtime());
+    assert(g_chaos_dns_cached_mtime != CHAOS_DNS_MTIME_RELOADING);
+    g_test_config_force_read_fail = 0;
+
+    assert(chaos_dns_config_prepare());
+    assert(chaos_dns_config_active_state()->rule_count == 2U);
+
+    restore_file(CHAOS_DNS_CONFIG_PATH, &backup);
+    free_backup(&backup);
+}
+
+/**
+ * @brief Invariant: the change stamp sees writes within one mtime tick.
+ *
+ * Triggering condition: stat results that differ only in size or only in inode.
+ *
+ * Expected observable behaviour: each difference yields a different stamp.
+ */
+static void test_change_stamp_beyond_mtime(void)
+{
+    struct stat base;
+    struct stat other;
+
+    memset(&base, 0, sizeof(base));
+    base.st_mtim.tv_sec = 50;
+    base.st_size = 10;
+    base.st_ino = 100;
+    other = base;
+    assert(chaos_dns_config_hash_mtime(&base) == chaos_dns_config_hash_mtime(&other));
+
+    other.st_size = 20;
+    assert(chaos_dns_config_hash_mtime(&base) != chaos_dns_config_hash_mtime(&other));
+
+    other = base;
+    other.st_ino = 101;
+    assert(chaos_dns_config_hash_mtime(&base) != chaos_dns_config_hash_mtime(&other));
+}
+
+/**
+ * @brief Invariant: a child forked during a reload takes the orphaned claim over.
+ *
+ * Triggering condition: the cached stamp is RELOADING but the claim was recorded
+ * by another process id, as a forked child sees it.
+ *
+ * Expected observable behaviour: `prepare()` reloads and publishes the file's rules;
+ * a claim recorded by this process is left alone.
+ */
+static void test_fork_takes_over_orphaned_reload(void)
+{
+    chaos_dns_test_file_backup_t backup;
+
+    backup_file(CHAOS_DNS_CONFIG_PATH, &backup);
+    chaos_dns_config_init();
+    write_config_text("dns://api.example.com:LATENCY:20\n", 60);
+
+    g_chaos_dns_reload_pid = (uint64_t)getpid() + 1U;
+    g_chaos_dns_cached_mtime = CHAOS_DNS_MTIME_RELOADING;
+    assert(chaos_dns_config_prepare());
+    assert(g_chaos_dns_cached_mtime == chaos_dns_config_observed_mtime());
+
+    /* A competing taker-over wins the release: this caller keeps the current snapshot. */
+    g_chaos_dns_reload_pid = (uint64_t)getpid() + 1U;
+    g_chaos_dns_cached_mtime = CHAOS_DNS_MTIME_RELOADING;
+    g_test_config_force_cas_fail = 1;
+    assert(chaos_dns_config_prepare());
+    g_test_config_force_cas_fail = 0;
+
+    /* The claim belongs to this process: another of its threads is reloading. */
+    g_chaos_dns_reload_pid = (uint64_t)getpid();
+    g_chaos_dns_cached_mtime = CHAOS_DNS_MTIME_RELOADING;
+    (void)chaos_dns_config_prepare();
+    assert(g_chaos_dns_cached_mtime == CHAOS_DNS_MTIME_RELOADING);
+    g_chaos_dns_cached_mtime = CHAOS_DNS_MTIME_UNKNOWN;
+
+    restore_file(CHAOS_DNS_CONFIG_PATH, &backup);
+    free_backup(&backup);
+}
+
+/**
+ * @brief Invariant: refreshing the config never changes the caller's errno.
+ *
+ * Triggering condition: `prepare()` with no config file, so its stat(2) fails with
+ * ENOENT, and with a file to read.
+ *
+ * Expected observable behaviour: errno holds the caller's value afterwards.
+ */
+static void test_prepare_preserves_errno(void)
+{
+    chaos_dns_test_file_backup_t backup;
+
+    backup_file(CHAOS_DNS_CONFIG_PATH, &backup);
+    chaos_dns_config_init();
+    (void)unlink(CHAOS_DNS_CONFIG_PATH);
+    errno = EBADF;
+    (void)chaos_dns_config_prepare();
+    assert(errno == EBADF);
+
+    write_config_text("dns://api.example.com:LATENCY:20\n", 70);
+    errno = EBADF;
+    assert(chaos_dns_config_prepare());
+    assert(errno == EBADF);
+
+    restore_file(CHAOS_DNS_CONFIG_PATH, &backup);
+    free_backup(&backup);
+}
+
+/**
+ * @brief Invariant: a config read interrupted by a signal is retried, not treated as failure.
+ *
+ * Triggering condition: the first `read()` fails with EINTR.
+ *
+ * Expected observable behaviour: the rules are loaded as if nothing had happened.
+ */
+static void test_interrupted_read_is_retried(void)
+{
+    chaos_dns_test_file_backup_t backup;
+
+    backup_file(CHAOS_DNS_CONFIG_PATH, &backup);
+    chaos_dns_config_init();
+    write_config_text("dns://api.example.com:LATENCY:20\n", 80);
+    g_test_config_read_eintr = 1;
+    assert(chaos_dns_config_prepare());
+    assert(g_test_config_read_eintr == 0);
+    assert(chaos_dns_config_active_state()->rule_count == 1U);
+
+    restore_file(CHAOS_DNS_CONFIG_PATH, &backup);
+    free_backup(&backup);
+}
+
 int main(void)
 {
     test_helper_functions();
@@ -788,5 +956,10 @@ int main(void)
     test_rule_selection();
     test_prepare_and_match();
     test_reload_in_progress_is_not_joined();
+    test_read_failure_keeps_rules_and_retries();
+    test_change_stamp_beyond_mtime();
+    test_fork_takes_over_orphaned_reload();
+    test_prepare_preserves_errno();
+    test_interrupted_read_is_retried();
     return 0;
 }

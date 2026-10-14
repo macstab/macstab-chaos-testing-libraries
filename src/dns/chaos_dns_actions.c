@@ -100,12 +100,15 @@ int chaos_dns_probability_hit(double probability)
 void chaos_dns_rule_apply_latency(const chaos_dns_rule_t *rule)
 {
     uint64_t remaining_us;
+    int saved_errno;
 
     if (rule == NULL || rule->effect != CHAOS_DNS_EFFECT_LATENCY)
     {
         return;
     }
 
+    /* An interrupted sleep sets EINTR; the delay is ours, so the caller's errno stays. */
+    saved_errno = errno;
     remaining_us = (uint64_t)rule->latency_ms * 1000ULL;
     while (remaining_us > 0ULL)
     {
@@ -114,6 +117,7 @@ void chaos_dns_rule_apply_latency(const chaos_dns_rule_t *rule)
         (void)usleep(chunk);
         remaining_us -= (uint64_t)chunk;
     }
+    errno = saved_errno;
 }
 
 /**

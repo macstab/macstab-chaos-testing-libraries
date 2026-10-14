@@ -37,6 +37,7 @@
 #include "chaos_net_internal.h"
 
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -171,7 +172,7 @@ static void chaos_net_resolve_symbol(void *target, const char *symbol)
  *
  * @return 8 bytes of entropy as a uint64_t, or a getpid()-derived fallback.
  */
-static uint64_t chaos_net_read_seed_material(void)
+static uint64_t chaos_net_read_urandom_seed(void)
 {
 #ifdef __linux__
     uint64_t seed = 0U;
@@ -200,6 +201,21 @@ static uint64_t chaos_net_read_seed_material(void)
 
     /* Fallback: compile-time constant XOR pid. Weak but non-zero and process-unique. */
     return UINT64_C(0x6a09e667f3bcc909) ^ (uint64_t)getpid();
+}
+
+/**
+ * @brief Returns seed material, leaving errno untouched.
+ *
+ * @details Seeding happens lazily inside an interposed call; reading /dev/urandom
+ * must not change the errno that call reports.
+ */
+static uint64_t chaos_net_read_seed_material(void)
+{
+    const int saved_errno = errno;
+    const uint64_t seed = chaos_net_read_urandom_seed();
+
+    errno = saved_errno;
+    return seed;
 }
 
 /**

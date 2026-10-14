@@ -52,10 +52,12 @@
 
 #include "chaos_process_config.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 /* -------------------------------------------------------------------------
  * Platform-specific mtime accessor macros
@@ -134,6 +136,17 @@ static volatile unsigned int g_chaos_process_active_config_index = 0U;
  * (acceptable — the next file modification will trigger a retry).
  */
 static volatile uint64_t g_chaos_process_cached_mtime = CHAOS_PROCESS_MTIME_UNKNOWN;
+
+/**
+ * @brief Process id of the thread that last claimed the reload marker.
+ *
+ * @details Written before every claim attempt. A forked child inherits a
+ * CHAOS_PROCESS_MTIME_RELOADING marker whose claiming thread does not exist in the
+ * child; the pid recorded here differs from the child's, which is how the child
+ * recognises an orphaned claim and takes the reload over instead of serving a
+ * stale snapshot forever.
+ */
+static volatile uint64_t g_chaos_process_reload_pid = 0U;
 
 /**
  * @brief Buffer the reload thread reads the config file into.
@@ -737,10 +750,15 @@ static uint64_t chaos_process_config_normalize_mtime_hash(uint64_t value)
 }
 
 /**
- * @brief Hashes the mtime fields of a `struct stat` into a 64-bit value.
+ * @brief Computes a 64-bit change stamp of the file: mtime, size, inode and device.
  *
- * Uses FNV-inspired XOR-multiply mixing on (tv_sec, tv_nsec).  The result
- * is normalised to avoid sentinel collisions.  Returns
+ * Uses FNV-inspired XOR-multiply mixing on (tv_sec, tv_nsec, size, inode,
+ * device). The mtime alone is not enough: file systems stamp it from a coarse clock (a
+ * few milliseconds), so two writes in one tick leave it unchanged. Mixing in the
+ * size catches an append, and the inode catches a rewrite through a temporary
+ * file and rename(2) (`sed -i`), even within one tick.
+ *
+ * The result is normalised to avoid sentinel collisions.  Returns
  * `CHAOS_PROCESS_MTIME_MISSING` if `st` is NULL.
  *
  * @param st Pointer to a populated `struct stat`, or NULL.
@@ -759,6 +777,12 @@ static uint64_t chaos_process_config_hash_mtime(const struct stat *st)
     value ^= (uint64_t)CHAOS_PROCESS_STAT_SEC(st);
     value *= UINT64_C(1099511628211);
     value ^= (uint64_t)CHAOS_PROCESS_STAT_NSEC(st);
+    value *= UINT64_C(1099511628211);
+    value ^= (uint64_t)st->st_size;
+    value *= UINT64_C(1099511628211);
+    value ^= (uint64_t)st->st_ino;
+    value *= UINT64_C(1099511628211);
+    value ^= (uint64_t)st->st_dev;
     value *= UINT64_C(1099511628211);
     return chaos_process_config_normalize_mtime_hash(value);
 }
@@ -819,7 +843,10 @@ static int chaos_process_config_read_file(size_t *size_out)
     }
 
     previous = chaos_process_enter_internal();
-    fd = open(CHAOS_PROCESS_CONFIG_PATH, O_RDONLY);
+    do
+    {
+        fd = open(CHAOS_PROCESS_CONFIG_PATH, O_RDONLY);
+    } while (fd < 0 && errno == EINTR);
     if (fd < 0)
     {
         chaos_process_leave_internal(previous);
@@ -830,6 +857,10 @@ static int chaos_process_config_read_file(size_t *size_out)
     {
         ssize_t rc =
             read(fd, g_chaos_process_config_buffer + total, CHAOS_PROCESS_MAX_CONFIG_BYTES - total);
+        if (rc < 0 && errno == EINTR)
+        {
+            continue;
+        }
         if (rc < 0)
         {
             (void)close(fd);
@@ -1146,7 +1177,7 @@ int chaos_process_config_select_rule(
  *    the previous one — and the cached mtime is advanced so we do not
  *    repeatedly re-read a corrupt file until the operator edits it.
  */
-int chaos_process_config_prepare(void)
+static int chaos_process_config_refresh(void)
 {
     uint64_t observed_mtime;
     uint64_t cached_mtime;
@@ -1167,8 +1198,23 @@ int chaos_process_config_prepare(void)
      * reload into the same inactive snapshot and read buffer concurrently. */
     if (cached_mtime == CHAOS_PROCESS_MTIME_RELOADING)
     {
-        return chaos_process_config_active_state()->rule_count != 0U;
+        if (chaos_process_atomic_load_u64(&g_chaos_process_reload_pid) == (uint64_t)getpid())
+        {
+            return chaos_process_config_active_state()->rule_count != 0U;
+        }
+        /* The claim was made in the parent before fork(); its thread does not exist in
+         * this child and will never publish. Release the orphaned claim; if another
+         * thread released it first, the claim below decides which of them reloads. */
+        (void)chaos_process_atomic_cas_u64(
+            &g_chaos_process_cached_mtime,
+            CHAOS_PROCESS_MTIME_RELOADING,
+            CHAOS_PROCESS_MTIME_UNKNOWN
+        );
+        cached_mtime = CHAOS_PROCESS_MTIME_UNKNOWN;
     }
+    /* Race to become the reload thread. Exactly one caller proceeds. The pid is
+     * recorded first so a thread that sees the claim can tell it is this process's. */
+    g_chaos_process_reload_pid = (uint64_t)getpid();
     if (!chaos_process_atomic_cas_u64(
             &g_chaos_process_cached_mtime, cached_mtime, CHAOS_PROCESS_MTIME_RELOADING
         ))
@@ -1181,17 +1227,45 @@ int chaos_process_config_prepare(void)
     next_state = &g_chaos_process_config_states[next_index];
     chaos_process_config_reset_state(next_state, 1);
 
-    if (observed_mtime != CHAOS_PROCESS_MTIME_MISSING &&
-        chaos_process_config_read_file(&config_size) == 0 && config_size > 0U &&
-        chaos_process_config_parse_buffer(
-            g_chaos_process_config_buffer, next_state->rules, &next_state->rule_count
-        ) != 0)
+    if (observed_mtime != CHAOS_PROCESS_MTIME_MISSING)
     {
-        chaos_process_config_reset_state(next_state, 0);
+        if (chaos_process_config_read_file(&config_size) != 0)
+        {
+            /* A failed read says nothing about the rules: keep the active snapshot and
+             * release the claim with the previous stamp, so the next call retries
+             * instead of running with no rules until the file changes again. */
+            __sync_synchronize();
+            g_chaos_process_cached_mtime = cached_mtime;
+            return chaos_process_config_active_state()->rule_count != 0U;
+        }
+        if (config_size > 0U &&
+            chaos_process_config_parse_buffer(
+                g_chaos_process_config_buffer, next_state->rules, &next_state->rule_count
+            ) != 0)
+        {
+            /* Parse failed: mark the snapshot invalid so match queries return 0. */
+            chaos_process_config_reset_state(next_state, 0);
+        }
     }
 
     chaos_process_config_publish(next_index, observed_mtime);
     return next_state->parse_ok != 0 && next_state->rule_count != 0U;
+}
+
+/**
+ * @brief Refreshes the snapshot if the config file changed, leaving errno untouched.
+ *
+ * @details The stat, open and read calls of a refresh belong to the library, not to
+ * the caller: an interposed call that then succeeds must not report the errno of a
+ * missing config file.
+ */
+int chaos_process_config_prepare(void)
+{
+    const int saved_errno = errno;
+    const int result = chaos_process_config_refresh();
+
+    errno = saved_errno;
+    return result;
 }
 
 /**

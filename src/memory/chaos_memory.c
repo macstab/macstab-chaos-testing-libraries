@@ -52,6 +52,7 @@
 #include "chaos_memory_internal.h"
 
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -207,7 +208,7 @@ static void chaos_memory_resolve_symbol(void *target, const char *symbol)
  * @note Linux-only.  On other platforms the function body is empty and the
  *       fallback is always returned.
  */
-static uint64_t chaos_memory_read_seed_material(void)
+static uint64_t chaos_memory_read_urandom_seed(void)
 {
 #ifdef __linux__
     uint64_t seed = 0U;
@@ -233,6 +234,21 @@ static uint64_t chaos_memory_read_seed_material(void)
 #endif
 
     return UINT64_C(0x6a09e667f3bcc909) ^ (uint64_t)getpid();
+}
+
+/**
+ * @brief Returns seed material, leaving errno untouched.
+ *
+ * @details Seeding happens lazily inside an interposed call; reading /dev/urandom
+ * must not change the errno that call reports.
+ */
+static uint64_t chaos_memory_read_seed_material(void)
+{
+    const int saved_errno = errno;
+    const uint64_t seed = chaos_memory_read_urandom_seed();
+
+    errno = saved_errno;
+    return seed;
 }
 
 /* =========================================================================

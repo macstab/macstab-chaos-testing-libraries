@@ -44,6 +44,7 @@
 #include "chaos_dns_internal.h"
 
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 
@@ -124,7 +125,7 @@ static void chaos_dns_resolve_symbol(void *target, const char *symbol)
  *
  * @return  An entropy value suitable for use as g_chaos_dns_process_seed.
  */
-static uint64_t chaos_dns_read_seed_material(void)
+static uint64_t chaos_dns_read_urandom_seed(void)
 {
 #ifdef __linux__
     uint64_t seed = 0U;
@@ -152,6 +153,21 @@ static uint64_t chaos_dns_read_seed_material(void)
 
     /* Non-Linux or /dev/urandom unavailable: combine a known constant with the PID. */
     return UINT64_C(0x6a09e667f3bcc909) ^ (uint64_t)getpid();
+}
+
+/**
+ * @brief Returns seed material, leaving errno untouched.
+ *
+ * @details Seeding happens lazily inside an interposed call; reading /dev/urandom
+ * must not change the errno that call reports.
+ */
+static uint64_t chaos_dns_read_seed_material(void)
+{
+    const int saved_errno = errno;
+    const uint64_t seed = chaos_dns_read_urandom_seed();
+
+    errno = saved_errno;
+    return seed;
 }
 
 /**

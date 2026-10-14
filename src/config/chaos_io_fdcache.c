@@ -31,6 +31,7 @@
 
 #include "chaos_io_fdcache.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -193,6 +194,7 @@ int chaos_io_fdcache_resolve(int fd, char *path, size_t path_size)
     int previous;
     int written;
     ssize_t length;
+    int saved_errno;
 
     if (fd <= 2 || path == NULL || path_size < 2U)
     {
@@ -207,10 +209,13 @@ int chaos_io_fdcache_resolve(int fd, char *path, size_t path_size)
     if (written < 0)
         return 0;
 
-    /* Enter internal mode: readlink must not be re-intercepted. */
+    /* Enter internal mode: readlink must not be re-intercepted. The lookup is the
+     * library's own business, so a failure must not leak into the caller's errno. */
+    saved_errno = errno;
     previous = chaos_io_enter_internal();
     length = readlink(proc_path, path, path_size - 1U);
     chaos_io_leave_internal(previous);
+    errno = saved_errno;
     if (length <= 0 || (size_t)length >= path_size)
     {
         return 0;

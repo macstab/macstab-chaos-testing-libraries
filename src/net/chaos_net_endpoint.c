@@ -40,6 +40,7 @@
 #include "chaos_net_endpoint.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -490,6 +491,8 @@ chaos_net_endpoint_kind_from_socket(int fd, sa_family_t family, chaos_net_endpoi
     int type = 0;
     socklen_t type_len = (socklen_t)sizeof(type);
     int previous;
+    int saved_errno;
+    int rc;
 
     if (kind == NULL || g_chaos_net_real_getsockopt == NULL)
     {
@@ -497,13 +500,16 @@ chaos_net_endpoint_kind_from_socket(int fd, sa_family_t family, chaos_net_endpoi
     }
 
     /* Guard: getsockopt must not re-enter the interposition layer. */
+    /* The lookup is the library's own business: a failure must not leak into errno. */
+    saved_errno = errno;
     previous = chaos_net_enter_internal();
-    if (g_chaos_net_real_getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &type_len) != 0)
+    rc = g_chaos_net_real_getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &type_len);
+    chaos_net_leave_internal(previous);
+    errno = saved_errno;
+    if (rc != 0)
     {
-        chaos_net_leave_internal(previous);
         return 0;
     }
-    chaos_net_leave_internal(previous);
 
     /* Mask Linux-specific creation-time flags; they are not relevant to stream/dgram. */
 #ifdef SOCK_CLOEXEC
@@ -694,15 +700,18 @@ int chaos_net_endpoint_from_local_fd(int fd, chaos_net_endpoint_t *endpoint)
     socklen_t address_length = (socklen_t)sizeof(storage);
     int previous;
     int rc;
+    int saved_errno;
 
     if (endpoint == NULL || g_chaos_net_real_getsockname == NULL)
     {
         return 0;
     }
 
+    saved_errno = errno;
     previous = chaos_net_enter_internal();
     rc = g_chaos_net_real_getsockname(fd, (struct sockaddr *)&storage, &address_length);
     chaos_net_leave_internal(previous);
+    errno = saved_errno;
     if (rc != 0)
     {
         return 0;
@@ -727,15 +736,18 @@ int chaos_net_endpoint_from_peer_fd(int fd, chaos_net_endpoint_t *endpoint)
     socklen_t address_length = (socklen_t)sizeof(storage);
     int previous;
     int rc;
+    int saved_errno;
 
     if (endpoint == NULL || g_chaos_net_real_getpeername == NULL)
     {
         return 0;
     }
 
+    saved_errno = errno;
     previous = chaos_net_enter_internal();
     rc = g_chaos_net_real_getpeername(fd, (struct sockaddr *)&storage, &address_length);
     chaos_net_leave_internal(previous);
+    errno = saved_errno;
     if (rc != 0)
     {
         return 0;

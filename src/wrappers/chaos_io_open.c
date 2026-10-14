@@ -55,6 +55,7 @@
 #include "chaos_io_fdcache.h"
 #include "chaos_io_internal.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <string.h>
@@ -246,15 +247,18 @@ static int chaos_io_getcwd_path(char *path, size_t path_size)
 {
     int previous;
     int ok;
+    int saved_errno;
 
     if (path == NULL || path_size == 0U)
     {
         return 0;
     }
 
+    saved_errno = errno;
     previous = chaos_io_enter_internal();
     ok = getcwd(path, path_size) != NULL;
     chaos_io_leave_internal(previous);
+    errno = saved_errno;
     return ok;
 }
 

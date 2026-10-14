@@ -51,6 +51,7 @@
 
 #include "chaos_memory_actions.h"
 
+#include <errno.h>
 #include <stdint.h>
 
 /**
@@ -123,6 +124,8 @@ int chaos_memory_probability_hit(double probability)
  */
 static void chaos_memory_sleep_chunk(useconds_t usec)
 {
+    /* An interrupted sleep sets EINTR; the delay is ours, so the caller's errno stays. */
+    const int saved_errno = errno;
     int previous;
 
     previous = chaos_memory_enter_internal();
@@ -141,6 +144,7 @@ static void chaos_memory_sleep_chunk(useconds_t usec)
         }
     }
     chaos_memory_leave_internal(previous);
+    errno = saved_errno;
 }
 
 /**

@@ -50,6 +50,7 @@
 #include "chaos_io_wrappers.h"
 
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -149,7 +150,7 @@ static void chaos_io_resolve_symbol(void *target, const char *symbol)
  *
  * @return 64 bits of entropy from `/dev/urandom`, or a PID-derived fallback.
  */
-static uint64_t chaos_io_read_seed_material(void)
+static uint64_t chaos_io_read_urandom_seed(void)
 {
     uint64_t seed = 0U;
     int fd;
@@ -173,6 +174,21 @@ static uint64_t chaos_io_read_seed_material(void)
     }
 
     return UINT64_C(0x6a09e667f3bcc909) ^ (uint64_t)getpid();
+}
+
+/**
+ * @brief Returns seed material, leaving errno untouched.
+ *
+ * @details Seeding happens lazily inside an interposed call; reading /dev/urandom
+ * must not change the errno that call reports.
+ */
+static uint64_t chaos_io_read_seed_material(void)
+{
+    const int saved_errno = errno;
+    const uint64_t seed = chaos_io_read_urandom_seed();
+
+    errno = saved_errno;
+    return seed;
 }
 
 /* --- Shared wrapper helper ------------------------------------------------------- */

@@ -153,6 +153,24 @@ static ssize_t chaos_test_stub_read(int fd, void *buffer, size_t count)
     return g_stub_read_result;
 }
 
+/** Number of upcoming reads `chaos_test_eintr_read` fails with EINTR before reading for real. */
+static int g_stub_read_eintr = 0;
+
+/**
+ * @brief Read that fails with EINTR `g_stub_read_eintr` times, as a signal would make it,
+ * then reads for real.
+ */
+static ssize_t chaos_test_eintr_read(int fd, void *buffer, size_t count)
+{
+    if (g_stub_read_eintr > 0)
+    {
+        --g_stub_read_eintr;
+        errno = EINTR;
+        return -1;
+    }
+    return read(fd, buffer, count);
+}
+
 /**
  * @brief Stub close function that counts calls and returns a configurable result.
  *
@@ -680,7 +698,8 @@ static void test_read_file_paths(void)
  * - After removing the config file: `observed_mtime()` → `CHAOS_IO_MTIME_MISSING`;
  *   `reload(MTIME_MISSING)` keeps `cached_mtime == MTIME_MISSING`; two consecutive
  *   `prepare()` calls both return 0 (no file → no rules loaded).
- * - With stub I/O and `reload(1234)`: `cached_mtime == 1234`, `rule_count == 0`.
+ * - With failing stub I/O and `reload(1234)`: nothing is published and `cached_mtime`
+ *   returns to the previous stamp (`MTIME_UNKNOWN`), so the next call retries.
  * - After writing a valid config and restoring real I/O: `observed_mtime()` !=
  *   `MTIME_MISSING`; `prepare()` returns 1; `match_loaded(WRITE, "/data/file.bin")`
  *   returns 1 with `rule.errnum == EIO`; `match_loaded(OPEN, ...)` returns 0;
@@ -700,7 +719,7 @@ static void test_reload_prepare_and_match(void)
     chaos_test_remove_file_if_exists(CHAOS_IO_CONFIG_PATH);
 
     assert(chaos_io_config_observed_mtime() == CHAOS_IO_MTIME_MISSING);
-    chaos_io_config_reload(CHAOS_IO_MTIME_MISSING);
+    chaos_io_config_reload(CHAOS_IO_MTIME_MISSING, CHAOS_IO_MTIME_UNKNOWN);
     assert(g_chaos_io_cached_mtime == CHAOS_IO_MTIME_MISSING);
     assert(chaos_io_config_prepare() == 0);
     assert(chaos_io_config_prepare() == 0);
@@ -710,8 +729,10 @@ static void test_reload_prepare_and_match(void)
     g_chaos_io_real_open = chaos_test_stub_open;
     g_chaos_io_real_read = chaos_test_stub_read;
     g_chaos_io_real_close = chaos_test_stub_close;
-    chaos_io_config_reload(UINT64_C(1234));
-    assert(g_chaos_io_cached_mtime == UINT64_C(1234));
+    chaos_io_config_reload(UINT64_C(1234), CHAOS_IO_MTIME_UNKNOWN);
+    /* The read failed: nothing is published and the claim is released with the
+     * previous stamp, so the next call retries. */
+    assert(g_chaos_io_cached_mtime == CHAOS_IO_MTIME_UNKNOWN);
     assert(chaos_io_config_active_state()->rule_count == 0U);
 
     chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/data:write:EIO:1.0\n");
@@ -738,6 +759,132 @@ static void test_reload_prepare_and_match(void)
     assert(chaos_io_config_match_path(CHAOS_IO_OP_WRITE, "/data/file.bin", &rule) == 0);
 }
 
+/**
+ * @brief Invariant: a failed config read keeps the active rules and is retried.
+ *
+ * Triggering condition: the file changes while `open()` fails.
+ *
+ * Expected observable behaviour: the previously loaded rule set stays active, the
+ * cached stamp is not advanced, and the next call loads the new content.
+ */
+static void test_read_failure_keeps_rules_and_retries(void)
+{
+    chaos_test_use_real_io();
+    chaos_io_config_init();
+    chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/data:write:EIO:1.0\n");
+    assert(chaos_io_config_prepare() == 1);
+    assert(chaos_io_config_active_state()->rule_count == 1U);
+
+    chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/data:write:EIO:1.0\n/logs:read:EIO:1.0\n");
+    chaos_test_reset_read_stubs();
+    g_chaos_io_real_open = chaos_test_stub_open;
+    assert(chaos_io_config_prepare() == 1);
+    assert(chaos_io_config_active_state()->rule_count == 1U);
+    assert(g_chaos_io_cached_mtime != chaos_io_config_observed_mtime());
+    assert(g_chaos_io_cached_mtime != CHAOS_IO_MTIME_RELOADING);
+
+    chaos_test_use_real_io();
+    assert(chaos_io_config_prepare() == 1);
+    assert(chaos_io_config_active_state()->rule_count == 2U);
+}
+
+/**
+ * @brief Invariant: the change stamp sees writes within one mtime tick.
+ *
+ * Triggering condition: stat results that differ only in size or only in inode.
+ *
+ * Expected observable behaviour: each difference yields a different stamp.
+ */
+static void test_change_stamp_beyond_mtime(void)
+{
+    struct stat base;
+    struct stat other;
+
+    memset(&base, 0, sizeof(base));
+    base.st_mtim.tv_sec = 50;
+    base.st_size = 10;
+    base.st_ino = 100;
+    other = base;
+    assert(chaos_io_config_hash_mtime(&base) == chaos_io_config_hash_mtime(&other));
+
+    other.st_size = 20;
+    assert(chaos_io_config_hash_mtime(&base) != chaos_io_config_hash_mtime(&other));
+
+    other = base;
+    other.st_ino = 101;
+    assert(chaos_io_config_hash_mtime(&base) != chaos_io_config_hash_mtime(&other));
+}
+
+/**
+ * @brief Invariant: a child forked during a reload takes the orphaned claim over.
+ *
+ * Triggering condition: the cached stamp is RELOADING but the claim was recorded
+ * by another process id, as a forked child sees it.
+ *
+ * Expected observable behaviour: `prepare()` reloads and publishes the file's rules;
+ * a claim recorded by this process is left alone.
+ */
+static void test_fork_takes_over_orphaned_reload(void)
+{
+    chaos_test_use_real_io();
+    chaos_io_config_init();
+    chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/data:write:EIO:1.0\n");
+
+    g_chaos_io_reload_pid = (uint64_t)getpid() + 1U;
+    g_chaos_io_cached_mtime = CHAOS_IO_MTIME_RELOADING;
+    assert(chaos_io_config_prepare() == 1);
+    assert(g_chaos_io_cached_mtime == chaos_io_config_observed_mtime());
+
+    g_chaos_io_reload_pid = (uint64_t)getpid();
+    g_chaos_io_cached_mtime = CHAOS_IO_MTIME_RELOADING;
+    (void)chaos_io_config_prepare();
+    assert(g_chaos_io_cached_mtime == CHAOS_IO_MTIME_RELOADING);
+    g_chaos_io_cached_mtime = CHAOS_IO_MTIME_UNKNOWN;
+}
+
+/**
+ * @brief Invariant: refreshing the config never changes the caller's errno.
+ *
+ * Triggering condition: `prepare()` with no config file, so its stat(2) fails with
+ * ENOENT, and with a file to read.
+ *
+ * Expected observable behaviour: errno holds the caller's value afterwards.
+ */
+static void test_prepare_preserves_errno(void)
+{
+    chaos_test_use_real_io();
+    chaos_io_config_init();
+    chaos_test_remove_file_if_exists(CHAOS_IO_CONFIG_PATH);
+    errno = EBADF;
+    (void)chaos_io_config_prepare();
+    assert(errno == EBADF);
+
+    chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/data:write:EIO:1.0\n");
+    errno = EBADF;
+    assert(chaos_io_config_prepare() == 1);
+    assert(errno == EBADF);
+}
+
+/**
+ * @brief Invariant: a config read interrupted by a signal is retried, not treated as failure.
+ *
+ * Triggering condition: the first `read()` fails with EINTR.
+ *
+ * Expected observable behaviour: the rules are loaded as if nothing had happened.
+ */
+static void test_interrupted_read_is_retried(void)
+{
+    chaos_test_use_real_io();
+    chaos_io_config_init();
+    chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/data:write:EIO:1.0\n");
+    g_chaos_io_real_read = chaos_test_eintr_read;
+    g_stub_read_eintr = 1;
+    assert(chaos_io_config_prepare() == 1);
+    assert(g_stub_read_eintr == 0);
+    assert(chaos_io_config_active_state()->rule_count == 1U);
+    chaos_test_use_real_io();
+}
+
 int main(void)
 {
     chaos_test_backup_file(CHAOS_IO_CONFIG_PATH, &g_config_backup);
@@ -750,6 +897,11 @@ int main(void)
     test_parse_buffer_error_paths();
     test_read_file_paths();
     test_reload_prepare_and_match();
+    test_read_failure_keeps_rules_and_retries();
+    test_change_stamp_beyond_mtime();
+    test_fork_takes_over_orphaned_reload();
+    test_prepare_preserves_errno();
+    test_interrupted_read_is_retried();
 
     return 0;
 }

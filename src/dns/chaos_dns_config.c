@@ -59,10 +59,12 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 /* -------------------------------------------------------------------------
  * Platform portability for stat mtime fields.
@@ -124,6 +126,17 @@ static volatile unsigned int g_chaos_dns_active_config_index = 0U;
  * The normalization function ensures no real mtime hash collides with these.
  */
 static volatile uint64_t g_chaos_dns_cached_mtime = CHAOS_DNS_MTIME_UNKNOWN;
+
+/**
+ * @brief Process id of the thread that last claimed the reload marker.
+ *
+ * @details Written before every claim attempt. A forked child inherits a
+ * CHAOS_DNS_MTIME_RELOADING marker whose claiming thread does not exist in the
+ * child; the pid recorded here differs from the child's, which is how the child
+ * recognises an orphaned claim and takes the reload over instead of serving a
+ * stale snapshot forever.
+ */
+static volatile uint64_t g_chaos_dns_reload_pid = 0U;
 
 /**
  * @brief Buffer the reload thread reads the config file into.
@@ -1024,12 +1037,16 @@ static uint64_t chaos_dns_config_normalize_mtime_hash(uint64_t value)
 }
 
 /**
- * @brief Compute a 64-bit hash of a struct stat's modification time.
+ * @brief Computes a 64-bit change stamp of the file: mtime, size, inode and device.
  *
- * @details Uses a pair of FNV-prime multiplications over the second and
- * nanosecond fields to spread the time domain across the full 64-bit output
- * space.  Both fields are incorporated so that a file modified within the same
- * second (nanosecond granularity) still produces a different hash.
+ * @details Uses FNV-prime multiplications over the mtime seconds and
+ * nanoseconds, the size, the inode and the device to spread the change domain
+ * across the full 64-bit output space.
+ *
+ * The mtime alone is not enough: file systems stamp it from a coarse clock (a
+ * few milliseconds), so two writes in one tick leave it unchanged. Mixing in the
+ * size catches an append, and the inode catches a rewrite through a temporary
+ * file and rename(2) (`sed -i`), even within one tick.
  *
  * The base value (0x1469598103934665603) is an arbitrary non-zero odd
  * constant; the multiplier (FNV prime 1099511628211) is the standard FNV-1a
@@ -1053,6 +1070,12 @@ static uint64_t chaos_dns_config_hash_mtime(const struct stat *st)
     value ^= (uint64_t)CHAOS_DNS_STAT_SEC(st);
     value *= UINT64_C(1099511628211);
     value ^= (uint64_t)CHAOS_DNS_STAT_NSEC(st);
+    value *= UINT64_C(1099511628211);
+    value ^= (uint64_t)st->st_size;
+    value *= UINT64_C(1099511628211);
+    value ^= (uint64_t)st->st_ino;
+    value *= UINT64_C(1099511628211);
+    value ^= (uint64_t)st->st_dev;
     value *= UINT64_C(1099511628211);
     return chaos_dns_config_normalize_mtime_hash(value);
 }
@@ -1111,7 +1134,10 @@ static int chaos_dns_config_read_file(size_t *size_out)
     }
 
     previous = chaos_dns_enter_internal();
-    fd = open(CHAOS_DNS_CONFIG_PATH, O_RDONLY);
+    do
+    {
+        fd = open(CHAOS_DNS_CONFIG_PATH, O_RDONLY);
+    } while (fd < 0 && errno == EINTR);
     if (fd < 0)
     {
         chaos_dns_leave_internal(previous);
@@ -1122,6 +1148,10 @@ static int chaos_dns_config_read_file(size_t *size_out)
     {
         ssize_t rc =
             read(fd, g_chaos_dns_config_buffer + total, CHAOS_DNS_MAX_CONFIG_BYTES - total);
+        if (rc < 0 && errno == EINTR)
+        {
+            continue;
+        }
         if (rc < 0)
         {
             (void)close(fd);
@@ -1565,7 +1595,7 @@ int chaos_dns_config_select_reverse_rule(
  *   7. On parse failure, reset next_state to empty (fail-open).
  *   8. Publish: fence + store next_index + fence + store observed_mtime.
  */
-int chaos_dns_config_prepare(void)
+static int chaos_dns_config_refresh(void)
 {
     uint64_t observed_mtime;
     uint64_t cached_mtime;
@@ -1586,33 +1616,72 @@ int chaos_dns_config_prepare(void)
      * reload into the same inactive snapshot and read buffer concurrently. */
     if (cached_mtime == CHAOS_DNS_MTIME_RELOADING)
     {
-        return chaos_dns_config_active_state()->rule_count != 0U;
+        if (chaos_dns_atomic_load_u64(&g_chaos_dns_reload_pid) == (uint64_t)getpid())
+        {
+            return chaos_dns_config_active_state()->rule_count != 0U;
+        }
+        /* The claim was made in the parent before fork(); its thread does not exist in
+         * this child and will never publish. Release the orphaned claim; if another
+         * thread released it first, the claim below decides which of them reloads. */
+        (void)chaos_dns_atomic_cas_u64(
+            &g_chaos_dns_cached_mtime, CHAOS_DNS_MTIME_RELOADING, CHAOS_DNS_MTIME_UNKNOWN
+        );
+        cached_mtime = CHAOS_DNS_MTIME_UNKNOWN;
     }
+    /* Race to become the reload thread. Exactly one caller proceeds. The pid is
+     * recorded first so a thread that sees the claim can tell it is this process's. */
+    g_chaos_dns_reload_pid = (uint64_t)getpid();
     if (!chaos_dns_atomic_cas_u64(
             &g_chaos_dns_cached_mtime, cached_mtime, CHAOS_DNS_MTIME_RELOADING
         ))
     {
-        /* Another thread is already reloading; use whatever is currently active. */
         return chaos_dns_config_active_state()->rule_count != 0U;
     }
 
     active_index = g_chaos_dns_active_config_index;
     next_index = active_index == 0U ? 1U : 0U;
     next_state = &g_chaos_dns_config_states[next_index];
-    chaos_dns_config_reset_state(next_state, 1); /* start with a clean, valid-but-empty snapshot */
+    chaos_dns_config_reset_state(next_state, 1);
 
-    if (observed_mtime != CHAOS_DNS_MTIME_MISSING &&
-        chaos_dns_config_read_file(&config_size) == 0 && config_size > 0U &&
-        chaos_dns_config_parse_buffer(
-            g_chaos_dns_config_buffer, next_state->rules, &next_state->rule_count
-        ) != 0)
+    if (observed_mtime != CHAOS_DNS_MTIME_MISSING)
     {
-        /* Parse failed: reset to empty-but-parse_ok=0 so matchers return "no match". */
-        chaos_dns_config_reset_state(next_state, 0);
+        if (chaos_dns_config_read_file(&config_size) != 0)
+        {
+            /* A failed read says nothing about the rules: keep the active snapshot and
+             * release the claim with the previous stamp, so the next call retries
+             * instead of running with no rules until the file changes again. */
+            __sync_synchronize();
+            g_chaos_dns_cached_mtime = cached_mtime;
+            return chaos_dns_config_active_state()->rule_count != 0U;
+        }
+        if (config_size > 0U &&
+            chaos_dns_config_parse_buffer(
+                g_chaos_dns_config_buffer, next_state->rules, &next_state->rule_count
+            ) != 0)
+        {
+            /* Parse failed: mark the snapshot invalid so match queries return 0. */
+            chaos_dns_config_reset_state(next_state, 0);
+        }
     }
 
     chaos_dns_config_publish(next_index, observed_mtime);
     return next_state->parse_ok != 0 && next_state->rule_count != 0U;
+}
+
+/**
+ * @brief Refreshes the snapshot if the config file changed, leaving errno untouched.
+ *
+ * @details The stat, open and read calls of a refresh belong to the library, not to
+ * the caller: an interposed call that then succeeds must not report the errno of a
+ * missing config file.
+ */
+int chaos_dns_config_prepare(void)
+{
+    const int saved_errno = errno;
+    const int result = chaos_dns_config_refresh();
+
+    errno = saved_errno;
+    return result;
 }
 
 /**
