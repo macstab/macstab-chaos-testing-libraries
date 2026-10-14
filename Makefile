@@ -206,7 +206,8 @@ HOST_RUNTIME_TESTS := \
 	$(TEST_RUNTIME_DIR)/test_process_glibc.sh \
 	$(TEST_RUNTIME_DIR)/test_process_alpine.sh \
 	$(TEST_RUNTIME_DIR)/test_errno_glibc.sh \
-	$(TEST_RUNTIME_DIR)/test_variants_glibc.sh
+	$(TEST_RUNTIME_DIR)/test_variants_glibc.sh \
+	$(TEST_RUNTIME_DIR)/test_sharing_glibc.sh
 MATRIX_RUNTIME_TESTS := \
 	$(TEST_RUNTIME_DIR)/test_glibc.sh \
 	$(TEST_RUNTIME_DIR)/test_alpine.sh \
