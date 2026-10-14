@@ -31,10 +31,10 @@
  *     empty-but-valid so the intercepted call passes through with no effect.
  *
  * ### Config file read buffer
- * The read buffer (`g_chaos_dns_config_buffer`) is allocated as a TLS array to
- * avoid a heap allocation on the reload path.  Because at most one thread
- * performs a reload at a time (CAS serialisation), only one thread ever writes
- * this buffer per reload cycle; the TLS storage is a pragmatic choice that
+ * The read buffer (`g_chaos_dns_config_buffer`) is a static array, avoiding a
+ * heap allocation on the reload path.  Because at most one thread performs a
+ * reload at a time (CAS serialisation, plus an early return for callers that
+ * observe a reload in progress), only one thread ever writes this buffer, which
  * eliminates both locking and heap fragmentation.
  *
  * ### Platform portability
@@ -126,14 +126,18 @@ static volatile unsigned int g_chaos_dns_active_config_index = 0U;
 static volatile uint64_t g_chaos_dns_cached_mtime = CHAOS_DNS_MTIME_UNKNOWN;
 
 /**
- * @brief Per-thread buffer for the raw config file contents.
+ * @brief Buffer the reload thread reads the config file into.
  *
- * @details Sized for CHAOS_DNS_MAX_CONFIG_BYTES + 1 (NUL terminator).
- * TLS allocation avoids a malloc on the reload path and is safe because the
- * CAS protocol allows at most one thread to be reloading at a time, so only
- * one thread is ever writing this buffer.
+ * @details Sized CHAOS_DNS_MAX_CONFIG_BYTES + 1 for the NUL terminator appended by
+ * chaos_dns_config_read_file().  Only the thread holding the reload marker
+ * (CHAOS_DNS_MTIME_RELOADING) touches it, so one process-wide buffer suffices.
+ *
+ * Deliberately not `__thread`: a 256 KiB TLS object is static TLS, which glibc reserves
+ * in every thread of the preloaded process and adds to each thread's minimum stack
+ * size.  Runtimes that create threads with small explicit stacks -- the Erlang VM, for
+ * one -- then fail pthread_create() with EINVAL and cannot start at all.
  */
-static __thread char g_chaos_dns_config_buffer[CHAOS_DNS_MAX_CONFIG_BYTES + 1U];
+static char g_chaos_dns_config_buffer[CHAOS_DNS_MAX_CONFIG_BYTES + 1U];
 
 /* -------------------------------------------------------------------------
  * Internal helpers: state management
@@ -1081,7 +1085,7 @@ static uint64_t chaos_dns_config_observed_mtime(void)
 }
 
 /**
- * @brief Read the config file into the TLS buffer.
+ * @brief Read the config file into the shared read buffer.
  *
  * @details Opens the file at CHAOS_DNS_CONFIG_PATH, reads it in a loop to
  * handle partial reads, and NUL-terminates the result.  The reentrancy guard
@@ -1574,6 +1578,13 @@ int chaos_dns_config_prepare(void)
     cached_mtime = chaos_dns_atomic_load_u64(&g_chaos_dns_cached_mtime);
 
     if (observed_mtime == cached_mtime)
+    {
+        return chaos_dns_config_active_state()->rule_count != 0U;
+    }
+    /* Another thread owns this reload cycle; use the current snapshot.  Without this
+     * check the CAS below succeeds as RELOADING -> RELOADING and a second thread would
+     * reload into the same inactive snapshot and read buffer concurrently. */
+    if (cached_mtime == CHAOS_DNS_MTIME_RELOADING)
     {
         return chaos_dns_config_active_state()->rule_count != 0U;
     }

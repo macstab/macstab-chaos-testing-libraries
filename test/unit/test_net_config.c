@@ -825,6 +825,35 @@ static void test_prepare_and_match(void)
     free_backup(&backup);
 }
 
+/**
+ * @brief Invariant: a caller that observes a reload in progress uses the current
+ *   snapshot and never starts a second, concurrent reload.
+ *
+ * Triggering condition: `g_chaos_net_cached_mtime` holds `CHAOS_NET_MTIME_RELOADING`
+ *   (another thread owns the reload) while the observed mtime differs from it.
+ *
+ * Expected observable behaviour: `prepare()` leaves both the reload marker and the
+ *   active snapshot index untouched. A CAS from RELOADING to RELOADING would succeed,
+ *   so without an explicit check the caller would reload into the same inactive
+ *   snapshot -- and through the same shared read buffer -- as the owning thread.
+ */
+static void test_reload_in_progress_is_not_joined(void)
+{
+    unsigned int active_index;
+
+    chaos_net_config_init();
+    active_index = g_chaos_net_active_config_index;
+    g_chaos_net_cached_mtime = CHAOS_NET_MTIME_RELOADING;
+    assert(chaos_net_config_observed_mtime() != CHAOS_NET_MTIME_RELOADING);
+
+    (void)chaos_net_config_prepare();
+
+    assert(g_chaos_net_cached_mtime == CHAOS_NET_MTIME_RELOADING);
+    assert(g_chaos_net_active_config_index == active_index);
+
+    g_chaos_net_cached_mtime = CHAOS_NET_MTIME_UNKNOWN;
+}
+
 int main(void)
 {
     test_helper_functions();
@@ -833,5 +862,6 @@ int main(void)
     test_invalid_lines();
     test_file_and_state_edges();
     test_prepare_and_match();
+    test_reload_in_progress_is_not_joined();
     return 0;
 }

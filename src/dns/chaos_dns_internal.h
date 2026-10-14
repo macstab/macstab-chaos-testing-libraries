@@ -56,7 +56,7 @@
 #define CHAOS_DNS_MAX_LINE_LENGTH 1024U
 
 /**
- * @brief Maximum total config file size that will be read into the TLS buffer.
+ * @brief Maximum total config file size that will be read into the read buffer.
  *
  * @details Derived from CHAOS_DNS_MAX_RULES * CHAOS_DNS_MAX_LINE_LENGTH.  A
  * file larger than this causes the reload to be abandoned and the previously

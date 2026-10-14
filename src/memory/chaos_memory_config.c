@@ -28,12 +28,13 @@
  * barrier before reading the index, ensuring it sees the index update from
  * step 4 before reading the slot contents.
  *
- * @par Per-thread read buffer
- * The config file is read into a per-thread TLS buffer
+ * @par Read buffer
+ * The config file is read into one process-wide static buffer
  * (g_chaos_memory_config_buffer) to avoid heap allocation in the hot path.
  * The buffer is sized for CHAOS_MEMORY_MAX_CONFIG_BYTES + 1 to accommodate the
  * null terminator.  Only the thread that wins the CAS race in
- * chaos_memory_config_prepare() uses its buffer for any given reload.
+ * chaos_memory_config_prepare() uses it, and callers that see a reload in
+ * progress never start another.
  *
  * @par Reentrancy
  * stat(2) and open()/read() calls set the TLS reentrancy guard so that any
@@ -162,19 +163,18 @@ static volatile unsigned int g_chaos_memory_active_config_index = 0U;
 static volatile uint64_t g_chaos_memory_cached_mtime = CHAOS_MEMORY_MTIME_UNKNOWN;
 
 /**
- * @brief Per-thread buffer for reading the config file.
+ * @brief Buffer the reload thread reads the config file into.
  *
- * @details
- * Holds the raw config file text during a reload.  TLS placement avoids heap
- * allocation and mutex serialisation — only the winning reload thread uses its
- * copy during any given reload, and multiple threads may reload concurrently
- * on pathological workloads (the CAS ensures at most one winner per mtime
- * change, but separate mtime changes can race across threads).
+ * @details Sized CHAOS_MEMORY_MAX_CONFIG_BYTES + 1 for the NUL terminator appended by
+ * chaos_memory_config_read_file().  Only the thread holding the reload marker
+ * (CHAOS_MEMORY_MTIME_RELOADING) touches it, so one process-wide buffer suffices.
  *
- * Sized CHAOS_MEMORY_MAX_CONFIG_BYTES + 1 to hold the null terminator appended
- * by chaos_memory_config_read_file().
+ * Deliberately not `__thread`: a 256 KiB TLS object is static TLS, which glibc reserves
+ * in every thread of the preloaded process and adds to each thread's minimum stack
+ * size.  Runtimes that create threads with small explicit stacks -- the Erlang VM, for
+ * one -- then fail pthread_create() with EINVAL and cannot start at all.
  */
-static __thread char g_chaos_memory_config_buffer[CHAOS_MEMORY_MAX_CONFIG_BYTES + 1U];
+static char g_chaos_memory_config_buffer[CHAOS_MEMORY_MAX_CONFIG_BYTES + 1U];
 
 /* =========================================================================
  * Internal helpers — state management
@@ -812,7 +812,7 @@ static uint64_t chaos_memory_config_observed_mtime(void)
  */
 
 /**
- * @brief Read the entire config file into the per-thread TLS buffer.
+ * @brief Read the entire config file into the shared read buffer.
  *
  * @details
  * Opens CHAOS_MEMORY_CONFIG_PATH, reads it in a loop, appends a null
@@ -1165,7 +1165,7 @@ int chaos_memory_config_select_rule(
  *     fails, another thread is reloading; fall back to the active snapshot.
  *  4. Determine the inactive slot index (1 - active).
  *  5. Reset the inactive slot to parse_ok=1, rule_count=0.
- *  6. If the file exists: read it into the TLS buffer and parse it.  On parse
+ *  6. If the file exists: read it into the read buffer and parse it.  On parse
  *     error, reset the slot to parse_ok=0 (fail-open: zero rules, no
  *     injection).
  *  7. Publish the new active index and the observed mtime.
@@ -1185,6 +1185,13 @@ int chaos_memory_config_prepare(void)
     cached_mtime = chaos_memory_atomic_load_u64(&g_chaos_memory_cached_mtime);
 
     if (observed_mtime == cached_mtime)
+    {
+        return chaos_memory_config_active_state()->rule_count != 0U;
+    }
+    /* Another thread owns this reload cycle; use the current snapshot.  Without this
+     * check the CAS below succeeds as RELOADING -> RELOADING and a second thread would
+     * reload into the same inactive snapshot and read buffer concurrently. */
+    if (cached_mtime == CHAOS_MEMORY_MTIME_RELOADING)
     {
         return chaos_memory_config_active_state()->rule_count != 0U;
     }

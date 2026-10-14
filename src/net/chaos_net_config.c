@@ -28,10 +28,9 @@
  *      c. Readers that observe g_chaos_net_cached_mtime == MTIME_RELOADING
  *         simply use the current active snapshot; they never block.
  *
- *   4. **Read buffer**: The TLS buffer g_chaos_net_config_buffer is per-thread so
- *      that two threads reloading concurrently (which cannot happen due to the CAS,
- *      but is handled gracefully by design) do not share buffer memory. In practice,
- *      only the thread that wins the CAS reads the file.
+ *   4. **Read buffer**: g_chaos_net_config_buffer is a single static buffer. Only
+ *      the thread that wins the CAS reads the file, and callers that observe
+ *      MTIME_RELOADING return before the CAS, so two reloads never overlap.
  *
  *   5. **All-or-nothing parsing**: If any line in the config file is invalid,
  *      chaos_net_config_parse_buffer() returns -1 and the new snapshot is marked
@@ -131,17 +130,18 @@ static volatile unsigned int g_chaos_net_active_config_index = 0U;
 static volatile uint64_t g_chaos_net_cached_mtime = CHAOS_NET_MTIME_UNKNOWN;
 
 /**
- * @brief Per-thread buffer used to read the raw config file content.
+ * @brief Buffer the reload thread reads the config file into.
  *
- * @details TLS allocation avoids a global lock around the file-read path.
- * The buffer is sized CHAOS_NET_MAX_CONFIG_BYTES + 1 to accommodate a NUL
- * terminator after the last byte read. The +1 ensures chaos_net_config_parse_buffer()
- * can always NUL-terminate safely.
+ * @details Sized CHAOS_NET_MAX_CONFIG_BYTES + 1 for the NUL terminator appended by
+ * chaos_net_config_read_file().  Only the thread holding the reload marker
+ * (CHAOS_NET_MTIME_RELOADING) touches it, so one process-wide buffer suffices.
  *
- * In practice only one thread reloads at a time (CAS lock), so the per-thread
- * allocation is conservative but avoids any design constraint on the concurrency model.
+ * Deliberately not `__thread`: a 256 KiB TLS object is static TLS, which glibc reserves
+ * in every thread of the preloaded process and adds to each thread's minimum stack
+ * size.  Runtimes that create threads with small explicit stacks -- the Erlang VM, for
+ * one -- then fail pthread_create() with EINVAL and cannot start at all.
  */
-static __thread char g_chaos_net_config_buffer[CHAOS_NET_MAX_CONFIG_BYTES + 1U];
+static char g_chaos_net_config_buffer[CHAOS_NET_MAX_CONFIG_BYTES + 1U];
 
 /*---------------------------------------------------------------------------
  * Internal helpers
@@ -668,7 +668,7 @@ static uint64_t chaos_net_config_observed_mtime(void)
 }
 
 /**
- * @brief Reads the entire config file into the per-thread TLS buffer.
+ * @brief Reads the entire config file into the shared read buffer.
  *
  * @details Opens the file and reads in a loop (to handle short reads on slow
  * devices or large files). The loop terminates when:
@@ -920,7 +920,7 @@ int chaos_net_config_parse_line(char *line, chaos_net_rule_t *rule)
 }
 
 /**
- * @brief Parses all lines from the TLS config buffer into a rules array.
+ * @brief Parses all lines from the config read buffer into a rules array.
  *
  * @details Splits on '\n' by writing NUL terminators in place. Stops and returns
  * -1 on the first invalid line (all-or-nothing policy). The rule count is written
@@ -1050,6 +1050,13 @@ int chaos_net_config_prepare(void)
     cached_mtime = chaos_net_atomic_load_u64(&g_chaos_net_cached_mtime);
 
     if (observed_mtime == cached_mtime)
+    {
+        return chaos_net_config_active_state()->rule_count != 0U;
+    }
+    /* Another thread owns this reload cycle; use the current snapshot.  Without this
+     * check the CAS below succeeds as RELOADING -> RELOADING and a second thread would
+     * reload into the same inactive snapshot and read buffer concurrently. */
+    if (cached_mtime == CHAOS_NET_MTIME_RELOADING)
     {
         return chaos_net_config_active_state()->rule_count != 0U;
     }

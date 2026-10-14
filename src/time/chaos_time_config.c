@@ -31,12 +31,13 @@
  * index/mtime access to prevent the CPU and compiler from reordering loads and
  * stores across the protocol boundary.
  *
- * ### Per-thread read buffer
+ * ### Read buffer
  *
- * g_chaos_time_config_buffer is TLS-allocated at CHAOS_TIME_MAX_CONFIG_BYTES+1
- * bytes.  It is only used by the thread that wins the reload CAS, so there is
- * no sharing.  TLS allocation avoids a large stack frame (256 KB) in what is
- * nominally a hot path.
+ * g_chaos_time_config_buffer is a static CHAOS_TIME_MAX_CONFIG_BYTES+1 byte
+ * buffer.  It is only used by the thread that wins the reload CAS, and callers
+ * that see a reload in progress never start another, so there is no sharing.
+ * Static storage avoids a large stack frame (256 KB) in what is nominally a hot
+ * path.
  *
  * ### Reentrancy during file I/O
  *
@@ -116,14 +117,18 @@ static volatile unsigned int g_chaos_time_active_config_index = 0U;
 static volatile uint64_t g_chaos_time_cached_mtime = CHAOS_TIME_MTIME_UNKNOWN;
 
 /**
- * Per-thread buffer used to hold the raw config file content during a reload.
+ * @brief Buffer the reload thread reads the config file into.
  *
- * Only the thread that wins the reload CAS uses this buffer.  TLS storage
- * avoids putting 256 KB on the call stack.  The extra byte beyond
- * CHAOS_TIME_MAX_CONFIG_BYTES provides space for a NUL terminator written by
- * chaos_time_config_read_file() after the last byte of file content.
+ * @details Sized CHAOS_TIME_MAX_CONFIG_BYTES + 1 for the NUL terminator appended by
+ * chaos_time_config_read_file().  Only the thread holding the reload marker
+ * (CHAOS_TIME_MTIME_RELOADING) touches it, so one process-wide buffer suffices.
+ *
+ * Deliberately not `__thread`: a 256 KiB TLS object is static TLS, which glibc reserves
+ * in every thread of the preloaded process and adds to each thread's minimum stack
+ * size.  Runtimes that create threads with small explicit stacks -- the Erlang VM, for
+ * one -- then fail pthread_create() with EINVAL and cannot start at all.
  */
-static __thread char g_chaos_time_config_buffer[CHAOS_TIME_MAX_CONFIG_BYTES + 1U];
+static char g_chaos_time_config_buffer[CHAOS_TIME_MAX_CONFIG_BYTES + 1U];
 
 /**
  * Resets a config state snapshot to a known-empty state.
@@ -1203,6 +1208,13 @@ int chaos_time_config_prepare(void)
     cached_mtime = chaos_time_atomic_load_u64(&g_chaos_time_cached_mtime);
 
     if (observed_mtime == cached_mtime)
+    {
+        return chaos_time_config_active_state()->rule_count != 0U;
+    }
+    /* Another thread owns this reload cycle; use the current snapshot.  Without this
+     * check the CAS below succeeds as RELOADING -> RELOADING and a second thread would
+     * reload into the same inactive snapshot and read buffer concurrently. */
+    if (cached_mtime == CHAOS_TIME_MTIME_RELOADING)
     {
         return chaos_time_config_active_state()->rule_count != 0U;
     }
