@@ -552,12 +552,17 @@ Each library performs `stat(its_config_path)` on every interposed call. When all
 six libraries are loaded:
 
 - Every `write()` triggers `libchaos-io`'s `stat("/tmp/.chaos-io.conf")`.
-- If `libchaos-io`'s LATENCY path calls `nanosleep()`, the `nanosleep` wrapper in
-  `libchaos-time` fires — but the `libchaos-io` TLS guard is set, so the
-  `libchaos-time` wrapper calls real `nanosleep` directly.
-
-This is correct. The per-library TLS guard prevents cross-library re-injection
-for the LATENCY sleep path.
+- A LATENCY delay never passes through another library. Each library's TLS
+  guard is its own variable, so it does not stop a *different* library's
+  wrapper: when the delay went through `usleep()` (io, net, dns) or a
+  `dlsym(RTLD_NEXT, "usleep")` pointer (memory, process, reaching
+  `libchaos-time` whenever it comes later in `LD_PRELOAD`), a time rule such as
+  `usleep:ERRNO:EINTR` ended another library's 300 ms delay after 1 ms, and
+  `usleep:LATENCY` lengthened it. Every library now sleeps through
+  `chaos_sleep_ms()` (`src/common/chaos_sleep.h`), a direct `clock_nanosleep`
+  system call that no preloaded library can intercept.
+  `test/runtime/test_isolation_glibc.sh` checks each library's delay under
+  hostile time rules in both preload orders.
 
 ### 11.2 Simultaneous FAIL_AFTER Counters
 
