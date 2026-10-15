@@ -1321,6 +1321,27 @@ static void test_rule_qualifiers(void)
     assert(chaos_time_config_parse_buffer(empty_first, rules, &count) == -1);
 }
 
+/**
+ * @brief Invariant: REGRESS needs a clock_gettime selector and a positive jump.
+ */
+static void test_regress_rule(void)
+{
+    chaos_time_rule_t rule;
+    char ok[] = "clock_gettime/monotonic:REGRESS:5000";
+    char gated[] = "clock_gettime:REGRESS:250@0.5";
+    char zero[] = "clock_gettime/monotonic:REGRESS:0";
+    char negative[] = "clock_gettime/monotonic:REGRESS:-5";
+    char sleep_rule[] = "nanosleep:REGRESS:5000";
+
+    assert(chaos_time_config_parse_line(ok, &rule) == 1);
+    assert(rule.effect == CHAOS_TIME_EFFECT_REGRESS && rule.offset_ms == 5000);
+    assert(chaos_time_config_parse_line(gated, &rule) == 1);
+    assert(rule.probability == 0.5);
+    assert(chaos_time_config_parse_line(zero, &rule) == -1);
+    assert(chaos_time_config_parse_line(negative, &rule) == -1);
+    assert(chaos_time_config_parse_line(sleep_rule, &rule) == -1);
+}
+
 int main(void)
 {
     /* Look at the rule file on every call; the throttle has its own test. */
@@ -1330,6 +1351,7 @@ int main(void)
     test_hits_are_counted_and_reported();
     test_rule_file_check_is_throttled();
     test_rule_qualifiers();
+    test_regress_rule();
     test_read_file_rejects_changed_file();
     test_helper_functions();
     test_selector_matching();

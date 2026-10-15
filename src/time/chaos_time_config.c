@@ -809,7 +809,7 @@ chaos_time_effect_allowed(const chaos_time_selector_t *selector, chaos_time_effe
     {
         return 1;
     }
-    if (effect != CHAOS_TIME_EFFECT_OFFSET)
+    if (effect != CHAOS_TIME_EFFECT_OFFSET && effect != CHAOS_TIME_EFFECT_REGRESS)
     {
         return 0;
     }
@@ -1136,6 +1136,19 @@ int chaos_time_config_parse_line(char *line, chaos_time_rule_t *rule)
         }
         return chaos_time_parse_offset(payload, &rule->offset_ms) == 0 ? 1 : -1;
     }
+    if (strcmp(effect_text, "REGRESS") == 0)
+    {
+        rule->effect = CHAOS_TIME_EFFECT_REGRESS;
+        if (!chaos_time_effect_allowed(&rule->selector, rule->effect) ||
+            chaos_time_parse_payload_probability(
+                value_text, payload, sizeof(payload), &rule->probability
+            ) != 0 ||
+            chaos_time_parse_offset(payload, &rule->offset_ms) != 0 || rule->offset_ms <= 0)
+        {
+            return -1;
+        }
+        return 1;
+    }
 
     return -1;
 }
@@ -1387,6 +1400,7 @@ static void chaos_time_config_attach_hits(chaos_time_config_state_t *next_state)
             {
                 next_state->hits[index].count = active->hits[previous].count;
                 next_state->hits[index].claimed = active->hits[previous].claimed;
+                next_state->hits[index].state = active->hits[previous].state;
                 break;
             }
         }

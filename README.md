@@ -332,10 +332,17 @@ Implemented effects:
 - `OFFSET`
   Signed milliseconds added to `clock_gettime()` results, with optional
   `@probability`
+- `REGRESS`
+  Positive milliseconds: the clock goes back once. The first read under the
+  rule is real, the next read (where the optional `@probability` fires) is that
+  much earlier, and every read after stays shifted, so the clock keeps
+  advancing from the earlier time: `clock_gettime/monotonic:REGRESS:5000`
+  is CLOCK_MONOTONIC stepping back 5 s, as after a VM migration or a buggy
+  hypervisor timer
 
 Important current boundary:
 
-- `OFFSET` is supported for `clock_gettime()` only
+- `OFFSET` and `REGRESS` are supported for `clock_gettime()` only
 - sleep wrappers support `ERRNO` and `LATENCY`, not returned-time mutation
 - injected `ERRNO:EINTR` on `nanosleep()` copies the requested interval into
   `remaining` because the failure is injected before the real sleep runs

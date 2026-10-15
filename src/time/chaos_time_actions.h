@@ -179,4 +179,17 @@ int chaos_time_rule_apply_errno(const chaos_time_rule_t *rule);
  */
 void chaos_time_rule_apply_offset(const chaos_time_rule_t *rule, struct timespec *value);
 
+/**
+ * Makes the clock go back once by rule->offset_ms (REGRESS).
+ *
+ * The first read under the rule is left real; the first later read where the
+ * rule fires jumps back, and every read after that stays shifted, so the clock
+ * advances normally from the earlier time. Needs the rule's hit slot for its
+ * state: a rule outside a snapshot does nothing.
+ *
+ * @param rule   Rule to apply.  May be NULL.
+ * @param value  struct timespec to modify in-place.  May be NULL (no-op).
+ */
+void chaos_time_rule_apply_regress(const chaos_time_rule_t *rule, struct timespec *value);
+
 #endif

@@ -291,3 +291,38 @@ void chaos_time_rule_apply_offset(const chaos_time_rule_t *rule, struct timespec
 
     chaos_time_add_offset_ms(value, rule->offset_ms);
 }
+
+/**
+ * @copydoc chaos_time_rule_apply_regress
+ *
+ * Implementation notes: the state lives in the rule's hit slot, so it is per
+ * process and survives a reload that keeps the rule's text. 0 → 1 on the first
+ * read (left real, so the program has a time to go back from); 1 → 2 on the read
+ * where the gate fires (the jump, counted as one hit); in state 2 every read is
+ * shifted without consulting the gate again.
+ */
+void chaos_time_rule_apply_regress(const chaos_time_rule_t *rule, struct timespec *value)
+{
+    chaos_hit_slot_t *slot;
+
+    if (rule == NULL || value == NULL || rule->effect != CHAOS_TIME_EFFECT_REGRESS ||
+        rule->hit == NULL)
+    {
+        return;
+    }
+    slot = rule->hit;
+    if (slot->state == 0U)
+    {
+        (void)__sync_bool_compare_and_swap(&slot->state, 0U, 1U);
+        return;
+    }
+    if (slot->state == 1U)
+    {
+        if (!chaos_time_rule_should_trigger(rule))
+        {
+            return;
+        }
+        (void)__sync_bool_compare_and_swap(&slot->state, 1U, 2U);
+    }
+    chaos_time_add_offset_ms(value, -rule->offset_ms);
+}

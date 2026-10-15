@@ -50,14 +50,14 @@ CHAOS_TIME_DEFINE_TEST_GLOBALS();
  * Index as `g_stub_rules[effect_index][operation_index]`. Tests fill the
  * desired cell and set the corresponding `g_stub_match` entry to 1.
  */
-static chaos_time_rule_t g_stub_rules[3][3];
+static chaos_time_rule_t g_stub_rules[CHAOS_TIME_EFFECT_REGRESS + 1][3];
 /**
  * @brief Per-effect, per-operation match-enable flags.
  *
  * Non-zero means `chaos_time_config_match(effect, op, clock_id, rule)` returns 1
  * and copies the rule from `g_stub_rules[effect][op]`.
  */
-static int g_stub_match[3][3];
+static int g_stub_match[CHAOS_TIME_EFFECT_REGRESS + 1][3];
 /** @brief Number of times `chaos_time_rule_apply_latency` was called. */
 static int g_latency_calls = 0;
 /**
@@ -67,6 +67,9 @@ static int g_latency_calls = 0;
 static int g_errno_trigger = 0;
 /** @brief Number of times `chaos_time_rule_apply_offset` was called. */
 static int g_offset_calls = 0;
+
+/** @brief Number of times `chaos_time_rule_apply_regress()` was called. */
+static int g_regress_calls = 0;
 /** @brief Number of times `chaos_time_test_clock_gettime` was called. */
 static int g_real_clock_gettime_calls = 0;
 /**
@@ -132,6 +135,7 @@ static void reset_wrapper_state(void)
     g_latency_calls = 0;
     g_errno_trigger = 0;
     g_offset_calls = 0;
+    g_regress_calls = 0;
     g_real_clock_gettime_calls = 0;
     g_real_clock_gettime_error = 0;
     g_real_nanosleep_calls = 0;
@@ -163,7 +167,7 @@ int chaos_time_config_match(
 )
 {
     (void)clock_id;
-    if (effect < 0 || effect > CHAOS_TIME_EFFECT_OFFSET || operation < 0 ||
+    if (effect < 0 || effect > CHAOS_TIME_EFFECT_REGRESS || operation < 0 ||
         operation > CHAOS_TIME_OP_USLEEP || rule == NULL || g_stub_match[effect][operation] == 0)
     {
         return 0;
@@ -207,6 +211,16 @@ int chaos_time_rule_apply_errno(const chaos_time_rule_t *rule)
  * Increments the call counter and applies the rule's offset_ms to @p value
  * using the same arithmetic as the production implementation, allowing tests
  * to assert on the exact updated timestamp.
+ */
+void chaos_time_rule_apply_regress(const chaos_time_rule_t *rule, struct timespec *value)
+{
+    assert(rule != NULL);
+    assert(value != NULL);
+    ++g_regress_calls;
+}
+
+/**
+ * @brief Stub for `chaos_time_rule_apply_offset()`.
  */
 void chaos_time_rule_apply_offset(const chaos_time_rule_t *rule, struct timespec *value)
 {
@@ -869,8 +883,25 @@ static void test_sleep_and_timespec_get_paths(void)
     assert(timespec_get(&value, TIME_UTC) == 0);
 }
 
+/**
+ * @brief Invariant: a successful clock read applies a matching REGRESS rule.
+ */
+static void test_clock_read_applies_regress(void)
+{
+    struct timespec value;
+
+    reset_wrapper_state();
+    g_chaos_time_real_clock_gettime = chaos_time_test_clock_gettime;
+    g_stub_match[CHAOS_TIME_EFFECT_REGRESS][CHAOS_TIME_OP_CLOCK_GETTIME] = 1;
+    g_stub_rules[CHAOS_TIME_EFFECT_REGRESS][CHAOS_TIME_OP_CLOCK_GETTIME].effect =
+        CHAOS_TIME_EFFECT_REGRESS;
+    assert(clock_gettime(CLOCK_MONOTONIC, &value) == 0);
+    assert(g_regress_calls == 1);
+}
+
 int main(void)
 {
+    test_clock_read_applies_regress();
     test_call_real_helpers();
     test_clock_gettime_paths();
     test_nanosleep_paths();

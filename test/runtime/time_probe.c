@@ -379,6 +379,37 @@ static int probe_sleep_and_timespec_get(void)
     return utc.tv_sec >= baseline + 86400 - 5 && utc.tv_sec <= baseline + 86400 + 5 ? 0 : 93;
 }
 
+/**
+ * @brief REGRESS:5000 on the monotonic clock: the first read is real, the next one
+ *        is 5 s earlier, and the clock then advances normally from there.
+ */
+static int probe_clock_regress(void)
+{
+    struct timespec first;
+    struct timespec jumped;
+    struct timespec later;
+    int rc = write_config("clock_gettime/monotonic:REGRESS:5000");
+
+    if (rc != 0)
+    {
+        return rc;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &first) != 0 ||
+        clock_gettime(CLOCK_MONOTONIC, &jumped) != 0 || clock_gettime(CLOCK_MONOTONIC, &later) != 0)
+    {
+        return 120;
+    }
+    if (elapsed_ms(&first, &jumped) > -4900LL || elapsed_ms(&first, &jumped) < -5100LL)
+    {
+        return 121;
+    }
+    if (elapsed_ms(&jumped, &later) < 0LL)
+    {
+        return 122;
+    }
+    return write_config("# clear");
+}
+
 int main(void)
 {
     int rc;
@@ -389,6 +420,11 @@ int main(void)
         return rc;
     }
     rc = probe_clock_offset();
+    if (rc != 0)
+    {
+        return rc;
+    }
+    rc = probe_clock_regress();
     if (rc != 0)
     {
         return rc;

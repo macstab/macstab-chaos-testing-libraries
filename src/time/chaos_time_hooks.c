@@ -397,6 +397,7 @@ static int chaos_time_read_clock(clockid_t clock_id, struct timespec *value)
     chaos_time_rule_t latency_rule;
     chaos_time_rule_t errno_rule;
     chaos_time_rule_t offset_rule;
+    chaos_time_rule_t regress_rule;
     int rc;
 
     if (chaos_time_config_match(
@@ -424,6 +425,12 @@ static int chaos_time_read_clock(clockid_t clock_id, struct timespec *value)
         ))
     {
         chaos_time_rule_apply_offset(&offset_rule, value);
+    }
+    if (chaos_time_config_match(
+            CHAOS_TIME_EFFECT_REGRESS, CHAOS_TIME_OP_CLOCK_GETTIME, clock_id, &regress_rule
+        ))
+    {
+        chaos_time_rule_apply_regress(&regress_rule, value);
     }
 
     return 0;

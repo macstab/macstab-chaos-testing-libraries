@@ -418,6 +418,22 @@ The OFFSET value is per-rule, read from the config. Config is reloaded atomicall
 (see §19). OFFSET application is per-call in the wrapper, after the real call
 returns. No shared mutable state is involved in the offset arithmetic. Thread-safe.
 
+### 5.5 REGRESS — a one-time backward step
+
+`clock_gettime/monotonic:REGRESS:5000` makes the clock go back once, observably:
+the first read under the rule is left real (so the program holds a time to go back
+from), the next read where the rule fires is 5000 ms earlier, and every read after
+that stays shifted by the same amount, so the clock advances normally from the
+earlier time. A static negative OFFSET never shows the step: every read is shifted,
+including the first. CLOCK_MONOTONIC going backwards happens in production (VM
+migration, suspend/resume, buggy hypervisor timers) and breaks timeouts, rate
+limiters, leases and elapsed-time arithmetic that trust it.
+
+The state (not yet read / armed / jumped) is kept per process in the rule's hit
+slot, moved with compare-and-swap, and survives a reload that keeps the rule's
+text. Removing the rule ends the shift: the clock jumps forward by the same amount.
+The jump counts as one hit.
+
 ---
 
 ## 6. nanosleep — POSIX Cancellation Contract

@@ -379,8 +379,54 @@ static void test_should_trigger_honours_qualifiers(void)
     assert(chaos_time_rule_should_trigger(&rule) == 0);
 }
 
+/**
+ * @brief Invariant: REGRESS leaves the first read real, jumps back on a later read
+ *   where it fires, and stays shifted after that; without a slot it does nothing.
+ */
+static void test_regress_goes_back_once(void)
+{
+    chaos_time_rule_t rule;
+    chaos_hit_slot_t slot;
+    struct timespec value;
+
+    memset(&rule, 0, sizeof(rule));
+    memset(&slot, 0, sizeof(slot));
+    rule.effect = CHAOS_TIME_EFFECT_REGRESS;
+    rule.offset_ms = 5000;
+    rule.probability = 1.0;
+
+    value.tv_sec = 100;
+    value.tv_nsec = 0;
+    chaos_time_rule_apply_regress(&rule, &value);
+    assert(value.tv_sec == 100);
+
+    rule.hit = &slot;
+    chaos_time_rule_apply_regress(&rule, &value);
+    assert(value.tv_sec == 100 && slot.state == 1U);
+
+    rule.probability = 0.0;
+    chaos_time_rule_apply_regress(&rule, &value);
+    assert(value.tv_sec == 100 && slot.state == 1U);
+
+    rule.probability = 1.0;
+    chaos_time_rule_apply_regress(&rule, &value);
+    assert(value.tv_sec == 95 && slot.state == 2U && slot.count == 1U);
+
+    rule.probability = 0.0;
+    value.tv_sec = 101;
+    chaos_time_rule_apply_regress(&rule, &value);
+    assert(value.tv_sec == 96 && slot.count == 1U);
+
+    rule.effect = CHAOS_TIME_EFFECT_OFFSET;
+    chaos_time_rule_apply_regress(&rule, &value);
+    assert(value.tv_sec == 96);
+    chaos_time_rule_apply_regress(NULL, &value);
+    chaos_time_rule_apply_regress(&rule, NULL);
+}
+
 int main(void)
 {
+    test_regress_goes_back_once();
     test_should_trigger_honours_qualifiers();
     test_should_trigger_counts_hits();
     test_probability_helpers();

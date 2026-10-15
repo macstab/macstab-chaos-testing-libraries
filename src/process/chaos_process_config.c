@@ -1338,6 +1338,7 @@ static void chaos_process_config_attach_hits(chaos_process_config_state_t *next_
             {
                 next_state->hits[index].count = active->hits[previous].count;
                 next_state->hits[index].claimed = active->hits[previous].claimed;
+                next_state->hits[index].state = active->hits[previous].state;
                 break;
             }
         }

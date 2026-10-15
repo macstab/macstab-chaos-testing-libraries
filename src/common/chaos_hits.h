@@ -56,6 +56,8 @@ struct chaos_hit_slot
     volatile uint64_t count;
     /** Firings claimed under `@first=N` (see chaos_policy.h); never more than N succeed. */
     volatile uint64_t claimed;
+    /** Effect state that must survive reloads (libchaos-time REGRESS: 0, 1 armed, 2 jumped). */
+    volatile uint64_t state;
     /** Library hook that reports the counts after a hit on this slot; NULL forces a report. */
     void (*report)(chaos_hit_slot_t *slot);
 };

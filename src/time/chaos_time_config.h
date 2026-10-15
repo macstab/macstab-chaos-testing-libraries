@@ -119,7 +119,14 @@ typedef enum chaos_time_effect
      * CHAOS_TIME_SELECTOR_OPERATION on CHAOS_TIME_OP_CLOCK_GETTIME.
      * Probability-gated.
      */
-    CHAOS_TIME_EFFECT_OFFSET
+    CHAOS_TIME_EFFECT_OFFSET,
+    /**
+     * The clock goes back once: the first matching read is real, a later read
+     * (where the probability gate fires) jumps back by offset_ms, and from then
+     * on every read stays shifted, so the clock keeps advancing from the earlier
+     * time. Same selectors as OFFSET.
+     */
+    CHAOS_TIME_EFFECT_REGRESS
 } chaos_time_effect_t;
 
 /**
