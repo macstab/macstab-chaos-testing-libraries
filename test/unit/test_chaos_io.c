@@ -2187,7 +2187,8 @@ static void test_path_form_wrappers(void)
  *
  * Expected observable behaviour:
  * - an ERRNO open rule makes fopen() return NULL with that errno, without the real call;
- * - freopen() under the same rule closes the stream it was given and returns NULL;
+ * - freopen() under the same rule fails the real freopen() (empty path), which closes
+ *   the stream the C library's way, and returns NULL with the rule's errno;
  * - LATENCY delays, then opens; an unmatched path, the guard and a NULL freopen()
  *   path reach the real call unchanged;
  * - fopen64 and freopen64 are the same wrappers.
@@ -2219,7 +2220,8 @@ static void test_stdio_open_wrappers(void)
     errno = 0;
     assert(freopen("/tmp/stdio-open.txt", "r", stream) == NULL);
     assert(errno == EACCES);
-    assert(g_real_freopen_calls == 0);
+    assert(g_real_freopen_calls == 1 && strcmp(g_real_fopen_path, "") == 0);
+    assert(fclose(stream) == 0); /* the stub reopened nothing and closed nothing */
 
     chaos_test_reset_state();
     chaos_test_bind_real_functions();

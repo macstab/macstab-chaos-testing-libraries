@@ -351,23 +351,24 @@ CHAOS_IO_EXPORT int fprintf(FILE *stream, const char *format, ...)
  *
  * @details The C library closes the descriptor with its own system call, so the
  * close() wrapper never sees it, and the next file opened under the same number
- * would otherwise inherit this stream's path.
+ * would otherwise inherit this stream's path. Forgotten after the close, like
+ * close() does: before it, a lookup on another thread could still cache the
+ * open file's path for the number.
  */
 CHAOS_IO_EXPORT int fclose(FILE *stream)
 {
+    const int saved_errno = errno;
+    const int fd = fileno(stream);
+    int rc;
+
     chaos_io_ensure_symbols();
+    errno = saved_errno;
+    rc = g_chaos_io_real_fclose(stream);
     if (!chaos_io_in_internal())
     {
-        const int saved_errno = errno;
-        const int fd = fileno(stream);
-
-        if (fd >= 0)
-        {
-            chaos_io_fdcache_invalidate(fd);
-        }
-        errno = saved_errno;
+        chaos_io_fdcache_invalidate(fd);
     }
-    return g_chaos_io_real_fclose(stream);
+    return rc;
 }
 
 /* --- Fortified entry points (_FORTIFY_SOURCE builds) ------------------------------ */

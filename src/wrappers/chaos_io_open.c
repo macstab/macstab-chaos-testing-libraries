@@ -504,9 +504,11 @@ CHAOS_IO_EXPORT FILE *fopen(const char *path, const char *mode)
 /**
  * @brief Interposed `freopen(3)`: the open rules apply to the new path.
  *
- * @details Like a failed freopen(), an injected error closes @p stream and returns
- * NULL with errno set. A NULL path only changes the mode of the open stream and is
- * forwarded unchanged.
+ * @details An injected error fails the real freopen() (on an empty path, which
+ * never opens), so @p stream ends up exactly as after a real failure: closed,
+ * and on glibc still allocated, which matters to callers that fclose() it anyway.
+ * Then NULL is returned with the rule's errno. A NULL path only changes the mode
+ * of the open stream and is forwarded unchanged.
  */
 CHAOS_IO_EXPORT FILE *freopen(const char *path, const char *mode, FILE *stream)
 {
@@ -517,8 +519,10 @@ CHAOS_IO_EXPORT FILE *freopen(const char *path, const char *mode, FILE *stream)
     if (chaos_io_stdio_open_fault(path, resolved_path, sizeof(resolved_path)))
     {
         const int injected = errno;
+        const int fd = fileno(stream);
 
-        (void)fclose(stream);
+        (void)g_chaos_io_real_freopen("", mode, stream);
+        chaos_io_fdcache_invalidate(fd);
         errno = injected;
         return NULL;
     }
