@@ -116,6 +116,20 @@ static time_t stub_time(time_t *out)
     return 0;
 }
 
+/** @brief Stub for `sleep(3)`. Returns 0. */
+static unsigned int stub_sleep(unsigned int seconds)
+{
+    (void)seconds;
+    return 0U;
+}
+
+/** @brief Stub for `timespec_get(3)`. Returns @p base. */
+static int stub_timespec_get(struct timespec *value, int base)
+{
+    (void)value;
+    return base;
+}
+
 /** @brief Stub for `clock_nanosleep(2)`. Returns 0 (success, no sleep). */
 static int stub_clock_nanosleep(
     clockid_t clock_id, int flags, const struct timespec *request, struct timespec *remaining
@@ -171,6 +185,10 @@ static void *chaos_time_test_dlsym(void *handle, const char *symbol)
         return CHAOS_TIME_TEST_DLSYM_RESULT(chaos_time_gettimeofday_fn, stub_gettimeofday);
     if (strcmp(symbol, "time") == 0)
         return CHAOS_TIME_TEST_DLSYM_RESULT(chaos_time_time_fn, stub_time);
+    if (strcmp(symbol, "sleep") == 0)
+        return CHAOS_TIME_TEST_DLSYM_RESULT(chaos_time_sleep_fn, stub_sleep);
+    if (strcmp(symbol, "timespec_get") == 0)
+        return CHAOS_TIME_TEST_DLSYM_RESULT(chaos_time_timespec_get_fn, stub_timespec_get);
     if (strcmp(symbol, "clock_nanosleep") == 0)
         return CHAOS_TIME_TEST_DLSYM_RESULT(chaos_time_clock_nanosleep_fn, stub_clock_nanosleep);
     return NULL;
@@ -380,6 +398,8 @@ static void test_constructor_init(void)
     assert(g_chaos_time_real_gettimeofday == stub_gettimeofday);
     assert(g_chaos_time_real_time == stub_time);
     assert(g_chaos_time_real_clock_nanosleep == stub_clock_nanosleep);
+    assert(g_chaos_time_real_sleep == stub_sleep);
+    assert(g_chaos_time_real_timespec_get == stub_timespec_get);
     assert(g_config_init_calls == config_calls_before + 1);
     assert(g_chaos_time_process_seed != 0U);
     assert(g_chaos_time_tls_prng_state != 0U);

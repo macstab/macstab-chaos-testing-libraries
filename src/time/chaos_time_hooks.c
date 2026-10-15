@@ -1,12 +1,14 @@
 /**
  * @file chaos_time_hooks.c
  * @brief LD_PRELOAD interceptor wrappers for clock_gettime(2), gettimeofday(2),
- *        time(2), nanosleep(2), clock_nanosleep(2) and usleep(3).
+ *        time(2), timespec_get(3), nanosleep(2), clock_nanosleep(2), sleep(3)
+ *        and usleep(3).
  *
  * This translation unit contains the exported symbols that the dynamic linker
  * resolves instead of the libc originals when the library is loaded via
- * LD_PRELOAD.  gettimeofday and time read the realtime clock through the
- * clock_gettime rules, and clock_nanosleep follows the nanosleep rules, so a
+ * LD_PRELOAD.  gettimeofday, time and timespec_get read the realtime clock
+ * through the clock_gettime rules, and clock_nanosleep and sleep follow the
+ * nanosleep rules, so a
  * rule applies however the program reads the clock or sleeps.  Each wrapper
  * follows the same structure:
  *
@@ -177,6 +179,41 @@ static int chaos_time_call_real_clock_nanosleep(
     return rc;
 }
 
+/**
+ * Calls the real sleep with the reentrancy guard raised.
+ *
+ * @param seconds  Duration to sleep.
+ * @return         The return value of the real sleep.
+ */
+static unsigned int chaos_time_call_real_sleep(unsigned int seconds)
+{
+    int previous;
+    unsigned int rc;
+
+    previous = chaos_time_enter_internal();
+    rc = g_chaos_time_real_sleep(seconds);
+    chaos_time_leave_internal(previous);
+    return rc;
+}
+
+/**
+ * Calls the real timespec_get with the reentrancy guard raised.
+ *
+ * @param value  Output timespec.
+ * @param base   Time base.
+ * @return       The return value of the real timespec_get.
+ */
+static int chaos_time_call_real_timespec_get(struct timespec *value, int base)
+{
+    int previous;
+    int rc;
+
+    previous = chaos_time_enter_internal();
+    rc = g_chaos_time_real_timespec_get(value, base);
+    chaos_time_leave_internal(previous);
+    return rc;
+}
+
 static int chaos_time_read_clock(clockid_t clock_id, struct timespec *value);
 
 /**
@@ -319,6 +356,33 @@ CHAOS_TIME_EXPORT time_t time(time_t *out)
 }
 
 /**
+ * Interceptor for timespec_get(3).
+ *
+ * The C11 way to read the wall clock. glibc and musl read CLOCK_REALTIME
+ * internally, without calling clock_gettime, so a TIME_UTC read goes through
+ * the clock_gettime rules like gettimeofday() and time(). Other bases are
+ * forwarded. Failure is reported as 0, timespec_get's only error value.
+ *
+ * @param value  Output timespec.
+ * @param base   Time base; TIME_UTC is the only one C11 defines.
+ * @return       @p base on success; 0 on failure.
+ */
+CHAOS_TIME_EXPORT int timespec_get(struct timespec *value, int base)
+{
+    /* Declared nonnull by glibc; read through a volatile so the test stays. */
+    struct timespec *volatile checked_value = value;
+    uintptr_t value_bits = (uintptr_t)(void *)checked_value;
+
+    chaos_time_ensure_symbols();
+
+    if (chaos_time_in_internal() || value_bits == 0U || base != TIME_UTC)
+    {
+        return chaos_time_call_real_timespec_get(value, base);
+    }
+    return chaos_time_read_clock(CLOCK_REALTIME, value) == 0 ? base : 0;
+}
+
+/**
  * Applies the clock_gettime rules to one read of @p clock_id.
  *
  * Shared by clock_gettime, gettimeofday and time so that every way of reading
@@ -414,6 +478,44 @@ CHAOS_TIME_EXPORT int nanosleep(const struct timespec *request, struct timespec 
     }
 
     return chaos_time_call_real_nanosleep(request, remaining);
+}
+
+/**
+ * Interceptor for sleep(3).
+ *
+ * glibc and musl implement sleep() with their internal nanosleep, which never
+ * passes through the exported symbol, so it follows the nanosleep rules here:
+ * LATENCY, then ERRNO. sleep() has no error return; an injected error is
+ * reported the way an interrupted sleep is, as the whole request unslept, with
+ * errno set to the injected value.
+ *
+ * @param seconds  Duration to sleep.
+ * @return         0 when the full time elapsed; otherwise the unslept seconds.
+ */
+CHAOS_TIME_EXPORT unsigned int sleep(unsigned int seconds)
+{
+    chaos_time_rule_t latency_rule;
+    chaos_time_rule_t errno_rule;
+
+    chaos_time_ensure_symbols();
+
+    if (chaos_time_in_internal())
+    {
+        return chaos_time_call_real_sleep(seconds);
+    }
+
+    if (chaos_time_config_match(
+            CHAOS_TIME_EFFECT_LATENCY, CHAOS_TIME_OP_NANOSLEEP, 0, &latency_rule
+        ))
+    {
+        chaos_time_rule_apply_latency(&latency_rule);
+    }
+    if (chaos_time_config_match(CHAOS_TIME_EFFECT_ERRNO, CHAOS_TIME_OP_NANOSLEEP, 0, &errno_rule) &&
+        chaos_time_rule_apply_errno(&errno_rule))
+    {
+        return seconds;
+    }
+    return chaos_time_call_real_sleep(seconds);
 }
 
 /**

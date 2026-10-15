@@ -77,6 +77,12 @@ chaos_time_gettimeofday_fn g_chaos_time_real_gettimeofday = NULL;
 /** Resolved pointer to the real time(2); NULL until first resolution. */
 chaos_time_time_fn g_chaos_time_real_time = NULL;
 
+/** Resolved pointer to the real sleep(3); NULL until first resolution. */
+chaos_time_sleep_fn g_chaos_time_real_sleep = NULL;
+
+/** Resolved pointer to the real timespec_get(3); NULL until first resolution. */
+chaos_time_timespec_get_fn g_chaos_time_real_timespec_get = NULL;
+
 /** Resolved pointer to the real clock_nanosleep(2); NULL until first resolution. */
 chaos_time_clock_nanosleep_fn g_chaos_time_real_clock_nanosleep = NULL;
 
@@ -239,6 +245,8 @@ static void chaos_time_resolve_all_symbols(void)
     chaos_time_resolve_symbol(&g_chaos_time_real_gettimeofday, "gettimeofday");
     chaos_time_resolve_symbol(&g_chaos_time_real_time, "time");
     chaos_time_resolve_symbol(&g_chaos_time_real_clock_nanosleep, "clock_nanosleep");
+    chaos_time_resolve_symbol(&g_chaos_time_real_sleep, "sleep");
+    chaos_time_resolve_symbol(&g_chaos_time_real_timespec_get, "timespec_get");
 }
 
 void chaos_time_ensure_symbols(void)

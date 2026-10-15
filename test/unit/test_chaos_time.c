@@ -346,7 +346,35 @@ static int chaos_time_test_clock_nanosleep(
     return g_real_nanosleep_error;
 }
 
+/** @brief Number of times `chaos_time_test_sleep` was called. */
+static int g_real_sleep_calls = 0;
+/** @brief Number of times `chaos_time_test_timespec_get` was called. */
+static int g_real_timespec_get_calls = 0;
+
+/** @brief Stub for the real `sleep(3)`. Returns 0 (slept fully). */
+static unsigned int chaos_time_test_sleep(unsigned int seconds)
+{
+    (void)seconds;
+    ++g_real_sleep_calls;
+    return 0U;
+}
+
+/** @brief Stub for the real `timespec_get(3)`. Fills {77s, 5ns}; returns @p base. */
+static int chaos_time_test_timespec_get(struct timespec *value, int base)
+{
+    ++g_real_timespec_get_calls;
+    if (value != NULL)
+    {
+        value->tv_sec = 77;
+        value->tv_nsec = 5L;
+    }
+    return base;
+}
+
 #include "../../src/time/chaos_time_hooks.c"
+
+/** @brief timespec_get called through a pointer: the libc declaration is nonnull. */
+typedef int (*volatile timespec_get_fn_t)(struct timespec *, int);
 
 /**
  * @brief Invariant: `chaos_time_call_real_*` helpers dispatch to the real stubs
@@ -758,6 +786,89 @@ static void test_clock_nanosleep_paths(void)
     assert(g_real_clock_nanosleep_calls == 0);
 }
 
+/**
+ * @brief Invariant: sleep follows the nanosleep rules; timespec_get(TIME_UTC) the
+ *   clock_gettime/realtime rules.
+ *
+ * Expected observable behaviour:
+ * - sleep under the guard or without a rule: the real sleep runs.
+ * - sleep with LATENCY: delay applied, then the real sleep.
+ * - sleep with ERRNO: returns the full request unslept, errno set, no real call.
+ * - timespec_get under the guard, with a NULL value or a base other than TIME_UTC:
+ *   forwarded to the real call.
+ * - timespec_get(TIME_UTC) with OFFSET +1500ms on {10s, 250ms}: {11s, 750ms}, returns
+ *   TIME_UTC, reads CLOCK_REALTIME; with ERRNO: returns 0.
+ */
+static void test_sleep_and_timespec_get_paths(void)
+{
+    timespec_get_fn_t call_timespec_get = timespec_get;
+    struct timespec value;
+
+    reset_wrapper_state();
+    g_real_sleep_calls = 0;
+    g_chaos_time_real_sleep = chaos_time_test_sleep;
+    g_chaos_time_tls_guard = 1;
+    assert(sleep(3U) == 0U);
+    g_chaos_time_tls_guard = 0;
+    assert(sleep(3U) == 0U);
+    assert(g_real_sleep_calls == 2);
+
+    reset_wrapper_state();
+    g_real_sleep_calls = 0;
+    g_chaos_time_real_sleep = chaos_time_test_sleep;
+    g_stub_match[CHAOS_TIME_EFFECT_LATENCY][CHAOS_TIME_OP_NANOSLEEP] = 1;
+    g_stub_rules[CHAOS_TIME_EFFECT_LATENCY][CHAOS_TIME_OP_NANOSLEEP].effect =
+        CHAOS_TIME_EFFECT_LATENCY;
+    assert(sleep(3U) == 0U);
+    assert(g_latency_calls == 1);
+    assert(g_real_sleep_calls == 1);
+
+    reset_wrapper_state();
+    g_real_sleep_calls = 0;
+    g_chaos_time_real_sleep = chaos_time_test_sleep;
+    g_stub_match[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_NANOSLEEP] = 1;
+    g_stub_rules[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_NANOSLEEP].effect = CHAOS_TIME_EFFECT_ERRNO;
+    g_stub_rules[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_NANOSLEEP].errnum = EINTR;
+    g_errno_trigger = 1;
+    errno = 0;
+    assert(sleep(3U) == 3U);
+    assert(errno == EINTR);
+    assert(g_real_sleep_calls == 0);
+
+    reset_wrapper_state();
+    g_real_timespec_get_calls = 0;
+    g_chaos_time_real_timespec_get = chaos_time_test_timespec_get;
+    g_chaos_time_tls_guard = 1;
+    assert(timespec_get(&value, TIME_UTC) == TIME_UTC);
+    g_chaos_time_tls_guard = 0;
+    assert(call_timespec_get(NULL, TIME_UTC) == TIME_UTC);
+    assert(timespec_get(&value, TIME_UTC + 1) == TIME_UTC + 1);
+    assert(g_real_timespec_get_calls == 3);
+
+    reset_wrapper_state();
+    g_real_timespec_get_calls = 0;
+    g_chaos_time_real_clock_gettime = chaos_time_test_clock_gettime;
+    g_chaos_time_real_timespec_get = chaos_time_test_timespec_get;
+    g_stub_match[CHAOS_TIME_EFFECT_OFFSET][CHAOS_TIME_OP_CLOCK_GETTIME] = 1;
+    g_stub_rules[CHAOS_TIME_EFFECT_OFFSET][CHAOS_TIME_OP_CLOCK_GETTIME].effect =
+        CHAOS_TIME_EFFECT_OFFSET;
+    g_stub_rules[CHAOS_TIME_EFFECT_OFFSET][CHAOS_TIME_OP_CLOCK_GETTIME].offset_ms = 1500;
+    assert(timespec_get(&value, TIME_UTC) == TIME_UTC);
+    assert(value.tv_sec == 11);
+    assert(value.tv_nsec == 750000000L);
+    assert(g_last_clock_id == CLOCK_REALTIME);
+    assert(g_real_timespec_get_calls == 0);
+
+    reset_wrapper_state();
+    g_chaos_time_real_clock_gettime = chaos_time_test_clock_gettime;
+    g_stub_match[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_CLOCK_GETTIME] = 1;
+    g_stub_rules[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_CLOCK_GETTIME].effect =
+        CHAOS_TIME_EFFECT_ERRNO;
+    g_stub_rules[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_CLOCK_GETTIME].errnum = EINVAL;
+    g_errno_trigger = 1;
+    assert(timespec_get(&value, TIME_UTC) == 0);
+}
+
 int main(void)
 {
     test_call_real_helpers();
@@ -767,5 +878,6 @@ int main(void)
     test_gettimeofday_paths();
     test_time_paths();
     test_clock_nanosleep_paths();
+    test_sleep_and_timespec_get_paths();
     return 0;
 }

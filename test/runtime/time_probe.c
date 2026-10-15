@@ -22,6 +22,7 @@
  * - `ERRNO` injection on `usleep` (synthetic `EINVAL` return)
  * - a realtime `OFFSET` shifts `clock_gettime`, `gettimeofday` and `time` alike
  * - `ERRNO` on `nanosleep` also fails `clock_nanosleep`, reported by return value
+ * - `ERRNO` on `nanosleep` also ends `sleep` at once; a realtime `OFFSET` shifts `timespec_get`
  *
  * On glibc, `clock_gettime`/`clock_getres` for `CLOCK_MONOTONIC` and
  * `CLOCK_REALTIME` are normally serviced through the vDSO fast path without
@@ -306,6 +307,52 @@ static int probe_clock_nanosleep_errno(void)
     return remaining.tv_sec == request.tv_sec && remaining.tv_nsec == request.tv_nsec ? 0 : 82;
 }
 
+/*
+ * sleep() and timespec_get() are implemented on internal paths in glibc and musl;
+ * they must still follow the nanosleep and clock_gettime/realtime rules.
+ */
+static int probe_sleep_and_timespec_get(void)
+{
+    struct timespec before;
+    struct timespec after;
+    struct timespec utc;
+    time_t baseline;
+    int rc = write_config("nanosleep:ERRNO:EINTR");
+
+    if (rc != 0)
+    {
+        return rc;
+    }
+    (void)clock_gettime(CLOCK_MONOTONIC, &before);
+    errno = 0;
+    if (sleep(2U) != 2U || errno != EINTR)
+    {
+        return 90;
+    }
+    (void)clock_gettime(CLOCK_MONOTONIC, &after);
+    if (elapsed_ms(&before, &after) >= 1000LL)
+    {
+        return 91;
+    }
+
+    rc = write_config("# clear");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    baseline = time(NULL);
+    rc = write_config("clock_gettime/realtime:OFFSET:86400000");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    if (timespec_get(&utc, TIME_UTC) != TIME_UTC)
+    {
+        return 92;
+    }
+    return utc.tv_sec >= baseline + 86400 - 5 && utc.tv_sec <= baseline + 86400 + 5 ? 0 : 93;
+}
+
 int main(void)
 {
     int rc;
@@ -346,6 +393,11 @@ int main(void)
         return rc;
     }
     rc = probe_clock_nanosleep_errno();
+    if (rc != 0)
+    {
+        return rc;
+    }
+    rc = probe_sleep_and_timespec_get();
     if (rc != 0)
     {
         return rc;

@@ -150,6 +150,12 @@ typedef int (*chaos_time_gettimeofday_fn)(struct timeval *, void *);
 /** Function-pointer type matching the POSIX time(2) signature. */
 typedef time_t (*chaos_time_time_fn)(time_t *);
 
+/** Function-pointer type matching the POSIX sleep(3) signature. */
+typedef unsigned int (*chaos_time_sleep_fn)(unsigned int);
+
+/** Function-pointer type matching the C11 timespec_get(3) signature. */
+typedef int (*chaos_time_timespec_get_fn)(struct timespec *, int);
+
 /** Function-pointer type matching the POSIX clock_nanosleep(2) signature. */
 typedef int (*chaos_time_clock_nanosleep_fn)(clockid_t, int, const struct timespec *, struct timespec *);
 
@@ -182,6 +188,12 @@ extern chaos_time_gettimeofday_fn g_chaos_time_real_gettimeofday;
 
 /** Resolved pointer to the real time implementation. */
 extern chaos_time_time_fn g_chaos_time_real_time;
+
+/** Resolved pointer to the real sleep implementation. */
+extern chaos_time_sleep_fn g_chaos_time_real_sleep;
+
+/** Resolved pointer to the real timespec_get implementation. */
+extern chaos_time_timespec_get_fn g_chaos_time_real_timespec_get;
 
 /** Resolved pointer to the real clock_nanosleep implementation. */
 extern chaos_time_clock_nanosleep_fn g_chaos_time_real_clock_nanosleep;
