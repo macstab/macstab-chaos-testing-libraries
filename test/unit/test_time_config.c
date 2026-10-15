@@ -1328,7 +1328,8 @@ static void test_regress_rule(void)
 {
     chaos_time_rule_t rule;
     char ok[] = "clock_gettime/monotonic:REGRESS:5000";
-    char gated[] = "clock_gettime:REGRESS:250@0.5";
+    char gated[] = "clock_gettime/realtime:REGRESS:250@0.5";
+    char every_clock[] = "clock_gettime:REGRESS:250";
     char zero[] = "clock_gettime/monotonic:REGRESS:0";
     char negative[] = "clock_gettime/monotonic:REGRESS:-5";
     char sleep_rule[] = "nanosleep:REGRESS:5000";
@@ -1337,6 +1338,7 @@ static void test_regress_rule(void)
     assert(rule.effect == CHAOS_TIME_EFFECT_REGRESS && rule.offset_ms == 5000);
     assert(chaos_time_config_parse_line(gated, &rule) == 1);
     assert(rule.probability == 0.5);
+    assert(chaos_time_config_parse_line(every_clock, &rule) == -1);
     assert(chaos_time_config_parse_line(zero, &rule) == -1);
     assert(chaos_time_config_parse_line(negative, &rule) == -1);
     assert(chaos_time_config_parse_line(sleep_rule, &rule) == -1);

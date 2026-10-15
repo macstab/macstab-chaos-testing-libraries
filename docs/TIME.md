@@ -429,9 +429,12 @@ including the first. CLOCK_MONOTONIC going backwards happens in production (VM
 migration, suspend/resume, buggy hypervisor timers) and breaks timeouts, rate
 limiters, leases and elapsed-time arithmetic that trust it.
 
+The rule needs a clock (`clock_gettime/<clock>:REGRESS:<ms>`): the state belongs to
+the rule, and one rule across all clocks would arm on one clock and jump on another.
 The state (not yet read / armed / jumped) is kept per process in the rule's hit
-slot, moved with compare-and-swap, and survives a reload that keeps the rule's
-text. Removing the rule ends the shift: the clock jumps forward by the same amount.
+slot and moved with compare-and-swap, so exactly one read decides the jump and it
+is counted once; it survives a reload that keeps the rule's text. Outside an
+`@from`/`@until` window the rule shifts nothing, also after the jump. Removing the rule ends the shift: the clock jumps forward by the same amount.
 The jump counts as one hit.
 
 ---

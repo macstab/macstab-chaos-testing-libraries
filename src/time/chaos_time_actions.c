@@ -297,9 +297,10 @@ void chaos_time_rule_apply_offset(const chaos_time_rule_t *rule, struct timespec
  *
  * Implementation notes: the state lives in the rule's hit slot, so it is per
  * process and survives a reload that keeps the rule's text. 0 → 1 on the first
- * read (left real, so the program has a time to go back from); 1 → 2 on the read
- * where the gate fires (the jump, counted as one hit); in state 2 every read is
- * shifted without consulting the gate again.
+ * read (left real, so the program has a time to go back from); 1 → 3 claims the
+ * decision for one thread, which moves to 2 when the gate fires (the jump,
+ * counted as one hit) or back to 1; in state 2 every read is shifted without
+ * consulting the gate again. A closed @from/@until window shifts nothing.
  */
 void chaos_time_rule_apply_regress(const chaos_time_rule_t *rule, struct timespec *value)
 {
@@ -310,19 +311,31 @@ void chaos_time_rule_apply_regress(const chaos_time_rule_t *rule, struct timespe
     {
         return;
     }
+    /* Outside its @from/@until window the rule shifts nothing, before or after the jump. */
+    if (!chaos_policy_window_open(&rule->policy))
+    {
+        return;
+    }
     slot = rule->hit;
     if (slot->state == 0U)
     {
         (void)__sync_bool_compare_and_swap(&slot->state, 0U, 1U);
         return;
     }
-    if (slot->state == 1U)
+    if (slot->state != 2U)
     {
-        if (!chaos_time_rule_should_trigger(rule))
+        /* Exactly one thread decides the jump (state 3 while it does); a read that
+         * meets that decision in progress is not shifted yet. */
+        if (!__sync_bool_compare_and_swap(&slot->state, 1U, 3U))
         {
             return;
         }
-        (void)__sync_bool_compare_and_swap(&slot->state, 1U, 2U);
+        if (!chaos_time_rule_should_trigger(rule))
+        {
+            slot->state = 1U;
+            return;
+        }
+        slot->state = 2U;
     }
     chaos_time_add_offset_ms(value, -rule->offset_ms);
 }

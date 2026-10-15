@@ -342,7 +342,8 @@ Implemented effects:
 
 Important current boundary:
 
-- `OFFSET` and `REGRESS` are supported for `clock_gettime()` only
+- `OFFSET` and `REGRESS` are supported for `clock_gettime()` only; `REGRESS`
+  needs a clock (`clock_gettime/monotonic`, ...), since the jump is tracked per rule
 - sleep wrappers support `ERRNO` and `LATENCY`, not returned-time mutation
 - injected `ERRNO:EINTR` on `nanosleep()` copies the requested interval into
   `remaining` because the failure is injected before the real sleep runs

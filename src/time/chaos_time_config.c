@@ -1139,7 +1139,10 @@ int chaos_time_config_parse_line(char *line, chaos_time_rule_t *rule)
     if (strcmp(effect_text, "REGRESS") == 0)
     {
         rule->effect = CHAOS_TIME_EFFECT_REGRESS;
+        /* One clock per rule: the jump state is per rule, and a rule across all
+         * clocks would arm on one clock and jump on another. */
         if (!chaos_time_effect_allowed(&rule->selector, rule->effect) ||
+            rule->selector.kind != CHAOS_TIME_SELECTOR_CLOCK_ID ||
             chaos_time_parse_payload_probability(
                 value_text, payload, sizeof(payload), &rule->probability
             ) != 0 ||

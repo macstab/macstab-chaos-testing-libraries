@@ -417,9 +417,24 @@ static void test_regress_goes_back_once(void)
     chaos_time_rule_apply_regress(&rule, &value);
     assert(value.tv_sec == 96 && slot.count == 1U);
 
-    rule.effect = CHAOS_TIME_EFFECT_OFFSET;
+    /* A closed window shifts nothing, even after the jump. */
+    rule.policy.until_ms = 1;
+    value.tv_sec = 101;
     chaos_time_rule_apply_regress(&rule, &value);
-    assert(value.tv_sec == 96);
+    assert(value.tv_sec == 101);
+    rule.policy.until_ms = 0;
+
+    /* Another thread deciding the jump: this read is not shifted yet. */
+    slot.state = 3U;
+    rule.probability = 1.0;
+    chaos_time_rule_apply_regress(&rule, &value);
+    assert(value.tv_sec == 101 && slot.state == 3U);
+    slot.state = 2U;
+
+    rule.effect = CHAOS_TIME_EFFECT_OFFSET;
+    value.tv_sec = 101;
+    chaos_time_rule_apply_regress(&rule, &value);
+    assert(value.tv_sec == 101);
     chaos_time_rule_apply_regress(NULL, &value);
     chaos_time_rule_apply_regress(&rule, NULL);
 }
