@@ -72,6 +72,9 @@
 /** Status file reporting the outcome of the last load (see chaos_status.h). */
 #define CHAOS_PROCESS_STATUS_PATH "/tmp/.chaos-process.status"
 
+/** Hits file of a process, without the `.<pid>` suffix (see chaos_hits.h). */
+#define CHAOS_PROCESS_HITS_PREFIX "/tmp/.chaos-process.hits"
+
 /** Maximum number of rules that can be loaded from a single config file. */
 #define CHAOS_PROCESS_MAX_RULES 256U
 

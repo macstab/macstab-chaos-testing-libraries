@@ -95,7 +95,12 @@ int chaos_process_rule_should_trigger(const chaos_process_rule_t *rule)
         return 0;
     }
 
-    return chaos_process_probability_hit(rule->probability);
+    if (!chaos_process_probability_hit(rule->probability))
+    {
+        return 0;
+    }
+    chaos_hit_record(rule->hit);
+    return 1;
 }
 
 /**
@@ -174,6 +179,7 @@ int chaos_process_rule_fail_after_error(
         return 0;
     }
 
+    chaos_hit_record(rule->hit);
     *errnum = rule->errnum;
     return 1;
 }

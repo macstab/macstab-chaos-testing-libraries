@@ -33,6 +33,7 @@
 #define CHAOS_NET_CONFIG_H
 
 #include "chaos_net_internal.h"
+#include "chaos_hits.h"
 #include "chaos_status.h"
 
 #include <netinet/in.h>
@@ -194,6 +195,8 @@ typedef struct chaos_net_rule
     int errnum;                      /**< errno value for ERRNO rules; 0 for others. */
     double probability;              /**< Firing probability [0.0, 1.0]; unused for LATENCY. */
     unsigned int latency_ms;         /**< Sleep time in ms for LATENCY rules; 0 for others. */
+    /** Hit counter of this rule in its snapshot; NULL for a rule outside a snapshot. */
+    chaos_hit_slot_t *hit;
 } chaos_net_rule_t;
 
 /**

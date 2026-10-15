@@ -192,8 +192,38 @@ static void test_errno_application(void)
     assert(errno == ECONNREFUSED);
 }
 
+/**
+ * @brief Invariant: a rule's hit counter advances exactly when its effect fires.
+ *
+ * Triggering condition: should_trigger on a rule with probability 1.0, then 0.0,
+ *   then on a rule without a counter.
+ *
+ * Expected observable behaviour: the count is 1 after the firing call and stays 1
+ *   after the call that does not fire; a rule without a counter still fires.
+ */
+static void test_should_trigger_counts_hits(void)
+{
+    chaos_net_rule_t rule;
+    chaos_hit_slot_t slot;
+
+    memset(&rule, 0, sizeof(rule));
+    memset(&slot, 0, sizeof(slot));
+    rule.effect = CHAOS_NET_EFFECT_ERRNO;
+    rule.hit = &slot;
+    rule.probability = 1.0;
+    assert(chaos_net_rule_should_trigger(&rule) == 1);
+    assert(slot.count == 1U);
+    rule.probability = 0.0;
+    assert(chaos_net_rule_should_trigger(&rule) == 0);
+    assert(slot.count == 1U);
+    rule.hit = NULL;
+    rule.probability = 1.0;
+    assert(chaos_net_rule_should_trigger(&rule) == 1);
+}
+
 int main(void)
 {
+    test_should_trigger_counts_hits();
     test_probability_helpers();
     test_corrupt_helpers();
     test_latency_and_trigger_helpers();

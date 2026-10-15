@@ -70,6 +70,9 @@
 /** Status file reporting the outcome of the last load (see chaos_status.h). */
 #define CHAOS_MEMORY_STATUS_PATH "/tmp/.chaos-memory.status"
 
+/** Hits file of a process, without the `.<pid>` suffix (see chaos_hits.h). */
+#define CHAOS_MEMORY_HITS_PREFIX "/tmp/.chaos-memory.hits"
+
 /**
  * @brief Maximum number of rules that can be parsed from the config file.
  *

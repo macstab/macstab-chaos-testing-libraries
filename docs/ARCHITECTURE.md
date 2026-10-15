@@ -363,6 +363,31 @@ pid=4711
 - A read that sees the file change mid-read publishes nothing and writes no
   report; the next call retries.
 
+### Hit counters
+
+[`src/common/chaos_hits.h`](../src/common/chaos_hits.h)
+
+A rule that parses but never matches what the program really does is the other
+silent failure. Every library counts, per rule, how often the rule's effect was
+applied, and each process reports its counts in
+`/tmp/.chaos-<lib>.hits.<pid>`, one line per rule of the active rule file:
+
+```text
+3	tcp4://127.0.0.1:5432:connect:ECONNREFUSED:1.0 # net
+0	tcp4://127.0.0.1:6379:recv:LATENCY:200 # redis
+```
+
+- A hit is counted where the library decides the effect fires
+  (`chaos_<lib>_rule_should_trigger`, and FAIL_AFTER in libchaos-process): a
+  call the probability gate lets through is not a hit.
+- The counter lives in the snapshot; every rule copy a wrapper gets carries a
+  pointer to it. A rule whose text is unchanged by a reload keeps its count.
+- The file is rewritten on each of a process's first 64 hits, then at most
+  every 100 ms on a hit, and at normal exit. A forked child starts from zero.
+- A reader sums the files of all processes. Files of finished processes stay,
+  so counts are cumulative until the files are removed.
+- Writes use the same raw-syscall rename as the status file.
+
 ## FD Path Resolution
 
 [`src/config/chaos_io_fdcache.c`](../src/config/chaos_io_fdcache.c)
@@ -575,6 +600,14 @@ and [`test/runtime/test_process_alpine.sh`](../test/runtime/test_process_alpine.
   line is invalid (`state=error`, line 3 and its text), with one valid rule
   (`state=ok`, `rules=1`) and without a rule file (no status file); each report
   must carry the pid of the program that loaded it
+- Accepts `linux/amd64` or `linux/arm64` as an optional explicit Docker target
+
+[`test/runtime/test_hits.sh`](../test/runtime/test_hits.sh)
+
+- Builds all six libraries for glibc and musl
+- For each, runs `hits_probe` twice, which applies one rule's effect twice; the
+  hits files of the two processes must add up to 4 for that rule and 0 for a
+  rule that never matches
 - Accepts `linux/amd64` or `linux/arm64` as an optional explicit Docker target
 
 ## Platform Internals and Symbol Resolution

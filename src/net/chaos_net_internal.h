@@ -60,6 +60,9 @@
 /** Status file reporting the outcome of the last load (see chaos_status.h). */
 #define CHAOS_NET_STATUS_PATH "/tmp/.chaos-net.status"
 
+/** Hits file of a process, without the `.<pid>` suffix (see chaos_hits.h). */
+#define CHAOS_NET_HITS_PREFIX "/tmp/.chaos-net.hits"
+
 /**
  * @brief Maximum number of fault-injection rules that can be loaded simultaneously.
  *

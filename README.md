@@ -729,6 +729,10 @@ Examples:
   rejected line is reported in `/tmp/.chaos-<lib>.status` (`state=error`,
   `line=`, `reason=`, `text=`); a successful load reports `state=ok` and the
   rule count. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status-file).
+- Every process reports how often each rule fired in
+  `/tmp/.chaos-<lib>.hits.<pid>` (`<count><TAB><rule as written>`); sum the
+  files of all processes. See
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#hit-counters).
 
 ## Runtime Behavior
 

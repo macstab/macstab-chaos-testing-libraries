@@ -45,6 +45,7 @@
 #define CHAOS_TIME_CONFIG_H
 
 #include "chaos_time_internal.h"
+#include "chaos_hits.h"
 #include "chaos_status.h"
 
 /**
@@ -184,6 +185,8 @@ typedef struct chaos_time_rule
     double probability;      /**< Injection probability in [0.0, 1.0]; 1.0 = always inject. */
     unsigned int latency_ms; /**< Pre-call delay in milliseconds for EFFECT_LATENCY; 0 otherwise. */
     int64_t offset_ms; /**< Signed time shift in milliseconds for EFFECT_OFFSET; 0 otherwise. */
+    /** Hit counter of this rule in its snapshot; NULL for a rule outside a snapshot. */
+    chaos_hit_slot_t *hit;
 } chaos_time_rule_t;
 
 /**

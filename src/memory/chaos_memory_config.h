@@ -46,6 +46,7 @@
 #define CHAOS_MEMORY_CONFIG_H
 
 #include "chaos_memory_internal.h"
+#include "chaos_hits.h"
 #include "chaos_status.h"
 
 /* =========================================================================
@@ -268,6 +269,8 @@ typedef struct chaos_memory_rule
      * Zero when effect != LATENCY.
      */
     unsigned int latency_ms;
+    /** Hit counter of this rule in its snapshot; NULL for a rule outside a snapshot. */
+    chaos_hit_slot_t *hit;
 } chaos_memory_rule_t;
 
 /* =========================================================================

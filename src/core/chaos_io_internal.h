@@ -68,6 +68,9 @@
 /** Status file reporting the outcome of the last load (see chaos_status.h). */
 #define CHAOS_IO_STATUS_PATH "/tmp/.chaos-io.status"
 
+/** Hits file of a process, without the `.<pid>` suffix (see chaos_hits.h). */
+#define CHAOS_IO_HITS_PREFIX "/tmp/.chaos-io.hits"
+
 /**
  * @brief Maximum number of rules that one config snapshot may hold.
  *

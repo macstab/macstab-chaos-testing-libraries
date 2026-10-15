@@ -163,30 +163,24 @@ static inline size_t chaos_status_format(
 #endif
 
 /**
- * @brief Replaces the status file at @p path with the outcome of a load.
+ * @brief Replaces the file at @p path with @p length bytes of @p data.
  *
- * @param path   Status file, e.g. `/tmp/.chaos-net.status`.
- * @param state  Outcome of the load.
- * @param rules  Number of active rules (ignored for an error).
- * @param error  The rejected line for CHAOS_STATUS_ERROR, otherwise NULL.
+ * @details Writes `<path>.<pid>` and renames it over @p path, so a reader sees the
+ * old file or the new one, never a mix. Best effort: on any failure the staging
+ * file is removed and @p path is left as it was. errno is left untouched.
  */
-static inline void chaos_status_write(
-    const char *path, chaos_status_state_t state, size_t rules, const chaos_status_error_t *error
-)
+static inline void chaos_status_replace_file(const char *path, const char *data, size_t length)
 {
     const int saved_errno = errno;
-    const long pid = (long)getpid();
-    char report[CHAOS_STATUS_BUFFER_SIZE];
     char staging[128];
-    size_t length;
     size_t written = 0U;
     int fd;
 
-    if ((size_t)snprintf(staging, sizeof(staging), "%s.%ld", path, pid) >= sizeof(staging))
+    if ((size_t)snprintf(staging, sizeof(staging), "%s.%ld", path, (long)getpid()) >=
+        sizeof(staging))
     {
         return;
     }
-    length = chaos_status_format(report, sizeof(report), state, rules, error, pid);
     fd = CHAOS_STATUS_OPEN(staging);
     if (fd < 0)
     {
@@ -195,7 +189,7 @@ static inline void chaos_status_write(
     }
     while (written < length)
     {
-        const long rc = (long)CHAOS_STATUS_WRITE(fd, report + written, length - written);
+        const long rc = (long)CHAOS_STATUS_WRITE(fd, data + written, length - written);
 
         if (rc <= 0)
         {
@@ -213,6 +207,25 @@ static inline void chaos_status_write(
         (void)CHAOS_STATUS_UNLINK(staging);
     }
     errno = saved_errno;
+}
+
+/**
+ * @brief Replaces the status file at @p path with the outcome of a load.
+ *
+ * @param path   Status file, e.g. `/tmp/.chaos-net.status`.
+ * @param state  Outcome of the load.
+ * @param rules  Number of active rules (ignored for an error).
+ * @param error  The rejected line for CHAOS_STATUS_ERROR, otherwise NULL.
+ */
+static inline void chaos_status_write(
+    const char *path, chaos_status_state_t state, size_t rules, const chaos_status_error_t *error
+)
+{
+    char report[CHAOS_STATUS_BUFFER_SIZE];
+    const size_t length =
+        chaos_status_format(report, sizeof(report), state, rules, error, (long)getpid());
+
+    chaos_status_replace_file(path, report, length);
 }
 
 /** @brief Removes the status file at @p path, leaving errno untouched. */

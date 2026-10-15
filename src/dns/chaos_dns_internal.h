@@ -52,6 +52,9 @@
 /** Status file reporting the outcome of the last load (see chaos_status.h). */
 #define CHAOS_DNS_STATUS_PATH "/tmp/.chaos-dns.status"
 
+/** Hits file of a process, without the `.<pid>` suffix (see chaos_hits.h). */
+#define CHAOS_DNS_HITS_PREFIX "/tmp/.chaos-dns.hits"
+
 /** Maximum number of rules that will be loaded from the config file. */
 #define CHAOS_DNS_MAX_RULES 256U
 

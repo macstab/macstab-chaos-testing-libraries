@@ -44,6 +44,7 @@
 #define CHAOS_PROCESS_CONFIG_H
 
 #include "chaos_process_internal.h"
+#include "chaos_hits.h"
 #include "chaos_status.h"
 
 /**
@@ -221,6 +222,8 @@ typedef struct chaos_process_rule
      * The counter is reset to 0 on every config reload.
      */
     uint64_t fail_after_count;
+    /** Hit counter of this rule in its snapshot; NULL for a rule outside a snapshot. */
+    chaos_hit_slot_t *hit;
 } chaos_process_rule_t;
 
 /**

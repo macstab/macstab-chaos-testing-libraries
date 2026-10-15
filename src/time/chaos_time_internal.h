@@ -46,6 +46,9 @@
 /** Status file reporting the outcome of the last load (see chaos_status.h). */
 #define CHAOS_TIME_STATUS_PATH "/tmp/.chaos-time.status"
 
+/** Hits file of a process, without the `.<pid>` suffix (see chaos_hits.h). */
+#define CHAOS_TIME_HITS_PREFIX "/tmp/.chaos-time.hits"
+
 /** Maximum number of rules that may be loaded from a single config snapshot. */
 #define CHAOS_TIME_MAX_RULES 256U
 

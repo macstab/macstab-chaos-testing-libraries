@@ -1075,10 +1075,121 @@ static void test_prepare_reports_status(void)
     assert(!read_status_file(status, sizeof(status)));
 }
 
+/**
+ * @brief Reads this process's hits file into @p buffer; returns 0 when it does not exist.
+ */
+static int read_hits_file(char *buffer, size_t size)
+{
+    char path[64];
+    FILE *file;
+    size_t length;
+
+    (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_DNS_HITS_PREFIX, (long)getpid());
+    file = fopen(path, "r");
+    if (file == NULL)
+    {
+        return 0;
+    }
+    length = fread(buffer, 1U, size - 1U, file);
+    buffer[length] = '\0';
+    assert(fclose(file) == 0);
+    return 1;
+}
+
+/**
+ * @brief Invariant: every rule of a loaded snapshot counts its hits, the process
+ *   reports the counts with the rule text, and a reload keeps the count of a rule
+ *   that is still in the file.
+ *
+ * Triggering condition: one rule loaded and hit twice; then a second rule added
+ *   and hit once.
+ *
+ * Expected observable behaviour: the hits file lists "2<TAB>rule # a", then also
+ *   "1<TAB>rule # b" with the first count unchanged.
+ */
+static void test_hits_are_counted_and_reported(void)
+{
+    char hits[1024];
+    char path[64];
+    chaos_dns_config_state_t *state;
+
+    chaos_dns_config_init();
+    write_config_text("dns://api.example.com:LATENCY:20 # a\n", 61);
+    assert(chaos_dns_config_prepare() == 1);
+    state = (chaos_dns_config_state_t *)chaos_dns_config_active_state();
+    assert(state->rule_count == 1U);
+    assert(state->rules[0].hit == &state->hits[0]);
+    assert(strcmp(state->text[0], "dns://api.example.com:LATENCY:20 # a") == 0);
+    chaos_hit_record(state->rules[0].hit);
+    chaos_hit_record(state->rules[0].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(strcmp(hits, "2\tdns://api.example.com:LATENCY:20 # a\n") == 0);
+
+    write_config_text(
+        "dns://api.example.com:LATENCY:20 # a\ndns://api.example.com:LATENCY:20 # b\n", 62
+    );
+    assert(chaos_dns_config_prepare() == 1);
+    state = (chaos_dns_config_state_t *)chaos_dns_config_active_state();
+    assert(state->rule_count == 2U);
+    assert(state->hits[0].count == 2U);
+    chaos_hit_record(state->rules[1].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(
+        strcmp(
+            hits,
+            "2\tdns://api.example.com:LATENCY:20 # a\n1\tdns://api.example.com:LATENCY:20 # b\n"
+        ) == 0
+    );
+
+    /* A hit that finds another thread writing is left pending, not lost. */
+    g_chaos_dns_hits_writing = 1;
+    chaos_hit_record(state->rules[1].hit);
+    g_chaos_dns_hits_writing = 0;
+    assert(g_chaos_dns_hits_pending == 1);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(
+        strcmp(
+            hits,
+            "2\tdns://api.example.com:LATENCY:20 # a\n1\tdns://api.example.com:LATENCY:20 # b\n"
+        ) == 0
+    );
+
+    /* Past the eager hits, a hit inside the interval is not written at once... */
+    g_chaos_dns_hits_total = CHAOS_HITS_EAGER;
+    g_chaos_dns_hits_last_ms = chaos_hits_now_ms();
+    chaos_hit_record(state->rules[1].hit);
+    assert(state->hits[1].count == 3U);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(
+        strcmp(
+            hits,
+            "2\tdns://api.example.com:LATENCY:20 # a\n1\tdns://api.example.com:LATENCY:20 # b\n"
+        ) == 0
+    );
+
+    /* ...the exit report writes it, and a second one has nothing left to write. */
+    chaos_dns_config_report_hits(NULL);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(
+        strcmp(
+            hits,
+            "2\tdns://api.example.com:LATENCY:20 # a\n3\tdns://api.example.com:LATENCY:20 # b\n"
+        ) == 0
+    );
+    assert(g_chaos_dns_hits_pending == 0);
+    chaos_dns_config_report_hits(NULL);
+    g_chaos_dns_hits_total = 0U;
+
+    (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_DNS_HITS_PREFIX, (long)getpid());
+    (void)unlink(path);
+    (void)unlink(CHAOS_DNS_CONFIG_PATH);
+}
+
 int main(void)
 {
     test_parse_buffer_reports_rejected_line();
     test_prepare_reports_status();
+    test_hits_are_counted_and_reported();
     test_read_file_rejects_changed_file();
     test_helper_functions();
     test_selector_matching();

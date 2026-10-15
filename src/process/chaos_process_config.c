@@ -100,6 +100,10 @@ typedef struct chaos_process_config_state
      * `chaos_process_config_match_loaded()`.
      */
     int parse_ok;
+    /** Hit counters, one per rule (see chaos_hits.h). */
+    chaos_hit_slot_t hits[CHAOS_PROCESS_MAX_RULES];
+    /** Each rule as written in the file, reported with its count. */
+    char text[CHAOS_PROCESS_MAX_RULES][CHAOS_STATUS_TEXT_MAX + 1U];
 } chaos_process_config_state_t;
 
 /* -------------------------------------------------------------------------
@@ -168,6 +172,27 @@ static char g_chaos_process_config_buffer[CHAOS_PROCESS_MAX_CONFIG_BYTES + 1U];
  * @details Written only by the thread that owns the reload claim.
  */
 static chaos_status_error_t g_chaos_process_config_error;
+
+/** @brief Text of each accepted rule of the last parse, copied into the snapshot. */
+static char g_chaos_process_config_texts[CHAOS_PROCESS_MAX_RULES][CHAOS_STATUS_TEXT_MAX + 1U];
+
+/** @brief Set while a thread writes the hits file. */
+static volatile int g_chaos_process_hits_writing = 0;
+
+/** @brief Set by every hit, cleared by the write that reports it. */
+static volatile int g_chaos_process_hits_pending = 0;
+
+/** @brief Hits recorded by this process (reset in a forked child). */
+static uint64_t g_chaos_process_hits_total = 0U;
+
+/** @brief CLOCK_MONOTONIC time of the last write, in milliseconds. */
+static uint64_t g_chaos_process_hits_last_ms = 0U;
+
+/** @brief Process the counters belong to; differs in a forked child. */
+static uint64_t g_chaos_process_hits_pid = 0U;
+
+/** @brief Scratch for the hits file; used only by the thread that writes it. */
+static char g_chaos_process_hits_buffer[CHAOS_PROCESS_MAX_RULES * CHAOS_HITS_LINE_MAX + 1U];
 
 /* -------------------------------------------------------------------------
  * Internal helpers
@@ -1125,6 +1150,11 @@ int chaos_process_config_parse_buffer(char *buffer, chaos_process_rule_t *rules,
             *rule_count = 0U;
             return -1;
         }
+        (void)memcpy(
+            g_chaos_process_config_texts[count],
+            g_chaos_process_config_error.text,
+            sizeof(g_chaos_process_config_texts[count])
+        );
         rules[count++] = parsed;
     }
 
@@ -1192,6 +1222,109 @@ int chaos_process_config_select_rule(
     }
 
     return found;
+}
+
+/**
+ * @brief Reports this process's hit counts after a hit on @p slot (NULL: at exit).
+ *
+ * @details Writes the hits file on each of the first CHAOS_HITS_EAGER hits, then at
+ * most every CHAOS_HITS_INTERVAL_MS; the exit report covers the rest. One thread
+ * writes at a time: a hit that finds the writer busy leaves `pending` set, and the
+ * writer repeats the write before it lets go. A forked child inherits the parent's
+ * counts; they are cleared at the child's first hit so no hit is reported twice.
+ */
+static void chaos_process_config_report_hits(chaos_hit_slot_t *slot)
+{
+    chaos_process_config_state_t *state;
+    const uint64_t pid = (uint64_t)getpid();
+    uint64_t now;
+
+    if (slot == NULL && (g_chaos_process_hits_pending == 0 || g_chaos_process_hits_pid != pid))
+    {
+        return;
+    }
+    g_chaos_process_hits_pending = 1;
+    if (!__sync_bool_compare_and_swap(&g_chaos_process_hits_writing, 0, 1))
+    {
+        return;
+    }
+    state = (chaos_process_config_state_t *)chaos_process_config_active_state();
+    if (slot != NULL && g_chaos_process_hits_pid != pid)
+    {
+        size_t index;
+
+        for (index = 0U; index < state->rule_count; ++index)
+        {
+            state->hits[index].count = 0U;
+        }
+        slot->count = 1U;
+        g_chaos_process_hits_pid = pid;
+        g_chaos_process_hits_total = 0U;
+        g_chaos_process_hits_last_ms = 0U;
+    }
+    if (slot != NULL)
+    {
+        ++g_chaos_process_hits_total;
+    }
+    now = chaos_hits_now_ms();
+    if (slot == NULL || g_chaos_process_hits_total <= CHAOS_HITS_EAGER ||
+        now - g_chaos_process_hits_last_ms >= CHAOS_HITS_INTERVAL_MS)
+    {
+        while (g_chaos_process_hits_pending != 0)
+        {
+            g_chaos_process_hits_pending = 0;
+            __sync_synchronize();
+            chaos_hits_write(
+                CHAOS_PROCESS_HITS_PREFIX,
+                state->hits,
+                (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) state->text,
+                state->rule_count,
+                g_chaos_process_hits_buffer,
+                sizeof(g_chaos_process_hits_buffer)
+            );
+        }
+        g_chaos_process_hits_last_ms = now;
+    }
+    __sync_lock_release(&g_chaos_process_hits_writing);
+}
+
+/** @brief Reports the hits not yet written when the process exits normally. */
+__attribute__((destructor)) static void chaos_process_config_report_hits_at_exit(void)
+{
+    chaos_process_config_report_hits(NULL);
+}
+
+/**
+ * @brief Gives each rule of a freshly parsed snapshot its counter and text.
+ *
+ * @details A rule whose text is unchanged from the active snapshot keeps its count,
+ * so adding one rule does not reset the counts of the others.
+ */
+static void chaos_process_config_attach_hits(chaos_process_config_state_t *next_state)
+{
+    const chaos_process_config_state_t *active = chaos_process_config_active_state();
+    size_t index;
+
+    for (index = 0U; index < next_state->rule_count; ++index)
+    {
+        size_t previous;
+
+        (void)memcpy(
+            next_state->text[index],
+            g_chaos_process_config_texts[index],
+            sizeof(next_state->text[index])
+        );
+        next_state->hits[index].report = chaos_process_config_report_hits;
+        for (previous = 0U; active != next_state && previous < active->rule_count; ++previous)
+        {
+            if (strcmp(active->text[previous], next_state->text[index]) == 0)
+            {
+                next_state->hits[index].count = active->hits[previous].count;
+                break;
+            }
+        }
+        next_state->rules[index].hit = &next_state->hits[index];
+    }
 }
 
 /**
@@ -1307,6 +1440,7 @@ static int chaos_process_config_refresh(void)
         }
     }
 
+    chaos_process_config_attach_hits(next_state);
     chaos_process_config_report(observed_mtime, next_state);
     chaos_process_config_publish(next_index, observed_mtime);
     return next_state->parse_ok != 0 && next_state->rule_count != 0U;
