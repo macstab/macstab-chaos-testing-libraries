@@ -1327,6 +1327,38 @@ static void *chaos_test_dlsym_pointer(const void *function_bytes, size_t functio
 #define CHAOS_TEST_DLSYM_RESULT(type, function)                                                    \
     chaos_test_dlsym_pointer(&(type){function}, sizeof(type))
 
+/** @brief Whether @p symbol is one of the stdio functions libchaos-io wraps. */
+static int chaos_test_is_stdio_symbol(const char *symbol)
+{
+    static const char *const names[] = {
+        "fread",
+        "fwrite",
+        "fgets",
+        "fputs",
+        "fgetc",
+        "getc",
+        "fputc",
+        "putc",
+
+        "getdelim",
+        "vfprintf",
+        "fflush",
+        "__vfprintf_chk",
+        "__fread_chk",
+        "__fgets_chk"
+    };
+    size_t index;
+
+    for (index = 0U; index < sizeof(names) / sizeof(names[0]); ++index)
+    {
+        if (strcmp(symbol, names[index]) == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /**
  * @brief Stub for `dlsym(RTLD_NEXT, symbol)` called by the production constructor.
  *
@@ -1460,6 +1492,13 @@ static void *chaos_test_dlsym(void *handle, const char *symbol)
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_pwritev_fn, chaos_test_real_pwritev_impl);
     }
 
+    /* stdio: the test binary's own output goes through the stdio wrappers, so
+     * these always resolve to the real C library. */
+    if (chaos_test_is_stdio_symbol(symbol))
+    {
+        return dlsym(RTLD_NEXT, symbol);
+    }
+
     g_dlerror_pending = "unexpected symbol";
     return NULL;
 }
@@ -1571,6 +1610,7 @@ static long chaos_test_syscall(long number, ...)
 #include "../../src/wrappers/chaos_io_rw.c"
 #include "../../src/wrappers/chaos_io_fsops.c"
 #include "../../src/wrappers/chaos_io_sync.c"
+#include "../../src/wrappers/chaos_io_stdio.c"
 #undef CHAOS_IO_CONSTRUCTOR
 #undef syscall
 #undef abort
@@ -1580,6 +1620,87 @@ static long chaos_test_syscall(long number, ...)
 /* -------------------------------------------------------------------------
  * Test state management
  * --------------------------------------------------------------------- */
+
+/**
+ * @brief Points the stdio wrappers at the real C library.
+ *
+ * @details The wrappers are linked into the test binary and replace its own
+ * printf, fputs, fflush and friends, so they must always reach the real ones;
+ * stdio tests swap in counting stubs and call this again afterwards.
+ */
+static void chaos_test_bind_real_stdio(void)
+{
+    {
+        void *resolved = dlsym(RTLD_NEXT, "fread");
+
+        (void)memcpy(&g_chaos_io_real_fread, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "fwrite");
+
+        (void)memcpy(&g_chaos_io_real_fwrite, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "fgets");
+
+        (void)memcpy(&g_chaos_io_real_fgets, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "fputs");
+
+        (void)memcpy(&g_chaos_io_real_fputs, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "fgetc");
+
+        (void)memcpy(&g_chaos_io_real_fgetc, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "getc");
+
+        (void)memcpy(&g_chaos_io_real_getc, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "fputc");
+
+        (void)memcpy(&g_chaos_io_real_fputc, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "putc");
+
+        (void)memcpy(&g_chaos_io_real_putc, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "getdelim");
+
+        (void)memcpy(&g_chaos_io_real_getdelim, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "vfprintf");
+
+        (void)memcpy(&g_chaos_io_real_vfprintf, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "fflush");
+
+        (void)memcpy(&g_chaos_io_real_fflush, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "__vfprintf_chk");
+
+        (void)memcpy(&g_chaos_io_real_vfprintf_chk, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "__fread_chk");
+
+        (void)memcpy(&g_chaos_io_real_fread_chk, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "__fgets_chk");
+
+        (void)memcpy(&g_chaos_io_real_fgets_chk, &resolved, sizeof(resolved));
+    }
+}
 
 /**
  * @brief Reset all harness globals to their default test-safe state.
@@ -1828,6 +1949,7 @@ static void chaos_test_reset_state(void)
     g_chaos_io_tls_guard = 0;
     g_chaos_io_tls_prng_state = 0U;
     g_chaos_io_process_seed = 0U;
+    chaos_test_bind_real_stdio();
 }
 
 /**
@@ -1872,6 +1994,7 @@ static void chaos_test_bind_real_functions(void)
     g_chaos_io_real_sendfile = chaos_test_real_sendfile_impl;
     g_chaos_io_real_copy_file_range = chaos_test_real_copy_file_range_impl;
 #endif
+    chaos_test_bind_real_stdio();
 }
 
 /**
@@ -1998,6 +2121,7 @@ static void chaos_test_bind_libc_functions_for_exit(void)
     g_fdcache_resolve_result = 0;
     g_rule_apply_errno_result = 0;
     g_rule_should_trigger_result = 0;
+    chaos_test_bind_real_stdio();
 }
 
 #endif

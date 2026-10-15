@@ -2285,8 +2285,172 @@ static void test_wrappers_record_call_size(void)
     (void)rc;
 }
 
+/** @brief Calls the vfprintf wrapper with a real va_list. */
+static int chaos_test_call_vfprintf(FILE *stream, const char *format, ...)
+{
+    va_list arguments;
+    int rc;
+
+    va_start(arguments, format);
+    rc = vfprintf(stream, format, arguments);
+    va_end(arguments);
+    return rc;
+}
+
+/** @brief Calls the __vfprintf_chk wrapper with a real va_list. */
+static int chaos_test_call_vfprintf_chk(FILE *stream, const char *format, ...)
+{
+    va_list arguments;
+    int rc;
+
+    va_start(arguments, format);
+    rc = __vfprintf_chk(stream, 1, format, arguments);
+    va_end(arguments);
+    return rc;
+}
+
+/** @brief Arms the config stubs so that every stdio stream matches a rule of @p effect. */
+static void chaos_test_stdio_rule(chaos_io_effect_t effect)
+{
+    chaos_test_reset_state();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/stdio.txt");
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = effect;
+    g_config_rule.errnum = EIO;
+    g_rule_apply_errno_result = 1;
+    g_rule_should_trigger_result = 1;
+}
+
+/** @brief A temporary stream holding "abc\ndef\n", positioned at the start. */
+static FILE *chaos_test_stdio_stream(void)
+{
+    FILE *stream;
+
+    chaos_test_reset_state();
+    stream = tmpfile();
+    assert(stream != NULL);
+    assert(fputs("abc\ndef\n", stream) >= 0);
+    rewind(stream);
+    return stream;
+}
+
+/**
+ * @brief Invariant: the stdio wrappers apply the io read/write rules to the stream's
+ *   descriptor: ERRNO fails the call the way the C library does and raises the error
+ *   indicator, LATENCY delays it, CORRUPT changes what a read returned, and calls
+ *   without a rule, on a NULL stream or on a stream without a descriptor pass through.
+ */
+static void test_stdio_wrappers(void)
+{
+    char buffer[16];
+    char *line = NULL;
+    size_t capacity = 0U;
+    FILE *stream;
+    FILE *memory;
+    /* Passthrough. */
+    stream = chaos_test_stdio_stream();
+    assert(fgets(buffer, sizeof(buffer), stream) == buffer && strcmp(buffer, "abc\n") == 0);
+    assert(fgetc(stream) == 'd' && getc(stream) == 'e');
+    assert(fread(buffer, 1U, 2U, stream) == 2U);
+    rewind(stream);
+    assert(getline(&line, &capacity, stream) == 4);
+    assert(fwrite("xy", 1U, 2U, stream) == 2U && fputs("z", stream) >= 0);
+    assert(fputc('1', stream) == '1' && putc('2', stream) == '2');
+    assert(fprintf(stream, "%d", 3) == 1 && fflush(stream) == 0 && fflush(NULL) == 0);
+    assert(chaos_test_call_vfprintf(stream, "%d", 4) == 1);
+    assert(chaos_test_call_vfprintf_chk(stream, "%d", 5) == 1);
+    assert(__fprintf_chk(stream, 1, "%d", 6) == 1);
+    rewind(stream);
+    assert(__fread_chk(buffer, sizeof(buffer), 1U, 2U, stream) == 2U);
+    assert(__fgets_chk(buffer, sizeof(buffer), 4, stream) == buffer);
+    memory = fmemopen(buffer, sizeof(buffer), "w");
+    assert(memory != NULL);
+    chaos_test_stdio_rule(CHAOS_IO_EFFECT_ERRNO);
+    assert(fputs("in memory", memory) >= 0); /* no descriptor: no rule */
+    assert(fclose(memory) == 0);
+    assert(g_rule_apply_errno_calls == 0);
+    assert(fclose(stream) == 0);
+
+    /* ERRNO: every form fails with its C library error value and sets ferror. */
+    stream = chaos_test_stdio_stream();
+    chaos_test_stdio_rule(CHAOS_IO_EFFECT_ERRNO);
+    errno = 0;
+    assert(fread(buffer, 1U, 4U, stream) == 0U && errno == EIO && ferror(stream));
+    clearerr(stream);
+    assert(fgets(buffer, sizeof(buffer), stream) == NULL && ferror(stream));
+    assert(fgetc(stream) == EOF && getc(stream) == EOF);
+    assert(getline(&line, &capacity, stream) == -1);
+    assert(getdelim(&line, &capacity, ';', stream) == -1);
+    assert(__getdelim(&line, &capacity, ';', stream) == -1);
+    assert(fwrite("x", 1U, 1U, stream) == 0U);
+    assert(fputs("xy", stream) == EOF);
+    assert(fputc('x', stream) == EOF && putc('x', stream) == EOF);
+    assert(fprintf(stream, "x%d", 1) < 0 && fflush(stream) == EOF);
+    assert(__fprintf_chk(stream, 1, "x%d", 1) < 0);
+    /* The standard streams are never faulted. */
+    assert(fflush(stdout) == 0);
+    assert(__fread_chk(buffer, sizeof(buffer), 1U, 4U, stream) == 0U);
+    assert(__fgets_chk(buffer, sizeof(buffer), 4, stream) == NULL);
+    chaos_test_reset_state();
+    assert(fclose(stream) == 0);
+
+    /* LATENCY delays, then runs the real call. */
+    stream = chaos_test_stdio_stream();
+    chaos_test_stdio_rule(CHAOS_IO_EFFECT_LATENCY);
+    assert(fread(buffer, 1U, 3U, stream) == 3U);
+    assert(fwrite("x", 1U, 1U, stream) == 1U);
+    assert(g_latency_calls == 2);
+    chaos_test_reset_state();
+    assert(fclose(stream) == 0);
+
+    /* CORRUPT changes what reads return; an empty result is left alone. */
+    stream = chaos_test_stdio_stream();
+    chaos_test_stdio_rule(CHAOS_IO_EFFECT_CORRUPT);
+    assert(fread(buffer, 1U, 2U, stream) == 2U && buffer[0] == ('a' ^ 1));
+    assert(fgets(buffer, sizeof(buffer), stream) == buffer && buffer[0] == ('c' ^ 1));
+    assert(fgetc(stream) == ('d' ^ 1));
+    assert(getline(&line, &capacity, stream) == 3 && line[0] == ('e' ^ 1));
+    assert(__fread_chk(buffer, sizeof(buffer), 1U, 2U, stream) == 0U);
+    assert(fgets(buffer, sizeof(buffer), stream) == NULL);
+    assert(__fgets_chk(buffer, sizeof(buffer), 4, stream) == NULL);
+    assert(fgetc(stream) == EOF);
+    rewind(stream);
+    assert(__fread_chk(buffer, sizeof(buffer), 1U, 2U, stream) == 2U);
+    assert(__fgets_chk(buffer, sizeof(buffer), 4, stream) == buffer);
+    g_rule_should_trigger_result = 0;
+    assert(fread(buffer, 1U, 1U, stream) == 1U);
+    assert(g_corrupt_calls == 6);
+    chaos_test_reset_state();
+    assert(fclose(stream) == 0);
+
+    /* Without the fortified functions in the C library, the plain ones run. */
+    stream = chaos_test_stdio_stream();
+    g_chaos_io_real_fread_chk = NULL;
+    g_chaos_io_real_fgets_chk = NULL;
+    g_chaos_io_real_vfprintf_chk = NULL;
+    assert(__fread_chk(buffer, sizeof(buffer), 1U, 2U, stream) == 2U);
+    assert(__fgets_chk(buffer, sizeof(buffer), 4, stream) == buffer);
+    assert(__fprintf_chk(stream, 1, "%s", "x") == 1);
+    chaos_test_stdio_rule(CHAOS_IO_EFFECT_LATENCY);
+    g_chaos_io_real_fread_chk = NULL;
+    g_chaos_io_real_fgets_chk = NULL;
+    assert(__fread_chk(buffer, sizeof(buffer), 1U, 1U, stream) == 1U);
+    assert(__fgets_chk(buffer, sizeof(buffer), 4, stream) == buffer);
+    chaos_test_reset_state();
+    assert(fclose(stream) == 0);
+
+    /* Byte counts for @size gates; a request that overflows has none. */
+    assert(chaos_io_stdio_size(4U, 3U) == 12U);
+    assert(chaos_io_stdio_size(SIZE_MAX, 3U) == CHAOS_POLICY_NO_SIZE);
+    assert(chaos_io_stdio_size(0U, 3U) == 0U);
+    free(line);
+}
+
 int main(void)
 {
+    test_stdio_wrappers();
     test_wrappers_record_call_size();
     test_stdio_open_wrappers();
     test_resolve_symbol_and_seed_material();

@@ -51,6 +51,7 @@ LIB_SRCS_io := \
 	$(SRC_WRAPPERS_DIR)/chaos_io_rw.c \
 	$(SRC_WRAPPERS_DIR)/chaos_io_fsops.c \
 	$(SRC_WRAPPERS_DIR)/chaos_io_sync.c \
+	$(SRC_WRAPPERS_DIR)/chaos_io_stdio.c \
 	$(SRC_EFFECTS_DIR)/chaos_io_actions.c \
 	$(SRC_CONFIG_DIR)/chaos_io_config.c \
 	$(SRC_CONFIG_DIR)/chaos_io_fdcache.c
@@ -212,7 +213,8 @@ HOST_RUNTIME_TESTS := \
 	$(TEST_RUNTIME_DIR)/test_isolation_glibc.sh \
 	$(TEST_RUNTIME_DIR)/test_path_forms.sh \
 	$(TEST_RUNTIME_DIR)/test_status.sh \
-	$(TEST_RUNTIME_DIR)/test_hits.sh
+	$(TEST_RUNTIME_DIR)/test_hits.sh \
+	$(TEST_RUNTIME_DIR)/test_stdio.sh
 MATRIX_RUNTIME_TESTS := \
 	$(TEST_RUNTIME_DIR)/test_glibc.sh \
 	$(TEST_RUNTIME_DIR)/test_alpine.sh \

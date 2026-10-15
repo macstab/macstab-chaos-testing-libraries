@@ -98,7 +98,25 @@ which Linux defines them to be; `truncate()` matches the `truncate` rules by pat
 `fopen()` and `freopen()` open the file inside the C library too, so the `open` rules
 apply to them in their own wrappers: an injected error returns NULL with errno set,
 and `freopen()` closes the stream it was given, as a failed `freopen()` does. Reading
-and writing through the stream does not reach the `read`/`write` rules (stdio buffers inside the C library).
+and writing through the stream is covered by the stdio wrappers below.
+
+The C library also reads and writes `FILE` streams with its own system calls, so
+buffered I/O never reached the `read`/`write` rules. `src/wrappers/chaos_io_stdio.c`
+applies them to the stream's descriptor: `fread`, `fgets`, `fgetc`, `getc`,
+`getline`, `getdelim` (and `__getdelim`, which optimized glibc builds call for
+`getline`) under the `read` rules; `fwrite`, `fputs`, `fputc`, `putc`, `fprintf`,
+`vfprintf` and `fflush` under the `write` rules; and the fortified `__fread_chk`,
+`__fgets_chk`, `__fprintf_chk`, `__vfprintf_chk`. `ERRNO` fails the call the way
+the C library reports an I/O error (0 items, NULL, EOF or a negative count) with
+errno set and the stream's error indicator raised, so `ferror()` is true: glibc and
+musl both keep that indicator as bit 0x20 of the first word of `FILE`. `LATENCY`
+delays the call, `CORRUPT` changes what a read returned; `TORN` does not apply,
+since a short `fwrite` means an error in stdio. A rule fires once per call, not
+once per system call the C library makes while filling or flushing a buffer.
+Descriptors 0-2 are left alone as everywhere, so `printf`, `puts`, `putchar` and
+`getchar` are not wrapped. Not covered: the scanf family (glibc redirects it to
+`__isoc99_*`/`__isoc23_*` names) and the `*_unlocked` variants.
+`test/runtime/test_stdio.sh` checks glibc (also with `_FORTIFY_SOURCE=2`) and musl.
 `test/runtime/test_path_forms.sh` checks them on glibc and musl.
 
 ### Assumptions

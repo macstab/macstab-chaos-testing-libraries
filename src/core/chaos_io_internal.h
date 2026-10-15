@@ -36,6 +36,7 @@
 #include <limits.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
@@ -250,6 +251,42 @@ typedef int (*chaos_io_ftruncate_fn)(int, off_t);
 /** @brief Type of the real `truncate(2)` libc symbol. */
 typedef int (*chaos_io_truncate_fn)(const char *, off_t);
 
+/** @brief Type of the real `fread` libc symbol. */
+typedef size_t (*chaos_io_fread_fn)(void *, size_t, size_t, FILE *);
+
+/** @brief Type of the real `fwrite` libc symbol. */
+typedef size_t (*chaos_io_fwrite_fn)(const void *, size_t, size_t, FILE *);
+
+/** @brief Type of the real `fgets` libc symbol. */
+typedef char *(*chaos_io_fgets_fn)(char *, int, FILE *);
+
+/** @brief Type of the real `fputs` libc symbol. */
+typedef int (*chaos_io_fputs_fn)(const char *, FILE *);
+
+/** @brief Type of the real `fgetc` libc symbol. */
+typedef int (*chaos_io_fgetc_fn)(FILE *);
+
+/** @brief Type of the real `fputc` libc symbol. */
+typedef int (*chaos_io_fputc_fn)(int, FILE *);
+
+/** @brief Type of the real `getdelim` libc symbol. */
+typedef ssize_t (*chaos_io_getdelim_fn)(char **, size_t *, int, FILE *);
+
+/** @brief Type of the real `vfprintf` libc symbol. */
+typedef int (*chaos_io_vfprintf_fn)(FILE *, const char *, va_list);
+
+/** @brief Type of the real `fflush` libc symbol. */
+typedef int (*chaos_io_fflush_fn)(FILE *);
+
+/** @brief Type of the real `__vfprintf_chk` libc symbol. */
+typedef int (*chaos_io_vfprintf_chk_fn)(FILE *, int, const char *, va_list);
+
+/** @brief Type of the real `__fread_chk` libc symbol. */
+typedef size_t (*chaos_io_fread_chk_fn)(void *, size_t, size_t, size_t, FILE *);
+
+/** @brief Type of the real `__fgets_chk` libc symbol. */
+typedef char *(*chaos_io_fgets_chk_fn)(char *, size_t, int, FILE *);
+
 /** @brief Type of the real `fopen(3)` libc symbol. */
 typedef FILE *(*chaos_io_fopen_fn)(const char *, const char *);
 
@@ -319,6 +356,21 @@ extern chaos_io_ftruncate_fn g_chaos_io_real_ftruncate; /**< Downstream `ftrunca
 extern chaos_io_unlinkat_fn g_chaos_io_real_unlinkat;   /**< Downstream `unlinkat`. */
 extern chaos_io_truncate_fn g_chaos_io_real_truncate;   /**< Downstream `truncate`. */
 extern chaos_io_fopen_fn g_chaos_io_real_fopen;         /**< Downstream `fopen`. */
+extern chaos_io_fread_fn g_chaos_io_real_fread;         /**< Downstream `fread`. */
+extern chaos_io_fwrite_fn g_chaos_io_real_fwrite;       /**< Downstream `fwrite`. */
+extern chaos_io_fgets_fn g_chaos_io_real_fgets;         /**< Downstream `fgets`. */
+extern chaos_io_fputs_fn g_chaos_io_real_fputs;         /**< Downstream `fputs`. */
+extern chaos_io_fgetc_fn g_chaos_io_real_fgetc;         /**< Downstream `fgetc`. */
+extern chaos_io_fgetc_fn g_chaos_io_real_getc;          /**< Downstream `getc`. */
+extern chaos_io_fputc_fn g_chaos_io_real_fputc;         /**< Downstream `fputc`. */
+extern chaos_io_fputc_fn g_chaos_io_real_putc;          /**< Downstream `putc`. */
+extern chaos_io_getdelim_fn g_chaos_io_real_getdelim;   /**< Downstream `getdelim`. */
+extern chaos_io_vfprintf_fn g_chaos_io_real_vfprintf;   /**< Downstream `vfprintf`. */
+extern chaos_io_fflush_fn g_chaos_io_real_fflush;       /**< Downstream `fflush`. */
+extern chaos_io_vfprintf_chk_fn
+    g_chaos_io_real_vfprintf_chk; /**< Downstream `__vfprintf_chk` (optional). */
+extern chaos_io_fread_chk_fn g_chaos_io_real_fread_chk; /**< Downstream `__fread_chk` (optional). */
+extern chaos_io_fgets_chk_fn g_chaos_io_real_fgets_chk; /**< Downstream `__fgets_chk` (optional). */
 extern chaos_io_freopen_fn g_chaos_io_real_freopen;     /**< Downstream `freopen`. */
 extern chaos_io_renameat2_fn
     g_chaos_io_real_renameat2; /**< Downstream `renameat2`; NULL when libc lacks it. */
