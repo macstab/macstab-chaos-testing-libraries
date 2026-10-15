@@ -21,6 +21,7 @@
  * - `LATENCY` injection on `mprotect` (≥ 90 ms added sleep)
  * - `ERRNO` injection on `madvise` (synthetic `EINVAL`)
  * - `LATENCY` injection on `madvise` (≥ 80 ms added sleep)
+ * - `ERRNO` on `madvise` also fails `posix_madvise`, returned as the error number
  * - `ERRNO` injection on `munmap` (synthetic `EINVAL`; chaos cleared before cleanup)
  * - `LATENCY` injection on `munmap` (≥ 80 ms added sleep)
  *
@@ -284,6 +285,33 @@ static int probe_madvise_errno(void)
     return rc == -1 && errno == EINVAL ? 0 : 61;
 }
 
+/*
+ * posix_madvise() is implemented with the madvise system call directly; it must
+ * still follow the madvise rules, report the error by value and keep errno.
+ */
+static int probe_posix_madvise_errno(void)
+{
+    size_t length;
+    void *mapping = map_rw_page(&length);
+    int rc;
+
+    if (mapping == MAP_FAILED)
+    {
+        return 62;
+    }
+    rc = write_config("madvise:ERRNO:EINVAL");
+    if (rc != 0)
+    {
+        (void)munmap(mapping, length);
+        return rc;
+    }
+
+    errno = 4242;
+    rc = posix_madvise(mapping, length, POSIX_MADV_SEQUENTIAL);
+    (void)munmap(mapping, length);
+    return rc == EINVAL && errno == 4242 ? 0 : 63;
+}
+
 static int probe_madvise_latency(void)
 {
     struct timespec start;
@@ -435,6 +463,11 @@ int main(void)
         return rc;
     }
     rc = probe_madvise_latency();
+    if (rc != 0)
+    {
+        return rc;
+    }
+    rc = probe_posix_madvise_errno();
     if (rc != 0)
     {
         return rc;

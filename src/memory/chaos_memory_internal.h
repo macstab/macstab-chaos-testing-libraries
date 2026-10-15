@@ -166,6 +166,9 @@ typedef int (*chaos_memory_mprotect_fn)(void *, size_t, int);
 /** @brief Signature of the real madvise(2). */
 typedef int (*chaos_memory_madvise_fn)(void *, size_t, int);
 
+/** @brief Signature of the real posix_madvise(3). */
+typedef int (*chaos_memory_posix_madvise_fn)(void *, size_t, int);
+
 /* =========================================================================
  * Resolved real-symbol pointers
  * =========================================================================
@@ -186,6 +189,9 @@ extern chaos_memory_mprotect_fn g_chaos_memory_real_mprotect;
 
 /** @brief Pointer to the real madvise(2) resolved via RTLD_NEXT. */
 extern chaos_memory_madvise_fn g_chaos_memory_real_madvise;
+
+/** @brief Pointer to the real posix_madvise(3) resolved via RTLD_NEXT. */
+extern chaos_memory_posix_madvise_fn g_chaos_memory_real_posix_madvise;
 
 /* =========================================================================
  * TLS reentrancy guard and PRNG state

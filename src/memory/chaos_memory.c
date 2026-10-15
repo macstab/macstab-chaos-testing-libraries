@@ -74,6 +74,9 @@ chaos_memory_mprotect_fn g_chaos_memory_real_mprotect = NULL;
 /** @brief Real madvise(2) function pointer, resolved via RTLD_NEXT at startup. */
 chaos_memory_madvise_fn g_chaos_memory_real_madvise = NULL;
 
+/** @brief Real posix_madvise(3) function pointer, resolved via RTLD_NEXT. */
+chaos_memory_posix_madvise_fn g_chaos_memory_real_posix_madvise = NULL;
+
 /**
  * @brief Per-thread reentrancy guard.
  *
@@ -278,6 +281,7 @@ static void chaos_memory_resolve_all_symbols(void)
     chaos_memory_resolve_symbol(&g_chaos_memory_real_munmap, "munmap");
     chaos_memory_resolve_symbol(&g_chaos_memory_real_mprotect, "mprotect");
     chaos_memory_resolve_symbol(&g_chaos_memory_real_madvise, "madvise");
+    chaos_memory_resolve_symbol(&g_chaos_memory_real_posix_madvise, "posix_madvise");
 }
 
 void chaos_memory_ensure_symbols(void)

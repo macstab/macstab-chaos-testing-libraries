@@ -176,6 +176,22 @@ static int chaos_memory_call_real_munmap(void *address, size_t length)
  *
  * @return  0 on success, -1 on error (errno set by the real function).
  */
+/**
+ * @brief Calls the real posix_madvise under the reentrancy guard.
+ *
+ * @return 0 on success; an error number on failure.
+ */
+static int chaos_memory_call_real_posix_madvise(void *address, size_t length, int advice)
+{
+    int previous;
+    int rc;
+
+    previous = chaos_memory_enter_internal();
+    rc = g_chaos_memory_real_posix_madvise(address, length, advice);
+    chaos_memory_leave_internal(previous);
+    return rc;
+}
+
 static int chaos_memory_call_real_madvise(void *address, size_t length, int advice)
 {
     int previous;
@@ -413,6 +429,49 @@ CHAOS_MEMORY_EXPORT int madvise(void *address, size_t length, int advice)
     }
 
     return chaos_memory_call_real_madvise(address, length, advice);
+}
+
+/**
+ * @brief Interposed posix_madvise(3): the madvise rules.
+ *
+ * @details glibc and musl implement posix_madvise() with the madvise system call
+ * directly, never through madvise(). It reports failure as the returned error
+ * number and leaves errno alone.
+ *
+ * @return 0 on success; an error number on failure.
+ */
+CHAOS_MEMORY_EXPORT int posix_madvise(void *address, size_t length, int advice)
+{
+    chaos_memory_rule_t latency_rule;
+    chaos_memory_rule_t errno_rule;
+    int saved_errno;
+    int injected;
+
+    chaos_memory_ensure_symbols();
+
+    if (chaos_memory_in_internal())
+    {
+        return chaos_memory_call_real_posix_madvise(address, length, advice);
+    }
+
+    if (chaos_memory_config_match(
+            CHAOS_MEMORY_EFFECT_LATENCY, CHAOS_MEMORY_OP_MADVISE, 0, &latency_rule
+        ))
+    {
+        chaos_memory_rule_apply_latency(&latency_rule);
+    }
+    saved_errno = errno;
+    if (chaos_memory_config_match(
+            CHAOS_MEMORY_EFFECT_ERRNO, CHAOS_MEMORY_OP_MADVISE, 0, &errno_rule
+        ) &&
+        chaos_memory_rule_apply_errno(&errno_rule))
+    {
+        injected = errno;
+        errno = saved_errno;
+        return injected;
+    }
+
+    return chaos_memory_call_real_posix_madvise(address, length, advice);
 }
 
 /* On 64-bit glibc mmap64() is a separate symbol with mmap()'s signature; the JVM,

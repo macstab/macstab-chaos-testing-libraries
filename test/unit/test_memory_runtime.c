@@ -117,6 +117,15 @@ static int stub_mprotect(void *address, size_t length, int protection)
     return 0;
 }
 
+/** @brief Stub for `posix_madvise(3)`. Returns 0 (success). */
+static int stub_posix_madvise(void *address, size_t length, int advice)
+{
+    (void)address;
+    (void)length;
+    (void)advice;
+    return 0;
+}
+
 /** @brief Stub for `madvise(2)`. Returns 0 (success). */
 static int stub_madvise(void *address, size_t length, int advice)
 {
@@ -166,6 +175,8 @@ static void *chaos_memory_test_dlsym(void *handle, const char *symbol)
         return CHAOS_MEMORY_TEST_DLSYM_RESULT(chaos_memory_mprotect_fn, stub_mprotect);
     if (strcmp(symbol, "madvise") == 0)
         return CHAOS_MEMORY_TEST_DLSYM_RESULT(chaos_memory_madvise_fn, stub_madvise);
+    if (strcmp(symbol, "posix_madvise") == 0)
+        return CHAOS_MEMORY_TEST_DLSYM_RESULT(chaos_memory_posix_madvise_fn, stub_posix_madvise);
     return NULL;
 }
 
@@ -371,6 +382,7 @@ static void test_constructor_init(void)
     assert(g_chaos_memory_real_munmap == stub_munmap);
     assert(g_chaos_memory_real_mprotect == stub_mprotect);
     assert(g_chaos_memory_real_madvise == stub_madvise);
+    assert(g_chaos_memory_real_posix_madvise == stub_posix_madvise);
     assert(g_config_init_calls == config_calls_before + 1);
     assert(g_chaos_memory_process_seed != 0U);
     assert(g_chaos_memory_tls_prng_state != 0U);

@@ -297,6 +297,19 @@ static int chaos_memory_test_madvise(void *address, size_t length, int advice)
     return 0;
 }
 
+/** @brief Number of times `chaos_memory_test_posix_madvise` was called. */
+static int g_real_posix_madvise_calls = 0;
+
+/** @brief Stub for the real posix_madvise(3). Returns 0. */
+static int chaos_memory_test_posix_madvise(void *address, size_t length, int advice)
+{
+    (void)address;
+    (void)length;
+    (void)advice;
+    ++g_real_posix_madvise_calls;
+    return 0;
+}
+
 #include "../../src/memory/chaos_memory_hooks.c"
 
 /**
@@ -560,6 +573,49 @@ static void test_madvise_paths(void)
     assert(errno == ENOMEM);
 }
 
+/**
+ * @brief Invariant: posix_madvise follows the madvise rules and reports errors by value.
+ *
+ * Expected observable behaviour:
+ * - Under the guard and without a rule: the real posix_madvise runs.
+ * - LATENCY: delay applied, then the real call.
+ * - ERRNO: the error number is returned, errno untouched, no real call.
+ */
+static void test_posix_madvise_paths(void)
+{
+    reset_wrapper_state();
+    g_real_posix_madvise_calls = 0;
+    g_chaos_memory_real_posix_madvise = chaos_memory_test_posix_madvise;
+    g_chaos_memory_tls_guard = 1;
+    assert(posix_madvise((void *)(uintptr_t)0x1000U, 4096U, POSIX_MADV_NORMAL) == 0);
+    g_chaos_memory_tls_guard = 0;
+    assert(posix_madvise((void *)(uintptr_t)0x1000U, 4096U, POSIX_MADV_NORMAL) == 0);
+    assert(g_real_posix_madvise_calls == 2);
+
+    reset_wrapper_state();
+    g_real_posix_madvise_calls = 0;
+    g_chaos_memory_real_posix_madvise = chaos_memory_test_posix_madvise;
+    g_stub_match[CHAOS_MEMORY_EFFECT_LATENCY][CHAOS_MEMORY_OP_MADVISE] = 1;
+    g_stub_rules[CHAOS_MEMORY_EFFECT_LATENCY][CHAOS_MEMORY_OP_MADVISE].effect =
+        CHAOS_MEMORY_EFFECT_LATENCY;
+    assert(posix_madvise((void *)(uintptr_t)0x1000U, 4096U, POSIX_MADV_NORMAL) == 0);
+    assert(g_latency_calls == 1);
+    assert(g_real_posix_madvise_calls == 1);
+
+    reset_wrapper_state();
+    g_real_posix_madvise_calls = 0;
+    g_chaos_memory_real_posix_madvise = chaos_memory_test_posix_madvise;
+    g_stub_match[CHAOS_MEMORY_EFFECT_ERRNO][CHAOS_MEMORY_OP_MADVISE] = 1;
+    g_stub_rules[CHAOS_MEMORY_EFFECT_ERRNO][CHAOS_MEMORY_OP_MADVISE].effect =
+        CHAOS_MEMORY_EFFECT_ERRNO;
+    g_stub_rules[CHAOS_MEMORY_EFFECT_ERRNO][CHAOS_MEMORY_OP_MADVISE].errnum = EAGAIN;
+    g_errno_trigger = 1;
+    errno = 4242;
+    assert(posix_madvise((void *)(uintptr_t)0x1000U, 4096U, POSIX_MADV_NORMAL) == EAGAIN);
+    assert(errno == 4242);
+    assert(g_real_posix_madvise_calls == 0);
+}
+
 int main(void)
 {
     test_call_real_helpers();
@@ -567,5 +623,6 @@ int main(void)
     test_munmap_paths();
     test_mprotect_paths();
     test_madvise_paths();
+    test_posix_madvise_paths();
     return 0;
 }
