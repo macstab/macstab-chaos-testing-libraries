@@ -20,7 +20,9 @@ repository. Repository-wide ownership rules live in
 Current implementation status:
 
 - shipped and tested on glibc/musl and amd64/arm64
-- exact interposed symbols today: `getaddrinfo()` and `getnameinfo()`
+- exact interposed symbols today: `getaddrinfo()`, `getnameinfo()`, and under the same
+  rules `gethostbyname()`, `gethostbyname2()`, `gethostbyname_r()`, `gethostbyname2_r()`,
+  `gethostbyaddr()` and `gethostbyaddr_r()`
 - config path: `/tmp/.chaos-dns.conf`
 - enforced source-line coverage gate enabled for shipped `src/dns/*.c`
   with `100.00%` on `chaos_dns_actions.c` and `chaos_dns.c`, and a minimum
@@ -57,8 +59,8 @@ Important current boundaries:
   selectors keyed by numeric address text
 - reverse lookup does not support `OVERRIDE`, `FILTER_FAMILY`, `LIMIT`, or
   `SHUFFLE`
-- legacy resolver entry points such as `gethostbyname*()`, `gethostbyaddr*()`,
-  and `res_*()` are not interposed yet
+- the legacy `gethostbyname*()` and `gethostbyaddr*()` resolvers follow the same
+  rules (see the legacy resolver section); `res_*()` is not interposed
 - multiple different effect kinds can compose on the same query
 - post-resolution transforms for `getaddrinfo()` run in this order:
   `FILTER_FAMILY`, `SHUFFLE`, then `LIMIT`
@@ -85,7 +87,7 @@ Important current boundaries:
 14. [Config Reload Protocol — Two-Snapshot CAS](#config-reload-protocol--two-snapshot-cas)
 15. [glibc vs musl Divergence](#glibc-vs-musl-divergence)
 16. [NSS Plumbing and the nsswitch.conf Stack](#nss-plumbing-and-the-nsswitchconf-stack)
-17. [Legacy Resolver API Non-Coverage — res_*(), gethostbyname](#legacy-resolver-api-non-coverage----res_-gethostbyname)
+17. [Legacy Resolver APIs — gethostbyname coverage, res_*() non-coverage](#legacy-resolver-apis----gethostbyname-coverage-res_-non-coverage)
 18. [Execution Boundary Summary](#execution-boundary-summary)
 
 ---
@@ -328,8 +330,7 @@ Reverse lookup through `getnameinfo()`:
 
 This library does not currently:
 
-- own legacy resolver APIs such as `gethostbyname*()`, `gethostbyaddr*()`, or
-  `res_*()`
+- own the raw `res_*()` resolver API
 - parse DNS headers or packet payloads
 - rewrite TTLs, RCODEs, or RRsets on the wire
 - control nameserver retry order or transport fallback
@@ -1243,29 +1244,32 @@ interposition layer.
 
 Reference: `nsswitch.conf(5)`, `resolv.conf(5)`, `nss(5)`.
 
-## Legacy Resolver API Non-Coverage — res_*(), gethostbyname
+## Legacy Resolver APIs — gethostbyname coverage, res_*() non-coverage
 
 ### gethostbyname / gethostbyaddr Family
 
-`gethostbyname(3)` and `gethostbyaddr(3)` (POSIX.1-2001, marked obsolescent)
-are older resolver entry points. They return `struct hostent` rather than
-`struct addrinfo`. They are:
+`gethostbyname(3)`, `gethostbyname2(3)`, their `_r` forms, `gethostbyaddr(3)` and
+`gethostbyaddr_r(3)` return `struct hostent` rather than `struct addrinfo`. glibc
+and musl resolve them through their internal lookup code, never through
+`getaddrinfo()` or `getnameinfo()`, so they have their own wrappers:
 
-- not thread-safe (global `struct hostent` buffer in glibc, per-thread in musl)
-- IPv4-only for `gethostbyname` (no AF_INET6 support in the struct)
-- superseded by `getaddrinfo()` since POSIX.1-2001
+- forward lookups follow the `dns://` rules of the name, reverse lookups the
+  `rdns://` rules of the address;
+- LATENCY and GAI apply first; the EAI code is reported as the matching
+  `h_errno` (`EAI_NONAME` → `HOST_NOT_FOUND`, `EAI_AGAIN` → `TRY_AGAIN`,
+  `EAI_NODATA`/`EAI_ADDRFAMILY` → `NO_DATA`, anything else → `NO_RECOVERY`); the
+  `_r` forms return 0 with `*result == NULL`, as libc does for a failed lookup;
+- when only LATENCY/GAI rules match, the real resolver answers unchanged
+  (aliases included);
+- when a rule shapes the answer (REWRITE, OVERRIDE, FILTER_FAMILY, SHUFFLE,
+  LIMIT), the answer comes from the same pipeline as `getaddrinfo()` and is laid
+  out as a `hostent` (canonical name, no aliases), so both APIs see the same
+  addresses; a buffer that is too small yields `ERANGE` like libc;
+- reverse lookups support REWRITE of `h_name`; the `_r` form stores the new name
+  at the end of the caller's buffer and gives the real resolver the rest.
 
-Why not interposed:
-
-1. glibc's `gethostbyname` internally calls `getaddrinfo()` on modern glibc
-   (≥ 2.25). Interposing `getaddrinfo()` therefore covers `gethostbyname`
-   transitively on glibc. On musl, `gethostbyname` also calls through a common
-   resolver path.
-2. The `struct hostent` API is too narrow (IPv4 only) to need its own injection
-   surface; all meaningful scenarios are covered via `getaddrinfo()`.
-3. `gethostbyname_r` (reentrant) and `gethostbyaddr_r` would need separate
-   wrappers with different return semantics. The value does not justify the
-   complexity.
+`gethostbyname` and `gethostbyname_r` are the `AF_INET` forms of
+`gethostbyname2`/`gethostbyname2_r`.
 
 ### res_*() — Low-Level Resolver Interface
 

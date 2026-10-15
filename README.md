@@ -509,6 +509,8 @@ Exact interposed symbols today:
 
 - `getaddrinfo()`
 - `getnameinfo()`
+- `gethostbyname()`, `gethostbyname2()`, their `_r` forms, `gethostbyaddr()` and
+  `gethostbyaddr_r()`, under the same `dns://` and `rdns://` rules
 
 Supported selectors:
 
@@ -529,12 +531,12 @@ Implemented effects:
 
 Important current boundary:
 
-- `libchaos-dns` currently owns `getaddrinfo()` and `getnameinfo()`
+- `libchaos-dns` currently owns `getaddrinfo()`, `getnameinfo()` and the legacy
+  `gethostbyname*()`/`gethostbyaddr*()` resolvers
 - reverse rules are address-based and use `rdns://...` selectors
 - reverse lookup currently supports `EAI_*`, `LATENCY`, `REWRITE`, and
   `SERVICE` only
-- legacy resolver APIs such as `gethostbyname*()`, `gethostbyaddr*()`, and
-  `res_*()` remain future work
+- the raw `res_*()` resolver API remains future work
 - rule matching is selector-specific and effect-specific; different effect
   kinds can compose on the same query
 - post-resolution transforms for `getaddrinfo()` currently run in this order:

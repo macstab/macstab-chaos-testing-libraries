@@ -133,7 +133,7 @@ Current ownership boundary:
 | --- | --- | --- |
 | `libchaos-io` | file symbols such as `open`, `openat`, `pread`, `pwrite`, `fsync`, `fdatasync`, `sendfile`, `copy_file_range`, `ftruncate`, `truncate`, `fallocate`, `posix_fallocate`, `renameat`, `renameat2`, `rename`, `unlinkat`, `unlink`, `rmdir`, `remove`, `creat`, `dup2`, `dup3`, `close_range`; and `read`, `write`, `readv`, `writev`, `close` **for files** | socket/DNS/wait symbols; any decision on a socket |
 | `libchaos-net` | socket/wait symbols such as `socket`, `socketpair`, `bind`, `listen`, `connect`, `accept`, `accept4`, `shutdown`, `send*`, `recv*`, `poll`, `ppoll`, `select`, `pselect`, `epoll_wait`, `epoll_pwait`; and `read`, `write`, `readv`, `writev`, `close` **for sockets** | any decision on a file; DNS symbols |
-| `libchaos-dns` | resolver symbols such as `getaddrinfo` and `getnameinfo` | generic fd/file symbols, socket symbols, wait symbols |
+| `libchaos-dns` | resolver symbols such as `getaddrinfo`, `getnameinfo`, and the `gethostbyname*`/`gethostbyaddr*` family | generic fd/file symbols, socket symbols, wait symbols |
 | `libchaos-time` | clock/sleep symbols such as `clock_gettime`, `nanosleep`, `usleep` | any symbol already owned by IO, NET, or DNS |
 | `libchaos-process` | process lifecycle symbols such as `pthread_create`, `fork`, `posix_spawn`, `posix_spawnp`, `execve`, `execveat`, the exec family, `system`, `popen`, `waitpid`, `wait`, `wait3`, `wait4`, and `waitid` | any symbol already owned by IO or NET |
 | `libchaos-memory` | memory-management symbols such as `mmap`, `munmap`, `mprotect`, `madvise`, and `posix_madvise` | any symbol already owned by IO or NET |
