@@ -116,6 +116,13 @@ once per system call the C library makes while filling or flushing a buffer.
 Descriptors 0-2 are left alone as everywhere, so `printf`, `puts`, `putchar` and
 `getchar` are not wrapped. Not covered: the scanf family (glibc redirects it to
 `__isoc99_*`/`__isoc23_*` names) and the `*_unlocked` variants.
+The stdio wrappers match on the stream's descriptor through the fd-to-path cache,
+so streams keep that cache right: `fopen` and `freopen` record the new descriptor's
+path (or drop the entry for an excluded path), and an interposed `fclose` drops it,
+since the C library closes with its own system call and the next file opened under
+the same number would otherwise inherit the old path. The error indicator is set
+under the stream lock, and a lookup on a stream without a descriptor (`fmemopen`,
+cookie streams) leaves errno as it was.
 `test/runtime/test_stdio.sh` checks glibc (also with `_FORTIFY_SOURCE=2`) and musl.
 `test/runtime/test_path_forms.sh` checks them on glibc and musl.
 

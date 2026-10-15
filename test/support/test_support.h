@@ -118,6 +118,7 @@
     chaos_io_unlinkat_fn g_chaos_io_real_unlinkat = NULL;                                          \
     chaos_io_truncate_fn g_chaos_io_real_truncate = NULL;                                          \
     chaos_io_fopen_fn g_chaos_io_real_fopen = NULL;                                                \
+    chaos_io_fclose_fn g_chaos_io_real_fclose = NULL;                                              \
     chaos_io_fread_fn g_chaos_io_real_fread = NULL;                                                \
     chaos_io_fwrite_fn g_chaos_io_real_fwrite = NULL;                                              \
     chaos_io_fgets_fn g_chaos_io_real_fgets = NULL;                                                \

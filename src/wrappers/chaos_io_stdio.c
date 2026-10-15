@@ -39,6 +39,7 @@
  */
 
 #include "chaos_io_actions.h"
+#include "chaos_io_fdcache.h"
 #include "chaos_io_internal.h"
 #include "chaos_io_wrappers.h"
 
@@ -56,7 +57,10 @@
 static void chaos_io_stdio_mark_error(FILE *stream)
 {
 #ifdef __linux__
+    /* Under the stream lock: the C library updates the same word under it. */
+    flockfile(stream);
     *(volatile int *)(void *)stream |= CHAOS_IO_STDIO_ERROR_FLAG;
+    funlockfile(stream);
 #else
     (void)stream;
 #endif
@@ -81,14 +85,19 @@ static int chaos_io_stdio_rule(
     FILE *stream, chaos_io_operation_t operation, uint64_t size, chaos_io_rule_t *rule
 )
 {
+    const int saved_errno = errno;
+    int matched;
     int fd;
 
     if (stream == NULL || chaos_io_in_internal())
     {
         return 0;
     }
+    /* fileno() sets EBADF for streams without a descriptor (fmemopen, cookies). */
     fd = fileno(stream);
-    return fd >= 0 && chaos_io_match_fd_rule_sized(fd, operation, size, rule);
+    matched = fd >= 0 && chaos_io_match_fd_rule_sized(fd, operation, size, rule);
+    errno = saved_errno;
+    return matched;
 }
 
 /**
@@ -335,6 +344,30 @@ CHAOS_IO_EXPORT int fprintf(FILE *stream, const char *format, ...)
     rc = chaos_io_stdio_vprintf(stream, -1, format, arguments);
     va_end(arguments);
     return rc;
+}
+
+/**
+ * @brief Interposed `fclose(3)`: forgets the descriptor's cached path.
+ *
+ * @details The C library closes the descriptor with its own system call, so the
+ * close() wrapper never sees it, and the next file opened under the same number
+ * would otherwise inherit this stream's path.
+ */
+CHAOS_IO_EXPORT int fclose(FILE *stream)
+{
+    chaos_io_ensure_symbols();
+    if (!chaos_io_in_internal())
+    {
+        const int saved_errno = errno;
+        const int fd = fileno(stream);
+
+        if (fd >= 0)
+        {
+            chaos_io_fdcache_invalidate(fd);
+        }
+        errno = saved_errno;
+    }
+    return g_chaos_io_real_fclose(stream);
 }
 
 /* --- Fortified entry points (_FORTIFY_SOURCE builds) ------------------------------ */

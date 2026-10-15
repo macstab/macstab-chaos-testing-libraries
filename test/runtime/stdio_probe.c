@@ -84,6 +84,28 @@ int main(void)
     expect("fgetc faulted", fgetc(stream) == EOF && ferror(stream));
     clearerr(stream);
     expect("getline faulted", getline(&line, &capacity, stream) == -1 && errno == EIO);
+    {
+        /* A descriptor number reused after fclose() must not keep the old path. */
+        FILE *first = fopen(DIR "/other.txt", "w");
+        FILE *proc;
+        int first_fd = first != NULL ? fileno(first) : -1;
+
+        /* Writing through the stream makes the library look up, and cache, its path. */
+        expect(
+            "fclose of a matched file",
+            first != NULL && fwrite("x", 1U, 1U, first) == 1U && fclose(first) == 0
+        );
+        proc = fopen("/proc/self/status", "r");
+        expect(
+            "a reused descriptor is not faulted for the old path",
+            proc != NULL && fileno(proc) == first_fd && fgets(buffer, sizeof(buffer), proc) != NULL
+        );
+        if (proc != NULL)
+        {
+            (void)fclose(proc);
+        }
+        (void)unlink(DIR "/other.txt");
+    }
 
     write_rules(DIR ":read:CORRUPT:1.0\n");
     clearerr(stream);

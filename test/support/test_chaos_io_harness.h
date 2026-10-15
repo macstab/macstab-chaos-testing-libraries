@@ -1345,7 +1345,8 @@ static int chaos_test_is_stdio_symbol(const char *symbol)
         "fflush",
         "__vfprintf_chk",
         "__fread_chk",
-        "__fgets_chk"
+        "__fgets_chk",
+        "fclose"
     };
     size_t index;
 
@@ -1630,6 +1631,11 @@ static long chaos_test_syscall(long number, ...)
  */
 static void chaos_test_bind_real_stdio(void)
 {
+    {
+        void *resolved = dlsym(RTLD_NEXT, "fclose");
+
+        (void)memcpy(&g_chaos_io_real_fclose, &resolved, sizeof(resolved));
+    }
     {
         void *resolved = dlsym(RTLD_NEXT, "fread");
 

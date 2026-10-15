@@ -287,6 +287,9 @@ typedef size_t (*chaos_io_fread_chk_fn)(void *, size_t, size_t, size_t, FILE *);
 /** @brief Type of the real `__fgets_chk` libc symbol. */
 typedef char *(*chaos_io_fgets_chk_fn)(char *, size_t, int, FILE *);
 
+/** @brief Type of the real `fclose` libc symbol. */
+typedef int (*chaos_io_fclose_fn)(FILE *);
+
 /** @brief Type of the real `fopen(3)` libc symbol. */
 typedef FILE *(*chaos_io_fopen_fn)(const char *, const char *);
 
@@ -356,6 +359,7 @@ extern chaos_io_ftruncate_fn g_chaos_io_real_ftruncate; /**< Downstream `ftrunca
 extern chaos_io_unlinkat_fn g_chaos_io_real_unlinkat;   /**< Downstream `unlinkat`. */
 extern chaos_io_truncate_fn g_chaos_io_real_truncate;   /**< Downstream `truncate`. */
 extern chaos_io_fopen_fn g_chaos_io_real_fopen;         /**< Downstream `fopen`. */
+extern chaos_io_fclose_fn g_chaos_io_real_fclose;       /**< Downstream `fclose`. */
 extern chaos_io_fread_fn g_chaos_io_real_fread;         /**< Downstream `fread`. */
 extern chaos_io_fwrite_fn g_chaos_io_real_fwrite;       /**< Downstream `fwrite`. */
 extern chaos_io_fgets_fn g_chaos_io_real_fgets;         /**< Downstream `fgets`. */

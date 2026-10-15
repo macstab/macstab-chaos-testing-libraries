@@ -2448,8 +2448,72 @@ static void test_stdio_wrappers(void)
     free(line);
 }
 
+/**
+ * @brief Invariant: streams keep the fd-to-path cache right, and stdio lookups leave
+ *   errno alone.
+ *
+ * Expected observable behaviour: fopen caches the stream's descriptor with its path;
+ *   freopen onto an excluded path drops the entry; fclose drops it; nothing is
+ *   cached under the guard; a passthrough call on a stream without a descriptor
+ *   leaves errno as it was.
+ */
+static void test_stdio_streams_keep_the_cache_right(void)
+{
+    char buffer[16];
+    FILE *stream;
+    FILE *memory;
+    int stores;
+    int invalidations;
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_fopen_return = tmpfile();
+    assert(g_real_fopen_return != NULL);
+    stream = fopen("/tmp/stdio-cache.txt", "w+");
+    assert(stream == g_real_fopen_return);
+    assert(g_fdcache_store_calls == 1 && g_last_store_fd == fileno(stream));
+    assert(strcmp(g_last_store_path, "/tmp/stdio-cache.txt") == 0);
+
+    /* Reopened onto an excluded path: the entry is dropped, not replaced. */
+    assert(freopen("/proc/self/status", "r", stream) == stream);
+    assert(g_fdcache_store_calls == 1 && g_last_invalidate_fd == fileno(stream));
+    /* A NULL path keeps the file: no change. */
+    invalidations = g_fdcache_invalidate_calls;
+    assert(freopen(NULL, "r", stream) == stream);
+    assert(g_fdcache_invalidate_calls == invalidations);
+    /* A stream without a descriptor is not cached. */
+    memory = fmemopen(buffer, sizeof(buffer), "w");
+    assert(memory != NULL);
+    g_real_fopen_return = memory;
+    stores = g_fdcache_store_calls;
+    assert(fopen("/tmp/stdio-cache.txt", "w") == memory);
+    assert(g_fdcache_store_calls == stores && g_fdcache_invalidate_calls == invalidations);
+
+    /* Under the guard nothing is cached or dropped. */
+    g_chaos_io_tls_guard = 1;
+    g_real_fopen_return = stream;
+    assert(fopen("/tmp/stdio-cache.txt", "r") == stream);
+    assert(freopen("/tmp/stdio-cache.txt", "r", stream) == stream);
+    assert(fclose(memory) == 0);
+    assert(g_fdcache_store_calls == stores && g_fdcache_invalidate_calls == invalidations);
+    g_chaos_io_tls_guard = 0;
+
+    /* fclose drops the entry of a stream with a descriptor. */
+    assert(fclose(stream) == 0);
+    assert(g_fdcache_invalidate_calls == invalidations + 1);
+
+    /* A passthrough call on a stream without a descriptor leaves errno alone. */
+    memory = fmemopen(buffer, sizeof(buffer), "w");
+    assert(memory != NULL);
+    errno = 4242;
+    assert(fputs("x", memory) >= 0);
+    assert(errno == 4242);
+    assert(fclose(memory) == 0);
+}
+
 int main(void)
 {
+    test_stdio_streams_keep_the_cache_right();
     test_stdio_wrappers();
     test_wrappers_record_call_size();
     test_stdio_open_wrappers();

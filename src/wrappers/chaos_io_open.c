@@ -54,6 +54,7 @@
 #include "chaos_io_config.h"
 #include "chaos_io_fdcache.h"
 #include "chaos_io_internal.h"
+#include "chaos_io_wrappers.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -423,14 +424,18 @@ CHAOS_IO_EXPORT int open(const char *path, int flags, ...)
  * without opening. Under the guard, or for an excluded or unmatched path, nothing
  * happens.
  */
-static int chaos_io_stdio_open_fault(const char *path)
+static int chaos_io_stdio_open_fault(const char *path, char *resolved_path, size_t resolved_size)
 {
     chaos_io_rule_t rule;
-    char resolved_path[CHAOS_IO_MAX_PATH];
 
+    resolved_path[0] = '\0';
     if (path == NULL || chaos_io_in_internal() ||
-        !chaos_io_resolve_at_path(AT_FDCWD, path, resolved_path, sizeof(resolved_path)) ||
-        chaos_io_is_excluded_path(resolved_path) ||
+        !chaos_io_resolve_at_path(AT_FDCWD, path, resolved_path, resolved_size))
+    {
+        resolved_path[0] = '\0';
+        return 0;
+    }
+    if (chaos_io_is_excluded_path(resolved_path) ||
         !chaos_io_config_match_path(CHAOS_IO_OP_OPEN, resolved_path, &rule))
     {
         return 0;
@@ -444,6 +449,33 @@ static int chaos_io_stdio_open_fault(const char *path)
 }
 
 /**
+ * @brief Records the descriptor of a stream fopen()/freopen() just opened.
+ *
+ * @details The C library opens the file with its own system call, so the open()
+ * wrapper never cached the path. Without this, the stream's descriptor keeps
+ * whatever path a closed descriptor of the same number had, and the stdio and
+ * read/write rules would match that stale path -- even for a /proc stream.
+ */
+static void chaos_io_cache_stream(FILE *stream, const char *resolved_path)
+{
+    const int saved_errno = errno;
+    const int fd = stream != NULL ? fileno(stream) : -1;
+
+    if (fd >= 0)
+    {
+        if (resolved_path[0] != '\0' && !chaos_io_is_excluded_path(resolved_path))
+        {
+            chaos_io_fdcache_store(fd, resolved_path);
+        }
+        else
+        {
+            chaos_io_fdcache_invalidate(fd);
+        }
+    }
+    errno = saved_errno;
+}
+
+/**
  * @brief Interposed `fopen(3)`: the open rules apply to the path.
  *
  * @details glibc and musl open the file with their own system call, so an open
@@ -453,12 +485,20 @@ static int chaos_io_stdio_open_fault(const char *path)
  */
 CHAOS_IO_EXPORT FILE *fopen(const char *path, const char *mode)
 {
+    char resolved_path[CHAOS_IO_MAX_PATH];
+    FILE *stream;
+
     chaos_io_ensure_symbols();
-    if (chaos_io_stdio_open_fault(path))
+    if (chaos_io_stdio_open_fault(path, resolved_path, sizeof(resolved_path)))
     {
         return NULL;
     }
-    return g_chaos_io_real_fopen(path, mode);
+    stream = g_chaos_io_real_fopen(path, mode);
+    if (stream != NULL && !chaos_io_in_internal())
+    {
+        chaos_io_cache_stream(stream, resolved_path);
+    }
+    return stream;
 }
 
 /**
@@ -470,8 +510,11 @@ CHAOS_IO_EXPORT FILE *fopen(const char *path, const char *mode)
  */
 CHAOS_IO_EXPORT FILE *freopen(const char *path, const char *mode, FILE *stream)
 {
+    char resolved_path[CHAOS_IO_MAX_PATH];
+    FILE *reopened;
+
     chaos_io_ensure_symbols();
-    if (chaos_io_stdio_open_fault(path))
+    if (chaos_io_stdio_open_fault(path, resolved_path, sizeof(resolved_path)))
     {
         const int injected = errno;
 
@@ -479,7 +522,13 @@ CHAOS_IO_EXPORT FILE *freopen(const char *path, const char *mode, FILE *stream)
         errno = injected;
         return NULL;
     }
-    return g_chaos_io_real_freopen(path, mode, stream);
+    reopened = g_chaos_io_real_freopen(path, mode, stream);
+    /* A NULL path keeps the open file; anything else replaced the descriptor's file. */
+    if (reopened != NULL && path != NULL && !chaos_io_in_internal())
+    {
+        chaos_io_cache_stream(reopened, resolved_path);
+    }
+    return reopened;
 }
 
 /**
