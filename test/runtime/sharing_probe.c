@@ -31,6 +31,8 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <time.h>
+#include <sys/syscall.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -57,7 +59,23 @@ static void check(const char *what, int ok)
 }
 
 /** Replaces a rule file atomically (new inode), as the framework's writers do. */
-static void write_rules(const char *path, const char *rules)
+/**
+ * @brief Waits until the library is due to look at its rule file again.
+ *
+ * Once rules are loaded the libraries look at the rule file at most every
+ * millisecond, so a change takes effect within that time, not on the very next
+ * call. The sleep is a raw system call: libchaos-time may be faulting nanosleep.
+ */
+static void wait_for_rule_check(void)
+{
+    struct timespec delay = {0, 2000000L};
+
+    while (syscall(SYS_clock_nanosleep, CLOCK_MONOTONIC, 0, &delay, &delay) != 0 && errno == EINTR)
+    {
+    }
+}
+
+static void write_rules_now(const char *path, const char *rules)
 {
     char staging[256];
     FILE *file;
@@ -69,6 +87,13 @@ static void write_rules(const char *path, const char *rules)
         perror("write_rules");
         exit(2);
     }
+}
+
+/** @brief Writes the rules, then waits until the library looks at them. */
+static void write_rules(const char *path, const char *rules)
+{
+    write_rules_now(path, rules);
+    wait_for_rule_check();
 }
 
 static int preloaded(const char *name)
@@ -173,6 +198,7 @@ static void scenario_socket_rules(void)
     check("a file is untouched by net rules", read(file, buffer, 4U) == 4);
 
     (void)unlink(NET_CONF);
+    wait_for_rule_check();
     check("the socket works again once the rules are gone", write(client, "ping", 4U) == 4);
     check("and reads", read(server, buffer, 4U) == 4);
     (void)close(file);
@@ -374,6 +400,7 @@ static void scenario_no_rules(void)
 
     (void)unlink(NET_CONF);
     (void)unlink(IO_CONF);
+    wait_for_rule_check();
     tcp_pair(&client, &server, &port);
     file = open_data_file(DATA_DIR, "plain.bin");
     check("socket write without rules", write(client, "ping", 4U) == 4);

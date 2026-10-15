@@ -55,6 +55,7 @@
  */
 
 #include "chaos_time_config.h"
+#include "chaos_clock.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -1401,6 +1402,34 @@ chaos_time_config_report(uint64_t observed_mtime, const chaos_time_config_state_
     }
 }
 
+/** @brief When this process last looked at the rule file (vDSO CLOCK_MONOTONIC, ns). */
+static volatile uint64_t g_chaos_time_last_check_ns = 0U;
+
+/** @brief Throttle for looking at the rule file; 0 looks on every call (unit tests). */
+static uint64_t g_chaos_time_check_interval_ns = CHAOS_CHECK_INTERVAL_NS;
+
+/**
+ * @brief Whether the rule file was looked at too recently to look again.
+ *
+ * @details Each look is a stat() system call, the largest part of a wrapper's cost.
+ * Once rules are loaded the file is looked at no more than every
+ * CHAOS_CHECK_INTERVAL_NS, so a change takes effect within that time instead of on
+ * the very next call. The first load, and any call while no rules are loaded yet,
+ * always looks.
+ */
+static int chaos_time_config_checked_recently(void)
+{
+    const uint64_t cached = chaos_time_atomic_load_u64(&g_chaos_time_cached_mtime);
+
+    if (cached == CHAOS_TIME_MTIME_UNKNOWN || cached == CHAOS_TIME_MTIME_RELOADING)
+    {
+        return 0;
+    }
+    return chaos_clock_checked_recently(
+        &g_chaos_time_last_check_ns, g_chaos_time_check_interval_ns
+    );
+}
+
 /**
  * @copydoc chaos_time_config_prepare
  *
@@ -1426,6 +1455,10 @@ static int chaos_time_config_refresh(void)
     size_t config_size;
     chaos_time_config_state_t *next_state;
 
+    if (chaos_time_config_checked_recently())
+    {
+        return chaos_time_config_active_state()->rule_count != 0U;
+    }
     observed_mtime = chaos_time_config_observed_mtime();
     cached_mtime = chaos_time_atomic_load_u64(&g_chaos_time_cached_mtime);
 

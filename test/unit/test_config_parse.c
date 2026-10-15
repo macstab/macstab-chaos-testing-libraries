@@ -1113,8 +1113,40 @@ static void test_hits_are_counted_and_reported(void)
     (void)unlink(CHAOS_IO_CONFIG_PATH);
 }
 
+/**
+ * @brief Invariant: once rules are loaded, the rule file is looked at no more often
+ *   than the check interval, and is looked at again once the interval has passed.
+ *
+ * Triggering condition: rules loaded; the rule file removed; prepare called right
+ *   after a look, then again with the last look one interval ago.
+ *
+ * Expected observable behaviour: the first call still sees the loaded rules (no
+ *   look), the second sees the file is gone.
+ */
+static void test_rule_file_check_is_throttled(void)
+{
+    chaos_test_reset_runtime();
+    chaos_test_use_real_io();
+    chaos_io_config_init();
+    chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/data:write:EIO:1.0\n");
+    g_chaos_io_cached_mtime = CHAOS_IO_MTIME_UNKNOWN;
+    assert(chaos_io_config_prepare() == 1);
+
+    assert(chaos_clock_now_ns() != 0U);
+    g_chaos_io_check_interval_ns = UINT64_C(10000000000);
+    g_chaos_io_last_check_ns = chaos_clock_now_ns();
+    (void)unlink(CHAOS_IO_CONFIG_PATH);
+    assert(chaos_io_config_prepare() == 1);
+
+    g_chaos_io_last_check_ns = chaos_clock_now_ns() - g_chaos_io_check_interval_ns;
+    assert(chaos_io_config_prepare() == 0);
+    g_chaos_io_check_interval_ns = 0U;
+}
+
 int main(void)
 {
+    /* Look at the rule file on every call; the throttle has its own test. */
+    g_chaos_io_check_interval_ns = 0U;
     chaos_test_backup_file(CHAOS_IO_CONFIG_PATH, &g_config_backup);
     assert(atexit(chaos_test_restore_config_path) == 0);
 
@@ -1134,6 +1166,7 @@ int main(void)
     test_parse_buffer_reports_rejected_line();
     test_prepare_reports_status();
     test_hits_are_counted_and_reported();
+    test_rule_file_check_is_throttled();
     test_read_file_rejects_changed_file();
     return 0;
 }

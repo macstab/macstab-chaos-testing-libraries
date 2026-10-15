@@ -844,7 +844,7 @@ Idempotency is entirely the application's concern.
 The library does not implement backpressure. Under heavy call volume, the main
 costs are:
 
-- `stat()` on every intercepted call
+- `stat()` of the rule file, at most every millisecond once rules are loaded
 - possible `readlink()` on fd-cache miss
 - linear rule scan
 - deliberate latency sleeps when configured
@@ -958,8 +958,10 @@ and external runtime dependencies.
 
 ### Performance-sensitive trade-offs
 
-- `stat()` on every call is expensive, but it gives immediate config pickup
-  without a daemon or polling thread.
+- the rule file is looked at no more than every millisecond: a change takes
+  effect within about 1 ms instead of on the very next call, which cut the
+  wrapper cost of a non-matching call by 0.3 to 1.2 µs (see ARCHITECTURE.md,
+  Change check). No daemon or polling thread is involved.
 - thread-local fd caching reduces repeated `readlink()` cost but weakens
   cross-thread path coherence.
 - no logs or metrics keeps the library small, but also reduces observability.

@@ -298,6 +298,8 @@ static void test_invalid_inputs(void)
 
 int main(void)
 {
+    /* Look at the rule file on every call; the throttle has its own test. */
+    g_chaos_io_check_interval_ns = 0U;
     chaos_io_config_init();
 
     test_roundtrip_errno_wildcard();

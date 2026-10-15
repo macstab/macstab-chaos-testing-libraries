@@ -138,6 +138,8 @@ static int write_config(const char *line, time_t stamp)
         return 34;
     }
 
+    /* The library looks at the rule file at most every millisecond. */
+    usleep(2000);
     return 0;
 }
 

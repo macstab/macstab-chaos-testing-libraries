@@ -740,7 +740,10 @@ Examples:
 - `close()` keeps Linux semantics: the descriptor is always released, and an injected error is reported after the real close (a synthetic error that left it open would leak it in programs that, correctly, never retry close).
 - `dup2`, `dup3` and `close_range` are forwarded unchanged; they only keep the fd-to-path cache correct for the descriptors they free or reassign. The cache is one lazily mapped table per process (no per-thread memory), so a close on one thread is seen by all.
 - On 64-bit glibc the large-file names `open64`, `openat64`, `pread64`, `pwrite64`, `preadv64`, `pwritev64`, `ftruncate64`, `fallocate64`, `sendfile64`, `fopen64` and `freopen64` are the same wrappers, and the fortified `__read_chk`, `__pread_chk`, `__pread64_chk`, `__open_2`, `__open64_2`, `__openat_2` and `__openat64_2` check the buffer like glibc and then run them. Programs bind to whichever name their build chose (the JDK, Redis, nginx and MySQL use the `64` names; `_FORTIFY_SOURCE` builds use the fortified ones), so each is intercepted.
-- The config file is checked with `stat()` on each intercepted call.
+- Once rules are loaded, the config file is checked with `stat()` at most every
+  millisecond (timed with the kernel's vDSO clock, not the interposed
+  `clock_gettime`), so a change takes effect within about 1 ms. Without a vDSO
+  clock it is checked on every call.
 - Reload is lock-free for readers and swaps between two config snapshots.
 - FD-backed operations resolve paths through `/proc/self/fd/<fd>` and cache them in thread-local storage.
 - The library uses a thread-local recursion guard.

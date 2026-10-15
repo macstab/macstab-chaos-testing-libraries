@@ -57,6 +57,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <sys/syscall.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
@@ -79,7 +80,23 @@ static long long elapsed_ms(const struct timespec *start, const struct timespec 
     return seconds * 1000LL + nanos / 1000000LL;
 }
 
-static int write_config(const char *line)
+/**
+ * @brief Waits until the library is due to look at its rule file again.
+ *
+ * Once rules are loaded the libraries look at the rule file at most every
+ * millisecond, so a change takes effect within that time, not on the very next
+ * call. The sleep is a raw system call: libchaos-time may be faulting nanosleep.
+ */
+static void wait_for_rule_check(void)
+{
+    struct timespec delay = {0, 2000000L};
+
+    while (syscall(SYS_clock_nanosleep, CLOCK_MONOTONIC, 0, &delay, &delay) != 0 && errno == EINTR)
+    {
+    }
+}
+
+static int write_config_now(const char *line)
 {
     struct timespec times[2];
     FILE *config = fopen("/tmp/.chaos-net.conf", "w");
@@ -113,6 +130,15 @@ static int write_config(const char *line)
     }
 
     return 0;
+}
+
+/** @brief Writes the rules, then waits until the library looks at them. */
+static int write_config(const char *line)
+{
+    const int rc = write_config_now(line);
+
+    wait_for_rule_check();
+    return rc;
 }
 
 static int set_reuseaddr(int fd)

@@ -1346,12 +1346,64 @@ static void test_forked_child_reports_own_hits(void)
     (void)unlink(CHAOS_NET_CONFIG_PATH);
 }
 
+/**
+ * @brief Invariant: once rules are loaded, the rule file is looked at no more often
+ *   than the check interval, and is looked at again once the interval has passed.
+ *
+ * Triggering condition: rules loaded; the rule file removed; prepare called right
+ *   after a look, then again with the last look one interval ago.
+ *
+ * Expected observable behaviour: the first call still sees the loaded rules (no
+ *   look), the second sees the file is gone.
+ */
+static void test_rule_file_check_is_throttled(void)
+{
+    chaos_net_config_init();
+    write_config_text("tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0\n", 81);
+    assert(chaos_net_config_prepare() == 1);
+
+    assert(chaos_clock_now_ns() != 0U);
+    g_chaos_net_check_interval_ns = UINT64_C(10000000000);
+    g_chaos_net_last_check_ns = chaos_clock_now_ns();
+    (void)unlink(CHAOS_NET_CONFIG_PATH);
+    assert(chaos_net_config_prepare() == 1);
+
+    g_chaos_net_last_check_ns = chaos_clock_now_ns() - g_chaos_net_check_interval_ns;
+    assert(chaos_net_config_prepare() == 0);
+    g_chaos_net_check_interval_ns = 0U;
+}
+
+/**
+ * @brief Invariant: the vDSO lookup fails safely on anything but a real vDSO.
+ *
+ * Expected observable behaviour: a NULL base, memory without an ELF header and an
+ *   unknown symbol name all give NULL; the real clock advances.
+ */
+static void test_vdso_lookup_rejects_bad_input(void)
+{
+    static const char not_elf[64] = "not an ELF image";
+    const uint64_t first = chaos_clock_now_ns();
+
+    assert(chaos_clock_vdso_lookup(0U, CHAOS_CLOCK_VDSO_SYMBOL) == NULL);
+    assert(chaos_clock_vdso_lookup((uintptr_t)not_elf, CHAOS_CLOCK_VDSO_SYMBOL) == NULL);
+    assert(
+        chaos_clock_vdso_lookup((uintptr_t)getauxval(AT_SYSINFO_EHDR), "no_such_symbol") == NULL
+    );
+    assert(chaos_clock_vdso_lookup((uintptr_t)getauxval(AT_SYSINFO_EHDR), NULL) == NULL);
+    assert(first != 0U && chaos_clock_now_ns() >= first);
+    assert(chaos_clock_checked_recently(&g_chaos_net_last_check_ns, 0U) == 0);
+}
+
 int main(void)
 {
+    /* Look at the rule file on every call; the throttle has its own test. */
+    g_chaos_net_check_interval_ns = 0U;
     test_parse_buffer_reports_rejected_line();
     test_prepare_reports_status();
     test_hits_are_counted_and_reported();
     test_forked_child_reports_own_hits();
+    test_rule_file_check_is_throttled();
+    test_vdso_lookup_rejects_bad_input();
     test_read_file_rejects_changed_file();
     test_helper_functions();
     test_parse_and_select_rules();

@@ -328,6 +328,36 @@ end note
 @enduml
 ```
 
+### Change check
+
+[`src/common/chaos_clock.h`](../src/common/chaos_clock.h)
+
+A `stat()` of the rule file on every intercepted call was the largest part of a
+wrapper's cost. Once rules are loaded, each library looks at the file at most
+every millisecond; the first load, and any call while no rules are loaded,
+always looks. A change therefore takes effect within about 1 ms instead of on
+the very next call. Tests that write rules and call at once must wait a few
+milliseconds (the runtime probes sleep 2 ms after each write); the Java side's
+`docker exec` round trip is far longer.
+
+The time comes from the kernel's vDSO `clock_gettime`, found once through
+`getauxval(AT_SYSINFO_EHDR)` and called directly: no system call, and not the C
+library's `clock_gettime`, which libchaos-time interposes (a time rule must not
+change how often the other libraries see their rules). Without a vDSO clock the
+file is looked at on every call, as before.
+
+Per-call cost with a rule file whose rules do not match (glibc, arm64 Docker,
+best of 5 × 200 000 calls):
+
+| library | operation | native | every call | throttled |
+|---|---|---:|---:|---:|
+| time | `clock_gettime` | 21 ns | 974 ns | 86 ns |
+| process | `waitpid(WNOHANG)` | 177 ns | 1140 ns | 240 ns |
+| memory | `mmap` + `munmap` | 973 ns | 2312 ns | 1079 ns |
+| dns | `getaddrinfo` | 9237 ns | 12044 ns | 9698 ns |
+| io | `write` | 161 ns | 1069 ns | 769 ns |
+| net | `send` + `recv` | 462 ns | 875 ns | 831 ns |
+
 ### Status file
 
 [`src/common/chaos_status.h`](../src/common/chaos_status.h)

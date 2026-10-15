@@ -1222,11 +1222,41 @@ static void test_hits_are_counted_and_reported(void)
     (void)unlink(CHAOS_MEMORY_CONFIG_PATH);
 }
 
+/**
+ * @brief Invariant: once rules are loaded, the rule file is looked at no more often
+ *   than the check interval, and is looked at again once the interval has passed.
+ *
+ * Triggering condition: rules loaded; the rule file removed; prepare called right
+ *   after a look, then again with the last look one interval ago.
+ *
+ * Expected observable behaviour: the first call still sees the loaded rules (no
+ *   look), the second sees the file is gone.
+ */
+static void test_rule_file_check_is_throttled(void)
+{
+    chaos_memory_config_init();
+    write_config_text("mprotect:LATENCY:25\n", 81);
+    assert(chaos_memory_config_prepare() == 1);
+
+    assert(chaos_clock_now_ns() != 0U);
+    g_chaos_memory_check_interval_ns = UINT64_C(10000000000);
+    g_chaos_memory_last_check_ns = chaos_clock_now_ns();
+    (void)unlink(CHAOS_MEMORY_CONFIG_PATH);
+    assert(chaos_memory_config_prepare() == 1);
+
+    g_chaos_memory_last_check_ns = chaos_clock_now_ns() - g_chaos_memory_check_interval_ns;
+    assert(chaos_memory_config_prepare() == 0);
+    g_chaos_memory_check_interval_ns = 0U;
+}
+
 int main(void)
 {
+    /* Look at the rule file on every call; the throttle has its own test. */
+    g_chaos_memory_check_interval_ns = 0U;
     test_parse_buffer_reports_rejected_line();
     test_prepare_reports_status();
     test_hits_are_counted_and_reported();
+    test_rule_file_check_is_throttled();
     test_read_file_rejects_changed_file();
     test_helper_functions();
     test_parse_line_and_buffer();

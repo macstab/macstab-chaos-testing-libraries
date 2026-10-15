@@ -288,8 +288,8 @@ Conditions that trigger fail-open (passthrough):
 - TLS guard set (reentrancy): call passes through immediately.
 
 The fail-open guarantee means that removing the config file restores normal
-behaviour immediately (on the next config mtime check, which happens on the
-next interposed call).
+behaviour within about a millisecond (on the next config mtime check; once
+rules are loaded, each process checks at most every millisecond).
 
 ### 5.1 The One Exception: Unresolvable Symbols
 

@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -35,7 +36,23 @@
 #define LATENCY_MS 300LL
 
 /** Replaces a rule file atomically (new inode), as the framework's writers do. */
-static void write_rules(const char *path, const char *rules)
+/**
+ * @brief Waits until the library is due to look at its rule file again.
+ *
+ * Once rules are loaded the libraries look at the rule file at most every
+ * millisecond, so a change takes effect within that time, not on the very next
+ * call. The sleep is a raw system call: libchaos-time may be faulting nanosleep.
+ */
+static void wait_for_rule_check(void)
+{
+    struct timespec delay = {0, 2000000L};
+
+    while (syscall(SYS_clock_nanosleep, CLOCK_MONOTONIC, 0, &delay, &delay) != 0 && errno == EINTR)
+    {
+    }
+}
+
+static void write_rules_now(const char *path, const char *rules)
 {
     char staging[256];
     FILE *file;
@@ -47,6 +64,13 @@ static void write_rules(const char *path, const char *rules)
         perror("write_rules");
         exit(2);
     }
+}
+
+/** @brief Writes the rules, then waits until the library looks at them. */
+static void write_rules(const char *path, const char *rules)
+{
+    write_rules_now(path, rules);
+    wait_for_rule_check();
 }
 
 static long long now_ms(void)
