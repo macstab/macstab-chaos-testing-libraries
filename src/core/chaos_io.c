@@ -77,6 +77,8 @@ chaos_io_pwritev_fn g_chaos_io_real_pwritev = NULL;
 chaos_io_ftruncate_fn g_chaos_io_real_ftruncate = NULL;
 chaos_io_unlinkat_fn g_chaos_io_real_unlinkat = NULL;
 chaos_io_truncate_fn g_chaos_io_real_truncate = NULL;
+chaos_io_fopen_fn g_chaos_io_real_fopen = NULL;
+chaos_io_freopen_fn g_chaos_io_real_freopen = NULL;
 chaos_io_renameat2_fn g_chaos_io_real_renameat2 = NULL;
 chaos_io_posix_fallocate_fn g_chaos_io_real_posix_fallocate = NULL;
 chaos_io_renameat_fn g_chaos_io_real_renameat = NULL;
@@ -313,6 +315,8 @@ static void chaos_io_resolve_all_symbols(void)
     chaos_io_resolve_symbol(&g_chaos_io_real_ftruncate, "ftruncate");
     chaos_io_resolve_symbol(&g_chaos_io_real_unlinkat, "unlinkat");
     chaos_io_resolve_symbol(&g_chaos_io_real_truncate, "truncate");
+    chaos_io_resolve_symbol(&g_chaos_io_real_fopen, "fopen");
+    chaos_io_resolve_symbol(&g_chaos_io_real_freopen, "freopen");
     chaos_io_resolve_symbol(&g_chaos_io_real_posix_fallocate, "posix_fallocate");
     chaos_io_resolve_optional_symbol(&g_chaos_io_real_renameat2, "renameat2");
     chaos_io_resolve_symbol(&g_chaos_io_real_renameat, "renameat");

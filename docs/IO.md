@@ -63,7 +63,7 @@ it does not try to simulate every kernel or filesystem behavior.
 The implemented logical operation surface is:
 
 - `open`
-  Backed by `open()`, `openat()` and `creat()`
+  Backed by `open()`, `openat()`, `creat()`, `fopen()` and `freopen()`
 - `read`
   Backed by `read()` and `readv()`
 - `write`
@@ -95,6 +95,10 @@ alone; `renameat2()` fails with ENOSYS where the C library lacks it (musl). They
 programs use: the JDK deletes with `unlink()` and moves with `rename()`. The first
 four forward to `unlinkat(AT_FDCWD, ...)`, `renameat(AT_FDCWD, ...)` and `open()`,
 which Linux defines them to be; `truncate()` matches the `truncate` rules by path.
+`fopen()` and `freopen()` open the file inside the C library too, so the `open` rules
+apply to them in their own wrappers: an injected error returns NULL with errno set,
+and `freopen()` closes the stream it was given, as a failed `freopen()` does. Reading
+and writing through the stream does not reach the `read`/`write` rules (stdio buffers inside the C library).
 `test/runtime/test_path_forms.sh` checks them on glibc and musl.
 
 ### Assumptions

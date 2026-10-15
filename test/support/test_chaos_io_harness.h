@@ -373,6 +373,14 @@ static int g_real_truncate_return = 0;
 static int g_real_truncate_guard = 0;
 /** @brief `length` argument captured from the most recent stub truncate call. */
 static off_t g_real_truncate_length = 0;
+/** @brief Number of times the stub fopen function was called. */
+static int g_real_fopen_calls = 0;
+/** @brief Number of times the stub freopen function was called. */
+static int g_real_freopen_calls = 0;
+/** @brief Stream returned by the stub fopen and freopen functions. */
+static FILE *g_real_fopen_return = NULL;
+/** @brief Path passed to the most recent stub fopen or freopen call. */
+static const char *g_real_fopen_path = NULL;
 
 /** @brief Number of times the stub unlinkat function was called. */
 static int g_real_unlinkat_calls = 0;
@@ -1128,6 +1136,25 @@ static int chaos_test_real_renameat2_impl(
     return 0;
 }
 
+/** @brief Stub for the real `fopen`. Returns `g_real_fopen_return`. */
+static FILE *chaos_test_real_fopen_impl(const char *path, const char *mode)
+{
+    (void)mode;
+    ++g_real_fopen_calls;
+    g_real_fopen_path = path;
+    return g_real_fopen_return;
+}
+
+/** @brief Stub for the real `freopen`. Returns `g_real_fopen_return`. */
+static FILE *chaos_test_real_freopen_impl(const char *path, const char *mode, FILE *stream)
+{
+    (void)mode;
+    (void)stream;
+    ++g_real_freopen_calls;
+    g_real_fopen_path = path;
+    return g_real_fopen_return;
+}
+
 /** @brief Stub for the real `posix_fallocate`. Returns `g_real_posix_fallocate_return`. */
 static int chaos_test_real_posix_fallocate_impl(int fd, off_t offset, off_t length)
 {
@@ -1396,6 +1423,14 @@ static void *chaos_test_dlsym(void *handle, const char *symbol)
     if (strcmp(symbol, "truncate") == 0)
     {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_truncate_fn, chaos_test_real_truncate_impl);
+    }
+    if (strcmp(symbol, "fopen") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_fopen_fn, chaos_test_real_fopen_impl);
+    }
+    if (strcmp(symbol, "freopen") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_freopen_fn, chaos_test_real_freopen_impl);
     }
     if (strcmp(symbol, "unlinkat") == 0)
     {
@@ -1694,6 +1729,10 @@ static void chaos_test_reset_state(void)
     g_real_truncate_return = 0;
     g_real_truncate_guard = 0;
     g_real_truncate_length = 0;
+    g_real_fopen_calls = 0;
+    g_real_freopen_calls = 0;
+    g_real_fopen_return = NULL;
+    g_real_fopen_path = NULL;
 
     g_real_unlinkat_calls = 0;
     g_real_unlinkat_return = 0;
@@ -1773,6 +1812,8 @@ static void chaos_test_reset_state(void)
     g_chaos_io_real_ftruncate = NULL;
     g_chaos_io_real_unlinkat = NULL;
     g_chaos_io_real_truncate = NULL;
+    g_chaos_io_real_fopen = NULL;
+    g_chaos_io_real_freopen = NULL;
     g_chaos_io_real_renameat2 = NULL;
     g_chaos_io_real_posix_fallocate = NULL;
     g_chaos_io_real_renameat = NULL;
@@ -1818,6 +1859,8 @@ static void chaos_test_bind_real_functions(void)
     g_chaos_io_real_ftruncate = chaos_test_real_ftruncate_impl;
     g_chaos_io_real_unlinkat = chaos_test_real_unlinkat_impl;
     g_chaos_io_real_truncate = chaos_test_real_truncate_impl;
+    g_chaos_io_real_fopen = chaos_test_real_fopen_impl;
+    g_chaos_io_real_freopen = chaos_test_real_freopen_impl;
     g_chaos_io_real_renameat2 = chaos_test_real_renameat2_impl;
     g_chaos_io_real_posix_fallocate = chaos_test_real_posix_fallocate_impl;
     g_chaos_io_real_renameat = chaos_test_real_renameat_impl;
@@ -1896,6 +1939,14 @@ static void chaos_test_bind_libc_functions_for_exit(void)
     resolved = dlsym(RTLD_NEXT, "truncate");
     assert(resolved != NULL);
     (void)memcpy(&g_chaos_io_real_truncate, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "fopen");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_fopen, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "freopen");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_freopen, &resolved, sizeof(resolved));
 
     resolved = dlsym(RTLD_NEXT, "unlinkat");
     assert(resolved != NULL);

@@ -3,7 +3,7 @@
  * @brief Runtime probe: the path forms of file operations are faulted like the *at forms.
  *
  * glibc and musl implement unlink(), rmdir(), remove(), rename(), renameat2() (glibc),
- * truncate(), creat() and posix_fallocate() with
+ * truncate(), creat(), fopen(), freopen() and posix_fallocate() with
  * their own system calls rather than through unlinkat(), renameat(), ftruncate(),
  * open() or fallocate(). They are the forms most programs use (the JDK deletes with unlink() and
  * moves with rename()), so each must reach the same rule as its *at or descriptor
@@ -97,6 +97,21 @@ int main(void)
     write_rules(DIR "/new.bin:open:EROFS:1.0\n");
     errno = 0;
     expect("creat faulted", creat(DIR "/new.bin", 0600) == -1 && errno == EROFS);
+    errno = 0;
+    expect("fopen faulted", fopen(DIR "/new.bin", "w") == NULL && errno == EROFS);
+#ifdef __GLIBC__
+    errno = 0;
+    expect("fopen64 faulted", fopen64(DIR "/new.bin", "w") == NULL && errno == EROFS);
+#endif
+    {
+        FILE *stream = fopen(DIR "/source.bin", "r");
+
+        errno = 0;
+        expect(
+            "freopen faulted",
+            stream != NULL && freopen(DIR "/new.bin", "w", stream) == NULL && errno == EROFS
+        );
+    }
 
     write_rules(DIR ":unlink:EACCES:1.0\n");
     errno = 0;
@@ -141,6 +156,17 @@ int main(void)
     expect("remove real", remove(DIR "/removed.bin") == 0 && remove(DIR "/removed.d") == 0);
     fd = creat(DIR "/new.bin", 0600);
     expect("creat real", fd >= 0 && close(fd) == 0 && unlink(DIR "/new.bin") == 0);
+    {
+        FILE *stream = fopen(DIR "/new.bin", "w");
+
+        expect("fopen real", stream != NULL && fclose(stream) == 0);
+        stream = fopen(DIR "/new.bin", "r");
+        expect(
+            "freopen real",
+            stream != NULL && (stream = freopen(DIR "/new.bin", "r", stream)) != NULL &&
+                fclose(stream) == 0 && unlink(DIR "/new.bin") == 0
+        );
+    }
 
     (void)unlink(CONF);
     (void)rmdir(DIR);

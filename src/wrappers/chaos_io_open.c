@@ -58,6 +58,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -416,6 +417,72 @@ CHAOS_IO_EXPORT int open(const char *path, int flags, ...)
 }
 
 /**
+ * @brief Applies the open rules to @p path before a stdio open; 1 when it must fail.
+ *
+ * @details LATENCY delays the open; ERRNO sets errno and asks the caller to fail
+ * without opening. Under the guard, or for an excluded or unmatched path, nothing
+ * happens.
+ */
+static int chaos_io_stdio_open_fault(const char *path)
+{
+    chaos_io_rule_t rule;
+    char resolved_path[CHAOS_IO_MAX_PATH];
+
+    if (path == NULL || chaos_io_in_internal() ||
+        !chaos_io_resolve_at_path(AT_FDCWD, path, resolved_path, sizeof(resolved_path)) ||
+        chaos_io_is_excluded_path(resolved_path) ||
+        !chaos_io_config_match_path(CHAOS_IO_OP_OPEN, resolved_path, &rule))
+    {
+        return 0;
+    }
+    if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
+    {
+        chaos_io_rule_apply_latency(&rule);
+        return 0;
+    }
+    return chaos_io_rule_apply_errno(&rule);
+}
+
+/**
+ * @brief Interposed `fopen(3)`: the open rules apply to the path.
+ *
+ * @details glibc and musl open the file with their own system call, so an open
+ * rule never saw `fopen()` -- the most common way C programs (and shells, via
+ * redirections in some builds) open files. On an injected error no stream is
+ * created and NULL is returned with errno set.
+ */
+CHAOS_IO_EXPORT FILE *fopen(const char *path, const char *mode)
+{
+    chaos_io_ensure_symbols();
+    if (chaos_io_stdio_open_fault(path))
+    {
+        return NULL;
+    }
+    return g_chaos_io_real_fopen(path, mode);
+}
+
+/**
+ * @brief Interposed `freopen(3)`: the open rules apply to the new path.
+ *
+ * @details Like a failed freopen(), an injected error closes @p stream and returns
+ * NULL with errno set. A NULL path only changes the mode of the open stream and is
+ * forwarded unchanged.
+ */
+CHAOS_IO_EXPORT FILE *freopen(const char *path, const char *mode, FILE *stream)
+{
+    chaos_io_ensure_symbols();
+    if (chaos_io_stdio_open_fault(path))
+    {
+        const int injected = errno;
+
+        (void)fclose(stream);
+        errno = injected;
+        return NULL;
+    }
+    return g_chaos_io_real_freopen(path, mode, stream);
+}
+
+/**
  * @brief Interposed `creat(2)`: `open(path, O_CREAT | O_WRONLY | O_TRUNC, mode)`.
  *
  * @details glibc and musl implement creat() with their own system call, not
@@ -510,6 +577,9 @@ static void (*g_chaos_io_open_chk_fail)(void) = __chk_fail;
 
 CHAOS_IO_EXPORT int open64(const char *path, int flags, ...) __attribute__((alias("open")));
 CHAOS_IO_EXPORT int creat64(const char *path, mode_t mode) __attribute__((alias("creat")));
+CHAOS_IO_EXPORT FILE *fopen64(const char *path, const char *mode) __attribute__((alias("fopen")));
+CHAOS_IO_EXPORT FILE *freopen64(const char *path, const char *mode, FILE *stream)
+    __attribute__((alias("freopen")));
 CHAOS_IO_EXPORT int openat64(int dirfd, const char *path, int flags, ...)
     __attribute__((alias("openat")));
 

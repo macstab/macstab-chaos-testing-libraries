@@ -36,6 +36,7 @@
 #include <limits.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -249,6 +250,12 @@ typedef int (*chaos_io_ftruncate_fn)(int, off_t);
 /** @brief Type of the real `truncate(2)` libc symbol. */
 typedef int (*chaos_io_truncate_fn)(const char *, off_t);
 
+/** @brief Type of the real `fopen(3)` libc symbol. */
+typedef FILE *(*chaos_io_fopen_fn)(const char *, const char *);
+
+/** @brief Type of the real `freopen(3)` libc symbol. */
+typedef FILE *(*chaos_io_freopen_fn)(const char *, const char *, FILE *);
+
 /** @brief Type of the real `renameat2(2)` libc symbol (glibc 2.28+; absent on musl). */
 typedef int (*chaos_io_renameat2_fn)(int, const char *, int, const char *, unsigned int);
 
@@ -311,6 +318,8 @@ extern chaos_io_pwritev_fn g_chaos_io_real_pwritev;     /**< Downstream `pwritev
 extern chaos_io_ftruncate_fn g_chaos_io_real_ftruncate; /**< Downstream `ftruncate`. */
 extern chaos_io_unlinkat_fn g_chaos_io_real_unlinkat;   /**< Downstream `unlinkat`. */
 extern chaos_io_truncate_fn g_chaos_io_real_truncate;   /**< Downstream `truncate`. */
+extern chaos_io_fopen_fn g_chaos_io_real_fopen;         /**< Downstream `fopen`. */
+extern chaos_io_freopen_fn g_chaos_io_real_freopen;     /**< Downstream `freopen`. */
 extern chaos_io_renameat2_fn
     g_chaos_io_real_renameat2; /**< Downstream `renameat2`; NULL when libc lacks it. */
 extern chaos_io_posix_fallocate_fn

@@ -280,6 +280,8 @@ static void test_init_runtime(void)
     assert(g_chaos_io_real_ftruncate == chaos_test_real_ftruncate_impl);
     assert(g_chaos_io_real_unlinkat == chaos_test_real_unlinkat_impl);
     assert(g_chaos_io_real_truncate == chaos_test_real_truncate_impl);
+    assert(g_chaos_io_real_fopen == chaos_test_real_fopen_impl);
+    assert(g_chaos_io_real_freopen == chaos_test_real_freopen_impl);
     assert(g_chaos_io_real_renameat == chaos_test_real_renameat_impl);
     assert(g_chaos_io_real_preadv == chaos_test_real_preadv_impl);
     assert(g_chaos_io_real_pwritev == chaos_test_real_pwritev_impl);
@@ -2180,8 +2182,73 @@ static void test_path_form_wrappers(void)
     assert(g_real_posix_fallocate_calls == 1);
 }
 
+/**
+ * @brief Invariant: fopen() and freopen() are faulted by the open rules.
+ *
+ * Expected observable behaviour:
+ * - an ERRNO open rule makes fopen() return NULL with that errno, without the real call;
+ * - freopen() under the same rule closes the stream it was given and returns NULL;
+ * - LATENCY delays, then opens; an unmatched path, the guard and a NULL freopen()
+ *   path reach the real call unchanged;
+ * - fopen64 and freopen64 are the same wrappers.
+ */
+static void test_stdio_open_wrappers(void)
+{
+    FILE *(*fopen64_fn)(const char *, const char *) = fopen64;
+    FILE *(*freopen64_fn)(const char *, const char *, FILE *) = freopen64;
+    FILE *stream;
+
+    assert(fopen64_fn == fopen);
+    assert(freopen64_fn == freopen);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_path_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
+    g_config_rule.errnum = EACCES;
+    g_rule_apply_errno_result = 1;
+    errno = 0;
+    assert(fopen("/tmp/stdio-open.txt", "r") == NULL);
+    assert(errno == EACCES);
+    assert(g_last_match_path_operation == CHAOS_IO_OP_OPEN);
+    assert(g_real_fopen_calls == 0);
+
+    stream = tmpfile();
+    assert(stream != NULL);
+    errno = 0;
+    assert(freopen("/tmp/stdio-open.txt", "r", stream) == NULL);
+    assert(errno == EACCES);
+    assert(g_real_freopen_calls == 0);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_path_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_LATENCY;
+    g_config_rule.latency_ms = 5U;
+    g_real_fopen_return = stdin;
+    assert(fopen("/tmp/stdio-open.txt", "r") == stdin);
+    assert(g_latency_calls == 1);
+    assert(g_real_fopen_calls == 1);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_fopen_return = stdin;
+    assert(fopen("/tmp/stdio-open.txt", "r") == stdin);
+    assert(freopen("/tmp/stdio-open.txt", "r", stdin) == stdin);
+    assert(freopen(NULL, "r", stdin) == stdin);
+    assert(g_real_fopen_path == NULL);
+    g_chaos_io_tls_guard = 1;
+    assert(fopen("/tmp/stdio-open.txt", "r") == stdin);
+    g_chaos_io_tls_guard = 0;
+    assert(g_real_fopen_calls == 2);
+    assert(g_real_freopen_calls == 2);
+}
+
 int main(void)
 {
+    test_stdio_open_wrappers();
     test_resolve_symbol_and_seed_material();
     test_call_real_open_and_match_fd_rule();
     test_wrappers_resolve_symbols_before_constructor();

@@ -117,6 +117,8 @@
     chaos_io_ftruncate_fn g_chaos_io_real_ftruncate = NULL;                                        \
     chaos_io_unlinkat_fn g_chaos_io_real_unlinkat = NULL;                                          \
     chaos_io_truncate_fn g_chaos_io_real_truncate = NULL;                                          \
+    chaos_io_fopen_fn g_chaos_io_real_fopen = NULL;                                                \
+    chaos_io_freopen_fn g_chaos_io_real_freopen = NULL;                                            \
     chaos_io_renameat2_fn g_chaos_io_real_renameat2 = NULL;                                        \
     chaos_io_posix_fallocate_fn g_chaos_io_real_posix_fallocate = NULL;                            \
     chaos_io_renameat_fn g_chaos_io_real_renameat = NULL;                                          \
@@ -336,6 +338,18 @@ static inline int chaos_test_real_truncate(const char *path, off_t length)
     return truncate(path, length);
 }
 
+/** @brief Opens a stream with the real libc `fopen`. */
+static inline FILE *chaos_test_real_fopen(const char *path, const char *mode)
+{
+    return fopen(path, mode);
+}
+
+/** @brief Reopens a stream with the real libc `freopen`. */
+static inline FILE *chaos_test_real_freopen(const char *path, const char *mode, FILE *stream)
+{
+    return freopen(path, mode, stream);
+}
+
 /**
  * @brief Remove a directory entry using the real libc `unlinkat`.
  * @param dirfd  Directory file descriptor or AT_FDCWD.
@@ -391,6 +405,8 @@ static inline void chaos_test_use_real_io(void)
     g_chaos_io_real_ftruncate = chaos_test_real_ftruncate;
     g_chaos_io_real_unlinkat = chaos_test_real_unlinkat;
     g_chaos_io_real_truncate = chaos_test_real_truncate;
+    g_chaos_io_real_fopen = chaos_test_real_fopen;
+    g_chaos_io_real_freopen = chaos_test_real_freopen;
     g_chaos_io_real_renameat = chaos_test_real_renameat;
     CHAOS_IO_TEST_ASSIGN_REAL_LINUX_COPY()
 }
@@ -421,6 +437,8 @@ static inline void chaos_test_reset_runtime(void)
     g_chaos_io_real_ftruncate = NULL;
     g_chaos_io_real_unlinkat = NULL;
     g_chaos_io_real_truncate = NULL;
+    g_chaos_io_real_fopen = NULL;
+    g_chaos_io_real_freopen = NULL;
     g_chaos_io_real_renameat2 = NULL;
     g_chaos_io_real_posix_fallocate = NULL;
     g_chaos_io_real_renameat = NULL;
