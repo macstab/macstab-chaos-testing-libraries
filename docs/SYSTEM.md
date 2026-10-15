@@ -135,7 +135,7 @@ Current ownership boundary:
 | `libchaos-net` | socket/wait symbols such as `socket`, `socketpair`, `bind`, `listen`, `connect`, `accept`, `accept4`, `shutdown`, `send*`, `recv*`, `poll`, `ppoll`, `select`, `pselect`, `epoll_wait`, `epoll_pwait`; and `read`, `write`, `readv`, `writev`, `close` **for sockets** | any decision on a file; DNS symbols |
 | `libchaos-dns` | resolver symbols such as `getaddrinfo` and `getnameinfo` | generic fd/file symbols, socket symbols, wait symbols |
 | `libchaos-time` | clock/sleep symbols such as `clock_gettime`, `nanosleep`, `usleep` | any symbol already owned by IO, NET, or DNS |
-| `libchaos-process` | process lifecycle symbols such as `pthread_create`, `fork`, `posix_spawn`, `posix_spawnp`, `execve`, `execveat`, and `waitpid` | any symbol already owned by IO or NET |
+| `libchaos-process` | process lifecycle symbols such as `pthread_create`, `fork`, `posix_spawn`, `posix_spawnp`, `execve`, `execveat`, `waitpid`, `wait`, `wait3`, `wait4`, and `waitid` | any symbol already owned by IO or NET |
 | `libchaos-memory` | memory-management symbols such as `mmap`, `munmap`, `mprotect`, and `madvise` | any symbol already owned by IO or NET |
 
 This has an intentional consequence:
@@ -767,8 +767,8 @@ Current responsibility:
 - `posix_spawnp`
 - `execve`
 - `execveat`
-- `waitpid`
-- future process-domain hooks such as `waitid`, `kill`, and `clone*`
+- `waitpid`, and `wait`, `wait3`, `wait4`, `waitid` through the `waitpid` rules
+- future process-domain hooks such as `kill` and `clone*`
 
 ### `libchaos-memory`
 

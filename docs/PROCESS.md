@@ -22,7 +22,8 @@ PLT/GOT cold/hot paths, AT_SECURE, glibc/musl matrix) are in
 Current implementation status:
 
 - interposed symbols: `pthread_create()`, `fork()`, `posix_spawn()`,
-  `posix_spawnp()`, `execve()`, `execveat()`, `waitpid()`
+  `posix_spawnp()`, `execve()`, `execveat()`, `waitpid()`, and under the `waitpid`
+  rules `wait()`, `wait3()`, `wait4()`, `waitid()`
 - config path: `/tmp/.chaos-process.conf`
 - unit-tested; strict `100.00%` line coverage gate on `src/process/*.c`
 - runtime probe implemented for glibc/musl and amd64/arm64 validation
@@ -37,7 +38,7 @@ Current implementation status:
 4. [posix_spawn: glibc vs musl Divergence](#4-posix_spawn-glibc-vs-musl-divergence)
 5. [vfork Hazards and Non-Coverage](#5-vfork-hazards-and-non-coverage)
 6. [execve, execveat, and the exec Family Matrix](#6-execve-execveat-and-the-exec-family-matrix)
-7. [waitpid, waitid, and the wait Family Gap](#7-waitpid-waitid-and-the-wait-family-gap)
+7. [waitpid, waitid, and the wait Family](#7-waitpid-waitid-and-the-wait-family)
 8. [EINTR Contract per POSIX.1-2017 §2.4.3](#8-eintr-contract-per-posix1-2017-243)
 9. [FAIL_AFTER Semantics and Counter Implementation](#9-fail_after-semantics-and-counter-implementation)
 10. [DSL Grammar and Rule Semantics](#10-dsl-grammar-and-rule-semantics)
@@ -45,7 +46,7 @@ Current implementation status:
 12. [Reentrancy Guard and TLS State](#12-reentrancy-guard-and-tls-state)
 13. [PRNG Model](#13-prng-model)
 14. [Config Reload Protocol](#14-config-reload-protocol)
-15. [Non-Coverage: clone/clone3, vfork, kill, pthread_kill, waitid](#15-non-coverage-cloneclone3-vfork-kill-pthread_kill-waitid)
+15. [Non-Coverage: clone/clone3, vfork, kill, pthread_kill](#15-non-coverage-cloneclone3-vfork-kill-pthread_kill)
 16. [glibc vs musl Divergence per Symbol](#16-glibc-vs-musl-divergence-per-symbol)
 17. [Execution Boundary Summary](#17-execution-boundary-summary)
 
@@ -314,7 +315,7 @@ require a ptrace-level intercept.
 
 ---
 
-## 7. waitpid, waitid, and the wait Family Gap
+## 7. waitpid, waitid, and the wait Family
 
 ### 7.1 The wait Family
 
@@ -326,10 +327,15 @@ require a ptrace-level intercept.
 | `wait3`   | BSD         | pid_t            | `int *status` + rusage       | only children      |
 | `wait4`   | BSD/Linux   | pid_t            | `int *status` + pid + rusage | specific pid       |
 
-`libchaos-process` intercepts `waitpid()` only. `wait()`, `waitid()`, `wait3()`,
-`wait4()` are not currently interposed.
+glibc and musl implement each of these with its own system call (`wait4` or
+`waitid`), not through `waitpid()`, so each has its own wrapper. There is no
+separate selector: all five follow the `waitpid` rules and share its FAIL_AFTER
+counter. `wait(s)` is forwarded as `waitpid(-1, s, 0)` and `wait3(s, o, r)` as
+`wait4(-1, s, o, r)`, which is what Linux defines them to be; `wait4()` and
+`waitid()` call their real functions, so `rusage` and `siginfo_t` are still filled.
+On an injected failure each returns `-1` with errno set.
 
-### 7.2 waitid Gap
+### 7.2 waitid
 
 `waitid(2)` (POSIX.1-2001, Linux 2.6.9) provides richer status via `siginfo_t`:
 `si_code` (CLD_EXITED / CLD_KILLED / CLD_DUMPED / CLD_STOPPED / CLD_TRAPPED /
@@ -338,8 +344,7 @@ CLD_CONTINUED), `si_status` (exit code or signal number), `si_pid`, `si_uid`,
 state) and `P_PIDFD` (Linux 5.4+, wait by pidfd).
 
 Applications using `waitid` in preference to `waitpid` (more portable status
-detail, `P_PIDFD` support) are not covered by the current interposition surface.
-This is a known gap; see §15.
+detail, `P_PIDFD` support) are covered through the `waitpid` rules (§7.1).
 
 ### 7.3 EINTR on waitpid
 
@@ -633,7 +638,7 @@ the same values (`0x0`, `0xfffffffffffffffe`, `0xffffffffffffffff`).
 
 ---
 
-## 15. Non-Coverage: clone/clone3, vfork, kill, pthread_kill, waitid
+## 15. Non-Coverage: clone/clone3, vfork, kill, pthread_kill
 
 | Symbol        | Rationale for non-coverage                                                |
 |---------------|---------------------------------------------------------------------------|
@@ -642,7 +647,6 @@ the same values (`0x0`, `0xfffffffffffffffe`, `0xffffffffffffffff`).
 | `vfork(2)`    | See §5. Safety contract violations in the injection window.               |
 | `kill(2)`     | Signal semantics orthogonal to the process-creation/destruction focus. Signal injection requires a different abstraction (signal interposition via `sigaction`/`raise` wrappers) with entirely different effect taxonomy. |
 | `pthread_kill`| Same rationale as `kill`. Signal delivery to threads is a signal-domain problem. |
-| `waitid(2)`   | Gap acknowledged. `waitid` offers `siginfo_t` status and `P_PIDFD` that `waitpid` cannot express. Candidate for next process-surface expansion. |
 | `wait(2)`     | Wrapper around `waitpid(-1, status, 0)` in glibc; covered transitively when `waitpid` is the implementation. But the libc symbol `wait` itself is not interposed. |
 | `wait3/wait4` | BSD-heritage symbols; `wait4` calls `waitpid` internally on Linux. Not interposed directly. |
 

@@ -438,7 +438,7 @@ Exact interposed symbols today:
 - `posix_spawnp()`
 - `execve()`
 - `execveat()`
-- `waitpid()`
+- `waitpid()`, and under its rules `wait()`, `wait3()`, `wait4()` and `waitid()`
 
 Supported selectors:
 
