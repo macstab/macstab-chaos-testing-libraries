@@ -622,7 +622,8 @@ Implemented effects:
   abortively (`SO_LINGER` 0), so the peer receives an RST (`ECONNRESET`) instead
   of an orderly end of stream.
 - `TRICKLE`
-  Bytes per call (at least 1); valid only for `recv`. Every receive (`recv`,
+  Bytes per call (at least 1); valid only for `recv`, applied to stream sockets
+  only (a datagram would be cut). Every receive (`recv`,
   `recvfrom`, `recvmsg`, `read`, `readv` on the socket) returns at most that many
   bytes. The data is complete and correct, only the chunking is pathological:
   `recv:TRICKLE:1` breaks any parser that assumes one read yields one message.

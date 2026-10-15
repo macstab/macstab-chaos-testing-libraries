@@ -124,6 +124,9 @@ static int g_errno_trigger = 0;
  */
 static int g_should_trigger = 0;
 
+/* Address length the recvfrom stub reports when the buffer was too small for it. */
+static socklen_t g_recvfrom_reported_name = 0;
+
 /** @brief Cumulative count of `chaos_net_corrupt_buffer*` stub invocations. */
 static int g_corrupt_calls = 0;
 
@@ -704,6 +707,12 @@ static ssize_t chaos_net_test_recvfrom(
         address->sa_family = AF_INET;
         *address_length = (socklen_t)sizeof(struct sockaddr_in);
     }
+    else if (address != NULL && address_length != NULL && g_recvfrom_reported_name > 0)
+    {
+        /* Like Linux: a cut address still reports its full length. */
+        memset(address, 0, *address_length);
+        *address_length = g_recvfrom_reported_name;
+    }
     if (buffer != NULL && size >= 4U)
     {
         (void)memcpy(buffer, "data", 4U);
@@ -1031,6 +1040,11 @@ static int chaos_net_test_epoll_pwait(
 /* -------------------------------------------------------------------------
  * Production source inclusion with symbol overrides
  * --------------------------------------------------------------------- */
+
+/* Socket type the wrappers see for any descriptor (TRICKLE applies to streams only). */
+static int g_test_socket_type = SOCK_STREAM;
+
+#define CHAOS_NET_SOCKET_TYPE(fd) ((void)(fd), g_test_socket_type)
 
 /* DUP slot table mapping: 0 maps for real, 1 fails, 2 loses the race to another thread. */
 static int g_dup_map_mode = 0;
@@ -2934,8 +2948,78 @@ static void test_dup_replays_the_last_payload(void)
     (void)rc;
 }
 
+/**
+ * @brief Invariant: TRICKLE leaves datagram sockets and requests no longer than the
+ *   chunk alone (and does not count them), DUP never waits for a busy slot, close
+ *   drops a slot without the lock, and a cut sender address is kept only as far as
+ *   the caller's buffer reached.
+ */
+static void test_trickle_and_dup_edges(void)
+{
+    char buffer[16];
+    char small_name[4];
+    struct sockaddr_in from;
+    socklen_t from_length;
+    long rc;
+
+    reset_wrapper_stubs();
+    g_stub_endpoint_from_local = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_TRICKLE;
+    g_stub_rule.chunk_bytes = 3U;
+    g_should_trigger = 1;
+    g_test_socket_type = SOCK_DGRAM;
+    rc = recv(4, buffer, sizeof(buffer), 0);
+    assert(g_last_receive_size == sizeof(buffer));
+    g_test_socket_type = SOCK_STREAM;
+    g_should_trigger = 0; /* would refuse if asked: a short request never asks */
+    rc = recv(4, buffer, 3U, 0);
+    assert(g_last_receive_size == 3U);
+
+    /* DUP: a busy slot skips DUP for the call instead of waiting. */
+    reset_wrapper_stubs();
+    g_stub_endpoint_from_local = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_DUP;
+    g_should_trigger = 1;
+    rc = recv(10, buffer, sizeof(buffer), 0);
+    assert(g_chaos_net_dup_slots != NULL);
+    g_chaos_net_dup_slots[10 % CHAOS_NET_DUP_SLOTS].lock = 1;
+    rc = recv(10, buffer, sizeof(buffer), 0);
+    assert(g_recv_calls == 2);
+    g_chaos_net_dup_slots[10 % CHAOS_NET_DUP_SLOTS].lock = 0;
+
+    /* The payload kept by the first call is still there and is replayed now. */
+    rc = recv(10, buffer, sizeof(buffer), 0);
+    assert(g_recv_calls == 2);
+    rc = recv(10, buffer, sizeof(buffer), 0);
+    assert(g_recv_calls == 3);
+
+    /* close of another descriptor in the same slot leaves the payload; its own drops it. */
+    chaos_net_dup_forget(10 + CHAOS_NET_DUP_SLOTS);
+    rc = recv(10, buffer, sizeof(buffer), 0);
+    assert(g_recv_calls == 3);
+    rc = recv(10, buffer, sizeof(buffer), 0);
+    assert(g_recv_calls == 4);
+    chaos_net_dup_forget(10);
+    rc = recv(10, buffer, sizeof(buffer), 0);
+    assert(g_recv_calls == 5);
+
+    /* A cut sender address is kept only as far as the caller's buffer reached. */
+    g_recvfrom_reported_name = (socklen_t)sizeof(struct sockaddr_in6);
+    from_length = (socklen_t)sizeof(small_name);
+    rc = recvfrom(11, buffer, sizeof(buffer), 0, (struct sockaddr *)small_name, &from_length);
+    assert(from_length == (socklen_t)sizeof(struct sockaddr_in6));
+    g_recvfrom_reported_name = 0;
+    from_length = (socklen_t)sizeof(from);
+    rc = recvfrom(11, buffer, sizeof(buffer), 0, (struct sockaddr *)&from, &from_length);
+    assert(rc == 4 && from_length == (socklen_t)sizeof(small_name));
+    (void)rc;
+}
+
 int main(void)
 {
+    test_trickle_and_dup_edges();
     test_dup_replays_the_last_payload();
     test_trickle_shortens_receives();
     test_wrappers_record_call_size();

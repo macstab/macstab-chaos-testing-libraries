@@ -521,7 +521,7 @@ accept4(int sockfd, CHAOS_NET_SOCKADDR_PARAM address, socklen_t *address_length,
 typedef struct chaos_net_dup_slot
 {
     volatile int lock;
-    int fd; /**< Owner of the stored payload; -1 when empty. */
+    volatile int fd; /**< Owner of the stored payload; -1 when empty. */
     size_t length;
     socklen_t name_length; /**< Sender address length (datagrams); 0 when none. */
     struct sockaddr_storage name;
@@ -597,8 +597,11 @@ static chaos_net_dup_slot_t *chaos_net_dup_lock(int fd, int create)
         return NULL;
     }
     slot = &table[fd % CHAOS_NET_DUP_SLOTS];
-    while (__sync_lock_test_and_set(&slot->lock, 1) != 0)
+    /* Never wait: the holder may be this very thread, interrupted by a signal
+     * handler that receives or closes. A busy slot just skips DUP for this call. */
+    if (__sync_lock_test_and_set(&slot->lock, 1) != 0)
     {
+        return NULL;
     }
     return slot;
 }
@@ -711,28 +714,67 @@ static ssize_t chaos_net_dup_replay(
 /** @brief Drops @p fd's kept payload; called when the descriptor is closed. */
 static void chaos_net_dup_forget(int fd)
 {
-    chaos_net_dup_slot_t *slot = chaos_net_dup_lock(fd, 0);
+    chaos_net_dup_slot_t *table = g_chaos_net_dup_slots;
 
-    if (slot == NULL)
+    if (table == NULL || fd < 0)
     {
         return;
     }
-    if (slot->fd == fd)
-    {
-        slot->fd = -1;
-    }
-    chaos_net_dup_unlock(slot);
+    /* Without the lock: close() must not wait, and only the owner tag changes. */
+    (void)__sync_bool_compare_and_swap(&table[fd % CHAOS_NET_DUP_SLOTS].fd, fd, -1);
 }
 
 /** @brief Largest iovec array a TRICKLE rule reshapes; longer ones are left alone. */
 #define CHAOS_NET_TRICKLE_MAX_IOV 64
 
 /**
- * @brief Whether a TRICKLE rule fires for this receive call.
+ * @brief The socket type of @p fd, asked with a raw system call; -1 when unknown.
+ *
+ * @details Unit tests define CHAOS_NET_SOCKET_TYPE before including this file.
  */
-static int chaos_net_trickles(const chaos_net_rule_t *rule)
+#ifndef CHAOS_NET_SOCKET_TYPE
+static int chaos_net_socket_type(int fd)
 {
-    return rule->effect == CHAOS_NET_EFFECT_TRICKLE && chaos_net_rule_should_trigger(rule);
+    const int saved_errno = errno;
+    int type = -1;
+    socklen_t length = (socklen_t)sizeof(type);
+
+#ifdef __linux__
+    if (syscall(SYS_getsockopt, fd, SOL_SOCKET, SO_TYPE, &type, &length) != 0)
+#else
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &length) != 0)
+#endif
+    {
+        type = -1;
+    }
+    errno = saved_errno;
+    return type;
+}
+#define CHAOS_NET_SOCKET_TYPE(fd) chaos_net_socket_type(fd)
+#endif
+
+/**
+ * @brief Whether @p fd is a stream socket.
+ *
+ * @details TRICKLE only shortens receives on streams: on a datagram socket a
+ * shorter buffer truncates the datagram and the kernel drops the rest.
+ */
+static int chaos_net_is_stream(int fd)
+{
+    return CHAOS_NET_SOCKET_TYPE(fd) == SOCK_STREAM;
+}
+
+/**
+ * @brief Whether a TRICKLE rule fires for a receive of @p requested bytes on @p fd.
+ *
+ * @details Only a stream socket and a request larger than the chunk are shortened,
+ * so a call TRICKLE leaves alone is not counted as a hit.
+ */
+static int chaos_net_trickles(const chaos_net_rule_t *rule, int fd, uint64_t requested)
+{
+    return rule->effect == CHAOS_NET_EFFECT_TRICKLE && requested > rule->chunk_bytes &&
+           requested != CHAOS_POLICY_NO_SIZE && chaos_net_is_stream(fd) &&
+           chaos_net_rule_should_trigger(rule);
 }
 
 /**
@@ -947,7 +989,7 @@ CHAOS_NET_EXPORT ssize_t recv(int sockfd, void *buffer, size_t size, int flags)
         }
         return rc;
     }
-    if (chaos_net_trickles(&rule) && size > rule.chunk_bytes)
+    if (chaos_net_trickles(&rule, sockfd, (uint64_t)size))
     {
         size = rule.chunk_bytes;
     }
@@ -1001,13 +1043,15 @@ CHAOS_NET_EXPORT ssize_t recvfrom(
         return -1;
     }
 
-    if (chaos_net_trickles(&rule) && size > rule.chunk_bytes)
+    if (chaos_net_trickles(&rule, sockfd, (uint64_t)size))
     {
         size = rule.chunk_bytes;
     }
     if (rule.effect == CHAOS_NET_EFFECT_DUP && (flags & MSG_PEEK) == 0)
     {
         struct iovec target;
+
+        const socklen_t capacity = address_length != NULL ? *address_length : 0;
 
         target.iov_base = buffer;
         target.iov_len = size;
@@ -1023,7 +1067,11 @@ CHAOS_NET_EXPORT ssize_t recvfrom(
                 1,
                 rc,
                 address_ptr,
-                address_ptr != NULL && address_length != NULL ? *address_length : 0
+                /* The kernel reports the full address length even when it had to
+                 * cut the address to fit the caller's buffer. */
+                address_ptr != NULL && address_length != NULL
+                    ? (*address_length < capacity ? *address_length : capacity)
+                    : 0
             );
         }
         return rc;
@@ -1070,6 +1118,7 @@ CHAOS_NET_EXPORT ssize_t recvmsg(int sockfd, struct msghdr *message, int flags)
 
     if (message != NULL && rule.effect == CHAOS_NET_EFFECT_DUP && (flags & MSG_PEEK) == 0)
     {
+        const socklen_t capacity = message->msg_namelen;
         socklen_t name_length = message->msg_namelen;
 
         rc = chaos_net_dup_replay(
@@ -1094,12 +1143,14 @@ CHAOS_NET_EXPORT ssize_t recvmsg(int sockfd, struct msghdr *message, int flags)
             (int)message->msg_iovlen,
             rc,
             (const struct sockaddr *)message->msg_name,
-            message->msg_name != NULL ? message->msg_namelen : 0
+            message->msg_name != NULL
+                ? (message->msg_namelen < capacity ? message->msg_namelen : capacity)
+                : 0
         );
         return rc;
     }
     if (message != NULL && (size_t)message->msg_iovlen <= (size_t)CHAOS_NET_TRICKLE_MAX_IOV &&
-        chaos_net_trickles(&rule))
+        chaos_net_trickles(&rule, sockfd, chaos_net_message_size(message)))
     {
         struct iovec limited[CHAOS_NET_TRICKLE_MAX_IOV];
         struct msghdr shortened = *message;
@@ -1378,7 +1429,7 @@ CHAOS_NET_EXPORT ssize_t read(int fd, void *buffer, size_t size)
         }
         return rc;
     }
-    if (chaos_net_trickles(&rule) && size > rule.chunk_bytes)
+    if (chaos_net_trickles(&rule, fd, (uint64_t)size))
     {
         size = rule.chunk_bytes;
     }
@@ -1426,7 +1477,7 @@ CHAOS_NET_EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
         return rc;
     }
     if (iov != NULL && iovcnt > 0 && iovcnt <= CHAOS_NET_TRICKLE_MAX_IOV &&
-        chaos_net_trickles(&rule))
+        chaos_net_trickles(&rule, fd, chaos_net_iovec_size(iov, iovcnt)))
     {
         struct iovec limited[CHAOS_NET_TRICKLE_MAX_IOV];
 

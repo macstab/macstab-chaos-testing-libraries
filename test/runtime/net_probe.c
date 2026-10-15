@@ -1321,6 +1321,43 @@ static int probe_recv_dup(void)
     return 0;
 }
 
+/**
+ * @brief TRICKLE on a datagram socket changes nothing: a shorter buffer would cut the
+ *        datagram and the kernel would drop the rest.
+ */
+static int probe_recv_trickle_datagram(void)
+{
+    struct sockaddr_in address;
+    char buffer[16];
+    int receiver;
+    int sender;
+    int rc;
+
+    rc = write_config("udp4://127.0.0.1:41032:recv:TRICKLE:1");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    receiver = create_udp_bound(41032U);
+    sender = socket(AF_INET, SOCK_DGRAM, 0);
+    if (receiver < 0 || sender < 0)
+    {
+        return 200;
+    }
+    set_loopback_v4(&address, 41032U);
+    if (sendto(sender, "abcd", 4U, 0, (struct sockaddr *)&address, sizeof(address)) != 4)
+    {
+        return 201;
+    }
+    if (recv(receiver, buffer, sizeof(buffer), 0) != 4 || memcmp(buffer, "abcd", 4U) != 0)
+    {
+        return 202;
+    }
+    close(sender);
+    close(receiver);
+    return 0;
+}
+
 int main(void)
 {
     int rc;
@@ -1352,6 +1389,9 @@ int main(void)
     if (rc != 0)
         return rc;
     rc = probe_recv_dup();
+    if (rc != 0)
+        return rc;
+    rc = probe_recv_trickle_datagram();
     if (rc != 0)
         return rc;
     rc = probe_sendto_errno();

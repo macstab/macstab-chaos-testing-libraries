@@ -671,7 +671,10 @@ Reason:
 - `TRICKLE:N`
   valid only for `recv`: `recv`, `recvfrom` and `read` ask the kernel for at
   most N bytes, `recvmsg` and `readv` pass a copy of the vector cut to N bytes
-  (vectors of more than 64 entries are left alone). Nothing is lost or changed --
+  (vectors of more than 64 entries are left alone). Only stream sockets are
+  shortened, and only requests larger than N (anything else is not counted as a
+  hit): on a datagram socket a shorter buffer would cut the datagram and the
+  kernel would drop the rest. Nothing is lost or changed --
   unlike `TORN`, which truncates -- so it tests message reassembly: length-
   prefixed framing, header parsers and `readLine` loops that assume one read is
   one message
@@ -682,7 +685,11 @@ Reason:
   socket, once, and the one after reads again. Duplicate delivery is the norm
   in at-least-once messaging and almost never tested: double charges, double
   writes, repeated side effects. `MSG_PEEK` receives are left alone; `close`
-  drops the copy. The copies live in a 64-slot table (about 260 KiB) mapped
+  drops the copy. A slot that is busy (another thread, or a signal handler that
+  interrupted this one) skips DUP for that call instead of waiting, and `close`
+  drops a copy without taking the lock. A sender address cut to fit the caller's
+  buffer is kept only as far as that buffer reached. The copies live in a 64-slot
+  table (about 260 KiB) mapped
   with a raw `mmap` on the first DUP rule; descriptors that share a slot drop
   each other's copy rather than replay the wrong one
 - `GAI`
