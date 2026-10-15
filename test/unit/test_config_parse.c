@@ -676,7 +676,7 @@ static void test_read_file_paths(void)
     g_chaos_io_real_close = chaos_test_stub_close;
     g_stub_open_result = 8;
     g_stub_read_result = (ssize_t)CHAOS_IO_MAX_CONFIG_BYTES;
-    assert(chaos_io_config_read_file(&size_out, chaos_io_config_observed_mtime()) == -1);
+    assert(chaos_io_config_read_file(&size_out, chaos_io_config_observed_mtime()) == -2);
     assert(g_stub_read_calls == 1U);
 
     chaos_test_use_real_io();
@@ -1013,6 +1013,29 @@ static void test_prepare_reports_status(void)
     (void)snprintf(expected, sizeof(expected), "state=ok\nrules=1\npid=%ld\n", (long)getpid());
     assert(strcmp(status, expected) == 0);
 
+    /* A file at the size limit is reported, not silently re-read. */
+    {
+        FILE *large = fopen(CHAOS_IO_CONFIG_PATH, "w");
+        size_t index;
+
+        assert(large != NULL);
+        for (index = 0U; index < CHAOS_IO_MAX_CONFIG_BYTES; ++index)
+        {
+            assert(fputc('#', large) != EOF);
+        }
+        assert(fclose(large) == 0);
+    }
+    g_chaos_io_cached_mtime = CHAOS_IO_MTIME_UNKNOWN;
+    assert(chaos_io_config_prepare() == 0);
+    assert(read_status_file(status, sizeof(status)));
+    (void)snprintf(
+        expected,
+        sizeof(expected),
+        "state=error\nrules=0\nline=0\nreason=file too large\ntext=\npid=%ld\n",
+        (long)getpid()
+    );
+    assert(strcmp(status, expected) == 0);
+
     (void)unlink(CHAOS_IO_CONFIG_PATH);
     g_chaos_io_cached_mtime = CHAOS_IO_MTIME_UNKNOWN;
     assert(chaos_io_config_prepare() == 0);
@@ -1085,7 +1108,7 @@ static void test_hits_are_counted_and_reported(void)
     assert(strcmp(hits, "2\t/data:write:EIO:1.0 # a\n1\t/data:write:EIO:1.0 # b\n") == 0);
 
     /* A hit that finds another thread writing is left pending, not lost. */
-    g_chaos_io_hits_writing = 1;
+    g_chaos_io_hits_writing = (uint64_t)getpid();
     chaos_hit_record(state->rules[1].hit);
     g_chaos_io_hits_writing = 0;
     assert(g_chaos_io_hits_pending == 1);
@@ -1107,6 +1130,22 @@ static void test_hits_are_counted_and_reported(void)
     assert(g_chaos_io_hits_pending == 0);
     chaos_io_config_report_hits(NULL);
     g_chaos_io_hits_total = 0U;
+
+    /* A writer flag inherited from a parent that forked mid-write is released. */
+    g_chaos_io_hits_writing = (uint64_t)getpid() + 1U;
+    chaos_hit_record(state->rules[0].hit);
+    assert(g_chaos_io_hits_writing == 0U);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(strcmp(hits, "3\t/data:write:EIO:1.0 # a\n3\t/data:write:EIO:1.0 # b\n") == 0);
+    g_chaos_io_hits_total = 0U;
+
+    /* The exit report of a process that only inherited these counts writes nothing. */
+    g_chaos_io_hits_pending = 1;
+    g_chaos_io_hits_pid = (uint64_t)getpid() + 1U;
+    chaos_io_config_report_hits(NULL);
+    assert(g_chaos_io_hits_pending == 1);
+    g_chaos_io_hits_pending = 0;
+    g_chaos_io_hits_pid = (uint64_t)getpid();
 
     (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_IO_HITS_PREFIX, (long)getpid());
     (void)unlink(path);

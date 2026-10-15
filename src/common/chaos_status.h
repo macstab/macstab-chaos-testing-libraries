@@ -12,7 +12,7 @@
  * state=ok|error
  * rules=<number of active rules>
  * line=<1-based line of the first rejected rule>      (error only)
- * reason=invalid rule|too many rules                   (error only)
+ * reason=invalid rule|too many rules|file too large    (error only; line=0 for the last)
  * text=<that line as written, at most 200 bytes>       (error only)
  * pid=<process that wrote the file>
  * @endcode
@@ -67,6 +67,9 @@ typedef struct chaos_status_error
 
 /** @brief Reason for the first line beyond the rule limit. */
 #define CHAOS_STATUS_REASON_TOO_MANY "too many rules"
+
+/** @brief Reason for a rule file at or over the size limit (no line is named). */
+#define CHAOS_STATUS_REASON_TOO_LARGE "file too large"
 
 /** @brief Forgets any recorded error. */
 static inline void chaos_status_clear(chaos_status_error_t *error)
@@ -145,7 +148,9 @@ static inline size_t chaos_status_format(
 
 #ifdef __linux__
 #define CHAOS_STATUS_OPEN(path)                                                                    \
-    (int)syscall(SYS_openat, AT_FDCWD, (path), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)
+    (int)syscall(                                                                                  \
+        SYS_openat, AT_FDCWD, (path), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644   \
+    )
 #define CHAOS_STATUS_WRITE(fd, data, length) syscall(SYS_write, (fd), (data), (length))
 #define CHAOS_STATUS_CLOSE(fd) syscall(SYS_close, (fd))
 #define CHAOS_STATUS_UNLINK(path) syscall(SYS_unlinkat, AT_FDCWD, (path), 0)
@@ -155,7 +160,8 @@ static inline size_t chaos_status_format(
 #define CHAOS_STATUS_RENAME(from, to) syscall(SYS_renameat2, AT_FDCWD, (from), AT_FDCWD, (to), 0)
 #endif
 #else
-#define CHAOS_STATUS_OPEN(path) open((path), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)
+#define CHAOS_STATUS_OPEN(path)                                                                    \
+    open((path), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644)
 #define CHAOS_STATUS_WRITE(fd, data, length) write((fd), (data), (length))
 #define CHAOS_STATUS_CLOSE(fd) close(fd)
 #define CHAOS_STATUS_UNLINK(path) unlink(path)
@@ -181,7 +187,14 @@ static inline void chaos_status_replace_file(const char *path, const char *data,
     {
         return;
     }
+    /* A new file only, never through a link: the name is predictable and /tmp is
+     * shared. A leftover of an earlier process with the same pid is removed once. */
     fd = CHAOS_STATUS_OPEN(staging);
+    if (fd < 0 && errno == EEXIST)
+    {
+        (void)CHAOS_STATUS_UNLINK(staging);
+        fd = CHAOS_STATUS_OPEN(staging);
+    }
     if (fd < 0)
     {
         errno = saved_errno;

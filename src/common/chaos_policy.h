@@ -32,6 +32,7 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 
 /** @brief Byte count of a call that has none; never satisfies a size gate. */
 #define CHAOS_POLICY_NO_SIZE UINT64_MAX
@@ -210,10 +211,20 @@ static inline int chaos_policy_size_ok(const chaos_rule_policy_t *policy, uint64
  */
 static inline int chaos_policy_fire(const chaos_rule_policy_t *policy, chaos_hit_slot_t *slot)
 {
-    if (policy->first != 0U && slot != NULL &&
-        __sync_fetch_and_add(&slot->claimed, 1U) >= policy->first)
+    if (policy->first != 0U && slot != NULL)
     {
-        return 0;
+        const uint64_t pid = (uint64_t)getpid();
+
+        /* Claims are per process: a forked child starts its own budget. */
+        if (slot->claimed_pid != pid)
+        {
+            slot->claimed = 0U;
+            slot->claimed_pid = pid;
+        }
+        if (__sync_fetch_and_add(&slot->claimed, 1U) >= policy->first)
+        {
+            return 0;
+        }
     }
     chaos_hit_record(slot);
     return 1;

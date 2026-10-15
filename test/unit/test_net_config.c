@@ -715,7 +715,7 @@ static void test_invalid_lines(void)
  * Triggering conditions:
  * - `g_test_config_force_open_fail = 1` causes `chaos_net_config_read_file()` to return -1.
  * - `g_test_config_force_read_fail = 1` causes `chaos_net_config_read_file()` to return -1.
- * - A file of exactly CHAOS_NET_MAX_CONFIG_BYTES bytes causes `read_file` to return -1.
+ * - A file of exactly CHAOS_NET_MAX_CONFIG_BYTES bytes causes `read_file` to return -2.
  * - A valid config file with mtime=30 loads successfully.
  * - Repeating `prepare()` with the same cached mtime skips the reload.
  * - `g_test_config_force_cas_fail = 1` causes `prepare()` to return true (old rules retained).
@@ -763,7 +763,7 @@ static void test_file_and_state_edges(void)
         assert(fputc('a', file) != EOF);
     }
     assert(fclose(file) == 0);
-    assert(chaos_net_config_read_file(&index, chaos_net_config_observed_mtime()) == -1);
+    assert(chaos_net_config_read_file(&index, chaos_net_config_observed_mtime()) == -2);
 
     write_config_text("tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0\n", 30);
     assert(chaos_net_endpoint_parse_selector("tcp4://127.0.0.1:9010", &endpoint));
@@ -1176,6 +1176,28 @@ static void test_prepare_reports_status(void)
     (void)snprintf(expected, sizeof(expected), "state=ok\nrules=1\npid=%ld\n", (long)getpid());
     assert(strcmp(status, expected) == 0);
 
+    /* A file at the size limit is reported, not silently re-read. */
+    {
+        FILE *large = fopen(CHAOS_NET_CONFIG_PATH, "w");
+        size_t index;
+
+        assert(large != NULL);
+        for (index = 0U; index < CHAOS_NET_MAX_CONFIG_BYTES; ++index)
+        {
+            assert(fputc('#', large) != EOF);
+        }
+        assert(fclose(large) == 0);
+    }
+    assert(chaos_net_config_prepare() == 0);
+    assert(read_status_file(status, sizeof(status)));
+    (void)snprintf(
+        expected,
+        sizeof(expected),
+        "state=error\nrules=0\nline=0\nreason=file too large\ntext=\npid=%ld\n",
+        (long)getpid()
+    );
+    assert(strcmp(status, expected) == 0);
+
     (void)unlink(CHAOS_NET_CONFIG_PATH);
     assert(chaos_net_config_prepare() == 0);
     assert(!read_status_file(status, sizeof(status)));
@@ -1251,7 +1273,7 @@ static void test_hits_are_counted_and_reported(void)
     );
 
     /* A hit that finds another thread writing is left pending, not lost. */
-    g_chaos_net_hits_writing = 1;
+    g_chaos_net_hits_writing = (uint64_t)getpid();
     chaos_hit_record(state->rules[1].hit);
     g_chaos_net_hits_writing = 0;
     assert(g_chaos_net_hits_pending == 1);
@@ -1291,6 +1313,28 @@ static void test_hits_are_counted_and_reported(void)
     assert(g_chaos_net_hits_pending == 0);
     chaos_net_config_report_hits(NULL);
     g_chaos_net_hits_total = 0U;
+
+    /* A writer flag inherited from a parent that forked mid-write is released. */
+    g_chaos_net_hits_writing = (uint64_t)getpid() + 1U;
+    chaos_hit_record(state->rules[0].hit);
+    assert(g_chaos_net_hits_writing == 0U);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(
+        strcmp(
+            hits,
+            "3\ttcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 # "
+            "a\n3\ttcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 # b\n"
+        ) == 0
+    );
+    g_chaos_net_hits_total = 0U;
+
+    /* The exit report of a process that only inherited these counts writes nothing. */
+    g_chaos_net_hits_pending = 1;
+    g_chaos_net_hits_pid = (uint64_t)getpid() + 1U;
+    chaos_net_config_report_hits(NULL);
+    assert(g_chaos_net_hits_pending == 1);
+    g_chaos_net_hits_pending = 0;
+    g_chaos_net_hits_pid = (uint64_t)getpid();
 
     (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_NET_HITS_PREFIX, (long)getpid());
     (void)unlink(path);

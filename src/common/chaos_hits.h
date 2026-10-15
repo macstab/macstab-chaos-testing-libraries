@@ -23,13 +23,15 @@
  *
  * The file is rewritten on each of a process's first CHAOS_HITS_EAGER hits, then
  * at most every CHAOS_HITS_INTERVAL_MS on a hit, and when the process exits
- * normally. A forked child starts again from zero, so the parent's hits are not
- * reported twice.
+ * normally; a hit that is not due to be written makes no system call. A forked
+ * child starts again from zero at its first write, so the parent's hits are not
+ * reported twice (hits the child made before that write are dropped with them).
  */
 
 #ifndef CHAOS_HITS_H
 #define CHAOS_HITS_H
 
+#include "chaos_clock.h"
 #include "chaos_status.h"
 
 #include <stdint.h>
@@ -56,6 +58,8 @@ struct chaos_hit_slot
     volatile uint64_t count;
     /** Firings claimed under `@first=N` (see chaos_policy.h); never more than N succeed. */
     volatile uint64_t claimed;
+    /** Process the claims belong to: a forked child starts its own `@first` budget. */
+    volatile uint64_t claimed_pid;
     /** Effect state that must survive reloads (libchaos-time REGRESS: 0, 1 armed, 2 jumped). */
     volatile uint64_t state;
     /** Library hook that reports the counts after a hit on this slot; NULL forces a report. */
@@ -80,11 +84,21 @@ static inline void chaos_hit_record(chaos_hit_slot_t *slot)
     }
 }
 
-/** @brief Milliseconds on CLOCK_MONOTONIC, read without passing through libchaos-time. */
+/**
+ * @brief Milliseconds on CLOCK_MONOTONIC, read without passing through libchaos-time.
+ *
+ * @details From the vDSO, so counting a hit makes no system call; a raw system call
+ * where there is no vDSO clock.
+ */
 static inline uint64_t chaos_hits_now_ms(void)
 {
     struct timespec now;
+    const uint64_t vdso_ns = chaos_clock_now_ns();
 
+    if (vdso_ns != 0U)
+    {
+        return vdso_ns / UINT64_C(1000000);
+    }
 #ifdef __linux__
     if (syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &now) != 0)
 #else

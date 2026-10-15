@@ -204,8 +204,8 @@ static chaos_status_error_t g_chaos_memory_config_error;
 /** @brief Text of each accepted rule of the last parse, copied into the snapshot. */
 static char g_chaos_memory_config_texts[CHAOS_MEMORY_MAX_RULES][CHAOS_STATUS_TEXT_MAX + 1U];
 
-/** @brief Set while a thread writes the hits file. */
-static volatile int g_chaos_memory_hits_writing = 0;
+/** @brief Pid of the process whose thread writes the hits file; 0 when nobody does. */
+static volatile uint64_t g_chaos_memory_hits_writing = 0U;
 
 /** @brief Set by every hit, cleared by the write that reports it. */
 static volatile int g_chaos_memory_hits_pending = 0;
@@ -936,7 +936,7 @@ static int chaos_memory_config_read_file(size_t *size_out, uint64_t expected_sta
         {
             (void)close(fd);
             chaos_memory_leave_internal(previous);
-            return -1;
+            return -2;
         }
     }
 
@@ -1026,6 +1026,8 @@ static int chaos_memory_split_rule_fields(
  */
 void chaos_memory_config_init(void)
 {
+    /* Find the vDSO clock now, not first inside a wrapper a signal handler may re-enter. */
+    (void)chaos_clock_now_ns();
     chaos_memory_config_reset_state(&g_chaos_memory_config_states[0], 1);
     chaos_memory_config_reset_state(&g_chaos_memory_config_states[1], 1);
     g_chaos_memory_active_config_index = 0U;
@@ -1266,6 +1268,20 @@ int chaos_memory_config_select_rule(
 }
 
 /**
+ * @brief Marks @p state as the result of a rule file at or over the size limit.
+ *
+ * @details Unlike a read that failed or met a concurrent writer, the size is a
+ * lasting property of this version of the file: it is reported like a rejected
+ * file (no rules, state=error) and not re-read until the file changes.
+ */
+static void chaos_memory_config_reject_file(chaos_memory_config_state_t *state)
+{
+    chaos_memory_config_reset_state(state, 0);
+    chaos_status_clear(&g_chaos_memory_config_error);
+    chaos_status_reject(&g_chaos_memory_config_error, CHAOS_STATUS_REASON_TOO_LARGE);
+}
+
+/**
  * @brief Reports this process's hit counts after a hit on @p slot (NULL: at exit).
  *
  * @details Writes the hits file on each of the first CHAOS_HITS_EAGER hits, then at
@@ -1277,15 +1293,42 @@ int chaos_memory_config_select_rule(
 static void chaos_memory_config_report_hits(chaos_hit_slot_t *slot)
 {
     chaos_memory_config_state_t *state;
-    const uint64_t pid = (uint64_t)getpid();
-    uint64_t now;
+    const uint64_t now = chaos_hits_now_ms();
+    uint64_t owner;
+    uint64_t pid;
 
-    if (slot == NULL && (g_chaos_memory_hits_pending == 0 || g_chaos_memory_hits_pid != pid))
+    if (slot != NULL)
+    {
+        ++g_chaos_memory_hits_total;
+        if (g_chaos_memory_hits_pending == 0)
+        {
+            g_chaos_memory_hits_pending = 1;
+        }
+        /* Past the eager hits and inside the interval there is nothing to write:
+         * no system call, no shared write beyond the counters. */
+        if (g_chaos_memory_hits_total > CHAOS_HITS_EAGER &&
+            now - g_chaos_memory_hits_last_ms < CHAOS_HITS_INTERVAL_MS)
+        {
+            return;
+        }
+    }
+    else if (g_chaos_memory_hits_pending == 0)
     {
         return;
     }
-    g_chaos_memory_hits_pending = 1;
-    if (!__sync_bool_compare_and_swap(&g_chaos_memory_hits_writing, 0, 1))
+    pid = (uint64_t)getpid();
+    if (slot == NULL && g_chaos_memory_hits_pid != pid)
+    {
+        return;
+    }
+    /* The writer flag holds the writer's pid. One inherited from a parent that forked
+     * while writing belongs to no thread of this process and is released. */
+    owner = g_chaos_memory_hits_writing;
+    if (owner != 0U && owner != pid)
+    {
+        (void)__sync_bool_compare_and_swap(&g_chaos_memory_hits_writing, owner, 0U);
+    }
+    if (!__sync_bool_compare_and_swap(&g_chaos_memory_hits_writing, 0U, pid))
     {
         return;
     }
@@ -1300,32 +1343,22 @@ static void chaos_memory_config_report_hits(chaos_hit_slot_t *slot)
         }
         slot->count = 1U;
         g_chaos_memory_hits_pid = pid;
-        g_chaos_memory_hits_total = 0U;
-        g_chaos_memory_hits_last_ms = 0U;
+        g_chaos_memory_hits_total = 1U;
     }
-    if (slot != NULL)
+    while (g_chaos_memory_hits_pending != 0)
     {
-        ++g_chaos_memory_hits_total;
+        g_chaos_memory_hits_pending = 0;
+        __sync_synchronize();
+        chaos_hits_write(
+            CHAOS_MEMORY_HITS_PREFIX,
+            state->hits,
+            (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) state->text,
+            state->rule_count,
+            g_chaos_memory_hits_buffer,
+            sizeof(g_chaos_memory_hits_buffer)
+        );
     }
-    now = chaos_hits_now_ms();
-    if (slot == NULL || g_chaos_memory_hits_total <= CHAOS_HITS_EAGER ||
-        now - g_chaos_memory_hits_last_ms >= CHAOS_HITS_INTERVAL_MS)
-    {
-        while (g_chaos_memory_hits_pending != 0)
-        {
-            g_chaos_memory_hits_pending = 0;
-            __sync_synchronize();
-            chaos_hits_write(
-                CHAOS_MEMORY_HITS_PREFIX,
-                state->hits,
-                (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) state->text,
-                state->rule_count,
-                g_chaos_memory_hits_buffer,
-                sizeof(g_chaos_memory_hits_buffer)
-            );
-        }
-        g_chaos_memory_hits_last_ms = now;
-    }
+    g_chaos_memory_hits_last_ms = now;
     __sync_lock_release(&g_chaos_memory_hits_writing);
 }
 
@@ -1362,6 +1395,7 @@ static void chaos_memory_config_attach_hits(chaos_memory_config_state_t *next_st
             {
                 next_state->hits[index].count = active->hits[previous].count;
                 next_state->hits[index].claimed = active->hits[previous].claimed;
+                next_state->hits[index].claimed_pid = active->hits[previous].claimed_pid;
                 next_state->hits[index].state = active->hits[previous].state;
                 break;
             }
@@ -1498,7 +1532,14 @@ static int chaos_memory_config_refresh(void)
 
     if (observed_mtime != CHAOS_MEMORY_MTIME_MISSING)
     {
-        if (chaos_memory_config_read_file(&config_size, observed_mtime) != 0)
+        const int read_rc = chaos_memory_config_read_file(&config_size, observed_mtime);
+
+        if (read_rc == -2)
+        {
+            chaos_memory_config_reject_file(next_state);
+            config_size = 0U;
+        }
+        else if (read_rc != 0)
         {
             /* A failed read says nothing about the rules: keep the active snapshot and
              * release the claim with the previous stamp, so the next call retries

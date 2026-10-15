@@ -413,9 +413,29 @@ applied, and each process reports its counts in
 - The counter lives in the snapshot; every rule copy a wrapper gets carries a
   pointer to it. A rule whose text is unchanged by a reload keeps its count.
 - The file is rewritten on each of a process's first 64 hits, then at most
-  every 100 ms on a hit, and at normal exit. A forked child starts from zero.
+  every 100 ms on a hit, and at normal exit. A hit that is not due to be written
+  makes no system call (the time comes from the vDSO). The writer flag holds the
+  writer's pid, so one inherited by a child forked mid-write is released.
+- A forked child starts from zero at its first write, so the parent's hits are
+  not reported twice; hits the child made before that write are dropped with
+  them. `@first` budgets are per process too: a child starts its own.
 - A reader sums the files of all processes. Files of finished processes stay,
-  so counts are cumulative until the files are removed.
+  so counts are cumulative until the files are removed (one file per process
+  that ever hit a rule: remove them between test runs).
+
+Known limits, kept on purpose:
+
+- A rule is identified across reloads by its first 200 bytes of text; two
+  rules that share them share a count and an `@first` budget.
+- A wrapper holds its rule copy across a blocking call. If the rule file is
+  reloaded twice during that call, a post-call effect (CORRUPT on `read`)
+  counts its hit against whatever rule then sits at that index.
+- `@size` compares the byte count the call asked for, also for effects
+  applied after the call (CORRUPT, TRICKLE, DUP).
+- In a sticky `/tmp`, a process may not replace a status file another user
+  created; the Java side then sees a pid that is not its own and skips the
+  check rather than reporting a stale result. A rule file at or over the size
+  limit is reported (`reason=file too large`) and not re-read until it changes.
 - Writes use the same raw-syscall rename as the status file.
 
 ## FD Path Resolution

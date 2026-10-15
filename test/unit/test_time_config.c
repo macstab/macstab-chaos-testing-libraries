@@ -1165,6 +1165,28 @@ static void test_prepare_reports_status(void)
     (void)snprintf(expected, sizeof(expected), "state=ok\nrules=1\npid=%ld\n", (long)getpid());
     assert(strcmp(status, expected) == 0);
 
+    /* A file at the size limit is reported, not silently re-read. */
+    {
+        FILE *large = fopen(CHAOS_TIME_CONFIG_PATH, "w");
+        size_t index;
+
+        assert(large != NULL);
+        for (index = 0U; index < CHAOS_TIME_MAX_CONFIG_BYTES; ++index)
+        {
+            assert(fputc('#', large) != EOF);
+        }
+        assert(fclose(large) == 0);
+    }
+    assert(chaos_time_config_prepare() == 0);
+    assert(read_status_file(status, sizeof(status)));
+    (void)snprintf(
+        expected,
+        sizeof(expected),
+        "state=error\nrules=0\nline=0\nreason=file too large\ntext=\npid=%ld\n",
+        (long)getpid()
+    );
+    assert(strcmp(status, expected) == 0);
+
     (void)unlink(CHAOS_TIME_CONFIG_PATH);
     assert(chaos_time_config_prepare() == 0);
     assert(!read_status_file(status, sizeof(status)));
@@ -1230,7 +1252,7 @@ static void test_hits_are_counted_and_reported(void)
     assert(strcmp(hits, "2\tnanosleep:ERRNO:EINTR # a\n1\tnanosleep:ERRNO:EINTR # b\n") == 0);
 
     /* A hit that finds another thread writing is left pending, not lost. */
-    g_chaos_time_hits_writing = 1;
+    g_chaos_time_hits_writing = (uint64_t)getpid();
     chaos_hit_record(state->rules[1].hit);
     g_chaos_time_hits_writing = 0;
     assert(g_chaos_time_hits_pending == 1);
@@ -1252,6 +1274,22 @@ static void test_hits_are_counted_and_reported(void)
     assert(g_chaos_time_hits_pending == 0);
     chaos_time_config_report_hits(NULL);
     g_chaos_time_hits_total = 0U;
+
+    /* A writer flag inherited from a parent that forked mid-write is released. */
+    g_chaos_time_hits_writing = (uint64_t)getpid() + 1U;
+    chaos_hit_record(state->rules[0].hit);
+    assert(g_chaos_time_hits_writing == 0U);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(strcmp(hits, "3\tnanosleep:ERRNO:EINTR # a\n3\tnanosleep:ERRNO:EINTR # b\n") == 0);
+    g_chaos_time_hits_total = 0U;
+
+    /* The exit report of a process that only inherited these counts writes nothing. */
+    g_chaos_time_hits_pending = 1;
+    g_chaos_time_hits_pid = (uint64_t)getpid() + 1U;
+    chaos_time_config_report_hits(NULL);
+    assert(g_chaos_time_hits_pending == 1);
+    g_chaos_time_hits_pending = 0;
+    g_chaos_time_hits_pid = (uint64_t)getpid();
 
     (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_TIME_HITS_PREFIX, (long)getpid());
     (void)unlink(path);
