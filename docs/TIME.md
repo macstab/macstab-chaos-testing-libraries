@@ -22,8 +22,8 @@ kernel source table are embedded inline in §2 of this document.
 
 Current implementation status:
 
-- interposed symbols: `clock_gettime()`, `gettimeofday()`, `time()`, `nanosleep()`,
-  `clock_nanosleep()`, `usleep()`
+- interposed symbols: `clock_gettime()`, `gettimeofday()`, `time()`, `timespec_get()`,
+  `nanosleep()`, `clock_nanosleep()`, `sleep()`, `usleep()`
 - config path: `/tmp/.chaos-time.conf`
 - unit-tested; runtime probe for glibc/musl and amd64/arm64 validation
 
@@ -559,13 +559,15 @@ backward. Positive values move it forward. Zero is a no-op but legal.
 | `nanosleep`             | yes     | yes   | no     | No timestamp return value to mutate              |
 | `usleep`                | yes     | yes   | no     | Same; no remaining-time output                   |
 
-No selector names `gettimeofday`, `time` or `clock_nanosleep`; they are governed
+No selector names `gettimeofday`, `time`, `timespec_get`, `clock_nanosleep` or `sleep`; they are governed
 by the rules of the call they are a form of:
 
 | Symbol            | Follows rules of          | Notes                                                    |
 |-------------------|---------------------------|----------------------------------------------------------|
 | `gettimeofday`    | `clock_gettime/realtime`  | Microseconds derived from the shifted timespec           |
 | `time`            | `clock_gettime/realtime`  | ERRNO returns `(time_t)-1`                               |
+| `timespec_get`    | `clock_gettime/realtime`  | `TIME_UTC` only; ERRNO returns 0                         |
+| `sleep`           | `nanosleep`               | ERRNO returns the full request unslept, errno set        |
 | `clock_nanosleep` | `nanosleep`               | Error returned as the result, errno untouched; EINTR fills `remaining` only for a relative sleep |
 
 ### 8.3 Valid errno Values
@@ -884,15 +886,10 @@ symbols traversed via the PLT.
 Covered:
 
 - `clock_gettime()` — with sub-selector per clock ID; ERRNO, LATENCY, OFFSET effects
-- `gettimeofday()`, `time()` — the `clock_gettime/realtime` rules
+- `gettimeofday()`, `time()`, `timespec_get()` — the `clock_gettime/realtime` rules
 - `nanosleep()` — ERRNO, LATENCY
-- `clock_nanosleep()` — the `nanosleep` rules
+- `clock_nanosleep()`, `sleep()` — the `nanosleep` rules
 - `usleep()` — ERRNO, LATENCY
-
-Not covered:
-
-- `sleep()` — glibc and musl implement it with their internal nanosleep, which
-  never passes through the exported symbol, so no wrapper sees it
 - `alarm()` / `setitimer()` — signal-domain timers; outside scope
 - POSIX timer APIs (`timer_create`, `timer_settime`, etc.) — outside scope
 - `timerfd_create` / `timerfd_settime` — IO-domain timer fds; outside scope

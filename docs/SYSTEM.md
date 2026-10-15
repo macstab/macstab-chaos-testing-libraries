@@ -750,8 +750,8 @@ Intended responsibility:
 - `clock_gettime`
 - `nanosleep`
 - `usleep`
-- `gettimeofday` and `time`, through the `clock_gettime/realtime` rules
-- `clock_nanosleep`, through the `nanosleep` rules
+- `gettimeofday`, `time` and `timespec_get`, through the `clock_gettime/realtime` rules
+- `clock_nanosleep` and `sleep`, through the `nanosleep` rules
 
 ### `libchaos-process`
 
