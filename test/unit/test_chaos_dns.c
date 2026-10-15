@@ -67,6 +67,8 @@
 
 #include "../support/test_dns_support.h"
 
+#include <stdio.h>
+
 #include "../../src/dns/chaos_dns_config.h"
 
 CHAOS_DNS_DEFINE_TEST_GLOBALS();
@@ -477,6 +479,99 @@ static void chaos_dns_test_freeaddrinfo(struct addrinfo *result)
         free(result);
         result = next;
     }
+}
+
+/** @brief Calls made to the stubbed real hostent resolvers. */
+static int g_real_hostent_calls = 0;
+/** @brief When non-zero, the stubbed real hostent resolvers report "not found". */
+static int g_real_hostent_missing = 0;
+/** @brief `buffer_size` passed to the most recent stubbed gethostbyaddr_r call. */
+static size_t g_real_hostent_buffer_size = 0U;
+/** @brief The entry the stubbed non-reentrant resolvers return. */
+static struct hostent g_real_hostent;
+/** @brief Name of the stubbed real entries. */
+static char g_real_hostent_name[] = "real.example";
+
+/** @brief Stub for the real gethostbyname2(3). */
+static struct hostent *chaos_dns_test_gethostbyname2(const char *name, int family)
+{
+    (void)name;
+    (void)family;
+    ++g_real_hostent_calls;
+    g_real_hostent.h_name = g_real_hostent_name;
+    return g_real_hostent_missing ? NULL : &g_real_hostent;
+}
+
+/** @brief Stub for the real gethostbyname2_r(3). */
+static int chaos_dns_test_gethostbyname2_r(
+    const char *name,
+    int family,
+    struct hostent *entry,
+    char *buffer,
+    size_t buffer_size,
+    struct hostent **result,
+    int *h_error
+)
+{
+    (void)name;
+    (void)family;
+    (void)buffer;
+    (void)buffer_size;
+    ++g_real_hostent_calls;
+    if (result != NULL)
+    {
+        *result = g_real_hostent_missing ? NULL : entry;
+    }
+    if (h_error != NULL)
+    {
+        *h_error = g_real_hostent_missing ? HOST_NOT_FOUND : 0;
+    }
+    return 0;
+}
+
+/** @brief Stub for the real gethostbyaddr(3). */
+static struct hostent *
+chaos_dns_test_gethostbyaddr(const void *address, socklen_t length, int family)
+{
+    (void)address;
+    (void)length;
+    (void)family;
+    ++g_real_hostent_calls;
+    g_real_hostent.h_name = g_real_hostent_name;
+    return g_real_hostent_missing ? NULL : &g_real_hostent;
+}
+
+/** @brief Stub for the real gethostbyaddr_r(3): names the entry "real.example". */
+static int chaos_dns_test_gethostbyaddr_r(
+    const void *address,
+    socklen_t length,
+    int family,
+    struct hostent *entry,
+    char *buffer,
+    size_t buffer_size,
+    struct hostent **result,
+    int *h_error
+)
+{
+    (void)address;
+    (void)length;
+    (void)family;
+    (void)buffer;
+    ++g_real_hostent_calls;
+    g_real_hostent_buffer_size = buffer_size;
+    if (result == NULL || h_error == NULL)
+    {
+        return 0;
+    }
+    if (g_real_hostent_missing)
+    {
+        *result = NULL;
+        *h_error = HOST_NOT_FOUND;
+        return 0;
+    }
+    entry->h_name = g_real_hostent_name;
+    *result = entry;
+    return 0;
 }
 
 #include "../../src/dns/chaos_dns_lookup.c"
@@ -913,6 +1008,332 @@ static void test_override_error_and_post_rules(void)
     chaos_dns_test_freeaddrinfo(result);
 }
 
+/** @brief Wires every real resolver to the test stubs. */
+static void bind_hostent_stubs(void)
+{
+    reset_wrapper_state();
+    g_chaos_dns_real_getaddrinfo = chaos_dns_test_getaddrinfo;
+    g_chaos_dns_real_freeaddrinfo = chaos_dns_test_freeaddrinfo;
+    g_chaos_dns_real_gethostbyname2 = chaos_dns_test_gethostbyname2;
+    g_chaos_dns_real_gethostbyname2_r = chaos_dns_test_gethostbyname2_r;
+    g_chaos_dns_real_gethostbyaddr = chaos_dns_test_gethostbyaddr;
+    g_chaos_dns_real_gethostbyaddr_r = chaos_dns_test_gethostbyaddr_r;
+    g_real_hostent_calls = 0;
+    g_real_hostent_missing = 0;
+    g_real_hostent_buffer_size = 0U;
+}
+
+/**
+ * @brief Invariant: the hostent helpers map errors and lay out entries correctly.
+ *
+ * Expected observable behaviour:
+ * - EAI codes map to HOST_NOT_FOUND, TRY_AGAIN, NO_DATA and NO_RECOVERY.
+ * - The entry holds the addresses of the requested family only, an empty alias list,
+ *   and the canonical name of the first node (or the query); IPv6 uses 16-byte
+ *   addresses; no matching address is ENOENT; a short buffer is ERANGE.
+ * - Reverse keys are built for IPv4 and IPv6 only, from addresses of full length.
+ */
+static void test_hostent_helpers(void)
+{
+    struct addrinfo *v6 = make_result_node(AF_INET6);
+    struct addrinfo *v4 = make_result_node(AF_INET);
+    struct addrinfo *no_address = make_result_node(AF_INET);
+    struct hostent entry;
+    struct in_addr ipv4;
+    struct in6_addr ipv6;
+    char buffer[256];
+    char text[INET6_ADDRSTRLEN];
+
+    assert(chaos_dns_h_errno_for(EAI_NONAME) == HOST_NOT_FOUND);
+    assert(chaos_dns_h_errno_for(EAI_AGAIN) == TRY_AGAIN);
+    assert(chaos_dns_h_errno_for(EAI_FAIL) == NO_RECOVERY);
+#ifdef EAI_NODATA
+    assert(chaos_dns_h_errno_for(EAI_NODATA) == NO_DATA);
+#endif
+#ifdef EAI_ADDRFAMILY
+    assert(chaos_dns_h_errno_for(EAI_ADDRFAMILY) == NO_DATA);
+#endif
+
+    ((struct sockaddr_in *)(void *)v4->ai_addr)->sin_addr.s_addr = htonl(0x0a000001U);
+    free(no_address->ai_addr);
+    no_address->ai_addr = NULL;
+    v6->ai_canonname = strdup("canon.example");
+    assert(v6->ai_canonname != NULL);
+    v6->ai_next = v4;
+    v4->ai_next = no_address;
+
+    assert(
+        chaos_dns_fill_hostent("query.example", AF_INET, v6, &entry, buffer, sizeof(buffer)) == 0
+    );
+    assert(strcmp(entry.h_name, "canon.example") == 0);
+    assert(entry.h_aliases[0] == NULL);
+    assert(entry.h_addrtype == AF_INET);
+    assert(entry.h_length == 4);
+    assert(inet_ntop(AF_INET, entry.h_addr_list[0], text, sizeof(text)) != NULL);
+    assert(strcmp(text, "10.0.0.1") == 0);
+    assert(entry.h_addr_list[1] == NULL);
+
+    assert(
+        chaos_dns_fill_hostent("query.example", AF_INET6, v4, &entry, buffer, sizeof(buffer)) ==
+        ENOENT
+    );
+    assert(
+        chaos_dns_fill_hostent("query.example", AF_INET6, v6, &entry, buffer, sizeof(buffer)) == 0
+    );
+    assert(entry.h_length == 16);
+    assert(
+        chaos_dns_fill_hostent(
+            "query.example", AF_INET, v4, &entry, buffer + 1, sizeof(buffer) - 1U
+        ) == 0
+    );
+    assert(strcmp(entry.h_name, "query.example") == 0);
+    assert(chaos_dns_fill_hostent("query.example", AF_INET, v4, &entry, buffer, 8U) == ERANGE);
+    assert(chaos_dns_fill_hostent("query.example", AF_INET, v4, &entry, buffer + 1, 1U) == ERANGE);
+    chaos_dns_test_freeaddrinfo(v6);
+
+    ipv4.s_addr = htonl(INADDR_LOOPBACK);
+    (void)memset(&ipv6, 0, sizeof(ipv6));
+    assert(chaos_dns_reverse_query_from_address(&ipv4, sizeof(ipv4), AF_INET, text, sizeof(text)));
+    assert(strcmp(text, "127.0.0.1") == 0);
+    assert(chaos_dns_reverse_query_from_address(&ipv6, sizeof(ipv6), AF_INET6, text, sizeof(text)));
+    assert(!chaos_dns_reverse_query_from_address(NULL, sizeof(ipv4), AF_INET, text, sizeof(text)));
+    assert(!chaos_dns_reverse_query_from_address(&ipv4, 2U, AF_INET, text, sizeof(text)));
+    assert(!chaos_dns_reverse_query_from_address(&ipv6, 4U, AF_INET6, text, sizeof(text)));
+    assert(!chaos_dns_reverse_query_from_address(&ipv4, sizeof(ipv4), AF_UNIX, text, sizeof(text)));
+}
+
+/**
+ * @brief Invariant: the forward hostent resolvers follow the dns:// rules.
+ *
+ * Expected observable behaviour:
+ * - Under the guard, without a name, without output pointers or without rules the
+ *   real resolver answers.
+ * - LATENCY is applied; GAI fails the lookup with the mapped h_errno.
+ * - A result-shaping rule answers through the getaddrinfo pipeline: success, a
+ *   resolver error (mapped h_errno), no address of the family (NO_DATA) and a short
+ *   buffer (ERANGE).
+ * - gethostbyname and gethostbyname_r are the AF_INET forms.
+ */
+static void test_forward_hostent_paths(void)
+{
+    const char *volatile no_name = NULL;
+    struct hostent entry;
+    struct hostent *result = NULL;
+    char buffer[256];
+    int h_error = 0;
+
+    bind_hostent_stubs();
+    g_chaos_dns_tls_guard = 1;
+    assert(
+        gethostbyname2_r("a.example", AF_INET, &entry, buffer, sizeof(buffer), &result, &h_error) ==
+        0
+    );
+    assert(gethostbyname2("a.example", AF_INET) == &g_real_hostent);
+    g_chaos_dns_tls_guard = 0;
+    assert(
+        gethostbyname2_r(no_name, AF_INET, &entry, buffer, sizeof(buffer), &result, &h_error) == 0
+    );
+    assert(gethostbyname2_r("", AF_INET, &entry, buffer, sizeof(buffer), &result, &h_error) == 0);
+    assert(
+        gethostbyname2_r("a.example", AF_INET, &entry, buffer, sizeof(buffer), NULL, &h_error) == 0
+    );
+    assert(
+        gethostbyname2_r("a.example", AF_INET, &entry, buffer, sizeof(buffer), &result, NULL) == 0
+    );
+    assert(gethostbyname_r("a.example", &entry, buffer, sizeof(buffer), &result, &h_error) == 0);
+    assert(result == &entry);
+    assert(gethostbyname2(no_name, AF_INET) == &g_real_hostent);
+    assert(gethostbyname2("", AF_INET) == &g_real_hostent);
+    assert(gethostbyname("a.example") == &g_real_hostent);
+    assert(g_real_hostent_calls == 10);
+
+    bind_hostent_stubs();
+    g_stub_match[CHAOS_DNS_EFFECT_LATENCY] = 1;
+    g_stub_rules[CHAOS_DNS_EFFECT_LATENCY].effect = CHAOS_DNS_EFFECT_LATENCY;
+    g_stub_match[CHAOS_DNS_EFFECT_GAI] = 1;
+    g_stub_rules[CHAOS_DNS_EFFECT_GAI].effect = CHAOS_DNS_EFFECT_GAI;
+    g_stub_rules[CHAOS_DNS_EFFECT_GAI].gai_error = EAI_AGAIN;
+    g_gai_trigger = 1;
+    result = &entry;
+    assert(
+        gethostbyname2_r("a.example", AF_INET, &entry, buffer, sizeof(buffer), &result, &h_error) ==
+        0
+    );
+    assert(result == NULL);
+    assert(h_error == TRY_AGAIN);
+    h_errno = 0;
+    assert(gethostbyname("a.example") == NULL);
+    assert(h_errno == TRY_AGAIN);
+    assert(g_latency_calls == 2);
+    assert(g_real_hostent_calls == 0);
+
+    bind_hostent_stubs();
+    g_stub_match[CHAOS_DNS_EFFECT_REWRITE] = 1;
+    g_stub_rules[CHAOS_DNS_EFFECT_REWRITE].effect = CHAOS_DNS_EFFECT_REWRITE;
+    (void)snprintf(
+        g_stub_rules[CHAOS_DNS_EFFECT_REWRITE].text, sizeof(g_stub_rules[0].text), "%s", "b.example"
+    );
+    assert(
+        gethostbyname2_r("a.example", AF_INET, &entry, buffer, sizeof(buffer), &result, &h_error) ==
+        0
+    );
+    assert(result == &entry);
+    assert(strcmp(entry.h_name, "a.example") == 0);
+    assert(strcmp(g_last_node, "b.example") == 0);
+    assert(gethostbyname("a.example") == &g_chaos_dns_hostent);
+
+    assert(
+        gethostbyname2_r(
+            "a.example", AF_INET6, &entry, buffer, sizeof(buffer), &result, &h_error
+        ) == 0
+    );
+    assert(result == NULL);
+    assert(h_error == NO_DATA);
+
+    errno = 0;
+    assert(gethostbyname2_r("a.example", AF_INET, &entry, buffer, 8U, &result, &h_error) == ERANGE);
+    assert(result == NULL);
+    assert(errno == ERANGE);
+    assert(h_error == NETDB_INTERNAL);
+
+    g_real_getaddrinfo_error = EAI_NONAME;
+    assert(
+        gethostbyname2_r("a.example", AF_INET, &entry, buffer, sizeof(buffer), &result, &h_error) ==
+        0
+    );
+    assert(result == NULL);
+    assert(h_error == HOST_NOT_FOUND);
+    h_errno = 0;
+    assert(gethostbyname2("a.example", AF_INET) == NULL);
+    assert(h_errno == HOST_NOT_FOUND);
+    assert(g_real_hostent_calls == 0);
+
+    bind_hostent_stubs();
+    g_stub_match[CHAOS_DNS_EFFECT_OVERRIDE] = 1;
+    assert(chaos_dns_has_result_rule("a.example"));
+    g_stub_match[CHAOS_DNS_EFFECT_OVERRIDE] = 0;
+    g_stub_match[CHAOS_DNS_EFFECT_FILTER_FAMILY] = 1;
+    assert(chaos_dns_has_result_rule("a.example"));
+    g_stub_match[CHAOS_DNS_EFFECT_FILTER_FAMILY] = 0;
+    g_stub_match[CHAOS_DNS_EFFECT_SHUFFLE] = 1;
+    assert(chaos_dns_has_result_rule("a.example"));
+    g_stub_match[CHAOS_DNS_EFFECT_SHUFFLE] = 0;
+    g_stub_match[CHAOS_DNS_EFFECT_LIMIT] = 1;
+    assert(chaos_dns_has_result_rule("a.example"));
+    g_stub_match[CHAOS_DNS_EFFECT_LIMIT] = 0;
+    assert(!chaos_dns_has_result_rule("a.example"));
+}
+
+/**
+ * @brief Invariant: the reverse hostent resolvers follow the rdns:// rules.
+ *
+ * Expected observable behaviour:
+ * - Under the guard, for an unsupported family or without output pointers the real
+ *   resolver answers unchanged.
+ * - GAI fails the lookup with the mapped h_errno.
+ * - REWRITE replaces h_name: in the tail of the caller's buffer for the _r form (the
+ *   real resolver gets the rest), in static storage for the plain form; a name longer
+ *   than the buffer is ERANGE; a rule that does not fire or a failed lookup changes
+ *   nothing.
+ */
+static void test_reverse_hostent_paths(void)
+{
+    struct hostent entry;
+    struct hostent *result = NULL;
+    struct in_addr ipv4;
+    char buffer[64];
+    int h_error = 0;
+
+    ipv4.s_addr = htonl(INADDR_LOOPBACK);
+
+    bind_hostent_stubs();
+    g_chaos_dns_tls_guard = 1;
+    assert(
+        gethostbyaddr_r(
+            &ipv4, sizeof(ipv4), AF_INET, &entry, buffer, sizeof(buffer), &result, &h_error
+        ) == 0
+    );
+    assert(gethostbyaddr(&ipv4, sizeof(ipv4), AF_INET) == &g_real_hostent);
+    g_chaos_dns_tls_guard = 0;
+    assert(
+        gethostbyaddr_r(
+            &ipv4, sizeof(ipv4), AF_UNIX, &entry, buffer, sizeof(buffer), &result, &h_error
+        ) == 0
+    );
+    assert(
+        gethostbyaddr_r(
+            &ipv4, sizeof(ipv4), AF_INET, &entry, buffer, sizeof(buffer), NULL, &h_error
+        ) == 0
+    );
+    assert(gethostbyaddr(&ipv4, sizeof(ipv4), AF_UNIX) == &g_real_hostent);
+    assert(g_real_hostent_calls == 5);
+
+    bind_hostent_stubs();
+    g_stub_match[CHAOS_DNS_EFFECT_GAI] = 1;
+    g_stub_rules[CHAOS_DNS_EFFECT_GAI].effect = CHAOS_DNS_EFFECT_GAI;
+    g_stub_rules[CHAOS_DNS_EFFECT_GAI].gai_error = EAI_FAIL;
+    g_gai_trigger = 1;
+    assert(
+        gethostbyaddr_r(
+            &ipv4, sizeof(ipv4), AF_INET, &entry, buffer, sizeof(buffer), &result, &h_error
+        ) == 0
+    );
+    assert(result == NULL);
+    assert(h_error == NO_RECOVERY);
+    h_errno = 0;
+    assert(gethostbyaddr(&ipv4, sizeof(ipv4), AF_INET) == NULL);
+    assert(h_errno == NO_RECOVERY);
+    assert(g_real_hostent_calls == 0);
+
+    bind_hostent_stubs();
+    g_stub_match[CHAOS_DNS_EFFECT_REWRITE] = 1;
+    g_stub_rules[CHAOS_DNS_EFFECT_REWRITE].effect = CHAOS_DNS_EFFECT_REWRITE;
+    (void)snprintf(
+        g_stub_rules[CHAOS_DNS_EFFECT_REWRITE].text,
+        sizeof(g_stub_rules[0].text),
+        "%s",
+        "ptr.example"
+    );
+    assert(
+        gethostbyaddr_r(
+            &ipv4, sizeof(ipv4), AF_INET, &entry, buffer, sizeof(buffer), &result, &h_error
+        ) == 0
+    );
+    assert(result == &entry);
+    assert(strcmp(entry.h_name, "ptr.example") == 0);
+    assert(entry.h_name == buffer + sizeof(buffer) - sizeof("ptr.example"));
+    assert(g_real_hostent_buffer_size == sizeof(buffer) - sizeof("ptr.example"));
+    result = gethostbyaddr(&ipv4, sizeof(ipv4), AF_INET);
+    assert(result != NULL && strcmp(result->h_name, "ptr.example") == 0);
+
+    errno = 0;
+    assert(
+        gethostbyaddr_r(&ipv4, sizeof(ipv4), AF_INET, &entry, buffer, 4U, &result, &h_error) ==
+        ERANGE
+    );
+    assert(result == NULL);
+    assert(errno == ERANGE);
+
+    g_real_hostent_missing = 1;
+    assert(
+        gethostbyaddr_r(
+            &ipv4, sizeof(ipv4), AF_INET, &entry, buffer, sizeof(buffer), &result, &h_error
+        ) == 0
+    );
+    assert(result == NULL);
+    assert(gethostbyaddr(&ipv4, sizeof(ipv4), AF_INET) == NULL);
+
+    g_real_hostent_missing = 0;
+    g_should_trigger = 0;
+    assert(
+        gethostbyaddr_r(
+            &ipv4, sizeof(ipv4), AF_INET, &entry, buffer, sizeof(buffer), &result, &h_error
+        ) == 0
+    );
+    assert(strcmp(entry.h_name, "real.example") == 0);
+    assert(g_real_hostent_buffer_size == sizeof(buffer));
+}
+
 int main(void)
 {
     test_static_helpers();
@@ -921,5 +1342,8 @@ int main(void)
     test_latency_and_gai_paths();
     test_rewrite_service_and_override_paths();
     test_override_error_and_post_rules();
+    test_hostent_helpers();
+    test_forward_hostent_paths();
+    test_reverse_hostent_paths();
     return 0;
 }

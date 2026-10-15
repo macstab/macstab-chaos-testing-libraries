@@ -130,6 +130,18 @@ typedef int (*chaos_dns_getnameinfo_fn)(
  */
 typedef void (*chaos_dns_freeaddrinfo_fn)(struct addrinfo *);
 
+/** @brief Signature of the real gethostbyname2(3). */
+typedef struct hostent *(*chaos_dns_gethostbyname2_fn)(const char *, int);
+
+/** @brief Signature of the real gethostbyname2_r(3). */
+typedef int (*chaos_dns_gethostbyname2_r_fn)(const char *, int, struct hostent *, char *, size_t, struct hostent **, int *);
+
+/** @brief Signature of the real gethostbyaddr(3). */
+typedef struct hostent *(*chaos_dns_gethostbyaddr_fn)(const void *, socklen_t, int);
+
+/** @brief Signature of the real gethostbyaddr_r(3). */
+typedef int (*chaos_dns_gethostbyaddr_r_fn)(const void *, socklen_t, int, struct hostent *, char *, size_t, struct hostent **, int *);
+
 /* -------------------------------------------------------------------------
  * Global variables — defined in chaos_dns.c, declared here for all TUs.
  * ------------------------------------------------------------------------- */
@@ -161,6 +173,12 @@ extern chaos_dns_getnameinfo_fn g_chaos_dns_real_getnameinfo;
  * @see g_chaos_dns_real_getaddrinfo for lifecycle notes.
  */
 extern chaos_dns_freeaddrinfo_fn g_chaos_dns_real_freeaddrinfo;
+
+/** @brief Pointers to the real hostent resolvers (legacy gethostbyname family). */
+extern chaos_dns_gethostbyname2_fn g_chaos_dns_real_gethostbyname2;
+extern chaos_dns_gethostbyname2_r_fn g_chaos_dns_real_gethostbyname2_r;
+extern chaos_dns_gethostbyaddr_fn g_chaos_dns_real_gethostbyaddr;
+extern chaos_dns_gethostbyaddr_r_fn g_chaos_dns_real_gethostbyaddr_r;
 
 /**
  * @brief Per-thread reentrancy guard.

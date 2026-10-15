@@ -63,6 +63,10 @@
     chaos_dns_getaddrinfo_fn g_chaos_dns_real_getaddrinfo = NULL;                                  \
     chaos_dns_getnameinfo_fn g_chaos_dns_real_getnameinfo = NULL;                                  \
     chaos_dns_freeaddrinfo_fn g_chaos_dns_real_freeaddrinfo = NULL;                                \
+    chaos_dns_gethostbyname2_fn g_chaos_dns_real_gethostbyname2 = NULL;                            \
+    chaos_dns_gethostbyname2_r_fn g_chaos_dns_real_gethostbyname2_r = NULL;                        \
+    chaos_dns_gethostbyaddr_fn g_chaos_dns_real_gethostbyaddr = NULL;                              \
+    chaos_dns_gethostbyaddr_r_fn g_chaos_dns_real_gethostbyaddr_r = NULL;                          \
     __thread int g_chaos_dns_tls_guard = 0;                                                        \
     __thread uint64_t g_chaos_dns_tls_prng_state = 0U;                                             \
     uint64_t g_chaos_dns_process_seed = 1U
@@ -79,6 +83,10 @@ static inline void chaos_dns_test_reset_runtime(void)
     g_chaos_dns_real_getaddrinfo = NULL;
     g_chaos_dns_real_getnameinfo = NULL;
     g_chaos_dns_real_freeaddrinfo = NULL;
+    g_chaos_dns_real_gethostbyname2 = NULL;
+    g_chaos_dns_real_gethostbyname2_r = NULL;
+    g_chaos_dns_real_gethostbyaddr = NULL;
+    g_chaos_dns_real_gethostbyaddr_r = NULL;
     g_chaos_dns_tls_guard = 0;
     g_chaos_dns_tls_prng_state = 0U;
     g_chaos_dns_process_seed = 1U;

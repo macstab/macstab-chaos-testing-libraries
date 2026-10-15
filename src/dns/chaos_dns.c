@@ -58,6 +58,10 @@
 chaos_dns_getaddrinfo_fn g_chaos_dns_real_getaddrinfo = NULL;
 chaos_dns_getnameinfo_fn g_chaos_dns_real_getnameinfo = NULL;
 chaos_dns_freeaddrinfo_fn g_chaos_dns_real_freeaddrinfo = NULL;
+chaos_dns_gethostbyname2_fn g_chaos_dns_real_gethostbyname2 = NULL;
+chaos_dns_gethostbyname2_r_fn g_chaos_dns_real_gethostbyname2_r = NULL;
+chaos_dns_gethostbyaddr_fn g_chaos_dns_real_gethostbyaddr = NULL;
+chaos_dns_gethostbyaddr_r_fn g_chaos_dns_real_gethostbyaddr_r = NULL;
 
 __thread int g_chaos_dns_tls_guard = 0;
 __thread uint64_t g_chaos_dns_tls_prng_state = 0U;
@@ -200,6 +204,10 @@ static void chaos_dns_resolve_all_symbols(void)
     chaos_dns_resolve_symbol(&g_chaos_dns_real_getaddrinfo, "getaddrinfo");
     chaos_dns_resolve_symbol(&g_chaos_dns_real_getnameinfo, "getnameinfo");
     chaos_dns_resolve_symbol(&g_chaos_dns_real_freeaddrinfo, "freeaddrinfo");
+    chaos_dns_resolve_symbol(&g_chaos_dns_real_gethostbyname2, "gethostbyname2");
+    chaos_dns_resolve_symbol(&g_chaos_dns_real_gethostbyname2_r, "gethostbyname2_r");
+    chaos_dns_resolve_symbol(&g_chaos_dns_real_gethostbyaddr, "gethostbyaddr");
+    chaos_dns_resolve_symbol(&g_chaos_dns_real_gethostbyaddr_r, "gethostbyaddr_r");
 }
 
 void chaos_dns_ensure_symbols(void)

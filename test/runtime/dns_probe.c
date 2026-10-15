@@ -22,6 +22,8 @@
  * - `EAI_AGAIN` injection on `getnameinfo` (synthetic transient failure)
  * - `LATENCY` injection on `getnameinfo` (≥ 150 ms added sleep)
  * - `REWRITE` + `SERVICE` on `getnameinfo` (PTR hostname and service name override)
+ * - the same rules on `gethostbyname`, `gethostbyname2`, their `_r` forms, `gethostbyaddr`
+ *   and `gethostbyaddr_r`, which glibc and musl resolve without getaddrinfo/getnameinfo
  *
  * The `OVERRIDE` subtest exercises the full FILTER→SHUFFLE→LIMIT transform
  * pipeline in a single call: the injected address list [127.0.0.1, ::1] is
@@ -338,6 +340,84 @@ static int probe_reverse_rewrite_service(void)
     return 0;
 }
 
+/*
+ * The legacy hostent resolvers follow the same dns:// and rdns:// rules as
+ * getaddrinfo() and getnameinfo(): a GAI error becomes h_errno, OVERRIDE supplies
+ * the addresses, REWRITE replaces the reverse name.
+ */
+static int probe_hostent_resolvers(void)
+{
+    struct hostent entry;
+    struct hostent *result;
+    struct in_addr loopback;
+    char buffer[1024];
+    char text[INET_ADDRSTRLEN];
+    int h_error = 0;
+    int rc = write_config("dns://localhost:EAI_NONAME:1.0");
+
+    if (rc != 0)
+    {
+        return rc;
+    }
+    if (gethostbyname("localhost") != NULL || h_errno != HOST_NOT_FOUND)
+    {
+        return 400;
+    }
+    if (gethostbyname_r("localhost", &entry, buffer, sizeof(buffer), &result, &h_error) != 0 ||
+        result != NULL || h_error != HOST_NOT_FOUND)
+    {
+        return 401;
+    }
+
+    rc = write_config("dns://override.test:OVERRIDE:10.20.30.40");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    result = gethostbyname2("override.test", AF_INET);
+    if (result == NULL || result->h_addrtype != AF_INET || result->h_addr_list[0] == NULL ||
+        inet_ntop(AF_INET, result->h_addr_list[0], text, sizeof(text)) == NULL ||
+        strcmp(text, "10.20.30.40") != 0 || result->h_addr_list[1] != NULL)
+    {
+        return 402;
+    }
+    if (gethostbyname2_r(
+            "override.test", AF_INET, &entry, buffer, sizeof(buffer), &result, &h_error
+        ) != 0 ||
+        result == NULL || inet_ntop(AF_INET, result->h_addr_list[0], text, sizeof(text)) == NULL ||
+        strcmp(text, "10.20.30.40") != 0)
+    {
+        return 403;
+    }
+
+    rc = write_config("rdns://127.0.0.1:REWRITE:ptr.example");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    loopback.s_addr = htonl(INADDR_LOOPBACK);
+    result = gethostbyaddr(&loopback, sizeof(loopback), AF_INET);
+    if (result == NULL || strcmp(result->h_name, "ptr.example") != 0)
+    {
+        return 404;
+    }
+    if (gethostbyaddr_r(
+            &loopback, sizeof(loopback), AF_INET, &entry, buffer, sizeof(buffer), &result, &h_error
+        ) != 0 ||
+        result == NULL || strcmp(result->h_name, "ptr.example") != 0)
+    {
+        return 405;
+    }
+
+    rc = write_config("# clear");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    result = gethostbyname("localhost");
+    return result != NULL && result->h_addrtype == AF_INET ? 0 : 406;
+}
+
 int main(void)
 {
     int rc;
@@ -364,6 +444,9 @@ int main(void)
     if (rc != 0)
         return rc;
     rc = probe_reverse_rewrite_service();
+    if (rc != 0)
+        return rc;
+    rc = probe_hostent_resolvers();
     if (rc != 0)
         return rc;
     return 0;
