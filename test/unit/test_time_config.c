@@ -811,9 +811,9 @@ static void test_prepare_and_match(void)
         }
         large_config[CHAOS_TIME_MAX_CONFIG_BYTES] = '\0';
         write_config_text(large_config, 17);
-        assert(chaos_time_config_read_file(&size) < 0);
+        assert(chaos_time_config_read_file(&size, chaos_time_config_observed_mtime()) < 0);
     }
-    assert(chaos_time_config_read_file(NULL) < 0);
+    assert(chaos_time_config_read_file(NULL, chaos_time_config_observed_mtime()) < 0);
 
     write_config_text("usleep:LATENCY:10\n", 13);
     g_test_config_force_open_fail = 1;
@@ -1043,8 +1043,29 @@ static void test_interrupted_read_is_retried(void)
     free_backup(&backup);
 }
 
+/**
+ * @brief Invariant: a file that changed while it was read is not used.
+ *
+ * Expected observable behaviour: reading with the stamp of the file as it is now
+ * succeeds; reading with any other stamp (the file changed after the stat that
+ * started the reload) fails, so the reload keeps the previous rules and retries.
+ */
+static void test_read_file_rejects_changed_file(void)
+{
+    size_t size = 0U;
+    uint64_t stamp;
+
+    write_config_text("# stable\n", 41);
+    stamp = chaos_time_config_observed_mtime();
+    assert(chaos_time_config_read_file(&size, stamp ^ UINT64_C(1)) == -1);
+    assert(chaos_time_config_read_file(&size, stamp) == 0);
+    assert(size == strlen("# stable\n"));
+    (void)unlink(CHAOS_TIME_CONFIG_PATH);
+}
+
 int main(void)
 {
+    test_read_file_rejects_changed_file();
     test_helper_functions();
     test_selector_matching();
     test_parse_line_and_buffer();

@@ -611,8 +611,9 @@ static uint64_t chaos_io_config_observed_mtime(void)
  * @pre `g_chaos_io_real_open`, `g_chaos_io_real_read`, and
  *      `g_chaos_io_real_close` are all non-NULL.
  */
-static int chaos_io_config_read_file(size_t *size_out)
+static int chaos_io_config_read_file(size_t *size_out, uint64_t expected_stamp)
 {
+    struct stat st;
     size_t total = 0U;
     int previous;
     int fd;
@@ -661,6 +662,17 @@ static int chaos_io_config_read_file(size_t *size_out)
             chaos_io_leave_internal(previous);
             return -1;
         }
+    }
+
+    /* The file must still be the one whose change triggered this reload. A writer
+     * that rewrote or appended to it while it was read leaves a different stamp; the
+     * copy may then be half old, half new, so it is not used and the next call
+     * reloads the finished file. */
+    if (fstat(fd, &st) != 0 || chaos_io_config_hash_mtime(&st) != expected_stamp)
+    {
+        (void)g_chaos_io_real_close(fd);
+        chaos_io_leave_internal(previous);
+        return -1;
     }
 
     (void)g_chaos_io_real_close(fd);
@@ -741,7 +753,7 @@ static void chaos_io_config_reload(uint64_t observed_mtime, uint64_t previous_mt
         return;
     }
 
-    if (chaos_io_config_read_file(&file_size) != 0)
+    if (chaos_io_config_read_file(&file_size, observed_mtime) != 0)
     {
         /* A failed read says nothing about the rules: keep the active snapshot and
          * release the claim with the previous stamp, so the next call retries

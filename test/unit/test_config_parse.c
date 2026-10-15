@@ -655,19 +655,19 @@ static void test_read_file_paths(void)
     chaos_test_reset_runtime();
     chaos_test_reset_read_stubs();
 
-    assert(chaos_io_config_read_file(NULL) == -1);
-    assert(chaos_io_config_read_file(&size_out) == -1);
+    assert(chaos_io_config_read_file(NULL, chaos_io_config_observed_mtime()) == -1);
+    assert(chaos_io_config_read_file(&size_out, chaos_io_config_observed_mtime()) == -1);
 
     g_chaos_io_real_open = chaos_test_stub_open;
     g_chaos_io_real_read = chaos_test_stub_read;
-    assert(chaos_io_config_read_file(&size_out) == -1);
+    assert(chaos_io_config_read_file(&size_out, chaos_io_config_observed_mtime()) == -1);
 
     g_chaos_io_real_close = chaos_test_stub_close;
-    assert(chaos_io_config_read_file(&size_out) == -1);
+    assert(chaos_io_config_read_file(&size_out, chaos_io_config_observed_mtime()) == -1);
 
     g_stub_open_result = 7;
     g_stub_read_result = -1;
-    assert(chaos_io_config_read_file(&size_out) == -1);
+    assert(chaos_io_config_read_file(&size_out, chaos_io_config_observed_mtime()) == -1);
     assert(g_stub_close_calls == 1);
 
     chaos_test_reset_read_stubs();
@@ -676,12 +676,12 @@ static void test_read_file_paths(void)
     g_chaos_io_real_close = chaos_test_stub_close;
     g_stub_open_result = 8;
     g_stub_read_result = (ssize_t)CHAOS_IO_MAX_CONFIG_BYTES;
-    assert(chaos_io_config_read_file(&size_out) == -1);
+    assert(chaos_io_config_read_file(&size_out, chaos_io_config_observed_mtime()) == -1);
     assert(g_stub_read_calls == 1U);
 
     chaos_test_use_real_io();
     chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/data:write:EIO:1.0\n");
-    assert(chaos_io_config_read_file(&size_out) == 0);
+    assert(chaos_io_config_read_file(&size_out, chaos_io_config_observed_mtime()) == 0);
     assert(size_out == strlen("/data:write:EIO:1.0\n"));
     assert(strcmp(g_chaos_io_config_buffer, "/data:write:EIO:1.0\n") == 0);
 }
@@ -885,6 +885,28 @@ static void test_interrupted_read_is_retried(void)
     chaos_test_use_real_io();
 }
 
+/**
+ * @brief Invariant: a file that changed while it was read is not used.
+ *
+ * Expected observable behaviour: reading with the stamp of the file as it is now
+ * succeeds; reading with any other stamp (the file changed after the stat that
+ * started the reload) fails, so the reload keeps the previous rules and retries.
+ */
+static void test_read_file_rejects_changed_file(void)
+{
+    size_t size = 0U;
+    uint64_t stamp;
+
+    chaos_test_reset_runtime();
+    chaos_test_use_real_io();
+    chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "# stable\n");
+    stamp = chaos_io_config_observed_mtime();
+    assert(chaos_io_config_read_file(&size, stamp ^ UINT64_C(1)) == -1);
+    assert(chaos_io_config_read_file(&size, stamp) == 0);
+    assert(size == strlen("# stable\n"));
+    (void)unlink(CHAOS_IO_CONFIG_PATH);
+}
+
 int main(void)
 {
     chaos_test_backup_file(CHAOS_IO_CONFIG_PATH, &g_config_backup);
@@ -903,5 +925,6 @@ int main(void)
     test_prepare_preserves_errno();
     test_interrupted_read_is_retried();
 
+    test_read_file_rejects_changed_file();
     return 0;
 }

@@ -715,8 +715,9 @@ static uint64_t chaos_net_config_observed_mtime(void)
  * @param size_out  Output: number of bytes read. Must not be NULL.
  * @return 0 on success; -1 on I/O error or file-too-large.
  */
-static int chaos_net_config_read_file(size_t *size_out)
+static int chaos_net_config_read_file(size_t *size_out, uint64_t expected_stamp)
 {
+    struct stat st;
     size_t total = 0U;
     int previous;
     int fd;
@@ -763,6 +764,17 @@ static int chaos_net_config_read_file(size_t *size_out)
             chaos_net_leave_internal(previous);
             return -1;
         }
+    }
+
+    /* The file must still be the one whose change triggered this reload. A writer
+     * that rewrote or appended to it while it was read leaves a different stamp; the
+     * copy may then be half old, half new, so it is not used and the next call
+     * reloads the finished file. */
+    if (fstat(fd, &st) != 0 || chaos_net_config_hash_mtime(&st) != expected_stamp)
+    {
+        (void)close(fd);
+        chaos_net_leave_internal(previous);
+        return -1;
     }
 
     (void)close(fd);
@@ -1132,7 +1144,7 @@ static int chaos_net_config_refresh(void)
 
     if (observed_mtime != CHAOS_NET_MTIME_MISSING)
     {
-        if (chaos_net_config_read_file(&config_size) != 0)
+        if (chaos_net_config_read_file(&config_size, observed_mtime) != 0)
         {
             /* A failed read says nothing about the rules: keep the active snapshot and
              * release the claim with the previous stamp, so the next call retries

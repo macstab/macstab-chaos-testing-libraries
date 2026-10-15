@@ -480,7 +480,7 @@ static void test_helper_functions(void)
 #endif
     assert(chaos_net_config_hash_mtime(&st) != CHAOS_NET_MTIME_MISSING);
 
-    assert(chaos_net_config_read_file(NULL) == -1);
+    assert(chaos_net_config_read_file(NULL, chaos_net_config_observed_mtime()) == -1);
     assert(!chaos_net_split_rule_fields(
         NULL, &selector_text, &operation_text, &effect_text, &value_text
     ));
@@ -748,11 +748,11 @@ static void test_file_and_state_edges(void)
 
     (void)unlink(CHAOS_NET_CONFIG_PATH);
     g_test_config_force_open_fail = 1;
-    assert(chaos_net_config_read_file(&index) == -1);
+    assert(chaos_net_config_read_file(&index, chaos_net_config_observed_mtime()) == -1);
     g_test_config_force_open_fail = 0;
 
     g_test_config_force_read_fail = 1;
-    assert(chaos_net_config_read_file(&index) == -1);
+    assert(chaos_net_config_read_file(&index, chaos_net_config_observed_mtime()) == -1);
     g_test_config_force_read_fail = 0;
 
     file = fopen(CHAOS_NET_CONFIG_PATH, "w");
@@ -762,7 +762,7 @@ static void test_file_and_state_edges(void)
         assert(fputc('a', file) != EOF);
     }
     assert(fclose(file) == 0);
-    assert(chaos_net_config_read_file(&index) == -1);
+    assert(chaos_net_config_read_file(&index, chaos_net_config_observed_mtime()) == -1);
 
     write_config_text("tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0\n", 30);
     assert(chaos_net_endpoint_parse_selector("tcp4://127.0.0.1:9010", &endpoint));
@@ -1052,8 +1052,29 @@ static void test_close_rules(void)
     assert(chaos_net_config_parse_line(reset_bad_probability, &rule) == -1);
 }
 
+/**
+ * @brief Invariant: a file that changed while it was read is not used.
+ *
+ * Expected observable behaviour: reading with the stamp of the file as it is now
+ * succeeds; reading with any other stamp (the file changed after the stat that
+ * started the reload) fails, so the reload keeps the previous rules and retries.
+ */
+static void test_read_file_rejects_changed_file(void)
+{
+    size_t size = 0U;
+    uint64_t stamp;
+
+    write_config_text("# stable\n", 41);
+    stamp = chaos_net_config_observed_mtime();
+    assert(chaos_net_config_read_file(&size, stamp ^ UINT64_C(1)) == -1);
+    assert(chaos_net_config_read_file(&size, stamp) == 0);
+    assert(size == strlen("# stable\n"));
+    (void)unlink(CHAOS_NET_CONFIG_PATH);
+}
+
 int main(void)
 {
+    test_read_file_rejects_changed_file();
     test_helper_functions();
     test_parse_and_select_rules();
     test_selection_and_buffer_edges();
