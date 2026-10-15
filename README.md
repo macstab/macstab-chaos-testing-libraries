@@ -582,7 +582,7 @@ Implemented logical operations:
   `write()` and `writev()` on sockets
 - `recv`
   Applies to `recv()`, `recvfrom()`, `recvmsg()`, and Linux `recvmmsg()`, and on glibc to the fortified
-  `__recv_chk()` and `__recvfrom_chk()`; also to `read()` and `readv()` on sockets
+  `__recv_chk()` and `__recvfrom_chk()`; also to `read()`, `__read_chk()` and `readv()` on sockets
 - `close`
   Applies to `close()` on sockets
 
@@ -592,8 +592,8 @@ Exact interposed symbols today:
   Linux `accept4()`, `shutdown()`
 - `send()`, `sendto()`, `sendmsg()`, Linux `sendmmsg()`
 - `recv()`, `recvfrom()`, `recvmsg()`, Linux `recvmmsg()`
-- `poll()`, `ppoll()`, `select()`, `pselect()`, Linux `epoll_wait()`, Linux
-  `epoll_pwait()`
+- `poll()`, `ppoll()` (and their fortified `__poll_chk()`, `__ppoll_chk()`), `select()`,
+  `pselect()`, Linux `epoll_wait()`, Linux `epoll_pwait()`
 - `read()`, `readv()`, `write()`, `writev()`, `close()`, shared with
   `libchaos-io`: net decides for sockets, io for files
 
