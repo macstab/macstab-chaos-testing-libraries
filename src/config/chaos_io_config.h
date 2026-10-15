@@ -45,6 +45,7 @@
  */
 
 #include "chaos_io_internal.h"
+#include "chaos_status.h"
 
 /**
  * @brief Enumeration of the intercepted I/O operations understood by the config system.
@@ -267,6 +268,14 @@ int chaos_io_config_parse_line(char *line, chaos_io_rule_t *rule);
  *         exceeded `CHAOS_IO_MAX_RULES`.
  */
 int chaos_io_config_parse_buffer(char *buffer, chaos_io_rule_t *rules, size_t *rule_count);
+
+/**
+ * @brief The line the last chaos_io_config_parse_buffer() call rejected.
+ *
+ * @return The rejected line (`reason != NULL`), or a cleared record when the last
+ *         parse succeeded. Valid until the next parse.
+ */
+const chaos_status_error_t *chaos_io_config_last_error(void);
 
 /**
  * @brief Selects the best matching rule from a caller-supplied rule array.

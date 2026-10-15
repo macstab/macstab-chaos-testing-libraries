@@ -1029,8 +1029,117 @@ static void test_read_file_rejects_changed_file(void)
     (void)unlink(CHAOS_PROCESS_CONFIG_PATH);
 }
 
+/**
+ * @brief Reads the status file into @p buffer; returns 0 when it does not exist.
+ */
+static int read_status_file(char *buffer, size_t size)
+{
+    FILE *file = fopen(CHAOS_PROCESS_STATUS_PATH, "r");
+    size_t length;
+
+    if (file == NULL)
+    {
+        return 0;
+    }
+    length = fread(buffer, 1U, size - 1U, file);
+    buffer[length] = '\0';
+    assert(fclose(file) == 0);
+    return 1;
+}
+
+/**
+ * @brief Invariant: a rejected line is recorded with its number, its text as written
+ *   and the reason, and a full rule set followed by comments is still accepted.
+ *
+ * Triggering condition: a buffer whose fourth line is invalid and carries a comment;
+ *   then exactly CHAOS_PROCESS_MAX_RULES valid rules followed by a comment; then one rule more.
+ *
+ * Expected observable behaviour: the invalid buffer reports line 4, "invalid rule" and
+ *   the line before the parser cut the comment off; the full set parses with no error;
+ *   the oversized set reports the first rule beyond the limit as "too many rules".
+ */
+static void test_parse_buffer_reports_rejected_line(void)
+{
+    static chaos_process_rule_t rules[CHAOS_PROCESS_MAX_RULES];
+    char buffer[] = "# header\n\nfork:ERRNO:EAGAIN\nbogus-rule # typo\n";
+    const chaos_status_error_t *error = chaos_process_config_last_error();
+    const size_t line_length = strlen("fork:ERRNO:EAGAIN\n");
+    size_t rule_count = 7U;
+    size_t index;
+    char *many;
+
+    assert(chaos_process_config_parse_buffer(buffer, rules, &rule_count) == -1);
+    assert(error->line == 4U);
+    assert(strcmp(error->reason, CHAOS_STATUS_REASON_INVALID) == 0);
+    assert(strcmp(error->text, "bogus-rule # typo") == 0);
+
+    many = (char *)malloc((CHAOS_PROCESS_MAX_RULES + 1U) * line_length + 32U);
+    assert(many != NULL);
+    many[0] = '\0';
+    for (index = 0U; index < CHAOS_PROCESS_MAX_RULES; ++index)
+    {
+        (void)strcat(many, "fork:ERRNO:EAGAIN\n");
+    }
+    (void)strcat(many, "# trailing comment\n");
+    assert(chaos_process_config_parse_buffer(many, rules, &rule_count) == 0);
+    assert(rule_count == CHAOS_PROCESS_MAX_RULES);
+    assert(error->reason == NULL);
+
+    many[0] = '\0';
+    for (index = 0U; index <= CHAOS_PROCESS_MAX_RULES; ++index)
+    {
+        (void)strcat(many, "fork:ERRNO:EAGAIN\n");
+    }
+    assert(chaos_process_config_parse_buffer(many, rules, &rule_count) == -1);
+    assert(rule_count == 0U);
+    assert(error->line == CHAOS_PROCESS_MAX_RULES + 1U);
+    assert(strcmp(error->reason, CHAOS_STATUS_REASON_TOO_MANY) == 0);
+    assert(strcmp(error->text, "fork:ERRNO:EAGAIN") == 0);
+    free(many);
+}
+
+/**
+ * @brief Invariant: every load reports its outcome in the status file.
+ *
+ * Triggering condition: a rule file whose second line is invalid, then a valid rule
+ *   file, then no rule file.
+ *
+ * Expected observable behaviour: state=error naming line 2 and its text, then
+ *   state=ok with the rule count, both stamped with this process id; without a rule
+ *   file the status file is removed.
+ */
+static void test_prepare_reports_status(void)
+{
+    char status[CHAOS_STATUS_BUFFER_SIZE];
+    char expected[CHAOS_STATUS_BUFFER_SIZE];
+
+    chaos_process_config_init();
+    write_config_text("# header\nbogus-rule # typo\n", 51);
+    assert(chaos_process_config_prepare() == 0);
+    assert(read_status_file(status, sizeof(status)));
+    (void)snprintf(
+        expected,
+        sizeof(expected),
+        "state=error\nrules=0\nline=2\nreason=invalid rule\ntext=bogus-rule # typo\npid=%ld\n",
+        (long)getpid()
+    );
+    assert(strcmp(status, expected) == 0);
+
+    write_config_text("fork:ERRNO:EAGAIN\n", 52);
+    assert(chaos_process_config_prepare() == 1);
+    assert(read_status_file(status, sizeof(status)));
+    (void)snprintf(expected, sizeof(expected), "state=ok\nrules=1\npid=%ld\n", (long)getpid());
+    assert(strcmp(status, expected) == 0);
+
+    (void)unlink(CHAOS_PROCESS_CONFIG_PATH);
+    assert(chaos_process_config_prepare() == 0);
+    assert(!read_status_file(status, sizeof(status)));
+}
+
 int main(void)
 {
+    test_parse_buffer_reports_rejected_line();
+    test_prepare_reports_status();
     test_read_file_rejects_changed_file();
     test_helper_functions();
     test_parse_line_and_buffer();

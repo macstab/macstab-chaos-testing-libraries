@@ -1095,6 +1095,8 @@ set.
 This avoids the hazard of a partially-written config file (mid-write when the
 mtime changes) applying only the first N lines of a new intended configuration.
 The library either loads the complete new config or falls back to no-op.
+Either way the outcome is reported in `/tmp/.chaos-dns.status`; a rejected
+file names the first bad line (see ARCHITECTURE.md, Status file).
 
 ---
 

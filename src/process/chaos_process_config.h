@@ -44,6 +44,7 @@
 #define CHAOS_PROCESS_CONFIG_H
 
 #include "chaos_process_internal.h"
+#include "chaos_status.h"
 
 /**
  * @brief Enumeration of all interposed operations.
@@ -318,6 +319,14 @@ int chaos_process_config_parse_line(char *line, chaos_process_rule_t *rule);
 int chaos_process_config_parse_buffer(
     char *buffer, chaos_process_rule_t *rules, size_t *rule_count
 );
+
+/**
+ * @brief The line the last chaos_process_config_parse_buffer() call rejected.
+ *
+ * @return The rejected line (`reason != NULL`), or a cleared record when the last
+ *         parse succeeded. Valid until the next parse.
+ */
+const chaos_status_error_t *chaos_process_config_last_error(void);
 
 /**
  * @brief Selects the best-matching rule from an array for a given

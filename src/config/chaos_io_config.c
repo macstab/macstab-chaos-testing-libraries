@@ -140,6 +140,13 @@ static volatile uint64_t g_chaos_io_reload_pid = 0U;
  */
 static char g_chaos_io_config_buffer[CHAOS_IO_MAX_CONFIG_BYTES + 1U];
 
+/**
+ * @brief The first line the last parse rejected, reported in the status file.
+ *
+ * @details Written only by the thread that owns the reload claim.
+ */
+static chaos_status_error_t g_chaos_io_config_error;
+
 /* --- Internal helpers ------------------------------------------------------------ */
 
 /**
@@ -724,6 +731,28 @@ static int chaos_io_rule_prefix_matches(const chaos_io_rule_t *rule, const char 
 }
 
 /**
+ * @brief Writes the status file for a load that produced @p state.
+ *
+ * @details Called by the reload owner before the snapshot is published. No rule
+ * file means nothing to report, so the status file is removed.
+ */
+static void chaos_io_config_report(uint64_t observed_mtime, const chaos_io_config_state_t *state)
+{
+    if (observed_mtime == CHAOS_IO_MTIME_MISSING)
+    {
+        chaos_status_remove(CHAOS_IO_STATUS_PATH);
+    }
+    else if (state->parse_ok == 0)
+    {
+        chaos_status_write(CHAOS_IO_STATUS_PATH, CHAOS_STATUS_ERROR, 0U, &g_chaos_io_config_error);
+    }
+    else
+    {
+        chaos_status_write(CHAOS_IO_STATUS_PATH, CHAOS_STATUS_OK, state->rule_count, NULL);
+    }
+}
+
+/**
  * @brief Reloads the inactive config state from disk, or clears it on passthrough conditions.
  *
  * @details Called exclusively by the thread that won the CAS race in
@@ -749,6 +778,7 @@ static void chaos_io_config_reload(uint64_t observed_mtime, uint64_t previous_mt
 
     if (observed_mtime == CHAOS_IO_MTIME_MISSING)
     {
+        chaos_io_config_report(CHAOS_IO_MTIME_MISSING, next_state);
         chaos_io_config_publish(next_index, CHAOS_IO_MTIME_MISSING);
         return;
     }
@@ -771,6 +801,7 @@ static void chaos_io_config_reload(uint64_t observed_mtime, uint64_t previous_mt
     }
 
     (void)file_size;
+    chaos_io_config_report(observed_mtime, next_state);
     chaos_io_config_publish(next_index, observed_mtime);
 }
 
@@ -987,51 +1018,63 @@ int chaos_io_config_parse_line(char *line, chaos_io_rule_t *rule)
  */
 int chaos_io_config_parse_buffer(char *buffer, chaos_io_rule_t *rules, size_t *rule_count)
 {
-    char *line;
+    char *cursor;
     size_t count = 0U;
+    size_t number = 0U;
 
+    chaos_status_clear(&g_chaos_io_config_error);
     if (buffer == NULL || rules == NULL || rule_count == NULL)
     {
         return -1;
     }
 
-    line = buffer;
-    for (;;)
+    cursor = buffer;
+    while (*cursor != '\0')
     {
-        char *next = strchr(line, '\n');
-        chaos_io_rule_t parsed_rule;
-        int parse_result;
+        char *line = cursor;
+        chaos_io_rule_t parsed;
+        int rc;
 
-        if (next != NULL)
+        while (*cursor != '\0' && *cursor != '\n')
         {
-            *next = '\0';
+            ++cursor;
+        }
+        if (*cursor == '\n')
+        {
+            *cursor++ = '\0';
         }
 
-        parse_result = chaos_io_config_parse_line(line, &parsed_rule);
-        if (parse_result < 0)
+        /* The parser edits the line in place; keep it as written for the report. */
+        chaos_status_keep_line(&g_chaos_io_config_error, ++number, line);
+        memset(&parsed, 0, sizeof(parsed));
+        rc = chaos_io_config_parse_line(line, &parsed);
+        if (rc < 0)
         {
+            chaos_status_reject(&g_chaos_io_config_error, CHAOS_STATUS_REASON_INVALID);
             *rule_count = 0U;
             return -1;
         }
-        if (parse_result > 0)
+        if (rc == 0)
         {
-            if (count >= CHAOS_IO_MAX_RULES)
-            {
-                *rule_count = 0U;
-                return -1;
-            }
-            rules[count++] = parsed_rule;
+            continue;
         }
-
-        if (next == NULL)
+        if (count >= CHAOS_IO_MAX_RULES)
         {
-            break;
+            chaos_status_reject(&g_chaos_io_config_error, CHAOS_STATUS_REASON_TOO_MANY);
+            *rule_count = 0U;
+            return -1;
         }
-        line = next + 1;
+        rules[count++] = parsed;
     }
 
+    chaos_status_clear(&g_chaos_io_config_error);
     *rule_count = count;
     return 0;
+}
+
+const chaos_status_error_t *chaos_io_config_last_error(void)
+{
+    return &g_chaos_io_config_error;
 }
 
 /**

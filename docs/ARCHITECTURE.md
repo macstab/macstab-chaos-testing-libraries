@@ -65,7 +65,9 @@ The code stays intentionally narrow:
 - Resolves the real libc symbols with `dlsym(RTLD_NEXT, ...)`.
 - Seeds process entropy from `/dev/urandom`, with a deterministic fallback when that read fails.
 - Seeds the current thread PRNG.
-- Resets config and fd-cache state.
+- Resets config and fd-cache state, then loads the rule file once, so a
+  rejected rule file is reported when the program starts (see
+  [Status file](#status-file)).
 - Shares common fd-rule matching used by the wrapper translation units.
 
 ### Request flow
@@ -326,6 +328,41 @@ end note
 @enduml
 ```
 
+### Status file
+
+[`src/common/chaos_status.h`](../src/common/chaos_status.h)
+
+Parsing is all-or-nothing, so a single bad line leaves a library with no
+rules, which looks exactly like a rule that never fires. Every library
+(io, net, dns, time, memory, process) therefore reports the outcome of each
+load in `/tmp/.chaos-<lib>.status`:
+
+```text
+state=error
+rules=0
+line=3
+reason=invalid rule
+text=bogus-rule # typo
+pid=4711
+```
+
+- `state=ok` with `rules=<n>` after a successful load; `state=error` with
+  the 1-based `line`, the `reason` (`invalid rule` or `too many rules`) and
+  the line as written (`text`, at most 200 bytes) after a rejected one.
+- `pid` is the process that loaded the rules. Every process with the library
+  loaded writes the same report for the same rule file; a writer that wants
+  the report for its own change runs one program under `LD_PRELOAD` and
+  checks that the `pid` is that program's.
+- The library constructor loads the rules, so starting any program (even
+  `/bin/true`) under `LD_PRELOAD` writes a fresh report.
+- Without a rule file the status file is removed.
+- The report is written to `<path>.<pid>` and renamed over the old one, with
+  raw system calls: libchaos-io interposes `open`, `write` and `rename`, and
+  a user's io rule must not be able to fail the report. Writing is best
+  effort and leaves errno untouched.
+- A read that sees the file change mid-read publishes nothing and writes no
+  report; the next call retries.
+
 ## FD Path Resolution
 
 [`src/config/chaos_io_fdcache.c`](../src/config/chaos_io_fdcache.c)
@@ -530,6 +567,15 @@ and [`test/runtime/test_process_alpine.sh`](../test/runtime/test_process_alpine.
   `libchaos-process` shared objects under glibc and musl
 - Exercise their dedicated runtime probes on both supported architectures
 - Accept `linux/amd64` or `linux/arm64` as explicit Docker targets
+
+[`test/runtime/test_status.sh`](../test/runtime/test_status.sh)
+
+- Builds all six libraries for glibc and musl
+- For each, starts `/bin/true` under `LD_PRELOAD` with a rule file whose third
+  line is invalid (`state=error`, line 3 and its text), with one valid rule
+  (`state=ok`, `rules=1`) and without a rule file (no status file); each report
+  must carry the pid of the program that loaded it
+- Accepts `linux/amd64` or `linux/arm64` as an optional explicit Docker target
 
 ## Platform Internals and Symbol Resolution
 

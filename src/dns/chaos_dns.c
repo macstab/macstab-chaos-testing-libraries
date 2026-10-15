@@ -244,4 +244,6 @@ static void chaos_dns_init(void)
     g_chaos_dns_process_seed = chaos_dns_read_seed_material();
     chaos_dns_prng_seed_thread(g_chaos_dns_process_seed);
     chaos_dns_config_init();
+    /* Load the rules now so a bad rule file is reported at start-up. */
+    (void)chaos_dns_config_prepare();
 }

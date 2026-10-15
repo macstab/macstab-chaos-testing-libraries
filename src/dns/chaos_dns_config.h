@@ -57,6 +57,7 @@
 #define CHAOS_DNS_CONFIG_H
 
 #include "chaos_dns_internal.h"
+#include "chaos_status.h"
 
 /* =========================================================================
  * Enumerations
@@ -390,6 +391,14 @@ int chaos_dns_config_parse_line(char *line, chaos_dns_rule_t *rule);
  * @threadsafety  No shared state; safe from any thread given distinct buffers.
  */
 int chaos_dns_config_parse_buffer(char *buffer, chaos_dns_rule_t *rules, size_t *rule_count);
+
+/**
+ * @brief The line the last chaos_dns_config_parse_buffer() call rejected.
+ *
+ * @return The rejected line (`reason != NULL`), or a cleared record when the last
+ *         parse succeeded. Valid until the next parse.
+ */
+const chaos_status_error_t *chaos_dns_config_last_error(void);
 
 /**
  * @brief Select the best-matching forward-lookup rule from an explicit rule array.

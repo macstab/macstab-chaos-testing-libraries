@@ -315,4 +315,6 @@ static void chaos_process_init(void)
     g_chaos_process_process_seed = chaos_process_read_seed_material();
     chaos_process_prng_seed_thread(g_chaos_process_process_seed);
     chaos_process_config_init();
+    /* Load the rules now so a bad rule file is reported at start-up. */
+    (void)chaos_process_config_prepare();
 }

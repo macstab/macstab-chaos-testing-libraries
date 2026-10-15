@@ -49,6 +49,9 @@
 /** Filesystem path polled for the chaos rule configuration file. */
 #define CHAOS_DNS_CONFIG_PATH "/tmp/.chaos-dns.conf"
 
+/** Status file reporting the outcome of the last load (see chaos_status.h). */
+#define CHAOS_DNS_STATUS_PATH "/tmp/.chaos-dns.status"
+
 /** Maximum number of rules that will be loaded from the config file. */
 #define CHAOS_DNS_MAX_RULES 256U
 

@@ -279,7 +279,8 @@ Conditions that trigger fail-open (passthrough):
 - Config file absent: all calls pass through.
 - Config file unreadable (EACCES, EIO): all calls pass through.
 - Config file parse error (any invalid line): entire file rejected, all calls
-  pass through.
+  pass through. The rejected line is reported in `/tmp/.chaos-<lib>.status`
+  so the failure is visible (see ARCHITECTURE.md, Status file).
 - Config file too large (> `CHAOS_*_MAX_CONFIG_BYTES`): rejected, pass through.
 - Selector match ambiguous or unresolvable (e.g., fd-to-path resolution failed):
   call passes through unchanged.

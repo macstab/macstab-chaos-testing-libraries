@@ -375,5 +375,7 @@ static void chaos_io_init(void)
     g_chaos_io_process_seed = chaos_io_read_seed_material();
     chaos_io_prng_seed_thread(g_chaos_io_process_seed);
     chaos_io_config_init();
+    /* Load the rules now so a bad rule file is reported at start-up. */
+    (void)chaos_io_config_prepare();
     chaos_io_fdcache_reset();
 }

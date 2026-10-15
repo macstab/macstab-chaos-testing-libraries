@@ -43,6 +43,9 @@
 /** Filesystem path of the configuration file polled for live reload. */
 #define CHAOS_TIME_CONFIG_PATH "/tmp/.chaos-time.conf"
 
+/** Status file reporting the outcome of the last load (see chaos_status.h). */
+#define CHAOS_TIME_STATUS_PATH "/tmp/.chaos-time.status"
+
 /** Maximum number of rules that may be loaded from a single config snapshot. */
 #define CHAOS_TIME_MAX_RULES 256U
 

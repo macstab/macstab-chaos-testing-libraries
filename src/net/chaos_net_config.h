@@ -33,6 +33,7 @@
 #define CHAOS_NET_CONFIG_H
 
 #include "chaos_net_internal.h"
+#include "chaos_status.h"
 
 #include <netinet/in.h>
 
@@ -319,6 +320,14 @@ int chaos_net_config_parse_line(char *line, chaos_net_rule_t *rule);
  * @par Thread-safety: operates on caller-supplied buffers only; safe.
  */
 int chaos_net_config_parse_buffer(char *buffer, chaos_net_rule_t *rules, size_t *rule_count);
+
+/**
+ * @brief The line the last chaos_net_config_parse_buffer() call rejected.
+ *
+ * @return The rejected line (`reason != NULL`), or a cleared record when the last
+ *         parse succeeded. Valid until the next parse.
+ */
+const chaos_status_error_t *chaos_net_config_last_error(void);
 
 /**
  * @brief Scans an array of rules for the best match for the given (operation, endpoint).

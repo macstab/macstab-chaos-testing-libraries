@@ -999,7 +999,8 @@ copy path.
 
 ### Runbook-relevant notes
 
-- If the config contains one invalid line, the full file becomes passthrough.
+- If the config contains one invalid line, the full file becomes passthrough;
+  `/tmp/.chaos-io.status` names that line (`state=error`, `line=`, `text=`).
 - If behavior is unexpectedly absent, confirm the program is not using
   `splice()`, `mmap()`, or direct syscalls.
 - If behavior is unexpectedly wrong in multithreaded workloads, suspect stale

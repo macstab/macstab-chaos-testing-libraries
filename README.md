@@ -725,7 +725,10 @@ Examples:
 - Prefix matching is path-boundary aware.
   `/data` matches `/data` and `/data/file`.
   `/data` does not match `/database`.
-- Invalid lines invalidate the full config load and force passthrough.
+- Invalid lines invalidate the full config load and force passthrough. The
+  rejected line is reported in `/tmp/.chaos-<lib>.status` (`state=error`,
+  `line=`, `reason=`, `text=`); a successful load reports `state=ok` and the
+  rule count. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status-file).
 
 ## Runtime Behavior
 

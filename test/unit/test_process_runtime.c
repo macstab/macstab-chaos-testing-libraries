@@ -39,6 +39,9 @@
 
 /** @brief Number of times `chaos_process_config_init()` stub was called. */
 static int g_config_init_calls = 0;
+
+/** @brief Number of times the `chaos_process_config_prepare()` stub was called. */
+static int g_config_prepare_calls = 0;
 /** @brief Number of times the `dlerror` stub was called. */
 static int g_dlerror_calls = 0;
 /** @brief Error string returned by the `dlerror` stub; NULL means no error. */
@@ -67,6 +70,7 @@ static void reset_test_state(void)
 {
     chaos_process_test_reset_runtime();
     g_config_init_calls = 0;
+    g_config_prepare_calls = 0;
     g_dlerror_calls = 0;
     g_dlerror_text = NULL;
     g_expect_abort = 0;
@@ -247,6 +251,15 @@ static pid_t stub_waitpid(pid_t pid, int *status, int options)
 void chaos_process_config_init(void)
 {
     ++g_config_init_calls;
+}
+
+/**
+ * @brief Stub for `chaos_process_config_prepare()`: counts the start-up load.
+ */
+int chaos_process_config_prepare(void)
+{
+    ++g_config_prepare_calls;
+    return 0;
 }
 
 /**
@@ -527,9 +540,11 @@ static void test_seed_fallback_paths(void)
 static void test_constructor_init(void)
 {
     int config_calls_before;
+    int prepare_calls_before;
 
     reset_test_state();
     config_calls_before = g_config_init_calls;
+    prepare_calls_before = g_config_prepare_calls;
     g_chaos_process_symbols_once = CHAOS_ONCE_INIT;
     chaos_process_init();
     assert(g_chaos_process_real_pthread_create == stub_pthread_create);
@@ -548,6 +563,8 @@ static void test_constructor_init(void)
     assert(g_chaos_process_real_system == stub_system);
     assert(g_chaos_process_real_popen == stub_popen);
     assert(g_config_init_calls == config_calls_before + 1);
+    /* The constructor loads the rules at once so a bad rule file is reported. */
+    assert(g_config_prepare_calls == prepare_calls_before + 1);
     assert(g_chaos_process_process_seed != 0U);
     assert(g_chaos_process_tls_prng_state != 0U);
 }

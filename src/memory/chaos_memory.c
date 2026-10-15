@@ -323,4 +323,6 @@ static void chaos_memory_init(void)
     g_chaos_memory_process_seed = chaos_memory_read_seed_material();
     chaos_memory_prng_seed_thread(g_chaos_memory_process_seed);
     chaos_memory_config_init();
+    /* Load the rules now so a bad rule file is reported at start-up. */
+    (void)chaos_memory_config_prepare();
 }

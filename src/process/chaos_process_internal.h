@@ -69,6 +69,9 @@
 /** Filesystem path from which the live rules file is read. */
 #define CHAOS_PROCESS_CONFIG_PATH "/tmp/.chaos-process.conf"
 
+/** Status file reporting the outcome of the last load (see chaos_status.h). */
+#define CHAOS_PROCESS_STATUS_PATH "/tmp/.chaos-process.status"
+
 /** Maximum number of rules that can be loaded from a single config file. */
 #define CHAOS_PROCESS_MAX_RULES 256U
 

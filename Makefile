@@ -210,7 +210,8 @@ HOST_RUNTIME_TESTS := \
 	$(TEST_RUNTIME_DIR)/test_sharing_glibc.sh \
 	$(TEST_RUNTIME_DIR)/test_baseline_glibc.sh \
 	$(TEST_RUNTIME_DIR)/test_isolation_glibc.sh \
-	$(TEST_RUNTIME_DIR)/test_path_forms.sh
+	$(TEST_RUNTIME_DIR)/test_path_forms.sh \
+	$(TEST_RUNTIME_DIR)/test_status.sh
 MATRIX_RUNTIME_TESTS := \
 	$(TEST_RUNTIME_DIR)/test_glibc.sh \
 	$(TEST_RUNTIME_DIR)/test_alpine.sh \

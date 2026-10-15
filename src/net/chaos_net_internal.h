@@ -57,6 +57,9 @@
  */
 #define CHAOS_NET_CONFIG_PATH "/tmp/.chaos-net.conf"
 
+/** Status file reporting the outcome of the last load (see chaos_status.h). */
+#define CHAOS_NET_STATUS_PATH "/tmp/.chaos-net.status"
+
 /**
  * @brief Maximum number of fault-injection rules that can be loaded simultaneously.
  *

@@ -189,6 +189,13 @@ static volatile uint64_t g_chaos_memory_reload_pid = 0U;
  */
 static char g_chaos_memory_config_buffer[CHAOS_MEMORY_MAX_CONFIG_BYTES + 1U];
 
+/**
+ * @brief The first line the last parse rejected, reported in the status file.
+ *
+ * @details Written only by the thread that owns the reload claim.
+ */
+static chaos_status_error_t g_chaos_memory_config_error;
+
 /* =========================================================================
  * Internal helpers — state management
  * =========================================================================
@@ -1098,7 +1105,9 @@ int chaos_memory_config_parse_buffer(char *buffer, chaos_memory_rule_t *rules, s
 {
     char *cursor;
     size_t count = 0U;
+    size_t number = 0U;
 
+    chaos_status_clear(&g_chaos_memory_config_error);
     if (buffer == NULL || rules == NULL || rule_count == NULL)
     {
         return -1;
@@ -1108,36 +1117,49 @@ int chaos_memory_config_parse_buffer(char *buffer, chaos_memory_rule_t *rules, s
     while (*cursor != '\0')
     {
         char *line = cursor;
-        int parsed;
+        chaos_memory_rule_t parsed;
+        int rc;
 
-        cursor = strchr(cursor, '\n');
-        if (cursor != NULL)
+        while (*cursor != '\0' && *cursor != '\n')
+        {
+            ++cursor;
+        }
+        if (*cursor == '\n')
         {
             *cursor++ = '\0';
         }
-        else
-        {
-            cursor = line + strlen(line);
-        }
 
-        parsed = chaos_memory_config_parse_line(line, &rules[count]);
-        if (parsed < 0)
+        /* The parser edits the line in place; keep it as written for the report. */
+        chaos_status_keep_line(&g_chaos_memory_config_error, ++number, line);
+        memset(&parsed, 0, sizeof(parsed));
+        rc = chaos_memory_config_parse_line(line, &parsed);
+        if (rc < 0)
         {
+            chaos_status_reject(&g_chaos_memory_config_error, CHAOS_STATUS_REASON_INVALID);
+            *rule_count = 0U;
             return -1;
         }
-        if (parsed == 0)
+        if (rc == 0)
         {
             continue;
         }
-        ++count;
-        if (count > CHAOS_MEMORY_MAX_RULES)
+        if (count >= CHAOS_MEMORY_MAX_RULES)
         {
+            chaos_status_reject(&g_chaos_memory_config_error, CHAOS_STATUS_REASON_TOO_MANY);
+            *rule_count = 0U;
             return -1;
         }
+        rules[count++] = parsed;
     }
 
+    chaos_status_clear(&g_chaos_memory_config_error);
     *rule_count = count;
     return 0;
+}
+
+const chaos_status_error_t *chaos_memory_config_last_error(void)
+{
+    return &g_chaos_memory_config_error;
 }
 
 /**
@@ -1194,6 +1216,31 @@ int chaos_memory_config_select_rule(
     }
 
     return found;
+}
+
+/**
+ * @brief Writes the status file for a load that produced @p state.
+ *
+ * @details Called by the reload owner before the snapshot is published. No rule
+ * file means nothing to report, so the status file is removed.
+ */
+static void
+chaos_memory_config_report(uint64_t observed_mtime, const chaos_memory_config_state_t *state)
+{
+    if (observed_mtime == CHAOS_MEMORY_MTIME_MISSING)
+    {
+        chaos_status_remove(CHAOS_MEMORY_STATUS_PATH);
+    }
+    else if (state->parse_ok == 0)
+    {
+        chaos_status_write(
+            CHAOS_MEMORY_STATUS_PATH, CHAOS_STATUS_ERROR, 0U, &g_chaos_memory_config_error
+        );
+    }
+    else
+    {
+        chaos_status_write(CHAOS_MEMORY_STATUS_PATH, CHAOS_STATUS_OK, state->rule_count, NULL);
+    }
 }
 
 /**
@@ -1286,6 +1333,7 @@ static int chaos_memory_config_refresh(void)
         }
     }
 
+    chaos_memory_config_report(observed_mtime, next_state);
     chaos_memory_config_publish(next_index, observed_mtime);
     return next_state->parse_ok != 0 && next_state->rule_count != 0U;
 }

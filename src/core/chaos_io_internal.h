@@ -65,6 +65,9 @@
  */
 #define CHAOS_IO_CONFIG_PATH "/tmp/.chaos-io.conf"
 
+/** Status file reporting the outcome of the last load (see chaos_status.h). */
+#define CHAOS_IO_STATUS_PATH "/tmp/.chaos-io.status"
+
 /**
  * @brief Maximum number of rules that one config snapshot may hold.
  *

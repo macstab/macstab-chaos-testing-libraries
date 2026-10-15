@@ -291,6 +291,8 @@ static void test_init_runtime(void)
     assert(g_chaos_io_process_seed == UINT64_C(0xfeedbeef12345678));
     assert(g_chaos_io_tls_prng_state != 0U);
     assert(g_config_init_calls == 1);
+    /* The constructor loads the rules at once so a bad rule file is reported. */
+    assert(g_config_prepare_calls == 1);
     assert(g_fdcache_reset_calls == 1);
 }
 

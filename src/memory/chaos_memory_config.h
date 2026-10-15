@@ -46,6 +46,7 @@
 #define CHAOS_MEMORY_CONFIG_H
 
 #include "chaos_memory_internal.h"
+#include "chaos_status.h"
 
 /* =========================================================================
  * Enumerations
@@ -396,6 +397,14 @@ int chaos_memory_config_parse_line(char *line, chaos_memory_rule_t *rule);
  * @return   0 on success, -1 on any parse error or rule count overflow.
  */
 int chaos_memory_config_parse_buffer(char *buffer, chaos_memory_rule_t *rules, size_t *rule_count);
+
+/**
+ * @brief The line the last chaos_memory_config_parse_buffer() call rejected.
+ *
+ * @return The rejected line (`reason != NULL`), or a cleared record when the last
+ *         parse succeeded. Valid until the next parse.
+ */
+const chaos_status_error_t *chaos_memory_config_last_error(void);
 
 /**
  * @brief Select the best-matching rule from an array for a given call context.

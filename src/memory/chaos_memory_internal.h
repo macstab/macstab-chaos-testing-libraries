@@ -67,6 +67,9 @@
  */
 #define CHAOS_MEMORY_CONFIG_PATH "/tmp/.chaos-memory.conf"
 
+/** Status file reporting the outcome of the last load (see chaos_status.h). */
+#define CHAOS_MEMORY_STATUS_PATH "/tmp/.chaos-memory.status"
+
 /**
  * @brief Maximum number of rules that can be parsed from the config file.
  *

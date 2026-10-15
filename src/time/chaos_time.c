@@ -276,4 +276,6 @@ static void chaos_time_init(void)
     g_chaos_time_process_seed = chaos_time_read_seed_material();
     chaos_time_prng_seed_thread(g_chaos_time_process_seed);
     chaos_time_config_init();
+    /* Load the rules now so a bad rule file is reported at start-up. */
+    (void)chaos_time_config_prepare();
 }
