@@ -243,6 +243,12 @@ typedef int (*chaos_io_ftruncate_fn)(int, off_t);
 /** @brief Type of the real `truncate(2)` libc symbol. */
 typedef int (*chaos_io_truncate_fn)(const char *, off_t);
 
+/** @brief Type of the real `renameat2(2)` libc symbol (glibc 2.28+; absent on musl). */
+typedef int (*chaos_io_renameat2_fn)(int, const char *, int, const char *, unsigned int);
+
+/** @brief Type of the real `posix_fallocate(3)` libc symbol. */
+typedef int (*chaos_io_posix_fallocate_fn)(int, off_t, off_t);
+
 /** @brief Type of the real `unlinkat(2)` libc symbol. */
 typedef int (*chaos_io_unlinkat_fn)(int, const char *, int);
 
@@ -299,7 +305,11 @@ extern chaos_io_pwritev_fn g_chaos_io_real_pwritev;     /**< Downstream `pwritev
 extern chaos_io_ftruncate_fn g_chaos_io_real_ftruncate; /**< Downstream `ftruncate`. */
 extern chaos_io_unlinkat_fn g_chaos_io_real_unlinkat;   /**< Downstream `unlinkat`. */
 extern chaos_io_truncate_fn g_chaos_io_real_truncate;   /**< Downstream `truncate`. */
-extern chaos_io_renameat_fn g_chaos_io_real_renameat;   /**< Downstream `renameat`. */
+extern chaos_io_renameat2_fn
+    g_chaos_io_real_renameat2; /**< Downstream `renameat2`; NULL when libc lacks it. */
+extern chaos_io_posix_fallocate_fn
+    g_chaos_io_real_posix_fallocate;                  /**< Downstream `posix_fallocate`. */
+extern chaos_io_renameat_fn g_chaos_io_real_renameat; /**< Downstream `renameat`. */
 #ifdef __linux__
 extern chaos_io_fallocate_fn g_chaos_io_real_fallocate; /**< Downstream `fallocate` (Linux). */
 extern chaos_io_sendfile_fn g_chaos_io_real_sendfile;   /**< Downstream `sendfile` (Linux). */

@@ -356,6 +356,15 @@ static int g_real_ftruncate_fd = -1;
 /** @brief `length` argument captured from the most recent stub ftruncate call. */
 static off_t g_real_ftruncate_length = 0;
 
+/** @brief Number of times the stub renameat2 function was called. */
+static int g_real_renameat2_calls = 0;
+/** @brief `flags` argument captured from the most recent stub renameat2 call. */
+static unsigned int g_real_renameat2_flags = 0U;
+/** @brief Number of times the stub posix_fallocate function was called. */
+static int g_real_posix_fallocate_calls = 0;
+/** @brief Return value (an error number) for the stub posix_fallocate function. */
+static int g_real_posix_fallocate_return = 0;
+
 /** @brief Number of times the stub truncate function was called. */
 static int g_real_truncate_calls = 0;
 /** @brief Return value for the stub truncate function. */
@@ -1105,6 +1114,30 @@ static int chaos_test_real_ftruncate_impl(int fd, off_t length)
     return g_real_ftruncate_return;
 }
 
+/** @brief Stub for the real `renameat2`. Captures flags; returns 0. */
+static int chaos_test_real_renameat2_impl(
+    int olddirfd, const char *oldpath, int newdirfd, const char *newpath, unsigned int flags
+)
+{
+    (void)olddirfd;
+    (void)oldpath;
+    (void)newdirfd;
+    (void)newpath;
+    ++g_real_renameat2_calls;
+    g_real_renameat2_flags = flags;
+    return 0;
+}
+
+/** @brief Stub for the real `posix_fallocate`. Returns `g_real_posix_fallocate_return`. */
+static int chaos_test_real_posix_fallocate_impl(int fd, off_t offset, off_t length)
+{
+    (void)fd;
+    (void)offset;
+    (void)length;
+    ++g_real_posix_fallocate_calls;
+    return g_real_posix_fallocate_return;
+}
+
 /** @brief Stub for the real `truncate` call. Captures length and TLS guard. */
 static int chaos_test_real_truncate_impl(const char *path, off_t length)
 {
@@ -1353,6 +1386,12 @@ static void *chaos_test_dlsym(void *handle, const char *symbol)
     if (strcmp(symbol, "ftruncate") == 0)
     {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_ftruncate_fn, chaos_test_real_ftruncate_impl);
+    }
+    if (strcmp(symbol, "posix_fallocate") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(
+            chaos_io_posix_fallocate_fn, chaos_test_real_posix_fallocate_impl
+        );
     }
     if (strcmp(symbol, "truncate") == 0)
     {
@@ -1646,6 +1685,11 @@ static void chaos_test_reset_state(void)
     g_real_ftruncate_fd = -1;
     g_real_ftruncate_length = 0;
 
+    g_real_renameat2_calls = 0;
+    g_real_renameat2_flags = 0U;
+    g_real_posix_fallocate_calls = 0;
+    g_real_posix_fallocate_return = 0;
+
     g_real_truncate_calls = 0;
     g_real_truncate_return = 0;
     g_real_truncate_guard = 0;
@@ -1729,6 +1773,8 @@ static void chaos_test_reset_state(void)
     g_chaos_io_real_ftruncate = NULL;
     g_chaos_io_real_unlinkat = NULL;
     g_chaos_io_real_truncate = NULL;
+    g_chaos_io_real_renameat2 = NULL;
+    g_chaos_io_real_posix_fallocate = NULL;
     g_chaos_io_real_renameat = NULL;
 #ifdef __linux__
     g_chaos_io_real_fallocate = NULL;
@@ -1772,6 +1818,8 @@ static void chaos_test_bind_real_functions(void)
     g_chaos_io_real_ftruncate = chaos_test_real_ftruncate_impl;
     g_chaos_io_real_unlinkat = chaos_test_real_unlinkat_impl;
     g_chaos_io_real_truncate = chaos_test_real_truncate_impl;
+    g_chaos_io_real_renameat2 = chaos_test_real_renameat2_impl;
+    g_chaos_io_real_posix_fallocate = chaos_test_real_posix_fallocate_impl;
     g_chaos_io_real_renameat = chaos_test_real_renameat_impl;
 #ifdef __linux__
     g_chaos_io_real_fallocate = chaos_test_real_fallocate_impl;
@@ -1837,6 +1885,13 @@ static void chaos_test_bind_libc_functions_for_exit(void)
     resolved = dlsym(RTLD_NEXT, "ftruncate");
     assert(resolved != NULL);
     (void)memcpy(&g_chaos_io_real_ftruncate, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "posix_fallocate");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_posix_fallocate, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "renameat2");
+    (void)memcpy(&g_chaos_io_real_renameat2, &resolved, sizeof(resolved));
 
     resolved = dlsym(RTLD_NEXT, "truncate");
     assert(resolved != NULL);

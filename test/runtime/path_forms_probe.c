@@ -2,9 +2,10 @@
  * @file path_forms_probe.c
  * @brief Runtime probe: the path forms of file operations are faulted like the *at forms.
  *
- * glibc and musl implement unlink(), rmdir(), rename(), truncate() and creat() with
- * their own system calls rather than through unlinkat(), renameat(), ftruncate() or
- * open(). They are the forms most programs use (the JDK deletes with unlink() and
+ * glibc and musl implement unlink(), rmdir(), remove(), rename(), renameat2() (glibc),
+ * truncate(), creat() and posix_fallocate() with
+ * their own system calls rather than through unlinkat(), renameat(), ftruncate(),
+ * open() or fallocate(). They are the forms most programs use (the JDK deletes with unlink() and
  * moves with rename()), so each must reach the same rule as its *at or descriptor
  * form. Every call below runs under a rule that fails its operation, then once more
  * without a rule to show the real call still works.
@@ -97,11 +98,47 @@ int main(void)
     errno = 0;
     expect("creat faulted", creat(DIR "/new.bin", 0600) == -1 && errno == EROFS);
 
+    write_rules(DIR ":unlink:EACCES:1.0\n");
+    errno = 0;
+    expect("remove file faulted", remove(DIR "/victim.bin") == -1 && errno == EACCES);
+    errno = 0;
+    expect("remove dir faulted", remove(DIR "/empty.d") == -1 && errno == EACCES);
+
+    write_rules(DIR ":allocate:ENOSPC:1.0\n");
+    fd = open(DIR "/source.bin", O_WRONLY);
+    errno = 4242;
+    expect(
+        "posix_fallocate faulted",
+        fd >= 0 && posix_fallocate(fd, 0, 4096) == ENOSPC && errno == 4242 && close(fd) == 0
+    );
+
+#ifdef __GLIBC__
+    write_rules(DIR "/dest.bin:rename_to:ENOSPC:1.0\n");
+    errno = 0;
+    expect(
+        "renameat2 faulted",
+        renameat2(AT_FDCWD, DIR "/source.bin", AT_FDCWD, DIR "/dest.bin", 0U) == -1 &&
+            errno == ENOSPC
+    );
+#endif
+
     write_rules("# idle\n");
+    fd = open(DIR "/source.bin", O_WRONLY);
+    expect("posix_fallocate real", fd >= 0 && posix_fallocate(fd, 0, 4096) == 0 && close(fd) == 0);
+#ifdef __GLIBC__
+    expect(
+        "renameat2 real",
+        renameat2(AT_FDCWD, DIR "/source.bin", AT_FDCWD, DIR "/moved.bin", 0U) == 0 &&
+            renameat2(AT_FDCWD, DIR "/moved.bin", AT_FDCWD, DIR "/source.bin", 0U) == 0
+    );
+#endif
     expect("truncate real", truncate(DIR "/source.bin", 2) == 0);
     expect("rename real", rename(DIR "/source.bin", DIR "/dest.bin") == 0);
     expect("unlink real", unlink(DIR "/victim.bin") == 0 && unlink(DIR "/dest.bin") == 0);
     expect("rmdir real", rmdir(DIR "/empty.d") == 0);
+    make_file(DIR "/removed.bin");
+    (void)mkdir(DIR "/removed.d", 0700);
+    expect("remove real", remove(DIR "/removed.bin") == 0 && remove(DIR "/removed.d") == 0);
     fd = creat(DIR "/new.bin", 0600);
     expect("creat real", fd >= 0 && close(fd) == 0 && unlink(DIR "/new.bin") == 0);
 

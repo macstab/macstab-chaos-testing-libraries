@@ -77,6 +77,8 @@ chaos_io_pwritev_fn g_chaos_io_real_pwritev = NULL;
 chaos_io_ftruncate_fn g_chaos_io_real_ftruncate = NULL;
 chaos_io_unlinkat_fn g_chaos_io_real_unlinkat = NULL;
 chaos_io_truncate_fn g_chaos_io_real_truncate = NULL;
+chaos_io_renameat2_fn g_chaos_io_real_renameat2 = NULL;
+chaos_io_posix_fallocate_fn g_chaos_io_real_posix_fallocate = NULL;
 chaos_io_renameat_fn g_chaos_io_real_renameat = NULL;
 #ifdef __linux__
 chaos_io_fallocate_fn g_chaos_io_real_fallocate = NULL;
@@ -147,7 +149,14 @@ static void chaos_io_resolve_symbol(void *target, const char *symbol)
 static void chaos_io_resolve_optional_symbol(void *target, const char *symbol)
 {
     void *resolved;
+    void *current;
 
+    /* Like chaos_io_resolve_symbol(): never replace a pointer that is already wired. */
+    (void)memcpy(&current, target, sizeof(current));
+    if (current != NULL)
+    {
+        return;
+    }
     (void)dlerror();
     resolved = dlsym(RTLD_NEXT, symbol);
     (void)dlerror();
@@ -304,6 +313,8 @@ static void chaos_io_resolve_all_symbols(void)
     chaos_io_resolve_symbol(&g_chaos_io_real_ftruncate, "ftruncate");
     chaos_io_resolve_symbol(&g_chaos_io_real_unlinkat, "unlinkat");
     chaos_io_resolve_symbol(&g_chaos_io_real_truncate, "truncate");
+    chaos_io_resolve_symbol(&g_chaos_io_real_posix_fallocate, "posix_fallocate");
+    chaos_io_resolve_optional_symbol(&g_chaos_io_real_renameat2, "renameat2");
     chaos_io_resolve_symbol(&g_chaos_io_real_renameat, "renameat");
 #ifdef __linux__
     chaos_io_resolve_symbol(&g_chaos_io_real_fallocate, "fallocate");

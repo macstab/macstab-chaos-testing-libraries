@@ -1844,6 +1844,7 @@ static void test_glibc_alternate_entries(void)
     int (*ftruncate_fn)(int, off_t) = ftruncate64;
     int (*truncate_fn)(const char *, off_t) = truncate64;
     int (*creat_fn)(const char *, mode_t) = creat64;
+    int (*posix_fallocate_fn)(int, off_t, off_t) = posix_fallocate64;
     int (*fallocate_fn)(int, int, off_t, off_t) = fallocate64;
     int (*open2_fn)(const char *, int) = __open64_2;
     int (*openat2_fn)(int, const char *, int) = __openat64_2;
@@ -1859,6 +1860,7 @@ static void test_glibc_alternate_entries(void)
     assert(ftruncate_fn == ftruncate);
     assert(truncate_fn == truncate);
     assert(creat_fn == creat);
+    assert(posix_fallocate_fn == posix_fallocate);
     assert(fallocate_fn == fallocate);
     assert(open2_fn == __open_2);
     assert(openat2_fn == __openat_2);
@@ -2063,6 +2065,117 @@ static void test_path_form_wrappers(void)
     assert(truncate("/tmp/path-form.bin", 3) == -1);
     assert(errno == ENOSPC);
     assert(g_real_truncate_calls == 0);
+
+    /* remove(): unlink first; a directory (EISDIR) is retried with AT_REMOVEDIR. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    assert(remove("/tmp/path-form.bin") == 0);
+    assert(g_real_unlinkat_calls == 1);
+    assert(g_real_unlinkat_flags == 0);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_unlinkat_return = -1;
+    errno = EISDIR;
+    assert(remove("/tmp/path-form.d") == -1);
+    assert(g_real_unlinkat_calls == 2);
+    assert(g_real_unlinkat_flags == AT_REMOVEDIR);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
+    g_config_rule.errnum = EACCES;
+    g_rule_apply_errno_result = 1;
+    assert(remove("/tmp/path-form.bin") == -1);
+    assert(errno == EACCES);
+    assert(g_real_unlinkat_calls == 0);
+
+    /* renameat2(): the rename rules, flags passed through, cache reset on success. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    assert(renameat2(AT_FDCWD, "/tmp/path-form.a", AT_FDCWD, "/tmp/path-form.b", 1U) == 0);
+    assert(g_real_renameat2_calls == 1);
+    assert(g_real_renameat2_flags == 1U);
+    assert(g_fdcache_reset_calls == 1);
+    g_chaos_io_tls_guard = 1;
+    assert(renameat2(AT_FDCWD, "/tmp/path-form.a", AT_FDCWD, "/tmp/path-form.b", 0U) == 0);
+    g_chaos_io_tls_guard = 0;
+    assert(g_real_renameat2_calls == 2);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_LATENCY;
+    assert(renameat2(AT_FDCWD, "/tmp/path-form.a", AT_FDCWD, "/tmp/path-form.b", 0U) == 0);
+    assert(g_latency_calls == 1);
+    assert(g_last_match_loaded_operation == CHAOS_IO_OP_RENAME_TO);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
+    g_config_rule.errnum = EROFS;
+    g_rule_apply_errno_result = 1;
+    assert(renameat2(AT_FDCWD, "/tmp/path-form.a", AT_FDCWD, "/tmp/path-form.b", 0U) == -1);
+    assert(errno == EROFS);
+    assert(g_real_renameat2_calls == 0);
+    assert(g_fdcache_reset_calls == 0);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_chaos_io_real_renameat2 = NULL;
+    errno = 0;
+    assert(renameat2(AT_FDCWD, "/tmp/path-form.a", AT_FDCWD, "/tmp/path-form.b", 0U) == -1);
+    assert(errno == ENOSYS);
+    assert(g_fdcache_reset_calls == 0);
+
+    /* posix_fallocate(): the allocate rules; errors returned, errno untouched. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_posix_fallocate_return = 0;
+    assert(posix_fallocate(9, 0, 4096) == 0);
+    assert(g_real_posix_fallocate_calls == 1);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/posix-allocate.bin");
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_LATENCY;
+    assert(posix_fallocate(9, 0, 4096) == 0);
+    assert(g_last_match_loaded_operation == CHAOS_IO_OP_ALLOCATE);
+    assert(g_latency_calls == 1);
+    assert(g_real_posix_fallocate_calls == 1);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/posix-allocate.bin");
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
+    g_config_rule.errnum = ENOSPC;
+    g_rule_apply_errno_result = 1;
+    errno = 4242;
+    assert(posix_fallocate(9, 0, 4096) == ENOSPC);
+    assert(errno == 4242);
+    assert(g_real_posix_fallocate_calls == 0);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/posix-allocate.bin");
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
+    g_rule_apply_errno_result = 0;
+    assert(posix_fallocate(9, 0, 4096) == 0);
+    assert(g_real_posix_fallocate_calls == 1);
 }
 
 int main(void)

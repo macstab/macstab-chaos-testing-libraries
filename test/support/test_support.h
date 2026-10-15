@@ -117,6 +117,8 @@
     chaos_io_ftruncate_fn g_chaos_io_real_ftruncate = NULL;                                        \
     chaos_io_unlinkat_fn g_chaos_io_real_unlinkat = NULL;                                          \
     chaos_io_truncate_fn g_chaos_io_real_truncate = NULL;                                          \
+    chaos_io_renameat2_fn g_chaos_io_real_renameat2 = NULL;                                        \
+    chaos_io_posix_fallocate_fn g_chaos_io_real_posix_fallocate = NULL;                            \
     chaos_io_renameat_fn g_chaos_io_real_renameat = NULL;                                          \
     CHAOS_IO_DEFINE_TEST_LINUX_COPY_GLOBALS()                                                      \
     __thread int g_chaos_io_tls_guard = 0;                                                         \
@@ -419,6 +421,8 @@ static inline void chaos_test_reset_runtime(void)
     g_chaos_io_real_ftruncate = NULL;
     g_chaos_io_real_unlinkat = NULL;
     g_chaos_io_real_truncate = NULL;
+    g_chaos_io_real_renameat2 = NULL;
+    g_chaos_io_real_posix_fallocate = NULL;
     g_chaos_io_real_renameat = NULL;
     CHAOS_IO_TEST_RESET_REAL_LINUX_COPY()
     g_chaos_io_tls_guard = 0;

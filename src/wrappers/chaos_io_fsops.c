@@ -6,7 +6,8 @@
  * This unit owns the interposed entry points for file-system–level operations
  * that are neither ordinary fd I/O nor sync boundaries: `ftruncate(2)`,
  * `truncate(2)`, `fallocate(2)` (Linux only), `unlinkat(2)`, `unlink(2)`,
- * `rmdir(2)`, `renameat(2)` and `rename(2)`.
+ * `rmdir(2)`, `remove(3)`, `renameat(2)`, `renameat2(2)`, `rename(2)` and
+ * `posix_fallocate(3)`.
  *
  * **Rule matching differences from read/write wrappers.**
  * `ftruncate` and `fallocate` arrive with a file descriptor and use the
@@ -55,7 +56,9 @@
 #include "chaos_io_internal.h"
 #include "chaos_io_wrappers.h"
 
+#include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <unistd.h>
 
 /* --- Real-call trampolines ------------------------------------------------------- */
@@ -94,6 +97,42 @@ static int chaos_io_call_real_truncate(const char *path, off_t length)
 
     previous = chaos_io_enter_internal();
     result = g_chaos_io_real_truncate(path, length);
+    chaos_io_leave_internal(previous);
+    return result;
+}
+
+/** @brief Calls the real `posix_fallocate()` while preserving the recursion guard. */
+static int chaos_io_call_real_posix_fallocate(int fd, off_t offset, off_t length)
+{
+    int previous;
+    int result;
+
+    previous = chaos_io_enter_internal();
+    result = g_chaos_io_real_posix_fallocate(fd, offset, length);
+    chaos_io_leave_internal(previous);
+    return result;
+}
+
+/**
+ * @brief Calls the real `renameat2()` while preserving the recursion guard.
+ *
+ * @details Absent on musl and before glibc 2.28; the call then fails with ENOSYS,
+ * which is what such a libc reports for the system call.
+ */
+static int chaos_io_call_real_renameat2(
+    int olddirfd, const char *oldpath, int newdirfd, const char *newpath, unsigned int flags
+)
+{
+    int previous;
+    int result;
+
+    if (g_chaos_io_real_renameat2 == NULL)
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+    previous = chaos_io_enter_internal();
+    result = g_chaos_io_real_renameat2(olddirfd, oldpath, newdirfd, newpath, flags);
     chaos_io_leave_internal(previous);
     return result;
 }
@@ -446,11 +485,109 @@ CHAOS_IO_EXPORT int rmdir(const char *path)
 }
 
 /**
+ * @brief Interposed `remove(3)`: the `unlink` rules.
+ *
+ * @details glibc and musl implement remove() with their internal unlink and
+ * rmdir: unlink first, and rmdir when that fails with EISDIR. This does the same
+ * through unlinkat(), so an injected failure on the first step ends the call.
+ */
+CHAOS_IO_EXPORT int remove(const char *path)
+{
+    int rc = unlinkat(AT_FDCWD, path, 0);
+
+    if (rc != 0 && errno == EISDIR)
+    {
+        rc = unlinkat(AT_FDCWD, path, AT_REMOVEDIR);
+    }
+    return rc;
+}
+
+/**
  * @brief Interposed `rename(2)`: the `rename_from`/`rename_to` rules, through renameat().
  */
 CHAOS_IO_EXPORT int rename(const char *oldpath, const char *newpath)
 {
     return renameat(AT_FDCWD, oldpath, AT_FDCWD, newpath);
+}
+
+int renameat2(
+    int olddirfd, const char *oldpath, int newdirfd, const char *newpath, unsigned int flags
+);
+
+/**
+ * @brief Interposed `renameat2(2)`: the `rename_from`/`rename_to` rules.
+ *
+ * @details renameat() with flags (RENAME_NOREPLACE, RENAME_EXCHANGE), used by
+ * `mv` and systemd. glibc's renameat() does not call it, so it needs its own
+ * wrapper. Rule selection and fd-cache handling are those of renameat().
+ *
+ * @return 0 on success; -1 with `errno` set on failure.
+ */
+CHAOS_IO_EXPORT int
+renameat2(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, unsigned int flags)
+{
+    chaos_io_rule_t rule;
+    int rc;
+
+    chaos_io_ensure_symbols();
+    if (!chaos_io_in_internal() &&
+        chaos_io_match_rename_rule(olddirfd, oldpath, newdirfd, newpath, &rule))
+    {
+        if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
+        {
+            chaos_io_rule_apply_latency(&rule);
+        }
+        else if (chaos_io_rule_apply_errno(&rule))
+        {
+            return -1;
+        }
+    }
+
+    rc = chaos_io_call_real_renameat2(olddirfd, oldpath, newdirfd, newpath, flags);
+    if (rc == 0)
+    {
+        chaos_io_fdcache_reset();
+    }
+    return rc;
+}
+
+/**
+ * @brief Interposed `posix_fallocate(3)`: the `allocate` rules.
+ *
+ * @details glibc and musl implement it with the fallocate system call directly
+ * (glibc falls back to writing zeros), never through fallocate(). Unlike
+ * fallocate() it reports failure as the returned error number and leaves errno
+ * alone.
+ *
+ * @return 0 on success; an error number on failure.
+ */
+CHAOS_IO_EXPORT int posix_fallocate(int fd, off_t offset, off_t length)
+{
+    chaos_io_rule_t rule;
+    int saved_errno;
+    int injected;
+
+    chaos_io_ensure_symbols();
+    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_ALLOCATE, &rule))
+    {
+        return chaos_io_call_real_posix_fallocate(fd, offset, length);
+    }
+
+    if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
+    {
+        chaos_io_rule_apply_latency(&rule);
+    }
+    else
+    {
+        saved_errno = errno;
+        if (chaos_io_rule_apply_errno(&rule))
+        {
+            injected = errno;
+            errno = saved_errno;
+            return injected;
+        }
+    }
+    return chaos_io_call_real_posix_fallocate(fd, offset, length);
 }
 
 /**
@@ -501,6 +638,8 @@ CHAOS_IO_EXPORT int truncate(const char *path, off_t length)
 
 CHAOS_IO_EXPORT int ftruncate64(int fd, off_t length) __attribute__((alias("ftruncate")));
 CHAOS_IO_EXPORT int truncate64(const char *path, off_t length) __attribute__((alias("truncate")));
+CHAOS_IO_EXPORT int posix_fallocate64(int fd, off_t offset, off_t length)
+    __attribute__((alias("posix_fallocate")));
 CHAOS_IO_EXPORT int fallocate64(int fd, int mode, off_t offset, off_t length)
     __attribute__((alias("fallocate")));
 
