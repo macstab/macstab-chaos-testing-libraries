@@ -96,8 +96,11 @@ Config refresh guarantees, identical in every library:
   the file atomically (write a temporary file in the same directory, then `rename` it over the
   rule file), as the Java framework does: a writer that pauses between two `write` calls can
   otherwise be read with a stable stamp in between.
-- **A fork during a reload does not freeze the child.** The reload claim records the claiming
-  process id; a child that inherits a claim from its parent releases it and reloads itself.
+- **A fork during a reload does not freeze the child.** Each library registers a
+  `pthread_atfork` child handler that releases an inherited reload claim, the hit writer flag
+  and the hit counters, so the child reloads and counts for itself. A `vfork` child (and glibc's
+  `posix_spawn`, JDK 8/11 process launching) shares the parent's memory and runs no atfork
+  handler: it takes over nothing the parent holds, and its hit report, if any, is skipped.
 - **errno is the caller's.** The library's own `stat`/`open`/`read`, socket lookups, `/proc` reads,
   seeding and latency sleeps restore errno, so a successful interposed call never reports an
   errno the library caused. `test/runtime/test_errno_glibc.sh` checks this for every library.
@@ -379,6 +382,9 @@ pid=4711
 - `state=ok` with `rules=<n>` after a successful load; `state=error` with
   the 1-based `line`, the `reason` (`invalid rule` or `too many rules`) and
   the line as written (`text`, at most 200 bytes) after a rejected one.
+- A file at or over the size limit (`reason=file too large`), or one the
+  process may not open (EACCES) or that is not a file (`reason=file
+  unreadable`), is reported with `line=0` and not re-read until it changes.
 - `pid` is the process that loaded the rules. Every process with the library
   loaded writes the same report for the same rule file; a writer that wants
   the report for its own change runs one program under `LD_PRELOAD` and
@@ -386,7 +392,8 @@ pid=4711
 - The library constructor loads the rules, so starting any program (even
   `/bin/true`) under `LD_PRELOAD` writes a fresh report.
 - Without a rule file the status file is removed.
-- The report is written to `<path>.<pid>` and renamed over the old one, with
+- The report is written to `/tmp/.chaos-staging-<pid>-<name>` and renamed over
+  the old one (a name no reader of status or hits files lists), with
   raw system calls: libchaos-io interposes `open`, `write` and `rename`, and
   a user's io rule must not be able to fail the report. Writing is best
   effort and leaves errno untouched.
@@ -414,11 +421,12 @@ applied, and each process reports its counts in
   pointer to it. A rule whose text is unchanged by a reload keeps its count.
 - The file is rewritten on each of a process's first 64 hits, then at most
   every 100 ms on a hit, and at normal exit. A hit that is not due to be written
-  makes no system call (the time comes from the vDSO). The writer flag holds the
-  writer's pid, so one inherited by a child forked mid-write is released.
-- A forked child starts from zero at its first write, so the parent's hits are
-  not reported twice; hits the child made before that write are dropped with
-  them. `@first` budgets are per process too: a child starts its own.
+  makes no system call (the time comes from the vDSO). A writer flag inherited
+  by a child forked mid-write is released by the atfork handler.
+- A forked child starts from zero, so the parent's hits are not reported twice.
+  `@first` budgets and once-only effects (REGRESS) are per process too: a child
+  starts its own. A `vfork` child counts into the parent's slots and writes no
+  file of its own.
 - A reader sums the files of all processes. Files of finished processes stay,
   so counts are cumulative until the files are removed (one file per process
   that ever hit a rule: remove them between test runs).
@@ -434,8 +442,7 @@ Known limits, kept on purpose:
   applied after the call (CORRUPT, TRICKLE, DUP).
 - In a sticky `/tmp`, a process may not replace a status file another user
   created; the Java side then sees a pid that is not its own and skips the
-  check rather than reporting a stale result. A rule file at or over the size
-  limit is reported (`reason=file too large`) and not re-read until it changes.
+  check rather than reporting a stale result.
 - Writes use the same raw-syscall rename as the status file.
 
 ## FD Path Resolution

@@ -640,7 +640,8 @@ static void test_parse_buffer_error_paths(void)
  * Expected observable behaviour:
  * - NULL size_out → -1 (no I/O attempted).
  * - NULL `g_chaos_io_real_open` → -1.
- * - Stub open returns -1 → -1.
+ * - Stub open returns -1 with EIO → -1 (retried); with EACCES → -3 (lasting until the
+ *   file changes).
  * - Stub open returns a valid fd, stub read returns -1 → -1 and `g_stub_close_calls == 1`
  *   (the fd is closed before returning).
  * - Stub read returns exactly `CHAOS_IO_MAX_CONFIG_BYTES` → -1 (buffer full, only one read
@@ -664,6 +665,9 @@ static void test_read_file_paths(void)
 
     g_chaos_io_real_close = chaos_test_stub_close;
     assert(chaos_io_config_read_file(&size_out, chaos_io_config_observed_mtime()) == -1);
+    g_stub_open_errno = EACCES;
+    assert(chaos_io_config_read_file(&size_out, chaos_io_config_observed_mtime()) == -3);
+    g_stub_open_errno = EIO;
 
     g_stub_open_result = 7;
     g_stub_read_result = -1;
@@ -830,12 +834,19 @@ static void test_fork_takes_over_orphaned_reload(void)
     chaos_io_config_init();
     chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/data:write:EIO:1.0\n");
 
-    g_chaos_io_reload_pid = (uint64_t)getpid() + 1U;
+    /* A claim is never taken over, whoever made it: in a vfork child the parent's
+     * reload thread is still running. A fork() child's atfork handler releases it. */
     g_chaos_io_cached_mtime = CHAOS_IO_MTIME_RELOADING;
-    assert(chaos_io_config_prepare() == 1);
+    (void)chaos_io_config_prepare();
+    assert(g_chaos_io_cached_mtime == CHAOS_IO_MTIME_RELOADING);
+    chaos_io_config_after_fork();
+    assert(g_chaos_io_cached_mtime == CHAOS_IO_MTIME_UNKNOWN);
+    assert(g_chaos_io_hits_pid == (uint64_t)getpid());
+    assert(chaos_io_config_prepare());
+    assert(g_chaos_io_cached_mtime == chaos_io_config_observed_mtime());
+    chaos_io_config_after_fork();
     assert(g_chaos_io_cached_mtime == chaos_io_config_observed_mtime());
 
-    g_chaos_io_reload_pid = (uint64_t)getpid();
     g_chaos_io_cached_mtime = CHAOS_IO_MTIME_RELOADING;
     (void)chaos_io_config_prepare();
     assert(g_chaos_io_cached_mtime == CHAOS_IO_MTIME_RELOADING);
@@ -1037,6 +1048,32 @@ static void test_prepare_reports_status(void)
     assert(strcmp(status, expected) == 0);
 
     (void)unlink(CHAOS_IO_CONFIG_PATH);
+
+    /* A rule file that cannot be read is reported too: a directory (EISDIR on read),
+     * and, unless running as root, a file without read permission (EACCES on open). */
+    assert(mkdir(CHAOS_IO_CONFIG_PATH, 0700) == 0);
+    assert(chaos_io_config_prepare() == 0);
+    assert(read_status_file(status, sizeof(status)));
+    (void)snprintf(
+        expected,
+        sizeof(expected),
+        "state=error\nrules=0\nline=0\nreason=file unreadable\ntext=\npid=%ld\n",
+        (long)getpid()
+    );
+    assert(strcmp(status, expected) == 0);
+    assert(rmdir(CHAOS_IO_CONFIG_PATH) == 0);
+    if (geteuid() != 0)
+    {
+        FILE *locked = fopen(CHAOS_IO_CONFIG_PATH, "w");
+
+        assert(locked != NULL);
+        assert(fclose(locked) == 0);
+        assert(chmod(CHAOS_IO_CONFIG_PATH, 0) == 0);
+        assert(chaos_io_config_prepare() == 0);
+        assert(read_status_file(status, sizeof(status)));
+        assert(strcmp(status, expected) == 0);
+        (void)unlink(CHAOS_IO_CONFIG_PATH);
+    }
     g_chaos_io_cached_mtime = CHAOS_IO_MTIME_UNKNOWN;
     assert(chaos_io_config_prepare() == 0);
     assert(!read_status_file(status, sizeof(status)));
@@ -1108,7 +1145,7 @@ static void test_hits_are_counted_and_reported(void)
     assert(strcmp(hits, "2\t/data:write:EIO:1.0 # a\n1\t/data:write:EIO:1.0 # b\n") == 0);
 
     /* A hit that finds another thread writing is left pending, not lost. */
-    g_chaos_io_hits_writing = (uint64_t)getpid();
+    g_chaos_io_hits_writing = 1;
     chaos_hit_record(state->rules[1].hit);
     g_chaos_io_hits_writing = 0;
     assert(g_chaos_io_hits_pending == 1);
@@ -1131,12 +1168,20 @@ static void test_hits_are_counted_and_reported(void)
     chaos_io_config_report_hits(NULL);
     g_chaos_io_hits_total = 0U;
 
-    /* A writer flag inherited from a parent that forked mid-write is released. */
-    g_chaos_io_hits_writing = (uint64_t)getpid() + 1U;
+    /* A writer flag held when the process forked is released in the child, which
+     * starts counting from zero. */
+    g_chaos_io_hits_writing = 1;
+    state->rules[0].hit->state = 3U; /* a once-only effect deciding in the parent */
+    state->rules[1].hit->state = 2U; /* one that already fired */
+    chaos_io_config_after_fork();
+    assert(g_chaos_io_hits_writing == 0);
+    assert(state->rules[0].hit->state == 1U);
+    assert(state->rules[1].hit->state == 2U);
+    state->rules[0].hit->state = 0U;
+    state->rules[1].hit->state = 0U;
     chaos_hit_record(state->rules[0].hit);
-    assert(g_chaos_io_hits_writing == 0U);
     assert(read_hits_file(hits, sizeof(hits)));
-    assert(strcmp(hits, "3\t/data:write:EIO:1.0 # a\n3\t/data:write:EIO:1.0 # b\n") == 0);
+    assert(strcmp(hits, "1\t/data:write:EIO:1.0 # a\n0\t/data:write:EIO:1.0 # b\n") == 0);
     g_chaos_io_hits_total = 0U;
 
     /* The exit report of a process that only inherited these counts writes nothing. */

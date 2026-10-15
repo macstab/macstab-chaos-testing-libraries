@@ -58,6 +58,7 @@
 #include "chaos_clock.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -124,17 +125,6 @@ static volatile unsigned int g_chaos_time_active_config_index = 0U;
 static volatile uint64_t g_chaos_time_cached_mtime = CHAOS_TIME_MTIME_UNKNOWN;
 
 /**
- * @brief Process id of the thread that last claimed the reload marker.
- *
- * @details Written before every claim attempt. A forked child inherits a
- * CHAOS_TIME_MTIME_RELOADING marker whose claiming thread does not exist in the
- * child; the pid recorded here differs from the child's, which is how the child
- * recognises an orphaned claim and takes the reload over instead of serving a
- * stale snapshot forever.
- */
-static volatile uint64_t g_chaos_time_reload_pid = 0U;
-
-/**
  * @brief Buffer the reload thread reads the config file into.
  *
  * @details Sized CHAOS_TIME_MAX_CONFIG_BYTES + 1 for the NUL terminator appended by
@@ -158,8 +148,13 @@ static chaos_status_error_t g_chaos_time_config_error;
 /** @brief Text of each accepted rule of the last parse, copied into the snapshot. */
 static char g_chaos_time_config_texts[CHAOS_TIME_MAX_RULES][CHAOS_STATUS_TEXT_MAX + 1U];
 
-/** @brief Pid of the process whose thread writes the hits file; 0 when nobody does. */
-static volatile uint64_t g_chaos_time_hits_writing = 0U;
+/** @brief Set while a thread writes the hits file. */
+static volatile int g_chaos_time_hits_writing = 0;
+
+/** @brief Set once the atfork handler is registered. */
+static int g_chaos_time_atfork_registered = 0;
+
+static void chaos_time_config_after_fork(void);
 
 /** @brief Set by every hit, cleared by the write that reports it. */
 static volatile int g_chaos_time_hits_pending = 0;
@@ -170,8 +165,8 @@ static uint64_t g_chaos_time_hits_total = 0U;
 /** @brief CLOCK_MONOTONIC time of the last write, in milliseconds. */
 static uint64_t g_chaos_time_hits_last_ms = 0U;
 
-/** @brief Process the counters belong to; differs in a forked child. */
-static uint64_t g_chaos_time_hits_pid = 0U;
+/** @brief Process the counters belong to: set at start and in a forked child. */
+static volatile uint64_t g_chaos_time_hits_pid = 0U;
 
 /** @brief Scratch for the hits file; used only by the thread that writes it. */
 static char g_chaos_time_hits_buffer[CHAOS_TIME_MAX_RULES * CHAOS_HITS_LINE_MAX + 1U];
@@ -942,8 +937,12 @@ static int chaos_time_config_read_file(size_t *size_out, uint64_t expected_stamp
     } while (fd < 0 && errno == EINTR);
     if (fd < 0)
     {
+        /* No permission lasts until the file changes; anything else (gone since
+         * the stat, out of descriptors, ...) is retried on the next check. */
+        const int open_error = errno;
+
         chaos_time_leave_internal(previous);
-        return -1;
+        return open_error == EACCES || open_error == EPERM ? -3 : -1;
     }
 
     for (;;)
@@ -956,9 +955,11 @@ static int chaos_time_config_read_file(size_t *size_out, uint64_t expected_stamp
         }
         if (rc < 0)
         {
+            const int read_error = errno;
+
             (void)close(fd);
             chaos_time_leave_internal(previous);
-            return -1;
+            return read_error == EISDIR ? -3 : -1;
         }
         if (rc == 0)
         {
@@ -1041,6 +1042,12 @@ static int chaos_time_split_rule_fields(
  */
 void chaos_time_config_init(void)
 {
+    g_chaos_time_hits_pid = (uint64_t)getpid();
+    if (!g_chaos_time_atfork_registered)
+    {
+        g_chaos_time_atfork_registered = 1;
+        (void)pthread_atfork(NULL, NULL, chaos_time_config_after_fork);
+    }
     /* Find the vDSO clock now, not first inside a wrapper a signal handler may re-enter. */
     (void)chaos_clock_now_ns();
     chaos_time_config_reset_state(&g_chaos_time_config_states[0], 1);
@@ -1309,17 +1316,18 @@ int chaos_time_config_select_rule(
 }
 
 /**
- * @brief Marks @p state as the result of a rule file at or over the size limit.
+ * @brief Marks @p state as the result of a rule file that cannot be used as a whole.
  *
- * @details Unlike a read that failed or met a concurrent writer, the size is a
- * lasting property of this version of the file: it is reported like a rejected
- * file (no rules, state=error) and not re-read until the file changes.
+ * @details A file at or over the size limit, or one this process may not open
+ * (EACCES) or read (a directory), stays so until it changes, unlike a read that
+ * failed or met a concurrent writer: it is reported like a rejected file (no
+ * rules, state=error) and not re-read until the file changes.
  */
-static void chaos_time_config_reject_file(chaos_time_config_state_t *state)
+static void chaos_time_config_reject_file(chaos_time_config_state_t *state, const char *reason)
 {
     chaos_time_config_reset_state(state, 0);
     chaos_status_clear(&g_chaos_time_config_error);
-    chaos_status_reject(&g_chaos_time_config_error, CHAOS_STATUS_REASON_TOO_LARGE);
+    chaos_status_reject(&g_chaos_time_config_error, reason);
 }
 
 /**
@@ -1335,8 +1343,6 @@ static void chaos_time_config_report_hits(chaos_hit_slot_t *slot)
 {
     chaos_time_config_state_t *state;
     const uint64_t now = chaos_hits_now_ms();
-    uint64_t owner;
-    uint64_t pid;
 
     if (slot != NULL)
     {
@@ -1357,50 +1363,76 @@ static void chaos_time_config_report_hits(chaos_hit_slot_t *slot)
     {
         return;
     }
-    pid = (uint64_t)getpid();
-    if (slot == NULL && g_chaos_time_hits_pid != pid)
+    /* Only the process the counts belong to writes them. A vfork child shares this
+     * memory but is another process and runs no atfork handler. */
+    if ((uint64_t)getpid() != g_chaos_time_hits_pid)
     {
         return;
     }
-    /* The writer flag holds the writer's pid. One inherited from a parent that forked
-     * while writing belongs to no thread of this process and is released. */
-    owner = g_chaos_time_hits_writing;
-    if (owner != 0U && owner != pid)
+    do
     {
-        (void)__sync_bool_compare_and_swap(&g_chaos_time_hits_writing, owner, 0U);
+        if (!__sync_bool_compare_and_swap(&g_chaos_time_hits_writing, 0, 1))
+        {
+            return;
+        }
+        state = (chaos_time_config_state_t *)chaos_time_config_active_state();
+        while (g_chaos_time_hits_pending != 0)
+        {
+            g_chaos_time_hits_pending = 0;
+            __sync_synchronize();
+            chaos_hits_write(
+                CHAOS_TIME_HITS_PREFIX,
+                state->hits,
+                (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) state->text,
+                state->rule_count,
+                g_chaos_time_hits_buffer,
+                sizeof(g_chaos_time_hits_buffer)
+            );
+        }
+        g_chaos_time_hits_last_ms = now;
+        __sync_lock_release(&g_chaos_time_hits_writing);
+        __sync_synchronize();
+        /* A hit that found the writer busy after its last check is written now. */
+    } while (g_chaos_time_hits_pending != 0);
+}
+
+/**
+ * @brief Child side of fork(): forgets what threads of the parent were doing.
+ *
+ * @details Registered with pthread_atfork(). The thread that held a reload claim,
+ * the hits writer flag or a REGRESS decision does not exist in the child, so those
+ * are released; counts and @first claims start from zero for the new process, and
+ * its hits file is its own. vfork children and posix_spawn run no atfork handler:
+ * they share the parent's memory, see its claims as busy and write nothing.
+ */
+static void chaos_time_config_after_fork(void)
+{
+    size_t which;
+
+    if (g_chaos_time_cached_mtime == CHAOS_TIME_MTIME_RELOADING)
+    {
+        g_chaos_time_cached_mtime = CHAOS_TIME_MTIME_UNKNOWN;
     }
-    if (!__sync_bool_compare_and_swap(&g_chaos_time_hits_writing, 0U, pid))
+    g_chaos_time_hits_writing = 0;
+    g_chaos_time_hits_pending = 0;
+    g_chaos_time_hits_total = 0U;
+    g_chaos_time_hits_last_ms = 0U;
+    g_chaos_time_hits_pid = (uint64_t)getpid();
+    for (which = 0U; which < 2U; ++which)
     {
-        return;
-    }
-    state = (chaos_time_config_state_t *)chaos_time_config_active_state();
-    if (slot != NULL && g_chaos_time_hits_pid != pid)
-    {
+        chaos_hit_slot_t *slots = g_chaos_time_config_states[which].hits;
         size_t index;
 
-        for (index = 0U; index < state->rule_count; ++index)
+        for (index = 0U; index < CHAOS_TIME_MAX_RULES; ++index)
         {
-            state->hits[index].count = 0U;
+            slots[index].count = 0U;
+            slots[index].claimed = 0U;
+            if (slots[index].state == 3U)
+            {
+                slots[index].state = 1U;
+            }
         }
-        slot->count = 1U;
-        g_chaos_time_hits_pid = pid;
-        g_chaos_time_hits_total = 1U;
     }
-    while (g_chaos_time_hits_pending != 0)
-    {
-        g_chaos_time_hits_pending = 0;
-        __sync_synchronize();
-        chaos_hits_write(
-            CHAOS_TIME_HITS_PREFIX,
-            state->hits,
-            (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) state->text,
-            state->rule_count,
-            g_chaos_time_hits_buffer,
-            sizeof(g_chaos_time_hits_buffer)
-        );
-    }
-    g_chaos_time_hits_last_ms = now;
-    __sync_lock_release(&g_chaos_time_hits_writing);
 }
 
 /** @brief Reports the hits not yet written when the process exits normally. */
@@ -1436,8 +1468,9 @@ static void chaos_time_config_attach_hits(chaos_time_config_state_t *next_state)
             {
                 next_state->hits[index].count = active->hits[previous].count;
                 next_state->hits[index].claimed = active->hits[previous].claimed;
-                next_state->hits[index].claimed_pid = active->hits[previous].claimed_pid;
-                next_state->hits[index].state = active->hits[previous].state;
+                /* A REGRESS decision in progress belongs to the old slot. */
+                next_state->hits[index].state =
+                    active->hits[previous].state == 3U ? 1U : active->hits[previous].state;
                 break;
             }
         }
@@ -1537,23 +1570,13 @@ static int chaos_time_config_refresh(void)
     /* Another thread owns this reload cycle; use the current snapshot.  Without this
      * check the CAS below succeeds as RELOADING -> RELOADING and a second thread would
      * reload into the same inactive snapshot and read buffer concurrently. */
+    /* Another thread of this process owns the reload; a claim inherited through
+     * fork() was released by the atfork handler, and a vfork child must not take
+     * over its parent's. */
     if (cached_mtime == CHAOS_TIME_MTIME_RELOADING)
     {
-        if (chaos_time_atomic_load_u64(&g_chaos_time_reload_pid) == (uint64_t)getpid())
-        {
-            return chaos_time_config_active_state()->rule_count != 0U;
-        }
-        /* The claim was made in the parent before fork(); its thread does not exist in
-         * this child and will never publish. Release the orphaned claim; if another
-         * thread released it first, the claim below decides which of them reloads. */
-        (void)chaos_time_atomic_cas_u64(
-            &g_chaos_time_cached_mtime, CHAOS_TIME_MTIME_RELOADING, CHAOS_TIME_MTIME_UNKNOWN
-        );
-        cached_mtime = CHAOS_TIME_MTIME_UNKNOWN;
+        return chaos_time_config_active_state()->rule_count != 0U;
     }
-    /* Race to become the reload thread. Exactly one caller proceeds. The pid is
-     * recorded first so a thread that sees the claim can tell it is this process's. */
-    g_chaos_time_reload_pid = (uint64_t)getpid();
     if (!chaos_time_atomic_cas_u64(
             &g_chaos_time_cached_mtime, cached_mtime, CHAOS_TIME_MTIME_RELOADING
         ))
@@ -1570,9 +1593,12 @@ static int chaos_time_config_refresh(void)
     {
         const int read_rc = chaos_time_config_read_file(&config_size, observed_mtime);
 
-        if (read_rc == -2)
+        if (read_rc == -2 || read_rc == -3)
         {
-            chaos_time_config_reject_file(next_state);
+            chaos_time_config_reject_file(
+                next_state,
+                read_rc == -2 ? CHAOS_STATUS_REASON_TOO_LARGE : CHAOS_STATUS_REASON_UNREADABLE
+            );
             config_size = 0U;
         }
         else if (read_rc != 0)

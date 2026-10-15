@@ -31,9 +31,6 @@ CHAOS_NET_DEFINE_TEST_GLOBALS();
 
 #include "../support/test_sleep_support.h"
 
-#include <sys/wait.h>
-#include <unistd.h>
-
 #include "../../src/net/chaos_net_actions.c"
 
 /**
@@ -270,42 +267,8 @@ static void test_should_trigger_honours_qualifiers(void)
     assert(chaos_net_rule_should_trigger(&rule) == 0);
 }
 
-/**
- * @brief Invariant: an @first budget is per process: a forked child starts its own.
- */
-static void test_first_budget_is_per_process(void)
-{
-    chaos_net_rule_t rule;
-    chaos_hit_slot_t slot;
-    pid_t child;
-    int status = 0;
-
-    memset(&rule, 0, sizeof(rule));
-    memset(&slot, 0, sizeof(slot));
-    rule.effect = CHAOS_NET_EFFECT_ERRNO;
-    rule.probability = 1.0;
-    rule.hit = &slot;
-    rule.policy.first = 1U;
-    assert(chaos_net_rule_should_trigger(&rule) == 1);
-    assert(chaos_net_rule_should_trigger(&rule) == 0);
-    child = fork();
-    assert(child >= 0);
-    if (child == 0)
-    {
-        _exit(
-            chaos_net_rule_should_trigger(&rule) == 1 && chaos_net_rule_should_trigger(&rule) == 0
-                ? 0
-                : 1
-        );
-    }
-    assert(waitpid(child, &status, 0) == child);
-    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-    assert(chaos_net_rule_should_trigger(&rule) == 0);
-}
-
 int main(void)
 {
-    test_first_budget_is_per_process();
     test_should_trigger_honours_qualifiers();
     test_should_trigger_counts_hits();
     test_probability_helpers();

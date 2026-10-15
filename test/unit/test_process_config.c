@@ -935,20 +935,26 @@ static void test_fork_takes_over_orphaned_reload(void)
     chaos_process_config_init();
     write_config_text("fork:ERRNO:EAGAIN\n", 60);
 
-    g_chaos_process_reload_pid = (uint64_t)getpid() + 1U;
+    /* A claim is never taken over, whoever made it: in a vfork child the parent's
+     * reload thread is still running. A fork() child's atfork handler releases it. */
     g_chaos_process_cached_mtime = CHAOS_PROCESS_MTIME_RELOADING;
+    (void)chaos_process_config_prepare();
+    assert(g_chaos_process_cached_mtime == CHAOS_PROCESS_MTIME_RELOADING);
+    chaos_process_config_after_fork();
+    assert(g_chaos_process_cached_mtime == CHAOS_PROCESS_MTIME_UNKNOWN);
+    assert(g_chaos_process_hits_pid == (uint64_t)getpid());
     assert(chaos_process_config_prepare());
+    assert(g_chaos_process_cached_mtime == chaos_process_config_observed_mtime());
+    chaos_process_config_after_fork();
     assert(g_chaos_process_cached_mtime == chaos_process_config_observed_mtime());
 
     /* A competing taker-over wins the release: this caller keeps the current snapshot. */
-    g_chaos_process_reload_pid = (uint64_t)getpid() + 1U;
     g_chaos_process_cached_mtime = CHAOS_PROCESS_MTIME_RELOADING;
     g_test_config_force_cas_fail = 1;
     assert(chaos_process_config_prepare());
     g_test_config_force_cas_fail = 0;
 
     /* The claim belongs to this process: another of its threads is reloading. */
-    g_chaos_process_reload_pid = (uint64_t)getpid();
     g_chaos_process_cached_mtime = CHAOS_PROCESS_MTIME_RELOADING;
     (void)chaos_process_config_prepare();
     assert(g_chaos_process_cached_mtime == CHAOS_PROCESS_MTIME_RELOADING);
@@ -1154,6 +1160,32 @@ static void test_prepare_reports_status(void)
     assert(strcmp(status, expected) == 0);
 
     (void)unlink(CHAOS_PROCESS_CONFIG_PATH);
+
+    /* A rule file that cannot be read is reported too: a directory (EISDIR on read),
+     * and, unless running as root, a file without read permission (EACCES on open). */
+    assert(mkdir(CHAOS_PROCESS_CONFIG_PATH, 0700) == 0);
+    assert(chaos_process_config_prepare() == 0);
+    assert(read_status_file(status, sizeof(status)));
+    (void)snprintf(
+        expected,
+        sizeof(expected),
+        "state=error\nrules=0\nline=0\nreason=file unreadable\ntext=\npid=%ld\n",
+        (long)getpid()
+    );
+    assert(strcmp(status, expected) == 0);
+    assert(rmdir(CHAOS_PROCESS_CONFIG_PATH) == 0);
+    if (geteuid() != 0)
+    {
+        FILE *locked = fopen(CHAOS_PROCESS_CONFIG_PATH, "w");
+
+        assert(locked != NULL);
+        assert(fclose(locked) == 0);
+        assert(chmod(CHAOS_PROCESS_CONFIG_PATH, 0) == 0);
+        assert(chaos_process_config_prepare() == 0);
+        assert(read_status_file(status, sizeof(status)));
+        assert(strcmp(status, expected) == 0);
+        (void)unlink(CHAOS_PROCESS_CONFIG_PATH);
+    }
     assert(chaos_process_config_prepare() == 0);
     assert(!read_status_file(status, sizeof(status)));
 }
@@ -1218,7 +1250,7 @@ static void test_hits_are_counted_and_reported(void)
     assert(strcmp(hits, "2\tfork:ERRNO:EAGAIN # a\n1\tfork:ERRNO:EAGAIN # b\n") == 0);
 
     /* A hit that finds another thread writing is left pending, not lost. */
-    g_chaos_process_hits_writing = (uint64_t)getpid();
+    g_chaos_process_hits_writing = 1;
     chaos_hit_record(state->rules[1].hit);
     g_chaos_process_hits_writing = 0;
     assert(g_chaos_process_hits_pending == 1);
@@ -1241,12 +1273,20 @@ static void test_hits_are_counted_and_reported(void)
     chaos_process_config_report_hits(NULL);
     g_chaos_process_hits_total = 0U;
 
-    /* A writer flag inherited from a parent that forked mid-write is released. */
-    g_chaos_process_hits_writing = (uint64_t)getpid() + 1U;
+    /* A writer flag held when the process forked is released in the child, which
+     * starts counting from zero. */
+    g_chaos_process_hits_writing = 1;
+    state->rules[0].hit->state = 3U; /* a once-only effect deciding in the parent */
+    state->rules[1].hit->state = 2U; /* one that already fired */
+    chaos_process_config_after_fork();
+    assert(g_chaos_process_hits_writing == 0);
+    assert(state->rules[0].hit->state == 1U);
+    assert(state->rules[1].hit->state == 2U);
+    state->rules[0].hit->state = 0U;
+    state->rules[1].hit->state = 0U;
     chaos_hit_record(state->rules[0].hit);
-    assert(g_chaos_process_hits_writing == 0U);
     assert(read_hits_file(hits, sizeof(hits)));
-    assert(strcmp(hits, "3\tfork:ERRNO:EAGAIN # a\n3\tfork:ERRNO:EAGAIN # b\n") == 0);
+    assert(strcmp(hits, "1\tfork:ERRNO:EAGAIN # a\n0\tfork:ERRNO:EAGAIN # b\n") == 0);
     g_chaos_process_hits_total = 0U;
 
     /* The exit report of a process that only inherited these counts writes nothing. */

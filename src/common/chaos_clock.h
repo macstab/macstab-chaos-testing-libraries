@@ -21,8 +21,6 @@
 #ifndef CHAOS_CLOCK_H
 #define CHAOS_CLOCK_H
 
-#include "chaos_once.h"
-
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
@@ -131,10 +129,10 @@ static inline void *chaos_clock_vdso_lookup(uintptr_t base, const char *name)
 /** @brief The vDSO clock, found once per process; NULL when unavailable. */
 static chaos_clock_vdso_fn g_chaos_clock_vdso = NULL;
 
-/** @brief Guards the one lookup. */
-static chaos_once_t g_chaos_clock_once = CHAOS_ONCE_INIT;
+/** @brief Lookup state: 0 not done, 1 in progress, 2 done (g_chaos_clock_vdso is final). */
+static volatile int g_chaos_clock_state = 0;
 
-/** @brief Finds the vDSO clock; run once through chaos_once(). */
+/** @brief Finds the vDSO clock; run once, by whichever caller claims the lookup. */
 static void chaos_clock_find_vdso(void)
 {
 #ifdef __linux__
@@ -146,14 +144,36 @@ static void chaos_clock_find_vdso(void)
 }
 
 /**
+ * @brief The vDSO clock, or NULL while it is unknown.
+ *
+ * @details Never waits: a caller that finds the lookup in progress -- another
+ * thread, or this thread interrupted by a signal handler, or a child forked in the
+ * middle of it -- gets NULL and uses the fallback for this call.
+ */
+static inline chaos_clock_vdso_fn chaos_clock_vdso(void)
+{
+    if (g_chaos_clock_state != 2)
+    {
+        if (!__sync_bool_compare_and_swap(&g_chaos_clock_state, 0, 1))
+        {
+            return NULL;
+        }
+        chaos_clock_find_vdso();
+        __sync_synchronize();
+        g_chaos_clock_state = 2;
+    }
+    return g_chaos_clock_vdso;
+}
+
+/**
  * @brief CLOCK_MONOTONIC in nanoseconds from the vDSO; 0 when there is no vDSO clock.
  */
 static inline uint64_t chaos_clock_now_ns(void)
 {
     struct timespec now;
+    const chaos_clock_vdso_fn vdso = chaos_clock_vdso();
 
-    chaos_once(&g_chaos_clock_once, chaos_clock_find_vdso);
-    if (g_chaos_clock_vdso == NULL || g_chaos_clock_vdso(CLOCK_MONOTONIC, &now) != 0)
+    if (vdso == NULL || vdso(CLOCK_MONOTONIC, &now) != 0)
     {
         return 0U;
     }
@@ -171,9 +191,9 @@ static inline uint64_t chaos_clock_now_ns(void)
 static inline int64_t chaos_clock_realtime_ms(void)
 {
     struct timespec now;
+    const chaos_clock_vdso_fn vdso = chaos_clock_vdso();
 
-    chaos_once(&g_chaos_clock_once, chaos_clock_find_vdso);
-    if (g_chaos_clock_vdso == NULL || g_chaos_clock_vdso(CLOCK_REALTIME, &now) != 0)
+    if (vdso == NULL || vdso(CLOCK_REALTIME, &now) != 0)
     {
 #ifdef __linux__
         if (syscall(SYS_clock_gettime, CLOCK_REALTIME, &now) != 0)

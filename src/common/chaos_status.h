@@ -12,7 +12,8 @@
  * state=ok|error
  * rules=<number of active rules>
  * line=<1-based line of the first rejected rule>      (error only)
- * reason=invalid rule|too many rules|file too large    (error only; line=0 for the last)
+ * reason=invalid rule|too many rules|file too large|file unreadable
+ *                                                      (error only; line=0 for the last two)
  * text=<that line as written, at most 200 bytes>       (error only)
  * pid=<process that wrote the file>
  * @endcode
@@ -70,6 +71,9 @@ typedef struct chaos_status_error
 
 /** @brief Reason for a rule file at or over the size limit (no line is named). */
 #define CHAOS_STATUS_REASON_TOO_LARGE "file too large"
+
+/** @brief Reason for a rule file this process may not open or read (no line is named). */
+#define CHAOS_STATUS_REASON_UNREADABLE "file unreadable"
 
 /** @brief Forgets any recorded error. */
 static inline void chaos_status_clear(chaos_status_error_t *error)
@@ -171,19 +175,36 @@ static inline size_t chaos_status_format(
 /**
  * @brief Replaces the file at @p path with @p length bytes of @p data.
  *
- * @details Writes `<path>.<pid>` and renames it over @p path, so a reader sees the
- * old file or the new one, never a mix. Best effort: on any failure the staging
- * file is removed and @p path is left as it was. errno is left untouched.
+ * @details Writes `<dir>/.chaos-staging-<pid>-<name>` and renames it over @p path,
+ * so a reader sees the old file or the new one, never a mix. The staging name
+ * starts differently from every status and hits file, so nothing that lists
+ * those (`.chaos-net.hits.*`) picks up a half-written one. Best effort: on any
+ * failure the staging file is removed and @p path is left as it was. errno is
+ * left untouched.
  */
 static inline void chaos_status_replace_file(const char *path, const char *data, size_t length)
 {
     const int saved_errno = errno;
-    char staging[128];
+    const char *slash = strrchr(path, '/');
+    const char *name = slash == NULL ? path : slash + 1;
+    const int dir_length = (int)(name - path);
+    char staging[160];
     size_t written = 0U;
     int fd;
 
-    if ((size_t)snprintf(staging, sizeof(staging), "%s.%ld", path, (long)getpid()) >=
-        sizeof(staging))
+    if (name[0] == '.')
+    {
+        ++name;
+    }
+    if ((size_t)snprintf(
+            staging,
+            sizeof(staging),
+            "%.*s.chaos-staging-%ld-%s",
+            dir_length,
+            path,
+            (long)getpid(),
+            name
+        ) >= sizeof(staging))
     {
         return;
     }

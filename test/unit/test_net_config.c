@@ -854,7 +854,6 @@ static void test_reload_in_progress_is_not_joined(void)
     chaos_net_config_init();
     active_index = g_chaos_net_active_config_index;
     /* The claim belongs to this process: another of its threads is reloading. */
-    g_chaos_net_reload_pid = (uint64_t)getpid();
     g_chaos_net_cached_mtime = CHAOS_NET_MTIME_RELOADING;
     assert(chaos_net_config_observed_mtime() != CHAOS_NET_MTIME_RELOADING);
 
@@ -953,14 +952,21 @@ static void test_fork_takes_over_orphaned_reload(void)
     assert(chaos_net_endpoint_parse_selector("tcp4://127.0.0.1:9010", &endpoint));
     write_config_text("tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0\n", 60);
 
-    g_chaos_net_reload_pid = (uint64_t)getpid() + 1U;
+    /* A claim is never taken over, whoever made it: in a vfork child the parent's
+     * reload thread is still running. A fork() child's atfork handler releases it. */
     g_chaos_net_cached_mtime = CHAOS_NET_MTIME_RELOADING;
+    (void)chaos_net_config_prepare();
+    assert(g_chaos_net_cached_mtime == CHAOS_NET_MTIME_RELOADING);
+    chaos_net_config_after_fork();
+    assert(g_chaos_net_cached_mtime == CHAOS_NET_MTIME_UNKNOWN);
+    assert(g_chaos_net_hits_pid == (uint64_t)getpid());
     assert(chaos_net_config_prepare());
+    assert(g_chaos_net_cached_mtime == chaos_net_config_observed_mtime());
+    chaos_net_config_after_fork();
     assert(g_chaos_net_cached_mtime == chaos_net_config_observed_mtime());
     assert(chaos_net_config_match_endpoint_loaded(CHAOS_NET_OP_CONNECT, &endpoint, &rule));
 
     /* A competing taker-over wins the release: this caller keeps the current snapshot. */
-    g_chaos_net_reload_pid = (uint64_t)getpid() + 1U;
     g_chaos_net_cached_mtime = CHAOS_NET_MTIME_RELOADING;
     g_test_config_force_cas_fail = 1;
     assert(chaos_net_config_prepare());
@@ -1170,8 +1176,22 @@ static void test_prepare_reports_status(void)
     );
     assert(strcmp(status, expected) == 0);
 
-    write_config_text("tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0\n", 52);
-    assert(chaos_net_config_prepare() == 1);
+    /* The status is staged under a name of its own; a leftover of an earlier
+     * process with this pid is replaced, not left behind. */
+    {
+        char staging[128];
+        FILE *leftover;
+
+        (void)snprintf(
+            staging, sizeof(staging), "/tmp/.chaos-staging-%ld-chaos-net.status", (long)getpid()
+        );
+        leftover = fopen(staging, "w");
+        assert(leftover != NULL);
+        assert(fclose(leftover) == 0);
+        write_config_text("tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0\n", 52);
+        assert(chaos_net_config_prepare() == 1);
+        assert(access(staging, F_OK) != 0);
+    }
     assert(read_status_file(status, sizeof(status)));
     (void)snprintf(expected, sizeof(expected), "state=ok\nrules=1\npid=%ld\n", (long)getpid());
     assert(strcmp(status, expected) == 0);
@@ -1199,6 +1219,32 @@ static void test_prepare_reports_status(void)
     assert(strcmp(status, expected) == 0);
 
     (void)unlink(CHAOS_NET_CONFIG_PATH);
+
+    /* A rule file that cannot be read is reported too: a directory (EISDIR on read),
+     * and, unless running as root, a file without read permission (EACCES on open). */
+    assert(mkdir(CHAOS_NET_CONFIG_PATH, 0700) == 0);
+    assert(chaos_net_config_prepare() == 0);
+    assert(read_status_file(status, sizeof(status)));
+    (void)snprintf(
+        expected,
+        sizeof(expected),
+        "state=error\nrules=0\nline=0\nreason=file unreadable\ntext=\npid=%ld\n",
+        (long)getpid()
+    );
+    assert(strcmp(status, expected) == 0);
+    assert(rmdir(CHAOS_NET_CONFIG_PATH) == 0);
+    if (geteuid() != 0)
+    {
+        FILE *locked = fopen(CHAOS_NET_CONFIG_PATH, "w");
+
+        assert(locked != NULL);
+        assert(fclose(locked) == 0);
+        assert(chmod(CHAOS_NET_CONFIG_PATH, 0) == 0);
+        assert(chaos_net_config_prepare() == 0);
+        assert(read_status_file(status, sizeof(status)));
+        assert(strcmp(status, expected) == 0);
+        (void)unlink(CHAOS_NET_CONFIG_PATH);
+    }
     assert(chaos_net_config_prepare() == 0);
     assert(!read_status_file(status, sizeof(status)));
 }
@@ -1273,7 +1319,7 @@ static void test_hits_are_counted_and_reported(void)
     );
 
     /* A hit that finds another thread writing is left pending, not lost. */
-    g_chaos_net_hits_writing = (uint64_t)getpid();
+    g_chaos_net_hits_writing = 1;
     chaos_hit_record(state->rules[1].hit);
     g_chaos_net_hits_writing = 0;
     assert(g_chaos_net_hits_pending == 1);
@@ -1314,16 +1360,24 @@ static void test_hits_are_counted_and_reported(void)
     chaos_net_config_report_hits(NULL);
     g_chaos_net_hits_total = 0U;
 
-    /* A writer flag inherited from a parent that forked mid-write is released. */
-    g_chaos_net_hits_writing = (uint64_t)getpid() + 1U;
+    /* A writer flag held when the process forked is released in the child, which
+     * starts counting from zero. */
+    g_chaos_net_hits_writing = 1;
+    state->rules[0].hit->state = 3U; /* a once-only effect deciding in the parent */
+    state->rules[1].hit->state = 2U; /* one that already fired */
+    chaos_net_config_after_fork();
+    assert(g_chaos_net_hits_writing == 0);
+    assert(state->rules[0].hit->state == 1U);
+    assert(state->rules[1].hit->state == 2U);
+    state->rules[0].hit->state = 0U;
+    state->rules[1].hit->state = 0U;
     chaos_hit_record(state->rules[0].hit);
-    assert(g_chaos_net_hits_writing == 0U);
     assert(read_hits_file(hits, sizeof(hits)));
     assert(
         strcmp(
             hits,
-            "3\ttcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 # "
-            "a\n3\ttcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 # b\n"
+            "1\ttcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 # "
+            "a\n0\ttcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 # b\n"
         ) == 0
     );
     g_chaos_net_hits_total = 0U;
@@ -1510,6 +1564,39 @@ static void test_trickle_rule(void)
     }
 }
 
+/**
+ * @brief Invariant: an @first budget is per process: a forked child starts its own,
+ *   while the parent's stays used up.
+ */
+static void test_first_budget_is_per_process(void)
+{
+    chaos_net_config_state_t *state;
+    pid_t child;
+    int status = 0;
+
+    chaos_net_config_init();
+    write_config_text("tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 @first=1\n", 91);
+    assert(chaos_net_config_prepare() == 1);
+    state = (chaos_net_config_state_t *)chaos_net_config_active_state();
+    assert(chaos_policy_fire(&state->rules[0].policy, state->rules[0].hit) == 1);
+    assert(chaos_policy_fire(&state->rules[0].policy, state->rules[0].hit) == 0);
+    child = fork();
+    assert(child >= 0);
+    if (child == 0)
+    {
+        _exit(
+            chaos_policy_fire(&state->rules[0].policy, state->rules[0].hit) == 1 &&
+                    chaos_policy_fire(&state->rules[0].policy, state->rules[0].hit) == 0
+                ? 0
+                : 1
+        );
+    }
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    assert(chaos_policy_fire(&state->rules[0].policy, state->rules[0].hit) == 0);
+    (void)unlink(CHAOS_NET_CONFIG_PATH);
+}
+
 int main(void)
 {
     /* Look at the rule file on every call; the throttle has its own test. */
@@ -1518,6 +1605,7 @@ int main(void)
     test_prepare_reports_status();
     test_hits_are_counted_and_reported();
     test_forked_child_reports_own_hits();
+    test_first_budget_is_per_process();
     test_rule_file_check_is_throttled();
     test_vdso_lookup_rejects_bad_input();
     test_rule_qualifiers();
