@@ -373,7 +373,7 @@ Exact interposed symbols today:
 - `mmap()`
 - `munmap()`
 - `mprotect()`
-- `madvise()`
+- `madvise()`, and `posix_madvise()` under the `madvise` rules (error returned by value)
 
 Supported selectors:
 

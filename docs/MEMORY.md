@@ -20,7 +20,9 @@ PLT/GOT cold/hot paths, vDSO, AT_SECURE) are in [`docs/PLATFORM.md`](PLATFORM.md
 
 Current implementation status:
 
-- exact interposed symbols today: `mmap()`, `munmap()`, `mprotect()`, `madvise()`, and on 64-bit
+- exact interposed symbols today: `mmap()`, `munmap()`, `mprotect()`, `madvise()`,
+  `posix_madvise()` (the `madvise` rules; glibc and musl call the system call directly,
+  and the error is returned by value), and on 64-bit
   glibc `mmap64()`, the same wrapper under the large-file name the JVM, Redis, nginx and MySQL bind to
 - config path: `/tmp/.chaos-memory.conf`
 - unit-tested; strict `100.00%` line coverage gate on `src/memory/*.c`

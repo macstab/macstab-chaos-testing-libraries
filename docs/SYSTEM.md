@@ -136,7 +136,7 @@ Current ownership boundary:
 | `libchaos-dns` | resolver symbols such as `getaddrinfo` and `getnameinfo` | generic fd/file symbols, socket symbols, wait symbols |
 | `libchaos-time` | clock/sleep symbols such as `clock_gettime`, `nanosleep`, `usleep` | any symbol already owned by IO, NET, or DNS |
 | `libchaos-process` | process lifecycle symbols such as `pthread_create`, `fork`, `posix_spawn`, `posix_spawnp`, `execve`, `execveat`, `waitpid`, `wait`, `wait3`, `wait4`, and `waitid` | any symbol already owned by IO or NET |
-| `libchaos-memory` | memory-management symbols such as `mmap`, `munmap`, `mprotect`, and `madvise` | any symbol already owned by IO or NET |
+| `libchaos-memory` | memory-management symbols such as `mmap`, `munmap`, `mprotect`, `madvise`, and `posix_madvise` | any symbol already owned by IO or NET |
 
 This has an intentional consequence:
 
@@ -781,7 +781,7 @@ Intended responsibility:
 - `mmap`
 - `munmap`
 - `mprotect`
-- `madvise`
+- `madvise`, and `posix_madvise` through the `madvise` rules
 - future memory-domain hooks such as `mmap64`, `brk`, and `sbrk`
 
 ### Shared Internal Scaffold
