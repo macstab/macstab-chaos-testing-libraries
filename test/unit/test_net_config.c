@@ -1435,6 +1435,26 @@ static void test_rule_qualifiers(void)
     assert(chaos_net_config_parse_buffer(empty_first, rules, &count) == -1);
 }
 
+/**
+ * @brief Invariant: TRICKLE parses on recv with a positive chunk size only.
+ */
+static void test_trickle_rule(void)
+{
+    chaos_net_rule_t rule;
+    char ok[] = "tcp4://127.0.0.1:9000:recv:TRICKLE:1";
+    char zero[] = "tcp4://127.0.0.1:9000:recv:TRICKLE:0";
+    char send_rule[] = "tcp4://127.0.0.1:9000:send:TRICKLE:4";
+    char text[] = "tcp4://127.0.0.1:9000:recv:TRICKLE:lots";
+
+    assert(chaos_net_config_parse_line(ok, &rule) == 1);
+    assert(rule.effect == CHAOS_NET_EFFECT_TRICKLE);
+    assert(rule.chunk_bytes == 1U);
+    assert(rule.probability == 1.0);
+    assert(chaos_net_config_parse_line(zero, &rule) == -1);
+    assert(chaos_net_config_parse_line(send_rule, &rule) == -1);
+    assert(chaos_net_config_parse_line(text, &rule) == -1);
+}
+
 int main(void)
 {
     /* Look at the rule file on every call; the throttle has its own test. */
@@ -1446,6 +1466,7 @@ int main(void)
     test_rule_file_check_is_throttled();
     test_vdso_lookup_rejects_bad_input();
     test_rule_qualifiers();
+    test_trickle_rule();
     test_read_file_rejects_changed_file();
     test_helper_functions();
     test_parse_and_select_rules();

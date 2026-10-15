@@ -497,6 +497,42 @@ accept4(int sockfd, CHAOS_NET_SOCKADDR_PARAM address, socklen_t *address_length,
 }
 #endif
 
+/** @brief Largest iovec array a TRICKLE rule reshapes; longer ones are left alone. */
+#define CHAOS_NET_TRICKLE_MAX_IOV 64
+
+/**
+ * @brief Whether a TRICKLE rule fires for this receive call.
+ */
+static int chaos_net_trickles(const chaos_net_rule_t *rule)
+{
+    return rule->effect == CHAOS_NET_EFFECT_TRICKLE && chaos_net_rule_should_trigger(rule);
+}
+
+/**
+ * @brief Copies @p iov into @p out keeping at most @p limit bytes; returns the entry count.
+ *
+ * @details TRICKLE on vectored receives: the kernel fills the shortened vector, so
+ * the caller's buffers receive the first bytes exactly as a short read would.
+ */
+static int
+chaos_net_limit_iovecs(const struct iovec *iov, int iovcnt, size_t limit, struct iovec *out)
+{
+    int count = 0;
+    int index;
+
+    for (index = 0; index < iovcnt && limit > 0U; ++index)
+    {
+        out[count] = iov[index];
+        if (out[count].iov_len > limit)
+        {
+            out[count].iov_len = limit;
+        }
+        limit -= out[count].iov_len;
+        ++count;
+    }
+    return count;
+}
+
 /** @brief Byte count of an iovec array for `@size` gates; CHAOS_POLICY_NO_SIZE if invalid. */
 static uint64_t chaos_net_iovec_size(const struct iovec *iov, int iovcnt)
 {
@@ -670,6 +706,10 @@ CHAOS_NET_EXPORT ssize_t recv(int sockfd, void *buffer, size_t size, int flags)
         return -1;
     }
 
+    if (chaos_net_trickles(&rule) && size > rule.chunk_bytes)
+    {
+        size = rule.chunk_bytes;
+    }
     rc = chaos_net_call_real_recv(sockfd, buffer, size, flags);
     /* Apply corruption only to successfully received data. */
     if (rc > 0 && rule.effect == CHAOS_NET_EFFECT_CORRUPT && chaos_net_rule_should_trigger(&rule))
@@ -720,6 +760,10 @@ CHAOS_NET_EXPORT ssize_t recvfrom(
         return -1;
     }
 
+    if (chaos_net_trickles(&rule) && size > rule.chunk_bytes)
+    {
+        size = rule.chunk_bytes;
+    }
     rc = chaos_net_call_real_recvfrom(sockfd, buffer, size, flags, address_ptr, address_length);
     if (rc > 0 && rule.effect == CHAOS_NET_EFFECT_CORRUPT && chaos_net_rule_should_trigger(&rule))
     {
@@ -760,6 +804,24 @@ CHAOS_NET_EXPORT ssize_t recvmsg(int sockfd, struct msghdr *message, int flags)
         return -1;
     }
 
+    if (message != NULL && (size_t)message->msg_iovlen <= (size_t)CHAOS_NET_TRICKLE_MAX_IOV &&
+        chaos_net_trickles(&rule))
+    {
+        struct iovec limited[CHAOS_NET_TRICKLE_MAX_IOV];
+        struct msghdr shortened = *message;
+
+        shortened.msg_iov = limited;
+        /* msg_iovlen is size_t on glibc and int on musl. */
+        shortened.msg_iovlen = chaos_net_limit_iovecs(
+            message->msg_iov, (int)message->msg_iovlen, rule.chunk_bytes, limited
+        );
+        rc = chaos_net_call_real_recvmsg(sockfd, &shortened, flags);
+        /* The kernel reports these through the header it was given. */
+        message->msg_namelen = shortened.msg_namelen;
+        message->msg_controllen = shortened.msg_controllen;
+        message->msg_flags = shortened.msg_flags;
+        return rc;
+    }
     rc = chaos_net_call_real_recvmsg(sockfd, message, flags);
     if (rc > 0 && rule.effect == CHAOS_NET_EFFECT_CORRUPT && chaos_net_rule_should_trigger(&rule))
     {
@@ -1008,6 +1070,10 @@ CHAOS_NET_EXPORT ssize_t read(int fd, void *buffer, size_t size)
         return -1;
     }
 
+    if (chaos_net_trickles(&rule) && size > rule.chunk_bytes)
+    {
+        size = rule.chunk_bytes;
+    }
     rc = chaos_net_call_real_read(fd, buffer, size);
     if (rc > 0 && rule.effect == CHAOS_NET_EFFECT_CORRUPT && chaos_net_rule_should_trigger(&rule))
     {
@@ -1041,6 +1107,15 @@ CHAOS_NET_EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
         return -1;
     }
 
+    if (iov != NULL && iovcnt > 0 && iovcnt <= CHAOS_NET_TRICKLE_MAX_IOV &&
+        chaos_net_trickles(&rule))
+    {
+        struct iovec limited[CHAOS_NET_TRICKLE_MAX_IOV];
+
+        return chaos_net_call_real_readv(
+            fd, limited, chaos_net_limit_iovecs(iov, iovcnt, rule.chunk_bytes, limited)
+        );
+    }
     rc = chaos_net_call_real_readv(fd, iov, iovcnt);
     if (rc > 0 && rule.effect == CHAOS_NET_EFFECT_CORRUPT && chaos_net_rule_should_trigger(&rule))
     {

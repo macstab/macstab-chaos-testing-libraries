@@ -94,7 +94,8 @@ typedef enum chaos_net_effect
     CHAOS_NET_EFFECT_LATENCY,      /**< Pre-call: sleep for latency_ms milliseconds. */
     CHAOS_NET_EFFECT_CORRUPT,      /**< Post-call: flip one bit in the receive buffer. */
     CHAOS_NET_EFFECT_TIMEOUT,      /**< POLL-only: return 0 with all events cleared. */
-    CHAOS_NET_EFFECT_RESET         /**< CLOSE-only: abortive close, the peer receives an RST. */
+    CHAOS_NET_EFFECT_RESET,        /**< CLOSE-only: abortive close, the peer receives an RST. */
+    CHAOS_NET_EFFECT_TRICKLE       /**< RECV-only: return at most chunk_bytes per call. */
 } chaos_net_effect_t;
 
 /**
@@ -196,6 +197,7 @@ typedef struct chaos_net_rule
     int errnum;                      /**< errno value for ERRNO rules; 0 for others. */
     double probability;              /**< Firing probability [0.0, 1.0]; unused for LATENCY. */
     unsigned int latency_ms;         /**< Sleep time in ms for LATENCY rules; 0 for others. */
+    unsigned int chunk_bytes;        /**< TRICKLE: most bytes one receive call returns. */
     /** Qualifiers written after the rule (`@first`, `@from`, `@until`, `@size`). */
     chaos_rule_policy_t policy;
     /**

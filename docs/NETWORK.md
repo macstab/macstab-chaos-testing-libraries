@@ -637,6 +637,7 @@ Current effects:
 - `CORRUPT`
 - `TIMEOUT`
 - `RESET`
+- `TRICKLE`
 
 Intentional omission:
 
@@ -666,6 +667,13 @@ Reason:
   so the connection is aborted and the peer receives an RST (`ECONNRESET`)
   instead of an orderly end of stream -- what a crashed or killed process, or a
   load balancer dropping the connection, looks like from the other side
+- `TRICKLE:N`
+  valid only for `recv`: `recv`, `recvfrom` and `read` ask the kernel for at
+  most N bytes, `recvmsg` and `readv` pass a copy of the vector cut to N bytes
+  (vectors of more than 64 entries are left alone). Nothing is lost or changed --
+  unlike `TORN`, which truncates -- so it tests message reassembly: length-
+  prefixed framing, header parsers and `readLine` loops that assume one read is
+  one message
 - `GAI`
   valid only for `dns`
 

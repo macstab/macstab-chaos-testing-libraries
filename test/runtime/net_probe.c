@@ -1210,6 +1210,74 @@ static int probe_recvmmsg_corrupt(void)
     return 0;
 }
 
+/**
+ * @brief TRICKLE:3 on recv: every receive form returns at most 3 bytes, and the
+ *        bytes put together are exactly what was sent.
+ */
+static int probe_recv_trickle(void)
+{
+    static const char sent[] = "HELLOWORLD!";
+    char received[sizeof(sent)] = {0};
+    size_t total = 0U;
+    int server;
+    int client;
+    int round = 0;
+    int rc;
+
+    rc = write_config("tcp4://127.0.0.1:41030:recv:TRICKLE:3");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    if (create_tcp_pair(41030U, &server, &client) != 0)
+    {
+        return 180;
+    }
+    if (send(client, sent, sizeof(sent) - 1U, 0) != (ssize_t)(sizeof(sent) - 1U))
+    {
+        return 181;
+    }
+    while (total < sizeof(sent) - 1U)
+    {
+        char chunk[8];
+        struct iovec iov[2];
+        struct msghdr message;
+        ssize_t got;
+
+        iov[0].iov_base = chunk;
+        iov[0].iov_len = 2U;
+        iov[1].iov_base = chunk + 2;
+        iov[1].iov_len = 6U;
+        memset(&message, 0, sizeof(message));
+        message.msg_iov = iov;
+        message.msg_iovlen = 2U;
+        switch (round++ % 4)
+        {
+        case 0:
+            got = recv(server, chunk, sizeof(chunk), 0);
+            break;
+        case 1:
+            got = read(server, chunk, sizeof(chunk));
+            break;
+        case 2:
+            got = readv(server, iov, 2);
+            break;
+        default:
+            got = recvmsg(server, &message, 0);
+            break;
+        }
+        if (got <= 0 || got > 3)
+        {
+            return 182;
+        }
+        memcpy(received + total, chunk, (size_t)got);
+        total += (size_t)got;
+    }
+    close(client);
+    close(server);
+    return memcmp(received, sent, sizeof(sent) - 1U) == 0 ? 0 : 183;
+}
+
 int main(void)
 {
     int rc;
@@ -1235,6 +1303,9 @@ int main(void)
     if (rc != 0)
         return rc;
     rc = probe_recv_corrupt();
+    if (rc != 0)
+        return rc;
+    rc = probe_recv_trickle();
     if (rc != 0)
         return rc;
     rc = probe_sendto_errno();

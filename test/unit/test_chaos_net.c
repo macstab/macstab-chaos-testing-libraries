@@ -79,6 +79,12 @@ static chaos_net_endpoint_t g_stub_endpoint;
  */
 static int g_stub_prepare = 0;
 
+/** @brief Size the recv / recvfrom / read stubs were last asked for. */
+static size_t g_last_receive_size = 0U;
+/** @brief Entries and bytes of the vector the recvmsg / readv stubs were last given. */
+static size_t g_last_receive_iovlen = 0U;
+static size_t g_last_receive_iov_bytes = 0U;
+
 /** @brief `call_size` of the rule copy the latency stub was last given. */
 static uint64_t g_last_call_size = 0U;
 
@@ -666,6 +672,7 @@ static ssize_t chaos_net_test_recv(int sockfd, void *buffer, size_t size, int fl
     (void)sockfd;
     (void)flags;
     ++g_recv_calls;
+    g_last_receive_size = size;
     if (buffer != NULL && size >= 4U)
     {
         (void)memcpy(buffer, "data", 4U);
@@ -712,6 +719,19 @@ static ssize_t chaos_net_test_recvmsg(int sockfd, struct msghdr *message, int fl
     (void)sockfd;
     (void)flags;
     ++g_recvmsg_calls;
+    if (message != NULL)
+    {
+        size_t index;
+
+        g_last_receive_iovlen = (size_t)message->msg_iovlen;
+        g_last_receive_iov_bytes = 0U;
+        for (index = 0U; index < (size_t)message->msg_iovlen; ++index)
+        {
+            g_last_receive_iov_bytes += message->msg_iov[index].iov_len;
+        }
+        message->msg_flags = MSG_TRUNC;
+        message->msg_namelen = 7U;
+    }
     if (message != NULL && message->msg_iovlen > 0 && message->msg_iov[0].iov_len >= 4U)
     {
         (void)memcpy(message->msg_iov[0].iov_base, "data", 4U);
@@ -2369,6 +2389,7 @@ static ssize_t chaos_net_test_next_read(int fd, void *buffer, size_t size)
 {
     (void)fd;
     ++g_descriptor_calls;
+    g_last_receive_size = size;
     if (buffer != NULL && size >= 4U)
     {
         (void)memcpy(buffer, "data", 4U);
@@ -2387,9 +2408,16 @@ static ssize_t chaos_net_test_next_write(int fd, const void *buffer, size_t size
 
 static ssize_t chaos_net_test_next_readv(int fd, const struct iovec *iov, int iovcnt)
 {
+    int index;
+
     (void)fd;
-    (void)iovcnt;
     ++g_descriptor_calls;
+    g_last_receive_iovlen = (size_t)iovcnt;
+    g_last_receive_iov_bytes = 0U;
+    for (index = 0; index < iovcnt; ++index)
+    {
+        g_last_receive_iov_bytes += iov[index].iov_len;
+    }
     return (ssize_t)iov[0].iov_len;
 }
 
@@ -2656,8 +2684,80 @@ static void test_wrappers_record_call_size(void)
     (void)rc;
 }
 
+/**
+ * @brief Invariant: TRICKLE shortens every receive form to the rule's chunk size and
+ *   leaves shorter requests, other effects and non-firing rules alone.
+ *
+ * Expected observable behaviour: recv, recvfrom and read ask for at most 3 bytes;
+ *   recvmsg and readv pass a vector of at most 3 bytes in total, cut inside the
+ *   entry that crosses the limit; recvmsg copies the kernel's flags and name length
+ *   back into the caller's header; an over-long vector is passed unchanged.
+ */
+static void test_trickle_shortens_receives(void)
+{
+    char buffer[16] = {0};
+    struct iovec iov[3];
+    struct iovec many[CHAOS_NET_TRICKLE_MAX_IOV + 1];
+    struct msghdr message;
+    long rc;
+    int index;
+
+    for (index = 0; index < 3; ++index)
+    {
+        iov[index].iov_base = buffer + index * 4;
+        iov[index].iov_len = 2U;
+    }
+    for (index = 0; index <= CHAOS_NET_TRICKLE_MAX_IOV; ++index)
+    {
+        many[index].iov_base = buffer;
+        many[index].iov_len = 1U;
+    }
+    memset(&message, 0, sizeof(message));
+    message.msg_iov = iov;
+    message.msg_iovlen = 3U;
+
+    reset_wrapper_stubs();
+    g_stub_endpoint_from_local = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_TRICKLE;
+    g_stub_rule.chunk_bytes = 3U;
+    g_should_trigger = 1;
+    rc = recv(4, buffer, sizeof(buffer), 0);
+    assert(g_last_receive_size == 3U);
+    rc = recv(4, buffer, 2U, 0);
+    assert(g_last_receive_size == 2U);
+    rc = recvfrom(4, buffer, sizeof(buffer), 0, NULL, NULL);
+    rc = recvmsg(4, &message, 0);
+    assert(g_last_receive_iovlen == 2U && g_last_receive_iov_bytes == 3U);
+    assert(message.msg_iov == iov && message.msg_iovlen == 3U);
+    assert(message.msg_flags == MSG_TRUNC && message.msg_namelen == 7U);
+    message.msg_iov = many;
+    message.msg_iovlen = CHAOS_NET_TRICKLE_MAX_IOV + 1;
+    rc = recvmsg(4, &message, 0);
+    assert(g_last_receive_iovlen == (size_t)CHAOS_NET_TRICKLE_MAX_IOV + 1U);
+    g_should_trigger = 0;
+    rc = recv(4, buffer, sizeof(buffer), 0);
+    assert(g_last_receive_size == sizeof(buffer));
+
+    reset_descriptor_stubs();
+    g_stub_prepare = 1;
+    g_stub_endpoint_from_local = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_TRICKLE;
+    g_stub_rule.chunk_bytes = 3U;
+    g_should_trigger = 1;
+    rc = read(5, buffer, sizeof(buffer));
+    assert(g_last_receive_size == 3U);
+    rc = readv(5, iov, 3);
+    assert(g_last_receive_iovlen == 2U && g_last_receive_iov_bytes == 3U);
+    rc = readv(5, many, CHAOS_NET_TRICKLE_MAX_IOV + 1);
+    assert(g_last_receive_iovlen == (size_t)CHAOS_NET_TRICKLE_MAX_IOV + 1U);
+    (void)rc;
+}
+
 int main(void)
 {
+    test_trickle_shortens_receives();
     test_wrappers_record_call_size();
     test_size_of_vectors_and_messages();
     test_bind_and_connect_paths();

@@ -584,7 +584,7 @@ static int chaos_net_effect_allowed(chaos_net_operation_t operation, chaos_net_e
                operation == CHAOS_NET_OP_POLL || operation == CHAOS_NET_OP_SEND ||
                operation == CHAOS_NET_OP_RECV || operation == CHAOS_NET_OP_CLOSE;
     }
-    if (effect == CHAOS_NET_EFFECT_CORRUPT)
+    if (effect == CHAOS_NET_EFFECT_CORRUPT || effect == CHAOS_NET_EFFECT_TRICKLE)
     {
         return operation == CHAOS_NET_OP_RECV;
     }
@@ -989,6 +989,16 @@ int chaos_net_config_parse_line(char *line, chaos_net_rule_t *rule)
     {
         rule->effect = CHAOS_NET_EFFECT_TIMEOUT;
         if (chaos_net_parse_probability(value_text, &rule->probability) != 0)
+        {
+            return -1;
+        }
+    }
+    else if (strcmp(effect_text, "TRICKLE") == 0)
+    {
+        /* The data is complete and correct; only the chunking is pathological. */
+        rule->effect = CHAOS_NET_EFFECT_TRICKLE;
+        rule->probability = 1.0;
+        if (chaos_net_parse_latency(value_text, &rule->chunk_bytes) != 0 || rule->chunk_bytes == 0U)
         {
             return -1;
         }
