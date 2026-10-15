@@ -95,7 +95,8 @@ typedef enum chaos_net_effect
     CHAOS_NET_EFFECT_CORRUPT,      /**< Post-call: flip one bit in the receive buffer. */
     CHAOS_NET_EFFECT_TIMEOUT,      /**< POLL-only: return 0 with all events cleared. */
     CHAOS_NET_EFFECT_RESET,        /**< CLOSE-only: abortive close, the peer receives an RST. */
-    CHAOS_NET_EFFECT_TRICKLE       /**< RECV-only: return at most chunk_bytes per call. */
+    CHAOS_NET_EFFECT_TRICKLE,      /**< RECV-only: return at most chunk_bytes per call. */
+    CHAOS_NET_EFFECT_DUP           /**< RECV-only: deliver the previous payload once more. */
 } chaos_net_effect_t;
 
 /**

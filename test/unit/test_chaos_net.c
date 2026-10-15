@@ -697,9 +697,13 @@ static ssize_t chaos_net_test_recvfrom(
 {
     (void)sockfd;
     (void)flags;
-    (void)address;
-    (void)address_length;
     ++g_recvfrom_calls;
+    if (address != NULL && address_length != NULL && *address_length >= sizeof(struct sockaddr_in))
+    {
+        memset(address, 0, sizeof(struct sockaddr_in));
+        address->sa_family = AF_INET;
+        *address_length = (socklen_t)sizeof(struct sockaddr_in);
+    }
     if (buffer != NULL && size >= 4U)
     {
         (void)memcpy(buffer, "data", 4U);
@@ -1028,7 +1032,48 @@ static int chaos_net_test_epoll_pwait(
  * Production source inclusion with symbol overrides
  * --------------------------------------------------------------------- */
 
+/* DUP slot table mapping: 0 maps for real, 1 fails, 2 loses the race to another thread. */
+static int g_dup_map_mode = 0;
+static void *chaos_net_test_dup_map(size_t size);
+static void chaos_net_test_dup_unmap(void *address, size_t size);
+#define CHAOS_NET_DUP_MAP(size) chaos_net_test_dup_map(size)
+#define CHAOS_NET_DUP_UNMAP(address, size) chaos_net_test_dup_unmap((address), (size))
 #include "../../src/net/chaos_net_socket.c"
+
+/** @brief Counts the unmaps of a table that lost the race. */
+static int g_dup_unmaps = 0;
+
+static void *chaos_net_test_dup_map(size_t size)
+{
+    void *mapped;
+
+    if (g_dup_map_mode == 1)
+    {
+        return MAP_FAILED;
+    }
+    mapped = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(mapped != MAP_FAILED);
+    if (g_dup_map_mode == 2)
+    {
+        chaos_net_dup_slot_t *racer =
+            mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        int index;
+
+        assert(racer != MAP_FAILED);
+        for (index = 0; index < CHAOS_NET_DUP_SLOTS; ++index)
+        {
+            racer[index].fd = -1;
+        }
+        g_chaos_net_dup_slots = racer;
+    }
+    return mapped;
+}
+
+static void chaos_net_test_dup_unmap(void *address, size_t size)
+{
+    ++g_dup_unmaps;
+    assert(munmap(address, size) == 0);
+}
 #include "../../src/net/chaos_net_extra.c"
 #ifdef __linux__
 /* Override the three syscall-like I/O symbols and snprintf only for the wait module. */
@@ -2755,8 +2800,143 @@ static void test_trickle_shortens_receives(void)
     (void)rc;
 }
 
+/**
+ * @brief Invariant: DUP keeps each socket's last payload and delivers it once more
+ *   when the rule fires, then reads the socket again.
+ *
+ * Expected observable behaviour: a firing DUP replays the kept bytes without a real
+ *   receive, once; MSG_PEEK, a rule that does not fire, a closed or colliding
+ *   descriptor and a failed table mapping all receive for real; the sender address
+ *   is replayed for recvfrom and recvmsg; payloads beyond 4 KiB are replayed cut.
+ */
+static void test_dup_replays_the_last_payload(void)
+{
+    static char big[CHAOS_NET_DUP_MAX_BYTES + 100U];
+    char buffer[16];
+    struct sockaddr_in from;
+    socklen_t from_length;
+    struct iovec iov[2];
+    struct msghdr message;
+    long rc;
+
+    reset_wrapper_stubs();
+    g_stub_endpoint_from_local = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_DUP;
+    g_should_trigger = 1;
+
+    /* The table cannot be mapped: every receive is real. */
+    g_chaos_net_dup_slots = NULL;
+    g_dup_map_mode = 1;
+    rc = recv(4, buffer, sizeof(buffer), 0);
+    rc = recv(4, buffer, sizeof(buffer), 0);
+    assert(g_recv_calls == 2);
+
+    /* Another thread maps the table first: its table is used, ours unmapped. */
+    g_dup_map_mode = 2;
+    rc = recv(4, buffer, sizeof(buffer), 0);
+    assert(g_dup_unmaps == 1);
+    g_dup_map_mode = 0;
+
+    /* Replayed once, without a real receive. */
+    memset(buffer, 0, sizeof(buffer));
+    rc = recv(4, buffer, sizeof(buffer), 0);
+    assert(rc == 4 && memcmp(buffer, "data", 4U) == 0);
+    assert(g_recv_calls == 3);
+    rc = recv(4, buffer, sizeof(buffer), 0);
+    assert(g_recv_calls == 4);
+
+    /* MSG_PEEK and a rule that does not fire receive for real. */
+    rc = recv(4, buffer, sizeof(buffer), MSG_PEEK);
+    assert(g_recv_calls == 5);
+    g_should_trigger = 0;
+    rc = recv(4, buffer, sizeof(buffer), 0);
+    assert(g_recv_calls == 6);
+    g_should_trigger = 1;
+
+    /* A colliding descriptor takes the slot; descriptor 4 then receives for real... */
+    rc = recv(4 + CHAOS_NET_DUP_SLOTS, buffer, sizeof(buffer), 0);
+    rc = recv(4, buffer, sizeof(buffer), 0);
+    assert(g_recv_calls == 8);
+    /* ...and keeps its own payload, so the other descriptor receives for real too. */
+    rc = recv(4 + CHAOS_NET_DUP_SLOTS, buffer, sizeof(buffer), 0);
+    assert(g_recv_calls == 9);
+
+    /* A failed receive keeps nothing. */
+    g_recv_result = -1;
+    rc = recv(5, buffer, sizeof(buffer), 0);
+    g_recv_result = 4;
+    rc = recv(5, buffer, sizeof(buffer), 0);
+    assert(g_recv_calls == 11);
+
+    /* recvfrom keeps and replays the sender address. */
+    from_length = (socklen_t)sizeof(from);
+    rc = recvfrom(6, buffer, sizeof(buffer), 0, (struct sockaddr *)&from, &from_length);
+    memset(&from, 0, sizeof(from));
+    from_length = (socklen_t)sizeof(from);
+    rc = recvfrom(6, buffer, sizeof(buffer), 0, (struct sockaddr *)&from, &from_length);
+    assert(rc == 4 && g_recvfrom_calls == 1);
+    assert(from.sin_family == AF_INET && from_length == (socklen_t)sizeof(from));
+    rc = recvfrom(6, buffer, sizeof(buffer), MSG_PEEK, NULL, NULL);
+    assert(g_recvfrom_calls == 2);
+
+    /* recvmsg: a payload without a sender replays with no name and no control data. */
+    iov[0].iov_base = buffer;
+    iov[0].iov_len = 2U;
+    iov[1].iov_base = buffer + 2;
+    iov[1].iov_len = 14U;
+    memset(&message, 0, sizeof(message));
+    message.msg_iov = iov;
+    message.msg_iovlen = 2U;
+    rc = recv(7, buffer, sizeof(buffer), 0);
+    message.msg_name = &from;
+    message.msg_namelen = (socklen_t)sizeof(from);
+    message.msg_controllen = 9U;
+    rc = recvmsg(7, &message, 0);
+    assert(rc == 4 && g_recvmsg_calls == 0);
+    assert(message.msg_namelen == 0 && message.msg_controllen == 0 && message.msg_flags == 0);
+    rc = recvmsg(7, &message, 0);
+    assert(g_recvmsg_calls == 1);
+    message.msg_name = NULL;
+    rc = recvmsg(7, &message, 0);
+    assert(rc == 4 && g_recvmsg_calls == 1 && message.msg_namelen == 0);
+    rc = recvmsg(7, &message, MSG_PEEK);
+    assert(g_recvmsg_calls == 2);
+
+    /* Payloads beyond the limit are kept cut. */
+    g_recv_result = (ssize_t)sizeof(big);
+    rc = recv(8, big, sizeof(big), 0);
+    g_recv_result = 4;
+    rc = recv(8, big, sizeof(big), 0);
+    assert(rc == (long)CHAOS_NET_DUP_MAX_BYTES);
+
+    /* read and readv on a socket; close drops the kept payload. */
+    reset_descriptor_stubs();
+    g_stub_prepare = 1;
+    g_stub_endpoint_from_local = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_DUP;
+    g_should_trigger = 1;
+    rc = read(9, buffer, sizeof(buffer));
+    rc = read(9, buffer, sizeof(buffer));
+    assert(rc == 4 && g_descriptor_calls == 1);
+    iov[0].iov_len = 8U;
+    rc = readv(9, iov, 1);
+    rc = readv(9, iov, 1);
+    assert(rc == 8 && g_descriptor_calls == 2);
+    rc = read(9, buffer, sizeof(buffer));
+    g_stub_prepare = 0;
+    assert(close(9) == 0);
+    g_stub_prepare = 1;
+    rc = read(9, buffer, sizeof(buffer));
+    assert(g_descriptor_calls == 5);
+    chaos_net_dup_forget(-1);
+    (void)rc;
+}
+
 int main(void)
 {
+    test_dup_replays_the_last_payload();
     test_trickle_shortens_receives();
     test_wrappers_record_call_size();
     test_size_of_vectors_and_messages();

@@ -638,6 +638,7 @@ Current effects:
 - `TIMEOUT`
 - `RESET`
 - `TRICKLE`
+- `DUP`
 
 Intentional omission:
 
@@ -674,6 +675,16 @@ Reason:
   unlike `TORN`, which truncates -- so it tests message reassembly: length-
   prefixed framing, header parsers and `readLine` loops that assume one read is
   one message
+- `DUP:p`
+  valid only for `recv`: every receive on a matching socket keeps a copy of
+  what it returned (up to 4 KiB, with the sender address for datagrams); when
+  the rule fires, the next receive returns that copy instead of reading the
+  socket, once, and the one after reads again. Duplicate delivery is the norm
+  in at-least-once messaging and almost never tested: double charges, double
+  writes, repeated side effects. `MSG_PEEK` receives are left alone; `close`
+  drops the copy. The copies live in a 64-slot table (about 260 KiB) mapped
+  with a raw `mmap` on the first DUP rule; descriptors that share a slot drop
+  each other's copy rather than replay the wrong one
 - `GAI`
   valid only for `dns`
 

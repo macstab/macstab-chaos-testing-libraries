@@ -1278,6 +1278,49 @@ static int probe_recv_trickle(void)
     return memcmp(received, sent, sizeof(sent) - 1U) == 0 ? 0 : 183;
 }
 
+/**
+ * @brief DUP:1.0 on recv: each payload is delivered twice, then the socket is read again.
+ */
+static int probe_recv_dup(void)
+{
+    char buffer[8];
+    int server;
+    int client;
+    int rc;
+
+    rc = write_config("tcp4://127.0.0.1:41031:recv:DUP:1.0");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    if (create_tcp_pair(41031U, &server, &client) != 0)
+    {
+        return 190;
+    }
+    if (send(client, "one", 3U, 0) != 3 || recv(server, buffer, sizeof(buffer), 0) != 3 ||
+        memcmp(buffer, "one", 3U) != 0)
+    {
+        return 191;
+    }
+    if (send(client, "two", 3U, 0) != 3)
+    {
+        return 192;
+    }
+    memset(buffer, 0, sizeof(buffer));
+    if (read(server, buffer, sizeof(buffer)) != 3 || memcmp(buffer, "one", 3U) != 0)
+    {
+        return 193;
+    }
+    memset(buffer, 0, sizeof(buffer));
+    if (recv(server, buffer, sizeof(buffer), 0) != 3 || memcmp(buffer, "two", 3U) != 0)
+    {
+        return 194;
+    }
+    close(client);
+    close(server);
+    return 0;
+}
+
 int main(void)
 {
     int rc;
@@ -1306,6 +1349,9 @@ int main(void)
     if (rc != 0)
         return rc;
     rc = probe_recv_trickle();
+    if (rc != 0)
+        return rc;
+    rc = probe_recv_dup();
     if (rc != 0)
         return rc;
     rc = probe_sendto_errno();

@@ -1453,6 +1453,17 @@ static void test_trickle_rule(void)
     assert(chaos_net_config_parse_line(zero, &rule) == -1);
     assert(chaos_net_config_parse_line(send_rule, &rule) == -1);
     assert(chaos_net_config_parse_line(text, &rule) == -1);
+
+    {
+        char dup[] = "tcp4://127.0.0.1:9000:recv:DUP:0.5";
+        char dup_send[] = "tcp4://127.0.0.1:9000:send:DUP:0.5";
+        char dup_bad[] = "tcp4://127.0.0.1:9000:recv:DUP:often";
+
+        assert(chaos_net_config_parse_line(dup, &rule) == 1);
+        assert(rule.effect == CHAOS_NET_EFFECT_DUP && rule.probability == 0.5);
+        assert(chaos_net_config_parse_line(dup_send, &rule) == -1);
+        assert(chaos_net_config_parse_line(dup_bad, &rule) == -1);
+    }
 }
 
 int main(void)

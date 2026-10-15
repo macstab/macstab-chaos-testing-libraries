@@ -619,6 +619,11 @@ Implemented effects:
   `recvfrom`, `recvmsg`, `read`, `readv` on the socket) returns at most that many
   bytes. The data is complete and correct, only the chunking is pathological:
   `recv:TRICKLE:1` breaks any parser that assumes one read yields one message.
+- `DUP`
+  Probability from `0.0` to `1.0`; valid only for `recv`. When it fires, a
+  receive delivers the socket's previous payload once more (with its sender
+  address for datagrams) instead of new data: at-least-once delivery, for
+  testing idempotency. Payloads are kept up to 4 KiB per socket.
 
 Supported endpoint selectors:
 
