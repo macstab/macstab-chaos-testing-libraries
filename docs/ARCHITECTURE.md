@@ -87,6 +87,13 @@ Config refresh guarantees, identical in every library:
 - **A failed read keeps the rules.** If the file cannot be opened or read, the active snapshot stays
   and the claim is released with the previous stamp, so the next call retries; `EINTR` is retried
   inside the read loop. Only a missing file or a file that fails to parse changes the rules.
+- **A file that changes while it is read is not used.** After reading, the library compares the
+  open descriptor's stamp (`fstat`) with the one that started the reload. A writer that appended
+  or rewrote the file in between leaves a different stamp; the copy may be half old, half new, so
+  the active rules stay and the next call reloads the finished file. Writers should still replace
+  the file atomically (write a temporary file in the same directory, then `rename` it over the
+  rule file), as the Java framework does: a writer that pauses between two `write` calls can
+  otherwise be read with a stable stamp in between.
 - **A fork during a reload does not freeze the child.** The reload claim records the claiming
   process id; a child that inherits a claim from its parent releases it and reloads itself.
 - **errno is the caller's.** The library's own `stat`/`open`/`read`, socket lookups, `/proc` reads,
