@@ -54,6 +54,8 @@ typedef struct chaos_hit_slot chaos_hit_slot_t;
 struct chaos_hit_slot
 {
     volatile uint64_t count;
+    /** Firings claimed under `@first=N` (see chaos_policy.h); never more than N succeed. */
+    volatile uint64_t claimed;
     /** Library hook that reports the counts after a hit on this slot; NULL forces a report. */
     void (*report)(chaos_hit_slot_t *slot);
 };

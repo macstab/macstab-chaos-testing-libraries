@@ -187,21 +187,20 @@ void chaos_io_rule_apply_latency(const chaos_io_rule_t *rule)
  */
 int chaos_io_rule_should_trigger(const chaos_io_rule_t *rule)
 {
-    if (rule == NULL)
+    if (rule == NULL || !chaos_policy_window_open(&rule->policy) ||
+        !chaos_policy_size_ok(&rule->policy, rule->call_size))
     {
         return 0;
     }
     if (rule->effect == CHAOS_IO_EFFECT_LATENCY)
     {
-        chaos_hit_record(rule->hit);
-        return 1;
+        return chaos_policy_fire(&rule->policy, rule->hit);
     }
     if (!chaos_io_probability_hit(rule->probability))
     {
         return 0;
     }
-    chaos_hit_record(rule->hit);
-    return 1;
+    return chaos_policy_fire(&rule->policy, rule->hit);
 }
 
 /**

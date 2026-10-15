@@ -129,6 +129,8 @@ static char g_last_store_path[CHAOS_IO_MAX_PATH];
 
 /** @brief Number of times `chaos_io_rule_apply_latency()` was called. */
 static int g_latency_calls = 0;
+/** @brief `call_size` of the rule copy the latency stub was last given. */
+static uint64_t g_last_call_size = 0U;
 /** @brief Number of times `chaos_io_rule_apply_errno()` was called. */
 static int g_rule_apply_errno_calls = 0;
 /** @brief Number of times `chaos_io_rule_should_trigger()` was called. */
@@ -696,6 +698,7 @@ void chaos_io_rule_apply_latency(const chaos_io_rule_t *rule)
 {
     assert(rule != NULL);
     ++g_latency_calls;
+    g_last_call_size = rule != NULL ? rule->call_size : 0U;
 }
 
 /**

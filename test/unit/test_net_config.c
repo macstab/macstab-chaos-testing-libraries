@@ -1394,6 +1394,47 @@ static void test_vdso_lookup_rejects_bad_input(void)
     assert(chaos_clock_checked_recently(&g_chaos_net_last_check_ns, 0U) == 0);
 }
 
+/**
+ * @brief Invariant: qualifiers after a rule are parsed into its policy, and a bad
+ *   qualifier rejects the line.
+ *
+ * Expected observable behaviour: every qualifier lands in the policy and the rule
+ *   itself still parses; an unknown qualifier, qualifiers without a rule and an
+ *   `@until` before its `@from` are rejected as invalid rules.
+ */
+static void test_rule_qualifiers(void)
+{
+    static chaos_net_rule_t rules[CHAOS_NET_MAX_RULES];
+    char qualified[] = "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 @first=3 @from=1000 "
+                       "@until=2000 @size>10 @size<99 # owner\n";
+    char unknown[] = "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 @bogus=1\n";
+    char lonely[] = "# header\n  @first=3\n";
+    char backwards[] = "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 @from=2000 @until=1000\n";
+    char empty_first[] = "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 @first=0\n";
+    size_t count = 0U;
+
+    assert(chaos_net_config_parse_buffer(qualified, rules, &count) == 0);
+    assert(count == 1U);
+    assert(rules[0].policy.first == 3U);
+    assert(rules[0].policy.from_ms == 1000);
+    assert(rules[0].policy.until_ms == 2000);
+    assert(rules[0].policy.has_size_above && rules[0].policy.size_above == 10U);
+    assert(rules[0].policy.has_size_below && rules[0].policy.size_below == 99U);
+    assert(rules[0].call_size == CHAOS_POLICY_NO_SIZE);
+
+    assert(chaos_net_config_parse_buffer(unknown, rules, &count) == -1);
+    assert(
+        strcmp(
+            chaos_net_config_last_error()->text,
+            "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 @bogus=1"
+        ) == 0
+    );
+    assert(chaos_net_config_parse_buffer(lonely, rules, &count) == -1);
+    assert(chaos_net_config_last_error()->line == 2U);
+    assert(chaos_net_config_parse_buffer(backwards, rules, &count) == -1);
+    assert(chaos_net_config_parse_buffer(empty_first, rules, &count) == -1);
+}
+
 int main(void)
 {
     /* Look at the rule file on every call; the throttle has its own test. */
@@ -1404,6 +1445,7 @@ int main(void)
     test_forked_child_reports_own_hits();
     test_rule_file_check_is_throttled();
     test_vdso_lookup_rejects_bad_input();
+    test_rule_qualifiers();
     test_read_file_rejects_changed_file();
     test_helper_functions();
     test_parse_and_select_rules();

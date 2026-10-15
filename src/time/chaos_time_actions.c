@@ -206,7 +206,8 @@ static void chaos_time_add_offset_ms(struct timespec *value, int64_t offset_ms)
  */
 int chaos_time_rule_should_trigger(const chaos_time_rule_t *rule)
 {
-    if (rule == NULL)
+    if (rule == NULL || !chaos_policy_window_open(&rule->policy) ||
+        !chaos_policy_size_ok(&rule->policy, rule->call_size))
     {
         return 0;
     }
@@ -215,8 +216,7 @@ int chaos_time_rule_should_trigger(const chaos_time_rule_t *rule)
     {
         return 0;
     }
-    chaos_hit_record(rule->hit);
-    return 1;
+    return chaos_policy_fire(&rule->policy, rule->hit);
 }
 
 /**

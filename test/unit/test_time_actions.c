@@ -333,8 +333,55 @@ static void test_should_trigger_counts_hits(void)
     assert(chaos_time_rule_should_trigger(&rule) == 1);
 }
 
+/**
+ * @brief Invariant: should_trigger honours `@first`, `@from` and `@until`.
+ *
+ * Expected observable behaviour: `@first=2` fires twice and then never; a window
+ *   that ended or has not started yet does not fire; an open window does.
+ */
+static void test_should_trigger_honours_qualifiers(void)
+{
+    chaos_time_rule_t rule;
+    chaos_hit_slot_t slot;
+
+    memset(&rule, 0, sizeof(rule));
+    memset(&slot, 0, sizeof(slot));
+    rule.effect = CHAOS_TIME_EFFECT_ERRNO;
+    rule.hit = &slot;
+    rule.probability = 1.0;
+    rule.policy.first = 2U;
+    assert(chaos_time_rule_should_trigger(&rule) == 1);
+    assert(chaos_time_rule_should_trigger(&rule) == 1);
+    assert(chaos_time_rule_should_trigger(&rule) == 0);
+    assert(slot.count == 2U);
+
+    memset(&rule.policy, 0, sizeof(rule.policy));
+    rule.policy.until_ms = 1;
+    assert(chaos_time_rule_should_trigger(&rule) == 0);
+    rule.policy.until_ms = 0;
+    rule.policy.from_ms = INT64_C(4000000000000);
+    assert(chaos_time_rule_should_trigger(&rule) == 0);
+    rule.policy.from_ms = 1;
+    assert(chaos_time_rule_should_trigger(&rule) == 1);
+
+    /* A size gate passes only calls with a byte count in range. */
+    memset(&rule.policy, 0, sizeof(rule.policy));
+    rule.policy.has_size_above = 1U;
+    rule.policy.size_above = 100U;
+    rule.call_size = CHAOS_POLICY_NO_SIZE;
+    assert(chaos_time_rule_should_trigger(&rule) == 0);
+    rule.call_size = 100U;
+    assert(chaos_time_rule_should_trigger(&rule) == 0);
+    rule.call_size = 101U;
+    assert(chaos_time_rule_should_trigger(&rule) == 1);
+    rule.policy.has_size_below = 1U;
+    rule.policy.size_below = 101U;
+    assert(chaos_time_rule_should_trigger(&rule) == 0);
+}
+
 int main(void)
 {
+    test_should_trigger_honours_qualifiers();
     test_should_trigger_counts_hits();
     test_probability_helpers();
     test_latency_helper();

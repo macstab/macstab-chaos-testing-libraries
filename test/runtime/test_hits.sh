@@ -5,7 +5,8 @@
 # Builds all libchaos libraries for glibc (gcc:bookworm) and musl (alpine:3.20). For
 # each library a rule file holds one rule that fires and one that never matches;
 # hits_probe calls the faulted operation twice, and runs twice. The hits files of the
-# two processes must add up to 4 for the firing rule and 0 for the other.
+# two processes must add up to 4 for the firing rule and 0 for the other. Then a rule
+# with @first=1 must fire once per process, and one whose @until passed never.
 #
 # Usage:   test_hits.sh [linux/amd64|linux/arm64]
 # Env:     CHAOS_HITS_DOCKER_PLATFORM  platform override
@@ -108,7 +109,36 @@ for lib in io net dns time memory process; do
         failures=$((failures + 1))
     fi
     rm -f /tmp/.chaos-$lib.conf /tmp/.chaos-$lib.hits.*
+
+    # @first=1 fires once per process; a window that ended long ago never fires.
+    { echo "$fired @first=1 # first"; echo "$fired @until=1 # expired"; } > /tmp/.chaos-$lib.conf
+    LD_PRELOAD=$so /tmp/hits-probe "$lib"
+    LD_PRELOAD=$so /tmp/hits-probe "$lib"
+    first=$(cat /tmp/.chaos-$lib.hits.* 2>/dev/null | awk -F "\t" -v r="$fired @first=1 # first" "\$2 == r { s += \$1 } END { print s + 0 }")
+    expired=$(cat /tmp/.chaos-$lib.hits.* 2>/dev/null | awk -F "\t" -v r="$fired @until=1 # expired" "\$2 == r { s += \$1 } END { print s + 0 }")
+    if [ "$first" -eq 2 ] && [ "$expired" -eq 0 ]; then
+        echo "ok   $LIBC $lib: @first=1 fired once per process, expired window never"
+    else
+        echo "FAIL $LIBC $lib: @first=1 total=$first, expired=$expired" >&2
+        cat /tmp/.chaos-$lib.hits.* >&2 || true
+        failures=$((failures + 1))
+    fi
+    rm -f /tmp/.chaos-$lib.conf /tmp/.chaos-$lib.hits.*
 done
+
+# @size: hits_probe maps 4096 bytes, so only the gate below that size fires.
+so=/out/libchaos-memory-$LIBC-'"$ARCH"'.so
+{ echo "mmap/anon:ERRNO:ENOMEM @size>4095 # small"; echo "mmap/anon:LATENCY:1 @size>4096 # large"; } > /tmp/.chaos-memory.conf
+LD_PRELOAD=$so /tmp/hits-probe memory
+small=$(cat /tmp/.chaos-memory.hits.* 2>/dev/null | awk -F "\t" "\$2 ~ /# small/ { s += \$1 } END { print s + 0 }")
+large=$(cat /tmp/.chaos-memory.hits.* 2>/dev/null | awk -F "\t" "\$2 ~ /# large/ { s += \$1 } END { print s + 0 }")
+if [ "$small" -eq 2 ] && [ "$large" -eq 0 ]; then
+    echo "ok   $LIBC memory: @size>4095 fired on 4096-byte maps, @size>4096 did not"
+else
+    echo "FAIL $LIBC memory: @size small=$small large=$large" >&2
+    failures=$((failures + 1))
+fi
+rm -f /tmp/.chaos-memory.conf /tmp/.chaos-memory.hits.*
 [ "$failures" -eq 0 ]
 '
 

@@ -2246,8 +2246,48 @@ static void test_stdio_open_wrappers(void)
     assert(g_real_freopen_calls == 2);
 }
 
+/**
+ * @brief Invariant: data-moving wrappers hand the call's byte count to the matched
+ *   rule, so `@size` gates see it; an iovec call reports its total.
+ */
+static void test_wrappers_record_call_size(void)
+{
+    char buffer[16] = {0};
+    long rc;
+    struct iovec iov[2];
+
+    iov[0].iov_base = buffer;
+    iov[0].iov_len = 5U;
+    iov[1].iov_base = buffer + 5;
+    iov[1].iov_len = 6U;
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/sized.bin");
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_LATENCY;
+    rc = write(9, buffer, 9U);
+    assert(g_last_call_size == 9U);
+    rc = read(9, buffer, 12U);
+    assert(g_last_call_size == 12U);
+    rc = writev(9, iov, 2);
+    assert(g_last_call_size == 11U);
+    rc = preadv(9, iov, 2, 0);
+    assert(g_last_call_size == 11U);
+    rc = pwrite(9, buffer, 3U, 0);
+    assert(g_last_call_size == 3U);
+    rc = fallocate(9, 0, 0, 4096);
+    assert(g_last_call_size == 4096U);
+    rc = readv(9, NULL, 0);
+    assert(g_last_call_size == CHAOS_POLICY_NO_SIZE);
+    (void)rc;
+}
+
 int main(void)
 {
+    test_wrappers_record_call_size();
     test_stdio_open_wrappers();
     test_resolve_symbol_and_seed_material();
     test_call_real_open_and_match_fd_rule();

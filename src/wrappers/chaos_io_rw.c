@@ -108,6 +108,15 @@ static int chaos_io_iovec_total_bytes(const struct iovec *iov, int iovcnt, size_
     return 1;
 }
 
+/** @brief Byte count of an iovec array for `@size` gates; CHAOS_POLICY_NO_SIZE if unknown. */
+static uint64_t chaos_io_iovec_size(const struct iovec *iov, int iovcnt)
+{
+    size_t total;
+
+    return chaos_io_iovec_total_bytes(iov, iovcnt, &total) != 0 ? (uint64_t)total
+                                                                : CHAOS_POLICY_NO_SIZE;
+}
+
 /**
  * @brief Builds a truncated iovec view that covers exactly `limit` bytes.
  *
@@ -352,7 +361,8 @@ CHAOS_IO_EXPORT ssize_t read(int fd, void *buffer, size_t count)
     int previous;
 
     chaos_io_ensure_symbols();
-    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_READ, &rule))
+    if (chaos_io_in_internal() ||
+        !chaos_io_match_fd_rule_sized(fd, CHAOS_IO_OP_READ, (uint64_t)count, &rule))
     {
         previous = chaos_io_enter_internal();
         rc = g_chaos_io_real_read(fd, buffer, count);
@@ -396,7 +406,9 @@ CHAOS_IO_EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
     ssize_t rc;
 
     chaos_io_ensure_symbols();
-    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_READ, &rule))
+    if (chaos_io_in_internal() || !chaos_io_match_fd_rule_sized(
+                                      fd, CHAOS_IO_OP_READ, chaos_io_iovec_size(iov, iovcnt), &rule
+                                  ))
     {
         return chaos_io_call_real_readv(fd, iov, iovcnt);
     }
@@ -439,7 +451,8 @@ CHAOS_IO_EXPORT ssize_t write(int fd, const void *buffer, size_t count)
     int previous;
 
     chaos_io_ensure_symbols();
-    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_WRITE, &rule))
+    if (chaos_io_in_internal() ||
+        !chaos_io_match_fd_rule_sized(fd, CHAOS_IO_OP_WRITE, (uint64_t)count, &rule))
     {
         previous = chaos_io_enter_internal();
         rc = g_chaos_io_real_write(fd, buffer, count);
@@ -487,7 +500,9 @@ CHAOS_IO_EXPORT ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
     chaos_io_rule_t rule;
 
     chaos_io_ensure_symbols();
-    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_WRITE, &rule))
+    if (chaos_io_in_internal() || !chaos_io_match_fd_rule_sized(
+                                      fd, CHAOS_IO_OP_WRITE, chaos_io_iovec_size(iov, iovcnt), &rule
+                                  ))
     {
         return chaos_io_call_real_writev(fd, iov, iovcnt);
     }
@@ -563,7 +578,8 @@ CHAOS_IO_EXPORT ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t co
     chaos_io_rule_t rule;
 
     chaos_io_ensure_symbols();
-    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(out_fd, CHAOS_IO_OP_WRITE, &rule))
+    if (chaos_io_in_internal() ||
+        !chaos_io_match_fd_rule_sized(out_fd, CHAOS_IO_OP_WRITE, (uint64_t)count, &rule))
     {
         return chaos_io_call_real_sendfile(out_fd, in_fd, offset, count);
     }
@@ -629,7 +645,8 @@ CHAOS_IO_EXPORT ssize_t copy_file_range(
 
     chaos_io_ensure_symbols();
 
-    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(out_fd, CHAOS_IO_OP_WRITE, &rule))
+    if (chaos_io_in_internal() ||
+        !chaos_io_match_fd_rule_sized(out_fd, CHAOS_IO_OP_WRITE, (uint64_t)count, &rule))
     {
         return chaos_io_call_real_copy_file_range(
             in_fd, in_offset, out_fd, out_offset, count, flags
@@ -673,7 +690,8 @@ CHAOS_IO_EXPORT ssize_t pread(int fd, void *buffer, size_t count, off_t offset)
     int previous;
 
     chaos_io_ensure_symbols();
-    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_PREAD, &rule))
+    if (chaos_io_in_internal() ||
+        !chaos_io_match_fd_rule_sized(fd, CHAOS_IO_OP_PREAD, (uint64_t)count, &rule))
     {
         previous = chaos_io_enter_internal();
         rc = g_chaos_io_real_pread(fd, buffer, count, offset);
@@ -718,7 +736,9 @@ CHAOS_IO_EXPORT ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_
     ssize_t rc;
 
     chaos_io_ensure_symbols();
-    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_PREAD, &rule))
+    if (chaos_io_in_internal() || !chaos_io_match_fd_rule_sized(
+                                      fd, CHAOS_IO_OP_PREAD, chaos_io_iovec_size(iov, iovcnt), &rule
+                                  ))
     {
         return chaos_io_call_real_preadv(fd, iov, iovcnt, offset);
     }
@@ -761,7 +781,8 @@ CHAOS_IO_EXPORT ssize_t pwrite(int fd, const void *buffer, size_t count, off_t o
     int previous;
 
     chaos_io_ensure_symbols();
-    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_PWRITE, &rule))
+    if (chaos_io_in_internal() ||
+        !chaos_io_match_fd_rule_sized(fd, CHAOS_IO_OP_PWRITE, (uint64_t)count, &rule))
     {
         previous = chaos_io_enter_internal();
         rc = g_chaos_io_real_pwrite(fd, buffer, count, offset);
@@ -808,7 +829,10 @@ CHAOS_IO_EXPORT ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off
     chaos_io_rule_t rule;
 
     chaos_io_ensure_symbols();
-    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_PWRITE, &rule))
+    if (chaos_io_in_internal() ||
+        !chaos_io_match_fd_rule_sized(
+            fd, CHAOS_IO_OP_PWRITE, chaos_io_iovec_size(iov, iovcnt), &rule
+        ))
     {
         return chaos_io_call_real_pwritev(fd, iov, iovcnt, offset);
     }

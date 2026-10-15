@@ -734,6 +734,19 @@ Examples:
   files of all processes. See
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#hit-counters).
 
+## Rule Qualifiers
+
+Every library accepts the same qualifiers after a rule, before any `# owner`
+comment: `@first=N` (fire at most N times per process), `@from=T` / `@until=T`
+(active only in that wall-clock window, Unix milliseconds) and `@size>N` /
+`@size<N` (only calls moving more / fewer than N bytes). An unknown qualifier
+rejects the line. See [docs/DSL.md](docs/DSL.md#71-todays-surface).
+
+```text
+tcp4://127.0.0.1:5432:connect:ECONNREFUSED:1.0 @first=3 # net
+/data:write:EIO:1.0 @from=1760000000000 @until=1760000005000 # disk
+```
+
 ## Runtime Behavior
 
 - The intercepted libc entry points are `read`, `readv`, `write`, `writev`, `open`, `openat`, `close`, `fsync`, `fdatasync`, `pread`, `preadv`, `pwrite`, `pwritev`, `ftruncate`, `truncate`, `unlinkat`, `unlink`, `rmdir`, `remove`, `renameat`, `renameat2`, `rename`, `creat`, `fopen`, `freopen`, `posix_fallocate`, and Linux `sendfile`, `copy_file_range`, plus `fallocate`.

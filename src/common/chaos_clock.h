@@ -31,6 +31,8 @@
 #include <elf.h>
 #include <link.h>
 #include <sys/auxv.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 /** @brief Signature of the vDSO clock_gettime. */
@@ -156,6 +158,33 @@ static inline uint64_t chaos_clock_now_ns(void)
         return 0U;
     }
     return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+}
+
+/**
+ * @brief CLOCK_REALTIME in milliseconds since the epoch, without libchaos-time.
+ *
+ * @details Rule windows (`@from=`, `@until=`) are wall-clock times so that every
+ * process of a container agrees on them. The time is read from the vDSO, or with
+ * a raw system call where there is no vDSO clock: never through the interposed
+ * clock_gettime, so a time OFFSET rule does not move another rule's window.
+ */
+static inline int64_t chaos_clock_realtime_ms(void)
+{
+    struct timespec now;
+
+    chaos_once(&g_chaos_clock_once, chaos_clock_find_vdso);
+    if (g_chaos_clock_vdso == NULL || g_chaos_clock_vdso(CLOCK_REALTIME, &now) != 0)
+    {
+#ifdef __linux__
+        if (syscall(SYS_clock_gettime, CLOCK_REALTIME, &now) != 0)
+#else
+        if (clock_gettime(CLOCK_REALTIME, &now) != 0)
+#endif
+        {
+            return 0;
+        }
+    }
+    return (int64_t)now.tv_sec * 1000 + (int64_t)(now.tv_nsec / 1000000L);
 }
 
 /** @brief Longest a library goes without looking at its rule file. */

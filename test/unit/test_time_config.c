@@ -1285,6 +1285,42 @@ static void test_rule_file_check_is_throttled(void)
     g_chaos_time_check_interval_ns = 0U;
 }
 
+/**
+ * @brief Invariant: qualifiers after a rule are parsed into its policy, and a bad
+ *   qualifier rejects the line.
+ *
+ * Expected observable behaviour: every qualifier lands in the policy and the rule
+ *   itself still parses; an unknown qualifier, qualifiers without a rule and an
+ *   `@until` before its `@from` are rejected as invalid rules.
+ */
+static void test_rule_qualifiers(void)
+{
+    static chaos_time_rule_t rules[CHAOS_TIME_MAX_RULES];
+    char qualified[] =
+        "nanosleep:ERRNO:EINTR @first=3 @from=1000 @until=2000 @size>10 @size<99 # owner\n";
+    char unknown[] = "nanosleep:ERRNO:EINTR @bogus=1\n";
+    char lonely[] = "# header\n  @first=3\n";
+    char backwards[] = "nanosleep:ERRNO:EINTR @from=2000 @until=1000\n";
+    char empty_first[] = "nanosleep:ERRNO:EINTR @first=0\n";
+    size_t count = 0U;
+
+    assert(chaos_time_config_parse_buffer(qualified, rules, &count) == 0);
+    assert(count == 1U);
+    assert(rules[0].policy.first == 3U);
+    assert(rules[0].policy.from_ms == 1000);
+    assert(rules[0].policy.until_ms == 2000);
+    assert(rules[0].policy.has_size_above && rules[0].policy.size_above == 10U);
+    assert(rules[0].policy.has_size_below && rules[0].policy.size_below == 99U);
+    assert(rules[0].call_size == CHAOS_POLICY_NO_SIZE);
+
+    assert(chaos_time_config_parse_buffer(unknown, rules, &count) == -1);
+    assert(strcmp(chaos_time_config_last_error()->text, "nanosleep:ERRNO:EINTR @bogus=1") == 0);
+    assert(chaos_time_config_parse_buffer(lonely, rules, &count) == -1);
+    assert(chaos_time_config_last_error()->line == 2U);
+    assert(chaos_time_config_parse_buffer(backwards, rules, &count) == -1);
+    assert(chaos_time_config_parse_buffer(empty_first, rules, &count) == -1);
+}
+
 int main(void)
 {
     /* Look at the rule file on every call; the throttle has its own test. */
@@ -1293,6 +1329,7 @@ int main(void)
     test_prepare_reports_status();
     test_hits_are_counted_and_reported();
     test_rule_file_check_is_throttled();
+    test_rule_qualifiers();
     test_read_file_rejects_changed_file();
     test_helper_functions();
     test_selector_matching();

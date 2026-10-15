@@ -324,11 +324,31 @@ Identity across layers: same definition, same range, same closed interval.
 
 ### 7.1. Today's surface
 
-The libc layer currently exposes only **probability gating** via `@p`. The other policy classes are *implicit*:
+Besides each library's probability field (`@p` or the trailing probability), every library
+accepts the same **rule qualifiers** (`src/common/chaos_policy.h`), written as separate words
+after the rule and before any `# owner` comment:
+
+| Qualifier | Meaning |
+|---|---|
+| `@first=N` | Fire at most N times per process, then go inert (start-up faults that clear by themselves). |
+| `@from=T` | Active only once the wall clock reaches T (Unix milliseconds). |
+| `@until=T` | Active only while the wall clock is before T. Together with `@from`, one rule file holds a whole incident timeline. |
+| `@size>N` / `@size<N` | Only calls moving more / fewer than N bytes. Calls with a byte count: io `read`/`write`/`pread`/`pwrite` and their `v` forms, `sendfile`, `copy_file_range`, `fallocate`, `posix_fallocate`; net `send`/`recv`/`sendto`/`recvfrom`/`sendmsg`/`recvmsg` and `read`/`write`/`readv`/`writev` on sockets; memory `mmap`/`munmap`/`mprotect`/`madvise` (length). Any other call never matches a size-gated rule. |
+
+```text
+tcp4://127.0.0.1:5432:connect:ECONNREFUSED:1.0 @first=3 # net
+/data:write:EIO:1.0 @from=1760000000000 @until=1760000005000 # disk
+```
+
+The windows are absolute so that every process in a container agrees on them; the JVM
+layer turns relative durations into absolute times. The time is read from the vDSO, so
+a libchaos-time OFFSET rule does not move another rule's window. An unknown or malformed
+qualifier rejects the line (reported in the status file). `@first` counts are per process
+and survive a reload that keeps the rule's text; a forked child continues its parent's count.
 
 - **`always`** ≡ omit `@p` ⇔ `@1.0`.
-- **`count`** ≡ `FAIL_AFTER:<errno>,<N>` for the only counter-driven effect today.
-- **`time_window`** ≡ not currently supported.
+- **`count`** ≡ `@first=N`.
+- **`time_window`** ≡ `@from=` / `@until=`.
 - **`session`** ≡ not applicable — the libc library is process-scoped; "session" is a JVM-layer concept tied to the JUnit test lifecycle.
 
 ### 7.2. JVM-layer surface
@@ -345,8 +365,8 @@ The libc layer currently exposes only **probability gating** via `@p`. The other
 | JVM `ActivationPolicy`           | libc rule construction                                                                                                            |
 |----------------------------------|-----------------------------------------------------------------------------------------------------------------------------------|
 | `always()`                       | `…@1.0` (or omit `@p`)                                                                                                             |
-| `count(N)` for ERRNO effect      | `FAIL_AFTER:<errno>,N` if available for that operation; otherwise *no clean translation* — see §10                                  |
-| `timeWindow(start, end)`         | *No clean translation today.* Workaround: write the rule file, sleep until `start`, write the rule file again with passthrough at `end`. |
+| `count(N)`                       | `… @first=N`                                                                                                                       |
+| `timeWindow(start, end)`         | `… @from=<start ms> @until=<end ms>`                                                                                               |
 | `session(id)`                    | *No clean translation.* Sessions don't exist in the libc layer.                                                                    |
 
 ---

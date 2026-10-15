@@ -1505,6 +1505,7 @@ int chaos_dns_config_parse_buffer(char *buffer, chaos_dns_rule_t *rules, size_t 
     {
         char *line = cursor;
         chaos_dns_rule_t parsed;
+        chaos_rule_policy_t policy;
         int rc;
 
         while (*cursor != '\0' && *cursor != '\n')
@@ -1518,6 +1519,12 @@ int chaos_dns_config_parse_buffer(char *buffer, chaos_dns_rule_t *rules, size_t 
 
         /* The parser edits the line in place; keep it as written for the report. */
         chaos_status_keep_line(&g_chaos_dns_config_error, ++number, line);
+        if (chaos_policy_extract(line, &policy) != 0)
+        {
+            chaos_status_reject(&g_chaos_dns_config_error, CHAOS_STATUS_REASON_INVALID);
+            *rule_count = 0U;
+            return -1;
+        }
         memset(&parsed, 0, sizeof(parsed));
         rc = chaos_dns_config_parse_line(line, &parsed);
         if (rc < 0)
@@ -1528,8 +1535,17 @@ int chaos_dns_config_parse_buffer(char *buffer, chaos_dns_rule_t *rules, size_t 
         }
         if (rc == 0)
         {
+            if (!chaos_policy_is_empty(&policy))
+            {
+                /* Qualifiers without a rule. */
+                chaos_status_reject(&g_chaos_dns_config_error, CHAOS_STATUS_REASON_INVALID);
+                *rule_count = 0U;
+                return -1;
+            }
             continue;
         }
+        parsed.policy = policy;
+        parsed.call_size = CHAOS_POLICY_NO_SIZE;
         if (count >= CHAOS_DNS_MAX_RULES)
         {
             chaos_status_reject(&g_chaos_dns_config_error, CHAOS_STATUS_REASON_TOO_MANY);
@@ -1742,6 +1758,7 @@ static void chaos_dns_config_attach_hits(chaos_dns_config_state_t *next_state)
             if (strcmp(active->text[previous], next_state->text[index]) == 0)
             {
                 next_state->hits[index].count = active->hits[previous].count;
+                next_state->hits[index].claimed = active->hits[previous].claimed;
                 break;
             }
         }

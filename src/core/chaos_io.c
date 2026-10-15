@@ -261,6 +261,19 @@ int chaos_io_match_fd_rule(int fd, chaos_io_operation_t operation, chaos_io_rule
     return chaos_io_config_match_loaded(operation, path, rule);
 }
 
+/** @copydoc chaos_io_match_fd_rule_sized */
+int chaos_io_match_fd_rule_sized(
+    int fd, chaos_io_operation_t operation, uint64_t size, chaos_io_rule_t *rule
+)
+{
+    if (!chaos_io_match_fd_rule(fd, operation, rule))
+    {
+        return 0;
+    }
+    rule->call_size = size;
+    return 1;
+}
+
 /* --- Symbol resolution ------------------------------------------------------------ */
 
 /**

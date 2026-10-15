@@ -46,6 +46,7 @@
 
 #include "chaos_time_internal.h"
 #include "chaos_hits.h"
+#include "chaos_policy.h"
 #include "chaos_status.h"
 
 /**
@@ -185,6 +186,13 @@ typedef struct chaos_time_rule
     double probability;      /**< Injection probability in [0.0, 1.0]; 1.0 = always inject. */
     unsigned int latency_ms; /**< Pre-call delay in milliseconds for EFFECT_LATENCY; 0 otherwise. */
     int64_t offset_ms; /**< Signed time shift in milliseconds for EFFECT_OFFSET; 0 otherwise. */
+    /** Qualifiers written after the rule (`@first`, `@from`, `@until`, `@size`). */
+    chaos_rule_policy_t policy;
+    /**
+     * Byte count of the call this copy is being decided for, set by wrappers that
+     * move data; CHAOS_POLICY_NO_SIZE otherwise, which no `@size` gate passes.
+     */
+    uint64_t call_size;
     /** Hit counter of this rule in its snapshot; NULL for a rule outside a snapshot. */
     chaos_hit_slot_t *hit;
 } chaos_time_rule_t;

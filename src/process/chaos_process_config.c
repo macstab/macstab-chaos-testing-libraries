@@ -1120,6 +1120,7 @@ int chaos_process_config_parse_buffer(char *buffer, chaos_process_rule_t *rules,
     {
         char *line = cursor;
         chaos_process_rule_t parsed;
+        chaos_rule_policy_t policy;
         int rc;
 
         while (*cursor != '\0' && *cursor != '\n')
@@ -1133,6 +1134,12 @@ int chaos_process_config_parse_buffer(char *buffer, chaos_process_rule_t *rules,
 
         /* The parser edits the line in place; keep it as written for the report. */
         chaos_status_keep_line(&g_chaos_process_config_error, ++number, line);
+        if (chaos_policy_extract(line, &policy) != 0)
+        {
+            chaos_status_reject(&g_chaos_process_config_error, CHAOS_STATUS_REASON_INVALID);
+            *rule_count = 0U;
+            return -1;
+        }
         memset(&parsed, 0, sizeof(parsed));
         rc = chaos_process_config_parse_line(line, &parsed);
         if (rc < 0)
@@ -1143,8 +1150,17 @@ int chaos_process_config_parse_buffer(char *buffer, chaos_process_rule_t *rules,
         }
         if (rc == 0)
         {
+            if (!chaos_policy_is_empty(&policy))
+            {
+                /* Qualifiers without a rule. */
+                chaos_status_reject(&g_chaos_process_config_error, CHAOS_STATUS_REASON_INVALID);
+                *rule_count = 0U;
+                return -1;
+            }
             continue;
         }
+        parsed.policy = policy;
+        parsed.call_size = CHAOS_POLICY_NO_SIZE;
         if (count >= CHAOS_PROCESS_MAX_RULES)
         {
             chaos_status_reject(&g_chaos_process_config_error, CHAOS_STATUS_REASON_TOO_MANY);
@@ -1321,6 +1337,7 @@ static void chaos_process_config_attach_hits(chaos_process_config_state_t *next_
             if (strcmp(active->text[previous], next_state->text[index]) == 0)
             {
                 next_state->hits[index].count = active->hits[previous].count;
+                next_state->hits[index].claimed = active->hits[previous].claimed;
                 break;
             }
         }

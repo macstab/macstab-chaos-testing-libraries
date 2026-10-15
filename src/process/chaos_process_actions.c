@@ -90,7 +90,8 @@ int chaos_process_probability_hit(double probability)
  */
 int chaos_process_rule_should_trigger(const chaos_process_rule_t *rule)
 {
-    if (rule == NULL)
+    if (rule == NULL || !chaos_policy_window_open(&rule->policy) ||
+        !chaos_policy_size_ok(&rule->policy, rule->call_size))
     {
         return 0;
     }
@@ -99,8 +100,7 @@ int chaos_process_rule_should_trigger(const chaos_process_rule_t *rule)
     {
         return 0;
     }
-    chaos_hit_record(rule->hit);
-    return 1;
+    return chaos_policy_fire(&rule->policy, rule->hit);
 }
 
 /**
@@ -179,7 +179,12 @@ int chaos_process_rule_fail_after_error(
         return 0;
     }
 
-    chaos_hit_record(rule->hit);
+    if (!chaos_policy_window_open(&rule->policy) ||
+        !chaos_policy_size_ok(&rule->policy, rule->call_size) ||
+        !chaos_policy_fire(&rule->policy, rule->hit))
+    {
+        return 0;
+    }
     *errnum = rule->errnum;
     return 1;
 }

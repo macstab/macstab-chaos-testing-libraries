@@ -58,6 +58,7 @@
 
 #include "chaos_dns_internal.h"
 #include "chaos_hits.h"
+#include "chaos_policy.h"
 #include "chaos_status.h"
 
 /* =========================================================================
@@ -236,6 +237,13 @@ typedef struct chaos_dns_rule
     unsigned int limit;               /**< Maximum result list length, ≥1 (LIMIT only). */
     chaos_dns_family_filter_t family; /**< Address family to retain (FILTER_FAMILY only). */
     char text[CHAOS_DNS_MAX_VALUE];   /**< NUL-terminated value for REWRITE/SERVICE/OVERRIDE. */
+    /** Qualifiers written after the rule (`@first`, `@from`, `@until`, `@size`). */
+    chaos_rule_policy_t policy;
+    /**
+     * Byte count of the call this copy is being decided for, set by wrappers that
+     * move data; CHAOS_POLICY_NO_SIZE otherwise, which no `@size` gate passes.
+     */
+    uint64_t call_size;
     /** Hit counter of this rule in its snapshot; NULL for a rule outside a snapshot. */
     chaos_hit_slot_t *hit;
 } chaos_dns_rule_t;

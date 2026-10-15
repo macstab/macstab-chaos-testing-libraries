@@ -98,6 +98,28 @@
  */
 
 /**
+ * @brief chaos_memory_config_match() for a call on @p length bytes.
+ *
+ * @details Records the length in the matched copy so that a rule's `@size>N` /
+ * `@size<N` gate is checked when the effect is decided.
+ */
+static int chaos_memory_match_sized(
+    chaos_memory_effect_t effect,
+    chaos_memory_operation_t operation,
+    int mmap_flags,
+    size_t length,
+    chaos_memory_rule_t *rule
+)
+{
+    if (!chaos_memory_config_match(effect, operation, mmap_flags, rule))
+    {
+        return 0;
+    }
+    rule->call_size = (uint64_t)length;
+    return 1;
+}
+
+/**
  * @brief Call the real mmap(2) under the reentrancy guard.
  *
  * @details
@@ -274,14 +296,14 @@ mmap(void *address, size_t length, int protection, int flags, int fd, off_t offs
         return chaos_memory_call_real_mmap(address, length, protection, flags, fd, offset);
     }
 
-    if (chaos_memory_config_match(
-            CHAOS_MEMORY_EFFECT_LATENCY, CHAOS_MEMORY_OP_MMAP, flags, &latency_rule
+    if (chaos_memory_match_sized(
+            CHAOS_MEMORY_EFFECT_LATENCY, CHAOS_MEMORY_OP_MMAP, flags, length, &latency_rule
         ))
     {
         chaos_memory_rule_apply_latency(&latency_rule);
     }
-    if (chaos_memory_config_match(
-            CHAOS_MEMORY_EFFECT_ERRNO, CHAOS_MEMORY_OP_MMAP, flags, &errno_rule
+    if (chaos_memory_match_sized(
+            CHAOS_MEMORY_EFFECT_ERRNO, CHAOS_MEMORY_OP_MMAP, flags, length, &errno_rule
         ) &&
         chaos_memory_rule_apply_errno(&errno_rule))
     {
@@ -323,14 +345,14 @@ CHAOS_MEMORY_EXPORT int munmap(void *address, size_t length)
         return chaos_memory_call_real_munmap(address, length);
     }
 
-    if (chaos_memory_config_match(
-            CHAOS_MEMORY_EFFECT_LATENCY, CHAOS_MEMORY_OP_MUNMAP, 0, &latency_rule
+    if (chaos_memory_match_sized(
+            CHAOS_MEMORY_EFFECT_LATENCY, CHAOS_MEMORY_OP_MUNMAP, 0, length, &latency_rule
         ))
     {
         chaos_memory_rule_apply_latency(&latency_rule);
     }
-    if (chaos_memory_config_match(
-            CHAOS_MEMORY_EFFECT_ERRNO, CHAOS_MEMORY_OP_MUNMAP, 0, &errno_rule
+    if (chaos_memory_match_sized(
+            CHAOS_MEMORY_EFFECT_ERRNO, CHAOS_MEMORY_OP_MUNMAP, 0, length, &errno_rule
         ) &&
         chaos_memory_rule_apply_errno(&errno_rule))
     {
@@ -368,14 +390,14 @@ CHAOS_MEMORY_EXPORT int mprotect(void *address, size_t length, int protection)
         return chaos_memory_call_real_mprotect(address, length, protection);
     }
 
-    if (chaos_memory_config_match(
-            CHAOS_MEMORY_EFFECT_LATENCY, CHAOS_MEMORY_OP_MPROTECT, 0, &latency_rule
+    if (chaos_memory_match_sized(
+            CHAOS_MEMORY_EFFECT_LATENCY, CHAOS_MEMORY_OP_MPROTECT, 0, length, &latency_rule
         ))
     {
         chaos_memory_rule_apply_latency(&latency_rule);
     }
-    if (chaos_memory_config_match(
-            CHAOS_MEMORY_EFFECT_ERRNO, CHAOS_MEMORY_OP_MPROTECT, 0, &errno_rule
+    if (chaos_memory_match_sized(
+            CHAOS_MEMORY_EFFECT_ERRNO, CHAOS_MEMORY_OP_MPROTECT, 0, length, &errno_rule
         ) &&
         chaos_memory_rule_apply_errno(&errno_rule))
     {
@@ -414,14 +436,14 @@ CHAOS_MEMORY_EXPORT int madvise(void *address, size_t length, int advice)
         return chaos_memory_call_real_madvise(address, length, advice);
     }
 
-    if (chaos_memory_config_match(
-            CHAOS_MEMORY_EFFECT_LATENCY, CHAOS_MEMORY_OP_MADVISE, 0, &latency_rule
+    if (chaos_memory_match_sized(
+            CHAOS_MEMORY_EFFECT_LATENCY, CHAOS_MEMORY_OP_MADVISE, 0, length, &latency_rule
         ))
     {
         chaos_memory_rule_apply_latency(&latency_rule);
     }
-    if (chaos_memory_config_match(
-            CHAOS_MEMORY_EFFECT_ERRNO, CHAOS_MEMORY_OP_MADVISE, 0, &errno_rule
+    if (chaos_memory_match_sized(
+            CHAOS_MEMORY_EFFECT_ERRNO, CHAOS_MEMORY_OP_MADVISE, 0, length, &errno_rule
         ) &&
         chaos_memory_rule_apply_errno(&errno_rule))
     {
@@ -454,15 +476,15 @@ CHAOS_MEMORY_EXPORT int posix_madvise(void *address, size_t length, int advice)
         return chaos_memory_call_real_posix_madvise(address, length, advice);
     }
 
-    if (chaos_memory_config_match(
-            CHAOS_MEMORY_EFFECT_LATENCY, CHAOS_MEMORY_OP_MADVISE, 0, &latency_rule
+    if (chaos_memory_match_sized(
+            CHAOS_MEMORY_EFFECT_LATENCY, CHAOS_MEMORY_OP_MADVISE, 0, length, &latency_rule
         ))
     {
         chaos_memory_rule_apply_latency(&latency_rule);
     }
     saved_errno = errno;
-    if (chaos_memory_config_match(
-            CHAOS_MEMORY_EFFECT_ERRNO, CHAOS_MEMORY_OP_MADVISE, 0, &errno_rule
+    if (chaos_memory_match_sized(
+            CHAOS_MEMORY_EFFECT_ERRNO, CHAOS_MEMORY_OP_MADVISE, 0, length, &errno_rule
         ) &&
         chaos_memory_rule_apply_errno(&errno_rule))
     {

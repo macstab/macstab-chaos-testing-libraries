@@ -79,6 +79,9 @@ static chaos_net_endpoint_t g_stub_endpoint;
  */
 static int g_stub_prepare = 0;
 
+/** @brief `call_size` of the rule copy the latency stub was last given. */
+static uint64_t g_last_call_size = 0U;
+
 /** @brief When non-zero, `chaos_net_config_match_endpoint*` fills @p rule and returns 1. */
 static int g_stub_match_endpoint = 0;
 
@@ -405,6 +408,7 @@ void chaos_net_rule_apply_latency(const chaos_net_rule_t *rule)
 {
     assert(rule != NULL);
     ++g_latency_calls;
+    g_last_call_size = rule->call_size;
 }
 
 /**
@@ -2594,8 +2598,68 @@ static void test_fortified_read_and_poll(void)
 }
 #endif
 
+/**
+ * @brief Invariant: byte counts for `@size` gates cover every iovec and treat a
+ *   missing vector or message as "no size".
+ */
+static void test_size_of_vectors_and_messages(void)
+{
+    struct iovec iov[2];
+    struct msghdr message;
+
+    iov[0].iov_base = NULL;
+    iov[0].iov_len = 3U;
+    iov[1].iov_base = NULL;
+    iov[1].iov_len = 4U;
+    memset(&message, 0, sizeof(message));
+    message.msg_iov = iov;
+    message.msg_iovlen = 2U;
+    assert(chaos_net_iovec_size(iov, 2) == 7U);
+    assert(chaos_net_iovec_size(NULL, 1) == CHAOS_POLICY_NO_SIZE);
+    assert(chaos_net_iovec_size(iov, -1) == CHAOS_POLICY_NO_SIZE);
+    assert(chaos_net_message_size(&message) == 7U);
+    assert(chaos_net_message_size(NULL) == CHAOS_POLICY_NO_SIZE);
+}
+
+/**
+ * @brief Invariant: send and receive wrappers hand the call's byte count to the
+ *   matched rule, so `@size` gates see it.
+ */
+static void test_wrappers_record_call_size(void)
+{
+    char buffer[16] = {0};
+    long rc;
+    struct iovec iov[2];
+    struct msghdr message;
+
+    iov[0].iov_base = buffer;
+    iov[0].iov_len = 5U;
+    iov[1].iov_base = buffer + 5;
+    iov[1].iov_len = 6U;
+    memset(&message, 0, sizeof(message));
+    message.msg_iov = iov;
+    message.msg_iovlen = 2U;
+
+    reset_wrapper_stubs();
+    g_stub_endpoint_from_peer = 1;
+    g_stub_endpoint_from_local = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_LATENCY;
+    rc = send(4, buffer, 9U, 0);
+    assert(g_last_call_size == 9U);
+    rc = recv(4, buffer, 12U, 0);
+    assert(g_last_call_size == 12U);
+    rc = sendmsg(4, &message, 0);
+    assert(g_last_call_size == 11U);
+    rc = recvmsg(4, &message, 0);
+    assert(g_last_call_size == 11U);
+    (void)rc;
+}
+
 int main(void)
 {
+    test_wrappers_record_call_size();
+    test_size_of_vectors_and_messages();
     test_bind_and_connect_paths();
     test_accept_and_send_paths();
     test_recv_paths();

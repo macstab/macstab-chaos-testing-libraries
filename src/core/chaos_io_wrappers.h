@@ -74,6 +74,16 @@
 int chaos_io_match_fd_rule(int fd, chaos_io_operation_t operation, chaos_io_rule_t *rule);
 
 /**
+ * @brief chaos_io_match_fd_rule() for a call that moves @p size bytes.
+ *
+ * @details Records @p size in the matched copy so that a rule's `@size>N` /
+ * `@size<N` gate can be checked when the effect is decided.
+ */
+int chaos_io_match_fd_rule_sized(
+    int fd, chaos_io_operation_t operation, uint64_t size, chaos_io_rule_t *rule
+);
+
+/**
  * @brief Resolves an `openat()`-style (dirfd, path) pair to a matchable string.
  *
  * @details Handles three cases:

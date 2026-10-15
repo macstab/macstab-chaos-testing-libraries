@@ -497,6 +497,33 @@ accept4(int sockfd, CHAOS_NET_SOCKADDR_PARAM address, socklen_t *address_length,
 }
 #endif
 
+/** @brief Byte count of an iovec array for `@size` gates; CHAOS_POLICY_NO_SIZE if invalid. */
+static uint64_t chaos_net_iovec_size(const struct iovec *iov, int iovcnt)
+{
+    uint64_t total = 0U;
+    int index;
+
+    if (iov == NULL || iovcnt < 0)
+    {
+        return CHAOS_POLICY_NO_SIZE;
+    }
+    for (index = 0; index < iovcnt; ++index)
+    {
+        total += (uint64_t)iov[index].iov_len;
+    }
+    return total;
+}
+
+/** @brief Byte count of a message for `@size` gates; CHAOS_POLICY_NO_SIZE if unknown. */
+static uint64_t chaos_net_message_size(const struct msghdr *message)
+{
+    if (message == NULL)
+    {
+        return CHAOS_POLICY_NO_SIZE;
+    }
+    return chaos_net_iovec_size(message->msg_iov, (int)message->msg_iovlen);
+}
+
 /**
  * @brief Interposed send(2).
  *
@@ -516,6 +543,7 @@ CHAOS_NET_EXPORT ssize_t send(int sockfd, const void *buffer, size_t size, int f
     {
         return chaos_net_call_real_send(sockfd, buffer, size, flags);
     }
+    rule.call_size = (uint64_t)size;
 
     if (chaos_net_apply_pre_call_rule(&rule) != 0)
     {
@@ -560,6 +588,7 @@ CHAOS_NET_EXPORT ssize_t sendto(
     {
         return chaos_net_call_real_sendto(sockfd, buffer, size, flags, address_ptr, address_length);
     }
+    rule.call_size = (uint64_t)size;
 
     if (chaos_net_apply_pre_call_rule(&rule) != 0)
     {
@@ -596,6 +625,7 @@ CHAOS_NET_EXPORT ssize_t sendmsg(int sockfd, const struct msghdr *message, int f
     {
         return chaos_net_call_real_sendmsg(sockfd, message, flags);
     }
+    rule.call_size = chaos_net_message_size(message);
 
     if (chaos_net_apply_pre_call_rule(&rule) != 0)
     {
@@ -629,6 +659,7 @@ CHAOS_NET_EXPORT ssize_t recv(int sockfd, void *buffer, size_t size, int flags)
     {
         return chaos_net_call_real_recv(sockfd, buffer, size, flags);
     }
+    rule.call_size = (uint64_t)size;
 
     if (rule.effect == CHAOS_NET_EFFECT_LATENCY)
     {
@@ -678,6 +709,7 @@ CHAOS_NET_EXPORT ssize_t recvfrom(
             sockfd, buffer, size, flags, address_ptr, address_length
         );
     }
+    rule.call_size = (uint64_t)size;
 
     if (rule.effect == CHAOS_NET_EFFECT_LATENCY)
     {
@@ -717,6 +749,7 @@ CHAOS_NET_EXPORT ssize_t recvmsg(int sockfd, struct msghdr *message, int flags)
     {
         return chaos_net_call_real_recvmsg(sockfd, message, flags);
     }
+    rule.call_size = chaos_net_message_size(message);
 
     if (rule.effect == CHAOS_NET_EFFECT_LATENCY)
     {
@@ -921,8 +954,9 @@ static int chaos_net_call_real_close(int fd)
  * @param rule       Output: the matching rule.
  * @return Non-zero when @p fd is a socket with a matching rule.
  */
-static int
-chaos_net_match_descriptor_rule(int fd, chaos_net_operation_t operation, chaos_net_rule_t *rule)
+static int chaos_net_match_descriptor_rule(
+    int fd, chaos_net_operation_t operation, uint64_t size, chaos_net_rule_t *rule
+)
 {
     chaos_net_endpoint_t endpoint;
     int found;
@@ -943,7 +977,12 @@ chaos_net_match_descriptor_rule(int fd, chaos_net_operation_t operation, chaos_n
     {
         found = chaos_net_endpoint_from_activity_fd(fd, &endpoint);
     }
-    return found && chaos_net_config_match_endpoint_loaded(operation, &endpoint, rule);
+    if (!found || !chaos_net_config_match_endpoint_loaded(operation, &endpoint, rule))
+    {
+        return 0;
+    }
+    rule->call_size = size;
+    return 1;
 }
 
 /**
@@ -955,7 +994,7 @@ CHAOS_NET_EXPORT ssize_t read(int fd, void *buffer, size_t size)
     ssize_t rc;
 
     chaos_net_ensure_symbols();
-    if (!chaos_net_match_descriptor_rule(fd, CHAOS_NET_OP_RECV, &rule))
+    if (!chaos_net_match_descriptor_rule(fd, CHAOS_NET_OP_RECV, (uint64_t)size, &rule))
     {
         return chaos_net_call_real_read(fd, buffer, size);
     }
@@ -986,7 +1025,9 @@ CHAOS_NET_EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
     ssize_t rc;
 
     chaos_net_ensure_symbols();
-    if (!chaos_net_match_descriptor_rule(fd, CHAOS_NET_OP_RECV, &rule))
+    if (!chaos_net_match_descriptor_rule(
+            fd, CHAOS_NET_OP_RECV, chaos_net_iovec_size(iov, iovcnt), &rule
+        ))
     {
         return chaos_net_call_real_readv(fd, iov, iovcnt);
     }
@@ -1016,7 +1057,7 @@ CHAOS_NET_EXPORT ssize_t write(int fd, const void *buffer, size_t size)
     chaos_net_rule_t rule;
 
     chaos_net_ensure_symbols();
-    if (chaos_net_match_descriptor_rule(fd, CHAOS_NET_OP_SEND, &rule) &&
+    if (chaos_net_match_descriptor_rule(fd, CHAOS_NET_OP_SEND, (uint64_t)size, &rule) &&
         chaos_net_apply_pre_call_rule(&rule) != 0)
     {
         return -1;
@@ -1032,7 +1073,9 @@ CHAOS_NET_EXPORT ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
     chaos_net_rule_t rule;
 
     chaos_net_ensure_symbols();
-    if (chaos_net_match_descriptor_rule(fd, CHAOS_NET_OP_SEND, &rule) &&
+    if (chaos_net_match_descriptor_rule(
+            fd, CHAOS_NET_OP_SEND, chaos_net_iovec_size(iov, iovcnt), &rule
+        ) &&
         chaos_net_apply_pre_call_rule(&rule) != 0)
     {
         return -1;
@@ -1065,7 +1108,7 @@ CHAOS_NET_EXPORT int close(int fd)
     int rc;
 
     chaos_net_ensure_symbols();
-    matched = chaos_net_match_descriptor_rule(fd, CHAOS_NET_OP_CLOSE, &rule);
+    matched = chaos_net_match_descriptor_rule(fd, CHAOS_NET_OP_CLOSE, CHAOS_POLICY_NO_SIZE, &rule);
     if (matched && rule.effect == CHAOS_NET_EFFECT_LATENCY)
     {
         chaos_net_rule_apply_latency(&rule);
