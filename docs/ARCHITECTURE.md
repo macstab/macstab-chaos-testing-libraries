@@ -667,6 +667,15 @@ and [`test/runtime/test_process_alpine.sh`](../test/runtime/test_process_alpine.
   rule that never matches
 - Accepts `linux/amd64` or `linux/arm64` as an optional explicit Docker target
 
+[`test/runtime/test_fork.sh`](../test/runtime/test_fork.sh)
+
+- Builds libchaos-io for glibc and musl; an open rule with `@first=1` faults the
+  first open of each process
+- `fork_probe` opens the file, starts a child that opens it, and opens it again:
+  a `vfork` child neither takes over nor resets the parent's budget and writes
+  no hits file; a `fork` child and a `posix_spawn`ed one each get their own
+- Accepts `linux/amd64` or `linux/arm64` as an optional explicit Docker target
+
 ## Platform Internals and Symbol Resolution
 
 The detailed mechanics of ELF link-map ordering, PLT/GOT lazy binding, vDSO

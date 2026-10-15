@@ -214,6 +214,7 @@ HOST_RUNTIME_TESTS := \
 	$(TEST_RUNTIME_DIR)/test_path_forms.sh \
 	$(TEST_RUNTIME_DIR)/test_status.sh \
 	$(TEST_RUNTIME_DIR)/test_hits.sh \
+	$(TEST_RUNTIME_DIR)/test_fork.sh \
 	$(TEST_RUNTIME_DIR)/test_stdio.sh
 MATRIX_RUNTIME_TESTS := \
 	$(TEST_RUNTIME_DIR)/test_glibc.sh \
