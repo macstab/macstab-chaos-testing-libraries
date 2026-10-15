@@ -79,21 +79,23 @@ The implemented logical operation surface is:
 - `truncate`
   Backed by `ftruncate()` and the path form `truncate()`
 - `allocate`
-  Backed by Linux `fallocate()`
+  Backed by Linux `fallocate()` and `posix_fallocate()`
 - `unlink`
-  Backed by `unlinkat()`, `unlink()` and `rmdir()`
+  Backed by `unlinkat()`, `unlink()`, `rmdir()` and `remove()`
 - `rename_from`
-  Backed by `renameat()` and `rename()` source-path matching
+  Backed by `renameat()`, `renameat2()` and `rename()` source-path matching
 - `rename_to`
-  Backed by `renameat()` and `rename()` destination-path matching
+  Backed by `renameat()`, `renameat2()` and `rename()` destination-path matching
 
-glibc and musl implement `unlink()`, `rmdir()`,
-`rename()`, `truncate()` and `creat()` with their own system calls, not through the
-`*at` or descriptor forms, so each has its own wrapper. They are the forms most
+glibc and musl implement `unlink()`, `rmdir()`, `remove()`,
+`rename()`, `renameat2()`, `truncate()`, `creat()` and `posix_fallocate()` with their own
+system calls, not through the `*at` or descriptor forms, so each has its own wrapper.
+`posix_fallocate()` reports an injected error as its return value and leaves errno
+alone; `renameat2()` fails with ENOSYS where the C library lacks it (musl). They are the forms most
 programs use: the JDK deletes with `unlink()` and moves with `rename()`. The first
 four forward to `unlinkat(AT_FDCWD, ...)`, `renameat(AT_FDCWD, ...)` and `open()`,
 which Linux defines them to be; `truncate()` matches the `truncate` rules by path.
-`test/runtime/test_path_forms.sh` checks all five on glibc and musl.
+`test/runtime/test_path_forms.sh` checks them on glibc and musl.
 
 ### Assumptions
 
