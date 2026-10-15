@@ -437,8 +437,9 @@ Exact interposed symbols today:
 - `fork()`
 - `posix_spawn()`
 - `posix_spawnp()`
-- `execve()`
-- `execveat()`
+- `execve()`, and under its rules `execv()`, `execvp()`, `execvpe()`, `execl()`, `execlp()`, `execle()`
+- `execveat()`, and under its rules `fexecve()`
+- `system()` and `popen()` under the `posix_spawn` rules
 - `waitpid()`, and under its rules `wait()`, `wait3()`, `wait4()` and `waitid()`
 
 Supported selectors:

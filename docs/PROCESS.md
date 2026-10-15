@@ -22,8 +22,9 @@ PLT/GOT cold/hot paths, AT_SECURE, glibc/musl matrix) are in
 Current implementation status:
 
 - interposed symbols: `pthread_create()`, `fork()`, `posix_spawn()`,
-  `posix_spawnp()`, `execve()`, `execveat()`, `waitpid()`, and under the `waitpid`
-  rules `wait()`, `wait3()`, `wait4()`, `waitid()`
+  `posix_spawnp()`, `execve()`, `execveat()`, `waitpid()`; under the `waitpid` rules
+  `wait()`, `wait3()`, `wait4()`, `waitid()`; under the `execve`/`execveat` rules the
+  exec family (§6.1); under the `posix_spawn` rules `system()` and `popen()`
 - config path: `/tmp/.chaos-process.conf`
 - unit-tested; strict `100.00%` line coverage gate on `src/process/*.c`
 - runtime probe implemented for glibc/musl and amd64/arm64 validation
@@ -277,9 +278,19 @@ eventually call `execve(2)` or `execveat(2)`:
 | `fexecve`       | fd          | `char*[]`+env| → `execveat` (Linux 3.19+) |
 | `execveat`      | dirfd+path  | `char*[]`+env| syscall (Linux 3.19+)      |
 
-`libchaos-process` intercepts `execve` and `execveat` at the PLT. The other
-variants (`execl`, `execlp`, `execvp`, `fexecve`) all call through `execve` or
-`execveat` via the PLT, so they are covered transitively.
+glibc and musl implement the other variants with their *internal* execve and
+execveat, which never pass through the exported symbols, so each has its own
+wrapper and follows the rules of the call it is a form of: `execl`, `execle`,
+`execlp`, `execv`, `execvp` and `execvpe` the `execve` rules, `fexecve` the
+`execveat` rules. `execv`, `execvp` and the `execl` forms forward to `execve` and
+`execvpe` exactly as libc defines them (the `execl` forms collect their arguments
+into an array first); `execvpe` and `fexecve` call their real functions, so the
+`PATH` search is libc's own. They share the operation's FAIL_AFTER counter.
+
+`system()` and `popen()` run their shell through libc's internal posix_spawn
+(glibc 2.29+, musl), so they follow the `posix_spawn` rules: an injected failure
+makes `system()` return -1 and `popen()` return NULL, with errno set.
+`system(NULL)`, which only asks whether a shell exists, is forwarded.
 
 ### 6.2 execveat Portability
 
@@ -647,8 +658,6 @@ the same values (`0x0`, `0xfffffffffffffffe`, `0xffffffffffffffff`).
 | `vfork(2)`    | See §5. Safety contract violations in the injection window.               |
 | `kill(2)`     | Signal semantics orthogonal to the process-creation/destruction focus. Signal injection requires a different abstraction (signal interposition via `sigaction`/`raise` wrappers) with entirely different effect taxonomy. |
 | `pthread_kill`| Same rationale as `kill`. Signal delivery to threads is a signal-domain problem. |
-| `wait(2)`     | Wrapper around `waitpid(-1, status, 0)` in glibc; covered transitively when `waitpid` is the implementation. But the libc symbol `wait` itself is not interposed. |
-| `wait3/wait4` | BSD-heritage symbols; `wait4` calls `waitpid` internally on Linux. Not interposed directly. |
 
 ---
 
