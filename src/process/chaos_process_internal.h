@@ -51,6 +51,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -177,6 +178,12 @@ typedef int (*chaos_process_execveat_fn)(int, const char *, char *const[], char 
 /** Signature of the real `waitpid(2)`. */
 typedef pid_t (*chaos_process_waitpid_fn)(pid_t, int *, int);
 
+/** Signature of the real `wait4(2)`. */
+typedef pid_t (*chaos_process_wait4_fn)(pid_t, int *, int, struct rusage *);
+
+/** Signature of the real `waitid(2)`. */
+typedef int (*chaos_process_waitid_fn)(idtype_t, id_t, siginfo_t *, int);
+
 /** @} */
 
 /** @defgroup chaos_process_globals Global state variables
@@ -211,6 +218,12 @@ extern chaos_process_execveat_fn g_chaos_process_real_execveat;
 
 /** Pointer to the real `waitpid` resolved via RTLD_NEXT. */
 extern chaos_process_waitpid_fn g_chaos_process_real_waitpid;
+
+/** Pointer to the real `wait4` resolved via RTLD_NEXT. */
+extern chaos_process_wait4_fn g_chaos_process_real_wait4;
+
+/** Pointer to the real `waitid` resolved via RTLD_NEXT. */
+extern chaos_process_waitid_fn g_chaos_process_real_waitid;
 
 /**
  * Per-thread re-entrancy guard.

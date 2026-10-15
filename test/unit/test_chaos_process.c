@@ -394,6 +394,35 @@ stub_execveat(int directory_fd, const char *path, char *const argv[], char *cons
  * sets `errno = g_real_waitpid_errno`. ECHILD (no child process) and EINTR (interrupted
  * by signal) are the representative errors used in tests.
  */
+/** @brief Number of times `stub_wait4` was called. */
+static int g_real_wait4_calls = 0;
+/** @brief `usage` argument captured from the most recent `stub_wait4` call. */
+static struct rusage *g_last_wait4_usage = NULL;
+/** @brief Number of times `stub_waitid` was called. */
+static int g_real_waitid_calls = 0;
+
+/** @brief Stub for the real `wait4`. Records the call; returns `g_real_waitpid_result`. */
+static pid_t stub_wait4(pid_t pid, int *status, int options, struct rusage *usage)
+{
+    (void)status;
+    ++g_real_wait4_calls;
+    g_last_waitpid_pid = pid;
+    g_last_waitpid_options = options;
+    g_last_wait4_usage = usage;
+    return g_real_waitpid_result;
+}
+
+/** @brief Stub for the real `waitid`. Records the call; returns 0. */
+static int stub_waitid(idtype_t type, id_t id, siginfo_t *info, int options)
+{
+    (void)type;
+    (void)id;
+    (void)info;
+    (void)options;
+    ++g_real_waitid_calls;
+    return 0;
+}
+
 static pid_t stub_waitpid(pid_t pid, int *status, int options)
 {
     (void)status;
@@ -417,7 +446,15 @@ static pid_t stub_waitpid(pid_t pid, int *status, int options)
 #define execveat chaos_process_test_execveat_wrapper
 #endif
 #define waitpid chaos_process_test_waitpid_wrapper
+#define wait chaos_process_test_wait_wrapper
+#define wait3 chaos_process_test_wait3_wrapper
+#define wait4 chaos_process_test_wait4_wrapper
+#define waitid chaos_process_test_waitid_wrapper
 #include "../../src/process/chaos_process_hooks.c"
+#undef waitid
+#undef wait4
+#undef wait3
+#undef wait
 #undef waitpid
 #ifdef __linux__
 #undef execveat
@@ -978,6 +1015,83 @@ static void test_waitpid_paths(void)
     assert(errno == ECHILD);
 }
 
+/**
+ * @brief Invariant: wait, wait3, wait4 and waitid follow the waitpid rules.
+ *
+ * Expected observable behaviour:
+ * - wait(s) reaches the real waitpid as waitpid(-1, s, 0).
+ * - wait3(s, o, u) reaches the real wait4 as wait4(-1, s, o, u), passing `usage` through.
+ * - wait4 and waitid run the real call under the guard and after an unmatched rule.
+ * - An ERRNO rule on `waitpid` fails wait4 and waitid with -1 and errno, without the
+ *   real call; a FAIL_AFTER rule does the same.
+ */
+static void test_wait_family_paths(void)
+{
+    struct rusage usage;
+    siginfo_t info;
+
+    reset_wrapper_state();
+    g_chaos_process_real_waitpid = stub_waitpid;
+    assert(chaos_process_test_wait_wrapper(NULL) == 321);
+    assert(g_last_waitpid_pid == -1);
+    assert(g_last_waitpid_options == 0);
+
+    reset_wrapper_state();
+    g_chaos_process_real_wait4 = stub_wait4;
+    g_real_wait4_calls = 0;
+    assert(chaos_process_test_wait3_wrapper(NULL, WNOHANG, &usage) == 321);
+    assert(g_real_wait4_calls == 1);
+    assert(g_last_waitpid_pid == -1);
+    assert(g_last_waitpid_options == WNOHANG);
+    assert(g_last_wait4_usage == &usage);
+
+    g_chaos_process_tls_guard = 1;
+    assert(chaos_process_test_wait4_wrapper(7, NULL, 0, NULL) == 321);
+    assert(g_real_wait4_calls == 2);
+    g_chaos_process_tls_guard = 0;
+
+    reset_wrapper_state();
+    g_chaos_process_real_waitid = stub_waitid;
+    g_real_waitid_calls = 0;
+    assert(chaos_process_test_waitid_wrapper(P_ALL, 0, &info, WEXITED) == 0);
+    g_chaos_process_tls_guard = 1;
+    assert(chaos_process_test_waitid_wrapper(P_ALL, 0, &info, WEXITED) == 0);
+    g_chaos_process_tls_guard = 0;
+    assert(g_real_waitid_calls == 2);
+
+    reset_wrapper_state();
+    g_chaos_process_real_wait4 = stub_wait4;
+    g_chaos_process_real_waitid = stub_waitid;
+    g_real_wait4_calls = 0;
+    g_real_waitid_calls = 0;
+    g_stub_match[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_WAITPID] = 1;
+    g_stub_rules[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_WAITPID].effect =
+        CHAOS_PROCESS_EFFECT_ERRNO;
+    g_stub_rules[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_WAITPID].errnum = EINTR;
+    g_errno_trigger = 1;
+    errno = 0;
+    assert(chaos_process_test_wait4_wrapper(7, NULL, 0, NULL) == -1);
+    assert(errno == EINTR);
+    errno = 0;
+    assert(chaos_process_test_waitid_wrapper(P_ALL, 0, &info, WEXITED) == -1);
+    assert(errno == EINTR);
+    assert(g_real_wait4_calls == 0);
+    assert(g_real_waitid_calls == 0);
+
+    reset_wrapper_state();
+    g_chaos_process_real_waitid = stub_waitid;
+    g_real_waitid_calls = 0;
+    g_stub_match[CHAOS_PROCESS_EFFECT_FAIL_AFTER][CHAOS_PROCESS_OP_WAITPID] = 1;
+    g_stub_rules[CHAOS_PROCESS_EFFECT_FAIL_AFTER][CHAOS_PROCESS_OP_WAITPID].effect =
+        CHAOS_PROCESS_EFFECT_FAIL_AFTER;
+    g_stub_rules[CHAOS_PROCESS_EFFECT_FAIL_AFTER][CHAOS_PROCESS_OP_WAITPID].errnum = ECHILD;
+    g_fail_after_trigger = 1;
+    errno = 0;
+    assert(chaos_process_test_waitid_wrapper(P_ALL, 0, &info, WEXITED) == -1);
+    assert(errno == ECHILD);
+    assert(g_real_waitid_calls == 0);
+}
+
 int main(void)
 {
     test_call_real_helpers();
@@ -990,5 +1104,6 @@ int main(void)
     test_execveat_paths();
 #endif
     test_waitpid_paths();
+    test_wait_family_paths();
     return 0;
 }

@@ -16,7 +16,7 @@
  *   - `fork(2)`
  *   - `posix_spawn(3)` / `posix_spawnp(3)`
  *   - `execve(2)` / `execveat(2)` (Linux only)
- *   - `waitpid(2)`
+ *   - `waitpid(2)`, and `wait(2)`, `wait3(2)`, `wait4(2)`, `waitid(2)` under its rules
  *
  * ## Hook structure
  *
@@ -303,6 +303,71 @@ static pid_t chaos_process_call_real_waitpid(pid_t pid, int *status, int options
     rc = g_chaos_process_real_waitpid(pid, status, options);
     chaos_process_leave_internal(previous);
     return rc;
+}
+
+/** @brief Calls the real `wait4` under the re-entrancy guard. */
+static pid_t
+chaos_process_call_real_wait4(pid_t pid, int *status, int options, struct rusage *usage)
+{
+    int previous;
+    pid_t rc;
+
+    previous = chaos_process_enter_internal();
+    rc = g_chaos_process_real_wait4(pid, status, options, usage);
+    chaos_process_leave_internal(previous);
+    return rc;
+}
+
+/** @brief Calls the real `waitid` under the re-entrancy guard. */
+static int chaos_process_call_real_waitid(idtype_t type, id_t id, siginfo_t *info, int options)
+{
+    int previous;
+    int rc;
+
+    previous = chaos_process_enter_internal();
+    rc = g_chaos_process_real_waitid(type, id, info, options);
+    chaos_process_leave_internal(previous);
+    return rc;
+}
+
+/**
+ * @brief Applies the `waitpid` rules to one call of any wait function.
+ *
+ * waitpid, wait, wait3, wait4 and waitid all reap or observe children; glibc and
+ * musl implement each with its own system call, so each has a wrapper, and all of
+ * them share these rules (and one FAIL_AFTER counter): LATENCY first, then ERRNO,
+ * then FAIL_AFTER.
+ *
+ * @return Non-zero when the call must fail; errno is then set.
+ */
+static int chaos_process_wait_fault(void)
+{
+    chaos_process_rule_t latency_rule;
+    chaos_process_rule_t errno_rule;
+    chaos_process_rule_t fail_after_rule;
+    int error_code;
+
+    if (chaos_process_config_match(
+            CHAOS_PROCESS_EFFECT_LATENCY, CHAOS_PROCESS_OP_WAITPID, &latency_rule
+        ))
+    {
+        chaos_process_rule_apply_latency(&latency_rule);
+    }
+    if ((chaos_process_config_match(
+             CHAOS_PROCESS_EFFECT_ERRNO, CHAOS_PROCESS_OP_WAITPID, &errno_rule
+         ) &&
+         chaos_process_rule_error_number(&errno_rule, &error_code)) ||
+        (chaos_process_config_match(
+             CHAOS_PROCESS_EFFECT_FAIL_AFTER, CHAOS_PROCESS_OP_WAITPID, &fail_after_rule
+         ) &&
+         chaos_process_rule_fail_after_error(
+             &fail_after_rule, CHAOS_PROCESS_OP_WAITPID, &error_code
+         )))
+    {
+        errno = error_code;
+        return 1;
+    }
+    return 0;
 }
 
 /* -------------------------------------------------------------------------
@@ -724,42 +789,71 @@ execveat(int directory_fd, const char *path, char *const argv[], char *const env
  */
 CHAOS_PROCESS_EXPORT pid_t waitpid(pid_t pid, int *status, int options)
 {
-    chaos_process_rule_t latency_rule;
-    chaos_process_rule_t errno_rule;
-    chaos_process_rule_t fail_after_rule;
-    int error_code;
-
     chaos_process_ensure_symbols();
 
     if (chaos_process_in_internal())
     {
         return chaos_process_call_real_waitpid(pid, status, options);
     }
-
-    if (chaos_process_config_match(
-            CHAOS_PROCESS_EFFECT_LATENCY, CHAOS_PROCESS_OP_WAITPID, &latency_rule
-        ))
+    if (chaos_process_wait_fault())
     {
-        chaos_process_rule_apply_latency(&latency_rule);
-    }
-    if (chaos_process_config_match(
-            CHAOS_PROCESS_EFFECT_ERRNO, CHAOS_PROCESS_OP_WAITPID, &errno_rule
-        ) &&
-        chaos_process_rule_error_number(&errno_rule, &error_code))
-    {
-        errno = error_code;
         return -1;
     }
-    if (chaos_process_config_match(
-            CHAOS_PROCESS_EFFECT_FAIL_AFTER, CHAOS_PROCESS_OP_WAITPID, &fail_after_rule
-        ) &&
-        chaos_process_rule_fail_after_error(
-            &fail_after_rule, CHAOS_PROCESS_OP_WAITPID, &error_code
-        ))
-    {
-        errno = error_code;
-        return -1;
-    }
-
     return chaos_process_call_real_waitpid(pid, status, options);
+}
+
+/**
+ * @brief Interposition hook for `wait(2)`: `waitpid(-1, status, 0)`, the `waitpid` rules.
+ */
+CHAOS_PROCESS_EXPORT pid_t wait(int *status)
+{
+    return waitpid(-1, status, 0);
+}
+
+/**
+ * @brief Interposition hook for `wait4(2)`: the `waitpid` rules.
+ *
+ * @details The real wait4 runs so that @p usage is still filled.
+ */
+CHAOS_PROCESS_EXPORT pid_t wait4(pid_t pid, int *status, int options, struct rusage *usage)
+{
+    chaos_process_ensure_symbols();
+
+    if (chaos_process_in_internal())
+    {
+        return chaos_process_call_real_wait4(pid, status, options, usage);
+    }
+    if (chaos_process_wait_fault())
+    {
+        return -1;
+    }
+    return chaos_process_call_real_wait4(pid, status, options, usage);
+}
+
+/**
+ * @brief Interposition hook for `wait3(2)`: `wait4(-1, status, options, usage)`.
+ */
+CHAOS_PROCESS_EXPORT pid_t wait3(int *status, int options, struct rusage *usage)
+{
+    return wait4(-1, status, options, usage);
+}
+
+/**
+ * @brief Interposition hook for `waitid(2)`: the `waitpid` rules.
+ *
+ * @return 0 on success; -1 with errno set on failure.
+ */
+CHAOS_PROCESS_EXPORT int waitid(idtype_t type, id_t id, siginfo_t *info, int options)
+{
+    chaos_process_ensure_symbols();
+
+    if (chaos_process_in_internal())
+    {
+        return chaos_process_call_real_waitid(type, id, info, options);
+    }
+    if (chaos_process_wait_fault())
+    {
+        return -1;
+    }
+    return chaos_process_call_real_waitid(type, id, info, options);
 }

@@ -7,7 +7,7 @@
  *
  * Coverage approach:
  * - All intercepted symbols (pthread_create, fork, posix_spawn, posix_spawnp, execve,
- *   execveat, waitpid) are mapped to local stubs via a test-controlled
+ *   execveat, waitpid, wait4, waitid) are mapped to local stubs via a test-controlled
  *   `dlsym` stub.
  * - `dlerror`, `abort`, and (on Linux) `syscall` are overridden via `#define` before
  *   `chaos_process.c` is included, exercising the constructor without LD_PRELOAD.
@@ -179,12 +179,26 @@ stub_execveat(int directory_fd, const char *path, char *const argv[], char *cons
     return 0;
 }
 
-/**
- * @brief Stub for `waitpid(2)`. Returns @p pid unchanged so callers can verify the value.
- *
- * @param pid  PID to wait for; echoed back as the return value.
- * @return @p pid (simulates a completed wait for that child).
- */
+/** @brief Stub for `wait4(2)`. Returns @p pid unchanged. */
+static pid_t stub_wait4(pid_t pid, int *status, int options, struct rusage *usage)
+{
+    (void)status;
+    (void)options;
+    (void)usage;
+    return pid;
+}
+
+/** @brief Stub for `waitid(2)`. Returns 0. */
+static int stub_waitid(idtype_t type, id_t id, siginfo_t *info, int options)
+{
+    (void)type;
+    (void)id;
+    (void)info;
+    (void)options;
+    return 0;
+}
+
+/** @brief Stub for `waitpid(2)`. Returns @p pid unchanged. */
 static pid_t stub_waitpid(pid_t pid, int *status, int options)
 {
     (void)status;
@@ -241,6 +255,10 @@ static void *chaos_process_test_dlsym(void *handle, const char *symbol)
         return CHAOS_PROCESS_TEST_DLSYM_RESULT(chaos_process_execveat_fn, stub_execveat);
     if (strcmp(symbol, "waitpid") == 0)
         return CHAOS_PROCESS_TEST_DLSYM_RESULT(chaos_process_waitpid_fn, stub_waitpid);
+    if (strcmp(symbol, "wait4") == 0)
+        return CHAOS_PROCESS_TEST_DLSYM_RESULT(chaos_process_wait4_fn, stub_wait4);
+    if (strcmp(symbol, "waitid") == 0)
+        return CHAOS_PROCESS_TEST_DLSYM_RESULT(chaos_process_waitid_fn, stub_waitid);
     return NULL;
 }
 
@@ -482,6 +500,8 @@ static void test_constructor_init(void)
     assert(g_chaos_process_real_execveat == stub_execveat);
 #endif
     assert(g_chaos_process_real_waitpid == stub_waitpid);
+    assert(g_chaos_process_real_wait4 == stub_wait4);
+    assert(g_chaos_process_real_waitid == stub_waitid);
     assert(g_config_init_calls == config_calls_before + 1);
     assert(g_chaos_process_process_seed != 0U);
     assert(g_chaos_process_tls_prng_state != 0U);
