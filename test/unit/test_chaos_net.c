@@ -2471,6 +2471,11 @@ static ssize_t chaos_net_test_next_readv(int fd, const struct iovec *iov, int io
 
     (void)fd;
     ++g_descriptor_calls;
+    if (iovcnt > CHAOS_NET_IOV_MAX)
+    {
+        errno = EINVAL; /* like the kernel, before looking at the vector */
+        return -1;
+    }
     g_last_receive_iovlen = (size_t)iovcnt;
     g_last_receive_iov_bytes = 0U;
     for (index = 0; index < iovcnt; ++index)
@@ -2706,6 +2711,10 @@ static void test_size_of_vectors_and_messages(void)
     assert(chaos_net_iovec_size(iov, -1) == CHAOS_POLICY_NO_SIZE);
     assert(chaos_net_message_size(&message) == 7U);
     assert(chaos_net_message_size(NULL) == CHAOS_POLICY_NO_SIZE);
+    /* An array longer than the kernel takes is not walked (nor its count narrowed). */
+    assert(chaos_net_iovec_size(iov, CHAOS_NET_IOV_MAX + 1) == CHAOS_POLICY_NO_SIZE);
+    message.msg_iovlen = (size_t)CHAOS_NET_IOV_MAX + 1U;
+    assert(chaos_net_message_size(&message) == CHAOS_POLICY_NO_SIZE);
 }
 
 /**
@@ -3017,8 +3026,76 @@ static void test_trickle_and_dup_edges(void)
     (void)rc;
 }
 
+/**
+ * @brief Invariant: DUP receives for real when nothing should be kept or replayed,
+ *   never keeps a payload for a descriptor closed while it was received, and a
+ *   fork() child can use slots other threads held at the fork.
+ *
+ * Expected observable behaviour: MSG_TRUNC, MSG_OOB, an empty or missing buffer and
+ *   an over-long iovec array call the real receive every time; a payload stored
+ *   after a close of its slot is not replayed; the atfork handler releases locks.
+ */
+static void test_dup_skips_and_close_races(void)
+{
+    char buffer[16];
+    struct iovec iov;
+    /* Hidden from the compiler, which knows the calls below are invalid. */
+    void *volatile no_buffer = NULL;
+    volatile int too_many = CHAOS_NET_IOV_MAX + 1;
+    unsigned generation;
+    long rc;
+
+    reset_wrapper_stubs();
+    g_stub_endpoint_from_local = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_DUP;
+    g_should_trigger = 1;
+
+    rc = recv(12, buffer, sizeof(buffer), MSG_TRUNC);
+    rc = recv(12, buffer, sizeof(buffer), MSG_TRUNC);
+    rc = recv(12, buffer, sizeof(buffer), MSG_OOB);
+    rc = recv(12, buffer, 0U, 0);
+    rc = recv(12, no_buffer, sizeof(buffer), 0);
+    assert(g_recv_calls == 5);
+    rc = recvfrom(12, no_buffer, sizeof(buffer), 0, NULL, NULL);
+    assert(g_recvfrom_calls == 1);
+
+    /* A close while the payload was being received: nothing is kept... */
+    iov.iov_base = buffer;
+    iov.iov_len = sizeof(buffer);
+    memcpy(buffer, "data", 4U);
+    generation = chaos_net_dup_generation(13);
+    chaos_net_dup_forget(13);
+    chaos_net_dup_store(13, &iov, 1, 4, NULL, 0, generation);
+    rc = recv(13, buffer, sizeof(buffer), 0);
+    assert(g_recv_calls == 6);
+    /* ...while one received after the close is kept as usual. */
+    rc = recv(13, buffer, sizeof(buffer), 0);
+    assert(g_recv_calls == 6);
+    assert(chaos_net_dup_generation(-1) == 0U);
+
+    /* A lock held by a thread that does not exist in the fork() child is released. */
+    g_chaos_net_dup_slots[14 % CHAOS_NET_DUP_SLOTS].lock = 1;
+    chaos_net_dup_after_fork();
+    assert(g_chaos_net_dup_slots[14 % CHAOS_NET_DUP_SLOTS].lock == 0);
+
+    /* readv: an empty vector and one longer than the kernel takes are real. */
+    reset_descriptor_stubs();
+    g_stub_prepare = 1;
+    g_stub_endpoint_from_local = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_DUP;
+    g_should_trigger = 1;
+    rc = readv(15, &iov, 0);
+    rc = readv(15, &iov, too_many); /* the kernel rejects it before reading it */
+    rc = read(15, no_buffer, sizeof(buffer));
+    assert(g_descriptor_calls == 3);
+    (void)rc;
+}
+
 int main(void)
 {
+    test_dup_skips_and_close_races();
     test_trickle_and_dup_edges();
     test_dup_replays_the_last_payload();
     test_trickle_shortens_receives();

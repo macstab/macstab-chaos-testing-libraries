@@ -60,6 +60,8 @@
 #include "chaos_net_endpoint.h"
 #include "chaos_net_internal.h"
 
+#include <limits.h>
+#include <pthread.h>
 #include <string.h>
 #include <sys/mman.h>
 #ifdef __linux__
@@ -521,7 +523,8 @@ accept4(int sockfd, CHAOS_NET_SOCKADDR_PARAM address, socklen_t *address_length,
 typedef struct chaos_net_dup_slot
 {
     volatile int lock;
-    volatile int fd; /**< Owner of the stored payload; -1 when empty. */
+    volatile int fd;          /**< Owner of the stored payload; -1 when empty. */
+    volatile unsigned closes; /**< Closes of descriptors in this slot, see dup_store(). */
     size_t length;
     socklen_t name_length; /**< Sender address length (datagrams); 0 when none. */
     struct sockaddr_storage name;
@@ -551,6 +554,23 @@ typedef struct chaos_net_dup_slot
 
 /** @brief The slot table, mapped on the first DUP rule; NULL before (or if mapping failed). */
 static chaos_net_dup_slot_t *volatile g_chaos_net_dup_slots = NULL;
+
+/**
+ * @brief Releases, in a fork() child, the slot locks other threads held at the fork.
+ *
+ * @details Those threads do not exist in the child: without this their slots would
+ * never replay there. A vfork child shares the table and runs no atfork handler.
+ */
+static void chaos_net_dup_after_fork(void)
+{
+    chaos_net_dup_slot_t *table = g_chaos_net_dup_slots;
+    int index;
+
+    for (index = 0; index < CHAOS_NET_DUP_SLOTS; ++index)
+    {
+        table[index].lock = 0;
+    }
+}
 
 /**
  * @brief Maps the slot table on first use with a raw system call.
@@ -583,6 +603,11 @@ static chaos_net_dup_slot_t *chaos_net_dup_table(void)
     {
         CHAOS_NET_DUP_UNMAP(mapped, size);
     }
+    else
+    {
+        /* Registered once, by the thread whose table is published. */
+        (void)pthread_atfork(NULL, NULL, chaos_net_dup_after_fork);
+    }
     return g_chaos_net_dup_slots;
 }
 
@@ -613,7 +638,29 @@ static void chaos_net_dup_unlock(chaos_net_dup_slot_t *slot)
 }
 
 /**
+ * @brief The close count of @p fd's slot, taken before a receive whose payload is kept.
+ *
+ * @details Maps the table if needed; 0 without one (nothing is kept then).
+ */
+static unsigned chaos_net_dup_generation(int fd)
+{
+    chaos_net_dup_slot_t *table = chaos_net_dup_table();
+
+    if (table == NULL || fd < 0)
+    {
+        return 0U;
+    }
+    __sync_synchronize();
+    return table[fd % CHAOS_NET_DUP_SLOTS].closes;
+}
+
+/**
  * @brief Keeps the @p received bytes just read into @p iov as @p fd's last payload.
+ *
+ * @details @p generation is the slot's close count from before the receive. If a
+ * descriptor in the slot was closed since (by another thread, while this one was
+ * receiving), the number may already name a new socket: the payload is dropped
+ * rather than replayed there.
  */
 static void chaos_net_dup_store(
     int fd,
@@ -621,7 +668,8 @@ static void chaos_net_dup_store(
     int iovcnt,
     ssize_t received,
     const struct sockaddr *name,
-    socklen_t name_length
+    socklen_t name_length,
+    unsigned generation
 )
 {
     chaos_net_dup_slot_t *slot;
@@ -637,6 +685,11 @@ static void chaos_net_dup_store(
     {
         return;
     }
+    if (slot->closes != generation)
+    {
+        chaos_net_dup_unlock(slot);
+        return;
+    }
     remaining =
         (size_t)received < CHAOS_NET_DUP_MAX_BYTES ? (size_t)received : CHAOS_NET_DUP_MAX_BYTES;
     slot->length = 0U;
@@ -644,7 +697,10 @@ static void chaos_net_dup_store(
     {
         const size_t part = iov[index].iov_len < remaining ? iov[index].iov_len : remaining;
 
-        memcpy(slot->data + slot->length, iov[index].iov_base, part);
+        if (part > 0U)
+        {
+            memcpy(slot->data + slot->length, iov[index].iov_base, part);
+        }
         slot->length += part;
         remaining -= part;
     }
@@ -655,6 +711,10 @@ static void chaos_net_dup_store(
         slot->name_length = name_length;
     }
     slot->fd = fd;
+    /* A close between the check above and here either sees the tag (and clears
+     * it) or bumped the count before this check does. */
+    __sync_synchronize();
+    (void)(slot->closes == generation || __sync_bool_compare_and_swap(&slot->fd, fd, -1));
     chaos_net_dup_unlock(slot);
 }
 
@@ -695,7 +755,10 @@ static ssize_t chaos_net_dup_replay(
         const size_t left = slot->length - delivered;
         const size_t part = iov[index].iov_len < left ? iov[index].iov_len : left;
 
-        memcpy(iov[index].iov_base, slot->data + delivered, part);
+        if (part > 0U)
+        {
+            memcpy(iov[index].iov_base, slot->data + delivered, part);
+        }
         delivered += part;
     }
     if (name != NULL && name_length != NULL)
@@ -720,8 +783,30 @@ static void chaos_net_dup_forget(int fd)
     {
         return;
     }
-    /* Without the lock: close() must not wait, and only the owner tag changes. */
+    /* Without the lock: close() must not wait. The count goes first, so a payload
+     * being stored for the closed descriptor right now is dropped by its writer. */
+    (void)__sync_fetch_and_add(&table[fd % CHAOS_NET_DUP_SLOTS].closes, 1U);
     (void)__sync_bool_compare_and_swap(&table[fd % CHAOS_NET_DUP_SLOTS].fd, fd, -1);
+}
+
+/** @brief Receive flags under which DUP receives for real (nothing is consumed or kept). */
+#ifdef MSG_ERRQUEUE
+#define CHAOS_NET_DUP_SKIP_FLAGS (MSG_PEEK | MSG_TRUNC | MSG_OOB | MSG_ERRQUEUE)
+#else
+#define CHAOS_NET_DUP_SKIP_FLAGS (MSG_PEEK | MSG_TRUNC | MSG_OOB)
+#endif
+
+/**
+ * @brief Whether a receive of @p requested bytes with @p flags goes through DUP.
+ *
+ * @details Peeks consume nothing; MSG_TRUNC may report more than the buffer
+ * holds; out-of-band and error-queue data is not the stream. An empty buffer
+ * is left alone too: a replay into it would return 0, which reads as EOF.
+ */
+static int chaos_net_dups(const chaos_net_rule_t *rule, int flags, uint64_t requested)
+{
+    return rule->effect == CHAOS_NET_EFFECT_DUP && (flags & CHAOS_NET_DUP_SKIP_FLAGS) == 0 &&
+           requested != 0U && requested != CHAOS_POLICY_NO_SIZE;
 }
 
 /** @brief Largest iovec array a TRICKLE rule reshapes; longer ones are left alone. */
@@ -802,13 +887,25 @@ chaos_net_limit_iovecs(const struct iovec *iov, int iovcnt, size_t limit, struct
     return count;
 }
 
-/** @brief Byte count of an iovec array for `@size` gates; CHAOS_POLICY_NO_SIZE if invalid. */
+/** @brief Most iovec entries the kernel accepts; a longer array fails with EINVAL. */
+#ifdef IOV_MAX
+#define CHAOS_NET_IOV_MAX IOV_MAX
+#else
+#define CHAOS_NET_IOV_MAX 1024
+#endif
+
+/**
+ * @brief Byte count of an iovec array for `@size` gates; CHAOS_POLICY_NO_SIZE if invalid.
+ *
+ * @details An array longer than the kernel accepts is not read: the call fails
+ * anyway, and its count need not describe memory the caller owns.
+ */
 static uint64_t chaos_net_iovec_size(const struct iovec *iov, int iovcnt)
 {
     uint64_t total = 0U;
     int index;
 
-    if (iov == NULL || iovcnt < 0)
+    if (iov == NULL || iovcnt < 0 || iovcnt > CHAOS_NET_IOV_MAX)
     {
         return CHAOS_POLICY_NO_SIZE;
     }
@@ -822,7 +919,8 @@ static uint64_t chaos_net_iovec_size(const struct iovec *iov, int iovcnt)
 /** @brief Byte count of a message for `@size` gates; CHAOS_POLICY_NO_SIZE if unknown. */
 static uint64_t chaos_net_message_size(const struct msghdr *message)
 {
-    if (message == NULL)
+    /* msg_iovlen is size_t on glibc: compare before narrowing it. */
+    if (message == NULL || (size_t)message->msg_iovlen > (size_t)CHAOS_NET_IOV_MAX)
     {
         return CHAOS_POLICY_NO_SIZE;
     }
@@ -975,7 +1073,7 @@ CHAOS_NET_EXPORT ssize_t recv(int sockfd, void *buffer, size_t size, int flags)
         return -1;
     }
 
-    if (rule.effect == CHAOS_NET_EFFECT_DUP && (flags & MSG_PEEK) == 0)
+    if (buffer != NULL && chaos_net_dups(&rule, flags, (uint64_t)size))
     {
         struct iovec target;
 
@@ -984,8 +1082,10 @@ CHAOS_NET_EXPORT ssize_t recv(int sockfd, void *buffer, size_t size, int flags)
         rc = chaos_net_dup_replay(&rule, sockfd, &target, 1, NULL, NULL);
         if (rc < 0)
         {
+            const unsigned generation = chaos_net_dup_generation(sockfd);
+
             rc = chaos_net_call_real_recv(sockfd, buffer, size, flags);
-            chaos_net_dup_store(sockfd, &target, 1, rc, NULL, 0);
+            chaos_net_dup_store(sockfd, &target, 1, rc, NULL, 0, generation);
         }
         return rc;
     }
@@ -1047,7 +1147,7 @@ CHAOS_NET_EXPORT ssize_t recvfrom(
     {
         size = rule.chunk_bytes;
     }
-    if (rule.effect == CHAOS_NET_EFFECT_DUP && (flags & MSG_PEEK) == 0)
+    if (buffer != NULL && chaos_net_dups(&rule, flags, (uint64_t)size))
     {
         struct iovec target;
 
@@ -1058,6 +1158,8 @@ CHAOS_NET_EXPORT ssize_t recvfrom(
         rc = chaos_net_dup_replay(&rule, sockfd, &target, 1, address_ptr, address_length);
         if (rc < 0)
         {
+            const unsigned generation = chaos_net_dup_generation(sockfd);
+
             rc = chaos_net_call_real_recvfrom(
                 sockfd, buffer, size, flags, address_ptr, address_length
             );
@@ -1071,7 +1173,8 @@ CHAOS_NET_EXPORT ssize_t recvfrom(
                  * cut the address to fit the caller's buffer. */
                 address_ptr != NULL && address_length != NULL
                     ? (*address_length < capacity ? *address_length : capacity)
-                    : 0
+                    : 0,
+                generation
             );
         }
         return rc;
@@ -1116,7 +1219,7 @@ CHAOS_NET_EXPORT ssize_t recvmsg(int sockfd, struct msghdr *message, int flags)
         return -1;
     }
 
-    if (message != NULL && rule.effect == CHAOS_NET_EFFECT_DUP && (flags & MSG_PEEK) == 0)
+    if (message != NULL && chaos_net_dups(&rule, flags, chaos_net_message_size(message)))
     {
         const socklen_t capacity = message->msg_namelen;
         socklen_t name_length = message->msg_namelen;
@@ -1136,17 +1239,22 @@ CHAOS_NET_EXPORT ssize_t recvmsg(int sockfd, struct msghdr *message, int flags)
             message->msg_flags = 0;
             return rc;
         }
-        rc = chaos_net_call_real_recvmsg(sockfd, message, flags);
-        chaos_net_dup_store(
-            sockfd,
-            message->msg_iov,
-            (int)message->msg_iovlen,
-            rc,
-            (const struct sockaddr *)message->msg_name,
-            message->msg_name != NULL
-                ? (message->msg_namelen < capacity ? message->msg_namelen : capacity)
-                : 0
-        );
+        {
+            const unsigned generation = chaos_net_dup_generation(sockfd);
+
+            rc = chaos_net_call_real_recvmsg(sockfd, message, flags);
+            chaos_net_dup_store(
+                sockfd,
+                message->msg_iov,
+                (int)message->msg_iovlen,
+                rc,
+                (const struct sockaddr *)message->msg_name,
+                message->msg_name != NULL
+                    ? (message->msg_namelen < capacity ? message->msg_namelen : capacity)
+                    : 0,
+                generation
+            );
+        }
         return rc;
     }
     if (message != NULL && (size_t)message->msg_iovlen <= (size_t)CHAOS_NET_TRICKLE_MAX_IOV &&
@@ -1415,7 +1523,7 @@ CHAOS_NET_EXPORT ssize_t read(int fd, void *buffer, size_t size)
         return -1;
     }
 
-    if (rule.effect == CHAOS_NET_EFFECT_DUP)
+    if (buffer != NULL && chaos_net_dups(&rule, 0, (uint64_t)size))
     {
         struct iovec target;
 
@@ -1424,8 +1532,10 @@ CHAOS_NET_EXPORT ssize_t read(int fd, void *buffer, size_t size)
         rc = chaos_net_dup_replay(&rule, fd, &target, 1, NULL, NULL);
         if (rc < 0)
         {
+            const unsigned generation = chaos_net_dup_generation(fd);
+
             rc = chaos_net_call_real_read(fd, buffer, size);
-            chaos_net_dup_store(fd, &target, 1, rc, NULL, 0);
+            chaos_net_dup_store(fd, &target, 1, rc, NULL, 0, generation);
         }
         return rc;
     }
@@ -1466,13 +1576,15 @@ CHAOS_NET_EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
         return -1;
     }
 
-    if (rule.effect == CHAOS_NET_EFFECT_DUP && iov != NULL && iovcnt > 0)
+    if (chaos_net_dups(&rule, 0, chaos_net_iovec_size(iov, iovcnt)))
     {
         rc = chaos_net_dup_replay(&rule, fd, iov, iovcnt, NULL, NULL);
         if (rc < 0)
         {
+            const unsigned generation = chaos_net_dup_generation(fd);
+
             rc = chaos_net_call_real_readv(fd, iov, iovcnt);
-            chaos_net_dup_store(fd, iov, iovcnt, rc, NULL, 0);
+            chaos_net_dup_store(fd, iov, iovcnt, rc, NULL, 0, generation);
         }
         return rc;
     }

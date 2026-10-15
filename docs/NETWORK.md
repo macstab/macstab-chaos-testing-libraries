@@ -684,14 +684,18 @@ Reason:
   the rule fires, the next receive returns that copy instead of reading the
   socket, once, and the one after reads again. Duplicate delivery is the norm
   in at-least-once messaging and almost never tested: double charges, double
-  writes, repeated side effects. `MSG_PEEK` receives are left alone; `close`
-  drops the copy. A slot that is busy (another thread, or a signal handler that
+  writes, repeated side effects. Receives with `MSG_PEEK`, `MSG_TRUNC`,
+  `MSG_OOB` or `MSG_ERRQUEUE`, into an empty buffer, or with an iovec array
+  longer than `IOV_MAX` are left alone (a replay into an empty buffer would
+  read as EOF); `close` drops the copy, also one a receive on another thread
+  is storing at that moment, so a reused descriptor never sees it. A slot that is busy (another thread, or a signal handler that
   interrupted this one) skips DUP for that call instead of waiting, and `close`
   drops a copy without taking the lock. A sender address cut to fit the caller's
   buffer is kept only as far as that buffer reached. The copies live in a 64-slot
   table (about 260 KiB) mapped
   with a raw `mmap` on the first DUP rule; descriptors that share a slot drop
-  each other's copy rather than replay the wrong one
+  each other's copy rather than replay the wrong one. A `fork` child releases
+  slots other threads held at the fork
 - `GAI`
   valid only for `dns`
 
