@@ -188,6 +188,39 @@ static pid_t stub_wait4(pid_t pid, int *status, int options, struct rusage *usag
     return pid;
 }
 
+/** @brief Stub for `execvpe(3)`. Returns -1. */
+static int stub_execvpe(const char *file, char *const argv[], char *const envp[])
+{
+    (void)file;
+    (void)argv;
+    (void)envp;
+    return -1;
+}
+
+/** @brief Stub for `fexecve(3)`. Returns -1. */
+static int stub_fexecve(int fd, char *const argv[], char *const envp[])
+{
+    (void)fd;
+    (void)argv;
+    (void)envp;
+    return -1;
+}
+
+/** @brief Stub for `system(3)`. Returns 0. */
+static int stub_system(const char *command)
+{
+    (void)command;
+    return 0;
+}
+
+/** @brief Stub for `popen(3)`. Returns NULL. */
+static FILE *stub_popen(const char *command, const char *mode)
+{
+    (void)command;
+    (void)mode;
+    return NULL;
+}
+
 /** @brief Stub for `waitid(2)`. Returns 0. */
 static int stub_waitid(idtype_t type, id_t id, siginfo_t *info, int options)
 {
@@ -259,6 +292,14 @@ static void *chaos_process_test_dlsym(void *handle, const char *symbol)
         return CHAOS_PROCESS_TEST_DLSYM_RESULT(chaos_process_wait4_fn, stub_wait4);
     if (strcmp(symbol, "waitid") == 0)
         return CHAOS_PROCESS_TEST_DLSYM_RESULT(chaos_process_waitid_fn, stub_waitid);
+    if (strcmp(symbol, "execvpe") == 0)
+        return CHAOS_PROCESS_TEST_DLSYM_RESULT(chaos_process_execvpe_fn, stub_execvpe);
+    if (strcmp(symbol, "fexecve") == 0)
+        return CHAOS_PROCESS_TEST_DLSYM_RESULT(chaos_process_fexecve_fn, stub_fexecve);
+    if (strcmp(symbol, "system") == 0)
+        return CHAOS_PROCESS_TEST_DLSYM_RESULT(chaos_process_system_fn, stub_system);
+    if (strcmp(symbol, "popen") == 0)
+        return CHAOS_PROCESS_TEST_DLSYM_RESULT(chaos_process_popen_fn, stub_popen);
     return NULL;
 }
 
@@ -502,6 +543,10 @@ static void test_constructor_init(void)
     assert(g_chaos_process_real_waitpid == stub_waitpid);
     assert(g_chaos_process_real_wait4 == stub_wait4);
     assert(g_chaos_process_real_waitid == stub_waitid);
+    assert(g_chaos_process_real_execvpe == stub_execvpe);
+    assert(g_chaos_process_real_fexecve == stub_fexecve);
+    assert(g_chaos_process_real_system == stub_system);
+    assert(g_chaos_process_real_popen == stub_popen);
     assert(g_config_init_calls == config_calls_before + 1);
     assert(g_chaos_process_process_seed != 0U);
     assert(g_chaos_process_tls_prng_state != 0U);

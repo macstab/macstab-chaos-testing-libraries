@@ -135,6 +135,8 @@
 #include "chaos_process_config.h"
 #include "chaos_process_internal.h"
 
+#include <stdarg.h>
+
 /* -------------------------------------------------------------------------
  * Call-through wrappers (re-entrancy-guarded)
  * ---------------------------------------------------------------------- */
@@ -331,38 +333,49 @@ static int chaos_process_call_real_waitid(idtype_t type, id_t id, siginfo_t *inf
 }
 
 /**
+ * @brief Applies one operation's rules to a call: LATENCY, then ERRNO, then FAIL_AFTER.
+ *
+ * Shared by every wrapper that follows the rules of another call -- the wait
+ * family (waitpid rules), the exec family (execve or execveat rules), system()
+ * and popen() (posix_spawn rules) -- so each sees exactly the same faults and the
+ * same FAIL_AFTER counter as the call it is a form of.
+ *
+ * @param operation   Operation whose rules apply.
+ * @param error_code  Receives the error to report when the call must fail.
+ * @return Non-zero when the call must fail.
+ */
+static int chaos_process_operation_fault(chaos_process_operation_t operation, int *error_code)
+{
+    chaos_process_rule_t latency_rule;
+    chaos_process_rule_t errno_rule;
+    chaos_process_rule_t fail_after_rule;
+
+    if (chaos_process_config_match(CHAOS_PROCESS_EFFECT_LATENCY, operation, &latency_rule))
+    {
+        chaos_process_rule_apply_latency(&latency_rule);
+    }
+    return (chaos_process_config_match(CHAOS_PROCESS_EFFECT_ERRNO, operation, &errno_rule) &&
+            chaos_process_rule_error_number(&errno_rule, error_code)) ||
+           (chaos_process_config_match(
+                CHAOS_PROCESS_EFFECT_FAIL_AFTER, operation, &fail_after_rule
+            ) &&
+            chaos_process_rule_fail_after_error(&fail_after_rule, operation, error_code));
+}
+
+/**
  * @brief Applies the `waitpid` rules to one call of any wait function.
  *
  * waitpid, wait, wait3, wait4 and waitid all reap or observe children; glibc and
  * musl implement each with its own system call, so each has a wrapper, and all of
- * them share these rules (and one FAIL_AFTER counter): LATENCY first, then ERRNO,
- * then FAIL_AFTER.
+ * them share these rules (and one FAIL_AFTER counter).
  *
  * @return Non-zero when the call must fail; errno is then set.
  */
 static int chaos_process_wait_fault(void)
 {
-    chaos_process_rule_t latency_rule;
-    chaos_process_rule_t errno_rule;
-    chaos_process_rule_t fail_after_rule;
     int error_code;
 
-    if (chaos_process_config_match(
-            CHAOS_PROCESS_EFFECT_LATENCY, CHAOS_PROCESS_OP_WAITPID, &latency_rule
-        ))
-    {
-        chaos_process_rule_apply_latency(&latency_rule);
-    }
-    if ((chaos_process_config_match(
-             CHAOS_PROCESS_EFFECT_ERRNO, CHAOS_PROCESS_OP_WAITPID, &errno_rule
-         ) &&
-         chaos_process_rule_error_number(&errno_rule, &error_code)) ||
-        (chaos_process_config_match(
-             CHAOS_PROCESS_EFFECT_FAIL_AFTER, CHAOS_PROCESS_OP_WAITPID, &fail_after_rule
-         ) &&
-         chaos_process_rule_fail_after_error(
-             &fail_after_rule, CHAOS_PROCESS_OP_WAITPID, &error_code
-         )))
+    if (chaos_process_operation_fault(CHAOS_PROCESS_OP_WAITPID, &error_code))
     {
         errno = error_code;
         return 1;
@@ -696,6 +709,230 @@ CHAOS_PROCESS_EXPORT int execve(const char *path, char *const argv[], char *cons
     }
 
     return chaos_process_call_real_execve(path, argv, envp);
+}
+
+/* -------------------------------------------------------------------------
+ * The exec family, system() and popen()
+ *
+ * glibc and musl implement execv, execvp, execvpe, execl, execle, execlp and
+ * fexecve on their internal execve/execveat, and system() and popen() on their
+ * internal posix_spawn, so none of them passes through the exported symbols.
+ * Each follows the rules of the call it is a form of: the exec family the execve
+ * rules (fexecve the execveat rules), system() and popen() the posix_spawn rules.
+ * execv, execvp and the execl forms forward to execve and execvpe exactly as libc
+ * defines them; execvpe, fexecve, system and popen call their real functions, so
+ * PATH search and the shell invocation stay libc's own.
+ * ------------------------------------------------------------------------- */
+
+/** @brief Interposition hook for `execv(3)`: `execve(path, argv, environ)`. */
+CHAOS_PROCESS_EXPORT int execv(const char *path, char *const argv[])
+{
+    return execve(path, argv, environ);
+}
+
+/**
+ * @brief Interposition hook for `execvpe(3)`: the execve rules, then the real execvpe.
+ *
+ * @return -1 with errno set on failure (no return on success).
+ */
+CHAOS_PROCESS_EXPORT int execvpe(const char *file, char *const argv[], char *const envp[])
+{
+    int error_code;
+    int previous;
+    int rc;
+
+    chaos_process_ensure_symbols();
+    if (!chaos_process_in_internal() &&
+        chaos_process_operation_fault(CHAOS_PROCESS_OP_EXECVE, &error_code))
+    {
+        errno = error_code;
+        return -1;
+    }
+    if (g_chaos_process_real_execvpe == NULL)
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+    previous = chaos_process_enter_internal();
+    rc = g_chaos_process_real_execvpe(file, argv, envp);
+    chaos_process_leave_internal(previous);
+    return rc;
+}
+
+/** @brief Interposition hook for `execvp(3)`: `execvpe(file, argv, environ)`. */
+CHAOS_PROCESS_EXPORT int execvp(const char *file, char *const argv[])
+{
+    return execvpe(file, argv, environ);
+}
+
+/** @brief Interposition hook for `execl(3)`: the arguments as an array, then execv(). */
+CHAOS_PROCESS_EXPORT int execl(const char *path, const char *arg, ...)
+{
+    va_list args;
+    size_t count = 1U;
+    size_t index;
+
+    va_start(args, arg);
+    while (va_arg(args, const char *) != NULL)
+    {
+        ++count;
+    }
+    va_end(args);
+    {
+        char *argv[count + 1U];
+
+        argv[0] = (char *)arg;
+        va_start(args, arg);
+        for (index = 1U; index <= count; ++index)
+        {
+            argv[index] = va_arg(args, char *);
+        }
+        va_end(args);
+        return execv(path, argv);
+    }
+}
+
+/** @brief Interposition hook for `execlp(3)`: the arguments as an array, then execvp(). */
+CHAOS_PROCESS_EXPORT int execlp(const char *file, const char *arg, ...)
+{
+    va_list args;
+    size_t count = 1U;
+    size_t index;
+
+    va_start(args, arg);
+    while (va_arg(args, const char *) != NULL)
+    {
+        ++count;
+    }
+    va_end(args);
+    {
+        char *argv[count + 1U];
+
+        argv[0] = (char *)arg;
+        va_start(args, arg);
+        for (index = 1U; index <= count; ++index)
+        {
+            argv[index] = va_arg(args, char *);
+        }
+        va_end(args);
+        return execvp(file, argv);
+    }
+}
+
+/**
+ * @brief Interposition hook for `execle(3)`: the arguments as an array, then execve().
+ *
+ * @details The environment follows the terminating NULL argument.
+ */
+CHAOS_PROCESS_EXPORT int execle(const char *path, const char *arg, ...)
+{
+    va_list args;
+    size_t count = 1U;
+    size_t index;
+
+    va_start(args, arg);
+    while (va_arg(args, const char *) != NULL)
+    {
+        ++count;
+    }
+    va_end(args);
+    {
+        char *argv[count + 1U];
+        char *const *envp;
+
+        argv[0] = (char *)arg;
+        va_start(args, arg);
+        for (index = 1U; index <= count; ++index)
+        {
+            argv[index] = va_arg(args, char *);
+        }
+        envp = va_arg(args, char *const *);
+        va_end(args);
+        return execve(path, argv, envp);
+    }
+}
+
+/**
+ * @brief Interposition hook for `fexecve(3)`: the execveat rules, then the real fexecve.
+ *
+ * @return -1 with errno set on failure (no return on success).
+ */
+CHAOS_PROCESS_EXPORT int fexecve(int fd, char *const argv[], char *const envp[])
+{
+    int error_code;
+    int previous;
+    int rc;
+
+    chaos_process_ensure_symbols();
+#ifdef __linux__
+    if (!chaos_process_in_internal() &&
+        chaos_process_operation_fault(CHAOS_PROCESS_OP_EXECVEAT, &error_code))
+    {
+        errno = error_code;
+        return -1;
+    }
+#else
+    (void)error_code;
+#endif
+    if (g_chaos_process_real_fexecve == NULL)
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+    previous = chaos_process_enter_internal();
+    rc = g_chaos_process_real_fexecve(fd, argv, envp);
+    chaos_process_leave_internal(previous);
+    return rc;
+}
+
+/**
+ * @brief Interposition hook for `system(3)`: the posix_spawn rules.
+ *
+ * @details `system(NULL)` only asks whether a shell exists and is forwarded. An
+ * injected failure is reported as system() reports a failed spawn: -1 with errno.
+ */
+CHAOS_PROCESS_EXPORT int system(const char *command)
+{
+    uintptr_t command_bits = (uintptr_t)(const void *)command;
+    int error_code;
+    int previous;
+    int rc;
+
+    chaos_process_ensure_symbols();
+    if (!chaos_process_in_internal() && command_bits != 0U &&
+        chaos_process_operation_fault(CHAOS_PROCESS_OP_POSIX_SPAWN, &error_code))
+    {
+        errno = error_code;
+        return -1;
+    }
+    previous = chaos_process_enter_internal();
+    rc = g_chaos_process_real_system(command);
+    chaos_process_leave_internal(previous);
+    return rc;
+}
+
+/**
+ * @brief Interposition hook for `popen(3)`: the posix_spawn rules.
+ *
+ * @return The stream, or NULL with errno set on failure.
+ */
+CHAOS_PROCESS_EXPORT FILE *popen(const char *command, const char *mode)
+{
+    int error_code;
+    int previous;
+    FILE *stream;
+
+    chaos_process_ensure_symbols();
+    if (!chaos_process_in_internal() &&
+        chaos_process_operation_fault(CHAOS_PROCESS_OP_POSIX_SPAWN, &error_code))
+    {
+        errno = error_code;
+        return NULL;
+    }
+    previous = chaos_process_enter_internal();
+    stream = g_chaos_process_real_popen(command, mode);
+    chaos_process_leave_internal(previous);
+    return stream;
 }
 
 #ifdef __linux__

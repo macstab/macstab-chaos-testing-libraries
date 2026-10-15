@@ -50,6 +50,7 @@
 #include <spawn.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/types.h>
@@ -178,6 +179,18 @@ typedef int (*chaos_process_execveat_fn)(int, const char *, char *const[], char 
 /** Signature of the real `waitpid(2)`. */
 typedef pid_t (*chaos_process_waitpid_fn)(pid_t, int *, int);
 
+/** Signature of the real `execvpe(3)` (GNU; may be absent). */
+typedef int (*chaos_process_execvpe_fn)(const char *, char *const[], char *const[]);
+
+/** Signature of the real `fexecve(3)` (may be absent). */
+typedef int (*chaos_process_fexecve_fn)(int, char *const[], char *const[]);
+
+/** Signature of the real `system(3)`. */
+typedef int (*chaos_process_system_fn)(const char *);
+
+/** Signature of the real `popen(3)`. */
+typedef FILE *(*chaos_process_popen_fn)(const char *, const char *);
+
 /** Signature of the real `wait4(2)`. */
 typedef pid_t (*chaos_process_wait4_fn)(pid_t, int *, int, struct rusage *);
 
@@ -218,6 +231,18 @@ extern chaos_process_execveat_fn g_chaos_process_real_execveat;
 
 /** Pointer to the real `waitpid` resolved via RTLD_NEXT. */
 extern chaos_process_waitpid_fn g_chaos_process_real_waitpid;
+
+/** Pointer to the real `execvpe`, or NULL when libc lacks it. */
+extern chaos_process_execvpe_fn g_chaos_process_real_execvpe;
+
+/** Pointer to the real `fexecve`, or NULL when libc lacks it. */
+extern chaos_process_fexecve_fn g_chaos_process_real_fexecve;
+
+/** Pointer to the real `system` resolved via RTLD_NEXT. */
+extern chaos_process_system_fn g_chaos_process_real_system;
+
+/** Pointer to the real `popen` resolved via RTLD_NEXT. */
+extern chaos_process_popen_fn g_chaos_process_real_popen;
 
 /** Pointer to the real `wait4` resolved via RTLD_NEXT. */
 extern chaos_process_wait4_fn g_chaos_process_real_wait4;

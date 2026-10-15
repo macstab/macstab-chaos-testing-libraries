@@ -77,6 +77,10 @@
     chaos_process_execveat_fn g_chaos_process_real_execveat = NULL;                                \
     chaos_process_waitpid_fn g_chaos_process_real_waitpid = NULL;                                  \
     chaos_process_wait4_fn g_chaos_process_real_wait4 = NULL;                                      \
+    chaos_process_execvpe_fn g_chaos_process_real_execvpe = NULL;                                  \
+    chaos_process_fexecve_fn g_chaos_process_real_fexecve = NULL;                                  \
+    chaos_process_system_fn g_chaos_process_real_system = NULL;                                    \
+    chaos_process_popen_fn g_chaos_process_real_popen = NULL;                                      \
     chaos_process_waitid_fn g_chaos_process_real_waitid = NULL;                                    \
     __thread int g_chaos_process_tls_guard = 0;                                                    \
     __thread uint64_t g_chaos_process_tls_prng_state = 0U;                                         \
@@ -105,6 +109,10 @@ static inline void chaos_process_test_reset_runtime(void)
     g_chaos_process_real_execveat = NULL;
     g_chaos_process_real_waitpid = NULL;
     g_chaos_process_real_wait4 = NULL;
+    g_chaos_process_real_execvpe = NULL;
+    g_chaos_process_real_fexecve = NULL;
+    g_chaos_process_real_system = NULL;
+    g_chaos_process_real_popen = NULL;
     g_chaos_process_real_waitid = NULL;
     g_chaos_process_tls_guard = 0;
     g_chaos_process_tls_prng_state = 0U;

@@ -80,6 +80,10 @@ chaos_process_execve_fn g_chaos_process_real_execve = NULL;
 chaos_process_execveat_fn g_chaos_process_real_execveat = NULL;
 chaos_process_waitpid_fn g_chaos_process_real_waitpid = NULL;
 chaos_process_wait4_fn g_chaos_process_real_wait4 = NULL;
+chaos_process_execvpe_fn g_chaos_process_real_execvpe = NULL;
+chaos_process_fexecve_fn g_chaos_process_real_fexecve = NULL;
+chaos_process_system_fn g_chaos_process_real_system = NULL;
+chaos_process_popen_fn g_chaos_process_real_popen = NULL;
 chaos_process_waitid_fn g_chaos_process_real_waitid = NULL;
 __thread int g_chaos_process_tls_guard = 0;
 __thread uint64_t g_chaos_process_tls_prng_state = 0U;
@@ -276,6 +280,10 @@ static void chaos_process_resolve_all_symbols(void)
     chaos_process_resolve_symbol(&g_chaos_process_real_waitpid, "waitpid");
     chaos_process_resolve_symbol(&g_chaos_process_real_wait4, "wait4");
     chaos_process_resolve_symbol(&g_chaos_process_real_waitid, "waitid");
+    chaos_process_resolve_symbol(&g_chaos_process_real_system, "system");
+    chaos_process_resolve_symbol(&g_chaos_process_real_popen, "popen");
+    chaos_process_try_resolve_symbol(&g_chaos_process_real_execvpe, "execvpe");
+    chaos_process_try_resolve_symbol(&g_chaos_process_real_fexecve, "fexecve");
 }
 
 void chaos_process_ensure_symbols(void)

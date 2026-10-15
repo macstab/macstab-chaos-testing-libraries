@@ -28,6 +28,8 @@
  * - `ERRNO` on `execveat` (synthetic `ENOENT`; skipped gracefully if weak symbol is NULL)
  * - `ERRNO` on `waitpid` (synthetic `EINTR`; config cleared before reaping zombie)
  * - `LATENCY` on `waitpid` (≥ 80 ms added sleep; child exits immediately)
+ * - `ERRNO` on `execve` also fails `execv`, `execvp`, `execl`, `execlp` and `execle`, and
+ *   `ERRNO` on `posix_spawn` fails `system` and `popen`; all run on internal paths in libc
  * - `ERRNO` on `waitpid` also fails `wait`, `wait3`, `wait4` and `waitid`, which glibc and
  *   musl implement with their own system calls; each still reaps once the rule is gone
  *
@@ -592,6 +594,104 @@ static int probe_wait_family(void)
     return 0;
 }
 
+/*
+ * Runs one exec form in a child. The child exits 42 when the exec was faulted with
+ * EACCES; an exec that went through would run /bin/true and exit 0 instead.
+ */
+static int exec_form_faulted(int form)
+{
+    char *const argv[] = {(char *)"true", NULL};
+    pid_t pid = fork();
+    int status;
+
+    if (pid < 0)
+    {
+        return 0;
+    }
+    if (pid == 0)
+    {
+        switch (form)
+        {
+        case 0:
+            (void)execv("/bin/true", argv);
+            break;
+        case 1:
+            (void)execvp("true", argv);
+            break;
+        case 2:
+            (void)execl("/bin/true", "true", (char *)NULL);
+            break;
+        case 3:
+            (void)execlp("true", "true", (char *)NULL);
+            break;
+        default:
+            (void)execle("/bin/true", "true", (char *)NULL, environ);
+            break;
+        }
+        _exit(errno == EACCES ? 42 : 43);
+    }
+    return wait_for_child(pid, &status) == 0 && WIFEXITED(status) && WEXITSTATUS(status) == 42;
+}
+
+static int probe_exec_family_and_shell(void)
+{
+    FILE *stream;
+    int form;
+    int rc = write_config("execve:ERRNO:EACCES");
+
+    if (rc != 0)
+    {
+        return rc;
+    }
+    for (form = 0; form < 5; ++form)
+    {
+        if (!exec_form_faulted(form))
+        {
+            (void)clear_config();
+            return 130 + form;
+        }
+    }
+
+    rc = write_config("posix_spawn:ERRNO:EAGAIN");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    errno = 0;
+    if (system("true") != -1 || errno != EAGAIN)
+    {
+        (void)clear_config();
+        return 136;
+    }
+    errno = 0;
+    stream = popen("true", "r");
+    if (stream != NULL || errno != EAGAIN)
+    {
+        if (stream != NULL)
+        {
+            (void)pclose(stream);
+        }
+        (void)clear_config();
+        return 137;
+    }
+
+    rc = clear_config();
+    if (rc != 0)
+    {
+        return rc;
+    }
+    if (system("true") != 0)
+    {
+        return 138;
+    }
+    stream = popen("true", "r");
+    if (stream == NULL || pclose(stream) != 0)
+    {
+        return 139;
+    }
+    return 0;
+}
+
 int main(void)
 {
     int rc;
@@ -630,6 +730,9 @@ int main(void)
     if (rc != 0)
         return rc;
     rc = probe_wait_family();
+    if (rc != 0)
+        return rc;
+    rc = probe_exec_family_and_shell();
     if (rc != 0)
         return rc;
 

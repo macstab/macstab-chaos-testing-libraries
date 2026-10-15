@@ -348,11 +348,36 @@ static int stub_posix_spawnp(
  * When `g_real_execve_result == -1`, sets `errno = g_real_execve_errno` to simulate
  * a failed exec (e.g. E2BIG for argument-list overflow, EACCES for permission denied).
  */
+/**
+ * @brief Arguments of the most recent exec stub call, copied while the caller's array
+ *   is alive (the execl forms build theirs on their own stack). An empty string after
+ *   the last argument marks the terminating NULL.
+ */
+static char g_last_exec_args[4][16];
+/** @brief `argv` pointer passed to the most recent `stub_execve` call. */
+static char *const *g_last_execve_argv = NULL;
+/** @brief `envp` passed to the most recent exec stub call. */
+static char *const *g_last_execve_envp = NULL;
+
+/** @brief Copies up to three arguments and the NULL marker into `g_last_exec_args`. */
+static void record_exec_args(char *const argv[])
+{
+    size_t index;
+
+    (void)memset(g_last_exec_args, 0, sizeof(g_last_exec_args));
+    for (index = 0U; index < 3U && argv[index] != NULL; ++index)
+    {
+        (void)snprintf(g_last_exec_args[index], sizeof(g_last_exec_args[index]), "%s", argv[index]);
+    }
+    assert(argv[index] == NULL);
+}
+
 static int stub_execve(const char *path, char *const argv[], char *const envp[])
 {
     (void)path;
-    (void)argv;
-    (void)envp;
+    g_last_execve_argv = argv;
+    g_last_execve_envp = envp;
+    record_exec_args(argv);
 
     ++g_real_execve_calls;
     if (g_real_execve_result == -1)
@@ -436,6 +461,53 @@ static pid_t stub_waitpid(pid_t pid, int *status, int options)
     return g_real_waitpid_result;
 }
 
+/** @brief Calls made to the stubbed execvpe, fexecve, system and popen. */
+static int g_real_exec_family_calls = 0;
+/** @brief `argv` passed to the most recent stubbed execvpe call. */
+static char *const *g_last_execvpe_argv = NULL;
+/** @brief `envp` passed to the most recent stubbed execvpe call. */
+static char *const *g_last_execvpe_envp = NULL;
+
+/** @brief Stub for the real execvpe. Records argv/envp; returns -1 with ENOENT. */
+static int stub_execvpe(const char *file, char *const argv[], char *const envp[])
+{
+    (void)file;
+    ++g_real_exec_family_calls;
+    g_last_execvpe_argv = argv;
+    g_last_execvpe_envp = envp;
+    record_exec_args(argv);
+    errno = ENOENT;
+    return -1;
+}
+
+/** @brief Stub for the real fexecve. Returns -1 with ENOENT. */
+static int stub_fexecve(int fd, char *const argv[], char *const envp[])
+{
+    (void)fd;
+    (void)argv;
+    (void)envp;
+    ++g_real_exec_family_calls;
+    errno = ENOENT;
+    return -1;
+}
+
+/** @brief Stub for the real system. Returns 7. */
+static int stub_system(const char *command)
+{
+    (void)command;
+    ++g_real_exec_family_calls;
+    return 7;
+}
+
+/** @brief Stub for the real popen. Returns stdin as a non-NULL stream. */
+static FILE *stub_popen(const char *command, const char *mode)
+{
+    (void)command;
+    (void)mode;
+    ++g_real_exec_family_calls;
+    return stdin;
+}
+
 /* Rename all intercepted function names to test-local wrappers before including the source. */
 #define pthread_create chaos_process_test_pthread_create_wrapper
 #define fork chaos_process_test_fork_wrapper
@@ -450,7 +522,25 @@ static pid_t stub_waitpid(pid_t pid, int *status, int options)
 #define wait3 chaos_process_test_wait3_wrapper
 #define wait4 chaos_process_test_wait4_wrapper
 #define waitid chaos_process_test_waitid_wrapper
+#define execv chaos_process_test_execv_wrapper
+#define execvp chaos_process_test_execvp_wrapper
+#define execvpe chaos_process_test_execvpe_wrapper
+#define execl chaos_process_test_execl_wrapper
+#define execlp chaos_process_test_execlp_wrapper
+#define execle chaos_process_test_execle_wrapper
+#define fexecve chaos_process_test_fexecve_wrapper
+#define system chaos_process_test_system_wrapper
+#define popen chaos_process_test_popen_wrapper
 #include "../../src/process/chaos_process_hooks.c"
+#undef popen
+#undef system
+#undef fexecve
+#undef execle
+#undef execlp
+#undef execl
+#undef execvpe
+#undef execvp
+#undef execv
 #undef waitid
 #undef wait4
 #undef wait3
@@ -1092,6 +1182,124 @@ static void test_wait_family_paths(void)
     assert(g_real_waitid_calls == 0);
 }
 
+/**
+ * @brief Invariant: the exec family follows the execve rules (fexecve the execveat
+ *   rules), system and popen the posix_spawn rules.
+ *
+ * Expected observable behaviour:
+ * - execv/execl/execle reach the real execve with the assembled argv and environ or
+ *   the given envp; execvp/execlp reach the real execvpe with environ.
+ * - An ERRNO rule on execve fails execvpe without the real call; on posix_spawn it
+ *   fails system (-1, errno) and popen (NULL, errno).
+ * - A missing real execvpe or fexecve fails with ENOSYS; system(NULL) is forwarded.
+ */
+static void test_exec_family_paths(void)
+{
+    char *const argv[] = {(char *)"tool", (char *)"-x", NULL};
+    char *const envp[] = {(char *)"A=1", NULL};
+
+    reset_wrapper_state();
+    g_chaos_process_real_execve = stub_execve;
+    g_real_execve_result = -1;
+    g_real_execve_errno = ENOENT;
+    assert(chaos_process_test_execv_wrapper("/bin/tool", argv) == -1);
+    assert(g_last_execve_argv == argv);
+    assert(g_last_execve_envp == environ);
+
+    assert(chaos_process_test_execl_wrapper("/bin/tool", "tool", "-x", "-y", (char *)NULL) == -1);
+    assert(strcmp(g_last_exec_args[0], "tool") == 0);
+    assert(strcmp(g_last_exec_args[2], "-y") == 0);
+    assert(g_last_execve_envp == environ);
+
+    assert(chaos_process_test_execle_wrapper("/bin/tool", "tool", (char *)NULL, envp) == -1);
+    assert(strcmp(g_last_exec_args[0], "tool") == 0);
+    assert(g_last_exec_args[1][0] == '\0');
+    assert(g_last_execve_envp == envp);
+    assert(chaos_process_test_execle_wrapper("/bin/tool", "tool", "-v", (char *)NULL, envp) == -1);
+    assert(strcmp(g_last_exec_args[1], "-v") == 0);
+    assert(g_last_execve_envp == envp);
+
+    reset_wrapper_state();
+    g_real_exec_family_calls = 0;
+    g_chaos_process_real_execvpe = stub_execvpe;
+    assert(chaos_process_test_execvp_wrapper("tool", argv) == -1);
+    assert(g_last_execvpe_argv == argv);
+    assert(g_last_execvpe_envp == environ);
+    assert(chaos_process_test_execlp_wrapper("tool", "tool", "-z", (char *)NULL) == -1);
+    assert(strcmp(g_last_exec_args[1], "-z") == 0);
+    assert(g_last_exec_args[2][0] == '\0');
+    g_chaos_process_tls_guard = 1;
+    assert(chaos_process_test_execvpe_wrapper("tool", argv, envp) == -1);
+    g_chaos_process_tls_guard = 0;
+    assert(g_real_exec_family_calls == 3);
+
+    g_stub_match[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_EXECVE] = 1;
+    g_stub_rules[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_EXECVE].effect =
+        CHAOS_PROCESS_EFFECT_ERRNO;
+    g_stub_rules[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_EXECVE].errnum = EACCES;
+    g_errno_trigger = 1;
+    errno = 0;
+    assert(chaos_process_test_execvpe_wrapper("tool", argv, envp) == -1);
+    assert(errno == EACCES);
+    assert(g_real_exec_family_calls == 3);
+
+    reset_wrapper_state();
+    g_chaos_process_real_execvpe = NULL;
+    g_chaos_process_real_fexecve = NULL;
+    errno = 0;
+    assert(chaos_process_test_execvpe_wrapper("tool", argv, envp) == -1);
+    assert(errno == ENOSYS);
+    errno = 0;
+    assert(chaos_process_test_fexecve_wrapper(3, argv, envp) == -1);
+    assert(errno == ENOSYS);
+
+    reset_wrapper_state();
+    g_real_exec_family_calls = 0;
+    g_chaos_process_real_fexecve = stub_fexecve;
+    assert(chaos_process_test_fexecve_wrapper(3, argv, envp) == -1);
+    assert(errno == ENOENT);
+    assert(g_real_exec_family_calls == 1);
+#ifdef __linux__
+    g_stub_match[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_EXECVEAT] = 1;
+    g_stub_rules[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_EXECVEAT].effect =
+        CHAOS_PROCESS_EFFECT_ERRNO;
+    g_stub_rules[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_EXECVEAT].errnum = EACCES;
+    g_errno_trigger = 1;
+    errno = 0;
+    assert(chaos_process_test_fexecve_wrapper(3, argv, envp) == -1);
+    assert(errno == EACCES);
+    assert(g_real_exec_family_calls == 1);
+#endif
+
+    reset_wrapper_state();
+    g_real_exec_family_calls = 0;
+    g_chaos_process_real_system = stub_system;
+    g_chaos_process_real_popen = stub_popen;
+    assert(chaos_process_test_system_wrapper("true") == 7);
+    assert(chaos_process_test_popen_wrapper("true", "r") == stdin);
+    g_chaos_process_tls_guard = 1;
+    assert(chaos_process_test_popen_wrapper("true", "r") == stdin);
+    g_chaos_process_tls_guard = 0;
+    assert(g_real_exec_family_calls == 3);
+
+    g_stub_match[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_POSIX_SPAWN] = 1;
+    g_stub_rules[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_POSIX_SPAWN].effect =
+        CHAOS_PROCESS_EFFECT_ERRNO;
+    g_stub_rules[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_POSIX_SPAWN].errnum = EAGAIN;
+    g_errno_trigger = 1;
+    errno = 0;
+    assert(chaos_process_test_system_wrapper("true") == -1);
+    assert(errno == EAGAIN);
+    errno = 0;
+    assert(chaos_process_test_popen_wrapper("true", "r") == NULL);
+    assert(errno == EAGAIN);
+    assert(chaos_process_test_system_wrapper(NULL) == 7);
+    g_chaos_process_tls_guard = 1;
+    assert(chaos_process_test_system_wrapper("true") == 7);
+    g_chaos_process_tls_guard = 0;
+    assert(g_real_exec_family_calls == 5);
+}
+
 int main(void)
 {
     test_call_real_helpers();
@@ -1105,5 +1313,6 @@ int main(void)
 #endif
     test_waitpid_paths();
     test_wait_family_paths();
+    test_exec_family_paths();
     return 0;
 }
