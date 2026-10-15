@@ -28,6 +28,8 @@
  * - `ERRNO` on `execveat` (synthetic `ENOENT`; skipped gracefully if weak symbol is NULL)
  * - `ERRNO` on `waitpid` (synthetic `EINTR`; config cleared before reaping zombie)
  * - `LATENCY` on `waitpid` (≥ 80 ms added sleep; child exits immediately)
+ * - `ERRNO` on `waitpid` also fails `wait`, `wait3`, `wait4` and `waitid`, which glibc and
+ *   musl implement with their own system calls; each still reaps once the rule is gone
  *
  * `pthread_create` errors are returned as the function's int return value, not
  * via `errno` — the probe verifies `rc == EAGAIN && errno == 0` to distinguish
@@ -56,6 +58,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -506,6 +509,89 @@ static int probe_waitpid_latency(void)
     return duration_ms >= 80LL ? 0 : 115;
 }
 
+/*
+ * wait(), wait3(), wait4() and waitid() follow the waitpid rules. Each is failed
+ * with ECHILD while a child is pending, then reaps that child once the rule is gone.
+ */
+static int probe_wait_family(void)
+{
+    struct rusage usage;
+    siginfo_t info;
+    pid_t pid;
+    int status;
+    int form;
+    int rc;
+
+    for (form = 0; form < 4; ++form)
+    {
+        int faulted;
+
+        rc = write_config("waitpid:ERRNO:ECHILD");
+        if (rc != 0)
+        {
+            return rc;
+        }
+        pid = fork();
+        if (pid < 0)
+        {
+            return 110;
+        }
+        if (pid == 0)
+        {
+            _exit(0);
+        }
+
+        errno = 0;
+        switch (form)
+        {
+        case 0:
+            faulted = wait(&status) == -1;
+            break;
+        case 1:
+            faulted = wait3(&status, 0, &usage) == -1;
+            break;
+        case 2:
+            faulted = wait4(pid, &status, 0, &usage) == -1;
+            break;
+        default:
+            faulted = waitid(P_PID, (id_t)pid, &info, WEXITED) == -1;
+            break;
+        }
+        rc = clear_config();
+        if (!faulted || errno != ECHILD)
+        {
+            (void)wait_for_child(pid, &status);
+            return 111 + form;
+        }
+        if (rc != 0)
+        {
+            (void)wait_for_child(pid, &status);
+            return rc;
+        }
+
+        switch (form)
+        {
+        case 0:
+            rc = wait(&status) == pid ? 0 : 120;
+            break;
+        case 1:
+            rc = wait3(&status, 0, &usage) == pid ? 0 : 121;
+            break;
+        case 2:
+            rc = wait4(pid, &status, 0, &usage) == pid ? 0 : 122;
+            break;
+        default:
+            rc = waitid(P_PID, (id_t)pid, &info, WEXITED) == 0 && info.si_pid == pid ? 0 : 123;
+            break;
+        }
+        if (rc != 0)
+        {
+            return rc;
+        }
+    }
+    return 0;
+}
+
 int main(void)
 {
     int rc;
@@ -541,6 +627,9 @@ int main(void)
     if (rc != 0)
         return rc;
     rc = probe_waitpid_latency();
+    if (rc != 0)
+        return rc;
+    rc = probe_wait_family();
     if (rc != 0)
         return rc;
 
