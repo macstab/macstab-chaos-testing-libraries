@@ -18,6 +18,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <poll.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,6 +39,14 @@ extern int __open64_2(const char *path, int flags);
 extern int __openat_2(int dirfd, const char *path, int flags);
 extern int __openat64_2(int dirfd, const char *path, int flags);
 extern ssize_t __recv_chk(int fd, void *buffer, size_t size, size_t buffer_size, int flags);
+extern int __poll_chk(struct pollfd *fds, nfds_t nfds, int timeout, size_t fds_size);
+extern int __ppoll_chk(
+    struct pollfd *fds,
+    nfds_t nfds,
+    const struct timespec *timeout,
+    const sigset_t *mask,
+    size_t fds_size
+);
 extern ssize_t __recvfrom_chk(
     int fd,
     void *buffer,
@@ -187,6 +196,42 @@ static void probe_net(void)
         __recvfrom_chk(server, buffer, 4U, sizeof(buffer), 0, NULL, NULL),
         ECONNRESET
     );
+    /* A fortified read on a socket reaches libchaos-net even without libchaos-io. */
+    expect_fault("__read_chk (socket)", __read_chk(server, buffer, 4U, sizeof(buffer)), ECONNRESET);
+
+    /* Data is pending, so only an injected TIMEOUT makes the fortified polls return 0. */
+    (void)snprintf(
+        rules, sizeof(rules), "tcp4://127.0.0.1:%u:poll:TIMEOUT:1.0\n", ntohs(address.sin_port)
+    );
+    write_rules("/tmp/.chaos-net.conf", rules);
+    {
+        struct pollfd pfd;
+        struct timespec timeout = {1, 0L};
+
+        if (send(client, "pong", 4U, 0) != 4)
+        {
+            perror("send");
+            exit(2);
+        }
+        pfd.fd = server;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        if (__poll_chk(&pfd, 1U, 1000, sizeof(pfd)) == 0)
+            (void)printf("ok   __poll_chk\n");
+        else
+        {
+            (void)fprintf(stderr, "FAIL __poll_chk: not timed out\n");
+            g_failures++;
+        }
+        pfd.revents = 0;
+        if (__ppoll_chk(&pfd, 1U, &timeout, NULL, sizeof(pfd)) == 0)
+            (void)printf("ok   __ppoll_chk\n");
+        else
+        {
+            (void)fprintf(stderr, "FAIL __ppoll_chk: not timed out\n");
+            g_failures++;
+        }
+    }
     (void)unlink("/tmp/.chaos-net.conf");
     (void)close(server);
     (void)close(client);

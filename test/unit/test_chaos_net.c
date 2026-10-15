@@ -2548,6 +2548,52 @@ static void test_descriptor_calls_on_sockets(void)
     reset_wrapper_stubs();
 }
 
+#if defined(__GLIBC__)
+/**
+ * @brief Invariant: the fortified read, poll and ppoll variants run the wrappers.
+ *
+ * Expected observable behaviour: within bounds the wrapper forwards to the next
+ * implementation; beyond them the overflow handler runs and nothing is forwarded.
+ */
+static void test_fortified_read_and_poll(void)
+{
+    struct pollfd fds[2];
+    struct timespec timeout = {0, 0L};
+    char buffer[8] = "xxxxxxx";
+
+    g_chaos_net_chk_fail = chaos_net_test_chk_fail;
+    (void)memset(fds, 0, sizeof(fds));
+    fds[0].fd = -1;
+    fds[1].fd = -1;
+
+    reset_descriptor_stubs();
+    g_chk_fail_calls = 0;
+    assert(__read_chk(5, buffer, 4U, sizeof(buffer)) >= 0);
+    assert(g_descriptor_calls == 1);
+    assert(__read_chk(5, buffer, 4U, 2U) == -1);
+    assert(g_chk_fail_calls == 1);
+    assert(g_descriptor_calls == 1);
+
+    reset_wrapper_stubs();
+    g_chaos_net_real_poll = chaos_net_test_poll;
+    g_chaos_net_real_ppoll = chaos_net_test_ppoll;
+    g_chk_fail_calls = 0;
+    (void)__poll_chk(fds, 2U, 0, sizeof(fds));
+    assert(g_poll_calls == 1);
+    assert(__poll_chk(fds, 2U, 0, sizeof(fds[0])) == -1);
+    assert(g_chk_fail_calls == 1);
+    assert(g_poll_calls == 1);
+
+    (void)__ppoll_chk(fds, 2U, &timeout, NULL, sizeof(fds));
+    assert(g_ppoll_calls == 1);
+    assert(__ppoll_chk(fds, 2U, &timeout, NULL, sizeof(fds[0])) == -1);
+    assert(g_chk_fail_calls == 2);
+    assert(g_ppoll_calls == 1);
+
+    g_chaos_net_chk_fail = __chk_fail;
+}
+#endif
+
 int main(void)
 {
     test_bind_and_connect_paths();
@@ -2556,6 +2602,7 @@ int main(void)
     test_descriptor_calls_on_sockets();
 #if defined(__GLIBC__)
     test_fortified_receive();
+    test_fortified_read_and_poll();
 #endif
     test_socket_and_shutdown_paths();
     test_wait_paths();

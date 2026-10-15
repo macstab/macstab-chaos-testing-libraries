@@ -742,9 +742,12 @@ CHAOS_NET_EXPORT ssize_t recvmsg(int sockfd, struct msghdr *message, int flags)
 /* ---------------------------------------------------------------------------
  * glibc fortified entry points
  *
- * `_FORTIFY_SOURCE` builds call `__recv_chk()` / `__recvfrom_chk()` instead of
- * `recv()` / `recvfrom()` when the buffer size is known. They check the buffer the
- * way glibc does and then run the wrapper. musl has no fortified variants.
+ * `_FORTIFY_SOURCE` builds call `__recv_chk()`, `__recvfrom_chk()`, `__read_chk()`,
+ * `__poll_chk()` and `__ppoll_chk()` instead of the base functions when the buffer
+ * size is known. They check the buffer the way glibc does and then run the
+ * wrapper. libchaos-io also exports `__read_chk()` for files; both forward to
+ * `read()`, which reaches both libraries in either preload order. musl has no
+ * fortified variants.
  * ------------------------------------------------------------------------- */
 #if defined(__GLIBC__)
 
@@ -784,6 +787,48 @@ CHAOS_NET_EXPORT ssize_t __recvfrom_chk(
         return -1;
     }
     return recvfrom(sockfd, buffer, size, flags, address, address_length);
+}
+
+/** @brief Fortified `read()`: aborts like glibc when @p size exceeds the buffer. */
+CHAOS_NET_EXPORT ssize_t __read_chk(int fd, void *buffer, size_t size, size_t buffer_size)
+{
+    chaos_net_ensure_symbols();
+    if (size > buffer_size)
+    {
+        g_chaos_net_chk_fail();
+        return -1;
+    }
+    return read(fd, buffer, size);
+}
+
+/** @brief Fortified `poll()`: aborts like glibc when @p nfds exceeds the array. */
+CHAOS_NET_EXPORT int __poll_chk(struct pollfd *fds, nfds_t nfds, int timeout, size_t fds_size)
+{
+    chaos_net_ensure_symbols();
+    if (fds_size / sizeof(*fds) < nfds)
+    {
+        g_chaos_net_chk_fail();
+        return -1;
+    }
+    return poll(fds, nfds, timeout);
+}
+
+/** @brief Fortified `ppoll()`: aborts like glibc when @p nfds exceeds the array. */
+CHAOS_NET_EXPORT int __ppoll_chk(
+    struct pollfd *fds,
+    nfds_t nfds,
+    const struct timespec *timeout,
+    const sigset_t *mask,
+    size_t fds_size
+)
+{
+    chaos_net_ensure_symbols();
+    if (fds_size / sizeof(*fds) < nfds)
+    {
+        g_chaos_net_chk_fail();
+        return -1;
+    }
+    return ppoll(fds, nfds, timeout, mask);
 }
 
 #endif
