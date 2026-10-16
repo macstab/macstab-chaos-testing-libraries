@@ -41,11 +41,11 @@ Current implementation status:
 8. [DSL Grammar and Rule Semantics](#8-dsl-grammar-and-rule-semantics)
 9. [Per-Hook Call Flows](#9-per-hook-call-flows)
 10. [Bypass Surfaces — When the Wrapper Is Not Invoked](#10-bypass-surfaces--when-the-wrapper-is-not-invoked)
-11. [Non-Coverage: clock_nanosleep](#11-non-coverage-clock_nanosleep)
+11. [clock_nanosleep and Absolute Deadlines](#11-clock_nanosleep-and-absolute-deadlines)
 12. [Non-Coverage: gettimeofday](#12-non-coverage-gettimeofday)
 13. [Non-Coverage: sleep and alarm](#13-non-coverage-sleep-and-alarm)
 14. [Non-Coverage: setitimer and POSIX Timer APIs](#14-non-coverage-setitimer-and-posix-timer-apis)
-15. [Non-Coverage: Futex Timeout Paths](#15-non-coverage-futex-timeout-paths)
+15. [Limit: Futex Timeouts Under a Shifted Clock](#15-limit-futex-timeouts-under-a-shifted-clock)
 16. [Non-Coverage: timerfd](#16-non-coverage-timerfd)
 17. [Reentrancy Guard and TLS State](#17-reentrancy-guard-and-tls-state)
 18. [PRNG Model](#18-prng-model)
@@ -535,7 +535,7 @@ Same reentrancy-guard logic applies.
 
 ### 7.4 Deprecation Note
 
-New code should use `nanosleep` or `clock_nanosleep` (not yet interposed; see §11).
+New code should use `nanosleep` or `clock_nanosleep` (see §11).
 `usleep` is covered here because a significant quantity of C/C++ library code
 still calls it, and injecting `usleep:ERRNO:EINTR` is a valid test for any caller
 that does not handle the return value of `usleep`.
@@ -704,27 +704,23 @@ Reference: `vdso(7)` Linux man-pages; Go source `src/runtime/sys_linux_amd64.s`;
 
 ---
 
-## 11. Non-Coverage: clock_nanosleep
+## 11. clock_nanosleep and Absolute Deadlines
 
-`clock_nanosleep(2)` (POSIX.1-2001, Linux 2.6) is a higher-precision sleep that
-takes an explicit `clockid` and supports absolute wakeup time (`TIMER_ABSTIME`).
-It is preferred over `nanosleep` in new code because:
+`clock_nanosleep(2)` follows the `nanosleep` rules (LATENCY, ERRNO); it reports
+failure by returning the error number and leaves errno untouched, and an injected
+EINTR fills `remaining` only for a relative sleep.
 
-1. It specifies which clock governs the sleep.
-2. `TIMER_ABSTIME` avoids TOCTTOU between reading the clock and computing the
-   relative sleep duration.
-3. It returns `EINTR` with a more precise `*remain` semantics relative to the
-   requested clock.
+With `TIMER_ABSTIME` the request is a deadline the program computed from the clock
+as it reads it: shifted by the `clock_gettime/<clock>` OFFSET and REGRESS rules of
+that clock. The kernel waits on the real clock, so the deadline is converted back
+before the call: an OFFSET of +O ms is subtracted, a REGRESS of R ms that has
+jumped is added. Without that, `OFFSET:3000` made "now + 100 ms" sleep 3.1 s and a
+negative offset ended every absolute sleep at once.
 
-Why not yet interposed:
-
-1. The `clockid` argument means the sub-selector grammar needs to be extended to
-   cover `clock_nanosleep/<clock>`, matching the `clock_gettime/<clock>` pattern.
-2. `TIMER_ABSTIME` sleep injection requires the library to understand absolute
-   target time vs relative offset — a semantically richer injection model than
-   the current millisecond-delay model.
-
-Candidate for next time-surface expansion. POSIX.1-2017 §11.4.2.
+Only a shift every read carries is converted: an OFFSET that fires on each read
+(probability 1, no `@first` or `@size`, its window open) and a REGRESS after its
+jump. A deadline computed from a read the probability gate left unshifted cannot
+be told apart and is passed as it is.
 
 ---
 
@@ -788,31 +784,23 @@ POSIX timer API reference: POSIX.1-2017 §14.2.1 through §14.2.5.
 
 ---
 
-## 15. Non-Coverage: Futex Timeout Paths
+## 15. Limit: Futex Timeouts Under a Shifted Clock
 
-`futex(2)` with `FUTEX_WAIT` accepts a `struct timespec *timeout` parameter
-controlling how long to block. This is the underlying primitive for:
+`futex(2)` with `FUTEX_WAIT_BITSET` and an absolute timeout is the primitive under:
 
-- `pthread_mutex_timedlock`
 - `pthread_cond_timedwait`
+- `pthread_mutex_timedlock`
 - `sem_timedwait`
-- `std::timed_mutex::try_lock_for` (C++11)
+- `std::condition_variable::wait_until`, `std::timed_mutex::try_lock_until` (C++11)
 
-The `timeout` passed to `FUTEX_WAIT` is not processed through `clock_gettime`.
-The kernel reads the value directly from the syscall argument register. There is
-no libc symbol for the timeout path; interposition is impossible via LD_PRELOAD.
-
-This means: injecting `clock_gettime/monotonic:OFFSET:+5000` does NOT affect the
-timeout in `pthread_cond_timedwait` — that function computes an absolute deadline
-from `clock_gettime(CLOCK_MONOTONIC)` before calling `futex`, but the `futex`
-syscall timeout is the raw kernel timeout value, not re-read through `clock_gettime`.
-
-However: if `pthread_cond_timedwait` calls `clock_gettime` to compute the absolute
-deadline, and our OFFSET fires, the deadline passed to `futex` is shifted by the
-OFFSET. So there is indirect coverage through the deadline computation step.
-
-This indirect path requires the application to use `CLOCK_MONOTONIC` for the
-condition variable (the default on Linux; `pthread_condattr_setclock` can change it).
+The program computes the absolute deadline from `clock_gettime`, which an OFFSET
+or REGRESS rule shifts, and passes it on; libc hands it to the kernel, which
+compares it with the real clock. These functions are not interposed, so the
+deadline is not converted as it is for `clock_nanosleep` (§11): under
+`clock_gettime/realtime:OFFSET:-3000` a one-second `pthread_cond_timedwait`
+returns ETIMEDOUT at once, and a positive offset makes it wait that much longer.
+Shift a clock only for programs whose waits do not depend on it, or expect their
+timed waits to be off by the shift.
 
 ---
 

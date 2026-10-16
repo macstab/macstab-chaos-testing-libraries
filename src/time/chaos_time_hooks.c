@@ -535,6 +535,12 @@ CHAOS_TIME_EXPORT unsigned int sleep(unsigned int seconds)
  * fills @p remaining for a relative sleep only; POSIX does not write it for
  * TIMER_ABSTIME.
  *
+ * A TIMER_ABSTIME deadline was computed from the clock as the program reads it,
+ * shifted by the clock_gettime OFFSET and REGRESS rules of @p clock_id; the
+ * kernel waits on the real clock. The deadline is converted back first
+ * (chaos_time_rule_unshift_deadline()), so a shifted clock neither stalls an
+ * absolute sleep nor ends it at once.
+ *
  * @param clock_id   Clock to sleep against.
  * @param flags      0 or TIMER_ABSTIME.
  * @param request    Requested duration or absolute deadline.
@@ -577,6 +583,25 @@ CHAOS_TIME_EXPORT int clock_nanosleep(
         return injected;
     }
 
+    if ((flags & TIMER_ABSTIME) != 0)
+    {
+        chaos_time_rule_t offset_rule;
+        chaos_time_rule_t regress_rule;
+        const int has_offset = chaos_time_config_match(
+            CHAOS_TIME_EFFECT_OFFSET, CHAOS_TIME_OP_CLOCK_GETTIME, clock_id, &offset_rule
+        );
+        const int has_regress = chaos_time_config_match(
+            CHAOS_TIME_EFFECT_REGRESS, CHAOS_TIME_OP_CLOCK_GETTIME, clock_id, &regress_rule
+        );
+        struct timespec deadline = *request;
+
+        if (chaos_time_rule_unshift_deadline(
+                has_offset ? &offset_rule : NULL, has_regress ? &regress_rule : NULL, &deadline
+            ))
+        {
+            return chaos_time_call_real_clock_nanosleep(clock_id, flags, &deadline, remaining);
+        }
+    }
     return chaos_time_call_real_clock_nanosleep(clock_id, flags, request, remaining);
 }
 

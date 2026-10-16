@@ -192,4 +192,24 @@ void chaos_time_rule_apply_offset(const chaos_time_rule_t *rule, struct timespec
  */
 void chaos_time_rule_apply_regress(const chaos_time_rule_t *rule, struct timespec *value);
 
+/**
+ * Converts an absolute deadline the program computed from its shifted clock back
+ * to the real clock (clock_nanosleep with TIMER_ABSTIME), which the kernel waits on.
+ *
+ * Only a shift every read carries is undone: an OFFSET rule that fires on each
+ * read (probability 1, no `@first` or `@size`, its window open) and a REGRESS rule
+ * that has jumped. Nothing is counted or claimed. A deadline before the epoch is
+ * clamped to {0, 0}.
+ *
+ * @param offset_rule   The OFFSET rule of the deadline's clock, or NULL.
+ * @param regress_rule  The REGRESS rule of the deadline's clock, or NULL.
+ * @param deadline      Deadline to convert in place.
+ * @return 1 when @p deadline was changed, 0 when it stays as it is.
+ */
+int chaos_time_rule_unshift_deadline(
+    const chaos_time_rule_t *offset_rule,
+    const chaos_time_rule_t *regress_rule,
+    struct timespec *deadline
+);
+
 #endif

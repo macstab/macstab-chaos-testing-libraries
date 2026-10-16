@@ -219,6 +219,29 @@ void chaos_time_rule_apply_regress(const chaos_time_rule_t *rule, struct timespe
     ++g_regress_calls;
 }
 
+/** @brief Number of times `chaos_time_rule_unshift_deadline()` was called. */
+static int g_unshift_calls = 0;
+
+/**
+ * @brief Stub for `chaos_time_rule_unshift_deadline()`: moves the deadline back by
+ *        the OFFSET rule's offset_ms when one is given.
+ */
+int chaos_time_rule_unshift_deadline(
+    const chaos_time_rule_t *offset_rule,
+    const chaos_time_rule_t *regress_rule,
+    struct timespec *deadline
+)
+{
+    (void)regress_rule;
+    ++g_unshift_calls;
+    if (offset_rule == NULL)
+    {
+        return 0;
+    }
+    deadline->tv_sec -= (time_t)(offset_rule->offset_ms / 1000);
+    return 1;
+}
+
 /**
  * @brief Stub for `chaos_time_rule_apply_offset()`.
  */
@@ -348,14 +371,19 @@ static time_t chaos_time_test_time(time_t *out)
 }
 
 /** @brief Stub for the real `clock_nanosleep(2)`. Returns 0 or `g_real_nanosleep_error`. */
+static struct timespec g_real_clock_nanosleep_request;
+
 static int chaos_time_test_clock_nanosleep(
     clockid_t clock_id, int flags, const struct timespec *request, struct timespec *remaining
 )
 {
     (void)clock_id;
     (void)flags;
-    (void)request;
     (void)remaining;
+    if (request != NULL)
+    {
+        g_real_clock_nanosleep_request = *request;
+    }
     ++g_real_clock_nanosleep_calls;
     return g_real_nanosleep_error;
 }
@@ -798,6 +826,26 @@ static void test_clock_nanosleep_paths(void)
     assert(clock_nanosleep(CLOCK_MONOTONIC, 0, &request, &remaining) == EINVAL);
     assert(remaining.tv_sec == 0);
     assert(g_real_clock_nanosleep_calls == 0);
+
+    /* An absolute deadline from a shifted clock is converted back before the kernel
+     * waits on the real one; a relative sleep is left alone. */
+    reset_wrapper_state();
+    g_chaos_time_real_clock_nanosleep = chaos_time_test_clock_nanosleep;
+    g_unshift_calls = 0;
+    g_stub_match[CHAOS_TIME_EFFECT_OFFSET][CHAOS_TIME_OP_CLOCK_GETTIME] = 1;
+    g_stub_rules[CHAOS_TIME_EFFECT_OFFSET][CHAOS_TIME_OP_CLOCK_GETTIME].effect =
+        CHAOS_TIME_EFFECT_OFFSET;
+    g_stub_rules[CHAOS_TIME_EFFECT_OFFSET][CHAOS_TIME_OP_CLOCK_GETTIME].offset_ms = 2000;
+    assert(clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &request, NULL) == 0);
+    assert(g_unshift_calls == 1);
+    assert(g_real_clock_nanosleep_request.tv_sec == request.tv_sec - 2);
+    assert(clock_nanosleep(CLOCK_MONOTONIC, 0, &request, NULL) == 0);
+    assert(g_unshift_calls == 1);
+    assert(g_real_clock_nanosleep_request.tv_sec == request.tv_sec);
+    g_stub_match[CHAOS_TIME_EFFECT_OFFSET][CHAOS_TIME_OP_CLOCK_GETTIME] = 0;
+    assert(clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &request, NULL) == 0);
+    assert(g_unshift_calls == 2);
+    assert(g_real_clock_nanosleep_request.tv_sec == request.tv_sec);
 }
 
 /**

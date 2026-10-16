@@ -439,9 +439,82 @@ static void test_regress_goes_back_once(void)
     chaos_time_rule_apply_regress(&rule, NULL);
 }
 
+/**
+ * @brief Invariant: an absolute deadline is converted back by the shift every read
+ *   carries, and only by that.
+ *
+ * Expected observable behaviour: OFFSET +2000 ms at probability 1 moves {100 s} to
+ * {98 s}; at probability below 1, with `@first`, with `@size` or outside its window
+ * it does not. REGRESS 5000 ms moves it 5 s later once it has jumped (state 2), not
+ * before, nor with an outdated slot. Both together add up. No rule: unchanged.
+ */
+static void test_unshift_deadline(void)
+{
+    chaos_time_rule_t offset;
+    chaos_time_rule_t regress;
+    chaos_hit_slot_t slot;
+    struct timespec deadline;
+
+    memset(&offset, 0, sizeof(offset));
+    memset(&regress, 0, sizeof(regress));
+    memset(&slot, 0, sizeof(slot));
+    offset.effect = CHAOS_TIME_EFFECT_OFFSET;
+    offset.offset_ms = 2000;
+    offset.probability = 1.0;
+    regress.effect = CHAOS_TIME_EFFECT_REGRESS;
+    regress.offset_ms = 5000;
+    regress.hit = &slot;
+
+    deadline.tv_sec = 100;
+    deadline.tv_nsec = 0L;
+    assert(chaos_time_rule_unshift_deadline(NULL, NULL, &deadline) == 0);
+    assert(chaos_time_rule_unshift_deadline(&offset, NULL, &deadline) == 1);
+    assert(deadline.tv_sec == 98);
+
+    offset.probability = 0.5;
+    assert(chaos_time_rule_unshift_deadline(&offset, NULL, &deadline) == 0);
+    offset.probability = 1.0;
+    offset.policy.first = 1U;
+    assert(chaos_time_rule_unshift_deadline(&offset, NULL, &deadline) == 0);
+    offset.policy.first = 0U;
+    offset.policy.has_size_above = 1U;
+    assert(chaos_time_rule_unshift_deadline(&offset, NULL, &deadline) == 0);
+    offset.policy.has_size_above = 0U;
+    offset.policy.has_size_below = 1U;
+    assert(chaos_time_rule_unshift_deadline(&offset, NULL, &deadline) == 0);
+    offset.policy.has_size_below = 0U;
+    offset.policy.until_ms = 1;
+    assert(chaos_time_rule_unshift_deadline(&offset, NULL, &deadline) == 0);
+    offset.policy.until_ms = 0;
+    assert(deadline.tv_sec == 98);
+
+    slot.state = 1U;
+    assert(chaos_time_rule_unshift_deadline(NULL, &regress, &deadline) == 0);
+    slot.state = 2U;
+    slot.generation = 1U;
+    assert(chaos_time_rule_unshift_deadline(NULL, &regress, &deadline) == 0);
+    slot.generation = 0U;
+    regress.policy.until_ms = 1;
+    assert(chaos_time_rule_unshift_deadline(NULL, &regress, &deadline) == 0);
+    regress.policy.until_ms = 0;
+    assert(chaos_time_rule_unshift_deadline(NULL, &regress, &deadline) == 1);
+    assert(deadline.tv_sec == 103);
+    assert(chaos_time_rule_unshift_deadline(&offset, &regress, &deadline) == 1);
+    assert(deadline.tv_sec == 106);
+
+    /* Wrong effects or a REGRESS without a slot change nothing. */
+    regress.hit = NULL;
+    offset.effect = CHAOS_TIME_EFFECT_REGRESS;
+    assert(chaos_time_rule_unshift_deadline(&offset, &regress, &deadline) == 0);
+    regress.hit = &slot;
+    regress.effect = CHAOS_TIME_EFFECT_OFFSET;
+    assert(chaos_time_rule_unshift_deadline(&offset, &regress, &deadline) == 0);
+}
+
 int main(void)
 {
     test_regress_goes_back_once();
+    test_unshift_deadline();
     test_should_trigger_honours_qualifiers();
     test_should_trigger_counts_hits();
     test_probability_helpers();

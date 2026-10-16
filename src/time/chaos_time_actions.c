@@ -339,3 +339,36 @@ void chaos_time_rule_apply_regress(const chaos_time_rule_t *rule, struct timespe
     }
     chaos_time_add_offset_ms(value, -rule->offset_ms);
 }
+
+/**
+ * @copydoc chaos_time_rule_unshift_deadline
+ *
+ * Implementation notes: the program saw now + O under OFFSET and now - R after a
+ * REGRESS jump, so its deadline is O ahead of and R behind the real one.
+ */
+int chaos_time_rule_unshift_deadline(
+    const chaos_time_rule_t *offset_rule,
+    const chaos_time_rule_t *regress_rule,
+    struct timespec *deadline
+)
+{
+    int changed = 0;
+
+    if (offset_rule != NULL && offset_rule->effect == CHAOS_TIME_EFFECT_OFFSET &&
+        offset_rule->probability >= 1.0 && offset_rule->policy.first == 0U &&
+        !offset_rule->policy.has_size_above && !offset_rule->policy.has_size_below &&
+        chaos_policy_window_open(&offset_rule->policy))
+    {
+        chaos_time_add_offset_ms(deadline, -offset_rule->offset_ms);
+        changed = 1;
+    }
+    if (regress_rule != NULL && regress_rule->effect == CHAOS_TIME_EFFECT_REGRESS &&
+        regress_rule->hit != NULL &&
+        chaos_hit_slot_current(regress_rule->hit, regress_rule->hit_generation) &&
+        regress_rule->hit->state == 2U && chaos_policy_window_open(&regress_rule->policy))
+    {
+        chaos_time_add_offset_ms(deadline, regress_rule->offset_ms);
+        changed = 1;
+    }
+    return changed;
+}

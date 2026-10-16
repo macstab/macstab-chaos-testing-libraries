@@ -410,6 +410,55 @@ static int probe_clock_regress(void)
     return write_config("# clear");
 }
 
+/** @brief CLOCK_MONOTONIC from the kernel, past every rule. */
+static void raw_monotonic(struct timespec *now)
+{
+    (void)syscall(SYS_clock_gettime, CLOCK_MONOTONIC, now);
+}
+
+/**
+ * @brief An absolute sleep to "now + 100 ms" on a shifted clock takes 100 ms.
+ *
+ * The deadline is computed from the clock as the program reads it, 3 s ahead under
+ * OFFSET; the kernel waits on the real clock. Unconverted it would take 3.1 s.
+ */
+static int probe_absolute_sleep_offset(void)
+{
+    struct timespec deadline;
+    struct timespec start;
+    struct timespec end;
+    long long duration_ms;
+    int rc = write_config("clock_gettime/monotonic:OFFSET:3000");
+
+    if (rc != 0)
+    {
+        return rc;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0)
+    {
+        return 130;
+    }
+    deadline.tv_nsec += 100000000L;
+    if (deadline.tv_nsec >= 1000000000L)
+    {
+        deadline.tv_nsec -= 1000000000L;
+        ++deadline.tv_sec;
+    }
+    raw_monotonic(&start);
+    if (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, NULL) != 0)
+    {
+        return 131;
+    }
+    raw_monotonic(&end);
+    duration_ms = elapsed_ms(&start, &end);
+    if (duration_ms < 50LL || duration_ms > 1000LL)
+    {
+        (void)fprintf(stderr, "absolute sleep under OFFSET took %lld ms\n", duration_ms);
+        return 132;
+    }
+    return write_config("# clear");
+}
+
 int main(void)
 {
     int rc;
@@ -425,6 +474,11 @@ int main(void)
         return rc;
     }
     rc = probe_clock_regress();
+    if (rc != 0)
+    {
+        return rc;
+    }
+    rc = probe_absolute_sleep_offset();
     if (rc != 0)
     {
         return rc;
