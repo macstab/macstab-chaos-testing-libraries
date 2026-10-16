@@ -1382,24 +1382,19 @@ int chaos_dns_config_parse_line(char *line, chaos_dns_rule_t *rule)
         return -1;
     }
 
+    /* GAI, LATENCY, REWRITE and SERVICE apply to lookups and reverse lookups alike,
+     * the only domains chaos_dns_selector_parse() produces: only the other effects
+     * ask chaos_dns_effect_allowed(). */
     gai_error = chaos_dns_parse_gai_name(effect_text);
     if (gai_error != 0x7fffffff)
     {
         rule->effect = CHAOS_DNS_EFFECT_GAI;
         rule->gai_error = gai_error;
-        if (!chaos_dns_effect_allowed(&rule->selector, rule->effect))
-        {
-            return -1;
-        }
         return chaos_dns_parse_probability(value_text, &rule->probability) == 0 ? 1 : -1;
     }
     if (strcmp(effect_text, "LATENCY") == 0)
     {
         rule->effect = CHAOS_DNS_EFFECT_LATENCY;
-        if (!chaos_dns_effect_allowed(&rule->selector, rule->effect))
-        {
-            return -1;
-        }
         if (chaos_dns_parse_payload_probability(
                 value_text, payload, sizeof(payload), &rule->probability
             ) != 0)
@@ -1411,10 +1406,6 @@ int chaos_dns_config_parse_line(char *line, chaos_dns_rule_t *rule)
     if (strcmp(effect_text, "REWRITE") == 0)
     {
         rule->effect = CHAOS_DNS_EFFECT_REWRITE;
-        if (!chaos_dns_effect_allowed(&rule->selector, rule->effect))
-        {
-            return -1;
-        }
         if (chaos_dns_parse_payload_probability(
                 value_text, payload, sizeof(payload), &rule->probability
             ) != 0)
@@ -1426,10 +1417,6 @@ int chaos_dns_config_parse_line(char *line, chaos_dns_rule_t *rule)
     if (strcmp(effect_text, "SERVICE") == 0)
     {
         rule->effect = CHAOS_DNS_EFFECT_SERVICE;
-        if (!chaos_dns_effect_allowed(&rule->selector, rule->effect))
-        {
-            return -1;
-        }
         if (chaos_dns_parse_payload_probability(
                 value_text, payload, sizeof(payload), &rule->probability
             ) != 0)

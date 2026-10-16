@@ -30,9 +30,8 @@
  *   clear all call counters, stub tables, and function-pointer globals.
  *
  * Properties under test:
- * - `chaos_dns_copy_text_or_null()`: NULL input returns 0 with target == NULL; valid input
- *   copies and sets target; buffer-too-short returns non-zero; NULL out-pointer non-zero.
- * - `chaos_dns_copy_output_text()`: copies on success; non-zero on buffer-too-short.
+ * - `chaos_dns_copy_output_text()`: copies on success; non-zero on buffer-too-short or
+ *   nothing to copy.
  * - `chaos_dns_strip_ipv6_brackets()`: strips `[` and `]` from `[::1]`; passes through
  *   IPv4 strings unchanged; NULL input returns non-zero.
  * - `chaos_dns_reverse_query_from_sockaddr()`: extracts dotted-decimal IPv4 from sockaddr_in;
@@ -595,19 +594,17 @@ static int chaos_dns_test_gethostbyaddr_r(
  * @brief Invariant: static helper functions enforce bounds and produce correct output.
  *
  * Triggering conditions:
- * - `chaos_dns_copy_text_or_null()` with NULL, valid, too-long, and NULL out-pointer inputs.
- * - `chaos_dns_copy_output_text()` with valid and too-long inputs.
- * - `chaos_dns_strip_ipv6_brackets()` with bracketed IPv6, plain IPv4, and NULL.
- * - `chaos_dns_reverse_query_from_sockaddr()` with valid and too-short sockaddr_in.
+ * - `chaos_dns_copy_output_text()` with valid, too-long and NULL inputs.
+ * - `chaos_dns_strip_ipv6_brackets()` with bracketed IPv6, plain IPv4, NULL, empty and
+ *   too-long tokens.
+ * - `chaos_dns_reverse_query_from_sockaddr()` with valid and too-short sockaddr_in and
+ *   sockaddr_in6, NULL, and a family without addresses.
  * - `chaos_dns_literal_family()` tells IPv4 and IPv6 literals from names.
  * - `chaos_dns_call_real_getaddrinfo()` and `chaos_dns_call_real_getnameinfo()` dispatch
  *   correctly with call counters incremented.
  *
  * Expected observable behaviour:
- * - `copy_text_or_null(NULL, ...)` → 0; `*target == NULL`.
- * - `copy_text_or_null("hello", buf, sizeof(buf), &target)` → 0; `strcmp(target, "hello") == 0`.
- * - Too-long string → non-zero return.
- * - NULL out-pointer → non-zero return.
+ * - Too-long or missing input → non-zero return (0 for the sockaddr query).
  * - `copy_output_text("hello", buf, sizeof(buf))` → 0; buffer contains "hello".
  * - `strip_ipv6_brackets("[::1]", host, sizeof(host))` → 0; `strcmp(host, "::1") == 0`.
  * - `strip_ipv6_brackets("127.0.0.1", host, sizeof(host))` → 0; string unchanged.
@@ -620,7 +617,6 @@ static int chaos_dns_test_gethostbyaddr_r(
  */
 static void test_static_helpers(void)
 {
-    const char *target = NULL;
     char buffer[16];
     char host[16];
     char service[16];
@@ -628,21 +624,22 @@ static void test_static_helpers(void)
     struct sockaddr_in ipv4;
 
     reset_wrapper_state();
-    assert(chaos_dns_copy_text_or_null(NULL, buffer, sizeof(buffer), &target) == 0);
-    assert(target == NULL);
-    assert(chaos_dns_copy_text_or_null("hello", buffer, sizeof(buffer), &target) == 0);
-    assert(strcmp(target, "hello") == 0);
-    assert(chaos_dns_copy_text_or_null("toolong", buffer, 4U, &target) != 0);
-    assert(chaos_dns_copy_text_or_null("hello", buffer, sizeof(buffer), NULL) != 0);
     assert(chaos_dns_copy_output_text("hello", buffer, sizeof(buffer)) == 0);
     assert(strcmp(buffer, "hello") == 0);
     assert(chaos_dns_copy_output_text("toolong", buffer, 4U) != 0);
+    assert(chaos_dns_copy_output_text(NULL, buffer, sizeof(buffer)) != 0);
+    assert(chaos_dns_copy_output_text("a", NULL, sizeof(buffer)) != 0);
+    assert(chaos_dns_copy_output_text("a", buffer, 0U) != 0);
 
     assert(chaos_dns_strip_ipv6_brackets("[::1]", host, sizeof(host)) == 0);
     assert(strcmp(host, "::1") == 0);
     assert(chaos_dns_strip_ipv6_brackets("127.0.0.1", host, sizeof(host)) == 0);
     assert(strcmp(host, "127.0.0.1") == 0);
     assert(chaos_dns_strip_ipv6_brackets(NULL, host, sizeof(host)) != 0);
+    assert(chaos_dns_strip_ipv6_brackets("", host, sizeof(host)) != 0);
+    /* Too long for the host buffer, with and without brackets. */
+    assert(chaos_dns_strip_ipv6_brackets("[1111:2222:3333:4444::1]", host, sizeof(host)) != 0);
+    assert(chaos_dns_strip_ipv6_brackets("1111:2222:3333:4444::1", host, sizeof(host)) != 0);
 
     (void)memset(&ipv4, 0, sizeof(ipv4));
     ipv4.sin_family = AF_INET;
@@ -655,6 +652,33 @@ static void test_static_helpers(void)
     assert(!chaos_dns_reverse_query_from_sockaddr(
         (const struct sockaddr *)&ipv4, (socklen_t)sizeof(sa_family_t), host, sizeof(host)
     ));
+    /* Nothing to read, an IPv6 address whole or cut short, a family without addresses. */
+    assert(!chaos_dns_reverse_query_from_sockaddr(NULL, (socklen_t)sizeof(ipv4), host, sizeof(host))
+    );
+    {
+        struct sockaddr_in6 ipv6;
+        char text[INET6_ADDRSTRLEN];
+        struct sockaddr unix_address;
+
+        (void)memset(&ipv6, 0, sizeof(ipv6));
+        ipv6.sin6_family = AF_INET6;
+        assert(inet_pton(AF_INET6, "fd00::1", &ipv6.sin6_addr) == 1);
+        assert(chaos_dns_reverse_query_from_sockaddr(
+            (const struct sockaddr *)&ipv6, (socklen_t)sizeof(ipv6), text, sizeof(text)
+        ));
+        assert(strcmp(text, "fd00::1") == 0);
+        assert(!chaos_dns_reverse_query_from_sockaddr(
+            (const struct sockaddr *)&ipv6,
+            (socklen_t)sizeof(struct sockaddr_in),
+            text,
+            sizeof(text)
+        ));
+        (void)memset(&unix_address, 0, sizeof(unix_address));
+        unix_address.sa_family = AF_UNIX;
+        assert(!chaos_dns_reverse_query_from_sockaddr(
+            &unix_address, (socklen_t)sizeof(unix_address), text, sizeof(text)
+        ));
+    }
 
     assert(chaos_dns_literal_family("10.0.0.1") == AF_INET);
     assert(chaos_dns_literal_family("fd00::1") == AF_INET6);
@@ -852,6 +876,52 @@ static void test_reverse_lookup_paths(void)
     g_chaos_dns_real_getnameinfo = chaos_dns_test_getnameinfo;
     g_stub_match[CHAOS_DNS_EFFECT_REWRITE] = 1;
     g_stub_rules[CHAOS_DNS_EFFECT_REWRITE].effect = CHAOS_DNS_EFFECT_REWRITE;
+    /* A failed real lookup is returned as it is, no rule applied. */
+    {
+        char untouched[16] = "untouched";
+
+        reset_wrapper_state();
+        g_chaos_dns_real_getnameinfo = chaos_dns_test_getnameinfo;
+        g_real_getnameinfo_error = EAI_NONAME;
+        g_stub_match[CHAOS_DNS_EFFECT_REWRITE] = 1;
+        g_stub_rules[CHAOS_DNS_EFFECT_REWRITE].effect = CHAOS_DNS_EFFECT_REWRITE;
+        (void)memcpy(g_stub_rules[CHAOS_DNS_EFFECT_REWRITE].text, "ptr.example", 12U);
+        assert(
+            getnameinfo(
+                (const struct sockaddr *)&ipv4,
+                (socklen_t)sizeof(ipv4),
+                untouched,
+                (socklen_t)sizeof(untouched),
+                service,
+                (socklen_t)sizeof(service),
+                0
+            ) == EAI_NONAME
+        );
+        assert(strcmp(untouched, "untouched") == 0);
+    }
+
+    /* A service name too long for the caller's buffer is EAI_OVERFLOW. */
+    reset_wrapper_state();
+    g_chaos_dns_real_getnameinfo = chaos_dns_test_getnameinfo;
+    g_stub_match[CHAOS_DNS_EFFECT_SERVICE] = 1;
+    g_stub_rules[CHAOS_DNS_EFFECT_SERVICE].effect = CHAOS_DNS_EFFECT_SERVICE;
+    (void)memcpy(g_stub_rules[CHAOS_DNS_EFFECT_SERVICE].text, "service-name-too-long", 22U);
+    assert(
+        getnameinfo(
+            (const struct sockaddr *)&ipv4,
+            (socklen_t)sizeof(ipv4),
+            host,
+            (socklen_t)sizeof(host),
+            service,
+            8U,
+            0
+        ) == EAI_OVERFLOW
+    );
+
+    reset_wrapper_state();
+    g_chaos_dns_real_getnameinfo = chaos_dns_test_getnameinfo;
+    g_stub_match[CHAOS_DNS_EFFECT_REWRITE] = 1;
+    g_stub_rules[CHAOS_DNS_EFFECT_REWRITE].effect = CHAOS_DNS_EFFECT_REWRITE;
     /* 24-byte string deliberately exceeds the 12-byte host buffer used below. */
     (void)memcpy(g_stub_rules[CHAOS_DNS_EFFECT_REWRITE].text, "name-too-long-for-buffer", 25U);
     assert(
@@ -912,6 +982,19 @@ static void test_latency_and_gai_paths(void)
     g_stub_rules[CHAOS_DNS_EFFECT_GAI].gai_error = EAI_AGAIN;
     g_gai_trigger = 1;
     assert(getaddrinfo("api.example.com", NULL, NULL, NULL) == EAI_AGAIN);
+    assert(g_real_getaddrinfo_calls == 0);
+
+    /* EAI_SYSTEM tells the caller to look at errno: it holds a system error. */
+    reset_wrapper_state();
+    g_chaos_dns_real_getaddrinfo = chaos_dns_test_getaddrinfo;
+    g_chaos_dns_real_freeaddrinfo = chaos_dns_test_freeaddrinfo;
+    g_stub_match[CHAOS_DNS_EFFECT_GAI] = 1;
+    g_stub_rules[CHAOS_DNS_EFFECT_GAI].effect = CHAOS_DNS_EFFECT_GAI;
+    g_stub_rules[CHAOS_DNS_EFFECT_GAI].gai_error = EAI_SYSTEM;
+    g_gai_trigger = 1;
+    errno = 0;
+    assert(getaddrinfo("api.example.com", NULL, NULL, &result) == EAI_SYSTEM);
+    assert(errno == EIO);
     assert(g_real_getaddrinfo_calls == 0);
 }
 

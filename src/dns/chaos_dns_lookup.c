@@ -151,47 +151,6 @@ static int chaos_dns_call_real_getnameinfo(
  * ------------------------------------------------------------------------- */
 
 /**
- * @brief Copy @p text into @p buffer and set *target to point into @p buffer,
- *        or set *target = NULL if @p text is NULL.
- *
- * @details Used to substitute hostname and service inputs before the real
- * resolver call.  The caller passes a stack-allocated buffer; this function
- * either copies the text into it (so the pointer's lifetime is the caller's
- * stack frame) or leaves *target as NULL when no substitution is needed.
- *
- * @param text         Source string; NULL means "no substitution".
- * @param buffer       Writable buffer to copy into if @p text is non-NULL.
- * @param buffer_size  Size of @p buffer.
- * @param target       Output: receives either a pointer into @p buffer or NULL.
- * @return  0 on success; -1 if @p text is non-NULL but too long for @p buffer.
- */
-static int
-chaos_dns_copy_text_or_null(const char *text, char *buffer, size_t buffer_size, const char **target)
-{
-    size_t len;
-
-    if (target == NULL)
-    {
-        return -1;
-    }
-    if (text == NULL)
-    {
-        *target = NULL;
-        return 0;
-    }
-
-    len = strlen(text);
-    if (len >= buffer_size)
-    {
-        return -1;
-    }
-
-    (void)memcpy(buffer, text, len + 1U);
-    *target = buffer;
-    return 0;
-}
-
-/**
  * @brief Copy @p text into a caller-supplied output buffer of size @p target_size.
  *
  * @details Used to overwrite getnameinfo output buffers for REWRITE and SERVICE
@@ -475,8 +434,6 @@ static int chaos_dns_resolve_with_rules(
     chaos_dns_rule_t filter_rule;
     chaos_dns_rule_t shuffle_rule;
     chaos_dns_rule_t limit_rule;
-    char node_buffer[CHAOS_DNS_MAX_VALUE];
-    char service_buffer[CHAOS_DNS_MAX_VALUE];
     const char *effective_node = node;
     const char *effective_service = service;
     const struct addrinfo *owned = NULL;
@@ -492,24 +449,15 @@ static int chaos_dns_resolve_with_rules(
     if (chaos_dns_config_match(CHAOS_DNS_EFFECT_REWRITE, node, &rewrite_rule) &&
         chaos_dns_rule_should_trigger(&rewrite_rule))
     {
-        if (chaos_dns_copy_text_or_null(
-                rewrite_rule.text, node_buffer, sizeof(node_buffer), &effective_node
-            ) != 0)
-        {
-            return EAI_FAIL;
-        }
+        /* The rule copy lives until the call returns. */
+        effective_node = rewrite_rule.text;
     }
 
     /* 6. SERVICE: substitute the service/port string. */
     if (chaos_dns_config_match(CHAOS_DNS_EFFECT_SERVICE, node, &service_rule) &&
         chaos_dns_rule_should_trigger(&service_rule))
     {
-        if (chaos_dns_copy_text_or_null(
-                service_rule.text, service_buffer, sizeof(service_buffer), &effective_service
-            ) != 0)
-        {
-            return EAI_FAIL;
-        }
+        effective_service = service_rule.text;
     }
 
     /* 7. OVERRIDE or real call.

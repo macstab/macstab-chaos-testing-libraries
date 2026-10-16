@@ -763,6 +763,7 @@ static void test_prepare_and_match(void)
     write_config_text("dns://api.example.com:OVERRIDE:not-a-host\n", 15);
     assert(!chaos_dns_config_prepare());
     assert(!chaos_dns_config_match_loaded(CHAOS_DNS_EFFECT_OVERRIDE, "api.example.com", &rule));
+    assert(!chaos_dns_config_match_reverse_loaded(CHAOS_DNS_EFFECT_REWRITE, "127.0.0.1", &rule));
     assert(!chaos_dns_config_match(CHAOS_DNS_EFFECT_OVERRIDE, NULL, &rule));
     assert(!chaos_dns_config_match_reverse(CHAOS_DNS_EFFECT_REWRITE, NULL, &rule));
 
@@ -1440,6 +1441,159 @@ static void test_pending_hits_written_after_interval(void)
     g_chaos_dns_check_interval_ns = interval;
 }
 
+/**
+ * @brief Invariant: every parser and matcher refuses what it cannot handle instead of
+ *   reading past it: missing arguments, over-long or malformed selectors and values,
+ *   rule lines whose fields are missing, and effects a selector domain does not allow.
+ *
+ * Triggering condition: the helpers called directly with NULL and boundary inputs, and
+ *   `chaos_dns_config_parse_line` with one malformed line per rejection.
+ *
+ * Expected observable behaviour: each call reports failure (0, -1, NULL, INVALID or
+ *   0x7fffffff) and leaves its output alone; the accepted forms (`dns://\*`, the
+ *   remaining EAI names, `any`) parse to their values.
+ */
+static void test_rejections(void)
+{
+    chaos_dns_selector_t selector;
+    chaos_dns_rule_t rule;
+    chaos_dns_rule_t rules[2];
+    char payload[CHAOS_DNS_MAX_VALUE];
+    char long_text[CHAOS_DNS_MAX_VALUE + 8U];
+    char line[CHAOS_DNS_MAX_VALUE + 64U];
+    size_t count = 7U;
+    double probability = 0.0;
+    unsigned int value = 0U;
+    unsigned int rank = 9U;
+
+    /* Helpers given nothing to work on. */
+    chaos_dns_config_reset_state(NULL, 1);
+    assert(chaos_dns_trim(NULL) == NULL);
+    chaos_dns_strip_comment(NULL);
+    assert(!chaos_dns_ascii_case_equal(NULL, "a") && !chaos_dns_ascii_case_equal("a", NULL));
+    assert(
+        !chaos_dns_ascii_case_ends_with(NULL, "a") && !chaos_dns_ascii_case_ends_with("a", NULL)
+    );
+    assert(!chaos_dns_ascii_case_ends_with("com", "example.com"));
+    assert(chaos_dns_parse_latency(NULL, &value) == -1 && chaos_dns_parse_latency("1", NULL) == -1);
+    assert(chaos_dns_parse_limit(NULL, &value) == -1 && chaos_dns_parse_limit("1", NULL) == -1);
+    assert(chaos_dns_parse_family_filter(NULL) == CHAOS_DNS_FAMILY_INVALID);
+    assert(chaos_dns_parse_family_filter("any") == CHAOS_DNS_FAMILY_ANY);
+    assert(chaos_dns_parse_gai_name(NULL) == 0x7fffffff);
+    assert(chaos_dns_parse_gai_name("EAI_NONAME") == EAI_NONAME);
+    assert(chaos_dns_parse_gai_name("EAI_MEMORY") == EAI_MEMORY);
+    assert(chaos_dns_parse_gai_name("EAI_SYSTEM") == EAI_SYSTEM);
+    assert(chaos_dns_copy_text_value(NULL, payload, sizeof(payload)) == -1);
+    assert(chaos_dns_copy_text_value("a", NULL, sizeof(payload)) == -1);
+    assert(chaos_dns_copy_text_value("a", payload, 0U) == -1);
+    assert(chaos_dns_parse_payload_probability(NULL, payload, sizeof(payload), &probability) == -1);
+    assert(chaos_dns_parse_payload_probability("a", NULL, sizeof(payload), &probability) == -1);
+    assert(chaos_dns_parse_payload_probability("a", payload, sizeof(payload), NULL) == -1);
+    assert(!chaos_dns_override_token_valid(NULL) && !chaos_dns_override_token_valid(""));
+    assert(!chaos_dns_validate_override_value(NULL));
+    assert(chaos_dns_config_read_file(NULL, 0U) == -1);
+    assert(!chaos_dns_split_rule_fields(NULL, NULL, NULL, NULL));
+    assert(chaos_dns_config_parse_buffer(NULL, rules, &count) == -1);
+    assert(chaos_dns_config_parse_line(NULL, &rule) == -1);
+    assert(chaos_dns_config_select_rule(NULL, 0U, CHAOS_DNS_EFFECT_GAI, "a", &rule) == 0);
+
+    /* A payload with nothing before the '@', and values too long for their buffers. */
+    assert(
+        chaos_dns_parse_payload_probability("@0.5", payload, sizeof(payload), &probability) == -1
+    );
+    assert(
+        chaos_dns_parse_payload_probability(" @0.5", payload, sizeof(payload), &probability) == -1
+    );
+    assert(chaos_dns_parse_payload_probability("a@", payload, sizeof(payload), &probability) == -1);
+    memset(long_text, 'x', sizeof(long_text) - 1U);
+    long_text[sizeof(long_text) - 1U] = '\0';
+    long_text[sizeof(long_text) - 3U] = '@';
+    assert(
+        chaos_dns_parse_payload_probability(long_text, payload, sizeof(payload), &probability) == -1
+    );
+    long_text[sizeof(long_text) - 3U] = 'x';
+    long_text[60] = '\0';
+    assert(!chaos_dns_override_token_valid(long_text));
+    long_text[60] = 'x';
+
+    /* Selectors: none, unknown scheme, the lookup wildcard, malformed reverse bodies. */
+    assert(!chaos_dns_selector_parse(NULL, &selector) && !chaos_dns_selector_parse("", &selector));
+    assert(!chaos_dns_selector_parse("*", NULL));
+    assert(!chaos_dns_selector_parse("http://example.com", &selector));
+    assert(chaos_dns_selector_parse("dns://*", &selector));
+    assert(selector.kind == CHAOS_DNS_SELECTOR_ANY);
+    assert(selector.domain == CHAOS_DNS_SELECTOR_DOMAIN_LOOKUP);
+    assert(!chaos_dns_parse_reverse_selector_body(NULL, &selector));
+    assert(!chaos_dns_parse_reverse_selector_body("1.2.3.4", NULL));
+    assert(!chaos_dns_selector_parse("rdns://", &selector));
+    assert(!chaos_dns_selector_parse("rdns://[]", &selector));
+    assert(!chaos_dns_selector_parse("rdns://[::1", &selector));
+    (void)snprintf(line, sizeof(line), "rdns://[%.60s]", long_text);
+    assert(!chaos_dns_selector_parse(line, &selector));
+    (void)snprintf(line, sizeof(line), "rdns://%.60s", long_text);
+    assert(!chaos_dns_selector_parse(line, &selector));
+
+    /* Matching: nothing to match, a kind no domain produces, a suffix without its dot. */
+    assert(!chaos_dns_selector_matches_domain(NULL, CHAOS_DNS_SELECTOR_DOMAIN_LOOKUP, "a", &rank));
+    assert(rank == 0U);
+    assert(chaos_dns_selector_parse("rdns://*", &selector));
+    selector.kind = CHAOS_DNS_SELECTOR_SUFFIX;
+    assert(!chaos_dns_selector_matches_domain(
+        &selector, CHAOS_DNS_SELECTOR_DOMAIN_REVERSE, "127.0.0.1", NULL
+    ));
+    assert(chaos_dns_selector_parse("dns://*.example.com", &selector));
+    assert(!chaos_dns_selector_matches_domain(
+        &selector, CHAOS_DNS_SELECTOR_DOMAIN_LOOKUP, "api.example.net", NULL
+    ));
+    assert(!chaos_dns_selector_matches_domain(
+        &selector, CHAOS_DNS_SELECTOR_DOMAIN_LOOKUP, "fooexample.com", NULL
+    ));
+
+    /* Effects: no selector, a domain no parser produces. */
+    assert(!chaos_dns_effect_allowed(NULL, CHAOS_DNS_EFFECT_GAI));
+    selector.domain = (chaos_dns_selector_domain_t)99;
+    assert(!chaos_dns_effect_allowed(&selector, CHAOS_DNS_EFFECT_GAI));
+
+    /* Rule lines missing a field, or with a value their effect cannot take. */
+    {
+        static const char *const bad[] = {
+            "nope:EAI_AGAIN:1.0",
+            "dns://api.example.com",
+            "dns://api.example.com:EAI_AGAIN",
+            "rdns://[::1:EAI_AGAIN:1.0",
+            "dns://api.example.com::1.0",
+            "dns://*bad:EAI_AGAIN:1.0",
+            "dns://api.example.com:LATENCY:@0.5",
+            "dns://api.example.com:REWRITE:@0.5",
+            "dns://api.example.com:SERVICE:@0.5",
+            "dns://api.example.com:OVERRIDE:@0.5",
+            "dns://api.example.com:FILTER_FAMILY:@0.5",
+            "rdns://127.0.0.1:FILTER_FAMILY:inet4",
+            "dns://api.example.com:LIMIT:@0.5",
+            "rdns://127.0.0.1:SHUFFLE:1.0",
+            "dns://api.example.com:BOGUS:1.0",
+        };
+        size_t index;
+
+        for (index = 0U; index < sizeof(bad) / sizeof(bad[0]); ++index)
+        {
+            (void)snprintf(line, sizeof(line), "%s", bad[index]);
+            assert(chaos_dns_config_parse_line(line, &rule) == -1);
+        }
+    }
+
+    /* Two rules of one rank: the longer selector wins, whichever comes first. */
+    (void)snprintf(line, sizeof(line), "dns://*.example.com:SHUFFLE:1.0");
+    assert(chaos_dns_config_parse_line(line, &rules[0]) == 1);
+    (void)snprintf(line, sizeof(line), "dns://*.api.example.com:SHUFFLE:1.0");
+    assert(chaos_dns_config_parse_line(line, &rules[1]) == 1);
+    assert(chaos_dns_config_select_rule(
+        rules, 2U, CHAOS_DNS_EFFECT_SHUFFLE, "edge.api.example.com", &rule
+    ));
+    assert(strcmp(rule.selector.text, "api.example.com") == 0);
+    assert(count == 7U);
+}
+
 int main(void)
 {
     /* Look at the rule file on every call; the throttle has its own test. */
@@ -1454,6 +1608,7 @@ int main(void)
     test_selector_matching();
     test_parse_line_and_buffer();
     test_rule_selection();
+    test_rejections();
     test_prepare_and_match();
     test_reload_in_progress_is_not_joined();
     test_read_failure_keeps_rules_and_retries();
