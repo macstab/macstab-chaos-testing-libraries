@@ -287,6 +287,12 @@ static void test_errno_application(void)
     errno = 0;
     assert(chaos_io_rule_apply_errno(&rule) == 1);
     assert(errno == EIO);
+
+    /* Any other effect never sets errno, however sure its probability. */
+    rule.effect = CHAOS_IO_EFFECT_LATENCY;
+    errno = 123;
+    assert(chaos_io_rule_apply_errno(&rule) == 0);
+    assert(errno == 123);
 }
 
 /**

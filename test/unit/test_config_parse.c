@@ -1437,6 +1437,209 @@ static void test_pending_hits_written_after_interval(void)
     g_chaos_io_check_interval_ns = interval;
 }
 
+/** Number of upcoming opens `chaos_test_eintr_open` fails with EINTR before opening. */
+static int g_stub_open_eintr = 0;
+
+/**
+ * @brief Open that fails with EINTR `g_stub_open_eintr` times, as a signal would make
+ * it, then opens for real.
+ */
+static int chaos_test_eintr_open(const char *path, int flags, ...)
+{
+    if (g_stub_open_eintr > 0)
+    {
+        --g_stub_open_eintr;
+        errno = EINTR;
+        return -1;
+    }
+    return chaos_test_real_open(path, flags);
+}
+
+/**
+ * @brief Invariant: each way reading the rule file can fail is classified: lasting
+ *   (-3, kept until the file changes) or retried (-1); an interrupted open is retried.
+ *
+ * Expected observable behaviour:
+ * - No read function → -1, nothing opened.
+ * - open() fails with EPERM → -3, like EACCES.
+ * - read() fails with EISDIR (a directory in the file's place) → -3, descriptor closed.
+ * - fstat() fails on the descriptor → -1, descriptor closed.
+ * - open() fails with EINTR once → retried, and the file is read.
+ */
+static void test_read_file_failure_kinds(void)
+{
+    size_t size_out = 0U;
+    uint64_t stamp;
+
+    chaos_test_reset_runtime();
+    chaos_test_reset_read_stubs();
+    g_chaos_io_real_open = chaos_test_stub_open;
+    g_chaos_io_real_close = chaos_test_stub_close;
+    g_stub_open_result = 7;
+    assert(chaos_io_config_read_file(&size_out, 0U) == -1);
+    assert(g_stub_close_calls == 0);
+
+    g_chaos_io_real_read = chaos_test_stub_read;
+    g_stub_open_result = -1;
+    g_stub_open_errno = EPERM;
+    assert(chaos_io_config_read_file(&size_out, 0U) == -3);
+
+    g_stub_open_result = 7;
+    g_stub_read_errno = EISDIR;
+    assert(chaos_io_config_read_file(&size_out, 0U) == -3);
+    assert(g_stub_close_calls == 1);
+
+    /* A descriptor number that is not open: fstat() fails with EBADF. */
+    chaos_test_reset_read_stubs();
+    g_stub_open_result = 1000;
+    g_stub_read_result = 0;
+    assert(chaos_io_config_read_file(&size_out, 0U) == -1);
+    assert(g_stub_close_calls == 1);
+
+    chaos_test_use_real_io();
+    chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/data:write:EIO:1.0\n");
+    stamp = chaos_io_config_observed_mtime();
+    g_chaos_io_real_open = chaos_test_eintr_open;
+    g_stub_open_eintr = 1;
+    assert(chaos_io_config_read_file(&size_out, stamp) == 0);
+    assert(g_stub_open_eintr == 0);
+    assert(size_out == strlen("/data:write:EIO:1.0\n"));
+    chaos_test_use_real_io();
+    (void)unlink(CHAOS_IO_CONFIG_PATH);
+}
+
+/**
+ * @brief Invariant: matching edges: the effects each operation class allows, a last
+ *   line without a newline, the more specific rule winning in either order, and a
+ *   rule matching through its resolved name as well as its written one.
+ */
+static void test_matching_edges(void)
+{
+    static chaos_io_rule_t rules[CHAOS_IO_MAX_RULES];
+    char specific_first[] = "/data/wal.log:write:ENOSPC:1.0\n/data:write:EIO:1.0";
+    char resolved[] = "/real";
+    chaos_io_rule_t match;
+    chaos_io_rule_t rule;
+    size_t count = 0U;
+
+    assert(chaos_io_effect_allowed(CHAOS_IO_OP_PWRITE, CHAOS_IO_EFFECT_TORN));
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_PREAD, CHAOS_IO_EFFECT_TORN));
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_CORRUPT));
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_PWRITE, CHAOS_IO_EFFECT_CORRUPT));
+
+    assert(chaos_io_config_parse_buffer(specific_first, rules, &count) == 0);
+    assert(count == 2U);
+    assert(strcmp(rules[1].path_prefix, "/data") == 0);
+    assert(chaos_io_config_select_rule(rules, count, CHAOS_IO_OP_WRITE, "/data/wal.log", &match));
+    assert(match.errnum == ENOSPC);
+    assert(chaos_io_config_select_rule(rules, count, CHAOS_IO_OP_WRITE, "/data/other", &match));
+    assert(match.errnum == EIO);
+
+    /* An empty prefix covers a path only at a boundary: a leading slash. */
+    assert(chaos_io_prefix_covers("", 0U, "/x"));
+    assert(!chaos_io_prefix_covers("", 0U, "x"));
+
+    (void)memset(&rule, 0, sizeof(rule));
+    (void)snprintf(rule.path_prefix, sizeof(rule.path_prefix), "%s", "/link");
+    rule.path_len = strlen(rule.path_prefix);
+    rule.resolved_prefix = resolved;
+    rule.resolved_len = strlen(resolved);
+    assert(chaos_io_rule_prefix_matches(&rule, "/link/f"));
+    assert(chaos_io_rule_prefix_matches(&rule, "/real/f"));
+    assert(!chaos_io_rule_prefix_matches(&rule, "/realm/f"));
+    assert(!chaos_io_rule_prefix_matches(&rule, "/other/f"));
+}
+
+/**
+ * @brief Invariant: past the eager hits, a hit after the interval is written at once.
+ */
+static void test_hit_after_interval_is_written(void)
+{
+    char hits[1024];
+    char path[64];
+    chaos_io_config_state_t *state;
+
+    chaos_test_reset_runtime();
+    chaos_test_use_real_io();
+    chaos_io_config_init();
+    chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/data:write:EIO:1.0\n");
+    g_chaos_io_cached_mtime = CHAOS_IO_MTIME_UNKNOWN;
+    assert(chaos_io_config_prepare() == 1);
+    state = (chaos_io_config_state_t *)chaos_io_config_active_state();
+
+    g_chaos_io_hits_total = CHAOS_HITS_EAGER;
+    g_chaos_io_hits_last_ms = chaos_hits_now_ms() - CHAOS_HITS_INTERVAL_MS;
+    chaos_hit_record(state->rules[0].hit);
+    assert(g_chaos_io_hits_pending == 0);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(strcmp(hits, "1\t/data:write:EIO:1.0\n") == 0);
+    g_chaos_io_hits_total = 0U;
+
+    (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_IO_HITS_PREFIX, g_chaos_io_hits_file);
+    (void)unlink(path);
+    (void)unlink(CHAOS_IO_CONFIG_PATH);
+}
+
+/**
+ * @brief Invariant: a rule follows a link only when the link's target fits a rule
+ *   path; a prefix that is no link keeps no second name.
+ *
+ * Triggering condition: a link to a directory whose path is longer than
+ *   CHAOS_IO_MAX_RULE_PATH, and a rule for `/tmp`, a plain directory.
+ *
+ * Expected observable behaviour: the link rule matches by the link's name only; the
+ *   `/tmp` rule has no resolved prefix.
+ */
+static void test_long_link_target_is_not_followed(void)
+{
+    char target[CHAOS_IO_MAX_RULE_PATH + 300U];
+    char component[201];
+    chaos_io_rule_t rule;
+    char *slash;
+
+    (void)memset(component, 'd', sizeof(component) - 1U);
+    component[sizeof(component) - 1U] = '\0';
+    (void)snprintf(target, sizeof(target), "%s", "/tmp/chaos-deep");
+    (void)mkdir(target, 0700);
+    while (strlen(target) < CHAOS_IO_MAX_RULE_PATH)
+    {
+        (void)strcat(target, "/");
+        (void)strcat(target, component);
+        assert(mkdir(target, 0700) == 0 || errno == EEXIST);
+    }
+    (void)unlink("/tmp/chaos-long-link");
+    assert(symlink(target, "/tmp/chaos-long-link") == 0);
+
+    chaos_test_reset_runtime();
+    chaos_test_use_real_io();
+    chaos_io_config_init();
+    chaos_test_write_text_file(
+        CHAOS_IO_CONFIG_PATH, "/tmp/chaos-long-link:read:EIO:1.0\n/tmp:write:EIO:1.0\n"
+    );
+    g_chaos_io_cached_mtime = CHAOS_IO_MTIME_UNKNOWN;
+    assert(chaos_io_config_prepare() == 1);
+    assert(chaos_io_config_match_loaded(CHAOS_IO_OP_READ, "/tmp/chaos-long-link/f", &rule) == 1);
+    assert(rule.resolved_prefix == NULL);
+    assert(chaos_io_config_match_loaded(CHAOS_IO_OP_WRITE, "/tmp/f", &rule) == 1);
+    assert(rule.resolved_prefix == NULL);
+    (void)strcat(target, "/f");
+    assert(chaos_io_config_match_loaded(CHAOS_IO_OP_READ, target, &rule) == 0);
+
+    assert(unlink("/tmp/chaos-long-link") == 0);
+    *strrchr(target, '/') = '\0';
+    for (;;)
+    {
+        assert(rmdir(target) == 0);
+        slash = strrchr(target, '/');
+        if (strcmp(target, "/tmp/chaos-deep") == 0 || slash == NULL)
+        {
+            break;
+        }
+        *slash = '\0';
+    }
+    (void)unlink(CHAOS_IO_CONFIG_PATH);
+}
+
 int main(void)
 {
     /* Look at the rule file on every call; the throttle has its own test. */
@@ -1467,5 +1670,9 @@ int main(void)
     test_read_file_rejects_changed_file();
     test_racy_rewrite_is_seen();
     test_pending_hits_written_after_interval();
+    test_read_file_failure_kinds();
+    test_matching_edges();
+    test_hit_after_interval_is_written();
+    test_long_link_target_is_not_followed();
     return 0;
 }

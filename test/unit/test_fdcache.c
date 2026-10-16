@@ -48,6 +48,7 @@
 #include "../support/test_support.h"
 
 #include <sys/mman.h>
+#include <sys/resource.h>
 
 CHAOS_IO_DEFINE_TEST_GLOBALS();
 
@@ -376,10 +377,39 @@ static void test_lazy_table_contention_and_failure(void)
     g_chaos_io_fd_cache = saved;
 }
 
+/**
+ * @brief Invariant: the default mapping reports a failed mmap as MAP_FAILED and
+ *   leaves errno as the caller had it.
+ *
+ * Triggering condition: an address-space limit below what the process already uses,
+ *   so any new mapping fails with ENOMEM.
+ */
+static void test_default_map_failure(void)
+{
+    struct rlimit saved;
+    struct rlimit tight;
+    void *mapping;
+
+    assert(getrlimit(RLIMIT_AS, &saved) == 0);
+    tight = saved;
+    tight.rlim_cur = (rlim_t)1 << 20;
+    assert(setrlimit(RLIMIT_AS, &tight) == 0);
+    errno = 4242;
+    mapping = chaos_io_fdcache_default_map();
+    assert(setrlimit(RLIMIT_AS, &saved) == 0);
+    assert(mapping == MAP_FAILED);
+    assert(errno == 4242);
+
+    mapping = chaos_io_fdcache_default_map();
+    assert(mapping != MAP_FAILED);
+    chaos_io_fdcache_default_unmap(mapping);
+}
+
 int main(void)
 {
     test_store_lookup_and_invalidate();
     test_resolve_paths();
     test_lazy_table_contention_and_failure();
+    test_default_map_failure();
     return 0;
 }

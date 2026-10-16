@@ -699,6 +699,7 @@ static void test_normalize_path(void)
         {"/tmp/..", "/"},
         {"/a/b/c/../../../..", "/"},
         {"/tmp/.hidden/..x/...", "/tmp/.hidden/..x/..."},
+        {"/tmp/.x/.y", "/tmp/.x/.y"},
         {"relative/../x", "relative/../x"},
     };
     char path[64];
@@ -2781,6 +2782,511 @@ static void test_stdio_streams_keep_the_cache_right(void)
     assert(fclose(memory) == 0);
 }
 
+/**
+ * @brief Invariant: the path filters exclude the control files and the `/proc`, `/sys`
+ *   and `/dev` trees at a path boundary only; a join inserts one separator and fails
+ *   one byte short; a zero seed is replaced, never kept.
+ */
+static void test_path_filters_join_and_seed(void)
+{
+    char path[16];
+    uint64_t state_of_zero;
+
+    assert(!chaos_io_is_control_path(NULL));
+    assert(chaos_io_is_control_path("/tmp/.chaos-dns.status"));
+    assert(chaos_io_has_reserved_prefix("/proc", "/proc"));
+    assert(chaos_io_has_reserved_prefix("/proc/self/fd/3", "/proc"));
+    assert(!chaos_io_has_reserved_prefix("/process", "/proc"));
+    assert(!chaos_io_has_reserved_prefix("/tmp", "/proc"));
+    assert(chaos_io_is_excluded_path("/proc"));
+    assert(chaos_io_is_excluded_path("/sys/kernel/mm"));
+    assert(chaos_io_is_excluded_path("/dev/null"));
+    assert(chaos_io_is_excluded_path("/dev"));
+    assert(!chaos_io_is_excluded_path("/system/x"));
+    assert(!chaos_io_is_excluded_path("/devices/x"));
+    assert(!chaos_io_is_excluded_path("/tmp/data.bin"));
+
+    /* A base that ends in a slash gets no second one. */
+    assert(chaos_io_join_paths(path, sizeof(path), "/tmp/", "f") == 1);
+    assert(strcmp(path, "/tmp/f") == 0);
+    assert(chaos_io_join_paths(path, sizeof(path), NULL, "f") == 0);
+    assert(chaos_io_join_paths(path, sizeof(path), "/tmp", NULL) == 0);
+    assert(chaos_io_join_paths(path, 0U, "/tmp", "f") == 0);
+    /* "/tmp" "/" "f1" and the NUL: 8 bytes fit exactly, 7 do not. */
+    assert(chaos_io_join_paths(path, 8U, "/tmp", "f1") == 1);
+    assert(strcmp(path, "/tmp/f1") == 0);
+    assert(chaos_io_join_paths(path, 7U, "/tmp", "f1") == 0);
+
+    chaos_io_prng_seed_thread(0U);
+    state_of_zero = g_chaos_io_tls_prng_state;
+    assert(state_of_zero != 0U);
+    chaos_io_prng_seed_thread(1U);
+    assert(g_chaos_io_tls_prng_state == state_of_zero);
+}
+
+/* rmdir() and unlinkat() here are the wrappers over the harness stubs, and syscall()
+ * is the harness's stand-in: removing a directory needs the raw system call. */
+#undef syscall
+/** @brief Removes the empty directory @p path for real; 0 on success. */
+static int chaos_test_remove_directory(const char *path)
+{
+    return (int)syscall(SYS_unlinkat, AT_FDCWD, path, AT_REMOVEDIR);
+}
+#define syscall chaos_test_syscall
+
+/**
+ * @brief Invariant: a path that cannot be resolved for matching is never matched, and
+ *   the call still reaches the real function unchanged.
+ *
+ * Triggering conditions: a working directory that was removed (getcwd() fails), a
+ * directory descriptor whose cached path leaves no room for the child, an absolute
+ * path longer than PATH_MAX, and an excluded path through openat().
+ *
+ * Expected observable behaviour: no rule lookup; the real open/openat/fopen runs.
+ */
+static void test_unresolvable_paths_pass_through(void)
+{
+    static char long_path[CHAOS_IO_MAX_PATH + 16U];
+    char cwd[CHAOS_IO_MAX_PATH];
+    char removed[] = "/tmp/chaos-io-cwd-XXXXXX";
+    char path[CHAOS_IO_MAX_PATH];
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    assert(getcwd(cwd, sizeof(cwd)) != NULL);
+    assert(mkdtemp(removed) != NULL);
+    assert(chdir(removed) == 0 && chaos_test_remove_directory(removed) == 0);
+    errno = 4242;
+    assert(chaos_io_resolve_at_path(AT_FDCWD, "relative.bin", path, sizeof(path)) == 0);
+    assert(errno == 4242);
+    g_config_match_path_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
+    g_rule_apply_errno_result = 1;
+    g_real_open_return = 5;
+    assert(open("relative.bin", O_RDONLY) == 5);
+    assert(g_config_match_path_calls == 0);
+    assert(chdir(cwd) == 0);
+
+    /* The directory's path fits, the joined one does not. */
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/base");
+    assert(chaos_io_resolve_at_path(9, "child.bin", path, 12U) == 0);
+
+    (void)memset(long_path, 'a', sizeof(long_path) - 1U);
+    long_path[0] = '/';
+    long_path[sizeof(long_path) - 1U] = '\0';
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_match_path_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
+    g_rule_apply_errno_result = 1;
+    g_real_open_return = -1;
+    g_real_fopen_return = NULL;
+    assert(open(long_path, O_RDONLY) == -1);
+    assert(fopen(long_path, "r") == NULL);
+    assert(g_real_open_calls == 1 && g_real_fopen_calls == 1);
+    assert(g_config_match_path_calls == 0);
+
+    /* openat() never looks /proc up. */
+    g_real_openat_return = 6;
+    assert(openat(AT_FDCWD, "/proc/self/status", O_RDONLY) == 6);
+    assert(g_config_match_path_calls == 0);
+}
+
+/**
+ * @brief Invariant: an open rule that matched but did not fire (its probability
+ *   missed) opens the file, and a mode is forwarded for O_TMPFILE as for O_CREAT.
+ */
+static void test_open_rule_that_does_not_fire(void)
+{
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_match_path_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
+    g_config_rule.errnum = EACCES;
+    g_rule_apply_errno_result = 0;
+    g_real_open_return = 7;
+    g_real_openat_return = 8;
+    assert(open("/tmp/unlucky.bin", O_RDONLY) == 7);
+    assert(openat(AT_FDCWD, "/tmp/unlucky.bin", O_RDONLY) == 8);
+    assert(g_rule_apply_errno_calls == 2);
+    assert(g_config_match_path_calls == 2);
+
+#ifdef O_TMPFILE
+    g_config_match_path_result = 0;
+    assert(openat(AT_FDCWD, "/tmp", O_TMPFILE | O_RDWR, 0600) == 8);
+    assert(g_real_openat_has_mode == 1 && g_real_openat_mode == 0600);
+#endif
+
+    /* A failed real fopen()/freopen() caches nothing. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_fopen_return = NULL;
+    assert(fopen("/tmp/missing/file", "r") == NULL);
+    assert(freopen("/tmp/missing/file", "r", stdin) == NULL);
+    assert(g_fdcache_invalidate_calls == 0 && g_fdcache_resolve_calls == 0);
+}
+
+/**
+ * @brief Invariant: under the reentrancy guard every descriptor wrapper calls the real
+ *   function straight away: no config look-up, no fd-cache resolution, no effect.
+ */
+static void test_descriptor_wrappers_under_guard(void)
+{
+    char buffer[8] = {0};
+    struct iovec iov[1];
+    off_t offset = 0;
+
+    iov[0].iov_base = buffer;
+    iov[0].iov_len = sizeof(buffer);
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_ERRNO);
+    g_config_match_path_result = 1;
+    g_rule_apply_errno_result = 1;
+    g_real_read_return = 1;
+    g_real_readv_return = 2;
+    g_real_write_return = 3;
+    g_real_writev_return = 4;
+    g_real_pread_return = 5;
+    g_real_preadv_return = 6;
+    g_real_pwrite_return = 7;
+    g_real_pwritev_return = 8;
+    g_real_sendfile_return = 9;
+    g_real_copy_file_range_return = 10;
+
+    g_chaos_io_tls_guard = 1;
+    assert(read(9, buffer, 1U) == 1);
+    assert(readv(9, iov, 1) == 2);
+    assert(write(9, buffer, 3U) == 3);
+    assert(writev(9, iov, 1) == 4);
+    assert(pread(9, buffer, 5U, 0) == 5);
+    assert(preadv(9, iov, 1, 0) == 6);
+    assert(pwrite(9, buffer, 7U, 0) == 7);
+    assert(pwritev(9, iov, 1, 0) == 8);
+#ifdef __linux__
+    assert(sendfile(9, 4, &offset, 9U) == 9);
+    assert(copy_file_range(4, NULL, 9, NULL, 10U, 0U) == 10);
+    assert(fallocate(9, 0, 0, 16) == 0);
+#endif
+    assert(ftruncate(9, 16) == 0);
+    assert(posix_fallocate(9, 0, 16) == 0);
+    assert(truncate("/tmp/guarded.bin", 16) == 0);
+    assert(unlinkat(AT_FDCWD, "/tmp/guarded.bin", 0) == 0);
+    assert(renameat(AT_FDCWD, "/tmp/a.bin", AT_FDCWD, "/tmp/b.bin") == 0);
+    assert(fsync(9) == 0);
+    assert(fdatasync(9) == 0);
+    assert(close(9) == 0);
+    g_chaos_io_tls_guard = 0;
+
+    assert(g_config_match_loaded_calls == 0);
+    assert(g_config_match_path_calls == 0);
+    assert(g_fdcache_resolve_calls == 0);
+    assert(g_rule_apply_errno_calls == 0);
+    assert(g_real_read_guard == 1 && g_real_write_guard == 1 && g_real_close_guard == 1);
+    assert(offset == 0);
+}
+
+/**
+ * @brief Invariant: a rule that matched but does not fire leaves the call exactly as
+ *   the real function made it: ERRNO whose probability missed, CORRUPT and TORN that
+ *   did not trigger, and a matched call the real function itself failed.
+ */
+static void test_rules_that_do_not_fire(void)
+{
+    char buffer[8];
+    struct iovec iov[2];
+
+    iov[0].iov_base = buffer;
+    iov[0].iov_len = 4U;
+    iov[1].iov_base = buffer + 4;
+    iov[1].iov_len = 4U;
+
+    /* ERRNO whose probability missed: every wrapper runs the real call. */
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_ERRNO);
+    g_config_match_path_result = 1;
+    g_config_rule.errnum = EIO;
+    g_rule_apply_errno_result = 0;
+    g_real_writev_return = 8;
+    g_real_close_return = 0;
+    assert(writev(9, iov, 2) == 8);
+    assert(ftruncate(9, 1) == 0);
+#ifdef __linux__
+    assert(fallocate(9, 0, 0, 1) == 0);
+#endif
+    assert(truncate("/tmp/unlucky.bin", 1) == 0);
+    assert(unlinkat(AT_FDCWD, "/tmp/unlucky.bin", 0) == 0);
+    assert(renameat(AT_FDCWD, "/tmp/a.bin", AT_FDCWD, "/tmp/b.bin") == 0);
+    assert(renameat2(AT_FDCWD, "/tmp/a.bin", AT_FDCWD, "/tmp/b.bin", 0U) == 0);
+    assert(fsync(9) == 0);
+    assert(fdatasync(9) == 0);
+    assert(close(9) == 0);
+#ifdef __linux__
+    assert(g_rule_apply_errno_calls == 10);
+#else
+    assert(g_rule_apply_errno_calls == 9);
+#endif
+    assert(g_real_writev_calls == 1 && g_real_ftruncate_calls == 1 && g_real_truncate_calls == 1);
+    assert(g_real_unlinkat_calls == 1 && g_real_renameat_calls == 1);
+    assert(g_real_fsync_calls == 1 && g_real_fdatasync_calls == 1 && g_real_close_calls == 1);
+    /* Each real success changed the namespace: the cache was reset each time. */
+    assert(g_fdcache_reset_calls == 3);
+
+    /* Writes under an ERRNO rule that missed are neither failed nor torn. */
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_ERRNO);
+    g_rule_apply_errno_result = 0;
+    g_torn_count_result = 1U;
+    g_real_write_return = 8;
+    g_real_pwrite_return = 8;
+    g_real_pwritev_return = 8;
+    assert(write(9, buffer, 8U) == 8 && g_real_write_count == 8U);
+    assert(pwrite(9, buffer, 8U, 0) == 8 && g_real_pwrite_count == 8U);
+    assert(pwritev(9, iov, 2, 0) == 8 && g_real_pwritev_iovcnt == 2);
+#ifdef __linux__
+    g_real_sendfile_return = 8;
+    g_real_copy_file_range_return = 8;
+    assert(sendfile(9, 4, NULL, 8U) == 8 && g_real_sendfile_count == 8U);
+    assert(copy_file_range(4, NULL, 9, NULL, 8U, 0U) == 8);
+    assert(g_real_copy_file_range_count == 8U);
+    assert(g_rule_apply_errno_calls == 5);
+#endif
+    assert(g_rule_should_trigger_calls == 0);
+
+    /* No rule for the descriptor: the call goes through untouched. */
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_ERRNO);
+    g_config_match_loaded_result = 0;
+    g_rule_apply_errno_result = 1;
+    g_real_pwrite_return = 8;
+    assert(pwrite(9, buffer, 8U, 0) == 8);
+#ifdef __linux__
+    g_real_sendfile_return = 8;
+    g_real_copy_file_range_return = 8;
+    assert(sendfile(9, 4, NULL, 8U) == 8);
+    assert(copy_file_range(4, NULL, 9, NULL, 8U, 0U) == 8);
+#endif
+    assert(g_rule_apply_errno_calls == 0);
+
+    /* CORRUPT at end of file: nothing was read, nothing is corrupted. */
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_CORRUPT);
+    g_real_read_return = 0;
+    g_real_pread_return = 0;
+    assert(read(9, buffer, 4U) == 0);
+    assert(pread(9, buffer, 4U, 0) == 0);
+    assert(g_rule_should_trigger_calls == 0 && g_corrupt_calls == 0);
+
+    /* CORRUPT that did not trigger: the data comes back as read. */
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_CORRUPT);
+    g_rule_should_trigger_result = 0;
+    g_real_read_return = 4;
+    g_real_readv_return = 4;
+    g_real_pread_return = 4;
+    g_real_preadv_return = 4;
+    assert(read(9, buffer, 4U) == 4);
+    assert(readv(9, iov, 2) == 4);
+    assert(pread(9, buffer, 4U, 0) == 4);
+    assert(preadv(9, iov, 2, 0) == 4);
+    assert(g_rule_should_trigger_calls == 4);
+    assert(g_corrupt_calls == 0 && g_corrupt_sample_calls == 0);
+
+    /* TORN that did not trigger: the full count is written. */
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_TORN);
+    g_rule_should_trigger_result = 0;
+    g_torn_count_result = 1U;
+    g_real_write_return = 8;
+    g_real_writev_return = 8;
+    g_real_pwrite_return = 8;
+    assert(write(9, buffer, 8U) == 8 && g_real_write_count == 8U);
+    assert(pwrite(9, buffer, 8U, 0) == 8 && g_real_pwrite_count == 8U);
+    assert(writev(9, iov, 2) == 8);
+    assert(g_real_writev_iovcnt == 2 && g_real_writev_lengths[1] == 4U);
+    g_real_pwritev_return = 8;
+    assert(pwritev(9, iov, 2, 0) == 8);
+    assert(g_real_pwritev_iovcnt == 2 && g_real_pwritev_lengths[1] == 4U);
+#ifdef __linux__
+    g_real_sendfile_return = 8;
+    g_real_copy_file_range_return = 8;
+    assert(sendfile(9, 4, NULL, 8U) == 8 && g_real_sendfile_count == 8U);
+    assert(copy_file_range(4, NULL, 9, NULL, 8U, 0U) == 8);
+    assert(g_real_copy_file_range_count == 8U);
+#endif
+
+    /* TORN that would tear nothing (a torn count of 0): the full vector is written. */
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_TORN);
+    g_torn_count_result = 0U;
+    g_real_writev_return = 8;
+    g_real_pwritev_return = 8;
+    assert(writev(9, iov, 2) == 8 && g_real_writev_iovcnt == 2);
+    assert(pwritev(9, iov, 2, 0) == 8 && g_real_pwritev_iovcnt == 2);
+    assert(g_rule_should_trigger_calls == 0);
+
+    /* A real call that failed after a LATENCY rule: the namespace did not change. */
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_LATENCY);
+    g_config_match_path_result = 1;
+    g_real_unlinkat_return = -1;
+    g_real_renameat_return = -1;
+    assert(unlinkat(AT_FDCWD, "/tmp/missing.bin", 0) == -1);
+    assert(renameat(AT_FDCWD, "/tmp/missing.bin", AT_FDCWD, "/tmp/b.bin") == -1);
+    assert(g_latency_calls == 2);
+    assert(g_fdcache_reset_calls == 0);
+}
+
+/**
+ * @brief Invariant: unlink and rename rules look only at paths they can resolve and
+ *   that are not excluded, and only once a rule file is loaded.
+ *
+ * Expected observable behaviour: an excluded path, a path too long to resolve or no
+ *   loaded rules pass the call through unmatched; a rename with one resolvable side is
+ *   matched on that side alone; neither side resolvable matches nothing.
+ */
+static void test_unlink_and_rename_matching_inputs(void)
+{
+    static char long_path[CHAOS_IO_MAX_PATH + 16U];
+    chaos_io_rule_t rule;
+
+    (void)memset(long_path, 'b', sizeof(long_path) - 1U);
+    long_path[0] = '/';
+    long_path[sizeof(long_path) - 1U] = '\0';
+
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_ERRNO);
+    g_rule_apply_errno_result = 1;
+    assert(unlinkat(AT_FDCWD, "/proc/self/fd/9", 0) == 0);
+    assert(unlinkat(AT_FDCWD, long_path, 0) == 0);
+    g_config_prepare_result = 0;
+    assert(unlinkat(AT_FDCWD, "/tmp/data.bin", 0) == 0);
+    assert(g_config_match_loaded_calls == 0);
+    assert(g_real_unlinkat_calls == 3);
+
+    /* truncate(): the same filters before its path rule. */
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_ERRNO);
+    g_config_match_path_result = 1;
+    g_rule_apply_errno_result = 1;
+    assert(truncate("/proc/self/status", 0) == 0);
+    assert(truncate(long_path, 0) == 0);
+    assert(g_config_match_path_calls == 0);
+    assert(g_real_truncate_calls == 2);
+
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_ERRNO);
+    assert(chaos_io_match_rename_rule(AT_FDCWD, long_path, AT_FDCWD, long_path, &rule) == 0);
+    assert(g_config_prepare_calls == 0);
+    assert(chaos_io_match_rename_rule(AT_FDCWD, long_path, AT_FDCWD, "/tmp/to.bin", &rule) == 1);
+    assert(g_last_match_loaded_operation == CHAOS_IO_OP_RENAME_TO);
+    assert(g_config_match_loaded_calls == 1);
+    assert(chaos_io_match_rename_rule(AT_FDCWD, "/tmp/from.bin", AT_FDCWD, long_path, &rule) == 1);
+    assert(g_last_match_loaded_operation == CHAOS_IO_OP_RENAME_FROM);
+    assert(strcmp(g_last_match_loaded_path, "/tmp/from.bin") == 0);
+    assert(g_config_match_loaded_calls == 2);
+}
+
+/**
+ * @brief Invariant: the iovec helpers skip empty segments, and a vector whose byte
+ *   total does not fit `ssize_t` is neither torn nor given a size.
+ */
+static void test_vectored_edge_segments(void)
+{
+    struct iovec source[3];
+    struct iovec target[3];
+    char bytes[4] = {'a', 'b', 'c', 'd'};
+    int target_count = 0;
+
+    /* An empty segment inside the budget is kept, empty. */
+    source[0].iov_base = bytes;
+    source[0].iov_len = 0U;
+    source[1].iov_base = bytes;
+    source[1].iov_len = 4U;
+    assert(chaos_io_trim_iovecs(source, 2, 3U, target, &target_count) == 1);
+    assert(target_count == 2);
+    assert(target[0].iov_len == 0U && target[1].iov_len == 3U);
+
+    /* Corruption lands in the segment that holds the bytes, past the empty one. */
+    chaos_test_reset_state();
+    chaos_io_corrupt_iovecs(source, 2, 4U);
+    assert(g_corrupt_sample_calls == 1);
+    assert(g_last_corrupt_sample_size == 4U);
+
+    /* Two segments of SSIZE_MAX bytes: no total, no torn view, no size. */
+    source[0].iov_len = (size_t)SSIZE_MAX;
+    source[1].iov_len = (size_t)SSIZE_MAX;
+    g_torn_count_result = 1U;
+    assert(chaos_io_build_torn_iovecs(source, 2, target, &target_count) == 0);
+    assert(chaos_io_iovec_size(source, 2) == CHAOS_POLICY_NO_SIZE);
+}
+
+/**
+ * @brief Invariant: close_range() forgets each descriptor of a narrow range up to
+ *   INT_MAX and stops there: no descriptor number past INT_MAX exists.
+ */
+static void test_close_range_at_int_max(void)
+{
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_dup_return = 0;
+    assert(close_range((unsigned int)INT_MAX - 1U, (unsigned int)INT_MAX + 1U, 0) == 0);
+    assert(g_fdcache_invalidate_calls == 2);
+    assert(g_last_invalidate_fd == INT_MAX);
+    assert(g_fdcache_reset_calls == 0);
+}
+
+/**
+ * @brief Invariant: stdio calls with a rule that does not fail them run the real
+ *   function: LATENCY on the write forms, ERRNO whose probability missed, a read at
+ *   end of file under CORRUPT, and a line read with no room reports no byte count.
+ */
+static void test_stdio_rules_that_do_not_fail(void)
+{
+    char buffer[16];
+    char *line = NULL;
+    size_t capacity = 0U;
+    FILE *stream;
+
+    stream = chaos_test_stdio_stream();
+    chaos_test_stdio_rule(CHAOS_IO_EFFECT_LATENCY);
+    assert(fputs("x", stream) >= 0);
+    assert(fputc('y', stream) == 'y');
+    assert(fflush(stream) == 0);
+    assert(fprintf(stream, "%d", 7) == 1);
+    assert(g_latency_calls == 4);
+    /* fgets() with no room: the C library refuses it; no byte count for @size. */
+    errno = 0;
+    assert(fgets(buffer, 0, stream) == NULL);
+    assert(g_latency_calls == 5 && g_last_call_size == CHAOS_POLICY_NO_SIZE);
+#if defined(__GLIBC__) && defined(__LP64__)
+    assert(__fgets_chk(buffer, sizeof(buffer), 0, stream) == NULL);
+    assert(g_latency_calls == 6 && g_last_call_size == CHAOS_POLICY_NO_SIZE);
+#endif
+    chaos_test_reset_state();
+    assert(fclose(stream) == 0);
+
+    stream = chaos_test_stdio_stream();
+    chaos_test_stdio_rule(CHAOS_IO_EFFECT_ERRNO);
+    g_rule_apply_errno_result = 0;
+    assert(fread(buffer, 1U, 4U, stream) == 4U && !ferror(stream));
+    assert(fwrite("z", 1U, 1U, stream) == 1U);
+    assert(g_rule_apply_errno_calls == 2);
+    chaos_test_reset_state();
+    assert(fclose(stream) == 0);
+
+    /* A C library without the fortified reads: a matched call runs the plain one. */
+    stream = chaos_test_stdio_stream();
+    chaos_test_stdio_rule(CHAOS_IO_EFFECT_LATENCY);
+    chaos_io_ensure_symbols();
+    g_chaos_io_real_fread_chk = NULL;
+    g_chaos_io_real_fgets_chk = NULL;
+    assert(__fread_chk(buffer, sizeof(buffer), 1U, 2U, stream) == 2U);
+    assert(strncmp(buffer, "ab", 2U) == 0);
+    assert(__fgets_chk(buffer, sizeof(buffer), 4, stream) == buffer);
+    assert(strcmp(buffer, "c\n") == 0);
+    assert(g_latency_calls == 2);
+    chaos_test_reset_state();
+    assert(fclose(stream) == 0);
+
+    stream = chaos_test_stdio_stream();
+    assert(fseek(stream, 0L, SEEK_END) == 0);
+    chaos_test_stdio_rule(CHAOS_IO_EFFECT_CORRUPT);
+    assert(getline(&line, &capacity, stream) == -1);
+    assert(g_corrupt_calls == 0);
+    chaos_test_reset_state();
+    assert(fclose(stream) == 0);
+    free(line);
+}
+
 int main(void)
 {
     test_stdio_streams_keep_the_cache_right();
@@ -2811,6 +3317,15 @@ int main(void)
 #if defined(__GLIBC__) && defined(__LP64__)
     test_glibc_alternate_entries();
 #endif
+    test_path_filters_join_and_seed();
+    test_unresolvable_paths_pass_through();
+    test_open_rule_that_does_not_fire();
+    test_descriptor_wrappers_under_guard();
+    test_rules_that_do_not_fire();
+    test_unlink_and_rename_matching_inputs();
+    test_vectored_edge_segments();
+    test_close_range_at_int_max();
+    test_stdio_rules_that_do_not_fail();
     chaos_test_bind_libc_functions_for_exit();
     return 0;
 }
