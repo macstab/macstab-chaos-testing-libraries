@@ -120,7 +120,7 @@ the load, never a passing `state=ok` first.
 | | |
 |---|---|
 | Kernel | 5.5 or newer (user notification with CONTINUE). Older: `state=unsupported`. |
-| Privileges | None beyond Docker's default profile. The child sets no_new_privs, so set-user-ID programs it starts do not gain privileges. |
+| Privileges | None beyond Docker's default profile. The child sets no_new_privs, so set-user-ID programs it starts do not gain privileges. It does so only once seccomp has said it offers user notification: an application started in  because the kernel or the profile refuses seccomp runs without it. |
 | Architecture | x86_64 and aarch64. Under emulation (amd64 on an arm64 host) seccomp is unavailable: `state=unsupported`. Other ABIs (x32) pass unfiltered. |
 | Reading the process | Paths, addresses and iovec sizes are read from the process's memory (`process_vm_readv`), and fds and sockets through `/proc/<pid>`. This works for a process of the same user. A process that changes user (root to nobody) cannot be read: its path and endpoint rules do not match, while rules on the operation alone still do. |
 | Leftover processes | When chaos-init is not PID 1 (a shell or another init started it), processes the application left behind keep the filter. A background copy answers them until the last one ends, which the kernel reports from 5.8; on 5.5 to 5.7 that copy stays, idle, until the container stops. |

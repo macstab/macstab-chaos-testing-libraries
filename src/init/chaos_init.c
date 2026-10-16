@@ -141,6 +141,7 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover)
         struct cmsghdr header;
         char space[CMSG_SPACE(sizeof(int))];
     } control;
+    uint32_t notify = SECCOMP_RET_USER_NOTIF;
     int error = 0;
     int listener = -1;
 
@@ -150,6 +151,12 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover)
     if (uname(&name) != 0 || !chaos_init_kernel_supported(CHAOS_INIT_RELEASE(&name)))
     {
         error = ENOTSUP;
+    }
+    /* Asked first, so that an application that runs without chaos also runs without
+     * no_new_privs, which cannot be undone. */
+    else if (syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0, &notify) != 0)
+    {
+        error = errno;
     }
     else if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
     {

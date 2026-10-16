@@ -13,7 +13,9 @@
 # - exit codes and death by signal pass through; SIGTERM reaches the application;
 # - orphans are reaped; a missing command exits 127;
 # - a file limit of 256 neither stops the application nor the mode;
-# - a kernel older than 5.5 (test build) starts the application without a filter.
+# - a kernel older than 5.5 (test build) starts the application without a filter;
+# - a profile that refuses seccomp starts it without a filter and without
+#   no_new_privs.
 #
 # Under emulation (amd64 on an arm64 host) seccomp is unavailable: then only the
 # unsupported path is checked.
@@ -163,3 +165,22 @@ for libc in glibc musl; do
         "$base" \
         sh -c "$CHECK_SCRIPT"
 done
+
+# A profile that refuses seccomp: the application runs without chaos, and without
+# no_new_privs, which chaos-init only sets once seccomp answers.
+printf '%s' '{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["seccomp"],"action":"SCMP_ACT_ERRNO"}]}' \
+    > "$TMP_DIR/no-seccomp.json"
+refused=$(docker run --rm \
+    --platform "$DOCKER_PLATFORM" \
+    --security-opt seccomp="$TMP_DIR/no-seccomp.json" \
+    -v "$TMP_DIR/out:/out:ro" \
+    alpine:3.20 \
+    sh -c "/out/chaos-init-$ARCH --libs io -- grep NoNewPrivs /proc/self/status | tr -d '\t '; sed -n 2p /tmp/.chaos-init.status")
+want="NoNewPrivs:0
+reason=seccomp refused by the container's security settings"
+if [ "$refused" = "$want" ]; then
+    echo "ok   seccomp refused: no chaos, no no_new_privs"
+else
+    echo "FAIL seccomp refused: got \"$refused\", want \"$want\"" >&2
+    exit 1
+fi
