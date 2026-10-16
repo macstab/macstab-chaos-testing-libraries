@@ -33,6 +33,9 @@ typedef struct chaos_init_verdict
     unsigned delay_ms;
     long value;  /**< RETURN, or DELAY that then returns: the value. */
     int returns; /**< DELAY: returns `value` when due instead of running. */
+    /** A wait that times out: "nothing ready" goes into the caller's buffers, once
+     *  the thread is known to still wait (chaos_init_net_commit()). */
+    int clear_ready;
 } chaos_init_verdict_t;
 
 #endif

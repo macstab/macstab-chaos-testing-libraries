@@ -351,6 +351,7 @@ chaos_init_answer(int listener, unsigned libs, void *request, void *response, si
     {
         return;
     }
+    chaos_init_net_commit(&call, &verdict);
     if (verdict.action == CHAOS_INIT_DELAY)
     {
         const chaos_init_verdict_t answer = chaos_init_delay_answer(&verdict);

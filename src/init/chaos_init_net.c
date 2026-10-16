@@ -1000,11 +1000,20 @@ int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *v
     else
     {
         /* Nothing became ready within the timeout: waited out, then 0. */
-        chaos_init_net_clear_ready(call);
+        verdict->clear_ready = 1;
         verdict->action = timeout_ms > 0 ? CHAOS_INIT_DELAY : CHAOS_INIT_RETURN;
         verdict->delay_ms = (unsigned)timeout_ms;
         verdict->returns = 1;
         verdict->value = 0;
     }
     return 1;
+}
+
+void chaos_init_net_commit(const chaos_init_call_t *call, const chaos_init_verdict_t *verdict)
+{
+    if (verdict->clear_ready)
+    {
+        g_chaos_init_net_tid = call->tid;
+        chaos_init_net_clear_ready(call);
+    }
 }

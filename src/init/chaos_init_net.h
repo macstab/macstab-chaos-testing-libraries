@@ -21,4 +21,12 @@ void chaos_init_net_start(void);
  */
 int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *verdict);
 
+/**
+ * @brief Carries out what @p verdict leaves to be written into the thread's
+ *        memory (a timed-out wait's buffers). Called only once the notification
+ *        is known to be the thread's still: a pid reused by another process meanwhile
+ *        must not be written to.
+ */
+void chaos_init_net_commit(const chaos_init_call_t *call, const chaos_init_verdict_t *verdict);
+
 #endif

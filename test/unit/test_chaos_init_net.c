@@ -80,9 +80,13 @@ decide(int nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, 
     call.args[3] = a3;
     call.args[4] = a4;
     call.args[5] = a5;
+    memset(&verdict, 0, sizeof(verdict));
     verdict.action = CHAOS_INIT_FAIL;
     verdict.error = -1;
     assert(chaos_init_net_decide(&call, &verdict) == 1);
+    /* As chaos-init answers: what goes into the thread's memory goes once the
+     * notification is known to be still the thread's. */
+    chaos_init_net_commit(&call, &verdict);
     return verdict;
 }
 
@@ -631,6 +635,29 @@ int main(void)
         assert(polled[0].revents == 0 && polled[1].revents == 0);
         verdict = decide(__NR_ppoll, P(polled), 2U, P(&now), 0, 0, 0);
         assert(verdict.action == CHAOS_INIT_RETURN && verdict.value == 0);
+        /* The decision writes nothing: the caller's buffers are cleared by the
+         * commit, which comes only after the thread is known to still wait. */
+        {
+            chaos_init_call_t wait_call;
+            chaos_init_verdict_t decided;
+
+            memset(&wait_call, 0, sizeof(wait_call));
+            memset(&decided, 0, sizeof(decided));
+            wait_call.tid = getpid();
+            wait_call.nr = __NR_ppoll;
+            wait_call.args[0] = P(polled);
+            wait_call.args[1] = 2U;
+            wait_call.args[2] = P(&wait);
+            polled[1].revents = POLLIN;
+            assert(chaos_init_net_decide(&wait_call, &decided) == 1 && decided.clear_ready);
+            assert(polled[1].revents == POLLIN);
+            chaos_init_net_commit(&wait_call, &decided);
+            assert(polled[1].revents == 0);
+            polled[1].revents = POLLIN;
+            decided.clear_ready = 0;
+            chaos_init_net_commit(&wait_call, &decided);
+            assert(polled[1].revents == POLLIN);
+        }
         assert(PASSES(decide(__NR_ppoll, P(polled), 2U, 0U, 0, 0, 0))); /* no timeout */
         assert(PASSES(decide(__NR_ppoll, P(polled), 1U, P(&wait), 0, 0, 0)));
         assert(PASSES(decide(__NR_ppoll, 0U, 2U, P(&wait), 0, 0, 0)));
