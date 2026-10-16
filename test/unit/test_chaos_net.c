@@ -1050,9 +1050,22 @@ static int g_test_socket_type = SOCK_STREAM;
 static int g_dup_map_mode = 0;
 static void *chaos_net_test_dup_map(size_t size);
 static void chaos_net_test_dup_unmap(void *address, size_t size);
+/* Closes the descriptor between a store's close check and its tag when set. */
+static int g_dup_close_before_tag = 0;
+static void chaos_net_test_dup_before_tag(int fd);
+#define CHAOS_NET_DUP_BEFORE_TAG(fd) chaos_net_test_dup_before_tag(fd)
 #define CHAOS_NET_DUP_MAP(size) chaos_net_test_dup_map(size)
 #define CHAOS_NET_DUP_UNMAP(address, size) chaos_net_test_dup_unmap((address), (size))
 #include "../../src/net/chaos_net_socket.c"
+
+static void chaos_net_test_dup_before_tag(int fd)
+{
+    if (g_dup_close_before_tag)
+    {
+        g_dup_close_before_tag = 0;
+        chaos_net_dup_forget(fd);
+    }
+}
 
 /** @brief Counts the unmaps of a table that lost the race. */
 static int g_dup_unmaps = 0;
@@ -3073,6 +3086,15 @@ static void test_dup_skips_and_close_races(void)
     rc = recv(13, buffer, sizeof(buffer), 0);
     assert(g_recv_calls == 6);
     assert(chaos_net_dup_generation(-1) == 0U);
+
+    /* A close after the store's check but before its tag: the re-check drops it. */
+    g_dup_close_before_tag = 1;
+    rc = recv(16, buffer, sizeof(buffer), 0);
+    assert(g_recv_calls == 7);
+    rc = recv(16, buffer, sizeof(buffer), 0);
+    assert(g_recv_calls == 8);
+    rc = recv(16, buffer, sizeof(buffer), 0); /* kept by the last one: replayed */
+    assert(g_recv_calls == 8);
 
     /* A lock held by a thread that does not exist in the fork() child is released. */
     g_chaos_net_dup_slots[14 % CHAOS_NET_DUP_SLOTS].lock = 1;

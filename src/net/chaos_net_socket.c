@@ -552,6 +552,16 @@ typedef struct chaos_net_dup_slot
 #endif
 #endif
 
+/**
+ * @brief Runs between a store's close check and its tag; does nothing in the library.
+ *
+ * @details Unit tests define it before including this file to close the descriptor
+ * exactly there, the window a concurrent close() can hit.
+ */
+#ifndef CHAOS_NET_DUP_BEFORE_TAG
+#define CHAOS_NET_DUP_BEFORE_TAG(fd) ((void)(fd))
+#endif
+
 /** @brief The slot table, mapped on the first DUP rule; NULL before (or if mapping failed). */
 static chaos_net_dup_slot_t *volatile g_chaos_net_dup_slots = NULL;
 
@@ -710,11 +720,16 @@ static void chaos_net_dup_store(
         memcpy(&slot->name, name, (size_t)name_length);
         slot->name_length = name_length;
     }
+    CHAOS_NET_DUP_BEFORE_TAG(fd);
     slot->fd = fd;
-    /* A close between the check above and here either sees the tag (and clears
-     * it) or bumped the count before this check does. */
+    /* A close since the check above either saw the tag (and cleared it) or bumped
+     * the count before this re-check: then the payload is dropped. The slot lock is
+     * held, so only a close can write the tag meanwhile, and it writes -1 too. */
     __sync_synchronize();
-    (void)(slot->closes == generation || __sync_bool_compare_and_swap(&slot->fd, fd, -1));
+    if (slot->closes != generation)
+    {
+        slot->fd = -1;
+    }
     chaos_net_dup_unlock(slot);
 }
 
