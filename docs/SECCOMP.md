@@ -36,6 +36,8 @@ container PID 1: chaos-init --libs io,net -- <entrypoint> [args...]
   across reloads, and every process writes its own `/tmp/.chaos-<lib>.hits.<pid>`.
   A program an execve starts is a new process, as under `LD_PRELOAD`: its counts
   start over, and its hits go to a file of its own beside the replaced image's.
+  A forked child starts with the FAIL_AFTER counts its parent had when it forked,
+  as the library's child inherits them with its memory.
 - **Only the requested libraries' system calls** are passed to the supervisor; every
   other call runs untouched by the filter.
 

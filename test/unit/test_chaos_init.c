@@ -482,6 +482,15 @@ static void test_memory_and_proc(void)
         g_fake_stat = "12 (x) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242 1 2 3 0 5 0 7";
         assert(chaos_init_process_of(getpid(), &tgid, &start) == 0 && start == 4242U);
     }
+    /* The parent of a process; none for one that is gone or a malformed status. */
+    assert(chaos_init_parent_of(999999999) == -1);
+    g_fake_status = "Name:\tx\nTgid:\t12\nPPid:\t7\n";
+    assert(chaos_init_parent_of(12) == 7);
+    g_fake_status = "Name:\tx\nTgid:\t12\n";
+    assert(chaos_init_parent_of(12) == -1);
+    g_fake_status = "Name:\tx\nTgid:\t12\nPPid:\tx\n";
+    assert(chaos_init_parent_of(12) == -1);
+    g_fake_status = "Name:\tx\nTgid:\t12\n";
     g_fake_stat = "12 no-paren";
     assert(chaos_init_process_of(getpid(), &tgid, &start) == -1);
     g_fake_status = NULL;
@@ -565,6 +574,9 @@ static void test_tracee_table(void)
     g_fake_start[11] = 5U;
     first = chaos_init_tracee_of(10);
     assert(first >= 0 && chaos_init_tracee_of(11) == first);
+    /* Found by process without allocating; an entry knows its process. */
+    assert(chaos_init_tracee_find(10) == first && chaos_init_tracee_tgid(first) == 10);
+    assert(chaos_init_tracee_find(12) == -1 && chaos_init_tracee_find(0) == -1);
 
     /* A hit is counted in the process's slot and written at once. */
     slot = chaos_init_tracee_slot(&g_test_lib, first, 1U);
@@ -616,9 +628,15 @@ static void test_tracee_table(void)
     /* The pid of an ended process, now another one's: its counts start over. */
     chaos_hit_record(slot);
     chaos_hit_record(slot); /* pending: written when the entry is dropped */
-    g_fake_start[10] = 6U;
-    g_fake_start[11] = 6U;
-    assert(chaos_init_tracee_of(10) >= 0);
+    {
+        const uint64_t ended = chaos_init_tracee_serial(first);
+
+        g_fake_start[10] = 6U;
+        g_fake_start[11] = 6U;
+        assert(chaos_init_tracee_of(10) >= 0);
+        /* Another process holds the entry now: another serial. */
+        assert(chaos_init_tracee_serial(chaos_init_tracee_find(10)) != ended);
+    }
     assert(chaos_init_tracee_slot(&g_test_lib, chaos_init_tracee_of(10), 0U)->count == 0U);
     /* Its hits go to a file of its own; the ended one's file is kept. */
     chaos_hit_record(chaos_init_tracee_slot(&g_test_lib, chaos_init_tracee_of(10), 0U));

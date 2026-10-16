@@ -25,11 +25,13 @@ typedef struct chaos_init_tracee
 {
     pid_t tgid; /**< 0 when free. */
     uint64_t start;
-    uint64_t age; /**< Order of last use, to drop the longest unused when nothing ended. */
+    uint64_t age;    /**< Order of last use, to drop the longest unused when nothing ended. */
+    uint64_t serial; /**< Order of allocation: which process holds the entry. */
 } chaos_init_tracee_t;
 
 static chaos_init_tracee_t g_chaos_init_tracees[CHAOS_INIT_MAX_TRACEES];
 static uint64_t g_chaos_init_age = 0U;
+static uint64_t g_chaos_init_serial = 0U;
 static chaos_init_rules_t *g_chaos_init_rules[CHAOS_INIT_MAX_LIBS];
 static size_t g_chaos_init_rule_libs = 0U;
 
@@ -255,7 +257,32 @@ int chaos_init_tracee_of(pid_t tid)
     g_chaos_init_tracees[free_index].tgid = tgid;
     g_chaos_init_tracees[free_index].start = start;
     g_chaos_init_tracees[free_index].age = ++g_chaos_init_age;
+    g_chaos_init_tracees[free_index].serial = ++g_chaos_init_serial;
     return free_index;
+}
+
+int chaos_init_tracee_find(pid_t tgid)
+{
+    size_t index;
+
+    for (index = 0U; tgid > 0 && index < CHAOS_INIT_MAX_TRACEES; ++index)
+    {
+        if (g_chaos_init_tracees[index].tgid == tgid)
+        {
+            return (int)index;
+        }
+    }
+    return -1;
+}
+
+pid_t chaos_init_tracee_tgid(int tracee)
+{
+    return g_chaos_init_tracees[tracee].tgid;
+}
+
+uint64_t chaos_init_tracee_serial(int tracee)
+{
+    return g_chaos_init_tracees[tracee].serial;
 }
 
 chaos_hit_slot_t *chaos_init_tracee_slot(chaos_init_rules_t *rules, int tracee, size_t rule_index)

@@ -13,7 +13,9 @@
  * As in the hooks: LATENCY delays the call, then ERRNO or FAIL_AFTER fails it.
  * FAIL_AFTER counts calls per operation in each process, from 0 again after a
  * reload of the rule file; the core keeps those counters in one array, which is
- * swapped in for the calling process around each decision.
+ * swapped in for the calling process around each decision. A forked child starts
+ * with the counts its parent had when it forked, as the library's child inherits
+ * them with its memory; a new program (execve) starts from 0.
  */
 
 #include "chaos_init_process.h"
@@ -47,6 +49,12 @@ static int chaos_init_process_supported(const struct chaos_process_rule *rule)
 CHAOS_INIT_RULES_STORAGE(g_chaos_init_process, CHAOS_PROCESS_MAX_RULES);
 static uint64_t g_chaos_init_process_counters[CHAOS_INIT_MAX_TRACEES][CHAOS_PROCESS_OP_COUNT];
 static uint64_t g_chaos_init_process_counters_load[CHAOS_INIT_MAX_TRACEES];
+/* Which process (chaos_init_tracee_serial) the counters of an entry are of. */
+static uint64_t g_chaos_init_process_counters_owner[CHAOS_INIT_MAX_TRACEES];
+/* The counters at a process's latest fork, until its child takes them over. */
+static uint64_t g_chaos_init_process_forked[CHAOS_INIT_MAX_TRACEES][CHAOS_PROCESS_OP_COUNT];
+static uint64_t g_chaos_init_process_forked_load[CHAOS_INIT_MAX_TRACEES];
+static uint64_t g_chaos_init_process_forked_owner[CHAOS_INIT_MAX_TRACEES];
 
 /** @brief The application chaos-init started, while its first execve() is pending. */
 static pid_t g_chaos_init_process_application = 0;
@@ -156,8 +164,49 @@ static int chaos_init_process_slot(const chaos_init_call_t *call, chaos_process_
 }
 
 /**
+ * @brief Makes the FAIL_AFTER counters of entry @p tracee those of its present
+ *        process under rule load @p load.
+ *
+ * @details A process new to the entry starts from 0, or, if it is the child of a
+ * fork its parent made under the same load, from the parent's counts at that fork.
+ * Each fork has one child: the first new process of that parent takes them over.
+ * Every process call comes here first, so a child takes them before an execve of
+ * its own could start a new program, which starts from 0.
+ */
+static void chaos_init_process_counters_of(int tracee, uint64_t load)
+{
+    const uint64_t serial = chaos_init_tracee_serial(tracee);
+
+    if (g_chaos_init_process_counters_owner[tracee] == serial &&
+        g_chaos_init_process_counters_load[tracee] == load)
+    {
+        return;
+    }
+    memset(g_chaos_init_process_counters[tracee], 0, sizeof(g_chaos_init_process_counters[0]));
+    if (g_chaos_init_process_counters_owner[tracee] != serial)
+    {
+        const int parent =
+            chaos_init_tracee_find(chaos_init_parent_of(chaos_init_tracee_tgid(tracee)));
+
+        if (parent >= 0 &&
+            g_chaos_init_process_forked_owner[parent] == chaos_init_tracee_serial(parent) &&
+            g_chaos_init_process_forked_load[parent] == load)
+        {
+            memcpy(
+                g_chaos_init_process_counters[tracee],
+                g_chaos_init_process_forked[parent],
+                sizeof(g_chaos_init_process_counters[0])
+            );
+            g_chaos_init_process_forked_owner[parent] = 0U;
+        }
+    }
+    g_chaos_init_process_counters_owner[tracee] = serial;
+    g_chaos_init_process_counters_load[tracee] = load;
+}
+
+/**
  * @brief FAIL_AFTER for the calling process: its counters swapped into the core's
- *        array around the decision, reset when the rules were reloaded.
+ *        array around the decision.
  */
 static int chaos_init_process_fail_after(
     const chaos_init_call_t *call,
@@ -166,8 +215,6 @@ static int chaos_init_process_fail_after(
     int *error
 )
 {
-    const chaos_init_text_t *texts;
-    uint64_t load;
     const int tracee = chaos_init_tracee_of(call->tid);
     int fails;
     int index;
@@ -175,12 +222,6 @@ static int chaos_init_process_fail_after(
     if (tracee < 0 || !chaos_init_process_slot(call, rule))
     {
         return 0;
-    }
-    (void)chaos_init_process_snapshot(&texts, &load);
-    if (g_chaos_init_process_counters_load[tracee] != load)
-    {
-        memset(g_chaos_init_process_counters[tracee], 0, sizeof(g_chaos_init_process_counters[0]));
-        g_chaos_init_process_counters_load[tracee] = load;
     }
     for (index = 0; index < CHAOS_PROCESS_OP_COUNT; ++index)
     {
@@ -198,6 +239,9 @@ int chaos_init_process_decide(const chaos_init_call_t *call, chaos_init_verdict_
 {
     const chaos_process_operation_t operation = chaos_init_process_operation(call);
     chaos_process_rule_t rule;
+    const chaos_init_text_t *texts;
+    uint64_t load;
+    int tracee;
     int error = 0;
 
     if (operation == CHAOS_PROCESS_OP_INVALID)
@@ -209,6 +253,13 @@ int chaos_init_process_decide(const chaos_init_call_t *call, chaos_init_verdict_
     {
         g_chaos_init_process_application = 0; /* the start of the application itself */
         return 1;
+    }
+    tracee = chaos_init_tracee_of(call->tid);
+    (void)chaos_process_config_prepare(); /* the load the decision is made under */
+    (void)chaos_init_process_snapshot(&texts, &load);
+    if (tracee >= 0)
+    {
+        chaos_init_process_counters_of(tracee, load);
     }
     if (chaos_process_config_match(CHAOS_PROCESS_EFFECT_LATENCY, operation, &rule) &&
         chaos_init_process_slot(call, &rule) && chaos_process_rule_should_trigger(&rule))
@@ -223,6 +274,17 @@ int chaos_init_process_decide(const chaos_init_call_t *call, chaos_init_verdict_
     {
         verdict->action = verdict->action == CHAOS_INIT_DELAY ? CHAOS_INIT_DELAY : CHAOS_INIT_FAIL;
         verdict->error = error;
+    }
+    /* A fork that goes ahead: its child will start from these counts. */
+    if (operation == CHAOS_PROCESS_OP_FORK && tracee >= 0 && error == 0)
+    {
+        memcpy(
+            g_chaos_init_process_forked[tracee],
+            g_chaos_init_process_counters[tracee],
+            sizeof(g_chaos_init_process_forked[0])
+        );
+        g_chaos_init_process_forked_load[tracee] = load;
+        g_chaos_init_process_forked_owner[tracee] = chaos_init_tracee_serial(tracee);
     }
     return 1;
 }

@@ -14,17 +14,25 @@
  *   fork, vfork, execve, execveat, wait4 and waitid reach their operations;
  * - the application's own first execve is never faulted, later ones are;
  * - LATENCY delays, ERRNO fails, both together delay and then fail;
- * - FAIL_AFTER counts per process and starts over after a reload.
+ * - FAIL_AFTER counts per process and starts over after a reload; a fork child
+ *   starts with its parent's counts at the fork, once; a new process that gets
+ *   an ended one's entry starts from 0.
  */
 
 #include <stdint.h>
 #include <sys/types.h>
 
 static int g_fail_process = 0;
+static uint64_t g_start_offset = 0U; /* > 0: every pid looks taken over by a new process */
 int chaos_init_process_of(pid_t tid, pid_t *tgid, uint64_t *start);
 static int test_process_of(pid_t tid, pid_t *tgid, uint64_t *start)
 {
-    return g_fail_process ? -1 : chaos_init_process_of(tid, tgid, start);
+    if (g_fail_process || chaos_init_process_of(tid, tgid, start) != 0)
+    {
+        return -1;
+    }
+    *start += g_start_offset;
+    return 0;
 }
 #define CHAOS_INIT_PROCESS_OF(tid, tgid, start) test_process_of((tid), (tgid), (start))
 
@@ -140,6 +148,39 @@ int main(void)
     write_rules("waitpid:FAIL_AFTER:EINTR,1 # reloaded\n");
     assert(decide(__NR_wait4, 0U).action == CHAOS_INIT_PASS);
     assert(fails(decide(__NR_wait4, 0U), EINTR));
+
+    /* A fork child starts with the counts its parent had at the fork, as the
+     * library's child inherits them; the fork's counts go to one child only. */
+    {
+        pid_t forked;
+        pid_t later;
+
+        assert(fails(decide(__NR_wait4, 0U), EINTR)); /* the parent's count is past 1 */
+        assert(decide(__NR_clone, SIGCHLD).action == CHAOS_INIT_PASS);
+        forked = fork();
+        if (forked == 0)
+        {
+            pause();
+            _exit(0);
+        }
+        later = fork();
+        if (later == 0)
+        {
+            pause();
+            _exit(0);
+        }
+        assert(forked > 0 && later > 0);
+        assert(fails(decide_for(forked, __NR_wait4, 0U), EINTR));
+        assert(decide_for(later, __NR_wait4, 0U).action == CHAOS_INIT_PASS);
+        assert(kill(forked, SIGKILL) == 0 && waitpid(forked, NULL, 0) == forked);
+        assert(kill(later, SIGKILL) == 0 && waitpid(later, NULL, 0) == later);
+    }
+
+    /* A new process in an ended one's entry does not get its counts. */
+    g_start_offset = 1U;
+    assert(decide(__NR_wait4, 0U).action == CHAOS_INIT_PASS);
+    assert(fails(decide(__NR_wait4, 0U), EINTR));
+    g_start_offset = 0U;
 
     /* A process that ended is not counted, and its call runs. */
     g_fail_process = 1;

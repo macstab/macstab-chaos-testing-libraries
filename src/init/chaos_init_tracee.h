@@ -77,9 +77,21 @@ int chaos_init_tracee_register(chaos_init_rules_t *rules);
  *
  * @details Allocates an entry for a new process. When the table is full, entries of
  * processes that ended (or whose pid now belongs to another process) are written
- * and freed first; if none ended, the oldest entry is.
+ * and freed first; if none ended, the one unused longest is.
  */
 int chaos_init_tracee_of(pid_t tid);
+
+/** @brief The table index of process @p tgid if it has an entry, else -1; allocates nothing. */
+int chaos_init_tracee_find(pid_t tgid);
+
+/** @brief The process of entry @p tracee. */
+pid_t chaos_init_tracee_tgid(int tracee);
+
+/**
+ * @brief A number unique to the process that holds entry @p tracee: state kept by
+ *        index elsewhere belongs to it only while this number stays the same.
+ */
+uint64_t chaos_init_tracee_serial(int tracee);
 
 /**
  * @brief The hit slot of rule @p rule_index (of the active snapshot) for process

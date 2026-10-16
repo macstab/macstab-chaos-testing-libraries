@@ -129,6 +129,20 @@ static long chaos_init_proc_read(pid_t pid, const char *name, char *out, size_t 
 #define CHAOS_INIT_PROC_READ chaos_init_proc_read
 #endif
 
+pid_t chaos_init_parent_of(pid_t pid)
+{
+    char text[1024];
+    const char *field;
+    long parent;
+
+    if (CHAOS_INIT_PROC_READ(pid, "status", text, sizeof(text)) < 0 ||
+        (field = strstr(text, "\nPPid:")) == NULL || sscanf(field, "\nPPid: %ld", &parent) != 1)
+    {
+        return -1;
+    }
+    return (pid_t)parent;
+}
+
 int chaos_init_process_of(pid_t tid, pid_t *tgid, uint64_t *start)
 {
     char text[1024];

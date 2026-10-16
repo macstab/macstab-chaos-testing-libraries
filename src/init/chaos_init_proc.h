@@ -55,4 +55,7 @@ long chaos_init_proc_link(pid_t pid, const char *name, char *out, size_t size);
  */
 int chaos_init_process_of(pid_t tid, pid_t *tgid, uint64_t *start);
 
+/** @brief The parent of process @p pid (/proc/<pid>/status PPid); -1 when it is gone. */
+pid_t chaos_init_parent_of(pid_t pid);
+
 #endif
