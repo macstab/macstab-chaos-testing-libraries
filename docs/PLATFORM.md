@@ -396,15 +396,15 @@ A statically-linked binary has libc baked into the executable image. There is no
 - **Some kernel-adjacent userspace** (busybox, toybox in static configs).
 - **Embedded distros** that prefer static for size predictability.
 
-### 7.2. Why we accept this
+### 7.2. What reaches them: SECCOMP mode
 
-Designing around static binaries would mean instrumenting at the syscall layer (e.g. `ptrace(2)` or `seccomp-bpf` with `SECCOMP_RET_TRACE`). That's a different toolchain — different overhead, different scope, different failure modes. The libc-interposition approach is the correct tool for the dynamically-linked-app population, which is the bulk of typical deployments.
+The libraries cannot reach static binaries; libc interposition is the right tool for the dynamically linked population, which is the bulk of typical deployments. For the rest, `chaos-init` applies the same rule files from outside the process at the system-call layer (seccomp user notification): io, net, memory and process rules, with fewer effects and a higher cost per call. See [SECCOMP.md](SECCOMP.md).
 
 ### 7.3. Detection
 
 ```sh
-file /path/to/binary       # "statically linked" → we cannot inject
-ldd /path/to/binary        # "not a dynamic executable" → we cannot inject
+file /path/to/binary       # "statically linked" → LD_PRELOAD cannot inject; use chaos-init
+ldd /path/to/binary        # "not a dynamic executable" → LD_PRELOAD cannot inject; use chaos-init
 ```
 
 The lifetime of a static binary makes this a *deployment-time* check, not a runtime one.

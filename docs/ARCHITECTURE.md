@@ -49,6 +49,11 @@ failures through small `LD_PRELOAD` shared objects. The sections below describe
 that shared architecture through the `libchaos-io` implementation, because it
 is still the clearest example of the common preload model.
 
+A second front end, `chaos-init` (`src/init/`), applies the same rule cores to
+statically linked programs through seccomp user notification; see
+[SECCOMP.md](SECCOMP.md). It compiles each library's config and actions sources
+unchanged and only maps notified system calls to what the wrappers pass to them.
+
 The code stays intentionally narrow:
 
 - no public SDK
@@ -674,6 +679,25 @@ and [`test/runtime/test_process_alpine.sh`](../test/runtime/test_process_alpine.
 - `fork_probe` opens the file, starts a child that opens it, and opens it again:
   a `vfork` child neither takes over nor resets the parent's budget and writes
   no hits file; a `fork` child and a `posix_spawn`ed one each get their own
+- Accepts `linux/amd64` or `linux/arm64` as an optional explicit Docker target
+
+[`test/runtime/test_init.sh`](../test/runtime/test_init.sh)
+
+- Builds `chaos-init` and runs it in glibc and musl containers under Docker's
+  default profile, with every library's filter active
+- Files, sockets, mmap, fork and exec still work for a static and a dynamic
+  program; exit codes and signals pass through, SIGTERM reaches the application,
+  orphans are reaped, a missing command exits 127
+- A test build that sees a kernel older than 5.5 reports `state=unsupported` and
+  still starts the application; under emulation only that path is checked
+
+[`test/runtime/test_seccomp.sh`](../test/runtime/test_seccomp.sh)
+
+- Builds `chaos-init` and a `CGO_ENABLED=0` Go program; with a static C probe
+  they run under `chaos-init` in glibc and musl containers
+- io, net, memory and process rules fault them (EIO, latency, refused
+  connections, failed mmap, fork, exec and os/exec), `@first` and hits are per
+  process, and a rule the mode cannot apply rejects its file in the status
 - Accepts `linux/amd64` or `linux/arm64` as an optional explicit Docker target
 
 ## Platform Internals and Symbol Resolution

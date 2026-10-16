@@ -128,6 +128,13 @@ Three repos, one mental model: **the same selector × effect × policy DSL spans
 ```text
 ROADMAP.md
 src/
+  init/
+    chaos_init.c            # chaos-init: PID 1, filter, event loop (SECCOMP mode)
+    chaos_init_core.c       # arguments, BPF filter, status, exit code
+    chaos_init_<lib>.c      # io, net, memory, process: calls to rule decisions
+    chaos_init_tracee.c     # per-process hits, @first, FAIL_AFTER
+    chaos_init_proc.c       # reading a supervised process's memory and /proc
+    chaos_init_delay.c      # LATENCY queue
   common/
     chaos_domain_stub.c
     chaos_domain_stub.h
@@ -245,7 +252,7 @@ Deep subsystem references:
   specificity ordering; (S × E × P) algebra; full effect taxonomy A–E
 - [`docs/PLATFORM.md`](docs/PLATFORM.md)
   ELF gABI §5.2 link-map mechanics, PLT/GOT lazy binding, RTLD_NEXT chain, STT_GNU_IFUNC
-  resolver phase, GNU symbol versioning, AT_SECURE auxv, static-binary immunity
+  resolver phase, GNU symbol versioning, AT_SECURE auxv, static-binary immunity (and SECCOMP mode)
 - [`docs/SYSTEM.md`](docs/SYSTEM.md)
   Global system manual: symbol ownership theorem, loader/libc/kernel interaction,
   cross-library composition, formal one-symbol-one-owner invariant
@@ -275,6 +282,9 @@ Deep subsystem references:
 - [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)
   rdtsc/CNTPCT_EL0 measurement methodology, per-library hot-path overhead tables,
   cold-path reload cost, libfaketime/toxiproxy comparison
+- [`docs/SECCOMP.md`](docs/SECCOMP.md)
+  SECCOMP mode: `chaos-init` applies io, net, memory and process rules to statically
+  linked programs (Go, `FROM scratch`) through seccomp user notification
 - [`docs/SAFETY.md`](docs/SAFETY.md)
   AT_SECURE kernel mechanics, container capability model, seccomp syscall table,
   fail-open guarantee, sanitiser interactions, config file security

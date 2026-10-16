@@ -138,7 +138,8 @@ cookie streams) leaves errno as it was.
 
 ### Non-Goals
 
-- Static binary support.
+- Static binary support in the library (chaos-init applies io rules to static
+  binaries through seccomp: [SECCOMP.md](SECCOMP.md)).
 - Full syscall-level coverage.
 - Inode-identity matching.
 - Packet, network, time, process, or memory chaos.

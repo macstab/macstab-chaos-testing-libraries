@@ -159,8 +159,11 @@ int main(int argc, char **argv)
         (void)printf("%s\n", try_open_errno_name(errno));
         return 0;
     }
-    (void)fprintf(stderr, "usage: %s open|openms|first <path> | connect <port> | mmap <bytes> | "
-                          "fork | exec\n",
-                  argv[0]);
+    (void)fprintf(
+        stderr,
+        "usage: %s open|openms|first <path> | connect <port> | mmap <bytes> | "
+        "fork | exec\n",
+        argv[0]
+    );
     return 2;
 }

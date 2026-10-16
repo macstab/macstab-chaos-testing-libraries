@@ -66,7 +66,7 @@ In scope:
 
 Out of scope:
 
-- static binaries
+- static binaries (for the libraries; `chaos-init` covers them, see [SECCOMP.md](SECCOMP.md))
 - kernel-space interception
 - packet-level network shaping
 - syscall tracing frameworks
@@ -984,7 +984,7 @@ The repository prevents this by design, not by best-effort runtime detection.
 
 These are explicit, not accidental:
 
-- static binaries bypass `LD_PRELOAD`
+- static binaries bypass `LD_PRELOAD` (SECCOMP mode reaches them: [SECCOMP.md](SECCOMP.md))
 - direct syscall users can bypass libc interposition
 - some Go or custom runtimes may avoid the expected libc path
 - network traffic through generic `read()` or `write()` is not endpoint-aware in
