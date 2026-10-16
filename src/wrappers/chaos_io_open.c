@@ -186,8 +186,9 @@ static int chaos_io_getcwd_path(char *path, size_t path_size)
 /**
  * @brief Resolves an open-style pathname into the string used for matching.
  *
- * @details Resolution rules:
- * - Absolute paths are used as-is (fast path; no cwd or dirfd needed).
+ * @details Resolution rules (the result is then normalised lexically, see
+ * chaos_io_normalize_path()):
+ * - Absolute paths are used as written (no cwd or dirfd needed).
  * - Relative paths under `AT_FDCWD` are joined with the current working
  *   directory obtained from `getcwd()` inside the internal guard.
  * - Other relative paths are joined with the directory-fd path resolved
@@ -215,18 +216,26 @@ int chaos_io_resolve_at_path(
     }
     if (path[0] == '/')
     {
-        return chaos_io_copy_path(resolved_path, resolved_path_size, path);
+        if (!chaos_io_copy_path(resolved_path, resolved_path_size, path))
+        {
+            return 0;
+        }
     }
-    if (dirfd == AT_FDCWD)
+    else if (dirfd == AT_FDCWD)
     {
-        return chaos_io_getcwd_path(base_path, sizeof(base_path)) &&
-               chaos_io_join_paths(resolved_path, resolved_path_size, base_path, path);
+        if (!chaos_io_getcwd_path(base_path, sizeof(base_path)) ||
+            !chaos_io_join_paths(resolved_path, resolved_path_size, base_path, path))
+        {
+            return 0;
+        }
     }
-    if (!chaos_io_fdcache_resolve(dirfd, base_path, sizeof(base_path)))
+    else if (!chaos_io_fdcache_resolve(dirfd, base_path, sizeof(base_path)) ||
+             !chaos_io_join_paths(resolved_path, resolved_path_size, base_path, path))
     {
         return 0;
     }
-    return chaos_io_join_paths(resolved_path, resolved_path_size, base_path, path);
+    chaos_io_normalize_path(resolved_path);
+    return 1;
 }
 
 /**
@@ -248,7 +257,7 @@ int chaos_io_resolve_at_path(
  * @param[in] path  Pre-resolved path if available; NULL to trigger lazy
  *                  resolution from `/proc/self/fd/<fd>`.
  */
-static void chaos_io_cache_open_result(int fd, const char *path)
+static void chaos_io_cache_open_result(int fd)
 {
     char resolved_path[CHAOS_IO_MAX_PATH];
 
@@ -256,15 +265,9 @@ static void chaos_io_cache_open_result(int fd, const char *path)
     {
         return;
     }
-    if (path != NULL)
-    {
-        if (!chaos_io_is_excluded_path(path))
-        {
-            chaos_io_fdcache_store(fd, path);
-        }
-        return;
-    }
-
+    /* The kernel's name for it, links resolved; and never an entry an earlier
+     * descriptor with this number left behind (closed where io did not see it). */
+    chaos_io_fdcache_invalidate(fd);
     (void)chaos_io_fdcache_resolve(fd, resolved_path, sizeof(resolved_path));
 }
 
@@ -332,7 +335,7 @@ CHAOS_IO_EXPORT int open(const char *path, int flags, ...)
     }
 
     fd = chaos_io_call_real_open(path, flags, has_mode, mode);
-    chaos_io_cache_open_result(fd, match_path);
+    chaos_io_cache_open_result(fd);
     return fd;
 }
 
@@ -375,23 +378,14 @@ static int chaos_io_stdio_open_fault(const char *path, char *resolved_path, size
  * whatever path a closed descriptor of the same number had, and the stdio and
  * read/write rules would match that stale path -- even for a /proc stream.
  */
-static void chaos_io_cache_stream(FILE *stream, const char *resolved_path)
+static void chaos_io_cache_stream(FILE *stream)
 {
     const int saved_errno = errno;
     const int fd = stream != NULL ? fileno(stream) : -1;
 
-    if (fd >= 0)
-    {
-        if (resolved_path[0] != '\0' && !chaos_io_is_excluded_path(resolved_path))
-        {
-            chaos_io_fdcache_store(fd, resolved_path);
-        }
-        else
-        {
-            chaos_io_fdcache_invalidate(fd);
-        }
-    }
+    /* fileno() sets EBADF for streams without a descriptor (fmemopen, cookies). */
     errno = saved_errno;
+    chaos_io_cache_open_result(fd);
 }
 
 /**
@@ -415,7 +409,7 @@ CHAOS_IO_EXPORT FILE *fopen(const char *path, const char *mode)
     stream = g_chaos_io_real_fopen(path, mode);
     if (stream != NULL && !chaos_io_in_internal())
     {
-        chaos_io_cache_stream(stream, resolved_path);
+        chaos_io_cache_stream(stream);
     }
     return stream;
 }
@@ -449,7 +443,7 @@ CHAOS_IO_EXPORT FILE *freopen(const char *path, const char *mode, FILE *stream)
     /* A NULL path keeps the open file; anything else replaced the descriptor's file. */
     if (reopened != NULL && path != NULL && !chaos_io_in_internal())
     {
-        chaos_io_cache_stream(reopened, resolved_path);
+        chaos_io_cache_stream(reopened);
     }
     return reopened;
 }
@@ -525,7 +519,7 @@ CHAOS_IO_EXPORT int openat(int dirfd, const char *path, int flags, ...)
     }
 
     fd = chaos_io_call_real_openat(dirfd, path, flags, has_mode, mode);
-    chaos_io_cache_open_result(fd, match_path);
+    chaos_io_cache_open_result(fd);
     return fd;
 }
 

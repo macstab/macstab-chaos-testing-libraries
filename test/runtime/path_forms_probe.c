@@ -10,6 +10,9 @@
  * form. Every call below runs under a rule that fails its operation, then once more
  * without a rule to show the real call still works.
  *
+ * Paths are matched as the kernel resolves them (`.`, `..`, `//`, relative), and a
+ * file opened through a link is known by its real path to the descriptor rules.
+ *
  * Vectored writes under a matching rule also get the kernel's answer for an array
  * the kernel rejects (unmapped, longer than IOV_MAX) instead of a crash in the
  * wrapper, and a vector too long to tear is written whole.
@@ -96,6 +99,64 @@ static void make_file(const char *path)
         perror(path);
         exit(2);
     }
+}
+
+/** @brief Opens @p path read-only; 1 when it failed with EIO. */
+static int open_fails_eio(const char *path)
+{
+    const int fd = open(path, O_RDONLY);
+
+    if (fd >= 0)
+    {
+        (void)close(fd);
+        return 0;
+    }
+    return errno == EIO;
+}
+
+/**
+ * @brief A path is matched as the kernel resolves it: `.`, `..`, repeated slashes
+ *        and relative forms reach the rule, and a file opened through a link is
+ *        known by its real path to the descriptor rules.
+ */
+static void check_path_spellings(void)
+{
+    char buffer[4];
+    int fd;
+
+    write_rules("# idle\n");
+    (void)mkdir(DIR "/data", 0700);
+    (void)mkdir(DIR "/other", 0700);
+    make_file(DIR "/data/f");
+    (void)unlink(DIR "/link");
+    if (symlink(DIR "/data", DIR "/link") != 0)
+    {
+        perror("symlink");
+        exit(2);
+    }
+
+    write_rules(DIR "/data:open:EIO:1.0\n");
+    expect("open as written", open_fails_eio(DIR "/data/f"));
+    expect("open through ./", open_fails_eio(DIR "/./data/f"));
+    expect("open through //", open_fails_eio(DIR "//data///f"));
+    expect("open through ..", open_fails_eio(DIR "/other/../data/f"));
+    expect("open relative ..", chdir(DIR "/other") == 0 && open_fails_eio("../data/f"));
+    expect("chdir back", chdir("/") == 0);
+
+    write_rules(DIR "/data:read:EIO:1.0\n");
+    fd = open(DIR "/link/f", O_RDONLY);
+    errno = 0;
+    expect(
+        "read through a link",
+        fd >= 0 && read(fd, buffer, sizeof(buffer)) == -1 && errno == EIO && close(fd) == 0
+    );
+
+    write_rules("# idle\n");
+    expect(
+        "spellings cleaned up",
+        unlink(DIR "/link") == 0 && unlink(DIR "/data/f") == 0 && rmdir(DIR "/data") == 0 &&
+            rmdir(DIR "/other") == 0
+    );
 }
 
 /** @brief writev through a pointer, so libc's attributes accept invalid arguments. */
@@ -201,6 +262,7 @@ int main(void)
 #endif
 
     check_vectored_writes();
+    check_path_spellings();
 
     write_rules("# idle\n");
     fd = open(DIR "/source.bin", O_WRONLY);

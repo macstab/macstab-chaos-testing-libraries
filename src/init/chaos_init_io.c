@@ -182,7 +182,8 @@ static int chaos_init_io_fd_path(pid_t tid, uint64_t fd, char *out, size_t size)
 
 /**
  * @brief The string the wrappers match for (dirfd, path) of thread @p tid:
- *        absolute, or joined to the working directory or the directory.
+ *        absolute, or joined to the working directory or the directory, then
+ *        normalised lexically (chaos_io_normalize_path()).
  */
 static int chaos_init_io_at_path(
     pid_t tid, int has_dirfd, uint64_t dirfd, uint64_t address, char *out, size_t size
@@ -190,27 +191,22 @@ static int chaos_init_io_at_path(
 {
     char path[CHAOS_IO_MAX_PATH];
     char base[CHAOS_IO_MAX_PATH];
+    int at_cwd;
 
     if (chaos_init_read_string(tid, address, path, sizeof(path)) < 0)
     {
         return 0;
     }
-    if (path[0] == '/')
-    {
-        return chaos_io_copy_path(out, size, path);
-    }
-    if (!has_dirfd || (int)(int32_t)dirfd == AT_FDCWD)
-    {
-        if (CHAOS_INIT_IO_PROC_LINK(tid, "cwd", base, sizeof(base)) <= 0)
-        {
-            return 0;
-        }
-    }
-    else if (!chaos_init_io_fd_path(tid, dirfd, base, sizeof(base)))
+    at_cwd = !has_dirfd || (int)(int32_t)dirfd == AT_FDCWD;
+    if (path[0] == '/' ? !chaos_io_copy_path(out, size, path)
+                       : (at_cwd ? CHAOS_INIT_IO_PROC_LINK(tid, "cwd", base, sizeof(base)) <= 0
+                                 : !chaos_init_io_fd_path(tid, dirfd, base, sizeof(base))) ||
+                             !chaos_io_join_paths(out, size, base, path))
     {
         return 0;
     }
-    return chaos_io_join_paths(out, size, base, path);
+    chaos_io_normalize_path(out);
+    return 1;
 }
 
 /** @brief Bytes an iovec array of thread @p tid describes; CHAOS_POLICY_NO_SIZE if unknown. */

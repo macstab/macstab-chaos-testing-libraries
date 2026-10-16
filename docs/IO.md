@@ -329,21 +329,23 @@ already-open fd.
 The path flow is:
 
 1. Decode varargs correctly if `mode_t` is present.
-2. Resolve a textual match path:
-   - absolute path: use as-is
-   - `AT_FDCWD` relative path: join with current working directory
-   - other relative path: resolve directory fd through `/proc/self/fd`, then
-     join lexically
+2. Resolve a match path:
+   - absolute path: as written
+   - `AT_FDCWD` relative path: joined to the current working directory
+   - other relative path: joined to the directory fd's path (fd cache or
+     `/proc/self/fd`)
+   - then normalised lexically: repeated slashes become one, `.` goes, `..`
+     takes the component before it, a trailing slash goes
 3. Match the resolved path against config.
 4. Apply pre-call effects if a rule matches.
 5. Call the real libc `open()` or `openat()`.
-6. Seed the fd cache for the returned fd:
-   - use the pre-resolved path if available
-   - otherwise recover it through `/proc/self/fd/<fd>`
+6. Cache the returned fd under the kernel's name for it (`/proc/self/fd/<fd>`,
+   links resolved), after dropping whatever an earlier fd with that number left.
 
-Important constraint: path resolution is lexical. The library does not
-canonicalize `.` or `..` and does not normalize symlinks. Rule matching is
-therefore based on textual path identity, not canonical inode identity.
+Symbolic links: an `open` rule matches the path as written, normalised but with
+links unresolved (resolving every component would cost a system call each). The
+descriptor rules (`read`, `write`, `fsync`, ...) match the real path, so a file
+opened through a link is faulted by the rules for where it really is.
 
 ### What happens on `renameat()`
 
@@ -1076,7 +1078,8 @@ make unit 2>&1 | grep -E 'PROPTEST|test_config|OK'
 - matching is path-boundary aware
 - no globbing
 - no regex
-- no canonicalization
+- paths are normalised lexically (`.`, `..`, `//`); descriptors are known by
+  their real path
 
 ### Effect semantics
 

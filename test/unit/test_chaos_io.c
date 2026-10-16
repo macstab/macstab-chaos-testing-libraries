@@ -212,6 +212,9 @@ static void test_call_real_open_and_match_fd_rule(void)
     assert(chaos_io_resolve_at_path(AT_FDCWD, NULL, path, sizeof(path)) == 0);
     assert(chaos_io_resolve_at_path(AT_FDCWD, "relative.bin", NULL, sizeof(path)) == 0);
     assert(chaos_io_resolve_at_path(AT_FDCWD, "relative.bin", path, 0U) == 0);
+    /* A result that does not fit the buffer: absolute, and joined to the cwd. */
+    assert(chaos_io_resolve_at_path(AT_FDCWD, "/tmp/absolute.bin", path, 4U) == 0);
+    assert(chaos_io_resolve_at_path(AT_FDCWD, "relative.bin", path, 4U) == 0);
     g_fdcache_resolve_result = 1;
     (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/base");
     assert(chaos_io_resolve_at_path(9, "child.bin", path, sizeof(path)) == 1);
@@ -584,11 +587,12 @@ static void test_fsops_helpers_and_wrappers(void)
  * - Guard bypass: `g_config_match_path_calls == 0`; `g_fdcache_store_calls == 0`; real
  *   open called with no chaos applied.
  * - Proc bypass: same as guard bypass (no match attempt, no fdcache store).
- * - LATENCY: `g_latency_calls == 1`; `g_fdcache_store_calls == 1`;
- *   `g_last_store_path == "/tmp/latency.bin"`.
+ * - LATENCY: `g_latency_calls == 1`; the descriptor's entry is dropped and resolved
+ *   anew from the kernel (`/proc/self/fd`), not stored under the caller's string.
  * - ERRNO: returns -1, errno == EIO; `g_real_open_calls == 0`; `g_fdcache_store_calls == 0`.
  * - O_CREAT: `g_real_open_has_mode == 1`; `g_real_open_mode == 0600`.
- * - Relative path: matched and stored path equals `CWD + "/relative-open.bin"`.
+ * - Relative path: matched path equals `CWD + "/relative-open.bin"`.
+ * - `.`, `..` and `//` in an absolute path are normalised before matching.
  */
 static void test_open_wrapper(void)
 {
@@ -619,8 +623,11 @@ static void test_open_wrapper(void)
     assert(open("/tmp/latency.bin", O_RDONLY) == 15);
     assert(g_config_match_path_calls == 1);
     assert(g_latency_calls == 1);
-    assert(g_fdcache_store_calls == 1);
-    assert(strcmp(g_last_store_path, "/tmp/latency.bin") == 0);
+    /* The new descriptor is cached under the kernel's name for it, never under a
+     * stale entry of an earlier descriptor with that number. */
+    assert(g_fdcache_store_calls == 0);
+    assert(g_fdcache_invalidate_calls == 1 && g_last_invalidate_fd == 15);
+    assert(g_fdcache_resolve_calls == 1);
 
     chaos_test_reset_state();
     chaos_test_bind_real_functions();
@@ -651,7 +658,50 @@ static void test_open_wrapper(void)
         chaos_io_join_paths(expected_path, sizeof(expected_path), cwd, "relative-open.bin") == 1
     );
     assert(strcmp(g_last_match_path, expected_path) == 0);
-    assert(strcmp(g_last_store_path, expected_path) == 0);
+
+    /* Matched as the kernel resolves it: `.`, `..` and repeated slashes. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_open_return = 18;
+    g_config_match_path_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_LATENCY;
+    assert(open("/tmp/pd/./x//../data/f", O_RDONLY) == 18);
+    assert(strcmp(g_last_match_path, "/tmp/pd/data/f") == 0);
+}
+
+/**
+ * @brief Invariant: paths are normalised lexically: one slash between components,
+ *   no `.`, `..` taking the component before it (not above the root), no trailing
+ *   slash; relative paths are left alone.
+ */
+static void test_normalize_path(void)
+{
+    static const char *const cases[][2] = {
+        {"/", "/"},
+        {"//", "/"},
+        {"/tmp", "/tmp"},
+        {"/tmp/", "/tmp"},
+        {"/tmp//pd///data", "/tmp/pd/data"},
+        {"/tmp/./pd/.", "/tmp/pd"},
+        {"/tmp/pd/../data", "/tmp/data"},
+        {"/tmp/pd/x/../../data", "/tmp/data"},
+        {"/..", "/"},
+        {"/../../tmp", "/tmp"},
+        {"/tmp/..", "/"},
+        {"/a/b/c/../../../..", "/"},
+        {"/tmp/.hidden/..x/...", "/tmp/.hidden/..x/..."},
+        {"relative/../x", "relative/../x"},
+    };
+    char path[64];
+    size_t index;
+
+    for (index = 0U; index < sizeof(cases) / sizeof(cases[0]); ++index)
+    {
+        (void)snprintf(path, sizeof(path), "%s", cases[index][0]);
+        chaos_io_normalize_path(path);
+        assert(strcmp(path, cases[index][1]) == 0);
+    }
+    chaos_io_normalize_path(NULL);
 }
 
 /**
@@ -702,7 +752,7 @@ static void test_openat_wrapper(void)
         chaos_io_join_paths(expected_path, sizeof(expected_path), cwd, "relative-openat.bin") == 1
     );
     assert(strcmp(g_last_match_path, expected_path) == 0);
-    assert(strcmp(g_last_store_path, expected_path) == 0);
+    assert(g_fdcache_invalidate_calls == 1 && g_last_invalidate_fd == 19);
     assert(g_latency_calls == 1);
 
     chaos_test_reset_state();
@@ -714,7 +764,7 @@ static void test_openat_wrapper(void)
     g_config_rule.effect = CHAOS_IO_EFFECT_LATENCY;
     assert(openat(21, "child.bin", O_RDONLY) == 20);
     assert(strcmp(g_last_match_path, "/tmp/openat-base/child.bin") == 0);
-    assert(strcmp(g_last_store_path, "/tmp/openat-base/child.bin") == 0);
+    assert(g_fdcache_store_calls == 0 && g_last_invalidate_fd == 20);
     assert(g_real_openat_dirfd == 21);
     assert(strcmp(g_real_openat_path, "child.bin") == 0);
 
@@ -2593,8 +2643,8 @@ static void test_stdio_wrappers(void)
  * @brief Invariant: streams keep the fd-to-path cache right, and stdio lookups leave
  *   errno alone.
  *
- * Expected observable behaviour: fopen caches the stream's descriptor with its path;
- *   freopen onto an excluded path drops the entry; fclose drops it; nothing is
+ * Expected observable behaviour: fopen drops any entry of the stream's descriptor
+ *   and resolves it anew; so does freopen; fclose drops it; nothing is
  *   cached under the guard; a passthrough call on a stream without a descriptor
  *   leaves errno as it was.
  */
@@ -2612,12 +2662,13 @@ static void test_stdio_streams_keep_the_cache_right(void)
     assert(g_real_fopen_return != NULL);
     stream = fopen("/tmp/stdio-cache.txt", "w+");
     assert(stream == g_real_fopen_return);
-    assert(g_fdcache_store_calls == 1 && g_last_store_fd == fileno(stream));
-    assert(strcmp(g_last_store_path, "/tmp/stdio-cache.txt") == 0);
+    /* Cached under the kernel's name for the new descriptor, never a stale one. */
+    assert(g_fdcache_invalidate_calls == 1 && g_last_invalidate_fd == fileno(stream));
+    assert(g_fdcache_resolve_calls == 1 && g_fdcache_store_calls == 0);
 
-    /* Reopened onto an excluded path: the entry is dropped, not replaced. */
+    /* Reopened: the descriptor's entry is dropped and resolved again. */
     assert(freopen("/proc/self/status", "r", stream) == stream);
-    assert(g_fdcache_store_calls == 1 && g_last_invalidate_fd == fileno(stream));
+    assert(g_fdcache_invalidate_calls == 2 && g_fdcache_resolve_calls == 2);
     /* A NULL path keeps the file: no change. */
     invalidations = g_fdcache_invalidate_calls;
     assert(freopen(NULL, "r", stream) == stream);
@@ -2626,9 +2677,9 @@ static void test_stdio_streams_keep_the_cache_right(void)
     memory = fmemopen(buffer, sizeof(buffer), "w");
     assert(memory != NULL);
     g_real_fopen_return = memory;
-    stores = g_fdcache_store_calls;
+    stores = g_fdcache_resolve_calls;
     assert(fopen("/tmp/stdio-cache.txt", "w") == memory);
-    assert(g_fdcache_store_calls == stores && g_fdcache_invalidate_calls == invalidations);
+    assert(g_fdcache_resolve_calls == stores && g_fdcache_invalidate_calls == invalidations);
 
     /* Under the guard nothing is cached or dropped. */
     g_chaos_io_tls_guard = 1;
@@ -2636,7 +2687,7 @@ static void test_stdio_streams_keep_the_cache_right(void)
     assert(fopen("/tmp/stdio-cache.txt", "r") == stream);
     assert(freopen("/tmp/stdio-cache.txt", "r", stream) == stream);
     assert(fclose(memory) == 0);
-    assert(g_fdcache_store_calls == stores && g_fdcache_invalidate_calls == invalidations);
+    assert(g_fdcache_resolve_calls == stores && g_fdcache_invalidate_calls == invalidations);
     g_chaos_io_tls_guard = 0;
 
     /* fclose drops the entry of a stream with a descriptor. */
@@ -2664,6 +2715,7 @@ int main(void)
     test_ensure_symbols_is_thread_safe();
     test_init_runtime();
     test_open_wrapper();
+    test_normalize_path();
     test_openat_wrapper();
     test_fsops_helpers_and_wrappers();
     test_path_form_wrappers();

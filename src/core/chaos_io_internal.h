@@ -832,6 +832,68 @@ static inline int chaos_io_copy_path(char *destination, size_t destination_size,
 }
 
 /**
+ * @brief Normalises the absolute path @p path in place, lexically.
+ *
+ * @details Repeated slashes become one, `.` components are dropped, `..` drops the
+ * component before it (and stays at the root), and a trailing slash goes, so that
+ * `/tmp/pd/./data//f` and `/tmp/pd/x/../data/f` match a rule for `/tmp/pd/data`
+ * as the kernel resolves them. Symbolic links are not followed here: the path an
+ * opened descriptor is cached under comes from the kernel (`/proc/self/fd`). A
+ * relative path is left as it is. The result is never longer than the input.
+ *
+ * @param[in,out] path  NUL-terminated path.
+ */
+static inline void chaos_io_normalize_path(char *path)
+{
+    size_t read_at = 1U;
+    size_t write_at = 1U;
+
+    if (path == NULL || path[0] != '/')
+    {
+        return;
+    }
+    while (path[read_at] != '\0')
+    {
+        size_t start;
+        size_t length;
+
+        while (path[read_at] == '/')
+        {
+            ++read_at;
+        }
+        start = read_at;
+        while (path[read_at] != '\0' && path[read_at] != '/')
+        {
+            ++read_at;
+        }
+        length = read_at - start;
+        if (length == 0U || (length == 1U && path[start] == '.'))
+        {
+            continue;
+        }
+        if (length == 2U && path[start] == '.' && path[start + 1U] == '.')
+        {
+            while (write_at > 1U && path[write_at - 1U] != '/')
+            {
+                --write_at;
+            }
+            if (write_at > 1U)
+            {
+                --write_at;
+            }
+            continue;
+        }
+        if (write_at > 1U)
+        {
+            path[write_at++] = '/';
+        }
+        (void)memmove(path + write_at, path + start, length);
+        write_at += length;
+    }
+    path[write_at] = '\0';
+}
+
+/**
  * @brief Joins a resolved base directory and a relative child path.
  *
  * @details `openat()` needs a stable absolute-ish string for config matching.
