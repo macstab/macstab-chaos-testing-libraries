@@ -22,7 +22,9 @@ container PID 1: chaos-init --libs io,net -- <entrypoint> [args...]
        ├─ fails it (errno), delays it (LATENCY, in a timer queue), returns a
        │  value without running it (poll TIMEOUT), or lets it run
        ├─ forwards termination and user signals, reaps orphans
-       └─ exits with the application's exit code (128 + signal if killed)
+       └─ exits with the application's exit code (128 + signal if killed);
+          when it is not PID 1, a background copy goes on answering the
+          processes the application left behind until the last of them ends
 ```
 
 - **One core, two front ends.** `chaos-init` compiles each library's rule core
@@ -117,6 +119,7 @@ the load, never a passing `state=ok` first.
 | Privileges | None beyond Docker's default profile. The child sets no_new_privs, so set-user-ID programs it starts do not gain privileges. |
 | Architecture | x86_64 and aarch64. Under emulation (amd64 on an arm64 host) seccomp is unavailable: `state=unsupported`. Other ABIs (x32) pass unfiltered. |
 | Reading the process | Paths, addresses and iovec sizes are read from the process's memory (`process_vm_readv`), and fds and sockets through `/proc/<pid>`. This works for a process of the same user. A process that changes user (root to nobody) cannot be read: its path and endpoint rules do not match, while rules on the operation alone still do. |
+| Leftover processes | When chaos-init is not PID 1 (a shell or another init started it), processes the application left behind keep the filter. A background copy answers them until the last one ends, which the kernel reports from 5.8; on 5.5 to 5.7 that copy stays, idle, until the container stops. |
 | Signals | A call held back by LATENCY waits out its delay when signals arrive (Go signals its threads constantly). From 5.19 the waiting call cannot be interrupted except by a fatal signal; before 5.19 the kernel restarts an interrupted call as a new notification, which keeps the delay's original due time and is not counted again. Handlers of signals that arrive meanwhile run after the delay (5.19+). |
 | UNIX sockets | The peer of a UNIX socket is not in `/proc`. Rules on a UNIX socket's peer (send on a connected client) do not match. |
 | Cost | One notified call takes about 2.5 µs instead of 0.2 µs (Docker Desktop, kernel 6.10). Only the requested libraries' system calls pay it. |

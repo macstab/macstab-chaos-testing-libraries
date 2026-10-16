@@ -11,6 +11,9 @@
  *        seccomp_probe connect <port> listens on 127.0.0.1:<port>, connects to it:
  *                                     "ok" or the errno name
  *        seccomp_probe mmap <bytes>   maps that many anonymous bytes
+ *        seccomp_probe orphan <path> <out> exits 3 at once, leaving a child that
+ *                                     opens <path> 300 ms later and writes the
+ *                                     result ("ok" or the errno name) to <out>
  *        seccomp_probe fork           forks a child that exits at once
  *        seccomp_probe exec           executes /bin/true (prints only on failure)
  */
@@ -135,6 +138,28 @@ int main(int argc, char **argv)
         (void)read(pipe_fds[0], child_result, sizeof(child_result) - 1U);
         (void)printf("parent=%s,%s child=%s\n", first, second, child_result);
         return 0;
+    }
+    if (argc == 4 && strcmp(argv[1], "orphan") == 0)
+    {
+        const pid_t child = fork();
+
+        if (child == 0)
+        {
+            const struct timespec wait = {0, 300000000L};
+            const char *result;
+            int out;
+
+            (void)nanosleep(&wait, NULL);
+            result = try_open(argv[2]);
+            out = open(argv[3], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (out >= 0)
+            {
+                (void)write(out, result, strlen(result));
+                (void)close(out);
+            }
+            _exit(0);
+        }
+        return child > 0 ? 3 : 1;
     }
     if (argc == 3 && strcmp(argv[1], "connect") == 0)
     {

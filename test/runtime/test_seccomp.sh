@@ -139,6 +139,17 @@ for variant in "$init" /tmp/chaos-init-restart; do
     expect "$variant: the interrupted delay counted once" \
         "$(cat /tmp/.chaos-io.hits.* 2>/dev/null | awk -F "\t" "\$2 ~ /slow/ { s += \$1 } END { print s + 0 }")" "1"
 done
+# chaos-init is not PID 1 here (sh is): when the application exits, its exit code
+# is returned at once, and the child it left behind is still answered, rules
+# included, instead of every filtered call failing with ENOSYS.
+rm -f /tmp/sec/orphan.out
+code=0
+$init --libs io -- /tmp/probe orphan /tmp/sec/data/x /tmp/sec/orphan.out >/dev/null || code=$?
+expect "the application exit code returns before its orphan is done" "$code $(cat /tmp/sec/orphan.out 2>/dev/null || echo none)" "3 none"
+sleep 1
+expect "the orphan is still answered, its rule applied" "$(cat /tmp/sec/orphan.out 2>/dev/null)" "EIO"
+expect "the background chaos-init ends with the last process" \
+    "$(grep -l chaos-init /proc/[0-9]*/comm 2>/dev/null | wc -l | tr -d " ")" "0"
 expect "C: without chaos-init the rule does nothing" "$(/tmp/probe open /tmp/sec/data/x)" "ok"
 expect "C: open rule fails the open" "$($init --libs io -- /tmp/probe open /tmp/sec/data/x)" "EIO"
 expect "C: an unmatched path opens" "$($init --libs io -- /tmp/probe open /tmp/sec/other)" "ok"

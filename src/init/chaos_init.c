@@ -412,6 +412,42 @@ static int chaos_init_reap(pid_t child, int *child_status)
     }
 }
 
+/**
+ * @brief Once the application has exited: whether a background copy of chaos-init
+ *        must go on answering the processes it left behind (daemons, double forks).
+ *
+ * @details They keep the filter; with nobody answering, every filtered call of
+ * theirs would fail with ENOSYS. As PID 1 nothing is needed: its exit ends the
+ * container's processes. Otherwise this process returns the application's exit
+ * code at once, as before, and a forked copy serves the listener until the kernel
+ * reports that no process uses the filter any more (POLLHUP, Linux 5.8+). Its
+ * standard descriptors are detached so a caller reading chaos-init's output sees
+ * the end of it.
+ *
+ * @return 1 in the background copy, 0 in the process that is to exit.
+ */
+static int chaos_init_serve_the_rest(int listener)
+{
+    int null_fd;
+
+    if (listener < 0 || getpid() == 1 || fork() != 0)
+    {
+        return 0;
+    }
+    null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+    if (null_fd >= 0)
+    {
+        (void)dup2(null_fd, STDIN_FILENO);
+        (void)dup2(null_fd, STDOUT_FILENO);
+        (void)dup2(null_fd, STDERR_FILENO);
+        if (null_fd > STDERR_FILENO)
+        {
+            (void)close(null_fd);
+        }
+    }
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     static unsigned long request[CHAOS_INIT_NOTIF_BUFFER / sizeof(unsigned long)];
@@ -426,6 +462,7 @@ int main(int argc, char **argv)
     int signals;
     int timer;
     int child_status = 0;
+    int serving_the_rest = 0;
     pid_t child;
 
     memset(&sizes, 0, sizeof(sizes));
@@ -552,14 +589,22 @@ int main(int argc, char **argv)
 
             if (read(signals, &info, sizeof(info)) == (ssize_t)sizeof(info))
             {
-                if (info.ssi_signo != SIGCHLD)
+                if (serving_the_rest)
+                {
+                    /* The application is gone: nothing to forward or reap. */
+                }
+                else if (info.ssi_signo != SIGCHLD)
                 {
                     (void)kill(child, (int)info.ssi_signo);
                 }
                 else if (chaos_init_reap(child, &child_status))
                 {
                     chaos_init_tracee_flush(1);
-                    return chaos_init_exit_code(child_status);
+                    if (!chaos_init_serve_the_rest(listener))
+                    {
+                        return chaos_init_exit_code(child_status);
+                    }
+                    serving_the_rest = 1;
                 }
             }
         }
@@ -582,6 +627,11 @@ int main(int argc, char **argv)
             /* No process uses the filter any more. */
             (void)close(listener);
             listener = -1;
+            if (serving_the_rest)
+            {
+                chaos_init_tracee_flush(1);
+                return 0;
+            }
         }
         if (listener >= 0)
         {
