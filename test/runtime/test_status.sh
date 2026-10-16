@@ -11,6 +11,8 @@
 #
 # The status is written by the library's constructor, so the program needs to call
 # nothing. Each report must carry the pid of the program that loaded the rules.
+# On glibc, a rule file reloaded after the program switched to de_DE.UTF-8 must
+# read the same (locale_probe).
 #
 # Usage:   test_status.sh [linux/amd64|linux/arm64]
 # Env:     CHAOS_STATUS_DOCKER_PLATFORM  platform override
@@ -132,6 +134,26 @@ for lib in io net dns time memory process; do
         echo "ok   $LIBC $lib: no rule file, no status file"
     fi
 done
+
+# A program that switches to a locale with a decimal comma (a JVM does, from LANG)
+# must still get "1.0" read as a probability (glibc; musl has no such locales).
+if [ "$LIBC" = glibc ]; then
+    if apt-get update >/dev/null 2>&1 && apt-get install -y --no-install-recommends locales >/dev/null 2>&1 &&
+        localedef -i de_DE -f UTF-8 de_DE.UTF-8 >/dev/null 2>&1; then
+        gcc -D_GNU_SOURCE -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o /tmp/locale-probe /work/test/runtime/locale_probe.c
+        echo "# idle" > /tmp/.chaos-io.conf
+        got=$(LD_PRELOAD=/out/libchaos-io-$LIBC-'"$ARCH"'.so /tmp/locale-probe)
+        rm -f /tmp/.chaos-io.conf
+        if [ "$got" = EIO ]; then
+            echo "ok   $LIBC io: a rule read under de_DE.UTF-8 applies"
+        else
+            echo "FAIL $LIBC io: a rule read under de_DE.UTF-8: $got" >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "skip $LIBC: the de_DE locale could not be installed"
+    fi
+fi
 [ "$failures" -eq 0 ]
 '
 
@@ -153,6 +175,7 @@ for libc in glibc musl; do
         --platform "$DOCKER_PLATFORM" \
         -e LIBC="$libc" \
         -v "$TMP_DIR/$libc:/out:ro" \
+        -v "$ROOT_DIR/test/runtime:/work/test/runtime:ro" \
         "$base" \
         sh -c "$CHECK_SCRIPT"
 done

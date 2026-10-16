@@ -428,6 +428,44 @@ static void test_helper_functions(void)
         assert(chaos_net_parse_probability(NULL, &probability) == -1);
         assert(chaos_net_parse_probability("2.0", &probability) == -1);
         assert(chaos_net_parse_probability("x", &probability) == -1);
+        /* The grammar, whatever the locale: strtod accepted nan (which passes
+         * every range check), inf, hex and exponents, and failed on "0.5"
+         * under a locale with a decimal comma. */
+        {
+            static const struct
+            {
+                const char *text;
+                double value;
+            } valid[] = {
+                {"0", 0.0},
+                {"1", 1.0},
+                {"0.5", 0.5},
+                {"0.3", 0.3},
+                {"1.0", 1.0},
+                {"1.0000", 1.0},
+                {"0.0001", 0.0001},
+                {"0.25 \t", 0.25},
+                {"0.12345678901234567", 0.123456789012345},
+            };
+            static const char *const invalid[] = {
+                "",      "nan",  "NAN",  "inf", "-0",    "+0.5", "0x0.8", "1e-3",
+                "0.5e0", "0,5",  ".5",   "0.",  "1.",    "1.5",  "1.01",  "2",
+                "01",    "0.5x", " 0.5", "00",  "0.5 1", "10",   "-0.5",  "1.0 x",
+            };
+            size_t item;
+
+            for (item = 0U; item < sizeof(valid) / sizeof(valid[0]); ++item)
+            {
+                probability = -1.0;
+                assert(chaos_policy_parse_probability(valid[item].text, &probability) == 0);
+                assert(probability == valid[item].value);
+            }
+            for (item = 0U; item < sizeof(invalid) / sizeof(invalid[0]); ++item)
+            {
+                assert(chaos_policy_parse_probability(invalid[item], &probability) == -1);
+            }
+            assert(chaos_policy_parse_probability("0.5", NULL) == -1);
+        }
 
         assert(chaos_net_parse_latency("25", &latency_ms) == 0);
         assert(latency_ms == 25U);

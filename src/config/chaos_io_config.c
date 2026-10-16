@@ -421,38 +421,16 @@ static int chaos_io_parse_errno_name(const char *text)
 }
 
 /**
- * @brief Parses a floating-point probability value from the config.
+ * @brief Parses a probability (see chaos_policy_parse_probability()): "0", "1",
+ *        "0." and digits, or "1." and zeros, whatever the locale.
  *
- * @details Uses `strtod()` and validates that the entire token was consumed
- * and the value lies in [0.0, 1.0].  Any trailing non-whitespace after the
- * number is treated as an error to prevent silently ignoring garbage.
- *
- * @param[in]  text         Null-terminated probability token.  May be NULL.
- * @param[out] probability  Receives the parsed value.  Must not be NULL.
- * @return 0 on success; -1 on parse or range error.
+ * @param text         Probability string. Must not be NULL.
+ * @param probability  Output: receives the parsed value. Must not be NULL.
+ * @return 0 on success; -1 when @p text is not a probability.
  */
 static int chaos_io_parse_probability(const char *text, double *probability)
 {
-    char *end = NULL;
-    double value;
-
-    if (text == NULL || probability == NULL)
-    {
-        return -1;
-    }
-
-    value = strtod(text, &end);
-    if (end == text || *chaos_io_trim(end) != '\0')
-    {
-        return -1;
-    }
-    if (value < 0.0 || value > 1.0)
-    {
-        return -1;
-    }
-
-    *probability = value;
-    return 0;
+    return chaos_policy_parse_probability(text, probability);
 }
 
 /**

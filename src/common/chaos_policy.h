@@ -48,6 +48,59 @@ typedef struct chaos_rule_policy
     unsigned char has_size_below;
 } chaos_rule_policy_t;
 
+/**
+ * @brief Parses a probability as the rule grammar defines it: "0", "1", "0." and
+ *        digits, or "1." and zeros; trailing blanks are allowed. -1 otherwise.
+ *
+ * @details Independent of the locale, unlike strtod: an application may set
+ * LC_NUMERIC (the JVM calls setlocale(LC_ALL, "")), and under a German locale
+ * strtod stops at the '.' of "0.5". strtod also takes nan, inf, hexadecimal and
+ * exponents, none of which is a probability. The first 15 decimals are exact;
+ * further digits are checked but below a double's precision.
+ */
+static inline int chaos_policy_parse_probability(const char *text, double *probability)
+{
+    uint64_t decimals = 0U;
+    double scale = 1.0;
+    int one;
+
+    if (text == NULL || probability == NULL || (*text != '0' && *text != '1'))
+    {
+        return -1;
+    }
+    one = *text++ == '1';
+    if (*text == '.')
+    {
+        ++text;
+        if (*text < '0' || *text > '9')
+        {
+            return -1;
+        }
+        for (; *text >= '0' && *text <= '9'; ++text)
+        {
+            if (one && *text != '0')
+            {
+                return -1;
+            }
+            if (scale < 1e15)
+            {
+                decimals = decimals * 10U + (uint64_t)(*text - '0');
+                scale *= 10.0;
+            }
+        }
+    }
+    while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n')
+    {
+        ++text;
+    }
+    if (*text != '\0')
+    {
+        return -1;
+    }
+    *probability = one ? 1.0 : (double)decimals / scale;
+    return 0;
+}
+
 /** @brief Parses a decimal number of at most 18 digits; -1 when @p text is not one. */
 static inline int chaos_policy_parse_number(const char *text, uint64_t *value)
 {

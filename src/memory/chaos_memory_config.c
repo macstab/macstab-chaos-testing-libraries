@@ -614,34 +614,16 @@ static int chaos_memory_parse_errno_name(const char *text)
 }
 
 /**
- * @brief Parse a probability value from a decimal string.
+ * @brief Parses a probability (see chaos_policy_parse_probability()): "0", "1",
+ *        "0." and digits, or "1." and zeros, whatever the locale.
  *
- * @details
- * Uses strtod() and validates that the result is in [0.0, 1.0].  Whitespace
- * after the number (but before the null terminator) is tolerated.
- *
- * @param text         Null-terminated probability string (e.g., "0.05", "1.0").
- * @param[out] probability  Set to the parsed value on success.
- * @return  0 on success, -1 on parse error or out-of-range value.
+ * @param text         Probability string. Must not be NULL.
+ * @param probability  Output: receives the parsed value. Must not be NULL.
+ * @return 0 on success; -1 when @p text is not a probability.
  */
 static int chaos_memory_parse_probability(const char *text, double *probability)
 {
-    char *end = NULL;
-    double value;
-
-    if (text == NULL || probability == NULL)
-    {
-        return -1;
-    }
-
-    value = strtod(text, &end);
-    if (end == text || *chaos_memory_trim(end) != '\0' || value < 0.0 || value > 1.0)
-    {
-        return -1;
-    }
-
-    *probability = value;
-    return 0;
+    return chaos_policy_parse_probability(text, probability);
 }
 
 /**

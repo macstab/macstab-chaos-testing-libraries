@@ -653,38 +653,16 @@ static int chaos_dns_selector_matches_domain(
  * ------------------------------------------------------------------------- */
 
 /**
- * @brief Parse a probability value from a NUL-terminated string.
+ * @brief Parses a probability (see chaos_policy_parse_probability()): "0", "1",
+ *        "0." and digits, or "1." and zeros, whatever the locale.
  *
- * @details Accepts any decimal floating-point representation recognised by
- * strtod(3) in the range [0.0, 1.0].  Any trailing non-whitespace after the
- * number causes failure.
- *
- * @param text         Input string.
- * @param probability  Output; set on success.
- * @return  0 on success; -1 on parse failure or out-of-range value.
+ * @param text         Probability string. Must not be NULL.
+ * @param probability  Output: receives the parsed value. Must not be NULL.
+ * @return 0 on success; -1 when @p text is not a probability.
  */
 static int chaos_dns_parse_probability(const char *text, double *probability)
 {
-    char *end = NULL;
-    double value;
-
-    if (text == NULL || probability == NULL)
-    {
-        return -1;
-    }
-
-    value = strtod(text, &end);
-    if (end == text || *chaos_dns_trim(end) != '\0')
-    {
-        return -1;
-    }
-    if (value < 0.0 || value > 1.0)
-    {
-        return -1;
-    }
-
-    *probability = value;
-    return 0;
+    return chaos_policy_parse_probability(text, probability);
 }
 
 /**

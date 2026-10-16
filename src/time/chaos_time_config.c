@@ -605,33 +605,16 @@ static int chaos_time_parse_errno_name(const char *text)
 }
 
 /**
- * Parses a probability string in [0.0, 1.0] from decimal text.
+ * @brief Parses a probability (see chaos_policy_parse_probability()): "0", "1",
+ *        "0." and digits, or "1." and zeros, whatever the locale.
  *
- * Uses strtod() for parsing.  Values outside the closed interval [0.0, 1.0]
- * are rejected; trailing non-whitespace after the number is also rejected.
- *
- * @param text         NUL-terminated decimal probability string.
- * @param probability  Output: set on success.
- * @return             0 on success, -1 on parse error or out-of-range value.
+ * @param text         Probability string. Must not be NULL.
+ * @param probability  Output: receives the parsed value. Must not be NULL.
+ * @return 0 on success; -1 when @p text is not a probability.
  */
 static int chaos_time_parse_probability(const char *text, double *probability)
 {
-    char *end = NULL;
-    double value;
-
-    if (text == NULL || probability == NULL)
-    {
-        return -1;
-    }
-
-    value = strtod(text, &end);
-    if (end == text || *chaos_time_trim(end) != '\0' || value < 0.0 || value > 1.0)
-    {
-        return -1;
-    }
-
-    *probability = value;
-    return 0;
+    return chaos_policy_parse_probability(text, probability);
 }
 
 /**
