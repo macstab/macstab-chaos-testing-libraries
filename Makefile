@@ -20,6 +20,8 @@ DIST_DIR := dist
 SRC_DIR := src
 TEST_DIR := test
 SRC_COMMON_DIR := $(SRC_DIR)/common
+# Shared by every library, chaos-init and the tests: a change rebuilds them all.
+COMMON_HDRS := $(wildcard $(SRC_COMMON_DIR)/*.h)
 SRC_CORE_DIR := $(SRC_DIR)/core
 SRC_CONFIG_DIR := $(SRC_DIR)/config
 SRC_EFFECTS_DIR := $(SRC_DIR)/effects
@@ -452,10 +454,10 @@ cross-init-amd64: $(DIST_DIR)/chaos-init-amd64
 
 cross-init-arm64: $(DIST_DIR)/chaos-init-arm64
 
-$(NATIVE_INIT): $(INIT_SRCS) $(INIT_HDRS) | $(BUILD_DIR)
+$(NATIVE_INIT): $(INIT_SRCS) $(INIT_HDRS) $(COMMON_HDRS) | $(BUILD_DIR)
 	$(INIT_CC) $(INIT_CFLAGS) -o $@ $(INIT_SRCS) $(INIT_LDFLAGS)
 
-$(DIST_DIR)/chaos-init-%: $(INIT_SRCS) $(INIT_HDRS) | $(DIST_DIR)
+$(DIST_DIR)/chaos-init-%: $(INIT_SRCS) $(INIT_HDRS) $(COMMON_HDRS) | $(DIST_DIR)
 	$(INIT_CC) $(INIT_CFLAGS) -o $@ $(INIT_SRCS) $(INIT_LDFLAGS)
 
 cross-musl-arm64: $(MUSL_ARM64_DISTS)
@@ -476,12 +478,12 @@ $(BUILD_DIR):
 $(DIST_DIR):
 	mkdir -p $(DIST_DIR)
 
-$(BUILD_DIR)/test_%: $(TEST_UNIT_DIR)/test_%.c $(LIB_SRCS_io) $(LIB_HDRS_io) $(LIB_SRCS_net) $(LIB_HDRS_net) $(LIB_SRCS_dns) $(LIB_HDRS_dns) $(LIB_SRCS_time) $(LIB_HDRS_time) $(LIB_SRCS_process) $(LIB_HDRS_process) $(LIB_SRCS_memory) $(LIB_HDRS_memory) $(INIT_SRCS) $(INIT_HDRS) $(TEST_SUPPORT_HDRS) | $(BUILD_DIR)
+$(BUILD_DIR)/test_%: $(TEST_UNIT_DIR)/test_%.c $(LIB_SRCS_io) $(LIB_HDRS_io) $(LIB_SRCS_net) $(LIB_HDRS_net) $(LIB_SRCS_dns) $(LIB_HDRS_dns) $(LIB_SRCS_time) $(LIB_HDRS_time) $(LIB_SRCS_process) $(LIB_HDRS_process) $(LIB_SRCS_memory) $(LIB_HDRS_memory) $(INIT_SRCS) $(INIT_HDRS) $(COMMON_HDRS) $(TEST_SUPPORT_HDRS) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $<
 
 define define_lib_rules
-$$(NATIVE_$(1)_LIB): $$(LIB_SRCS_$(1)) $$(LIB_HDRS_$(1)) | $$(BUILD_DIR)
+$$(NATIVE_$(1)_LIB): $$(LIB_SRCS_$(1)) $$(LIB_HDRS_$(1)) $$(COMMON_HDRS) | $$(BUILD_DIR)
 ifeq ($$(UNAME_S),Linux)
 	$$(CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(LDLIBS)
 else
@@ -489,16 +491,16 @@ else
 	@exit 1
 endif
 
-$$(DIST_glibc-amd64_$(1)_LIB): $$(LIB_SRCS_$(1)) $$(LIB_HDRS_$(1)) | $$(DIST_DIR)
+$$(DIST_glibc-amd64_$(1)_LIB): $$(LIB_SRCS_$(1)) $$(LIB_HDRS_$(1)) $$(COMMON_HDRS) | $$(DIST_DIR)
 	$$(GLIBC_AMD64_CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(LDLIBS)
 
-$$(DIST_glibc-arm64_$(1)_LIB): $$(LIB_SRCS_$(1)) $$(LIB_HDRS_$(1)) | $$(DIST_DIR)
+$$(DIST_glibc-arm64_$(1)_LIB): $$(LIB_SRCS_$(1)) $$(LIB_HDRS_$(1)) $$(COMMON_HDRS) | $$(DIST_DIR)
 	$$(GLIBC_ARM64_CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(LDLIBS)
 
-$$(DIST_musl-amd64_$(1)_LIB): $$(LIB_SRCS_$(1)) $$(LIB_HDRS_$(1)) | $$(DIST_DIR)
+$$(DIST_musl-amd64_$(1)_LIB): $$(LIB_SRCS_$(1)) $$(LIB_HDRS_$(1)) $$(COMMON_HDRS) | $$(DIST_DIR)
 	$$(MUSL_AMD64_CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(LDLIBS)
 
-$$(DIST_musl-arm64_$(1)_LIB): $$(LIB_SRCS_$(1)) $$(LIB_HDRS_$(1)) | $$(DIST_DIR)
+$$(DIST_musl-arm64_$(1)_LIB): $$(LIB_SRCS_$(1)) $$(LIB_HDRS_$(1)) $$(COMMON_HDRS) | $$(DIST_DIR)
 	$$(MUSL_ARM64_CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(LDLIBS)
 
 native-$(1): $$(NATIVE_$(1)_LIB)
