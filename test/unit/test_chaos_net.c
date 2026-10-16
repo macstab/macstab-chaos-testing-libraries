@@ -1906,6 +1906,46 @@ static void test_batch_paths(void)
     assert(g_corrupt_calls == 1);
     assert(memcmp(buffer, "data", 4U) != 0);
 
+    /* `@size` sees the whole batch, the kernel's 1024 messages at most; messages
+     * beyond those are not looked at, and the connection is looked up once. */
+    {
+        static struct mmsghdr batch[CHAOS_NET_MMSG_MAX + 2U];
+        struct iovec two_bytes;
+
+        reset_wrapper_stubs();
+        two_bytes.iov_base = buffer;
+        two_bytes.iov_len = 2U;
+        (void)memset(batch, 0, sizeof(batch));
+        batch[0].msg_hdr.msg_iov = &two_bytes;
+        batch[0].msg_hdr.msg_iovlen = 1;
+        batch[1].msg_hdr.msg_iov = &two_bytes;
+        batch[1].msg_hdr.msg_iovlen = 1;
+        g_stub_endpoint_from_peer = 1;
+        g_stub_match_endpoint = 1;
+        g_stub_rule.effect = CHAOS_NET_EFFECT_LATENCY;
+        assert(sendmmsg(4, batch, 2U, 0U) == 1);
+        assert(g_latency_calls == 1 && g_last_call_size == 4U);
+        assert(recvmmsg(5, batch, 2U, 0U, NULL) == 1);
+        assert(g_latency_calls == 2 && g_last_call_size == 4U);
+
+        reset_wrapper_stubs();
+        batch[CHAOS_NET_MMSG_MAX].msg_hdr.msg_name = &address;
+        batch[CHAOS_NET_MMSG_MAX].msg_hdr.msg_namelen = (socklen_t)sizeof(address);
+        g_stub_endpoint_from_sockaddr = 1;
+        g_stub_match_endpoint = 1;
+        g_stub_rule.effect = CHAOS_NET_EFFECT_LATENCY;
+        assert(sendmmsg(4, batch, CHAOS_NET_MMSG_MAX + 2U, 0U) == 1);
+        assert(g_latency_calls == 0);
+
+        batch[0].msg_hdr.msg_iovlen = (size_t)CHAOS_NET_IOV_MAX + 1U;
+        assert(chaos_net_mmsg_size(batch, 2U) == CHAOS_POLICY_NO_SIZE);
+        assert(chaos_net_mmsg_size(NULL, 2U) == CHAOS_POLICY_NO_SIZE);
+        batch[0].msg_hdr.msg_iovlen = 1;
+        two_bytes.iov_len = (size_t)(UINT64_MAX / 2U);
+        assert(chaos_net_mmsg_size(batch, 2U) == CHAOS_POLICY_NO_SIZE);
+        assert(sendmmsg(4, NULL, 1U, 0U) == 1);
+    }
+
     reset_wrapper_stubs();
     assert(sendmmsg(4, messages, 1U, 0U) == 1);
     assert(g_sendmmsg_calls == 1);

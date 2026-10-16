@@ -309,13 +309,44 @@ CHAOS_NET_EXPORT int shutdown(int sockfd, int how)
 }
 
 #ifdef __linux__
+/** @brief Most messages the kernel moves in one sendmmsg/recvmmsg call (UIO_MAXIOV). */
+#define CHAOS_NET_MMSG_MAX 1024U
+
+/**
+ * @brief Bytes the first @p count messages of a batch describe, for `@size` gates;
+ *        CHAOS_POLICY_NO_SIZE when one of them is unknown.
+ */
+static uint64_t chaos_net_mmsg_size(const struct mmsghdr *msgvec, unsigned int count)
+{
+    uint64_t total = 0U;
+    unsigned int index;
+
+    if (msgvec == NULL)
+    {
+        return CHAOS_POLICY_NO_SIZE;
+    }
+    for (index = 0U; index < count; ++index)
+    {
+        const uint64_t part = chaos_net_message_size(&msgvec[index].msg_hdr);
+
+        if (part == CHAOS_POLICY_NO_SIZE || part > UINT64_MAX / 2U - total)
+        {
+            return CHAOS_POLICY_NO_SIZE;
+        }
+        total += part;
+    }
+    return total;
+}
+
 /**
  * @brief Interposed sendmmsg(2) (Linux only).
  *
- * @details Scans the message array for the first message whose endpoint resolves
- * and matches a SEND rule. This is a "first-match-wins" strategy: if any message
+ * @details Scans the messages the kernel would send (at most CHAOS_NET_MMSG_MAX)
+ * for the first whose destination matches a SEND rule, the connection standing for
+ * every message without one. This is a "first-match-wins" strategy: if any message
  * targets a matched endpoint, the pre-call effect is applied and the entire batch
  * is affected (either all messages are sent or, on errno injection, none are).
+ * `@size` compares the bytes of the whole batch.
  *
  * The reentrancy guard is checked once at entry rather than per-message to keep
  * the inner loop minimal. The guard is not needed for endpoint resolution inside
@@ -325,41 +356,50 @@ CHAOS_NET_EXPORT int shutdown(int sockfd, int how)
 CHAOS_NET_EXPORT int
 sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, CHAOS_NET_MMSG_FLAGS_TYPE flags)
 {
+    const unsigned int count = vlen < CHAOS_NET_MMSG_MAX ? vlen : CHAOS_NET_MMSG_MAX;
     chaos_net_endpoint_t endpoint;
     chaos_net_rule_t rule;
     unsigned int index;
+    int connected_checked = 0;
     int matched = 0;
 
     chaos_net_ensure_symbols();
 
-    if (chaos_net_in_internal())
+    if (chaos_net_in_internal() || msgvec == NULL || !chaos_net_config_prepare())
     {
         return chaos_net_call_real_sendmmsg(sockfd, msgvec, vlen, flags);
     }
 
-    for (index = 0U; index < vlen; ++index)
+    /* The kernel sends at most CHAOS_NET_MMSG_MAX messages of a batch. A message
+     * without a destination goes to the connection, which is looked up once. */
+    for (index = 0U; index < count && !matched; ++index)
     {
         struct msghdr *message = &msgvec[index].msg_hdr;
 
-        /* Use msg_name if present (datagram send); otherwise use getpeername. */
-        matched = message->msg_name != NULL
-                      ? chaos_net_endpoint_from_sockaddr_fd(
-                            sockfd,
-                            (const struct sockaddr *)message->msg_name,
-                            message->msg_namelen,
-                            &endpoint
-                        ) && chaos_net_config_match_endpoint(CHAOS_NET_OP_SEND, &endpoint, &rule)
-                      : chaos_net_match_connected(sockfd, CHAOS_NET_OP_SEND, 1, &rule);
-        if (matched)
+        if (message->msg_name != NULL)
         {
-            if (chaos_net_apply_simple_pre_call_rule(&rule) != 0)
-            {
-                return -1;
-            }
-            return chaos_net_call_real_sendmmsg(sockfd, msgvec, vlen, flags);
+            matched = chaos_net_endpoint_from_sockaddr_fd(
+                          sockfd,
+                          (const struct sockaddr *)message->msg_name,
+                          message->msg_namelen,
+                          &endpoint
+                      ) &&
+                      chaos_net_config_match_endpoint_loaded(CHAOS_NET_OP_SEND, &endpoint, &rule);
+        }
+        else if (!connected_checked)
+        {
+            connected_checked = 1;
+            matched = chaos_net_match_connected(sockfd, CHAOS_NET_OP_SEND, 1, &rule);
         }
     }
-
+    if (matched)
+    {
+        rule.call_size = chaos_net_mmsg_size(msgvec, count);
+        if (chaos_net_apply_simple_pre_call_rule(&rule) != 0)
+        {
+            return -1;
+        }
+    }
     return chaos_net_call_real_sendmmsg(sockfd, msgvec, vlen, flags);
 }
 
@@ -394,6 +434,8 @@ CHAOS_NET_EXPORT int recvmmsg(
         return chaos_net_call_real_recvmmsg(sockfd, msgvec, vlen, flags, timeout);
     }
 
+    rule.call_size =
+        chaos_net_mmsg_size(msgvec, vlen < CHAOS_NET_MMSG_MAX ? vlen : CHAOS_NET_MMSG_MAX);
     if (chaos_net_apply_simple_pre_call_rule(&rule) != 0)
     {
         return -1;

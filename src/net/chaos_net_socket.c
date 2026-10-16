@@ -969,46 +969,6 @@ chaos_net_limit_iovecs(const struct iovec *iov, int iovcnt, size_t limit, struct
     return count;
 }
 
-/** @brief Most iovec entries the kernel accepts; a longer array fails with EINVAL. */
-#ifdef IOV_MAX
-#define CHAOS_NET_IOV_MAX IOV_MAX
-#else
-#define CHAOS_NET_IOV_MAX 1024
-#endif
-
-/**
- * @brief Byte count of an iovec array for `@size` gates; CHAOS_POLICY_NO_SIZE if invalid.
- *
- * @details An array longer than the kernel accepts is not read: the call fails
- * anyway, and its count need not describe memory the caller owns.
- */
-static uint64_t chaos_net_iovec_size(const struct iovec *iov, int iovcnt)
-{
-    uint64_t total = 0U;
-    int index;
-
-    if (iov == NULL || iovcnt < 0 || iovcnt > CHAOS_NET_IOV_MAX)
-    {
-        return CHAOS_POLICY_NO_SIZE;
-    }
-    for (index = 0; index < iovcnt; ++index)
-    {
-        total += (uint64_t)iov[index].iov_len;
-    }
-    return total;
-}
-
-/** @brief Byte count of a message for `@size` gates; CHAOS_POLICY_NO_SIZE if unknown. */
-static uint64_t chaos_net_message_size(const struct msghdr *message)
-{
-    /* msg_iovlen is size_t on glibc: compare before narrowing it. */
-    if (message == NULL || (size_t)message->msg_iovlen > (size_t)CHAOS_NET_IOV_MAX)
-    {
-        return CHAOS_POLICY_NO_SIZE;
-    }
-    return chaos_net_iovec_size(message->msg_iov, (int)message->msg_iovlen);
-}
-
 int chaos_net_match_connected(
     int fd, chaos_net_operation_t operation, int peer_first, chaos_net_rule_t *rule
 )
