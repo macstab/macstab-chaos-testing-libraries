@@ -61,6 +61,8 @@
  * - `fsync` / `fdatasync` wrappers: passthrough; latency; errno.
  * - `pread` / `pwrite` wrappers: guard bypass; corrupt, torn, latency, errno; offset
  *   forwarded.
+ * - Unresolved downstream symbols (a call during symbol resolution): the system-call
+ *   wrappers make the system call themselves, the stdio ones fail with ENOSYS.
  *
  * What is NOT tested here:
  * - Concurrent access to the TLS guard from multiple threads.
@@ -68,6 +70,33 @@
  * - Config hot-reload under genuine filesystem mtime changes.
  * - LD_PRELOAD interposition via the dynamic linker (covered by integration tests).
  */
+
+#include <stdarg.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+/**
+ * @brief The real system call, for the fallbacks a wrapper makes while its symbol
+ *        is unresolved; the harness turns the wrappers' own `syscall` into a stub.
+ */
+static long chaos_test_raw_syscall(long number, ...)
+{
+    va_list args;
+    long arguments[6];
+    int index;
+
+    va_start(args, number);
+    for (index = 0; index < 6; ++index)
+    {
+        arguments[index] = va_arg(args, long);
+    }
+    va_end(args);
+    return syscall(
+        number, arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5]
+    );
+}
+#define CHAOS_IO_SYSCALL chaos_test_raw_syscall
 
 #include "../support/test_chaos_io_harness.h"
 
@@ -3287,6 +3316,251 @@ static void test_stdio_rules_that_do_not_fail(void)
     free(line);
 }
 
+/** @brief Closes @p fd with the system call (the close wrapper reaches a stub here). */
+static void chaos_test_raw_close(int fd)
+{
+    assert(chaos_test_raw_syscall(SYS_close, (long)fd) == 0);
+}
+
+/** @brief Size of the file at @p path, or -1. */
+static long chaos_test_file_size(const char *path)
+{
+    struct stat info;
+
+    return stat(path, &info) == 0 ? (long)info.st_size : -1L;
+}
+
+/**
+ * @brief Invariant: a wrapper whose downstream symbol is still unresolved (a call that
+ *   arrives during symbol resolution) makes the system call itself instead of
+ *   jumping through a NULL pointer.
+ *
+ * Expected observable behaviour: every call has its real effect on a real file --
+ * bytes written and read back, files opened, created, truncated, allocated, renamed
+ * and removed, descriptors duplicated and closed.
+ */
+static void test_unresolved_symbols_use_system_calls(void)
+{
+    char path[] = "/tmp/chaos-io-unresolved-XXXXXX";
+    char created[64];
+    char moved[64];
+    char buffer[16];
+    struct iovec iov;
+    struct stat info;
+    int (*volatile closedir_wrapper)(DIR *) = closedir;
+    int (*volatile pclose_wrapper)(FILE *) = pclose;
+    int fd;
+    int other;
+    int copy;
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    chaos_io_ensure_symbols();
+    fd = mkstemp(path);
+    assert(fd >= 0);
+    (void)snprintf(created, sizeof(created), "%s.created", path);
+    (void)snprintf(moved, sizeof(moved), "%s.moved", path);
+
+    /* Writes: "abcdef", then "XY" at 1, "gh" appended, "Z" at 0 -> "ZXYdefgh". */
+    g_chaos_io_real_write = NULL;
+    assert(write(fd, "abcdef", 6U) == 6);
+    g_chaos_io_real_pwrite = NULL;
+    assert(pwrite(fd, "XY", 2U, 1) == 2);
+    g_chaos_io_real_writev = NULL;
+    iov.iov_base = (void *)"gh";
+    iov.iov_len = 2U;
+    assert(writev(fd, &iov, 1) == 2);
+    g_chaos_io_real_pwritev = NULL;
+    iov.iov_base = (void *)"Z";
+    iov.iov_len = 1U;
+    assert(pwritev(fd, &iov, 1, 0) == 1);
+    g_chaos_io_real_fsync = NULL;
+    assert(fsync(fd) == 0);
+    g_chaos_io_real_fdatasync = NULL;
+    assert(fdatasync(fd) == 0);
+
+    /* Opened for real, and read back. */
+    g_chaos_io_real_open = NULL;
+    other = open(path, O_RDONLY);
+    assert(other >= 0);
+    g_chaos_io_real_read = NULL;
+    assert(read(other, buffer, 3U) == 3 && memcmp(buffer, "ZXY", 3U) == 0);
+    g_chaos_io_real_pread = NULL;
+    assert(pread(other, buffer, 2U, 6) == 2 && memcmp(buffer, "gh", 2U) == 0);
+    g_chaos_io_real_readv = NULL;
+    iov.iov_base = buffer;
+    iov.iov_len = 3U;
+    assert(readv(other, &iov, 1) == 3 && memcmp(buffer, "def", 3U) == 0);
+    g_chaos_io_real_preadv = NULL;
+    iov.iov_len = 2U;
+    assert(preadv(other, &iov, 1, 1) == 2 && memcmp(buffer, "XY", 2U) == 0);
+    g_chaos_io_real_close = NULL;
+    assert(close(other) == 0);
+    errno = 0;
+    assert(close(other) == -1 && errno == EBADF);
+
+    /* The creation mode reaches the kernel; without O_CREAT none is needed. */
+    other = open(created, O_CREAT | O_EXCL | O_WRONLY, 0600);
+    assert(other >= 0);
+    assert(fstat(other, &info) == 0 && (info.st_mode & 0777) == 0600);
+    chaos_test_raw_close(other);
+    g_chaos_io_real_openat = NULL;
+    other = openat(AT_FDCWD, path, O_RDONLY);
+    assert(other >= 0 && read(other, buffer, 1U) == 1 && buffer[0] == 'Z');
+    chaos_test_raw_close(other);
+    /* unlink() is a wrapper too, on a stub here. */
+    assert(chaos_test_raw_syscall(SYS_unlinkat, (long)AT_FDCWD, (long)created, 0L) == 0);
+    other = openat(AT_FDCWD, created, O_CREAT | O_EXCL | O_WRONLY, 0640);
+    assert(other >= 0);
+    assert(fstat(other, &info) == 0 && (info.st_mode & 0777) == 0640);
+
+    /* dup2 onto itself only checks the descriptor, as the C library's does. */
+    g_chaos_io_real_dup2 = NULL;
+    assert(dup2(fd, fd) == fd);
+    errno = 0;
+    assert(dup2(-1, -1) == -1 && errno == EBADF);
+    assert(dup2(fd, other) == other);
+    assert(fstat(other, &info) == 0 && info.st_size == 8);
+#ifdef __linux__
+    g_chaos_io_real_dup3 = NULL;
+    copy = dup3(fd, other, O_CLOEXEC);
+    assert(copy == other && (fcntl(copy, F_GETFD) & FD_CLOEXEC) != 0);
+#else
+    copy = other;
+#endif
+    chaos_test_raw_close(copy);
+
+    /* Sizes change for real. */
+    g_chaos_io_real_ftruncate = NULL;
+    assert(ftruncate(fd, 4) == 0 && chaos_test_file_size(path) == 4L);
+    g_chaos_io_real_truncate = NULL;
+    assert(truncate(path, 2) == 0 && chaos_test_file_size(path) == 2L);
+#ifdef __linux__
+    g_chaos_io_real_fallocate = NULL;
+    assert(fallocate(fd, 0, 0, 64) == 0 && chaos_test_file_size(path) == 64L);
+#endif
+    /* posix_fallocate returns its error and leaves errno alone. */
+    g_chaos_io_real_posix_fallocate = NULL;
+    assert(posix_fallocate(fd, 0, 128) == 0 && chaos_test_file_size(path) == 128L);
+    errno = 4242;
+    assert(posix_fallocate(-1, 0, 1) == EBADF && errno == 4242);
+
+#ifdef __linux__
+    /* Kernel-side copies into "created": the first bytes of the file, twice. */
+    assert(pwrite(fd, "kl", 2U, 0) == 2);
+    other = open(created, O_RDWR | O_TRUNC);
+    assert(other >= 0);
+    g_chaos_io_real_sendfile = NULL;
+    {
+        off_t offset = 0;
+
+        assert(sendfile(other, fd, &offset, 2U) == 2 && offset == 2);
+    }
+    g_chaos_io_real_copy_file_range = NULL;
+    {
+        off_t in_offset = 0;
+
+        assert(copy_file_range(fd, &in_offset, other, NULL, 2U, 0U) == 2);
+    }
+    assert(pread(other, buffer, 4U, 0) == 4 && memcmp(buffer, "klkl", 4U) == 0);
+    chaos_test_raw_close(other);
+#endif
+
+    /* Names change for real. */
+    g_chaos_io_real_renameat = NULL;
+    assert(renameat(AT_FDCWD, path, AT_FDCWD, moved) == 0);
+    assert(chaos_test_file_size(path) == -1L && chaos_test_file_size(moved) == 128L);
+    g_chaos_io_real_unlinkat = NULL;
+    assert(unlinkat(AT_FDCWD, moved, 0) == 0 && chaos_test_file_size(moved) == -1L);
+    assert(unlinkat(AT_FDCWD, created, 0) == 0 && chaos_test_file_size(created) == -1L);
+    chaos_test_raw_close(fd);
+
+    /* Directory and pipe streams belong to the C library: ENOSYS, no crash. */
+    g_chaos_io_real_closedir = NULL;
+    errno = 0;
+    assert(closedir_wrapper(NULL) == -1 && errno == ENOSYS);
+    g_chaos_io_real_pclose = NULL;
+    errno = 0;
+    assert(pclose_wrapper(NULL) == -1 && errno == ENOSYS);
+
+    chaos_test_reset_state();
+}
+
+/**
+ * @brief Invariant: a stdio wrapper whose downstream symbol is still unresolved
+ *   fails the way the function reports errors, with errno ENOSYS: no system call
+ *   can stand in for the C library's own stream object.
+ */
+static void test_unresolved_stdio_fails_with_enosys(void)
+{
+    char buffer[8];
+    char *line = NULL;
+    size_t capacity = 0U;
+    /* Through a pointer: the compiler knows fclose frees its argument. */
+    int (*volatile fclose_wrapper)(FILE *) = fclose;
+    FILE *stream = chaos_test_stdio_stream();
+
+    chaos_io_ensure_symbols();
+    g_chaos_io_real_fread = NULL;
+    g_chaos_io_real_fread_chk = NULL;
+    g_chaos_io_real_fgets = NULL;
+    g_chaos_io_real_fgets_chk = NULL;
+    g_chaos_io_real_fgetc = NULL;
+    g_chaos_io_real_getc = NULL;
+    g_chaos_io_real_getdelim = NULL;
+    g_chaos_io_real_fwrite = NULL;
+    g_chaos_io_real_fputs = NULL;
+    g_chaos_io_real_fputc = NULL;
+    g_chaos_io_real_putc = NULL;
+    g_chaos_io_real_fflush = NULL;
+    g_chaos_io_real_vfprintf = NULL;
+    g_chaos_io_real_vfprintf_chk = NULL;
+    g_chaos_io_real_fclose = NULL;
+    g_chaos_io_real_fopen = NULL;
+    g_chaos_io_real_freopen = NULL;
+
+    errno = 0;
+    assert(fread(buffer, 1U, 2U, stream) == 0U && errno == ENOSYS);
+    errno = 0;
+    assert(__fread_chk(buffer, sizeof(buffer), 1U, 2U, stream) == 0U && errno == ENOSYS);
+    errno = 0;
+    assert(fgets(buffer, (int)sizeof(buffer), stream) == NULL && errno == ENOSYS);
+    errno = 0;
+    assert(__fgets_chk(buffer, sizeof(buffer), 4, stream) == NULL && errno == ENOSYS);
+    errno = 0;
+    assert(fgetc(stream) == EOF && errno == ENOSYS);
+    errno = 0;
+    assert(getc(stream) == EOF && errno == ENOSYS);
+    errno = 0;
+    assert(getline(&line, &capacity, stream) == -1 && errno == ENOSYS);
+    errno = 0;
+    assert(fwrite("x", 1U, 1U, stream) == 0U && errno == ENOSYS);
+    errno = 0;
+    assert(fputs("x", stream) == EOF && errno == ENOSYS);
+    errno = 0;
+    assert(fputc('x', stream) == EOF && errno == ENOSYS);
+    errno = 0;
+    assert(putc('x', stream) == EOF && errno == ENOSYS);
+    errno = 0;
+    assert(fflush(stream) == EOF && errno == ENOSYS);
+    errno = 0;
+    assert(fprintf(stream, "%d", 7) == -1 && errno == ENOSYS);
+    errno = 0;
+    assert(__fprintf_chk(stream, 1, "%d", 7) == -1 && errno == ENOSYS);
+    errno = 0;
+    assert(fopen("/dev/null", "r") == NULL && errno == ENOSYS);
+    errno = 0;
+    assert(freopen("/dev/null", "r", stream) == NULL && errno == ENOSYS);
+    errno = 0;
+    assert(fclose_wrapper(stream) == EOF && errno == ENOSYS);
+
+    /* Nothing was read: the stream is where it was, and still open. */
+    chaos_test_reset_state();
+    assert(fgets(buffer, (int)sizeof(buffer), stream) == buffer && strcmp(buffer, "abc\n") == 0);
+    assert(fclose(stream) == 0);
+    free(line);
+}
+
 int main(void)
 {
     test_stdio_streams_keep_the_cache_right();
@@ -3326,6 +3600,11 @@ int main(void)
     test_vectored_edge_segments();
     test_close_range_at_int_max();
     test_stdio_rules_that_do_not_fail();
+    test_unresolved_symbols_use_system_calls();
+    test_unresolved_stdio_fails_with_enosys();
     chaos_test_bind_libc_functions_for_exit();
+    /* Shutdown I/O, the coverage dump included, goes straight to the C library:
+     * rule lookups made while the line counts are written would skew them. */
+    (void)chaos_io_enter_internal();
     return 0;
 }

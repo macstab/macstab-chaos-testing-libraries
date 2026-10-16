@@ -374,12 +374,88 @@ static void chaos_io_corrupt_iovecs(const struct iovec *iov, int iovcnt, size_t 
 
 /* --- Real-call trampolines ------------------------------------------------------- */
 
+/*
+ * Each trampoline makes the system call itself while its `g_chaos_io_real_*`
+ * pointer is still NULL: a call that arrives during symbol resolution.
+ */
+
+/** @brief Splits a file offset into the low and high words preadv/pwritev take. */
+#define CHAOS_IO_OFFSET_WORDS(offset) (long)(offset), (long)((uint64_t)(offset) >> 32)
+
+/** @brief Calls the real `read()` while preserving the recursion guard. */
+static ssize_t chaos_io_call_real_read(int fd, void *buffer, size_t count)
+{
+    int previous;
+    ssize_t result;
+
+    if (g_chaos_io_real_read == NULL)
+    {
+        return (ssize_t)CHAOS_IO_SYSCALL(SYS_read, fd, buffer, count);
+    }
+    previous = chaos_io_enter_internal();
+    result = g_chaos_io_real_read(fd, buffer, count);
+    chaos_io_leave_internal(previous);
+    return result;
+}
+
+/** @brief Calls the real `write()` while preserving the recursion guard. */
+static ssize_t chaos_io_call_real_write(int fd, const void *buffer, size_t count)
+{
+    int previous;
+    ssize_t result;
+
+    if (g_chaos_io_real_write == NULL)
+    {
+        return (ssize_t)CHAOS_IO_SYSCALL(SYS_write, fd, buffer, count);
+    }
+    previous = chaos_io_enter_internal();
+    result = g_chaos_io_real_write(fd, buffer, count);
+    chaos_io_leave_internal(previous);
+    return result;
+}
+
+/** @brief Calls the real `pread()` while preserving the recursion guard. */
+static ssize_t chaos_io_call_real_pread(int fd, void *buffer, size_t count, off_t offset)
+{
+    int previous;
+    ssize_t result;
+
+    if (g_chaos_io_real_pread == NULL)
+    {
+        return (ssize_t)CHAOS_IO_SYSCALL(SYS_pread64, fd, buffer, count, offset);
+    }
+    previous = chaos_io_enter_internal();
+    result = g_chaos_io_real_pread(fd, buffer, count, offset);
+    chaos_io_leave_internal(previous);
+    return result;
+}
+
+/** @brief Calls the real `pwrite()` while preserving the recursion guard. */
+static ssize_t chaos_io_call_real_pwrite(int fd, const void *buffer, size_t count, off_t offset)
+{
+    int previous;
+    ssize_t result;
+
+    if (g_chaos_io_real_pwrite == NULL)
+    {
+        return (ssize_t)CHAOS_IO_SYSCALL(SYS_pwrite64, fd, buffer, count, offset);
+    }
+    previous = chaos_io_enter_internal();
+    result = g_chaos_io_real_pwrite(fd, buffer, count, offset);
+    chaos_io_leave_internal(previous);
+    return result;
+}
+
 /** @brief Calls the real `readv()` while preserving the recursion guard. */
 static ssize_t chaos_io_call_real_readv(int fd, const struct iovec *iov, int iovcnt)
 {
     int previous;
     ssize_t result;
 
+    if (g_chaos_io_real_readv == NULL)
+    {
+        return (ssize_t)CHAOS_IO_SYSCALL(SYS_readv, fd, iov, iovcnt);
+    }
     previous = chaos_io_enter_internal();
     result = g_chaos_io_real_readv(fd, iov, iovcnt);
     chaos_io_leave_internal(previous);
@@ -392,6 +468,10 @@ static ssize_t chaos_io_call_real_writev(int fd, const struct iovec *iov, int io
     int previous;
     ssize_t result;
 
+    if (g_chaos_io_real_writev == NULL)
+    {
+        return (ssize_t)CHAOS_IO_SYSCALL(SYS_writev, fd, iov, iovcnt);
+    }
     previous = chaos_io_enter_internal();
     result = g_chaos_io_real_writev(fd, iov, iovcnt);
     chaos_io_leave_internal(previous);
@@ -404,6 +484,11 @@ static ssize_t chaos_io_call_real_preadv(int fd, const struct iovec *iov, int io
     int previous;
     ssize_t result;
 
+    if (g_chaos_io_real_preadv == NULL)
+    {
+        return (ssize_t
+        )CHAOS_IO_SYSCALL(SYS_preadv, fd, iov, iovcnt, CHAOS_IO_OFFSET_WORDS(offset));
+    }
     previous = chaos_io_enter_internal();
     result = g_chaos_io_real_preadv(fd, iov, iovcnt, offset);
     chaos_io_leave_internal(previous);
@@ -416,6 +501,11 @@ static ssize_t chaos_io_call_real_pwritev(int fd, const struct iovec *iov, int i
     int previous;
     ssize_t result;
 
+    if (g_chaos_io_real_pwritev == NULL)
+    {
+        return (ssize_t
+        )CHAOS_IO_SYSCALL(SYS_pwritev, fd, iov, iovcnt, CHAOS_IO_OFFSET_WORDS(offset));
+    }
     previous = chaos_io_enter_internal();
     result = g_chaos_io_real_pwritev(fd, iov, iovcnt, offset);
     chaos_io_leave_internal(previous);
@@ -446,16 +536,12 @@ CHAOS_IO_EXPORT ssize_t read(int fd, void *buffer, size_t count)
 {
     chaos_io_rule_t rule;
     ssize_t rc;
-    int previous;
 
     chaos_io_ensure_symbols();
     if (chaos_io_in_internal() ||
         !chaos_io_match_fd_rule_sized(fd, CHAOS_IO_OP_READ, (uint64_t)count, &rule))
     {
-        previous = chaos_io_enter_internal();
-        rc = g_chaos_io_real_read(fd, buffer, count);
-        chaos_io_leave_internal(previous);
-        return rc;
+        return chaos_io_call_real_read(fd, buffer, count);
     }
 
     if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
@@ -467,9 +553,7 @@ CHAOS_IO_EXPORT ssize_t read(int fd, void *buffer, size_t count)
         return -1;
     }
 
-    previous = chaos_io_enter_internal();
-    rc = g_chaos_io_real_read(fd, buffer, count);
-    chaos_io_leave_internal(previous);
+    rc = chaos_io_call_real_read(fd, buffer, count);
     if (rc > 0 && rule.effect == CHAOS_IO_EFFECT_CORRUPT && chaos_io_rule_should_trigger(&rule))
     {
         chaos_io_corrupt_buffer(buffer, (size_t)rc);
@@ -536,16 +620,12 @@ CHAOS_IO_EXPORT ssize_t write(int fd, const void *buffer, size_t count)
 {
     chaos_io_rule_t rule;
     ssize_t rc;
-    int previous;
 
     chaos_io_ensure_symbols();
     if (chaos_io_in_internal() ||
         !chaos_io_match_fd_rule_sized(fd, CHAOS_IO_OP_WRITE, (uint64_t)count, &rule))
     {
-        previous = chaos_io_enter_internal();
-        rc = g_chaos_io_real_write(fd, buffer, count);
-        chaos_io_leave_internal(previous);
-        return rc;
+        return chaos_io_call_real_write(fd, buffer, count);
     }
 
     if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
@@ -561,9 +641,7 @@ CHAOS_IO_EXPORT ssize_t write(int fd, const void *buffer, size_t count)
         count = chaos_io_torn_count(count);
     }
 
-    previous = chaos_io_enter_internal();
-    rc = g_chaos_io_real_write(fd, buffer, count);
-    chaos_io_leave_internal(previous);
+    rc = chaos_io_call_real_write(fd, buffer, count);
     return rc;
 }
 
@@ -633,6 +711,10 @@ static ssize_t chaos_io_call_real_sendfile(int out_fd, int in_fd, off_t *offset,
     int previous;
     ssize_t result;
 
+    if (g_chaos_io_real_sendfile == NULL)
+    {
+        return (ssize_t)CHAOS_IO_SYSCALL(SYS_sendfile, out_fd, in_fd, offset, count);
+    }
     previous = chaos_io_enter_internal();
     result = g_chaos_io_real_sendfile(out_fd, in_fd, offset, count);
     chaos_io_leave_internal(previous);
@@ -700,6 +782,16 @@ static ssize_t chaos_io_call_real_copy_file_range(
     int previous;
     ssize_t result;
 
+    if (g_chaos_io_real_copy_file_range == NULL)
+    {
+#ifdef SYS_copy_file_range
+        return (ssize_t
+        )CHAOS_IO_SYSCALL(SYS_copy_file_range, in_fd, in_offset, out_fd, out_offset, count, flags);
+#else
+        errno = ENOSYS;
+        return -1;
+#endif
+    }
     previous = chaos_io_enter_internal();
     result = g_chaos_io_real_copy_file_range(in_fd, in_offset, out_fd, out_offset, count, flags);
     chaos_io_leave_internal(previous);
@@ -774,16 +866,12 @@ CHAOS_IO_EXPORT ssize_t pread(int fd, void *buffer, size_t count, off_t offset)
 {
     chaos_io_rule_t rule;
     ssize_t rc;
-    int previous;
 
     chaos_io_ensure_symbols();
     if (chaos_io_in_internal() ||
         !chaos_io_match_fd_rule_sized(fd, CHAOS_IO_OP_PREAD, (uint64_t)count, &rule))
     {
-        previous = chaos_io_enter_internal();
-        rc = g_chaos_io_real_pread(fd, buffer, count, offset);
-        chaos_io_leave_internal(previous);
-        return rc;
+        return chaos_io_call_real_pread(fd, buffer, count, offset);
     }
 
     if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
@@ -795,9 +883,7 @@ CHAOS_IO_EXPORT ssize_t pread(int fd, void *buffer, size_t count, off_t offset)
         return -1;
     }
 
-    previous = chaos_io_enter_internal();
-    rc = g_chaos_io_real_pread(fd, buffer, count, offset);
-    chaos_io_leave_internal(previous);
+    rc = chaos_io_call_real_pread(fd, buffer, count, offset);
     if (rc > 0 && rule.effect == CHAOS_IO_EFFECT_CORRUPT && chaos_io_rule_should_trigger(&rule))
     {
         chaos_io_corrupt_buffer(buffer, (size_t)rc);
@@ -865,16 +951,12 @@ CHAOS_IO_EXPORT ssize_t pwrite(int fd, const void *buffer, size_t count, off_t o
 {
     chaos_io_rule_t rule;
     ssize_t rc;
-    int previous;
 
     chaos_io_ensure_symbols();
     if (chaos_io_in_internal() ||
         !chaos_io_match_fd_rule_sized(fd, CHAOS_IO_OP_PWRITE, (uint64_t)count, &rule))
     {
-        previous = chaos_io_enter_internal();
-        rc = g_chaos_io_real_pwrite(fd, buffer, count, offset);
-        chaos_io_leave_internal(previous);
-        return rc;
+        return chaos_io_call_real_pwrite(fd, buffer, count, offset);
     }
 
     if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
@@ -890,9 +972,7 @@ CHAOS_IO_EXPORT ssize_t pwrite(int fd, const void *buffer, size_t count, off_t o
         count = chaos_io_torn_count(count);
     }
 
-    previous = chaos_io_enter_internal();
-    rc = g_chaos_io_real_pwrite(fd, buffer, count, offset);
-    chaos_io_leave_internal(previous);
+    rc = chaos_io_call_real_pwrite(fd, buffer, count, offset);
     return rc;
 }
 

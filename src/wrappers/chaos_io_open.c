@@ -85,6 +85,14 @@ static int chaos_io_call_real_open(const char *path, int flags, int has_mode, mo
     int previous;
     int result;
 
+    if (g_chaos_io_real_open == NULL)
+    {
+        /* Not resolved yet: open is openat on the working directory (aarch64 has
+         * no open system call). The kernel reads the mode only when it needs it. */
+        return (int)CHAOS_IO_SYSCALL(
+            SYS_openat, AT_FDCWD, path, flags, has_mode != 0 ? (unsigned int)mode : 0U
+        );
+    }
     previous = chaos_io_enter_internal();
     if (has_mode != 0)
     {
@@ -139,6 +147,11 @@ chaos_io_call_real_openat(int dirfd, const char *path, int flags, int has_mode, 
     int previous;
     int result;
 
+    if (g_chaos_io_real_openat == NULL)
+    {
+        return (int
+        )CHAOS_IO_SYSCALL(SYS_openat, dirfd, path, flags, has_mode != 0 ? (unsigned int)mode : 0U);
+    }
     previous = chaos_io_enter_internal();
     if (has_mode != 0)
     {
@@ -389,6 +402,32 @@ static void chaos_io_cache_stream(FILE *stream)
 }
 
 /**
+ * @brief Calls the real `fopen()`; fails with ENOSYS while it is not resolved.
+ *
+ * @details A stream is the C library's own object: no system call makes one.
+ */
+static FILE *chaos_io_call_real_fopen(const char *path, const char *mode)
+{
+    if (g_chaos_io_real_fopen == NULL)
+    {
+        errno = ENOSYS;
+        return NULL;
+    }
+    return g_chaos_io_real_fopen(path, mode);
+}
+
+/** @brief Calls the real `freopen()`; fails with ENOSYS while it is not resolved. */
+static FILE *chaos_io_call_real_freopen(const char *path, const char *mode, FILE *stream)
+{
+    if (g_chaos_io_real_freopen == NULL)
+    {
+        errno = ENOSYS;
+        return NULL;
+    }
+    return g_chaos_io_real_freopen(path, mode, stream);
+}
+
+/**
  * @brief Interposed `fopen(3)`: the open rules apply to the path.
  *
  * @details glibc and musl open the file with their own system call, so an open
@@ -406,7 +445,7 @@ CHAOS_IO_EXPORT FILE *fopen(const char *path, const char *mode)
     {
         return NULL;
     }
-    stream = g_chaos_io_real_fopen(path, mode);
+    stream = chaos_io_call_real_fopen(path, mode);
     if (stream != NULL && !chaos_io_in_internal())
     {
         chaos_io_cache_stream(stream);
@@ -434,12 +473,12 @@ CHAOS_IO_EXPORT FILE *freopen(const char *path, const char *mode, FILE *stream)
         const int injected = errno;
         const int fd = fileno(stream);
 
-        (void)g_chaos_io_real_freopen("", mode, stream);
+        (void)chaos_io_call_real_freopen("", mode, stream);
         chaos_io_fdcache_invalidate(fd);
         errno = injected;
         return NULL;
     }
-    reopened = g_chaos_io_real_freopen(path, mode, stream);
+    reopened = chaos_io_call_real_freopen(path, mode, stream);
     /* A NULL path keeps the open file; anything else replaced the descriptor's file. */
     if (reopened != NULL && path != NULL && !chaos_io_in_internal())
     {

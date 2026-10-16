@@ -47,7 +47,141 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <fcntl.h>
 #include <sys/syscall.h>
+
+/* --- Real-call trampolines ------------------------------------------------------- */
+
+/*
+ * Each trampoline makes the system call itself while its `g_chaos_io_real_*`
+ * pointer is still NULL: a call that arrives during symbol resolution. The
+ * directory and pipe streams are the C library's own objects and fail with ENOSYS.
+ */
+
+/** @brief Calls the real `close()` while preserving the recursion guard. */
+static int chaos_io_call_real_close(int fd)
+{
+    int previous;
+    int rc;
+
+    if (g_chaos_io_real_close == NULL)
+    {
+        return (int)CHAOS_IO_SYSCALL(SYS_close, fd);
+    }
+    previous = chaos_io_enter_internal();
+    rc = g_chaos_io_real_close(fd);
+    chaos_io_leave_internal(previous);
+    return rc;
+}
+
+/**
+ * @brief Calls the real `dup2()` while preserving the recursion guard.
+ *
+ * @details aarch64 has no dup2 system call. dup3 does the same, except that it
+ * refuses equal descriptors, which dup2 accepts when the descriptor is open.
+ */
+static int chaos_io_call_real_dup2(int oldfd, int newfd)
+{
+    int previous;
+    int rc;
+
+    if (g_chaos_io_real_dup2 == NULL)
+    {
+        if (oldfd == newfd)
+        {
+            return CHAOS_IO_SYSCALL(SYS_fcntl, oldfd, F_GETFD) < 0 ? -1 : newfd;
+        }
+        return (int)CHAOS_IO_SYSCALL(SYS_dup3, oldfd, newfd, 0);
+    }
+    previous = chaos_io_enter_internal();
+    rc = g_chaos_io_real_dup2(oldfd, newfd);
+    chaos_io_leave_internal(previous);
+    return rc;
+}
+
+#ifdef __linux__
+/** @brief Calls the real Linux `dup3()` while preserving the recursion guard. */
+static int chaos_io_call_real_dup3(int oldfd, int newfd, int flags)
+{
+    int previous;
+    int rc;
+
+    if (g_chaos_io_real_dup3 == NULL)
+    {
+        return (int)CHAOS_IO_SYSCALL(SYS_dup3, oldfd, newfd, flags);
+    }
+    previous = chaos_io_enter_internal();
+    rc = g_chaos_io_real_dup3(oldfd, newfd, flags);
+    chaos_io_leave_internal(previous);
+    return rc;
+}
+#endif
+
+/** @brief Calls the real `closedir()` while preserving the recursion guard. */
+static int chaos_io_call_real_closedir(DIR *directory)
+{
+    int previous;
+    int rc;
+
+    if (g_chaos_io_real_closedir == NULL)
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+    previous = chaos_io_enter_internal();
+    rc = g_chaos_io_real_closedir(directory);
+    chaos_io_leave_internal(previous);
+    return rc;
+}
+
+/** @brief Calls the real `pclose()` while preserving the recursion guard. */
+static int chaos_io_call_real_pclose(FILE *stream)
+{
+    int previous;
+    int rc;
+
+    if (g_chaos_io_real_pclose == NULL)
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+    previous = chaos_io_enter_internal();
+    rc = g_chaos_io_real_pclose(stream);
+    chaos_io_leave_internal(previous);
+    return rc;
+}
+
+/** @brief Calls the real `fsync()` while preserving the recursion guard. */
+static int chaos_io_call_real_fsync(int fd)
+{
+    int previous;
+    int rc;
+
+    if (g_chaos_io_real_fsync == NULL)
+    {
+        return (int)CHAOS_IO_SYSCALL(SYS_fsync, fd);
+    }
+    previous = chaos_io_enter_internal();
+    rc = g_chaos_io_real_fsync(fd);
+    chaos_io_leave_internal(previous);
+    return rc;
+}
+
+/** @brief Calls the real `fdatasync()` while preserving the recursion guard. */
+static int chaos_io_call_real_fdatasync(int fd)
+{
+    int previous;
+    int rc;
+
+    if (g_chaos_io_real_fdatasync == NULL)
+    {
+        return (int)CHAOS_IO_SYSCALL(SYS_fdatasync, fd);
+    }
+    previous = chaos_io_enter_internal();
+    rc = g_chaos_io_real_fdatasync(fd);
+    chaos_io_leave_internal(previous);
+    return rc;
+}
 
 /**
  * @brief Interposed `close(2)` entry point.
@@ -71,7 +205,6 @@ CHAOS_IO_EXPORT int close(int fd)
     chaos_io_rule_t rule;
     int matched;
     int rc;
-    int previous;
 
     chaos_io_ensure_symbols();
     matched = !chaos_io_in_internal() && chaos_io_match_fd_rule(fd, CHAOS_IO_OP_CLOSE, &rule);
@@ -80,9 +213,7 @@ CHAOS_IO_EXPORT int close(int fd)
         chaos_io_rule_apply_latency(&rule);
     }
 
-    previous = chaos_io_enter_internal();
-    rc = g_chaos_io_real_close(fd);
-    chaos_io_leave_internal(previous);
+    rc = chaos_io_call_real_close(fd);
     chaos_io_fdcache_invalidate(fd);
 
     if (matched && rule.effect != CHAOS_IO_EFFECT_LATENCY && chaos_io_rule_apply_errno(&rule))
@@ -101,12 +232,9 @@ CHAOS_IO_EXPORT int close(int fd)
 CHAOS_IO_EXPORT int dup2(int oldfd, int newfd)
 {
     int rc;
-    int previous;
 
     chaos_io_ensure_symbols();
-    previous = chaos_io_enter_internal();
-    rc = g_chaos_io_real_dup2(oldfd, newfd);
-    chaos_io_leave_internal(previous);
+    rc = chaos_io_call_real_dup2(oldfd, newfd);
     if (rc >= 0 && oldfd != newfd)
     {
         chaos_io_fdcache_invalidate(newfd);
@@ -121,12 +249,9 @@ CHAOS_IO_EXPORT int dup2(int oldfd, int newfd)
 CHAOS_IO_EXPORT int dup3(int oldfd, int newfd, int flags)
 {
     int rc;
-    int previous;
 
     chaos_io_ensure_symbols();
-    previous = chaos_io_enter_internal();
-    rc = g_chaos_io_real_dup3(oldfd, newfd, flags);
-    chaos_io_leave_internal(previous);
+    rc = chaos_io_call_real_dup3(oldfd, newfd, flags);
     if (rc >= 0)
     {
         chaos_io_fdcache_invalidate(newfd);
@@ -189,7 +314,6 @@ CHAOS_IO_EXPORT int close_range(unsigned int first, unsigned int last, int flags
 CHAOS_IO_EXPORT int closedir(DIR *directory)
 {
     const int saved_errno = errno;
-    int previous;
     int fd;
     int rc;
 
@@ -199,9 +323,7 @@ CHAOS_IO_EXPORT int closedir(DIR *directory)
     chaos_io_ensure_symbols();
     fd = checked != NULL ? dirfd(directory) : -1;
     errno = saved_errno;
-    previous = chaos_io_enter_internal();
-    rc = g_chaos_io_real_closedir(directory);
-    chaos_io_leave_internal(previous);
+    rc = chaos_io_call_real_closedir(directory);
     chaos_io_fdcache_invalidate(fd);
     return rc;
 }
@@ -214,7 +336,6 @@ CHAOS_IO_EXPORT int closedir(DIR *directory)
 CHAOS_IO_EXPORT int pclose(FILE *stream)
 {
     const int saved_errno = errno;
-    int previous;
     int fd;
     int rc;
 
@@ -223,9 +344,7 @@ CHAOS_IO_EXPORT int pclose(FILE *stream)
     chaos_io_ensure_symbols();
     fd = checked != NULL ? fileno(stream) : -1;
     errno = saved_errno;
-    previous = chaos_io_enter_internal();
-    rc = g_chaos_io_real_pclose(stream);
-    chaos_io_leave_internal(previous);
+    rc = chaos_io_call_real_pclose(stream);
     chaos_io_fdcache_invalidate(fd);
     return rc;
 }
@@ -302,16 +421,11 @@ CHAOS_IO_EXPORT void closefrom(int lowfd)
 CHAOS_IO_EXPORT int fsync(int fd)
 {
     chaos_io_rule_t rule;
-    int rc;
-    int previous;
 
     chaos_io_ensure_symbols();
     if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_FSYNC, &rule))
     {
-        previous = chaos_io_enter_internal();
-        rc = g_chaos_io_real_fsync(fd);
-        chaos_io_leave_internal(previous);
-        return rc;
+        return chaos_io_call_real_fsync(fd);
     }
 
     if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
@@ -323,10 +437,7 @@ CHAOS_IO_EXPORT int fsync(int fd)
         return -1;
     }
 
-    previous = chaos_io_enter_internal();
-    rc = g_chaos_io_real_fsync(fd);
-    chaos_io_leave_internal(previous);
-    return rc;
+    return chaos_io_call_real_fsync(fd);
 }
 
 /**
@@ -342,16 +453,11 @@ CHAOS_IO_EXPORT int fsync(int fd)
 CHAOS_IO_EXPORT int fdatasync(int fd)
 {
     chaos_io_rule_t rule;
-    int rc;
-    int previous;
 
     chaos_io_ensure_symbols();
     if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_FDATASYNC, &rule))
     {
-        previous = chaos_io_enter_internal();
-        rc = g_chaos_io_real_fdatasync(fd);
-        chaos_io_leave_internal(previous);
-        return rc;
+        return chaos_io_call_real_fdatasync(fd);
     }
 
     if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
@@ -363,8 +469,5 @@ CHAOS_IO_EXPORT int fdatasync(int fd)
         return -1;
     }
 
-    previous = chaos_io_enter_internal();
-    rc = g_chaos_io_real_fdatasync(fd);
-    chaos_io_leave_internal(previous);
-    return rc;
+    return chaos_io_call_real_fdatasync(fd);
 }

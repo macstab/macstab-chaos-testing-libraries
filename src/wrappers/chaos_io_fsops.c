@@ -64,12 +64,21 @@
 
 /* --- Real-call trampolines ------------------------------------------------------- */
 
+/*
+ * Each trampoline makes the system call itself while its `g_chaos_io_real_*`
+ * pointer is still NULL: a call that arrives during symbol resolution.
+ */
+
 /** @brief Calls the real `ftruncate()` while preserving the recursion guard. */
 static int chaos_io_call_real_ftruncate(int fd, off_t length)
 {
     int previous;
     int result;
 
+    if (g_chaos_io_real_ftruncate == NULL)
+    {
+        return (int)CHAOS_IO_SYSCALL(SYS_ftruncate, fd, length);
+    }
     previous = chaos_io_enter_internal();
     result = g_chaos_io_real_ftruncate(fd, length);
     chaos_io_leave_internal(previous);
@@ -83,6 +92,10 @@ static int chaos_io_call_real_fallocate(int fd, int mode, off_t offset, off_t le
     int previous;
     int result;
 
+    if (g_chaos_io_real_fallocate == NULL)
+    {
+        return (int)CHAOS_IO_SYSCALL(SYS_fallocate, fd, mode, offset, length);
+    }
     previous = chaos_io_enter_internal();
     result = g_chaos_io_real_fallocate(fd, mode, offset, length);
     chaos_io_leave_internal(previous);
@@ -96,6 +109,10 @@ static int chaos_io_call_real_truncate(const char *path, off_t length)
     int previous;
     int result;
 
+    if (g_chaos_io_real_truncate == NULL)
+    {
+        return (int)CHAOS_IO_SYSCALL(SYS_truncate, path, length);
+    }
     previous = chaos_io_enter_internal();
     result = g_chaos_io_real_truncate(path, length);
     chaos_io_leave_internal(previous);
@@ -108,6 +125,15 @@ static int chaos_io_call_real_posix_fallocate(int fd, off_t offset, off_t length
     int previous;
     int result;
 
+    if (g_chaos_io_real_posix_fallocate == NULL)
+    {
+        /* posix_fallocate returns the error rather than setting errno. */
+        const int saved_errno = errno;
+
+        result = CHAOS_IO_SYSCALL(SYS_fallocate, fd, 0, offset, length) == 0 ? 0 : errno;
+        errno = saved_errno;
+        return result;
+    }
     previous = chaos_io_enter_internal();
     result = g_chaos_io_real_posix_fallocate(fd, offset, length);
     chaos_io_leave_internal(previous);
@@ -149,6 +175,10 @@ static int chaos_io_call_real_unlinkat(int dirfd, const char *path, int flags)
     int previous;
     int result;
 
+    if (g_chaos_io_real_unlinkat == NULL)
+    {
+        return (int)CHAOS_IO_SYSCALL(SYS_unlinkat, dirfd, path, flags);
+    }
     previous = chaos_io_enter_internal();
     result = g_chaos_io_real_unlinkat(dirfd, path, flags);
     chaos_io_leave_internal(previous);
@@ -162,6 +192,15 @@ chaos_io_call_real_renameat(int olddirfd, const char *oldpath, int newdirfd, con
     int previous;
     int result;
 
+    if (g_chaos_io_real_renameat == NULL)
+    {
+#ifdef SYS_renameat
+        return (int)CHAOS_IO_SYSCALL(SYS_renameat, olddirfd, oldpath, newdirfd, newpath);
+#else
+        /* aarch64 has only renameat2; without flags it is renameat. */
+        return (int)CHAOS_IO_SYSCALL(SYS_renameat2, olddirfd, oldpath, newdirfd, newpath, 0U);
+#endif
+    }
     previous = chaos_io_enter_internal();
     result = g_chaos_io_real_renameat(olddirfd, oldpath, newdirfd, newpath);
     chaos_io_leave_internal(previous);

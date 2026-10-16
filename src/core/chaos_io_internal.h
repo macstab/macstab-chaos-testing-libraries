@@ -54,6 +54,19 @@
 #endif
 
 /**
+ * @brief Raw system call used when a downstream libc symbol is not resolved yet.
+ *
+ * @details A wrapper can run while the symbol table is still being filled (a
+ * signal handler during the constructor's dlsym, or an allocator whose first
+ * allocation inside dlsym does file I/O). Its `g_chaos_io_real_*` pointer is
+ * NULL then, and the wrapper makes the system call itself. The unit tests point
+ * this at the real system call; their `syscall` is a stub.
+ */
+#ifndef CHAOS_IO_SYSCALL
+#define CHAOS_IO_SYSCALL syscall
+#endif
+
+/**
  * @defgroup chaos_io_limits Capacity and path limits
  * @{
  */

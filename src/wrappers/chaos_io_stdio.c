@@ -127,6 +127,148 @@ static void chaos_io_stdio_corrupt(const chaos_io_rule_t *rule, void *buffer, si
     }
 }
 
+/* --- Real-call trampolines ------------------------------------------------------- */
+
+/*
+ * A stream is the C library's own object, so no system call can stand in for these.
+ * While a `g_chaos_io_real_*` pointer is still NULL (a call that arrives during
+ * symbol resolution) the call fails the way the function reports errors, with ENOSYS.
+ */
+
+static size_t chaos_io_call_real_fread(void *buffer, size_t size, size_t count, FILE *stream)
+{
+    if (g_chaos_io_real_fread == NULL)
+    {
+        errno = ENOSYS;
+        return 0U;
+    }
+    return g_chaos_io_real_fread(buffer, size, count, stream);
+}
+
+/** @brief `__fread_chk` where the C library has it, else the plain fread. */
+static size_t chaos_io_call_real_fread_chk(
+    void *buffer, size_t buffer_size, size_t size, size_t count, FILE *stream
+)
+{
+    if (g_chaos_io_real_fread_chk != NULL)
+    {
+        return g_chaos_io_real_fread_chk(buffer, buffer_size, size, count, stream);
+    }
+    return chaos_io_call_real_fread(buffer, size, count, stream);
+}
+
+static char *chaos_io_call_real_fgets(char *buffer, int size, FILE *stream)
+{
+    if (g_chaos_io_real_fgets == NULL)
+    {
+        errno = ENOSYS;
+        return NULL;
+    }
+    return g_chaos_io_real_fgets(buffer, size, stream);
+}
+
+/** @brief `__fgets_chk` where the C library has it, else the plain fgets. */
+static char *chaos_io_call_real_fgets_chk(char *buffer, size_t buffer_size, int size, FILE *stream)
+{
+    if (g_chaos_io_real_fgets_chk != NULL)
+    {
+        return g_chaos_io_real_fgets_chk(buffer, buffer_size, size, stream);
+    }
+    return chaos_io_call_real_fgets(buffer, size, stream);
+}
+
+/** @brief Calls @p real, the resolved fgetc or getc. */
+static int chaos_io_call_real_getc(chaos_io_fgetc_fn real, FILE *stream)
+{
+    if (real == NULL)
+    {
+        errno = ENOSYS;
+        return EOF;
+    }
+    return real(stream);
+}
+
+static ssize_t
+chaos_io_call_real_getdelim(char **line, size_t *capacity, int delimiter, FILE *stream)
+{
+    if (g_chaos_io_real_getdelim == NULL)
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+    return g_chaos_io_real_getdelim(line, capacity, delimiter, stream);
+}
+
+static size_t chaos_io_call_real_fwrite(const void *buffer, size_t size, size_t count, FILE *stream)
+{
+    if (g_chaos_io_real_fwrite == NULL)
+    {
+        errno = ENOSYS;
+        return 0U;
+    }
+    return g_chaos_io_real_fwrite(buffer, size, count, stream);
+}
+
+static int chaos_io_call_real_fputs(const char *text, FILE *stream)
+{
+    if (g_chaos_io_real_fputs == NULL)
+    {
+        errno = ENOSYS;
+        return EOF;
+    }
+    return g_chaos_io_real_fputs(text, stream);
+}
+
+/** @brief Calls @p real, the resolved fputc or putc. */
+static int chaos_io_call_real_putc(chaos_io_fputc_fn real, int c, FILE *stream)
+{
+    if (real == NULL)
+    {
+        errno = ENOSYS;
+        return EOF;
+    }
+    return real(c, stream);
+}
+
+static int chaos_io_call_real_fflush(FILE *stream)
+{
+    if (g_chaos_io_real_fflush == NULL)
+    {
+        errno = ENOSYS;
+        return EOF;
+    }
+    return g_chaos_io_real_fflush(stream);
+}
+
+/**
+ * @brief The real formatter: `__vfprintf_chk` for a fortified call (@p flag >= 0)
+ *        where the C library has it, else vfprintf.
+ */
+static int
+chaos_io_call_real_vfprintf(FILE *stream, int flag, const char *format, va_list arguments)
+{
+    if (flag >= 0 && g_chaos_io_real_vfprintf_chk != NULL)
+    {
+        return g_chaos_io_real_vfprintf_chk(stream, flag, format, arguments);
+    }
+    if (g_chaos_io_real_vfprintf == NULL)
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+    return g_chaos_io_real_vfprintf(stream, format, arguments);
+}
+
+static int chaos_io_call_real_fclose(FILE *stream)
+{
+    if (g_chaos_io_real_fclose == NULL)
+    {
+        errno = ENOSYS;
+        return EOF;
+    }
+    return g_chaos_io_real_fclose(stream);
+}
+
 /* --- Reads ------------------------------------------------------------------------ */
 
 CHAOS_IO_EXPORT size_t fread(void *buffer, size_t size, size_t count, FILE *stream)
@@ -137,13 +279,13 @@ CHAOS_IO_EXPORT size_t fread(void *buffer, size_t size, size_t count, FILE *stre
     chaos_io_ensure_symbols();
     if (!chaos_io_stdio_rule(stream, CHAOS_IO_OP_READ, chaos_io_stdio_size(size, count), &rule))
     {
-        return g_chaos_io_real_fread(buffer, size, count, stream);
+        return chaos_io_call_real_fread(buffer, size, count, stream);
     }
     if (chaos_io_stdio_fails(stream, &rule))
     {
         return 0U;
     }
-    items = g_chaos_io_real_fread(buffer, size, count, stream);
+    items = chaos_io_call_real_fread(buffer, size, count, stream);
     chaos_io_stdio_corrupt(&rule, buffer, items * size);
     return items;
 }
@@ -158,13 +300,13 @@ CHAOS_IO_EXPORT char *fgets(char *buffer, int size, FILE *stream)
             stream, CHAOS_IO_OP_READ, size > 0 ? (uint64_t)size : CHAOS_POLICY_NO_SIZE, &rule
         ))
     {
-        return g_chaos_io_real_fgets(buffer, size, stream);
+        return chaos_io_call_real_fgets(buffer, size, stream);
     }
     if (chaos_io_stdio_fails(stream, &rule))
     {
         return NULL;
     }
-    line = g_chaos_io_real_fgets(buffer, size, stream);
+    line = chaos_io_call_real_fgets(buffer, size, stream);
     if (line != NULL)
     {
         chaos_io_stdio_corrupt(&rule, line, strlen(line));
@@ -182,13 +324,13 @@ static int chaos_io_stdio_getc(FILE *stream, chaos_io_fgetc_fn real)
     chaos_io_ensure_symbols();
     if (!chaos_io_stdio_rule(stream, CHAOS_IO_OP_READ, 1U, &rule))
     {
-        return real(stream);
+        return chaos_io_call_real_getc(real, stream);
     }
     if (chaos_io_stdio_fails(stream, &rule))
     {
         return EOF;
     }
-    c = real(stream);
+    c = chaos_io_call_real_getc(real, stream);
     if (c == EOF)
     {
         return c;
@@ -218,13 +360,13 @@ CHAOS_IO_EXPORT ssize_t getdelim(char **line, size_t *capacity, int delimiter, F
     chaos_io_ensure_symbols();
     if (!chaos_io_stdio_rule(stream, CHAOS_IO_OP_READ, CHAOS_POLICY_NO_SIZE, &rule))
     {
-        return g_chaos_io_real_getdelim(line, capacity, delimiter, stream);
+        return chaos_io_call_real_getdelim(line, capacity, delimiter, stream);
     }
     if (chaos_io_stdio_fails(stream, &rule))
     {
         return -1;
     }
-    length = g_chaos_io_real_getdelim(line, capacity, delimiter, stream);
+    length = chaos_io_call_real_getdelim(line, capacity, delimiter, stream);
     if (length > 0 && line != NULL)
     {
         chaos_io_stdio_corrupt(&rule, *line, (size_t)length);
@@ -254,7 +396,7 @@ CHAOS_IO_EXPORT size_t fwrite(const void *buffer, size_t size, size_t count, FIL
     {
         return 0U;
     }
-    return g_chaos_io_real_fwrite(buffer, size, count, stream);
+    return chaos_io_call_real_fwrite(buffer, size, count, stream);
 }
 
 CHAOS_IO_EXPORT int fputs(const char *text, FILE *stream)
@@ -267,7 +409,7 @@ CHAOS_IO_EXPORT int fputs(const char *text, FILE *stream)
     {
         return EOF;
     }
-    return g_chaos_io_real_fputs(text, stream);
+    return chaos_io_call_real_fputs(text, stream);
 }
 
 /** @brief Shared body of fputc, putc and putchar. */
@@ -280,7 +422,7 @@ static int chaos_io_stdio_putc(int c, FILE *stream, chaos_io_fputc_fn real)
     {
         return EOF;
     }
-    return real(c, stream);
+    return chaos_io_call_real_putc(real, c, stream);
 }
 
 CHAOS_IO_EXPORT int fputc(int c, FILE *stream)
@@ -305,7 +447,7 @@ CHAOS_IO_EXPORT int fflush(FILE *stream)
     {
         return EOF;
     }
-    return g_chaos_io_real_fflush(stream);
+    return chaos_io_call_real_fflush(stream);
 }
 
 /**
@@ -323,11 +465,7 @@ static int chaos_io_stdio_vprintf(FILE *stream, int flag, const char *format, va
     {
         return -1;
     }
-    if (flag >= 0 && g_chaos_io_real_vfprintf_chk != NULL)
-    {
-        return g_chaos_io_real_vfprintf_chk(stream, flag, format, arguments);
-    }
-    return g_chaos_io_real_vfprintf(stream, format, arguments);
+    return chaos_io_call_real_vfprintf(stream, flag, format, arguments);
 }
 
 CHAOS_IO_EXPORT int vfprintf(FILE *stream, const char *format, va_list arguments)
@@ -363,7 +501,7 @@ CHAOS_IO_EXPORT int fclose(FILE *stream)
 
     chaos_io_ensure_symbols();
     errno = saved_errno;
-    rc = g_chaos_io_real_fclose(stream);
+    rc = chaos_io_call_real_fclose(stream);
     if (!chaos_io_in_internal())
     {
         chaos_io_fdcache_invalidate(fd);
@@ -403,17 +541,13 @@ __fread_chk(void *buffer, size_t buffer_size, size_t size, size_t count, FILE *s
     chaos_io_ensure_symbols();
     if (!chaos_io_stdio_rule(stream, CHAOS_IO_OP_READ, chaos_io_stdio_size(size, count), &rule))
     {
-        return g_chaos_io_real_fread_chk != NULL
-                   ? g_chaos_io_real_fread_chk(buffer, buffer_size, size, count, stream)
-                   : g_chaos_io_real_fread(buffer, size, count, stream);
+        return chaos_io_call_real_fread_chk(buffer, buffer_size, size, count, stream);
     }
     if (chaos_io_stdio_fails(stream, &rule))
     {
         return 0U;
     }
-    items = g_chaos_io_real_fread_chk != NULL
-                ? g_chaos_io_real_fread_chk(buffer, buffer_size, size, count, stream)
-                : g_chaos_io_real_fread(buffer, size, count, stream);
+    items = chaos_io_call_real_fread_chk(buffer, buffer_size, size, count, stream);
     chaos_io_stdio_corrupt(&rule, buffer, items * size);
     return items;
 }
@@ -428,17 +562,13 @@ CHAOS_IO_EXPORT char *__fgets_chk(char *buffer, size_t buffer_size, int size, FI
             stream, CHAOS_IO_OP_READ, size > 0 ? (uint64_t)size : CHAOS_POLICY_NO_SIZE, &rule
         ))
     {
-        return g_chaos_io_real_fgets_chk != NULL
-                   ? g_chaos_io_real_fgets_chk(buffer, buffer_size, size, stream)
-                   : g_chaos_io_real_fgets(buffer, size, stream);
+        return chaos_io_call_real_fgets_chk(buffer, buffer_size, size, stream);
     }
     if (chaos_io_stdio_fails(stream, &rule))
     {
         return NULL;
     }
-    line = g_chaos_io_real_fgets_chk != NULL
-               ? g_chaos_io_real_fgets_chk(buffer, buffer_size, size, stream)
-               : g_chaos_io_real_fgets(buffer, size, stream);
+    line = chaos_io_call_real_fgets_chk(buffer, buffer_size, size, stream);
     if (line != NULL)
     {
         chaos_io_stdio_corrupt(&rule, line, strlen(line));
