@@ -366,6 +366,11 @@ static void test_call_real_helpers(void)
         assert(chaos_memory_call_real_mprotect(page, 4096U, PROT_READ | PROT_WRITE) == 0);
         assert(chaos_memory_call_real_madvise(page, 4096U, MADV_NORMAL) == 0);
         assert(chaos_memory_call_real_posix_madvise(page, 4096U, POSIX_MADV_NORMAL) == 0);
+        /* POSIX_MADV_DONTNEED is advice only: the page keeps what was written, which
+         * MADV_DONTNEED (the same number) would have discarded. */
+        ((volatile char *)page)[0] = 'x';
+        assert(chaos_memory_call_real_posix_madvise(page, 4096U, POSIX_MADV_DONTNEED) == 0);
+        assert(((volatile char *)page)[0] == 'x');
         assert(chaos_memory_call_real_munmap(page, 4096U) == 0);
         errno = 0;
         assert(chaos_memory_call_real_munmap((void *)(uintptr_t)0x1001U, 4096U) == -1);

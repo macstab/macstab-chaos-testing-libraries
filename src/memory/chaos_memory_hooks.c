@@ -214,6 +214,12 @@ static int chaos_memory_call_real_posix_madvise(void *address, size_t length, in
     {
         const int saved_errno = errno;
 
+        /* POSIX_MADV_DONTNEED is only advice; MADV_DONTNEED, the same number, would
+         * discard the pages. glibc and musl ignore it, so does this. */
+        if (advice == POSIX_MADV_DONTNEED)
+        {
+            return 0;
+        }
         rc = syscall(SYS_madvise, address, length, advice) == 0 ? 0 : errno;
         errno = saved_errno;
         return rc;
