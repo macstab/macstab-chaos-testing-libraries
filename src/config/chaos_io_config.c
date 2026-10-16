@@ -724,7 +724,8 @@ static int chaos_io_config_read_file(size_t *size_out, uint64_t expected_stamp)
 /**
  * @brief Returns non-zero when a rule prefix matches the supplied path.
  *
- * @details The wildcard `"*"` matches any non-NULL path unconditionally.
+ * @details The wildcard `"*"` matches every file: an absolute path that is not a
+ * memfd (`/memfd:`); pipes, sockets and anonymous inodes only by name.
  * For explicit prefixes the match is boundary-aware:
  * - An exact match (`path == prefix`) succeeds.
  * - A prefix that ends with `/` succeeds when the path has the same
@@ -744,7 +745,11 @@ static int chaos_io_rule_prefix_matches(const chaos_io_rule_t *rule, const char 
     }
     if (strcmp(rule->path_prefix, "*") == 0)
     {
-        return 1;
+        /* Files only. Pipes, sockets and anonymous inodes (eventfd, timerfd, ...) are
+         * named pipe:[N], socket:[N] and anon_inode:[...], memfds /memfd:<name>: a
+         * TORN or CORRUPT meant for files would break their protocols (an 8-byte
+         * eventfd write). A rule that names them still reaches them. */
+        return path[0] == '/' && strncmp(path, "/memfd:", 7U) != 0;
     }
     if (strncmp(path, rule->path_prefix, rule->path_len) != 0)
     {

@@ -35,6 +35,8 @@
 #include <string.h>
 #include <limits.h>
 #include <stdint.h>
+#include <sys/eventfd.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -194,6 +196,38 @@ static void check_unseen_close(void)
     expect("cached dir removed", rmdir(PROBE_DIR "/cached") == 0);
 }
 
+/**
+ * @brief A `*` rule is for files: an eventfd, a pipe and a socket are written whole
+ *        under `*:write:TORN`, while a file is torn.
+ */
+static void check_wildcard_spares_non_files(void)
+{
+    const uint64_t one = 1U;
+    int pipe_fds[2];
+    int pair[2];
+    int counter;
+    int fd;
+
+    write_rules("*:write:TORN:1.0\n");
+    counter = eventfd(0U, 0);
+    expect("eventfd written whole", counter >= 0 && write(counter, &one, sizeof(one)) == 8);
+    expect("pipe written whole", pipe(pipe_fds) == 0 && write(pipe_fds[1], "data", 4U) == 4);
+    expect(
+        "socket written whole",
+        socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0 && write(pair[0], "data", 4U) == 4
+    );
+    fd = open(PROBE_DIR "/torn.bin", O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    expect("file torn", fd >= 0 && write(fd, "data", 4U) < 4);
+    (void)close(counter);
+    (void)close(pipe_fds[0]);
+    (void)close(pipe_fds[1]);
+    (void)close(pair[0]);
+    (void)close(pair[1]);
+    (void)close(fd);
+    write_rules("# idle\n");
+    expect("torn file removed", unlink(PROBE_DIR "/torn.bin") == 0);
+}
+
 /** @brief writev through a pointer, so libc's attributes accept invalid arguments. */
 static ssize_t (*volatile g_writev)(int, const struct iovec *, int) = writev;
 
@@ -304,6 +338,7 @@ int main(void)
     check_vectored_writes();
     check_path_spellings();
     check_unseen_close();
+    check_wildcard_spares_non_files();
 
     write_rules("# idle\n");
     fd = open(PROBE_DIR "/source.bin", O_WRONLY);

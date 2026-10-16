@@ -1078,7 +1078,9 @@ make unit 2>&1 | grep -E 'PROPTEST|test_config|OK'
 ### Matching rules
 
 - longest prefix wins
-- `*` is the lowest-priority wildcard
+- `*` is the lowest-priority wildcard, and matches files only: not pipes,
+  sockets, anonymous inodes (eventfd, timerfd, ...) or memfds, which a rule
+  reaches only by naming them
 - matching is path-boundary aware
 - no globbing
 - no regex

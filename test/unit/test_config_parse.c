@@ -581,6 +581,12 @@ static void test_parse_buffer_and_selection(void)
     assert(chaos_io_rule_prefix_matches(NULL, "/data") == 0);
     assert(chaos_io_rule_prefix_matches(&rules[0], NULL) == 0);
     assert(chaos_io_rule_prefix_matches(&rules[0], "/tmp/file"));
+    /* `*` is for files: not pipes, sockets, anonymous inodes or memfds. */
+    assert(!chaos_io_rule_prefix_matches(&rules[0], "pipe:[1234]"));
+    assert(!chaos_io_rule_prefix_matches(&rules[0], "socket:[1234]"));
+    assert(!chaos_io_rule_prefix_matches(&rules[0], "anon_inode:[eventfd]"));
+    assert(!chaos_io_rule_prefix_matches(&rules[0], "/memfd:cache (deleted)"));
+    assert(chaos_io_rule_prefix_matches(&rules[0], "/memfd"));
     assert(chaos_io_rule_prefix_matches(&rules[1], "/data"));
     assert(chaos_io_rule_prefix_matches(&rules[1], "/data/file"));
     assert(!chaos_io_rule_prefix_matches(&rules[1], "/tmp/file"));
