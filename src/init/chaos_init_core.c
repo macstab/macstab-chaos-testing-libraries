@@ -325,6 +325,11 @@ int chaos_init_kernel_supported(const char *release)
     return major > 5U || (major == 5U && minor >= 5U);
 }
 
+int chaos_init_caller_gone(int error)
+{
+    return error == ENOENT;
+}
+
 const char *chaos_init_unsupported_reason(int error)
 {
     switch (error)

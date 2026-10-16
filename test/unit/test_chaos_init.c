@@ -222,6 +222,12 @@ static void test_exit_code(void)
 
 static void test_kernel_and_reasons(void)
 {
+    /* Only ENOENT from NOTIF_ID_VALID means the thread is gone; any other error
+     * still gets the call answered. */
+    assert(chaos_init_caller_gone(ENOENT));
+    assert(!chaos_init_caller_gone(EINVAL));
+    assert(!chaos_init_caller_gone(ENOTTY));
+
     assert(!chaos_init_kernel_supported(NULL));
     assert(!chaos_init_kernel_supported("garbage"));
     assert(!chaos_init_kernel_supported("5"));

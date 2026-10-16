@@ -78,6 +78,17 @@ int chaos_init_exit_code(int status);
 int chaos_init_kernel_supported(const char *release);
 
 /**
+ * @brief Whether a failed NOTIF_ID_VALID check (@p error) says the notified thread
+ *        is gone.
+ *
+ * @details Only ENOENT does. Any other error proves nothing (5.5 to 5.8 know the
+ * request only under its older number and answer EINVAL), and the call is answered
+ * anyway: a reply goes by notification id and never reaches another thread, while
+ * one left out keeps the thread blocked for good.
+ */
+int chaos_init_caller_gone(int error);
+
+/**
  * @brief Finds @p command as execvp() would: as given when it holds a '/', else the
  *        first executable regular file of that name in @p path (":"-separated; NULL
  *        means "/usr/local/bin:/usr/bin:/bin"; an empty entry is the current directory).

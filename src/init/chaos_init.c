@@ -329,7 +329,8 @@ chaos_init_answer(int listener, unsigned libs, void *request, void *response, si
     /* The decision read the thread's memory: act on it only if that thread is still
      * the one waiting (its pid could otherwise belong to another process by now). */
     if (verdict.action != CHAOS_INIT_PASS &&
-        chaos_init_ioctl(listener, SECCOMP_IOCTL_NOTIF_ID_VALID, &notification->id) != 0)
+        chaos_init_ioctl(listener, SECCOMP_IOCTL_NOTIF_ID_VALID, &notification->id) != 0 &&
+        chaos_init_caller_gone(errno))
     {
         return;
     }
