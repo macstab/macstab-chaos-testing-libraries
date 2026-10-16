@@ -160,6 +160,12 @@ static int chaos_net_wait_match_fdsets(
 }
 
 #ifdef __linux__
+/** @brief Bytes of /proc/self/fdinfo read at a time (lines are a few dozen bytes). */
+#define CHAOS_NET_FDINFO_CHUNK 512U
+
+/** @brief Most fdinfo bytes scanned per wait (about 4000 watched descriptors). */
+#define CHAOS_NET_FDINFO_MAX (256U * 1024U)
+
 /**
  * @brief Scans fdinfo text @p buffer for a `tfd:` line whose fd has a POLL rule.
  *
@@ -228,8 +234,13 @@ static int chaos_net_wait_scan_fdinfo(char *buffer, chaos_net_rule_t *rule)
 static int chaos_net_wait_match_epoll_fdinfo(int epfd, chaos_net_rule_t *rule)
 {
     char path[64];
-    char buffer[16384];
+    /* Small and read in pieces: a wait can run in a signal handler on a small
+     * alternate stack, and an epoll instance may watch thousands of descriptors. */
+    char buffer[CHAOS_NET_FDINFO_CHUNK];
     size_t used = 0U;
+    size_t total = 0U;
+    int skipping = 0;
+    int found = 0;
     int fd;
     int previous;
 
@@ -250,31 +261,52 @@ static int chaos_net_wait_match_epoll_fdinfo(int epfd, chaos_net_rule_t *rule)
         return 0;
     }
 
-    for (;;)
+    while (!found)
     {
-        ssize_t rc = read(fd, buffer + used, sizeof(buffer) - 1U - used);
-        if (rc < 0)
-        {
-            (void)close(fd);
-            chaos_net_leave_internal(previous);
-            return 0;
-        }
-        if (rc == 0)
+        const ssize_t rc = read(fd, buffer + used, sizeof(buffer) - 1U - used);
+        char *last;
+
+        if (rc <= 0 || total > CHAOS_NET_FDINFO_MAX)
         {
             break;
         }
+        total += (size_t)rc;
         used += (size_t)rc;
-        /* Stop at buffer capacity - 1; NUL terminator needs one byte. */
-        if (used == sizeof(buffer) - 1U)
+        buffer[used] = '\0';
+        last = strrchr(buffer, '\n');
+        if (last == NULL)
         {
-            break;
+            /* A line longer than the buffer is no tfd line: skip to its end. */
+            if (used == sizeof(buffer) - 1U)
+            {
+                used = 0U;
+                skipping = 1;
+            }
+            continue;
+        }
+        {
+            char *tail = last + 1;
+            const size_t tail_length = used - (size_t)(tail - buffer);
+            char *lines = buffer;
+
+            if (skipping)
+            {
+                lines = strchr(buffer, '\n') + 1;
+                skipping = 0;
+            }
+            const char first = *tail;
+
+            *tail = '\0';
+            found = lines < tail && chaos_net_wait_scan_fdinfo(lines, rule);
+            /* The cut line goes on with the next piece. */
+            *tail = first;
+            (void)memmove(buffer, tail, tail_length);
+            used = tail_length;
         }
     }
     (void)close(fd);
     chaos_net_leave_internal(previous);
-    buffer[used] = '\0';
-
-    return chaos_net_wait_scan_fdinfo(buffer, rule);
+    return found;
 }
 
 /**

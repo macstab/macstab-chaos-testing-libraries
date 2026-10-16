@@ -366,10 +366,13 @@ int chaos_net_endpoint_from_socket_spec(
  * Used by `shutdown`, `poll`, `ppoll`, `select`, `pselect`, and epoll paths.
  * Returns 1 and fills @p endpoint when `g_stub_endpoint_from_activity != 0`.
  */
+/** @brief When not -1, the only descriptor the activity stub resolves. */
+static int g_stub_activity_only_fd = -1;
+
 int chaos_net_endpoint_from_activity_fd(int fd, chaos_net_endpoint_t *endpoint)
 {
-    (void)fd;
-    if (g_stub_endpoint_from_activity == 0 || endpoint == NULL)
+    if (g_stub_endpoint_from_activity == 0 || endpoint == NULL ||
+        (g_stub_activity_only_fd != -1 && fd != g_stub_activity_only_fd))
     {
         return 0;
     }
@@ -2411,6 +2414,85 @@ static void test_wrapper_passthrough_and_additional_branches(void)
  * - LATENCY: call count==1, `g_latency_calls==1`, return 1.
  * - Passthrough: call count==1, return 1.
  */
+/**
+ * @brief Invariant: the watched descriptors of an epoll instance are read in small
+ *   pieces, so a descriptor listed far into its fdinfo, across a piece's boundary,
+ *   is still found.
+ */
+static ssize_t chaos_net_test_next_read(int fd, void *buffer, size_t size);
+
+/** @brief fdinfo text the scripted read stub hands out, and how much is left. */
+static const char *g_fdinfo_script = NULL;
+static size_t g_fdinfo_left = 0U;
+
+/** @brief Read stub: hands out g_fdinfo_script in pieces of at most 100 bytes. */
+static ssize_t chaos_net_test_script_read(int fd, void *buffer, size_t size)
+{
+    size_t part = g_fdinfo_left < size ? g_fdinfo_left : size;
+
+    (void)fd;
+    part = part < 100U ? part : 100U;
+    (void)memcpy(buffer, g_fdinfo_script, part);
+    g_fdinfo_script += part;
+    g_fdinfo_left -= part;
+    return (ssize_t)part;
+}
+
+static void test_epoll_fdinfo_in_pieces(void)
+{
+    struct epoll_event event;
+    struct epoll_event events[1];
+    int pipes[30][2];
+    int epfd = epoll_create1(0);
+    int index;
+
+    assert(epfd >= 0);
+    for (index = 0; index < 30; ++index)
+    {
+        assert(pipe(pipes[index]) == 0);
+        (void)memset(&event, 0, sizeof(event));
+        event.events = EPOLLIN;
+        assert(epoll_ctl(epfd, EPOLL_CTL_ADD, pipes[index][0], &event) == 0);
+    }
+    reset_wrapper_stubs();
+    g_stub_prepare = 1;
+    g_stub_endpoint_from_activity = 1;
+    g_stub_activity_only_fd = pipes[29][0];
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_TIMEOUT;
+    g_should_trigger = 1;
+    assert(epoll_wait(epfd, events, 1, 0) == 0);
+    assert(g_epoll_wait_calls == 0);
+    g_stub_activity_only_fd = 1000; /* watched by nobody */
+    (void)epoll_wait(epfd, events, 1, 0);
+    assert(g_epoll_wait_calls == 1);
+    g_stub_activity_only_fd = -1;
+
+    /* A line longer than a piece is skipped whole; the line after it is read. */
+    {
+        static char script[1200];
+
+        (void)memset(script, 'x', 700U);
+        (void)snprintf(script + 700, sizeof(script) - 700U, "%s", "\ntfd:  12 events: 19\n");
+        g_fdinfo_script = script;
+        g_fdinfo_left = strlen(script);
+        g_chaos_net_real_read = chaos_net_test_script_read;
+        g_stub_activity_only_fd = 12;
+        assert(chaos_net_wait_match_epoll(epfd, &g_stub_rule) == 1);
+        /* An endless stream stops at the scan limit. */
+        g_chaos_net_real_read = chaos_net_test_next_read;
+        assert(chaos_net_wait_match_epoll(epfd, &g_stub_rule) == 0);
+        g_stub_activity_only_fd = -1;
+        reset_wrapper_stubs();
+    }
+    for (index = 0; index < 30; ++index)
+    {
+        (void)close(pipes[index][0]);
+        (void)close(pipes[index][1]);
+    }
+    (void)close(epfd);
+}
+
 static void test_epoll_wrapper_paths(void)
 {
     int pipefd[2];
@@ -3391,6 +3473,7 @@ int main(void)
     test_batch_paths();
     test_direct_linux_helper_paths();
     test_epoll_wrapper_paths();
+    test_epoll_fdinfo_in_pieces();
 #endif
     return 0;
 }
