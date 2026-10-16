@@ -37,6 +37,9 @@
  * - LD_PRELOAD wrapper call paths.
  */
 
+/* A rule file counts as just written for 5 s, not 20 ms: the racily-clean tests
+ * restore an earlier mtime and must find it still recent on a slow machine. */
+#define CHAOS_RACY_WINDOW_MS 5000
 #include <stdint.h>
 
 /** @brief Staging-name nonce of the status writer (chaos_status.h), fixed by the tests. */

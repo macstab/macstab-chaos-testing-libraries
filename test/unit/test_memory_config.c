@@ -58,6 +58,9 @@
 #define CHAOS_CONFIG_FILE_READ(fd, buffer, size) read((fd), (buffer), (size))
 #define CHAOS_CONFIG_FILE_CLOSE(fd) (void)close(fd)
 
+/* A rule file counts as just written for 5 s, not 20 ms: the racily-clean tests
+ * restore an earlier mtime and must find it still recent on a slow machine. */
+#define CHAOS_RACY_WINDOW_MS 5000
 #include "../support/test_memory_support.h"
 
 #include <errno.h>

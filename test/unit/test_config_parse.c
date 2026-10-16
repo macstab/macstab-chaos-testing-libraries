@@ -52,6 +52,9 @@
  * - Config file parsing through the full LD_PRELOAD constructor path.
  */
 
+/* A rule file counts as just written for 5 s, not 20 ms: the racily-clean tests
+ * restore an earlier mtime and must find it still recent on a slow machine. */
+#define CHAOS_RACY_WINDOW_MS 5000
 #include "../support/test_support.h"
 
 #include <stdint.h>

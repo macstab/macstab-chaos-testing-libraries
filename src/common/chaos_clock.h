@@ -223,8 +223,11 @@ static inline int64_t chaos_clock_realtime_ms(void)
     return (int64_t)now.tv_sec * 1000 + (int64_t)(now.tv_nsec / 1000000L);
 }
 
-/** @brief How long after its mtime a rule file may still change unseen, in ms. */
+/** @brief How long after its mtime a rule file may still change unseen, in ms; unit
+ *         tests widen it, so that a slow machine does not close it under them. */
+#ifndef CHAOS_RACY_WINDOW_MS
 #define CHAOS_RACY_WINDOW_MS 20
+#endif
 
 /**
  * @brief Whether a file stamped @p sec / @p nsec (mtime) is so recent that it may
