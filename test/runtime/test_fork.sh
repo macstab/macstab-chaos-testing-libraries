@@ -107,6 +107,16 @@ check() {
 check vfork "parent=EIO child=ok parent=ok" 1 1
 check fork "parent=EIO child=EIO parent=ok" 2 2
 check spawn "parent=EIO child=EIO parent=ok" 2 2
+
+echo "/tmp/fork-data:open:EIO:0.5" > /tmp/.chaos-io.conf
+draws=$(LD_PRELOAD=$so /tmp/fork-probe draws)
+rm -f /tmp/.chaos-io.conf /tmp/.chaos-io.hits.*
+if [ "$draws" = different ]; then
+    echo "ok   $LIBC fork: the child draws its own random numbers"
+else
+    echo "FAIL $LIBC fork: parent and child drew $draws numbers" >&2
+    failures=$((failures + 1))
+fi
 [ "$failures" -eq 0 ]
 '
 

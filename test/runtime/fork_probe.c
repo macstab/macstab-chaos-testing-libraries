@@ -2,7 +2,7 @@
  * @file fork_probe.c
  * @brief Runtime probe: an @first budget across vfork, fork and posix_spawn children.
  *
- * Usage: fork_probe vfork|fork|spawn|open   (under LD_PRELOAD of libchaos-io)
+ * Usage: fork_probe vfork|fork|spawn|open|draws   (under LD_PRELOAD of libchaos-io)
  *
  * The parent opens /tmp/fork-data/file, starts a child that opens it too, then opens
  * it again, and prints which of the three opens failed with EIO:
@@ -11,6 +11,10 @@
  *
  * `open` only opens the file once and exits 1 on EIO; `spawn` runs the probe itself
  * in that mode. test_fork.sh compares the line and the hits files.
+ *
+ * `draws` opens 64 times in the parent and in a forked child under a rule with a
+ * probability, and prints "same" when both saw the same failures, "different"
+ * otherwise: a child must not repeat its parent's random numbers.
  */
 
 #ifndef _GNU_SOURCE
@@ -57,6 +61,18 @@ static const char *word(int failed)
     return failed == 1 ? "EIO" : failed == 0 ? "ok" : "error";
 }
 
+/** @brief Opens the faulted file 64 times; which opens failed, as '0'/'1'. */
+static void draw(char *pattern)
+{
+    int index;
+
+    for (index = 0; index < 64; ++index)
+    {
+        pattern[index] = open_fails() == 1 ? '1' : '0';
+    }
+    pattern[64] = '\0';
+}
+
 int main(int argc, char **argv)
 {
     int first;
@@ -65,12 +81,39 @@ int main(int argc, char **argv)
 
     if (argc != 2)
     {
-        (void)fprintf(stderr, "usage: %s vfork|fork|spawn|open\n", argv[0]);
+        (void)fprintf(stderr, "usage: %s vfork|fork|spawn|open|draws\n", argv[0]);
         return 2;
     }
     if (strcmp(argv[1], "open") == 0)
     {
         return open_fails();
+    }
+
+    if (strcmp(argv[1], "draws") == 0)
+    {
+        char parent[65];
+        char forked[65] = "";
+        int pipe_fds[2];
+
+        if (pipe(pipe_fds) != 0)
+        {
+            return 2;
+        }
+        pid = fork();
+        if (pid == 0)
+        {
+            draw(forked);
+            _exit(write(pipe_fds[1], forked, 64U) == 64 ? 0 : 1);
+        }
+        draw(parent);
+        (void)close(pipe_fds[1]);
+        if (pid < 0 || read(pipe_fds[0], forked, 64U) != 64)
+        {
+            return 2;
+        }
+        (void)waitpid(pid, NULL, 0);
+        (void)printf("%s\n", strcmp(parent, forked) == 0 ? "same" : "different");
+        return 0;
     }
 
     first = open_fails();

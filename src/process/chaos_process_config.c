@@ -1355,6 +1355,9 @@ static void chaos_process_config_after_fork(void)
     g_chaos_process_hits_total = 0U;
     g_chaos_process_hits_last_ms = 0U;
     g_chaos_process_hits_pid = (uint64_t)getpid();
+    /* The child must not draw the parent's numbers (pre-fork workers would all
+     * decide alike): its PRNG reseeds from its own thread id on the next draw. */
+    g_chaos_process_tls_prng_state = 0U;
     for (which = 0U; which < 2U; ++which)
     {
         chaos_hit_slot_t *slots = g_chaos_process_config_states[which].hits;

@@ -979,7 +979,9 @@ static void test_fork_takes_over_orphaned_reload(void)
     g_chaos_time_cached_mtime = CHAOS_TIME_MTIME_RELOADING;
     (void)chaos_time_config_prepare();
     assert(g_chaos_time_cached_mtime == CHAOS_TIME_MTIME_RELOADING);
+    g_chaos_time_tls_prng_state = UINT64_C(42);
     chaos_time_config_after_fork();
+    assert(g_chaos_time_tls_prng_state == 0U);
     assert(g_chaos_time_cached_mtime == CHAOS_TIME_MTIME_UNKNOWN);
     assert(g_chaos_time_hits_pid == (uint64_t)getpid());
     assert(chaos_time_config_prepare());
