@@ -1324,17 +1324,19 @@ CHAOS_NET_EXPORT ssize_t recvmsg(int sockfd, struct msghdr *message, int flags)
         }
         {
             const unsigned generation = chaos_net_dup_generation(sockfd);
+            socklen_t kept;
 
             rc = chaos_net_call_real_recvmsg(sockfd, message, flags);
+            kept = message->msg_name == NULL         ? 0
+                   : message->msg_namelen < capacity ? message->msg_namelen
+                                                     : capacity;
             chaos_net_dup_store(
                 sockfd,
                 message->msg_iov,
                 (int)message->msg_iovlen,
                 rc,
                 (const struct sockaddr *)message->msg_name,
-                message->msg_name != NULL
-                    ? (message->msg_namelen < capacity ? message->msg_namelen : capacity)
-                    : 0,
+                kept,
                 generation
             );
         }
