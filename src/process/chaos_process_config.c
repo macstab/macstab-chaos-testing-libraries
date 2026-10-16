@@ -1375,6 +1375,8 @@ static void chaos_process_config_after_fork(void)
     /* The child must not draw the parent's numbers (pre-fork workers would all
      * decide alike): its PRNG reseeds from its own thread id on the next draw. */
     g_chaos_process_tls_prng_state = 0U;
+    /* FAIL_AFTER counts per process, like @first, and as chaos-init counts it. */
+    chaos_process_reset_fail_after_counters();
     chaos_hits_pool_after_fork(
         g_chaos_process_hit_pool,
         sizeof(g_chaos_process_hit_pool) / sizeof(g_chaos_process_hit_pool[0])

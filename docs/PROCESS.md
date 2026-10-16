@@ -471,8 +471,9 @@ Given rule `pthread_create:FAIL_AFTER:EAGAIN,128`:
    this call).
 4. At `old_value == 128` and beyond: call fails with `EAGAIN`.
 
-The counter is per-operation (all `pthread_create` calls share one counter),
-not per-thread. Multiple threads calling `pthread_create` concurrently increment
+The counter is per-operation (all `pthread_create` calls share one counter) and
+per process: a forked child starts from 0, as with `@first`, and as chaos-init
+counts it. It is not per-thread. Multiple threads calling `pthread_create` concurrently increment
 the same counter atomically; the N-th global call (not the N-th call on any
 particular thread) triggers failure.
 
