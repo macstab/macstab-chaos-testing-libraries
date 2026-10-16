@@ -189,7 +189,17 @@ int main(int argc, char **argv)
             _exit(0);
         }
         (void)waitpid(child, NULL, 0);
-        pause_ms(800L);
+        /* The grandchild ends after 200 ms; chaos-init reaps it soon after, on a
+         * busy machine not always within a fixed time: up to 5 s. */
+        {
+            int tries = 0;
+
+            pause_ms(200L);
+            while (zombies() != 0 && tries++ < 50)
+            {
+                pause_ms(100L);
+            }
+        }
         (void)printf("zombies=%d\n", zombies());
         return zombies() == 0 ? 0 : 1;
     }
