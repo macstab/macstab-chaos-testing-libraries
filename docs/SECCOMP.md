@@ -127,7 +127,7 @@ the load, never a passing `state=ok` first.
 | Signals | A call held back by LATENCY waits out its delay when signals arrive (Go signals its threads constantly). From 5.19 the waiting call cannot be interrupted except by a fatal signal; before 5.19 the kernel restarts an interrupted call as a new notification, which keeps the delay's original due time and is not counted again. Handlers of signals that arrive meanwhile run after the delay (5.19+). |
 | UNIX sockets | The peer of a UNIX socket is not in `/proc`. Rules on a UNIX socket's peer (send on a connected client) do not match. |
 | Cost | One notified call takes about 2.5 µs instead of 0.2 µs (Docker Desktop, kernel 6.10). Only the requested libraries' system calls pay it. |
-| Capacity | 128 processes with counts at once (the state of an ended one is dropped first, the oldest last), 1024 delayed calls (beyond that a call runs without its delay), 1024 descriptors scanned per poll call. |
+| Capacity | 128 processes with counts at once (the state of an ended one is dropped first, then that of the one unused longest), 1024 delayed calls (beyond that a call runs without its delay), 1024 descriptors scanned per poll call. |
 
 ## 8. Tests
 

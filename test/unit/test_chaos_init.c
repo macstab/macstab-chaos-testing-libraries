@@ -646,12 +646,29 @@ static void test_tracee_table(void)
     g_fake_tgid[150] = 150;
     g_fake_start[150] = 1U;
     assert(chaos_init_tracee_of(150) >= 0);
-    /* ...and when none ended, the oldest (process 10) gives way. */
+    /* ...and when none ended, the one unused longest gives way: process 20, not
+     * process 10, which came first but has just been used again. */
+    slot = chaos_init_tracee_slot(&g_test_lib, chaos_init_tracee_of(10), 0U);
+    chaos_hit_record(slot);
     g_fake_tgid[151] = 151;
     g_fake_start[151] = 1U;
     assert(chaos_init_tracee_of(151) >= 0);
-    g_fake_start[10] = 6U;
-    assert(chaos_init_tracee_of(10) >= 0); /* back, as a new entry */
+    assert(chaos_init_tracee_slot(&g_test_lib, chaos_init_tracee_of(10), 0U)->count == 2U);
+    {
+        char path[64];
+
+        (void)snprintf(
+            path,
+            sizeof(path),
+            "/tmp/.chaos-inittest.hits.%ld",
+            g_test_rules_file[chaos_init_tracee_of(10)]
+        );
+        assert(unlink(path) == 0);
+    }
+    for (index = 0; index < (int)CHAOS_INIT_MAX_TRACEES; ++index)
+    {
+        assert(g_chaos_init_tracees[index].tgid != 20);
+    }
 }
 
 int main(void)

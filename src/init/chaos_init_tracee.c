@@ -25,7 +25,7 @@ typedef struct chaos_init_tracee
 {
     pid_t tgid; /**< 0 when free. */
     uint64_t start;
-    uint64_t age; /**< Order of allocation, to drop the oldest when nothing ended. */
+    uint64_t age; /**< Order of last use, to drop the longest unused when nothing ended. */
 } chaos_init_tracee_t;
 
 static chaos_init_tracee_t g_chaos_init_tracees[CHAOS_INIT_MAX_TRACEES];
@@ -226,6 +226,7 @@ int chaos_init_tracee_of(pid_t tid)
 
         if (entry->tgid == tgid && entry->start == start)
         {
+            g_chaos_init_tracees[index].age = ++g_chaos_init_age;
             return (int)index;
         }
         if (entry->tgid == tgid)
