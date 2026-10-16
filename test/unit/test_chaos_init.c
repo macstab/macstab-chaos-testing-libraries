@@ -253,17 +253,37 @@ static void test_status_text(void)
 
     assert(
         chaos_init_format_status(
-            text, sizeof(text), CHAOS_INIT_LIB_PROCESS | CHAOS_INIT_LIB_IO, NULL, 1L
+            text, sizeof(text), CHAOS_INIT_LIB_PROCESS | CHAOS_INIT_LIB_IO, NULL, 1L, 0
         ) > 0U
     );
     assert(strcmp(text, "state=active\nlibs=io,process\npid=1\n") == 0);
     assert(
         chaos_init_format_status(
-            text, sizeof(text), CHAOS_INIT_LIB_NET, "kernel older than 5.5", 7L
+            text, sizeof(text), CHAOS_INIT_LIB_NET, "kernel older than 5.5", 7L, 1
         ) > 0U
     );
     assert(strcmp(text, "state=unsupported\nreason=kernel older than 5.5\nlibs=net\npid=7\n") == 0);
-    assert(chaos_init_format_status(tiny, sizeof(tiny), CHAOS_INIT_LIB_NET, NULL, 1L) == 0U);
+    assert(chaos_init_format_status(tiny, sizeof(tiny), CHAOS_INIT_LIB_NET, NULL, 1L, 0) == 0U);
+    /* Multipath TCP turned off for the application: said when active. */
+    assert(chaos_init_format_status(text, sizeof(text), CHAOS_INIT_LIB_NET, NULL, 1L, 1) > 0U);
+    assert(strcmp(text, "state=active\nlibs=net\npid=1\nmptcp=off\n") == 0);
+
+    /* GODEBUG with MPTCP off: set, added to what is there, never over the user's. */
+    {
+        char value[32];
+
+        assert(chaos_init_godebug_mptcp_off(NULL, value, sizeof(value)) == 1);
+        assert(strcmp(value, "multipathtcp=0") == 0);
+        assert(chaos_init_godebug_mptcp_off("", value, sizeof(value)) == 1);
+        assert(strcmp(value, "multipathtcp=0") == 0);
+        assert(chaos_init_godebug_mptcp_off("http2debug=1", value, sizeof(value)) == 1);
+        assert(strcmp(value, "http2debug=1,multipathtcp=0") == 0);
+        assert(chaos_init_godebug_mptcp_off("multipathtcp=1", value, sizeof(value)) == 0);
+        assert(chaos_init_godebug_mptcp_off("a=1,multipathtcp=2", value, sizeof(value)) == 0);
+        assert(chaos_init_godebug_mptcp_off("xmultipathtcp=1", value, sizeof(value)) == 1);
+        assert(strcmp(value, "xmultipathtcp=1,multipathtcp=0") == 0);
+        assert(chaos_init_godebug_mptcp_off("a-setting-far-too-long-for-it", value, 8U) == 0);
+    }
 }
 
 static void test_find_command(void)

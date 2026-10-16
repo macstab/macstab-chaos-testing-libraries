@@ -108,10 +108,24 @@ const char *chaos_init_unsupported_reason(int error);
 
 /**
  * @brief Formats the status file: `state=active` when @p reason is NULL, else
- *        `state=unsupported` with the reason.
+ *        `state=unsupported` with the reason; `mptcp=off` when @p mptcp_off.
  * @return Bytes written (NUL excluded), 0 if @p size is too small.
  */
-size_t
-chaos_init_format_status(char *buffer, size_t size, unsigned libs, const char *reason, long pid);
+size_t chaos_init_format_status(
+    char *buffer, size_t size, unsigned libs, const char *reason, long pid, int mptcp_off
+);
+
+/**
+ * @brief The application's GODEBUG with Multipath TCP off (`multipathtcp=0`), from
+ *        its @p current value (NULL when unset).
+ *
+ * @details For hosts whose kernel offers MPTCP without letting its sockets be
+ * looked up (no mptcp_diag): Go listens with MPTCP there by default from 1.24, and
+ * net rules on such sockets could not match. A multipathtcp setting of the user's
+ * own is kept.
+ *
+ * @return 1 with the new value in @p out; 0 to leave GODEBUG as it is.
+ */
+int chaos_init_godebug_mptcp_off(const char *current, char *out, size_t size);
 
 #endif

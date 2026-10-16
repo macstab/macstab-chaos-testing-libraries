@@ -43,6 +43,7 @@ static int chaos_init_net_supported(const struct chaos_net_rule *rule);
 #include <linux/sock_diag.h>
 #include <sys/random.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/un.h>
@@ -89,6 +90,15 @@ static const chaos_init_net_protocol_t g_chaos_init_net_protocols[] = {
     {"MPTCP", SOCK_STREAM, AF_INET, NULL, IPPROTO_MPTCP},
     {"MPTCPv6", SOCK_STREAM, AF_INET6, NULL, IPPROTO_MPTCP},
 };
+
+/** @brief The socket that tells whether MPTCP sockets can be looked up; unit tests
+ *         replace it, and the protocol sock_diag is asked for. */
+#ifndef CHAOS_INIT_NET_MPTCP_SOCKET
+#define CHAOS_INIT_NET_MPTCP_SOCKET() socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_MPTCP)
+#endif
+#ifndef CHAOS_INIT_NET_MPTCP_DIAG
+#define CHAOS_INIT_NET_MPTCP_DIAG IPPROTO_MPTCP
+#endif
 
 /** @brief The netlink socket sock_diag is asked through; unit tests make it fail. */
 #ifndef CHAOS_INIT_NET_DIAG_SOCKET
@@ -1157,4 +1167,30 @@ void chaos_init_net_commit(const chaos_init_call_t *call, const chaos_init_verdi
         g_chaos_init_net_tid = call->tid;
         chaos_init_net_clear_ready(call);
     }
+}
+
+int chaos_init_net_mptcp_unresolvable(void)
+{
+    const int probe = CHAOS_INIT_NET_MPTCP_SOCKET();
+    struct sockaddr_in loopback;
+    struct sockaddr_storage found;
+    socklen_t found_length = 0;
+    struct stat info;
+    int unresolvable;
+
+    if (probe < 0)
+    {
+        return 0; /* no MPTCP: Go uses plain TCP */
+    }
+    memset(&loopback, 0, sizeof(loopback));
+    loopback.sin_family = AF_INET;
+    loopback.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    unresolvable =
+        bind(probe, (struct sockaddr *)&loopback, sizeof(loopback)) != 0 || listen(probe, 1) != 0 ||
+        fstat(probe, &info) != 0 ||
+        !chaos_init_net_diag_name(
+            AF_INET, CHAOS_INIT_NET_MPTCP_DIAG, (unsigned long)info.st_ino, 0, &found, &found_length
+        );
+    (void)close(probe);
+    return unresolvable;
 }

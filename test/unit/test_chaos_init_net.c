@@ -61,9 +61,26 @@ static int g_diag_socket_fails = 0;
 static int test_diag_socket(void);
 #define CHAOS_INIT_NET_DIAG_SOCKET() test_diag_socket()
 
+/* The MPTCP probe: absent, or a TCP socket standing in, asked under a protocol. */
+static int g_mptcp_absent = 0;
+static int g_test_mptcp_diag = 262;
+static int test_mptcp_socket(void);
+#define CHAOS_INIT_NET_MPTCP_SOCKET() test_mptcp_socket()
+#define CHAOS_INIT_NET_MPTCP_DIAG g_test_mptcp_diag
+
 #include "../../src/init/chaos_init_net.c"
 #include "../../src/init/chaos_init_proc.c"
 #include "../../src/init/chaos_init_tracee.c"
+
+static int test_mptcp_socket(void)
+{
+    if (g_mptcp_absent)
+    {
+        errno = EPROTONOSUPPORT;
+        return -1;
+    }
+    return socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+}
 
 static int test_diag_socket(void)
 {
@@ -221,6 +238,16 @@ static void test_sock_diag(int listener, int client, const struct sockaddr_in *s
             chaos_init_net_diag_parse(&answer, sizeof(answer), 7UL, 0, &found, &found_length) == 0
         );
     }
+
+    /* Whether MPTCP sockets can be looked up: without MPTCP there are none to look
+     * up; with it, sock_diag must find a listener of its own. */
+    g_mptcp_absent = 1;
+    assert(!chaos_init_net_mptcp_unresolvable());
+    g_mptcp_absent = 0;
+    assert(chaos_init_net_mptcp_unresolvable()); /* TCP stand-in: no MPTCP socket of it */
+    g_test_mptcp_diag = IPPROTO_TCP;
+    assert(!chaos_init_net_mptcp_unresolvable()); /* found when asked as what it is */
+    g_test_mptcp_diag = 262;
 
     /* An MPTCP socket is a stream socket; its addresses are sock_diag's: this one is
      * TCP, so sock_diag knows no MPTCP socket of its inode, and it reads as unbound. */

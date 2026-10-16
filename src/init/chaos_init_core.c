@@ -354,8 +354,31 @@ const char *chaos_init_unsupported_reason(int error)
     }
 }
 
-size_t
-chaos_init_format_status(char *buffer, size_t size, unsigned libs, const char *reason, long pid)
+int chaos_init_godebug_mptcp_off(const char *current, char *out, size_t size)
+{
+    const char *setting = current;
+
+    /* A multipathtcp setting of the user's own, first or after a comma, stays. */
+    while (setting != NULL && (setting = strstr(setting, "multipathtcp=")) != NULL)
+    {
+        if (setting == current || setting[-1] == ',')
+        {
+            return 0;
+        }
+        ++setting;
+    }
+    return (size_t)snprintf(
+               out,
+               size,
+               "%s%smultipathtcp=0",
+               current != NULL ? current : "",
+               current != NULL && *current != '\0' ? "," : ""
+           ) < size;
+}
+
+size_t chaos_init_format_status(
+    char *buffer, size_t size, unsigned libs, const char *reason, long pid, int mptcp_off
+)
 {
     char names[64] = "";
     size_t index;
@@ -374,7 +397,14 @@ chaos_init_format_status(char *buffer, size_t size, unsigned libs, const char *r
     }
     if (reason == NULL)
     {
-        written = snprintf(buffer, size, "state=active\nlibs=%s\npid=%ld\n", names, pid);
+        written = snprintf(
+            buffer,
+            size,
+            "state=active\nlibs=%s\npid=%ld\n%s",
+            names,
+            pid,
+            mptcp_off ? "mptcp=off\n" : ""
+        );
     }
     else
     {

@@ -7,7 +7,8 @@
  * it, and a plain TCP client of the MPTCP listener and its accepted connection
  * (which the kernel may hand out as a TCP socket). Prints one line per socket
  * and query, and exits 1 when chaos-init's answer differs, 77 when the kernel
- * has no MPTCP.
+ * has no MPTCP. Where MPTCP sockets cannot be looked up at all (no mptcp_diag),
+ * chaos-init must say so, and only the TCP sockets have to match.
  */
 
 #include "../../src/init/chaos_init_net.c"
@@ -19,6 +20,10 @@
 #include <sys/stat.h>
 
 static int g_failures = 0;
+
+/* Where MPTCP sockets cannot be looked up, chaos-init turns MPTCP off for Go: their
+ * lookups failing is then expected, and only that chaos-init says so is checked. */
+static int g_unresolvable = 0;
 
 /** @brief The port of a sockaddr, or -1 for another family. */
 static int port_of(const struct sockaddr_storage *address)
@@ -71,7 +76,7 @@ static void check(const char *what, int fd)
             seen_rc,
             seen_rc == 0 ? port_of(&seen) : 0
         );
-        g_failures += same ? 0 : 1;
+        g_failures += same || (g_unresolvable && strncmp(protocol, "MPTCP", 5U) == 0) ? 0 : 1;
     }
 }
 
@@ -164,6 +169,12 @@ int main(void)
             (void)close(link);
         }
     }
+    g_unresolvable = chaos_init_net_mptcp_unresolvable();
+    (void)printf(
+        "%s\n",
+        g_unresolvable ? "MPTCP sockets cannot be looked up here: chaos-init turns MPTCP off for Go"
+                       : "MPTCP sockets can be looked up here"
+    );
     check("MPTCP listener", listener);
     check("MPTCP client", client);
     check("MPTCP accepted", server);

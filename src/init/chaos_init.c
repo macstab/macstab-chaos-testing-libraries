@@ -181,7 +181,7 @@ static int chaos_init_try_install(const struct sock_fprog *program)
  * @return 0 when the child may execute the command, -1 when it must not (a filter
  *         is installed that nobody would answer).
  */
-static int chaos_init_install_and_hand_over(unsigned libs, int handover)
+static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *installed)
 {
     struct sock_filter filter[CHAOS_INIT_MAX_FILTER];
     struct sock_fprog program;
@@ -241,6 +241,7 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover)
     }
     /* Not sent: the parent would wait for it while this child waits for the go
      * signal. The child gives up, which the parent sees as the end of the socket. */
+    *installed = listener >= 0;
     if (CHAOS_INIT_SENDMSG(handover, &message, CHAOS_INIT_HANDOVER_FLAGS) != (ssize_t)sizeof(error))
     {
         return -1;
@@ -316,11 +317,11 @@ static int chaos_init_receive_listener(int socket, int *error)
 }
 
 /** @brief Writes the status file, creating /tmp first (images built FROM scratch lack it). */
-static void chaos_init_write_status(unsigned libs, const char *reason)
+static void chaos_init_write_status(unsigned libs, const char *reason, int mptcp_off)
 {
     char text[CHAOS_STATUS_BUFFER_SIZE];
     const size_t length =
-        chaos_init_format_status(text, sizeof(text), libs, reason, (long)getpid());
+        chaos_init_format_status(text, sizeof(text), libs, reason, (long)getpid(), mptcp_off);
 
     if (mkdir("/tmp", 01777) == 0)
     {
@@ -554,6 +555,7 @@ int main(int argc, char **argv)
     int child_status = 0;
     int serving_the_rest = 0;
     int found;
+    int mptcp_off;
     static char command_path[4096];
     pid_t child;
 
@@ -586,6 +588,9 @@ int main(int argc, char **argv)
     found = chaos_init_find_command(
         argv[options.command], getenv("PATH"), command_path, sizeof(command_path)
     );
+    /* Where the kernel offers Multipath TCP but cannot say where its sockets are, Go
+     * (from 1.24) is told to listen with plain TCP, so net rules can match. */
+    mptcp_off = (options.libs & CHAOS_INIT_LIB_NET) != 0U && chaos_init_net_mptcp_unresolvable();
     child = fork();
     if (child < 0)
     {
@@ -596,6 +601,7 @@ int main(int argc, char **argv)
     {
         sigset_t go;
         int received;
+        int installed = 0;
 
         (void)close(pair[0]);
         (void)sigemptyset(&go);
@@ -604,10 +610,19 @@ int main(int argc, char **argv)
          * waited for, so it cannot be lost if it comes early. */
         /* Sent on pair[1] as it is: a fixed number would fail under a low file limit
          * and could clobber a descriptor the application inherits. */
-        if (chaos_init_install_and_hand_over(options.libs, pair[1]) != 0 ||
+        if (chaos_init_install_and_hand_over(options.libs, pair[1], &installed) != 0 ||
             sigwait(&go, &received) != 0 || sigprocmask(SIG_SETMASK, &original, NULL) != 0)
         {
             _exit(CHAOS_INIT_EXIT_HANDOVER);
+        }
+        if (mptcp_off && installed)
+        {
+            static char godebug[1024];
+
+            if (chaos_init_godebug_mptcp_off(getenv("GODEBUG"), godebug, sizeof(godebug)))
+            {
+                (void)setenv("GODEBUG", godebug, 1);
+            }
         }
         if (found > 0)
         {
@@ -661,7 +676,9 @@ int main(int argc, char **argv)
         chaos_init_process_start(child);
     }
     chaos_init_write_status(
-        options.libs, listener >= 0 ? NULL : chaos_init_unsupported_reason(error)
+        options.libs,
+        listener >= 0 ? NULL : chaos_init_unsupported_reason(error),
+        mptcp_off && listener >= 0
     );
     (void)kill(child, CHAOS_INIT_GO_SIGNAL);
 
