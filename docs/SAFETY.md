@@ -460,6 +460,10 @@ to the target process.
 **Default location:** `/tmp/.chaos-*.conf`. `/tmp` is world-writable on Linux
 (sticky bit, mode `1777`). Any user on the system can create these files.
 
+The status and hits files are created mode 0666, so that a process of another
+user (an application that dropped root) can still update them; any user can
+also overwrite them with false reports.
+
 **Consequence:** In a multi-tenant environment, any user can:
 1. Create `/tmp/.chaos-io.conf` with `*:write:EIO:1.0`.
 2. Any process running with `LD_PRELOAD=libchaos-io.so` on that machine

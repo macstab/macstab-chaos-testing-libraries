@@ -455,10 +455,12 @@ Known limits, kept on purpose:
   counts its hit against whatever rule then sits at that index.
 - `@size` compares the byte count the call asked for, also for effects
   applied after the call (CORRUPT, TRICKLE, DUP).
-- In a sticky `/tmp`, a process may not replace a status file another user
-  created; the Java side then sees a pid that is not its own and skips the
-  check rather than reporting a stale result.
 - Writes use the same raw-syscall rename as the status file.
+- Status and hits files are created readable and writable by everyone (0666).
+  In a sticky `/tmp` another user may not rename over a file it does not own
+  (an image that starts as root and runs the application as another user);
+  the write then falls back to rewriting the file in place, which a reader may
+  briefly see short.
 
 ## FD Path Resolution
 

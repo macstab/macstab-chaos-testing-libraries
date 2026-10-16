@@ -12,7 +12,8 @@
 # The status is written by the library's constructor, so the program needs to call
 # nothing. Each report must carry the pid of the program that loaded the rules.
 # On glibc, a rule file reloaded after the program switched to de_DE.UTF-8 must
-# read the same (locale_probe).
+# read the same (locale_probe), and a user other than the status file's owner must
+# still update it.
 #
 # Usage:   test_status.sh [linux/amd64|linux/arm64]
 # Env:     CHAOS_STATUS_DOCKER_PLATFORM  platform override
@@ -134,6 +135,27 @@ for lib in io net dns time memory process; do
         echo "ok   $LIBC $lib: no rule file, no status file"
     fi
 done
+
+# An image that starts as root and runs the application as another user: the
+# other user cannot rename over the status file root wrote in sticky /tmp, so it rewrites
+# it in place (glibc image: setpriv).
+if [ "$LIBC" = glibc ] && command -v setpriv >/dev/null 2>&1; then
+    so=/out/libchaos-io-$LIBC-'"$ARCH"'.so
+    echo "/data:write:EIO:1.0" > /tmp/.chaos-io.conf
+    load_rules "$so" >/dev/null
+    printf "bogus-rule\n" > /tmp/.chaos-io.conf.new
+    mv -f /tmp/.chaos-io.conf.new /tmp/.chaos-io.conf
+    setpriv --reuid=1000 --regid=1000 --clear-groups env LD_PRELOAD="$so" /bin/true
+    state=$(head -1 /tmp/.chaos-io.status)
+    owner=$(stat -c %u /tmp/.chaos-io.status)
+    if [ "$state" = state=error ] && [ "$owner" = 0 ]; then
+        echo "ok   $LIBC io: another user updates the status file root wrote"
+    else
+        echo "FAIL $LIBC io: a load by another user left $state (owner $owner)" >&2
+        failures=$((failures + 1))
+    fi
+    rm -f /tmp/.chaos-io.conf /tmp/.chaos-io.status /tmp/.chaos-staging-*
+fi
 
 # A program that switches to a locale with a decimal comma (a JVM does, from LANG)
 # must still get "1.0" read as a probability (glibc; musl has no such locales).

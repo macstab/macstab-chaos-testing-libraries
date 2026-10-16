@@ -165,6 +165,9 @@ static inline size_t chaos_status_format(
     (int)syscall(                                                                                  \
         SYS_openat, AT_FDCWD, (path), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644   \
     )
+#define CHAOS_STATUS_OPEN_EXISTING(path)                                                           \
+    (int)syscall(SYS_openat, AT_FDCWD, (path), O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC)
+#define CHAOS_STATUS_SHARE(fd) syscall(SYS_fchmod, (fd), 0666)
 #define CHAOS_STATUS_WRITE(fd, data, length) syscall(SYS_write, (fd), (data), (length))
 #define CHAOS_STATUS_CLOSE(fd) syscall(SYS_close, (fd))
 #define CHAOS_STATUS_UNLINK(path) syscall(SYS_unlinkat, AT_FDCWD, (path), 0)
@@ -177,6 +180,8 @@ static inline size_t chaos_status_format(
 #else
 #define CHAOS_STATUS_OPEN(path)                                                                    \
     open((path), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644)
+#define CHAOS_STATUS_OPEN_EXISTING(path) open((path), O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC)
+#define CHAOS_STATUS_SHARE(fd) fchmod((fd), 0666)
 #define CHAOS_STATUS_WRITE(fd, data, length) write((fd), (data), (length))
 #define CHAOS_STATUS_CLOSE(fd) close(fd)
 #define CHAOS_STATUS_UNLINK(path) unlink(path)
@@ -221,15 +226,44 @@ static inline uint64_t chaos_config_content_hash(const char *data, size_t size)
     return hash;
 }
 
+/** @brief Writes @p length bytes of @p data to @p fd; 1 when all were written. */
+static inline int chaos_status_write_all(int fd, const char *data, size_t length)
+{
+    size_t written = 0U;
+
+    while (written < length)
+    {
+        const long rc = (long)CHAOS_STATUS_WRITE(fd, data + written, length - written);
+
+        if (rc <= 0)
+        {
+            if (rc < 0 && errno == EINTR)
+            {
+                continue;
+            }
+            return 0;
+        }
+        written += (size_t)rc;
+    }
+    return 1;
+}
+
 /**
  * @brief Replaces the file at @p path with @p length bytes of @p data.
  *
  * @details Writes `<dir>/.chaos-staging-<pid>-<name>` and renames it over @p path,
  * so a reader sees the old file or the new one, never a mix. The staging name
  * starts differently from every status and hits file, so nothing that lists
- * those (`.chaos-net.hits.*`) picks up a half-written one. Best effort: on any
- * failure the staging file is removed and @p path is left as it was. errno is
- * left untouched.
+ * those (`.chaos-net.hits.*`) picks up a half-written one.
+ *
+ * Files are created readable and writable by everyone (0666): in a shared, sticky
+ * /tmp another user may not rename over a file it does not own, as when an image
+ * starts as root and the application runs as another user. Such a refused rename
+ * falls back to rewriting @p path in place; a reader may then briefly see it
+ * short. It is opened without O_CREAT, which fs.protected_regular would refuse.
+ *
+ * Best effort: on any other failure the staging file is removed and @p path is
+ * left as it was. errno is left untouched.
  */
 static inline void chaos_status_replace_file(const char *path, const char *data, size_t length)
 {
@@ -238,7 +272,7 @@ static inline void chaos_status_replace_file(const char *path, const char *data,
     const char *name = slash == NULL ? path : slash + 1;
     const int dir_length = (int)(name - path);
     char staging[160];
-    size_t written = 0U;
+    int complete;
     int fd;
 
     if (name[0] == '.')
@@ -270,25 +304,25 @@ static inline void chaos_status_replace_file(const char *path, const char *data,
         errno = saved_errno;
         return;
     }
-    while (written < length)
-    {
-        const long rc = (long)CHAOS_STATUS_WRITE(fd, data + written, length - written);
-
-        if (rc <= 0)
-        {
-            if (rc < 0 && errno == EINTR)
-            {
-                continue;
-            }
-            break;
-        }
-        written += (size_t)rc;
-    }
+    (void)CHAOS_STATUS_SHARE(fd);
+    complete = chaos_status_write_all(fd, data, length);
     (void)CHAOS_STATUS_CLOSE(fd);
-    if (written != length || CHAOS_STATUS_RENAME(staging, path) != 0)
+    if (complete && CHAOS_STATUS_RENAME(staging, path) == 0)
     {
-        (void)CHAOS_STATUS_UNLINK(staging);
+        errno = saved_errno;
+        return;
     }
+    if (complete && (errno == EPERM || errno == EACCES))
+    {
+        /* Another user's file in a sticky directory: rewrite it in place. */
+        fd = CHAOS_STATUS_OPEN_EXISTING(path);
+        if (fd >= 0)
+        {
+            (void)chaos_status_write_all(fd, data, length);
+            (void)CHAOS_STATUS_CLOSE(fd);
+        }
+    }
+    (void)CHAOS_STATUS_UNLINK(staging);
     errno = saved_errno;
 }
 
