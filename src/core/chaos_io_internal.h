@@ -704,18 +704,26 @@ static inline uint32_t chaos_io_prng_next_u32(void)
  * @{
  */
 
+/** @brief Name prefix of every libchaos library's control files (rules, status, hits). */
+#define CHAOS_IO_CONTROL_PREFIX "/tmp/.chaos-"
+
 /**
- * @brief Returns non-zero when a path is exactly the active config file.
+ * @brief Returns non-zero when a path is a control file of any libchaos library.
  *
- * @details The preload library must never inject faults into its own control plane, so
- * wrappers and cache code use this as an early exclusion check.
+ * @details No library may be faulted through its control plane: the rule, status and
+ * hits files of all of them (`/tmp/.chaos-<lib>.conf`, `.status`, `.hits.<pid>`) and
+ * the tools that write them, such as a shell redirecting into a rule file under the
+ * same preload, are never injected into.
  *
  * @param[in] path  Null-terminated path string.  May be NULL.
- * @return Non-zero when `path` equals `CHAOS_IO_CONFIG_PATH`.
+ * @return Non-zero when `path` is `CHAOS_IO_CONFIG_PATH` or starts with
+ *   `CHAOS_IO_CONTROL_PREFIX`.
  */
-static inline int chaos_io_is_config_path(const char *path)
+static inline int chaos_io_is_control_path(const char *path)
 {
-    return path != NULL && strcmp(path, CHAOS_IO_CONFIG_PATH) == 0;
+    return path != NULL &&
+           (strcmp(path, CHAOS_IO_CONFIG_PATH) == 0 ||
+            strncmp(path, CHAOS_IO_CONTROL_PREFIX, sizeof(CHAOS_IO_CONTROL_PREFIX) - 1U) == 0);
 }
 
 /**
@@ -758,7 +766,7 @@ static inline int chaos_io_has_reserved_prefix(const char *path, const char *pre
  *
  * Excluded paths:
  * - NULL or empty string (unresolvable or unknown)
- * - The config file path exactly (`/tmp/.chaos-io.conf`)
+ * - The control files of every libchaos library (`/tmp/.chaos-*`)
  * - Anything under `/proc`, `/sys`, or `/dev`
  *
  * The `/proc` exclusion is essential: resolving fd paths via
@@ -776,7 +784,7 @@ static inline int chaos_io_is_excluded_path(const char *path)
     {
         return 1;
     }
-    if (chaos_io_is_config_path(path))
+    if (chaos_io_is_control_path(path))
     {
         return 1;
     }

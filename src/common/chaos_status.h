@@ -175,6 +175,26 @@ static inline size_t chaos_status_format(
 #define CHAOS_STATUS_RENAME(from, to) rename((from), (to))
 #endif
 
+/*
+ * Rule files are read with raw system calls too. Through libc, another library
+ * preloaded into the same process (libchaos-io) would see one library reading its
+ * rules, and its rules could fail or delay that read. O_CLOEXEC: a descriptor open
+ * while another thread execs must not leak into the new program. Unit tests
+ * replace these with stubs.
+ */
+#ifndef CHAOS_CONFIG_FILE_OPEN
+#ifdef __linux__
+#define CHAOS_CONFIG_FILE_OPEN(path)                                                               \
+    (int)syscall(SYS_openat, AT_FDCWD, (path), O_RDONLY | O_CLOEXEC)
+#define CHAOS_CONFIG_FILE_READ(fd, buffer, size) (ssize_t) syscall(SYS_read, (fd), (buffer), (size))
+#define CHAOS_CONFIG_FILE_CLOSE(fd) (void)syscall(SYS_close, (fd))
+#else
+#define CHAOS_CONFIG_FILE_OPEN(path) open((path), O_RDONLY | O_CLOEXEC)
+#define CHAOS_CONFIG_FILE_READ(fd, buffer, size) read((fd), (buffer), (size))
+#define CHAOS_CONFIG_FILE_CLOSE(fd) (void)close(fd)
+#endif
+#endif
+
 /**
  * @brief Replaces the file at @p path with @p length bytes of @p data.
  *

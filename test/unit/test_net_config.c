@@ -37,6 +37,11 @@
  * - LD_PRELOAD wrapper call paths.
  */
 
+/* The rule file is read through these stubs (defined below) instead of raw system calls. */
+#define CHAOS_CONFIG_FILE_OPEN(path) open((path), O_RDONLY)
+#define CHAOS_CONFIG_FILE_READ(fd, buffer, size) read((fd), (buffer), (size))
+#define CHAOS_CONFIG_FILE_CLOSE(fd) (void)close(fd)
+
 #include "../support/test_net_support.h"
 
 #include <errno.h>

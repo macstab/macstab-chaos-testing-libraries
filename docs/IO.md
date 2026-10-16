@@ -282,8 +282,9 @@ Internal implementation detail:
   The process-wide mapping from file descriptor number to resolved path string,
   mapped lazily on first use.
 - Excluded path
-  A path the library will never inject into: the config file, `/proc`, `/sys`,
-  `/dev`, or an empty/invalid path.
+  A path the library will never inject into: the control files of every libchaos
+  library (`/tmp/.chaos-*`: rules, status, hits), `/proc`, `/sys`, `/dev`, or an
+  empty/invalid path.
 - Torn write
   A successful short write. This is not an error and not buffer corruption.
 - Corrupt read

@@ -874,7 +874,7 @@ static int chaos_process_config_read_file(size_t *size_out, uint64_t expected_st
     previous = chaos_process_enter_internal();
     do
     {
-        fd = open(CHAOS_PROCESS_CONFIG_PATH, O_RDONLY);
+        fd = CHAOS_CONFIG_FILE_OPEN(CHAOS_PROCESS_CONFIG_PATH);
     } while (fd < 0 && errno == EINTR);
     if (fd < 0)
     {
@@ -888,8 +888,9 @@ static int chaos_process_config_read_file(size_t *size_out, uint64_t expected_st
 
     for (;;)
     {
-        ssize_t rc =
-            read(fd, g_chaos_process_config_buffer + total, CHAOS_PROCESS_MAX_CONFIG_BYTES - total);
+        ssize_t rc = CHAOS_CONFIG_FILE_READ(
+            fd, g_chaos_process_config_buffer + total, CHAOS_PROCESS_MAX_CONFIG_BYTES - total
+        );
         if (rc < 0 && errno == EINTR)
         {
             continue;
@@ -898,7 +899,7 @@ static int chaos_process_config_read_file(size_t *size_out, uint64_t expected_st
         {
             const int read_error = errno;
 
-            (void)close(fd);
+            CHAOS_CONFIG_FILE_CLOSE(fd);
             chaos_process_leave_internal(previous);
             return read_error == EISDIR ? -3 : -1;
         }
@@ -909,7 +910,7 @@ static int chaos_process_config_read_file(size_t *size_out, uint64_t expected_st
         total += (size_t)rc;
         if (total == CHAOS_PROCESS_MAX_CONFIG_BYTES)
         {
-            (void)close(fd);
+            CHAOS_CONFIG_FILE_CLOSE(fd);
             chaos_process_leave_internal(previous);
             return -2;
         }
@@ -921,12 +922,12 @@ static int chaos_process_config_read_file(size_t *size_out, uint64_t expected_st
      * reloads the finished file. */
     if (fstat(fd, &st) != 0 || chaos_process_config_hash_mtime(&st) != expected_stamp)
     {
-        (void)close(fd);
+        CHAOS_CONFIG_FILE_CLOSE(fd);
         chaos_process_leave_internal(previous);
         return -1;
     }
 
-    (void)close(fd);
+    CHAOS_CONFIG_FILE_CLOSE(fd);
     chaos_process_leave_internal(previous);
     g_chaos_process_config_buffer[total] = '\0';
     *size_out = total;

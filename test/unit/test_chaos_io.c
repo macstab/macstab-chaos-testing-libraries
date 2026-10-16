@@ -342,7 +342,15 @@ static void test_fsops_helpers_and_wrappers(void)
     assert(chaos_io_match_loaded_path_rule(CHAOS_IO_OP_UNLINK, NULL, &rule) == 0);
     assert(chaos_io_match_loaded_path_rule(CHAOS_IO_OP_UNLINK, "/tmp/unlink.bin", NULL) == 0);
     assert(chaos_io_match_loaded_path_rule(CHAOS_IO_OP_UNLINK, "/proc/self/maps", &rule) == 0);
+    /* Every library's control files, not only io's own rule file. */
+    assert(chaos_io_match_loaded_path_rule(CHAOS_IO_OP_UNLINK, "/tmp/.chaos-io.conf", &rule) == 0);
+    assert(chaos_io_match_loaded_path_rule(CHAOS_IO_OP_OPEN, "/tmp/.chaos-net.conf", &rule) == 0);
+    assert(
+        chaos_io_match_loaded_path_rule(CHAOS_IO_OP_WRITE, "/tmp/.chaos-dns.hits.42", &rule) == 0
+    );
     assert(g_config_match_loaded_calls == 0);
+    assert(chaos_io_is_excluded_path("/tmp/.chaos") == 0);
+    assert(chaos_io_is_excluded_path("/tmp/.chaosx.conf") == 0);
 
     g_config_match_loaded_result = 1;
     g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;

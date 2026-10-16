@@ -759,7 +759,7 @@ static int chaos_net_config_read_file(size_t *size_out, uint64_t expected_stamp)
     previous = chaos_net_enter_internal();
     do
     {
-        fd = open(CHAOS_NET_CONFIG_PATH, O_RDONLY);
+        fd = CHAOS_CONFIG_FILE_OPEN(CHAOS_NET_CONFIG_PATH);
     } while (fd < 0 && errno == EINTR);
     if (fd < 0)
     {
@@ -773,8 +773,9 @@ static int chaos_net_config_read_file(size_t *size_out, uint64_t expected_stamp)
 
     for (;;)
     {
-        ssize_t rc =
-            read(fd, g_chaos_net_config_buffer + total, CHAOS_NET_MAX_CONFIG_BYTES - total);
+        ssize_t rc = CHAOS_CONFIG_FILE_READ(
+            fd, g_chaos_net_config_buffer + total, CHAOS_NET_MAX_CONFIG_BYTES - total
+        );
         if (rc < 0 && errno == EINTR)
         {
             continue;
@@ -783,7 +784,7 @@ static int chaos_net_config_read_file(size_t *size_out, uint64_t expected_stamp)
         {
             const int read_error = errno;
 
-            (void)close(fd);
+            CHAOS_CONFIG_FILE_CLOSE(fd);
             chaos_net_leave_internal(previous);
             return read_error == EISDIR ? -3 : -1;
         }
@@ -795,7 +796,7 @@ static int chaos_net_config_read_file(size_t *size_out, uint64_t expected_stamp)
         if (total == CHAOS_NET_MAX_CONFIG_BYTES)
         {
             /* File is at or over the size limit; treat as an error. */
-            (void)close(fd);
+            CHAOS_CONFIG_FILE_CLOSE(fd);
             chaos_net_leave_internal(previous);
             return -2;
         }
@@ -807,12 +808,12 @@ static int chaos_net_config_read_file(size_t *size_out, uint64_t expected_stamp)
      * reloads the finished file. */
     if (fstat(fd, &st) != 0 || chaos_net_config_hash_mtime(&st) != expected_stamp)
     {
-        (void)close(fd);
+        CHAOS_CONFIG_FILE_CLOSE(fd);
         chaos_net_leave_internal(previous);
         return -1;
     }
 
-    (void)close(fd);
+    CHAOS_CONFIG_FILE_CLOSE(fd);
     chaos_net_leave_internal(previous);
     g_chaos_net_config_buffer[total] = '\0';
     *size_out = total;

@@ -7,6 +7,8 @@
 # memory and process, each preloaded together with libchaos-time in both orders.
 # libchaos-time fails every usleep and nanosleep; the library's own LATENCY
 # delay must still last its full duration.
+# Then net, dns, memory and process run with libchaos-io failing every file
+# access under /tmp: they must still read their rule files (/tmp/.chaos-*).
 #
 # Usage:   test_isolation_glibc.sh [linux/amd64|linux/arm64]
 # Env:     CHAOS_ISOLATION_DOCKER_PLATFORM  platform override
@@ -95,5 +97,11 @@ docker run --rm \
             so=/out/libchaos-\$lib-glibc-$ARCH.so
             LD_PRELOAD=\$so:\$time_lib /tmp/isolation-probe \$lib
             LD_PRELOAD=\$time_lib:\$so /tmp/isolation-probe \$lib
+        done
+        io_lib=/out/libchaos-io-glibc-$ARCH.so
+        for lib in net dns memory process; do
+            so=/out/libchaos-\$lib-glibc-$ARCH.so
+            LD_PRELOAD=\$io_lib:\$so /tmp/isolation-probe control:\$lib
+            LD_PRELOAD=\$so:\$io_lib /tmp/isolation-probe control:\$lib
         done
     "

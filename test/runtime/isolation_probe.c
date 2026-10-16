@@ -10,8 +10,14 @@
  * call still takes the full 300 ms. Time is measured with the raw system call so
  * the measurement itself cannot be affected.
  *
- * Usage: isolation_probe io|net|dns|memory|process
- *        (under LD_PRELOAD of that library and libchaos-time, in either order)
+ * In `control:<lib>` mode the other library is libchaos-io, with rules failing
+ * every open, read and write under /tmp. The control files (`/tmp/.chaos-*`) are
+ * outside its reach: the library under test must still read its rules and the
+ * probe still write them.
+ *
+ * Usage: isolation_probe [control:]io|net|dns|memory|process
+ *        (under LD_PRELOAD of that library and libchaos-time, or libchaos-io in
+ *        control mode, in either order)
  * Exit code 0 when the delay was intact, 1 otherwise.
  */
 
@@ -168,39 +174,56 @@ static void trigger_process(void)
 
 int main(int argc, char **argv)
 {
+    const char *other_rules = "/tmp/.chaos-time.conf";
+    const char *lib;
     long long start;
     long long elapsed;
 
     if (argc != 2)
     {
-        (void)fprintf(stderr, "usage: %s io|net|dns|memory|process\n", argv[0]);
+        (void)fprintf(stderr, "usage: %s [control:]io|net|dns|memory|process\n", argv[0]);
         return 2;
     }
 
-    /* Every sleep that reaches libchaos-time fails at once. */
-    write_rules("/tmp/.chaos-time.conf", "usleep:ERRNO:EINTR\nnanosleep:ERRNO:EINTR\n");
+    lib = argv[1];
+    if (strncmp(lib, "control:", 8U) == 0)
+    {
+        /* Every file access under /tmp fails, except the control files. */
+        lib += 8;
+        other_rules = "/tmp/.chaos-io.conf";
+        write_rules(
+            other_rules,
+            "/tmp:open:EACCES:1.0\n/tmp:read:EIO:1.0\n/tmp:write:EIO:1.0\n"
+            "/tmp:rename_to:EIO:1.0\n"
+        );
+    }
+    else
+    {
+        /* Every sleep that reaches libchaos-time fails at once. */
+        write_rules(other_rules, "usleep:ERRNO:EINTR\nnanosleep:ERRNO:EINTR\n");
+    }
 
     start = now_ms();
-    if (strcmp(argv[1], "io") == 0)
+    if (strcmp(lib, "io") == 0)
         trigger_io();
-    else if (strcmp(argv[1], "net") == 0)
+    else if (strcmp(lib, "net") == 0)
         trigger_net();
-    else if (strcmp(argv[1], "dns") == 0)
+    else if (strcmp(lib, "dns") == 0)
         trigger_dns();
-    else if (strcmp(argv[1], "memory") == 0)
+    else if (strcmp(lib, "memory") == 0)
         trigger_memory();
-    else if (strcmp(argv[1], "process") == 0)
+    else if (strcmp(lib, "process") == 0)
         trigger_process();
     else
         return 2;
     elapsed = now_ms() - start;
 
-    (void)unlink("/tmp/.chaos-time.conf");
+    (void)unlink(other_rules);
     if (elapsed < LATENCY_MS - 20LL)
     {
         (void)fprintf(
             stderr,
-            "FAIL %s: LATENCY 300 ms took %lld ms with time rules loaded\n",
+            "FAIL %s: LATENCY 300 ms took %lld ms with the other library's rules loaded\n",
             argv[1],
             elapsed
         );
