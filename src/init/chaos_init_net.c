@@ -19,12 +19,16 @@
  * The wait calls scan their descriptors like the library does: the pollfd array
  * and fd_sets from the thread's memory, an epoll instance's descriptors from
  * /proc/<pid>/fdinfo. SECCOMP mode applies ERRNO, LATENCY and (poll family)
- * TIMEOUT; CORRUPT, TRICKLE and DUP change received data, RESET needs the socket
- * itself, and ERRNO on close would have to close and fail at once: none of these is
- * applied here.
+ * TIMEOUT. CORRUPT, TRICKLE and DUP change received data, RESET needs the socket
+ * itself, and ERRNO on close would have to close and fail at once: a rule file with
+ * any of them is rejected while it is parsed (`unsupported in seccomp mode`).
  */
 
 #include "chaos_init_net.h"
+
+struct chaos_net_rule;
+static int chaos_init_net_supported(const struct chaos_net_rule *rule);
+#define CHAOS_NET_RULE_SUPPORTED(rule) chaos_init_net_supported(rule)
 
 #include "../net/chaos_net_actions.c"
 #include "../net/chaos_net_config.c"
@@ -39,6 +43,12 @@
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/xattr.h>
+
+static int chaos_init_net_supported(const struct chaos_net_rule *rule)
+{
+    return (rule->effect == CHAOS_NET_EFFECT_ERRNO && rule->operation != CHAOS_NET_OP_CLOSE) ||
+           rule->effect == CHAOS_NET_EFFECT_LATENCY || rule->effect == CHAOS_NET_EFFECT_TIMEOUT;
+}
 
 /** @brief The thread whose descriptors the socket queries below answer for. */
 static pid_t g_chaos_init_net_tid = 0;
@@ -690,16 +700,7 @@ int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *v
     {
         return 1;
     }
-    if (rule.effect != CHAOS_NET_EFFECT_ERRNO && rule.effect != CHAOS_NET_EFFECT_LATENCY &&
-        rule.effect != CHAOS_NET_EFFECT_TIMEOUT)
-    {
-        return 1;
-    }
-    if (entry->operation == CHAOS_NET_OP_CLOSE && rule.effect == CHAOS_NET_EFFECT_ERRNO)
-    {
-        return 1;
-    }
-
+    /* Only ERRNO, LATENCY and TIMEOUT rules get here (see chaos_init_net_supported). */
     /* The rule's counters are the calling process's, not the snapshot's. */
     state = chaos_net_config_active_state();
     rule.call_size = size;

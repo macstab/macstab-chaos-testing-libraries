@@ -175,6 +175,9 @@ chaos_net_test_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint6
 #define read chaos_net_test_config_read
 #define close chaos_net_test_config_close
 #define chaos_net_atomic_cas_u64 chaos_net_test_atomic_cas_u64
+/* The build hook for rules a build cannot apply (chaos-init defines it): a switch. */
+static int g_test_rules_unsupported = 0;
+#define CHAOS_NET_RULE_SUPPORTED(rule) ((void)(rule), !g_test_rules_unsupported)
 #include "../../src/net/chaos_net_config.c"
 #undef chaos_net_atomic_cas_u64
 #undef close
@@ -534,6 +537,18 @@ static void test_parse_and_select_rules(void)
 
     assert(chaos_net_config_parse_buffer(buffer, rules, &rule_count) == 0);
     assert(rule_count == 7U);
+
+    /* A build that cannot apply a rule (chaos-init) rejects the file at it. */
+    {
+        char unsupported[] = "tcp4://*:80:connect:ECONNREFUSED:1.0\n";
+        size_t rejected_count = 9U;
+
+        g_test_rules_unsupported = 1;
+        assert(chaos_net_config_parse_buffer(unsupported, rules, &rejected_count) == -1);
+        assert(rejected_count == 0U && g_chaos_net_config_error.line == 1U);
+        assert(strcmp(g_chaos_net_config_error.reason, CHAOS_STATUS_REASON_UNSUPPORTED) == 0);
+        g_test_rules_unsupported = 0;
+    }
     assert(rules[0].operation == CHAOS_NET_OP_CONNECT);
     assert(rules[0].effect == CHAOS_NET_EFFECT_ERRNO);
     assert(rules[2].operation == CHAOS_NET_OP_SOCKET);

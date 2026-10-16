@@ -1038,6 +1038,18 @@ int chaos_net_config_parse_line(char *line, chaos_net_rule_t *rule)
 }
 
 /**
+ * @brief Whether this build can apply @p rule.
+ *
+ * @details Every rule the parser accepts, in the library. chaos-init, which applies
+ * rules from outside the process through seccomp, defines it before including this
+ * file: a rule it cannot apply rejects the file like an invalid line would, with
+ * its own reason, so the status file says so instead of the rule doing nothing.
+ */
+#ifndef CHAOS_NET_RULE_SUPPORTED
+#define CHAOS_NET_RULE_SUPPORTED(rule) 1
+#endif
+
+/**
  * @brief Parses all lines from the config read buffer into a rules array.
  *
  * @details Splits on '\n' by writing NUL terminators in place. Stops and returns
@@ -1105,6 +1117,12 @@ int chaos_net_config_parse_buffer(char *buffer, chaos_net_rule_t *rules, size_t 
         if (count >= CHAOS_NET_MAX_RULES)
         {
             chaos_status_reject(&g_chaos_net_config_error, CHAOS_STATUS_REASON_TOO_MANY);
+            *rule_count = 0U;
+            return -1;
+        }
+        if (!CHAOS_NET_RULE_SUPPORTED(&parsed))
+        {
+            chaos_status_reject(&g_chaos_net_config_error, CHAOS_STATUS_REASON_UNSUPPORTED);
             *rule_count = 0U;
             return -1;
         }

@@ -16,7 +16,8 @@
 #   the server side's read (Go), and the net status file reports the rules;
 # - an mmap rule fails a mapping of its size (C and Go), a fork rule fails fork
 #   (C), a posix_spawn rule fails Go's os/exec, an execve rule fails a later
-#   exec but never the start of the application itself.
+#   exec but never the start of the application itself;
+# - a rule SECCOMP mode cannot apply (TORN) rejects its file, named in the status.
 #
 # Without chaos-init the same opens succeed. Under emulation (amd64 on an arm64
 # host) seccomp is unavailable and the test is skipped.
@@ -159,6 +160,11 @@ expect "Go: posix_spawn rule fails os/exec" "$($init --libs process -- $go spawn
 expect "Go: without chaos-init os/exec works" "$($go spawn)" "ok"
 rm -f /tmp/.chaos-process.conf
 expect "all libraries at once" "$($init --libs io,net,memory,process -- $go dial 7777)" "ECONNREFUSED"
+
+printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/data:write:TORN:1.0 # t" > /tmp/.chaos-io.conf
+expect "a rule SECCOMP mode cannot apply rejects the file" "$($init --libs io -- /tmp/probe open /tmp/sec/data/x)" "ok"
+expect "the status file names it" "$(sed -n 3,4p /tmp/.chaos-io.status | tr "\n" " ")" \
+    "line=2 reason=unsupported in seccomp mode "
 [ "$failures" -eq 0 ]
 '
 

@@ -149,9 +149,7 @@ int main(void)
                 "/tmp/initio/never:open:EIO:0.0\n"
                 "/tmp/initio/once:open:EACCES:1.0 @first=1\n"
                 "/tmp/initio/big:read:EIO:1.0 @size>100\n"
-                "/tmp/initio/torn:write:TORN:1.0\n"
                 "/tmp/initio/w:write:ENOSPC:1.0\n"
-                "/tmp/initio/c:close:EIO:1.0\n"
                 "/tmp/initio/s:fsync:EIO:1.0\n"
                 "/tmp/initio/t:truncate:EROFS:1.0\n"
                 "/tmp/initio/data:unlink:EACCES:1.0\n"
@@ -224,20 +222,14 @@ int main(void)
     assert(PASSES(decide(__NR_read, 1U, P(buffer), 500U, 0, 0)));
     assert(PASSES(decide(__NR_read, (uint64_t)pipe_fds[0], P(buffer), 500U, 0, 0)));
 
-    /* TORN is not applied; ENOSPC on writes, also through sendfile and
-     * copy_file_range to the file. */
-    torn = open_file("/tmp/initio/torn/f");
-    assert(PASSES(decide(__NR_write, (uint64_t)torn, P(buffer), 10U, 0, 0)));
+    /* ENOSPC on writes, also through sendfile and copy_file_range to the file. */
     full = open_file("/tmp/initio/w/f");
     assert(FAILS(decide(__NR_write, (uint64_t)full, P(buffer), 10U, 0, 0), ENOSPC));
     assert(FAILS(decide(__NR_sendfile, (uint64_t)full, (uint64_t)big, 0, 10U, 0), ENOSPC));
     assert(FAILS(decide(__NR_copy_file_range, (uint64_t)big, 0, (uint64_t)full, 0, 10U), ENOSPC));
     assert(PASSES(decide(__NR_copy_file_range, (uint64_t)full, 0, (uint64_t)big, 0, 10U)));
 
-    /* close, fsync, truncate by path and by descriptor, unlinkat. */
-    closing = open_file("/tmp/initio/c/f");
-    /* ERRNO on close is not applied: the call cannot both close and fail. */
-    assert(PASSES(decide(__NR_close, (uint64_t)closing, 0, 0, 0, 0)));
+    /* fsync, truncate by path and by descriptor, unlinkat. */
     syncing = open_file("/tmp/initio/s/f");
     assert(FAILS(decide(__NR_fsync, (uint64_t)syncing, 0, 0, 0, 0), EIO));
     assert(PASSES(decide(__NR_fdatasync, (uint64_t)syncing, 0, 0, 0, 0)));
@@ -342,6 +334,32 @@ int main(void)
         ) == 0
     );
     (void)unlink(buffer);
+
+    /* Rules SECCOMP mode cannot apply reject the whole file, named in the status:
+     * TORN and CORRUPT change data, ERRNO on close would have to close and fail. */
+    torn = open_file("/tmp/initio/torn/f");
+    closing = open_file("/tmp/initio/c/f");
+    write_rules("/tmp/initio/data:open:EIO:1.0\n/tmp/initio/torn:write:TORN:1.0\n");
+    assert(PASSES(decide(__NR_write, (uint64_t)torn, P(buffer), 10U, 0, 0)));
+    assert(PASSES(decide(__NR_openat, (uint64_t)AT_FDCWD, P("/tmp/initio/data/x"), 0, 0, 0)));
+    file = fopen("/tmp/.chaos-io.status", "r");
+    assert(file != NULL);
+    hits[fread(hits, 1U, sizeof(hits) - 1U, file)] = '\0';
+    (void)fclose(file);
+    assert(
+        strncmp(
+            hits,
+            "state=error\nrules=0\nline=2\nreason=unsupported in seccomp mode\n",
+            strlen("state=error\nrules=0\nline=2\nreason=unsupported in seccomp mode\n")
+        ) == 0
+    );
+    write_rules("/tmp/initio/c:close:EIO:1.0\n");
+    assert(PASSES(decide(__NR_close, (uint64_t)closing, 0, 0, 0, 0)));
+    write_rules("/tmp/initio/c:close:LATENCY:5\n/tmp/initio/data:read:CORRUPT:1.0\n");
+    assert(PASSES(decide(__NR_close, (uint64_t)closing, 0, 0, 0, 0)));
+    write_rules("/tmp/initio/c:close:LATENCY:5\n");
+    assert(decide(__NR_close, (uint64_t)closing, 0, 0, 0, 0).action == CHAOS_INIT_DELAY);
+
     (void)unlink("/tmp/.chaos-io.conf");
     return 0;
 }

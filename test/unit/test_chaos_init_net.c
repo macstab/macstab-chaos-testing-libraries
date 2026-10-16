@@ -312,9 +312,7 @@ int main(void)
         "tcp4://127.0.0.1:%u:send:EPIPE:1.0 @size>10\n"
         "tcp4://127.0.0.1:%u:shutdown:ENOTCONN:1.0\n"
         "tcp4://127.0.0.1:%u:poll:TIMEOUT:1.0\n"
-        "tcp4://127.0.0.1:%u:close:ECONNRESET:1.0\n"
         "udp4://127.0.0.1:%u:send:ECONNREFUSED:1.0\n"
-        "udp4://127.0.0.1:%u:recv:CORRUPT:1.0\n"
         "tcp6://*:0:socket:EMFILE:1.0\n",
         ntohs(server_address.sin_port),
         ntohs(other_address.sin_port),
@@ -324,8 +322,6 @@ int main(void)
         ntohs(server_address.sin_port),
         ntohs(server_address.sin_port),
         ntohs(server_address.sin_port),
-        ntohs(server_address.sin_port),
-        ntohs(udp_address.sin_port),
         ntohs(udp_address.sin_port)
     );
     write_rules(rules);
@@ -372,7 +368,6 @@ int main(void)
     assert(
         decide(__NR_recvmsg, (uint64_t)server, P(&message), 0, 0, 0, 0).action == CHAOS_INIT_DELAY
     );
-    assert(PASSES(decide(__NR_recvfrom, (uint64_t)udp, P(buffer), 8U, 0, 0, 0))); /* CORRUPT */
 
     /* By the peer, with the byte count for @size. */
     assert(PASSES(decide(__NR_write, (uint64_t)client, P(buffer), 5U, 0, 0, 0)));
@@ -421,11 +416,31 @@ int main(void)
     );
     assert(PASSES(decide(__NR_epoll_pwait, 999U, 0, 1U, 0, 0, 0)));
 
-    /* Not applied in SECCOMP mode: ERRNO on close. A process that ended is not counted. */
-    assert(PASSES(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0)));
+    /* A process that ended is not counted, and its call runs. */
     g_fail_process = 1;
     assert(PASSES(decide(__NR_listen, (uint64_t)listener, 4U, 0, 0, 0, 0)));
     g_fail_process = 0;
+
+    /* Rules SECCOMP mode cannot apply reject the whole file: data effects, RESET,
+     * ERRNO on close. */
+    write_rules("*:connect:ECONNREFUSED:1.0\n*:recv:CORRUPT:1.0\n");
+    assert(PASSES(
+        decide(__NR_connect, (uint64_t)unbound, P(&server_address), sizeof(server_address), 0, 0, 0)
+    ));
+    {
+        char status[256] = {0};
+        FILE *file = fopen("/tmp/.chaos-net.status", "r");
+
+        assert(file != NULL && fread(status, 1U, sizeof(status) - 1U, file) > 0U);
+        (void)fclose(file);
+        assert(strstr(status, "line=2\nreason=unsupported in seccomp mode\n") != NULL);
+    }
+    write_rules("*:close:ECONNRESET:1.0\n");
+    assert(PASSES(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0)));
+    write_rules("*:close:RESET:1.0\n");
+    assert(PASSES(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0)));
+    write_rules("*:close:LATENCY:5\n");
+    assert(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0).action == CHAOS_INIT_DELAY);
 
     (void)unlink("/tmp/.chaos-net.conf");
     (void)unlink("/tmp/initnet.sock");

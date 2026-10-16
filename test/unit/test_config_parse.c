@@ -188,6 +188,9 @@ static int chaos_test_stub_close(int fd)
     return g_stub_close_result;
 }
 
+/* The build hook for rules a build cannot apply (chaos-init defines it): a switch. */
+static int g_test_rules_unsupported = 0;
+#define CHAOS_IO_RULE_SUPPORTED(rule) ((void)(rule), !g_test_rules_unsupported)
 #include "../../src/config/chaos_io_config.c"
 
 /**
@@ -563,6 +566,18 @@ static void test_parse_buffer_and_selection(void)
 
     assert(chaos_io_config_parse_buffer(buffer, rules, &rule_count) == 0);
     assert(rule_count == 4U);
+
+    /* A build that cannot apply a rule (chaos-init) rejects the file at it. */
+    {
+        char unsupported[] = "/data:write:EIO:1.0\n";
+        size_t rejected_count = 9U;
+
+        g_test_rules_unsupported = 1;
+        assert(chaos_io_config_parse_buffer(unsupported, rules, &rejected_count) == -1);
+        assert(rejected_count == 0U && g_chaos_io_config_error.line == 1U);
+        assert(strcmp(g_chaos_io_config_error.reason, CHAOS_STATUS_REASON_UNSUPPORTED) == 0);
+        g_test_rules_unsupported = 0;
+    }
     assert(chaos_io_rule_prefix_matches(NULL, "/data") == 0);
     assert(chaos_io_rule_prefix_matches(&rules[0], NULL) == 0);
     assert(chaos_io_rule_prefix_matches(&rules[0], "/tmp/file"));

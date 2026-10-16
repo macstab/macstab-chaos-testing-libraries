@@ -75,6 +75,9 @@ typedef struct chaos_status_error
 /** @brief Reason for a rule file this process may not open or read (no line is named). */
 #define CHAOS_STATUS_REASON_UNREADABLE "file unreadable"
 
+/** @brief Reason for a valid rule chaos-init cannot apply (data effects, ERRNO on close). */
+#define CHAOS_STATUS_REASON_UNSUPPORTED "unsupported in seccomp mode"
+
 /** @brief Forgets any recorded error. */
 static inline void chaos_status_clear(chaos_status_error_t *error)
 {

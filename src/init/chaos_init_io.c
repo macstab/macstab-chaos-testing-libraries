@@ -10,12 +10,18 @@
  * and /proc, /sys, /dev never faulted, sendfile and copy_file_range as writes to
  * their output, renames decided like renameat().
  *
- * SECCOMP mode applies ERRNO and LATENCY; TORN and CORRUPT change data the kernel
+ * SECCOMP mode applies ERRNO and LATENCY. TORN and CORRUPT change data the kernel
  * moves, and ERRNO on close would have to close and fail at once (the wrapper
- * closes, then reports the error): none of these is applied here.
+ * closes, then reports the error): a rule file with any of them is rejected while
+ * it is parsed, so its status file reports `unsupported in seccomp mode` and no rule
+ * of it applies.
  */
 
 #include "chaos_init_io.h"
+
+struct chaos_io_rule;
+static int chaos_init_io_supported(const struct chaos_io_rule *rule);
+#define CHAOS_IO_RULE_SUPPORTED(rule) chaos_init_io_supported(rule)
 
 #include "../config/chaos_io_config.c"
 #include "../effects/chaos_io_actions.c"
@@ -34,6 +40,12 @@ chaos_io_close_fn g_chaos_io_real_close = close;
 __thread int g_chaos_io_tls_guard = 0;
 __thread uint64_t g_chaos_io_tls_prng_state = 0U;
 uint64_t g_chaos_io_process_seed = UINT64_C(0x2545f4914f6cdd1d);
+
+static int chaos_init_io_supported(const struct chaos_io_rule *rule)
+{
+    return (rule->effect == CHAOS_IO_EFFECT_ERRNO && rule->operation != CHAOS_IO_OP_CLOSE) ||
+           rule->effect == CHAOS_IO_EFFECT_LATENCY;
+}
 
 /** @brief How /proc links are read; unit tests replace it to make one unreadable. */
 #ifndef CHAOS_INIT_IO_PROC_LINK
@@ -332,9 +344,8 @@ int chaos_init_io_decide(const chaos_init_call_t *call, chaos_init_verdict_t *ve
         matched = chaos_init_io_rename(call, 1, &rule);
         break;
     }
-    if (!matched ||
-        (rule.effect != CHAOS_IO_EFFECT_ERRNO && rule.effect != CHAOS_IO_EFFECT_LATENCY) ||
-        (entry->operation == CHAOS_IO_OP_CLOSE && rule.effect == CHAOS_IO_EFFECT_ERRNO))
+    /* Only ERRNO and LATENCY rules get here (see chaos_init_io_supported). */
+    if (!matched)
     {
         return 1;
     }
