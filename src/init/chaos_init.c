@@ -88,6 +88,25 @@ static const int g_chaos_init_forwarded[] = {
 #define CHAOS_INIT_RELEASE(name) ((name)->release)
 #endif
 
+#ifndef SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV
+#define SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV (1UL << 5)
+#endif
+
+/**
+ * @brief Filter flags tried first. Since Linux 5.19 a call the supervisor has
+ *        received waits killably: a signal no longer interrupts a delayed call,
+ *        which the kernel would otherwise restart as a new notification (Go
+ *        signals its threads constantly). Older kernels reject the flag; the delay
+ *        queue then recognises a restarted call instead (chaos_init_delay_resume).
+ *        Runtime tests build a variant without it to reach that path.
+ */
+#ifdef CHAOS_INIT_TEST_NO_KILLABLE_WAIT
+#define CHAOS_INIT_FILTER_FLAGS SECCOMP_FILTER_FLAG_NEW_LISTENER
+#else
+#define CHAOS_INIT_FILTER_FLAGS                                                                    \
+    (SECCOMP_FILTER_FLAG_NEW_LISTENER | SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV)
+#endif
+
 /** @brief Large enough for the kernel's notification structures (checked at start). */
 #define CHAOS_INIT_NOTIF_BUFFER 512U
 
@@ -136,8 +155,15 @@ static int chaos_init_install_and_hand_over(unsigned libs)
     }
     else
     {
-        listener = (int
-        )syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, &program);
+        listener =
+            (int)syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, CHAOS_INIT_FILTER_FLAGS, &program);
+        if (listener < 0 && errno == EINVAL)
+        {
+            /* Before 5.19: without the killable wait. */
+            listener = (int)syscall(
+                SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, &program
+            );
+        }
         error = listener < 0 ? errno : 0;
     }
 
@@ -282,6 +308,12 @@ chaos_init_answer(int listener, unsigned libs, void *request, void *response, si
     {
         call.args[index] = notification->data.args[index];
     }
+    /* A delayed call a signal interrupted, restarted by the kernel: it keeps its
+     * due time and its verdict, and is neither decided nor counted again. */
+    if (chaos_init_delay_resume(&call, notification->id))
+    {
+        return;
+    }
     memset(&verdict, 0, sizeof(verdict));
     verdict.action = CHAOS_INIT_PASS;
     /* The libraries' system calls are disjoint, except read, write and close: net
@@ -302,7 +334,7 @@ chaos_init_answer(int listener, unsigned libs, void *request, void *response, si
     }
     if (verdict.action == CHAOS_INIT_DELAY &&
         chaos_init_delay_add(
-            notification->id, chaos_init_now_ms() + verdict.delay_ms, verdict.error
+            notification->id, &call, chaos_init_now_ms() + verdict.delay_ms, verdict.error
         ) == 0)
     {
         return;

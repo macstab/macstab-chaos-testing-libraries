@@ -260,16 +260,24 @@ static void test_status_text(void)
 
 static void test_delays(void)
 {
+    chaos_init_call_t call;
+    chaos_init_call_t other;
     uint64_t due = 0U;
     uint64_t id = 0U;
     int error = 0;
     size_t index;
 
+    memset(&call, 0, sizeof(call));
+    call.tid = 41;
+    call.nr = 63;
+    call.args[0] = 5U;
+    call.args[2] = 4096U;
+
     assert(chaos_init_delay_next(&due) == 0);
     assert(chaos_init_delay_pop(1000U, &id, &error) == 0);
-    assert(chaos_init_delay_add(7U, 300U, 0) == 0);
-    assert(chaos_init_delay_add(8U, 100U, EIO) == 0);
-    assert(chaos_init_delay_add(9U, 200U, 0) == 0);
+    assert(chaos_init_delay_add(7U, &call, 300U, 0) == 0);
+    assert(chaos_init_delay_add(8U, &call, 100U, EIO) == 0);
+    assert(chaos_init_delay_add(9U, &call, 200U, 0) == 0);
     assert(chaos_init_delay_next(&due) == 1 && due == 100U);
     assert(chaos_init_delay_pop(50U, &id, &error) == 0);
     assert(
@@ -284,12 +292,31 @@ static void test_delays(void)
     assert(chaos_init_delay_pop(300U, &id, &error) == 1 && id == 7U);
     for (index = 0U; index < CHAOS_INIT_MAX_DELAYED; ++index)
     {
-        assert(chaos_init_delay_add(index, 1U, 0) == 0);
+        assert(chaos_init_delay_add(index, &call, 1U, 0) == 0);
     }
-    assert(chaos_init_delay_add(1U, 1U, 0) == -1);
+    assert(chaos_init_delay_add(1U, &call, 1U, 0) == -1);
     while (chaos_init_delay_pop(1U, &id, &error))
     {
     }
+
+    /* A parked call a signal interrupted comes back under a new id: it keeps its
+     * due time and error. Another thread, call or argument is a new call. */
+    assert(chaos_init_delay_resume(&call, 20U) == 0);
+    assert(chaos_init_delay_add(10U, &call, 500U, EIO) == 0);
+    other = call;
+    other.tid = 42;
+    assert(chaos_init_delay_resume(&other, 21U) == 0);
+    other = call;
+    other.nr = 64;
+    assert(chaos_init_delay_resume(&other, 21U) == 0);
+    other = call;
+    other.args[5] = 1U;
+    assert(chaos_init_delay_resume(&other, 21U) == 0);
+    assert(chaos_init_delay_resume(&call, 22U) == 1);
+    assert(chaos_init_delay_next(&due) == 1 && due == 500U);
+    assert(chaos_init_delay_pop(499U, &id, &error) == 0);
+    assert(chaos_init_delay_pop(500U, &id, &error) == 1 && id == 22U && error == EIO);
+    assert(chaos_init_delay_next(&due) == 0);
 }
 
 static void test_memory_and_proc(void)

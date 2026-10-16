@@ -4,6 +4,8 @@
  *
  * Usage: seccomp_probe open <path>    prints "ok" or the errno name
  *        seccomp_probe openms <path>  prints how long the open took, in ms
+ *        seccomp_probe signalled <path> the same, with a SIGALRM (SA_RESTART)
+ *                                     every 20 ms interrupting the open
  *        seccomp_probe first <path>   opens twice, then once in a forked child:
  *                                     "parent=<1st>,<2nd> child=<1st>"
  *        seccomp_probe connect <port> listens on 127.0.0.1:<port>, connects to it:
@@ -25,7 +27,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <signal.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -59,6 +63,26 @@ static const char *try_open(const char *path)
     return try_open_errno_name(errno);
 }
 
+static void on_alarm(int signal_number)
+{
+    (void)signal_number;
+}
+
+/** @brief Prints how long opening @p path takes, in ms. */
+static void print_open_ms(const char *path)
+{
+    struct timespec start;
+    struct timespec end;
+
+    (void)clock_gettime(CLOCK_MONOTONIC, &start);
+    (void)try_open(path);
+    (void)clock_gettime(CLOCK_MONOTONIC, &end);
+    (void)printf(
+        "%ld\n",
+        (long)((end.tv_sec - start.tv_sec) * 1000L + (end.tv_nsec - start.tv_nsec) / 1000000L)
+    );
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 3 && strcmp(argv[1], "open") == 0)
@@ -68,16 +92,22 @@ int main(int argc, char **argv)
     }
     if (argc == 3 && strcmp(argv[1], "openms") == 0)
     {
-        struct timespec start;
-        struct timespec end;
+        print_open_ms(argv[2]);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "signalled") == 0)
+    {
+        struct sigaction action;
+        struct itimerval every = {{0, 20000}, {0, 20000}};
 
-        (void)clock_gettime(CLOCK_MONOTONIC, &start);
-        (void)try_open(argv[2]);
-        (void)clock_gettime(CLOCK_MONOTONIC, &end);
-        (void)printf(
-            "%ld\n",
-            (long)((end.tv_sec - start.tv_sec) * 1000L + (end.tv_nsec - start.tv_nsec) / 1000000L)
-        );
+        memset(&action, 0, sizeof(action));
+        action.sa_handler = on_alarm;
+        action.sa_flags = SA_RESTART;
+        if (sigaction(SIGALRM, &action, NULL) != 0 || setitimer(ITIMER_REAL, &every, NULL) != 0)
+        {
+            return 1;
+        }
+        print_open_ms(argv[2]);
         return 0;
     }
     if (argc == 3 && strcmp(argv[1], "first") == 0)

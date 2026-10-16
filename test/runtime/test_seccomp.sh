@@ -102,9 +102,14 @@ at_least() {
 }
 
 case "$LIBC" in
-    musl) apk add --no-cache build-base >/dev/null ;;
+    musl) apk add --no-cache build-base linux-headers >/dev/null ;;
 esac
 gcc -D_GNU_SOURCE -std=c99 -Wall -Wextra -Werror -pedantic -O2 -static -o /tmp/probe /work/test/runtime/seccomp_probe.c
+# chaos-init as on kernels before 5.19, where a signal restarts a delayed call.
+(cd /work && gcc -D_GNU_SOURCE -Isrc -Isrc/common -Isrc/core -Isrc/config -Isrc/effects \
+    -Isrc/wrappers -Isrc/net -Isrc/dns -Isrc/time -Isrc/process -Isrc/memory -Isrc/init \
+    -std=c99 -Wall -Wextra -Werror -pedantic -O2 -static -DCHAOS_INIT_TEST_NO_KILLABLE_WAIT \
+    -o /tmp/chaos-init-restart src/init/chaos_init*.c)
 init=/out/chaos-init-'"$ARCH"'
 go=/out/seccomp-go
 mkdir -p /tmp/sec/data /tmp/sec/slow /tmp/sec/once
@@ -118,6 +123,22 @@ fi
 expect "C: no rules, no chaos-init: open works" "$(/tmp/probe open /tmp/sec/data/x)" "ok"
 printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/slow:open:LATENCY:150 # t" \
     "/tmp/sec/once:open:EACCES:1.0 @first=1 # t" > /tmp/.chaos-io.conf
+# A signal every 20 ms must neither cut the delay short nor restart it: the
+# kernel restarts an interrupted call as a new notification, which would be
+# delayed again and again (without the killable wait of 5.19, without the
+# delay queue recognising it).
+for variant in "$init" /tmp/chaos-init-restart; do
+    rm -f /tmp/.chaos-io.hits.*
+    ms=$(timeout 10 $variant --libs io -- /tmp/probe signalled /tmp/sec/slow/x || echo 99999)
+    if [ "$ms" -ge 150 ] && [ "$ms" -lt 2000 ]; then
+        echo "ok   $LIBC $variant: LATENCY 150 under SIGALRM every 20 ms took $ms ms"
+    else
+        echo "FAIL $LIBC $variant: LATENCY 150 under SIGALRM every 20 ms took $ms ms" >&2
+        failures=$((failures + 1))
+    fi
+    expect "$variant: the interrupted delay counted once" \
+        "$(cat /tmp/.chaos-io.hits.* 2>/dev/null | awk -F "\t" "\$2 ~ /slow/ { s += \$1 } END { print s + 0 }")" "1"
+done
 expect "C: without chaos-init the rule does nothing" "$(/tmp/probe open /tmp/sec/data/x)" "ok"
 expect "C: open rule fails the open" "$($init --libs io -- /tmp/probe open /tmp/sec/data/x)" "EIO"
 expect "C: an unmatched path opens" "$($init --libs io -- /tmp/probe open /tmp/sec/other)" "ok"
