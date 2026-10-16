@@ -56,6 +56,7 @@
 #include "chaos_net_internal.h"
 
 #include <string.h>
+#include <sys/syscall.h>
 
 /**
  * @brief Applies pre-call effects (LATENCY or ERRNO) for socket/shutdown/sendmmsg operations.
@@ -95,6 +96,12 @@ static int chaos_net_call_real_socket(int domain, int type, int protocol)
     int previous;
     int rc;
 
+    if (g_chaos_net_real_socket == NULL)
+    {
+        /* Not resolved yet: a call from inside the symbol lookup. The system
+         * call does what libc would. */
+        return (int)syscall(SYS_socket, domain, type, protocol);
+    }
     previous = chaos_net_enter_internal();
     rc = g_chaos_net_real_socket(domain, type, protocol);
     chaos_net_leave_internal(previous);
@@ -107,6 +114,10 @@ static int chaos_net_call_real_socketpair(int domain, int type, int protocol, in
     int previous;
     int rc;
 
+    if (g_chaos_net_real_socketpair == NULL)
+    {
+        return (int)syscall(SYS_socketpair, domain, type, protocol, sv);
+    }
     previous = chaos_net_enter_internal();
     rc = g_chaos_net_real_socketpair(domain, type, protocol, sv);
     chaos_net_leave_internal(previous);
@@ -119,6 +130,10 @@ static int chaos_net_call_real_shutdown(int sockfd, int how)
     int previous;
     int rc;
 
+    if (g_chaos_net_real_shutdown == NULL)
+    {
+        return (int)syscall(SYS_shutdown, sockfd, how);
+    }
     previous = chaos_net_enter_internal();
     rc = g_chaos_net_real_shutdown(sockfd, how);
     chaos_net_leave_internal(previous);
@@ -134,6 +149,10 @@ static int chaos_net_call_real_sendmmsg(
     int previous;
     int rc;
 
+    if (g_chaos_net_real_sendmmsg == NULL)
+    {
+        return (int)syscall(SYS_sendmmsg, sockfd, msgvec, vlen, flags);
+    }
     previous = chaos_net_enter_internal();
     rc = g_chaos_net_real_sendmmsg(sockfd, msgvec, vlen, flags);
     chaos_net_leave_internal(previous);
@@ -152,6 +171,10 @@ static int chaos_net_call_real_recvmmsg(
     int previous;
     int rc;
 
+    if (g_chaos_net_real_recvmmsg == NULL)
+    {
+        return (int)syscall(SYS_recvmmsg, sockfd, msgvec, vlen, flags, timeout);
+    }
     previous = chaos_net_enter_internal();
     rc = g_chaos_net_real_recvmmsg(sockfd, msgvec, vlen, flags, timeout);
     chaos_net_leave_internal(previous);

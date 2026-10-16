@@ -54,7 +54,9 @@
 #include "../support/test_net_support.h"
 
 #include <fcntl.h>
+#include <signal.h>
 #include <stdarg.h>
+#include <time.h>
 #include "../../src/net/chaos_net_config.h"
 #include "../../src/net/chaos_net_actions.h"
 #include "../../src/net/chaos_net_endpoint.h"
@@ -4066,6 +4068,229 @@ static void test_receive_helpers_and_vector_shapes(void)
     reset_wrapper_stubs();
 }
 
+#ifdef __linux__
+/** @brief Milliseconds on the monotonic clock. */
+static long long unresolved_now_ms(void)
+{
+    struct timespec now;
+
+    assert(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+    return (long long)now.tv_sec * 1000LL + (long long)(now.tv_nsec / 1000000L);
+}
+
+/**
+ * @brief Invariant: a call that arrives before the real symbols are resolved
+ *        reaches the kernel instead of calling through a NULL pointer.
+ *
+ * Every `g_chaos_net_real_*` pointer the wrappers call through is NULL, and each
+ * `chaos_net_call_real_*` helper is driven on real descriptors: sockets are
+ * really created, connected and accepted, bytes really travel, the wait calls
+ * really report readiness and really wait out their timeout.
+ */
+static void test_unresolved_symbols_reach_the_kernel(void)
+{
+    struct sockaddr_in address;
+    socklen_t address_length;
+    struct linger linger;
+    socklen_t linger_length;
+    struct pollfd watched;
+    struct timespec ts;
+    struct timeval tv;
+    fd_set readable;
+    sigset_t mask;
+    struct epoll_event event;
+    struct epoll_event events[1];
+    struct iovec iov[2];
+    struct msghdr message;
+    struct mmsghdr messages[2];
+    struct iovec message_iov[2];
+    char one[2] = {'p', 'q'};
+    char two[2] = {'r', 's'};
+    char buffer[8];
+    char other[8];
+    long long started;
+    int pair[2];
+    int datagrams[2];
+    int listener;
+    int client;
+    int second_client;
+    int accepted;
+    int accepted4;
+    int epfd;
+
+    reset_wrapper_stubs();
+    chaos_net_test_reset_runtime();
+    g_chaos_net_real_setsockopt = NULL;
+    g_chaos_net_real_read = NULL;
+    g_chaos_net_real_write = NULL;
+    g_chaos_net_real_readv = NULL;
+    g_chaos_net_real_writev = NULL;
+    g_chaos_net_real_close = NULL;
+
+    /* Byte streams over a socket pair. */
+    assert(chaos_net_call_real_socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    assert(chaos_net_call_real_send(pair[0], "ab", 2U, 0) == 2);
+    (void)memset(buffer, 0, sizeof(buffer));
+    assert(chaos_net_call_real_recv(pair[1], buffer, sizeof(buffer), 0) == 2);
+    assert(memcmp(buffer, "ab", 2U) == 0);
+    assert(chaos_net_call_real_sendto(pair[0], "c", 1U, 0, NULL, 0) == 1);
+    assert(chaos_net_call_real_recvfrom(pair[1], buffer, sizeof(buffer), 0, NULL, NULL) == 1);
+    assert(buffer[0] == 'c');
+    assert(chaos_net_call_real_write(pair[0], "de", 2U) == 2);
+    assert(chaos_net_call_real_read(pair[1], buffer, sizeof(buffer)) == 2);
+    assert(memcmp(buffer, "de", 2U) == 0);
+    iov[0].iov_base = one;
+    iov[0].iov_len = sizeof(one);
+    iov[1].iov_base = two;
+    iov[1].iov_len = sizeof(two);
+    assert(chaos_net_call_real_writev(pair[0], iov, 2) == 4);
+    (void)memset(buffer, 0, sizeof(buffer));
+    (void)memset(other, 0, sizeof(other));
+    iov[0].iov_base = buffer;
+    iov[0].iov_len = 1U;
+    iov[1].iov_base = other;
+    iov[1].iov_len = 3U;
+    assert(chaos_net_call_real_readv(pair[1], iov, 2) == 4);
+    assert(buffer[0] == 'p' && memcmp(other, "qrs", 3U) == 0);
+    iov[0].iov_base = one;
+    iov[0].iov_len = sizeof(one);
+    (void)memset(&message, 0, sizeof(message));
+    message.msg_iov = iov;
+    message.msg_iovlen = 1U;
+    assert(chaos_net_call_real_sendmsg(pair[0], &message, 0) == 2);
+    iov[0].iov_base = buffer;
+    iov[0].iov_len = sizeof(buffer);
+    assert(chaos_net_call_real_recvmsg(pair[1], &message, 0) == 2);
+    assert(memcmp(buffer, "pq", 2U) == 0);
+
+    /* The wait calls: a real timeout first, then real readiness. */
+    watched.fd = pair[1];
+    watched.events = POLLIN;
+    watched.revents = 0;
+    started = unresolved_now_ms();
+    assert(chaos_net_call_real_poll(&watched, 1U, 20) == 0);
+    assert(unresolved_now_ms() - started >= 15);
+    FD_ZERO(&readable);
+    FD_SET(pair[1], &readable);
+    tv.tv_sec = 0;
+    tv.tv_usec = 20000;
+    started = unresolved_now_ms();
+    assert(chaos_net_call_real_select(pair[1] + 1, &readable, NULL, NULL, &tv) == 0);
+    assert(unresolved_now_ms() - started >= 15);
+    assert(tv.tv_sec == 0 && tv.tv_usec == 0);
+    assert(chaos_net_call_real_send(pair[0], "x", 1U, 0) == 1);
+    assert(chaos_net_call_real_poll(&watched, 1U, -1) == 1);
+    assert(watched.revents == POLLIN);
+    ts.tv_sec = 1;
+    ts.tv_nsec = 0;
+    watched.revents = 0;
+    assert(chaos_net_call_real_ppoll(&watched, 1U, &ts, NULL) == 1);
+    assert(watched.revents == POLLIN && ts.tv_sec == 1 && ts.tv_nsec == 0);
+    watched.revents = 0;
+    assert(chaos_net_call_real_ppoll(&watched, 1U, NULL, NULL) == 1);
+    FD_ZERO(&readable);
+    FD_SET(pair[1], &readable);
+    assert(chaos_net_call_real_select(pair[1] + 1, &readable, NULL, NULL, NULL) == 1);
+    assert(FD_ISSET(pair[1], &readable));
+    FD_ZERO(&readable);
+    FD_SET(pair[1], &readable);
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    assert(chaos_net_call_real_select(pair[1] + 1, &readable, NULL, NULL, &tv) == 1);
+    FD_ZERO(&readable);
+    FD_SET(pair[1], &readable);
+    (void)sigemptyset(&mask);
+    assert(chaos_net_call_real_pselect(pair[1] + 1, &readable, NULL, NULL, &ts, &mask) == 1);
+    assert(FD_ISSET(pair[1], &readable) && ts.tv_sec == 1 && ts.tv_nsec == 0);
+    FD_ZERO(&readable);
+    FD_SET(pair[1], &readable);
+    assert(chaos_net_call_real_pselect(pair[1] + 1, &readable, NULL, NULL, NULL, NULL) == 1);
+    epfd = (int)syscall(SYS_epoll_create1, 0);
+    assert(epfd >= 0);
+    (void)memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    event.data.fd = pair[1];
+    assert(syscall(SYS_epoll_ctl, epfd, EPOLL_CTL_ADD, pair[1], &event) == 0);
+    assert(chaos_net_call_real_epoll_wait(epfd, events, 1, 1000) == 1);
+    assert(events[0].data.fd == pair[1]);
+    assert(chaos_net_call_real_epoll_pwait(epfd, events, 1, 1000, &mask) == 1);
+    assert(chaos_net_call_real_close(epfd) == 0);
+
+    /* shutdown: the peer reads end of stream once the pending byte is gone. */
+    assert(chaos_net_call_real_recv(pair[1], buffer, sizeof(buffer), 0) == 1);
+    assert(chaos_net_call_real_shutdown(pair[0], SHUT_WR) == 0);
+    assert(chaos_net_call_real_recv(pair[1], buffer, sizeof(buffer), 0) == 0);
+    assert(chaos_net_call_real_close(pair[0]) == 0);
+    assert(chaos_net_call_real_close(pair[1]) == 0);
+    errno = 0;
+    assert(chaos_net_call_real_close(pair[1]) == -1 && errno == EBADF);
+
+    /* Datagrams in batches. */
+    assert(chaos_net_call_real_socketpair(AF_UNIX, SOCK_DGRAM, 0, datagrams) == 0);
+    (void)memset(messages, 0, sizeof(messages));
+    message_iov[0].iov_base = one;
+    message_iov[0].iov_len = sizeof(one);
+    message_iov[1].iov_base = two;
+    message_iov[1].iov_len = sizeof(two);
+    messages[0].msg_hdr.msg_iov = &message_iov[0];
+    messages[0].msg_hdr.msg_iovlen = 1U;
+    messages[1].msg_hdr.msg_iov = &message_iov[1];
+    messages[1].msg_hdr.msg_iovlen = 1U;
+    assert(chaos_net_call_real_sendmmsg(datagrams[0], messages, 2U, 0U) == 2);
+    (void)memset(buffer, 0, sizeof(buffer));
+    (void)memset(other, 0, sizeof(other));
+    message_iov[0].iov_base = buffer;
+    message_iov[0].iov_len = sizeof(buffer);
+    message_iov[1].iov_base = other;
+    message_iov[1].iov_len = sizeof(other);
+    assert(chaos_net_call_real_recvmmsg(datagrams[1], messages, 2U, 0U, NULL) == 2);
+    assert(memcmp(buffer, "pq", 2U) == 0 && memcmp(other, "rs", 2U) == 0);
+    assert(chaos_net_call_real_close(datagrams[0]) == 0);
+    assert(chaos_net_call_real_close(datagrams[1]) == 0);
+
+    /* A TCP connection on the loopback, accepted both ways. */
+    listener = chaos_net_call_real_socket(AF_INET, SOCK_STREAM, 0);
+    assert(listener >= 0);
+    chaos_net_test_set_ipv4(&address, "127.0.0.1", 0U);
+    assert(chaos_net_call_real_bind(listener, (struct sockaddr *)&address, sizeof(address)) == 0);
+    assert(chaos_net_call_real_listen(listener, 4) == 0);
+    address_length = (socklen_t)sizeof(address);
+    assert(syscall(SYS_getsockname, listener, (struct sockaddr *)&address, &address_length) == 0);
+    client = chaos_net_call_real_socket(AF_INET, SOCK_STREAM, 0);
+    second_client = chaos_net_call_real_socket(AF_INET, SOCK_STREAM, 0);
+    assert(client >= 0 && second_client >= 0);
+    assert(chaos_net_call_real_connect(client, (struct sockaddr *)&address, sizeof(address)) == 0);
+    assert(
+        chaos_net_call_real_connect(second_client, (struct sockaddr *)&address, sizeof(address)) ==
+        0
+    );
+    accepted = chaos_net_call_real_accept(listener, NULL, NULL);
+    assert(accepted >= 0);
+    accepted4 = chaos_net_call_real_accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+    assert(accepted4 >= 0);
+    assert(chaos_net_call_real_send(client, "z", 1U, 0) == 1);
+    assert(chaos_net_call_real_recv(accepted, buffer, sizeof(buffer), 0) == 1 && buffer[0] == 'z');
+    linger.l_onoff = 1;
+    linger.l_linger = 0;
+    assert(
+        chaos_net_call_real_setsockopt(
+            client, SOL_SOCKET, SO_LINGER, &linger, (socklen_t)sizeof(linger)
+        ) == 0
+    );
+    (void)memset(&linger, 0, sizeof(linger));
+    linger_length = (socklen_t)sizeof(linger);
+    assert(syscall(SYS_getsockopt, client, SOL_SOCKET, SO_LINGER, &linger, &linger_length) == 0);
+    assert(linger.l_onoff != 0 && linger.l_linger == 0);
+    assert(chaos_net_call_real_close(accepted4) == 0);
+    assert(chaos_net_call_real_close(accepted) == 0);
+    assert(chaos_net_call_real_close(second_client) == 0);
+    assert(chaos_net_call_real_close(client) == 0);
+    assert(chaos_net_call_real_close(listener) == 0);
+
+    reset_wrapper_stubs();
+}
+#endif
+
 int main(void)
 {
     test_wrappers_forward_inside_library();
@@ -4098,6 +4323,7 @@ int main(void)
     test_direct_linux_helper_paths();
     test_epoll_wrapper_paths();
     test_epoll_fdinfo_in_pieces();
+    test_unresolved_symbols_reach_the_kernel();
 #endif
     return 0;
 }

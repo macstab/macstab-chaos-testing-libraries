@@ -503,6 +503,16 @@ static int chaos_net_call_real_poll(struct pollfd *fds, nfds_t nfds, int timeout
     int previous;
     int rc;
 
+    if (g_chaos_net_real_poll == NULL)
+    {
+        /* Not resolved yet: a call from inside the symbol lookup. arm64 has no
+         * poll system call, so both architectures use ppoll. */
+        struct timespec wait;
+
+        wait.tv_sec = (time_t)(timeout / 1000);
+        wait.tv_nsec = (long)(timeout % 1000) * 1000000L;
+        return (int)syscall(SYS_ppoll, fds, nfds, timeout < 0 ? NULL : &wait, NULL, (size_t)8U);
+    }
     previous = chaos_net_enter_internal();
     rc = g_chaos_net_real_poll(fds, nfds, timeout);
     chaos_net_leave_internal(previous);
@@ -517,6 +527,19 @@ static int chaos_net_call_real_ppoll(
     int previous;
     int rc;
 
+    if (g_chaos_net_real_ppoll == NULL)
+    {
+        /* The kernel writes the time left back; the caller's timeout is const. */
+        struct timespec wait = {0, 0};
+        struct timespec *wait_for = NULL;
+
+        if (timeout != NULL)
+        {
+            wait = *timeout;
+            wait_for = &wait;
+        }
+        return (int)syscall(SYS_ppoll, fds, nfds, wait_for, sigmask, (size_t)8U);
+    }
     previous = chaos_net_enter_internal();
     rc = g_chaos_net_real_ppoll(fds, nfds, timeout, sigmask);
     chaos_net_leave_internal(previous);
@@ -531,6 +554,27 @@ static int chaos_net_call_real_select(
     int previous;
     int rc;
 
+    if (g_chaos_net_real_select == NULL)
+    {
+        /* arm64 has no select system call: pselect6, with the time left
+         * written back as Linux's select does. */
+        struct timespec wait = {0, 0};
+        struct timespec *wait_for = NULL;
+
+        if (timeout != NULL)
+        {
+            wait.tv_sec = timeout->tv_sec;
+            wait.tv_nsec = (long)timeout->tv_usec * 1000L;
+            wait_for = &wait;
+        }
+        rc = (int)syscall(SYS_pselect6, nfds, readfds, writefds, exceptfds, wait_for, NULL);
+        if (timeout != NULL)
+        {
+            timeout->tv_sec = wait.tv_sec;
+            timeout->tv_usec = (suseconds_t)(wait.tv_nsec / 1000L);
+        }
+        return rc;
+    }
     previous = chaos_net_enter_internal();
     rc = g_chaos_net_real_select(nfds, readfds, writefds, exceptfds, timeout);
     chaos_net_leave_internal(previous);
@@ -550,6 +594,27 @@ static int chaos_net_call_real_pselect(
     int previous;
     int rc;
 
+    if (g_chaos_net_real_pselect == NULL)
+    {
+        /* pselect6 takes the mask with its size, and writes the time left back
+         * into its own copy of the timeout. */
+        struct timespec wait = {0, 0};
+        struct timespec *wait_for = NULL;
+        struct
+        {
+            const sigset_t *set;
+            size_t size;
+        } mask;
+
+        if (timeout != NULL)
+        {
+            wait = *timeout;
+            wait_for = &wait;
+        }
+        mask.set = sigmask;
+        mask.size = (size_t)8U;
+        return (int)syscall(SYS_pselect6, nfds, readfds, writefds, exceptfds, wait_for, &mask);
+    }
     previous = chaos_net_enter_internal();
     rc = g_chaos_net_real_pselect(nfds, readfds, writefds, exceptfds, timeout, sigmask);
     chaos_net_leave_internal(previous);
@@ -564,6 +629,11 @@ chaos_net_call_real_epoll_wait(int epfd, struct epoll_event *events, int maxeven
     int previous;
     int rc;
 
+    if (g_chaos_net_real_epoll_wait == NULL)
+    {
+        /* arm64 has no epoll_wait system call: epoll_pwait without a mask. */
+        return (int)syscall(SYS_epoll_pwait, epfd, events, maxevents, timeout, NULL, (size_t)8U);
+    }
     previous = chaos_net_enter_internal();
     rc = g_chaos_net_real_epoll_wait(epfd, events, maxevents, timeout);
     chaos_net_leave_internal(previous);
@@ -578,6 +648,10 @@ static int chaos_net_call_real_epoll_pwait(
     int previous;
     int rc;
 
+    if (g_chaos_net_real_epoll_pwait == NULL)
+    {
+        return (int)syscall(SYS_epoll_pwait, epfd, events, maxevents, timeout, sigmask, (size_t)8U);
+    }
     previous = chaos_net_enter_internal();
     rc = g_chaos_net_real_epoll_pwait(epfd, events, maxevents, timeout, sigmask);
     chaos_net_leave_internal(previous);

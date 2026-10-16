@@ -69,9 +69,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#ifdef __linux__
 #include <sys/syscall.h>
-#endif
 
 /**
  * @brief Flips one bit in a scattered I/O vector using pre-drawn PRNG samples.
@@ -138,8 +136,10 @@ static void chaos_net_corrupt_iovecs(const struct iovec *iov, int iovcnt, size_t
  * Real-symbol call wrappers
  *
  * These wrappers set the reentrancy guard, invoke the real symbol, and restore
- * the guard. They exist to centralise the guard management so that the interposition
- * wrappers themselves read clearly without guard boilerplate on every call site.
+ * the guard. A pointer that is still NULL (a call that arrives while the symbols
+ * are being resolved) is served by the system call itself. They exist to centralise the guard
+ *management so that the interposition wrappers themselves read clearly without guard boilerplate on
+ *every call site.
  *---------------------------------------------------------------------------*/
 
 /**
@@ -151,6 +151,13 @@ chaos_net_call_real_bind(int sockfd, const struct sockaddr *address, socklen_t a
     int previous;
     int result;
 
+    if (g_chaos_net_real_bind == NULL)
+    {
+        /* Not resolved yet: a call from inside the symbol lookup (a signal handler,
+         * or an allocator that does I/O while dlsym runs). The system call does
+         * what libc would. */
+        return (int)syscall(SYS_bind, sockfd, address, address_length);
+    }
     previous = chaos_net_enter_internal();
     result = g_chaos_net_real_bind(sockfd, address, address_length);
     chaos_net_leave_internal(previous);
@@ -165,6 +172,10 @@ static int chaos_net_call_real_listen(int sockfd, int backlog)
     int previous;
     int result;
 
+    if (g_chaos_net_real_listen == NULL)
+    {
+        return (int)syscall(SYS_listen, sockfd, backlog);
+    }
     previous = chaos_net_enter_internal();
     result = g_chaos_net_real_listen(sockfd, backlog);
     chaos_net_leave_internal(previous);
@@ -180,6 +191,10 @@ chaos_net_call_real_connect(int sockfd, const struct sockaddr *address, socklen_
     int previous;
     int result;
 
+    if (g_chaos_net_real_connect == NULL)
+    {
+        return (int)syscall(SYS_connect, sockfd, address, address_length);
+    }
     previous = chaos_net_enter_internal();
     result = g_chaos_net_real_connect(sockfd, address, address_length);
     chaos_net_leave_internal(previous);
@@ -195,6 +210,10 @@ chaos_net_call_real_accept(int sockfd, struct sockaddr *address, socklen_t *addr
     int previous;
     int result;
 
+    if (g_chaos_net_real_accept == NULL)
+    {
+        return (int)syscall(SYS_accept, sockfd, address, address_length);
+    }
     previous = chaos_net_enter_internal();
     result = g_chaos_net_real_accept(sockfd, address, address_length);
     chaos_net_leave_internal(previous);
@@ -212,6 +231,10 @@ static int chaos_net_call_real_accept4(
     int previous;
     int result;
 
+    if (g_chaos_net_real_accept4 == NULL)
+    {
+        return (int)syscall(SYS_accept4, sockfd, address, address_length, flags);
+    }
     previous = chaos_net_enter_internal();
     result = g_chaos_net_real_accept4(sockfd, address, address_length, flags);
     chaos_net_leave_internal(previous);
@@ -227,6 +250,11 @@ static ssize_t chaos_net_call_real_send(int sockfd, const void *buffer, size_t s
     int previous;
     ssize_t result;
 
+    if (g_chaos_net_real_send == NULL)
+    {
+        /* Neither amd64 nor arm64 has a send system call: sendto without an address. */
+        return (ssize_t)syscall(SYS_sendto, sockfd, buffer, size, flags, NULL, (socklen_t)0);
+    }
     previous = chaos_net_enter_internal();
     result = g_chaos_net_real_send(sockfd, buffer, size, flags);
     chaos_net_leave_internal(previous);
@@ -248,6 +276,10 @@ static ssize_t chaos_net_call_real_sendto(
     int previous;
     ssize_t result;
 
+    if (g_chaos_net_real_sendto == NULL)
+    {
+        return (ssize_t)syscall(SYS_sendto, sockfd, buffer, size, flags, address, address_length);
+    }
     previous = chaos_net_enter_internal();
     result = g_chaos_net_real_sendto(sockfd, buffer, size, flags, address, address_length);
     chaos_net_leave_internal(previous);
@@ -262,6 +294,10 @@ static ssize_t chaos_net_call_real_sendmsg(int sockfd, const struct msghdr *mess
     int previous;
     ssize_t result;
 
+    if (g_chaos_net_real_sendmsg == NULL)
+    {
+        return (ssize_t)syscall(SYS_sendmsg, sockfd, message, flags);
+    }
     previous = chaos_net_enter_internal();
     result = g_chaos_net_real_sendmsg(sockfd, message, flags);
     chaos_net_leave_internal(previous);
@@ -276,6 +312,11 @@ static ssize_t chaos_net_call_real_recv(int sockfd, void *buffer, size_t size, i
     int previous;
     ssize_t result;
 
+    if (g_chaos_net_real_recv == NULL)
+    {
+        /* Neither amd64 nor arm64 has a recv system call: recvfrom without an address. */
+        return (ssize_t)syscall(SYS_recvfrom, sockfd, buffer, size, flags, NULL, NULL);
+    }
     previous = chaos_net_enter_internal();
     result = g_chaos_net_real_recv(sockfd, buffer, size, flags);
     chaos_net_leave_internal(previous);
@@ -297,6 +338,10 @@ static ssize_t chaos_net_call_real_recvfrom(
     int previous;
     ssize_t result;
 
+    if (g_chaos_net_real_recvfrom == NULL)
+    {
+        return (ssize_t)syscall(SYS_recvfrom, sockfd, buffer, size, flags, address, address_length);
+    }
     previous = chaos_net_enter_internal();
     result = g_chaos_net_real_recvfrom(sockfd, buffer, size, flags, address, address_length);
     chaos_net_leave_internal(previous);
@@ -311,6 +356,10 @@ static ssize_t chaos_net_call_real_recvmsg(int sockfd, struct msghdr *message, i
     int previous;
     ssize_t result;
 
+    if (g_chaos_net_real_recvmsg == NULL)
+    {
+        return (ssize_t)syscall(SYS_recvmsg, sockfd, message, flags);
+    }
     previous = chaos_net_enter_internal();
     result = g_chaos_net_real_recvmsg(sockfd, message, flags);
     chaos_net_leave_internal(previous);
@@ -1495,6 +1544,10 @@ static ssize_t chaos_net_call_real_read(int fd, void *buffer, size_t size)
     int previous;
     ssize_t result;
 
+    if (g_chaos_net_real_read == NULL)
+    {
+        return (ssize_t)syscall(SYS_read, fd, buffer, size);
+    }
     previous = chaos_net_enter_internal();
     result = g_chaos_net_real_read(fd, buffer, size);
     chaos_net_leave_internal(previous);
@@ -1507,6 +1560,10 @@ static ssize_t chaos_net_call_real_write(int fd, const void *buffer, size_t size
     int previous;
     ssize_t result;
 
+    if (g_chaos_net_real_write == NULL)
+    {
+        return (ssize_t)syscall(SYS_write, fd, buffer, size);
+    }
     previous = chaos_net_enter_internal();
     result = g_chaos_net_real_write(fd, buffer, size);
     chaos_net_leave_internal(previous);
@@ -1519,6 +1576,10 @@ static ssize_t chaos_net_call_real_readv(int fd, const struct iovec *iov, int io
     int previous;
     ssize_t result;
 
+    if (g_chaos_net_real_readv == NULL)
+    {
+        return (ssize_t)syscall(SYS_readv, fd, iov, iovcnt);
+    }
     previous = chaos_net_enter_internal();
     result = g_chaos_net_real_readv(fd, iov, iovcnt);
     chaos_net_leave_internal(previous);
@@ -1531,6 +1592,10 @@ static ssize_t chaos_net_call_real_writev(int fd, const struct iovec *iov, int i
     int previous;
     ssize_t result;
 
+    if (g_chaos_net_real_writev == NULL)
+    {
+        return (ssize_t)syscall(SYS_writev, fd, iov, iovcnt);
+    }
     previous = chaos_net_enter_internal();
     result = g_chaos_net_real_writev(fd, iov, iovcnt);
     chaos_net_leave_internal(previous);
@@ -1543,8 +1608,29 @@ static int chaos_net_call_real_close(int fd)
     int previous;
     int result;
 
+    if (g_chaos_net_real_close == NULL)
+    {
+        return (int)syscall(SYS_close, fd);
+    }
     previous = chaos_net_enter_internal();
     result = g_chaos_net_real_close(fd);
+    chaos_net_leave_internal(previous);
+    return result;
+}
+
+/** @brief Calls the next setsockopt(2) in the chain with the reentrancy guard set. */
+static int
+chaos_net_call_real_setsockopt(int fd, int level, int name, const void *value, socklen_t length)
+{
+    int previous;
+    int result;
+
+    if (g_chaos_net_real_setsockopt == NULL)
+    {
+        return (int)syscall(SYS_setsockopt, fd, level, name, value, length);
+    }
+    previous = chaos_net_enter_internal();
+    result = g_chaos_net_real_setsockopt(fd, level, name, value, length);
     chaos_net_leave_internal(previous);
     return result;
 }
@@ -1748,7 +1834,6 @@ CHAOS_NET_EXPORT int close(int fd)
     chaos_net_rule_t rule;
     struct linger abort_linger;
     int matched;
-    int previous;
     int saved_errno;
     int rc;
 
@@ -1764,11 +1849,9 @@ CHAOS_NET_EXPORT int close(int fd)
         abort_linger.l_onoff = 1;
         abort_linger.l_linger = 0;
         saved_errno = errno;
-        previous = chaos_net_enter_internal();
-        (void)g_chaos_net_real_setsockopt(
+        (void)chaos_net_call_real_setsockopt(
             fd, SOL_SOCKET, SO_LINGER, &abort_linger, (socklen_t)sizeof(abort_linger)
         );
-        chaos_net_leave_internal(previous);
         errno = saved_errno;
     }
 

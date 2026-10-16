@@ -181,7 +181,10 @@
  * One typedef per intercepted libc/libsocket symbol. The global variables
  * g_chaos_net_real_* are populated by dlsym(RTLD_NEXT, …) in chaos_net_init()
  * and are never written again after construction; reads on the hot path are
- * therefore safe without barriers (they observe the initialized value).
+ * therefore safe without barriers (they observe the initialized value). A call
+ * that arrives while they are being resolved (a signal handler, or an allocator
+ * doing I/O inside dlsym) still sees NULL; the call_real helpers then make the
+ * system call directly instead of calling through the pointer.
  *---------------------------------------------------------------------------*/
 
 /** @brief Real bind(2) pointer; never NULL after library init. */
