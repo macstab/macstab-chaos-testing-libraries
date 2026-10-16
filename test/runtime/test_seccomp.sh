@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# test_seccomp.sh — io and net rules in SECCOMP mode, on static programs (Docker).
+# test_seccomp.sh — io, net, memory and process rules in SECCOMP mode (Docker).
 #
 # Builds chaos-init (docker/Dockerfile.build) and a statically linked Go program
 # (CGO_ENABLED=0, the kind LD_PRELOAD cannot reach), then runs them and a static
@@ -13,7 +13,10 @@
 #   writes its own hits file;
 # - the io status file reports the loaded rules;
 # - a connect rule refuses the connection (C and Go), a recv LATENCY rule delays
-#   the server side's read (Go), and the net status file reports the rules.
+#   the server side's read (Go), and the net status file reports the rules;
+# - an mmap rule fails a mapping of its size (C and Go), a fork rule fails fork
+#   (C), a posix_spawn rule fails Go's os/exec, an execve rule fails a later
+#   exec but never the start of the application itself.
 #
 # Without chaos-init the same opens succeed. Under emulation (amd64 on an arm64
 # host) seccomp is unavailable and the test is skipped.
@@ -141,6 +144,21 @@ expect "Go: another port dials" "$($init --libs net -- $go dial 7779)" "ok"
 at_least "Go: recv LATENCY delays the server read" "$($init --libs net -- $go recvms 7778)" 150
 expect "Go: io and net together" "$($init --libs io,net -- $go open /tmp/sec/data/x) $($init --libs io,net -- $go dial 7777)" "EIO ECONNREFUSED"
 expect "net status reports the rules" "$(head -2 /tmp/.chaos-net.status | tr "\n" " ")" "state=ok rules=2 "
+
+printf "%s\n" "mmap/anon:ERRNO:ENOMEM @size>1234566 @size<1234568 # t" > /tmp/.chaos-memory.conf
+expect "C: mmap rule fails a mapping of its size" "$($init --libs memory -- /tmp/probe mmap 1234567)" "ENOMEM"
+expect "C: other sizes map" "$($init --libs memory -- /tmp/probe mmap 4096)" "ok"
+expect "Go: mmap rule fails a mapping of its size" "$($init --libs memory -- $go mmap 1234567)" "ENOMEM"
+expect "Go: other sizes map, the runtime runs" "$($init --libs memory -- $go mmap 4096)" "ok"
+
+printf "%s\n" "fork:ERRNO:ENOMEM # t" "posix_spawn:ERRNO:EAGAIN # t" "execve:ERRNO:EACCES # t" > /tmp/.chaos-process.conf
+expect "C: the application starts despite an execve rule" "$($init --libs process -- /tmp/probe open /tmp/sec/other)" "ok"
+expect "C: fork rule fails fork" "$($init --libs process -- /tmp/probe fork)" "ENOMEM"
+expect "C: execve rule fails a later exec" "$($init --libs process -- /tmp/probe exec)" "EACCES"
+expect "Go: posix_spawn rule fails os/exec" "$($init --libs process -- $go spawn)" "EAGAIN"
+expect "Go: without chaos-init os/exec works" "$($go spawn)" "ok"
+rm -f /tmp/.chaos-process.conf
+expect "all libraries at once" "$($init --libs io,net,memory,process -- $go dial 7777)" "ECONNREFUSED"
 [ "$failures" -eq 0 ]
 '
 

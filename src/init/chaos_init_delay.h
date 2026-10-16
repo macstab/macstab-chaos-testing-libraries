@@ -15,13 +15,16 @@
 /** @brief Calls held at once; a call beyond that is not delayed. */
 #define CHAOS_INIT_MAX_DELAYED 1024U
 
-/** @brief Parks notification @p id until @p due_ms. @return 0, or -1 when full. */
-int chaos_init_delay_add(uint64_t id, uint64_t due_ms);
+/**
+ * @brief Parks notification @p id until @p due_ms; then it fails with @p error, or
+ *        runs when @p error is 0. @return 0, or -1 when full.
+ */
+int chaos_init_delay_add(uint64_t id, uint64_t due_ms, int error);
 
 /** @brief The earliest due time into @p due_ms. @return 0 when nothing is parked. */
 int chaos_init_delay_next(uint64_t *due_ms);
 
-/** @brief Removes one call due at @p now_ms into @p id. @return 0 when none is due. */
-int chaos_init_delay_pop(uint64_t now_ms, uint64_t *id);
+/** @brief Removes one call due at @p now_ms into @p id and @p error. @return 0 when none is due. */
+int chaos_init_delay_pop(uint64_t now_ms, uint64_t *id, int *error);
 
 #endif

@@ -11,12 +11,13 @@ typedef struct chaos_init_delayed
 {
     uint64_t id;
     uint64_t due_ms;
+    int error;
 } chaos_init_delayed_t;
 
 static chaos_init_delayed_t g_chaos_init_delayed[CHAOS_INIT_MAX_DELAYED];
 static size_t g_chaos_init_delayed_count = 0U;
 
-int chaos_init_delay_add(uint64_t id, uint64_t due_ms)
+int chaos_init_delay_add(uint64_t id, uint64_t due_ms, int error)
 {
     if (g_chaos_init_delayed_count == CHAOS_INIT_MAX_DELAYED)
     {
@@ -24,6 +25,7 @@ int chaos_init_delay_add(uint64_t id, uint64_t due_ms)
     }
     g_chaos_init_delayed[g_chaos_init_delayed_count].id = id;
     g_chaos_init_delayed[g_chaos_init_delayed_count].due_ms = due_ms;
+    g_chaos_init_delayed[g_chaos_init_delayed_count].error = error;
     ++g_chaos_init_delayed_count;
     return 0;
 }
@@ -47,7 +49,7 @@ int chaos_init_delay_next(uint64_t *due_ms)
     return 1;
 }
 
-int chaos_init_delay_pop(uint64_t now_ms, uint64_t *id)
+int chaos_init_delay_pop(uint64_t now_ms, uint64_t *id, int *error)
 {
     size_t index;
 
@@ -56,6 +58,7 @@ int chaos_init_delay_pop(uint64_t now_ms, uint64_t *id)
         if (g_chaos_init_delayed[index].due_ms <= now_ms)
         {
             *id = g_chaos_init_delayed[index].id;
+            *error = g_chaos_init_delayed[index].error;
             g_chaos_init_delayed[index] = g_chaos_init_delayed[--g_chaos_init_delayed_count];
             return 1;
         }

@@ -658,7 +658,6 @@ int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *v
     chaos_net_rule_t rule;
     uint64_t size = CHAOS_POLICY_NO_SIZE;
     size_t index;
-    int tracee;
 
     for (index = 0U; index < sizeof(g_chaos_init_net_calls) / sizeof(g_chaos_init_net_calls[0]);
          ++index)
@@ -703,14 +702,10 @@ int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *v
 
     /* The rule's counters are the calling process's, not the snapshot's. */
     state = chaos_net_config_active_state();
-    if (rule.hit < state->hits || rule.hit >= state->hits + state->rule_count ||
-        (tracee = chaos_init_tracee_of(call->tid)) < 0)
-    {
-        return 1;
-    }
     rule.call_size = size;
-    rule.hit =
-        chaos_init_tracee_slot(&g_chaos_init_net_rules, tracee, (size_t)(rule.hit - state->hits));
+    rule.hit = chaos_init_tracee_hit(
+        &g_chaos_init_net_rules, call->tid, state->hits, state->rule_count, rule.hit
+    );
     if (rule.hit == NULL || !chaos_net_rule_should_trigger(&rule))
     {
         return 1;

@@ -85,6 +85,21 @@ int chaos_init_tracee_of(pid_t tid);
  */
 chaos_hit_slot_t *chaos_init_tracee_slot(chaos_init_rules_t *rules, int tracee, size_t rule_index);
 
+/**
+ * @brief The slot a matched rule copy counts in for the process of thread @p tid.
+ *
+ * @param hit    The copy's `hit`: a slot of the snapshot @p hits (@p count rules).
+ * @return The process's slot of that rule, or NULL when @p hit is not one of the
+ *         snapshot's or the process cannot be identified (it ended).
+ */
+chaos_hit_slot_t *chaos_init_tracee_hit(
+    chaos_init_rules_t *rules,
+    pid_t tid,
+    const chaos_hit_slot_t *hits,
+    size_t count,
+    const chaos_hit_slot_t *hit
+);
+
 /** @brief Writes every pending hits file, or all of them when @p all. */
 void chaos_init_tracee_flush(int all);
 

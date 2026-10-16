@@ -31,7 +31,9 @@
 #include "chaos_init_core.h"
 #include "chaos_init_delay.h"
 #include "chaos_init_io.h"
+#include "chaos_init_memory.h"
 #include "chaos_init_net.h"
+#include "chaos_init_process.h"
 #include "chaos_init_tracee.h"
 #include "chaos_status.h"
 
@@ -280,12 +282,16 @@ chaos_init_answer(int listener, unsigned libs, void *request, void *response, si
     {
         call.args[index] = notification->data.args[index];
     }
+    memset(&verdict, 0, sizeof(verdict));
     verdict.action = CHAOS_INIT_PASS;
-    /* net first: it claims read, write and close on sockets; io decides the rest. */
-    if (((libs & CHAOS_INIT_LIB_NET) == 0U || !chaos_init_net_decide(&call, &verdict)) &&
-        (libs & CHAOS_INIT_LIB_IO) != 0U)
+    /* The libraries' system calls are disjoint, except read, write and close: net
+     * claims them on sockets, io decides them on anything else. */
+    if (!((libs & CHAOS_INIT_LIB_NET) != 0U && chaos_init_net_decide(&call, &verdict)) &&
+        !((libs & CHAOS_INIT_LIB_IO) != 0U && chaos_init_io_decide(&call, &verdict)) &&
+        !((libs & CHAOS_INIT_LIB_MEMORY) != 0U && chaos_init_memory_decide(&call, &verdict)) &&
+        (libs & CHAOS_INIT_LIB_PROCESS) != 0U)
     {
-        (void)chaos_init_io_decide(&call, &verdict);
+        (void)chaos_init_process_decide(&call, &verdict);
     }
     /* The decision read the thread's memory: act on it only if that thread is still
      * the one waiting (its pid could otherwise belong to another process by now). */
@@ -295,13 +301,16 @@ chaos_init_answer(int listener, unsigned libs, void *request, void *response, si
         return;
     }
     if (verdict.action == CHAOS_INIT_DELAY &&
-        chaos_init_delay_add(notification->id, chaos_init_now_ms() + verdict.delay_ms) == 0)
+        chaos_init_delay_add(
+            notification->id, chaos_init_now_ms() + verdict.delay_ms, verdict.error
+        ) == 0)
     {
         return;
     }
     if (verdict.action == CHAOS_INIT_DELAY)
     {
-        verdict.action = CHAOS_INIT_PASS; /* the queue is full: run it now */
+        /* The queue is full: no delay, the rest of the verdict now. */
+        verdict.action = verdict.error != 0 ? CHAOS_INIT_FAIL : CHAOS_INIT_PASS;
     }
     chaos_init_reply(listener, notification->id, &verdict, response, response_size);
 }
@@ -318,11 +327,13 @@ static void chaos_init_on_time(int timer, int listener, void *response, size_t r
     uint64_t due = 0U;
     uint64_t id;
 
-    chaos_init_verdict_t run;
-    run.action = CHAOS_INIT_PASS;
-    while (chaos_init_delay_pop(now, &id))
+    chaos_init_verdict_t due_verdict;
+
+    memset(&due_verdict, 0, sizeof(due_verdict));
+    while (chaos_init_delay_pop(now, &id, &due_verdict.error))
     {
-        chaos_init_reply(listener, id, &run, response, response_size);
+        due_verdict.action = due_verdict.error != 0 ? CHAOS_INIT_FAIL : CHAOS_INIT_PASS;
+        chaos_init_reply(listener, id, &due_verdict, response, response_size);
     }
     if (chaos_init_tracee_pending() && now - last_flush_ms >= CHAOS_HITS_INTERVAL_MS)
     {
@@ -462,6 +473,14 @@ int main(int argc, char **argv)
     if (listener >= 0 && (options.libs & CHAOS_INIT_LIB_NET) != 0U)
     {
         chaos_init_net_start();
+    }
+    if (listener >= 0 && (options.libs & CHAOS_INIT_LIB_MEMORY) != 0U)
+    {
+        chaos_init_memory_start();
+    }
+    if (listener >= 0 && (options.libs & CHAOS_INIT_LIB_PROCESS) != 0U)
+    {
+        chaos_init_process_start(child);
     }
     chaos_init_write_status(
         options.libs, listener >= 0 ? NULL : chaos_init_unsupported_reason(error)

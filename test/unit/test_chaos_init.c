@@ -262,25 +262,32 @@ static void test_delays(void)
 {
     uint64_t due = 0U;
     uint64_t id = 0U;
+    int error = 0;
     size_t index;
 
     assert(chaos_init_delay_next(&due) == 0);
-    assert(chaos_init_delay_pop(1000U, &id) == 0);
-    assert(chaos_init_delay_add(7U, 300U) == 0);
-    assert(chaos_init_delay_add(8U, 100U) == 0);
-    assert(chaos_init_delay_add(9U, 200U) == 0);
+    assert(chaos_init_delay_pop(1000U, &id, &error) == 0);
+    assert(chaos_init_delay_add(7U, 300U, 0) == 0);
+    assert(chaos_init_delay_add(8U, 100U, EIO) == 0);
+    assert(chaos_init_delay_add(9U, 200U, 0) == 0);
     assert(chaos_init_delay_next(&due) == 1 && due == 100U);
-    assert(chaos_init_delay_pop(50U, &id) == 0);
-    assert(chaos_init_delay_pop(250U, &id) == 1 && (id == 8U || id == 9U));
-    assert(chaos_init_delay_pop(250U, &id) == 1 && (id == 8U || id == 9U));
-    assert(chaos_init_delay_pop(250U, &id) == 0);
-    assert(chaos_init_delay_pop(300U, &id) == 1 && id == 7U);
+    assert(chaos_init_delay_pop(50U, &id, &error) == 0);
+    assert(
+        chaos_init_delay_pop(250U, &id, &error) == 1 &&
+        (id == 8U ? error == EIO : id == 9U && error == 0)
+    );
+    assert(
+        chaos_init_delay_pop(250U, &id, &error) == 1 &&
+        (id == 8U ? error == EIO : id == 9U && error == 0)
+    );
+    assert(chaos_init_delay_pop(250U, &id, &error) == 0);
+    assert(chaos_init_delay_pop(300U, &id, &error) == 1 && id == 7U);
     for (index = 0U; index < CHAOS_INIT_MAX_DELAYED; ++index)
     {
-        assert(chaos_init_delay_add(index, 1U) == 0);
+        assert(chaos_init_delay_add(index, 1U, 0) == 0);
     }
-    assert(chaos_init_delay_add(1U, 1U) == -1);
-    while (chaos_init_delay_pop(1U, &id))
+    assert(chaos_init_delay_add(1U, 1U, 0) == -1);
+    while (chaos_init_delay_pop(1U, &id, &error))
     {
     }
 }
@@ -465,6 +472,18 @@ static void test_tracee_table(void)
     assert(strcmp(hits, "65\t/b:open:EIO:1.0\n0\t/c:open:EIO:1.0\n") == 0);
     chaos_init_tracee_flush(1);
     assert(read_hits(10, hits, sizeof(hits)));
+
+    /* The slot for a rule copy: of the snapshot's slots, for a known process. */
+    {
+        chaos_hit_slot_t snapshot[2];
+
+        assert(
+            chaos_init_tracee_hit(&g_test_lib, 10, snapshot, 2U, &snapshot[1]) ==
+            chaos_init_tracee_slot(&g_test_lib, chaos_init_tracee_of(10), 1U)
+        );
+        assert(chaos_init_tracee_hit(&g_test_lib, 10, snapshot, 1U, &snapshot[1]) == NULL);
+        assert(chaos_init_tracee_hit(&g_test_lib, 0, snapshot, 2U, &snapshot[0]) == NULL);
+    }
 
     /* A slot of no registered library is ignored. */
     memset(&foreign, 0, sizeof(foreign));

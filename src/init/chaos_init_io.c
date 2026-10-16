@@ -284,7 +284,6 @@ int chaos_init_io_decide(const chaos_init_call_t *call, chaos_init_verdict_t *ve
     chaos_io_rule_t rule;
     size_t index;
     int matched = 0;
-    int tracee;
 
     for (index = 0U; index < sizeof(g_chaos_init_io_calls) / sizeof(g_chaos_init_io_calls[0]);
          ++index)
@@ -340,13 +339,6 @@ int chaos_init_io_decide(const chaos_init_call_t *call, chaos_init_verdict_t *ve
         return 1;
     }
 
-    /* The rule's counters are the calling process's, not the snapshot's. */
-    state = chaos_io_config_active_state();
-    if (rule.hit < state->hits || rule.hit >= state->hits + state->rule_count ||
-        (tracee = chaos_init_tracee_of(call->tid)) < 0)
-    {
-        return 1;
-    }
     if (entry->size >= 0)
     {
         rule.call_size = call->args[entry->size];
@@ -355,8 +347,11 @@ int chaos_init_io_decide(const chaos_init_call_t *call, chaos_init_verdict_t *ve
     {
         rule.call_size = chaos_init_io_iov_size(call->tid, call->args[1], call->args[2]);
     }
-    rule.hit =
-        chaos_init_tracee_slot(&g_chaos_init_io_rules, tracee, (size_t)(rule.hit - state->hits));
+    /* The rule's counters are the calling process's, not the snapshot's. */
+    state = chaos_io_config_active_state();
+    rule.hit = chaos_init_tracee_hit(
+        &g_chaos_init_io_rules, call->tid, state->hits, state->rule_count, rule.hit
+    );
     if (rule.hit == NULL || !chaos_io_rule_should_trigger(&rule))
     {
         return 1;

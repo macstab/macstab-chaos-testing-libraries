@@ -252,6 +252,23 @@ chaos_hit_slot_t *chaos_init_tracee_slot(chaos_init_rules_t *rules, int tracee, 
     return &rules->slots[(size_t)tracee * rules->max_rules + rule_index];
 }
 
+chaos_hit_slot_t *chaos_init_tracee_hit(
+    chaos_init_rules_t *rules,
+    pid_t tid,
+    const chaos_hit_slot_t *hits,
+    size_t count,
+    const chaos_hit_slot_t *hit
+)
+{
+    int tracee;
+
+    if (hit < hits || hit >= hits + count || (tracee = chaos_init_tracee_of(tid)) < 0)
+    {
+        return NULL;
+    }
+    return chaos_init_tracee_slot(rules, tracee, (size_t)(hit - hits));
+}
+
 void chaos_init_tracee_flush(int all)
 {
     size_t lib;

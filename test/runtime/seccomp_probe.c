@@ -8,6 +8,9 @@
  *                                     "parent=<1st>,<2nd> child=<1st>"
  *        seccomp_probe connect <port> listens on 127.0.0.1:<port>, connects to it:
  *                                     "ok" or the errno name
+ *        seccomp_probe mmap <bytes>   maps that many anonymous bytes
+ *        seccomp_probe fork           forks a child that exits at once
+ *        seccomp_probe exec           executes /bin/true (prints only on failure)
  */
 
 #ifndef _GNU_SOURCE
@@ -21,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -36,6 +40,8 @@ static const char *try_open_errno_name(int error)
         return "EACCES";
     case ECONNREFUSED:
         return "ECONNREFUSED";
+    case ENOMEM:
+        return "ENOMEM";
     default:
         return strerror(error);
     }
@@ -115,11 +121,46 @@ int main(int argc, char **argv)
         {
             return 1;
         }
-        (void)printf("%s\n", connect(client, (struct sockaddr *)&address, sizeof(address)) == 0
-                                 ? "ok"
-                                 : try_open_errno_name(errno));
+        (void)printf(
+            "%s\n",
+            connect(client, (struct sockaddr *)&address, sizeof(address)) == 0
+                ? "ok"
+                : try_open_errno_name(errno)
+        );
         return 0;
     }
-    (void)fprintf(stderr, "usage: %s open|openms|first <path> | connect <port>\n", argv[0]);
+    if (argc == 3 && strcmp(argv[1], "mmap") == 0)
+    {
+        const size_t length = (size_t)strtoul(argv[2], NULL, 10);
+        void *mapping =
+            mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+        (void)printf("%s\n", mapping != MAP_FAILED ? "ok" : try_open_errno_name(errno));
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "fork") == 0)
+    {
+        const pid_t child = fork();
+
+        if (child == 0)
+        {
+            _exit(0);
+        }
+        if (child > 0)
+        {
+            (void)waitpid(child, NULL, 0);
+        }
+        (void)printf("%s\n", child > 0 ? "ok" : try_open_errno_name(errno));
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "exec") == 0)
+    {
+        (void)execl("/bin/true", "true", (char *)NULL);
+        (void)printf("%s\n", try_open_errno_name(errno));
+        return 0;
+    }
+    (void)fprintf(stderr, "usage: %s open|openms|first <path> | connect <port> | mmap <bytes> | "
+                          "fork | exec\n",
+                  argv[0]);
     return 2;
 }
