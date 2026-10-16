@@ -1906,6 +1906,13 @@ static int chaos_dns_config_refresh(void)
     {
         return chaos_dns_config_active_state()->rule_count != 0U;
     }
+    /* Hits of an interval that is over are written now, not only at the next hit
+     * or at exit: a long-running process that stopped hitting reports them too. */
+    if (g_chaos_dns_hits_pending != 0 &&
+        chaos_hits_now_ms() - g_chaos_dns_hits_last_ms >= CHAOS_HITS_INTERVAL_MS)
+    {
+        chaos_dns_config_report_hits(NULL);
+    }
     observed_mtime = chaos_dns_config_observed_mtime();
     cached_mtime = chaos_dns_atomic_load_u64(&g_chaos_dns_cached_mtime);
 

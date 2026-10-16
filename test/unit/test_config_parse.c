@@ -1359,6 +1359,26 @@ static void test_racy_rewrite_is_seen(void)
     g_chaos_io_check_interval_ns = interval;
 }
 
+/**
+ * @brief Invariant: hits still pending when their interval is over are written by
+ *        the next look at the rule file, not only by the next hit or at exit.
+ */
+static void test_pending_hits_written_after_interval(void)
+{
+    const uint64_t interval = g_chaos_io_check_interval_ns;
+
+    g_chaos_io_check_interval_ns = 0U;
+    g_chaos_io_hits_pid = (uint64_t)getpid();
+    g_chaos_io_hits_pending = 1;
+    g_chaos_io_hits_last_ms = chaos_hits_now_ms();
+    (void)chaos_io_config_prepare();
+    assert(g_chaos_io_hits_pending == 1);
+    g_chaos_io_hits_last_ms = chaos_hits_now_ms() - CHAOS_HITS_INTERVAL_MS;
+    (void)chaos_io_config_prepare();
+    assert(g_chaos_io_hits_pending == 0);
+    g_chaos_io_check_interval_ns = interval;
+}
+
 int main(void)
 {
     /* Look at the rule file on every call; the throttle has its own test. */
@@ -1386,5 +1406,6 @@ int main(void)
     test_rule_qualifiers();
     test_read_file_rejects_changed_file();
     test_racy_rewrite_is_seen();
+    test_pending_hits_written_after_interval();
     return 0;
 }

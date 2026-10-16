@@ -126,6 +126,19 @@ for lib in io net dns time memory process; do
     rm -f /tmp/.chaos-$lib.conf /tmp/.chaos-$lib.hits.*
 done
 
+# Hits of the last interval reach the file while the process still runs: 100
+# hits, past the 64 written at once, then the interval passes and one more call.
+so=/out/libchaos-io-$LIBC-'"$ARCH"'.so
+echo "/tmp/hits-data:open:EIO:1.0 # burst" > /tmp/.chaos-io.conf
+burst=$(LD_PRELOAD=$so /tmp/hits-probe burst)
+if [ "$burst" -eq 100 ]; then
+    echo "ok   $LIBC io: 100 hits on file while the process runs"
+else
+    echo "FAIL $LIBC io: $burst hits on file while the process runs, want 100" >&2
+    failures=$((failures + 1))
+fi
+rm -f /tmp/.chaos-io.conf /tmp/.chaos-io.hits.*
+
 # A delay is a hit like any other effect and honours @first: hits_probe calls the
 # operation twice, so @first=1 delays once per process.
 for lib in io net; do

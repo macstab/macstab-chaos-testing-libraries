@@ -3,6 +3,9 @@
  * @brief Runtime probe: calls the operation of one library's test rule twice.
  *
  * Usage: hits_probe io|net|dns|time|memory|process   (under LD_PRELOAD of that library)
+ *        hits_probe burst   (libchaos-io) opens the faulted file 100 times, waits
+ *                           past the hits interval, makes one unrelated call and
+ *                           prints the hits its own file reports while it runs
  *
  * Results are ignored; test_hits.sh checks the hits files the library wrote.
  */
@@ -15,6 +18,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -85,12 +89,50 @@ static void call_once(const char *lib)
     }
 }
 
+/** @brief The burst mode: the hits this process's file reports while it still runs. */
+static int burst(void)
+{
+    const struct timespec past_interval = {0, 200000000L};
+    char path[64];
+    char line[512];
+    unsigned long total = 0UL;
+    FILE *hits;
+    int index;
+
+    for (index = 0; index < 100; ++index)
+    {
+        call_once("io");
+    }
+    (void)nanosleep(&past_interval, NULL);
+    index = open("/tmp/elsewhere-unmatched", O_RDONLY);
+    if (index >= 0)
+    {
+        (void)close(index);
+    }
+    (void)snprintf(path, sizeof(path), "/tmp/.chaos-io.hits.%ld", (long)getpid());
+    hits = fopen(path, "r");
+    while (hits != NULL && fgets(line, sizeof(line), hits) != NULL)
+    {
+        total += strtoul(line, NULL, 10);
+    }
+    if (hits != NULL)
+    {
+        (void)fclose(hits);
+    }
+    (void)printf("%lu\n", total);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2)
     {
         (void)fprintf(stderr, "usage: %s io|net|dns|time|memory|process\n", argv[0]);
         return 2;
+    }
+    if (strcmp(argv[1], "burst") == 0)
+    {
+        return burst();
     }
     call_once(argv[1]);
     call_once(argv[1]);
