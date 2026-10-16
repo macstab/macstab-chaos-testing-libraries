@@ -591,6 +591,10 @@ Supported selector forms:
 - `udp4://8.8.8.8:53`
 - `udp6://[2001:db8::1]:53`
 - `unix:///var/run/docker.sock`
+- `unix://@name`: an abstract socket (D-Bus and friends), written as Linux shows
+  it in `/proc/net/unix`, `@` for each NUL of the name
+- `unix://*`: every unix socket, also an unnamed one (`socketpair()`, a client
+  that never bound)
 - `dns://api.example.com`
 - `*`
 

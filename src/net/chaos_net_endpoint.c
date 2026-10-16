@@ -566,9 +566,10 @@ chaos_net_endpoint_kind_from_socket(int fd, sa_family_t family, chaos_net_endpoi
  *     they are not relevant for config-file matching.
  *   - AF_UNIX: copies sun_path, bounded by both address_length and sizeof(sun_path)
  *     and terminated explicitly, because the field is neither guaranteed to be
- *     present nor guaranteed to be NUL-terminated. Rejects abstract paths
- *     (sun_path[0] == '\0') and an address_length that covers no path byte at all
- *     (unnamed sockets report address_length == sizeof(sa_family_t)).
+ *     present nor guaranteed to be NUL-terminated. An abstract name (sun_path[0]
+ *     == '\0') is written `@name`, each NUL as '@', as /proc/net/unix shows it; an
+ *     unnamed socket (address_length covers no path byte, as for socketpair()) gets
+ *     an empty name, matched by the wildcards only.
  *   - AF_INET6 with an IPv4-mapped address (::ffff:a.b.c.d): TCP4/UDP4 with
  *     the IPv4 address, so IPv4 rules match a dual-stack socket's IPv4 traffic.
  *   - Other families: rejected (return 0).
@@ -652,11 +653,9 @@ static int chaos_net_endpoint_from_sockaddr(
          *      legal on Linux, and strlen() would read past the caller's buffer.
          * address_length therefore bounds the path; anything at or below the sun_path
          * offset carries no path and is rejected. */
-        if ((size_t)address_length <= offsetof(struct sockaddr_un, sun_path))
-        {
-            return 0;
-        }
-        path_max = (size_t)address_length - offsetof(struct sockaddr_un, sun_path);
+        path_max = (size_t)address_length > offsetof(struct sockaddr_un, sun_path)
+                       ? (size_t)address_length - offsetof(struct sockaddr_un, sun_path)
+                       : 0U;
         if (path_max > sizeof(unix_address->sun_path))
         {
             path_max = sizeof(unix_address->sun_path);
@@ -665,11 +664,27 @@ static int chaos_net_endpoint_from_sockaddr(
         {
             return 0;
         }
-        /* Abstract UNIX sockets have a NUL as the first byte of sun_path.
-         * They cannot be represented as a config selector string, so reject them. */
+        /* An unnamed socket (socketpair(), a client never bound) has no name: an empty
+         * one, which only the wildcards match. */
+        if (path_max == 0U)
+        {
+            return 1;
+        }
+        /* An abstract socket's name starts with a NUL and may hold more of them. It is
+         * written as Linux shows it (/proc/net/unix): '@' for each NUL, so
+         * unix://@name selects it. */
         if (unix_address->sun_path[0] == '\0')
         {
-            return 0;
+            size_t index;
+
+            for (index = 0U; index < path_max; ++index)
+            {
+                const char ch = unix_address->sun_path[index];
+
+                endpoint->value.text[index] = ch == '\0' ? '@' : ch;
+            }
+            endpoint->value.text[path_max] = '\0';
+            return 1;
         }
         /* memchr rather than strnlen: it is C89 and carries no feature-test
          * visibility question across the glibc/musl build matrix. */

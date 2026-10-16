@@ -56,6 +56,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <sys/syscall.h>
 #include <stdlib.h>
@@ -1445,6 +1446,36 @@ static int probe_recv_rule_on_client_side(void)
     return 0;
 }
 
+/** @brief An abstract unix socket is selected as unix://@name, as Linux shows it. */
+static int probe_abstract_unix_connect(void)
+{
+    struct sockaddr_un address;
+    const socklen_t length = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 12U);
+    int listener;
+    int client;
+    int rc = write_config("unix://@chaos-probe:connect:ECONNREFUSED:1.0");
+
+    if (rc != 0)
+    {
+        return rc;
+    }
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, "\0chaos-probe", 12U);
+    listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    client = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (listener < 0 || client < 0 || bind(listener, (struct sockaddr *)&address, length) != 0 ||
+        listen(listener, 1) != 0)
+    {
+        return 240;
+    }
+    errno = 0;
+    rc = connect(client, (struct sockaddr *)&address, length);
+    close(client);
+    close(listener);
+    return rc == -1 && errno == ECONNREFUSED ? 0 : 241;
+}
+
 /**
  * @brief A kept DUP payload is replayed only on the socket it came from: after
  *        dup2() puts another connection under the number, that one is read for real.
@@ -1562,6 +1593,9 @@ int main(void)
     if (rc != 0)
         return rc;
     rc = probe_recv_rule_on_client_side();
+    if (rc != 0)
+        return rc;
+    rc = probe_abstract_unix_connect();
     if (rc != 0)
         return rc;
     rc = probe_recv_trickle_datagram();

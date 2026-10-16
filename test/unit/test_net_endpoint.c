@@ -407,7 +407,7 @@ static void test_selector_parsing_and_matching(void)
  * - AF_UNIX with "/tmp/chaos.sock" → UNIX, path matches; empty sun_path → false.
  * - AF_UNIX sun_path is bounded by address_length and by sizeof(sun_path): a fully
  *   filled, unterminated sun_path → UNIX with exactly sizeof(sun_path) characters;
- *   address_length == sizeof(sa_family_t) (unnamed socket) → false; a short
+ *   address_length == sizeof(sa_family_t) (unnamed socket) → an empty name; a short
  *   address_length → path truncated to what address_length covers.
  * - Local fd resolution via getsockname with IPv4/TCP4: endpoint.kind=TCP4.
  * - Peer fd resolution via getpeername with IPv4/TCP4: endpoint.kind=TCP4.
@@ -512,10 +512,26 @@ static void test_endpoint_resolution_from_sockaddr_and_fd(void)
     ));
     assert(endpoint.kind == CHAOS_NET_ENDPOINT_UNIX);
     assert(strcmp(endpoint.value.text, "/tmp/chaos.sock") == 0);
-    unix_address.sun_path[0] = '\0';
-    assert(!chaos_net_endpoint_from_sockaddr_fd(
-        7, (const struct sockaddr *)&unix_address, (socklen_t)sizeof(unix_address), &endpoint
-    ));
+    /* An abstract name is written as Linux shows it: '@' for each NUL. */
+    {
+        chaos_net_endpoint_t selector;
+
+        (void)memset(&unix_address, 0, sizeof(unix_address));
+        unix_address.sun_family = AF_UNIX;
+        (void)memcpy(unix_address.sun_path, "\0bus\0x", 6U);
+        assert(chaos_net_endpoint_from_sockaddr_fd(
+            7,
+            (const struct sockaddr *)&unix_address,
+            (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 6U),
+            &endpoint
+        ));
+        assert(endpoint.kind == CHAOS_NET_ENDPOINT_UNIX);
+        assert(strcmp(endpoint.value.text, "@bus@x") == 0);
+        assert(chaos_net_endpoint_parse_selector("unix://@bus@x", &selector));
+        assert(chaos_net_endpoint_matches(&selector, &endpoint, NULL));
+        assert(chaos_net_endpoint_parse_selector("unix://*", &selector));
+        assert(chaos_net_endpoint_matches(&selector, &endpoint, NULL));
+    }
     /* sun_path is bounded by address_length and by sizeof(sun_path) -- never by the
      * first NUL that happens to lie after the struct in memory. Here the bytes that
      * follow sun_path are also non-NUL, so an unbounded scan would run past the
@@ -534,13 +550,21 @@ static void test_endpoint_resolution_from_sockaddr_and_fd(void)
 
     /* An unnamed socket -- socketpair(2), or one that was never bound -- reports
      * address_length == sizeof(sa_family_t) and carries no sun_path at all. Nothing
-     * past address_length may be read, so the endpoint is not resolvable even when
-     * the memory behind the struct is non-NUL. */
-    (void)memset(&unix_address, 'x', sizeof(unix_address));
-    unix_address.sun_family = AF_UNIX;
-    assert(!chaos_net_endpoint_from_sockaddr(
-        7, (const struct sockaddr *)&unix_address, (socklen_t)sizeof(sa_family_t), &endpoint
-    ));
+     * past address_length is read: its name is empty, which only wildcards match. */
+    {
+        chaos_net_endpoint_t selector;
+
+        (void)memset(&unix_address, 'x', sizeof(unix_address));
+        unix_address.sun_family = AF_UNIX;
+        assert(chaos_net_endpoint_from_sockaddr(
+            7, (const struct sockaddr *)&unix_address, (socklen_t)sizeof(sa_family_t), &endpoint
+        ));
+        assert(endpoint.kind == CHAOS_NET_ENDPOINT_UNIX && endpoint.value.text[0] == '\0');
+        assert(chaos_net_endpoint_parse_selector("unix://*", &selector));
+        assert(chaos_net_endpoint_matches(&selector, &endpoint, NULL));
+        assert(chaos_net_endpoint_parse_selector("unix:///tmp/a.sock", &selector));
+        assert(!chaos_net_endpoint_matches(&selector, &endpoint, NULL));
+    }
 
     /* A caller may supply a sun_path with no NUL terminator as long as
      * address_length accounts for exactly the path bytes; the path ends there. */
