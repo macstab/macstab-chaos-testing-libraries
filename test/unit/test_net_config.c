@@ -1585,6 +1585,17 @@ static void test_vdso_lookup_rejects_bad_input(void)
     assert(chaos_clock_vdso_lookup((uintptr_t)getauxval(AT_SYSINFO_EHDR), NULL) == NULL);
     assert(first != 0U && chaos_clock_now_ns() >= first);
     assert(chaos_clock_checked_recently(&g_chaos_net_last_check_ns, 0U) == 0);
+
+    /* A lookup of the vDSO clock claimed by another process (the parent, forked in
+     * the middle of it) is taken over, not waited for. */
+    g_chaos_clock_state = 1;
+    g_chaos_clock_owner = (long)getpid() + 1L;
+    (void)chaos_clock_now_ns();
+    assert(g_chaos_clock_state == 2 && g_chaos_clock_owner == (long)getpid());
+    /* One of this process's own is in progress: the fallback, this time. */
+    g_chaos_clock_state = 1;
+    assert(chaos_clock_vdso() == NULL);
+    g_chaos_clock_state = 2;
 }
 
 /**

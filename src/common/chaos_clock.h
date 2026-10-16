@@ -132,6 +132,9 @@ static chaos_clock_vdso_fn g_chaos_clock_vdso = NULL;
 /** @brief Lookup state: 0 not done, 1 in progress, 2 done (g_chaos_clock_vdso is final). */
 static volatile int g_chaos_clock_state = 0;
 
+/** @brief Process that claimed the lookup (state 1). */
+static volatile long g_chaos_clock_owner = 0;
+
 /** @brief Finds the vDSO clock; run once, by whichever caller claims the lookup. */
 static void chaos_clock_find_vdso(void)
 {
@@ -147,17 +150,24 @@ static void chaos_clock_find_vdso(void)
  * @brief The vDSO clock, or NULL while it is unknown.
  *
  * @details Never waits: a caller that finds the lookup in progress -- another
- * thread, or this thread interrupted by a signal handler, or a child forked in the
- * middle of it -- gets NULL and uses the fallback for this call.
+ * thread, or this thread interrupted by a signal handler -- gets NULL and uses the
+ * fallback for this call. A child forked in the middle of a lookup finds it claimed
+ * by another process, which will never finish it here: it takes the lookup over
+ * instead of using the fallback for good.
  */
 static inline chaos_clock_vdso_fn chaos_clock_vdso(void)
 {
     if (g_chaos_clock_state != 2)
     {
+        if (g_chaos_clock_state == 1 && g_chaos_clock_owner != (long)getpid())
+        {
+            (void)__sync_bool_compare_and_swap(&g_chaos_clock_state, 1, 0);
+        }
         if (!__sync_bool_compare_and_swap(&g_chaos_clock_state, 0, 1))
         {
             return NULL;
         }
+        g_chaos_clock_owner = (long)getpid();
         chaos_clock_find_vdso();
         __sync_synchronize();
         g_chaos_clock_state = 2;
