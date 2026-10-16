@@ -543,7 +543,16 @@ static int chaos_net_parse_latency(const char *text, unsigned int *latency_ms)
     }
 
     value = strtoul(text, &end, 10);
-    if (end == text || *chaos_net_trim(end) != '\0')
+    if (end == text)
+    {
+        return -1;
+    }
+    /* Blanks may follow; the text itself is left as it is. */
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')
+    {
+        ++end;
+    }
+    if (*end != '\0')
     {
         return -1;
     }

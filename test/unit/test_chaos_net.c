@@ -98,6 +98,8 @@ static int g_stub_match_misses = 0;
 
 /** @brief When non-zero, `chaos_net_endpoint_from_sockaddr_fd` fills @p endpoint and returns 1. */
 static int g_stub_endpoint_from_sockaddr = 0;
+/** @brief Destination addresses looked up through the sockaddr stub. */
+static int g_sockaddr_lookups = 0;
 
 /** @brief When non-zero, `chaos_net_endpoint_from_socket_spec` fills @p endpoint and returns 1. */
 static int g_stub_endpoint_from_socket_spec = 0;
@@ -356,6 +358,7 @@ int chaos_net_endpoint_from_sockaddr_fd(
     (void)fd;
     (void)address;
     (void)address_length;
+    ++g_sockaddr_lookups;
     if (g_stub_endpoint_from_sockaddr == 0 || endpoint == NULL)
     {
         return 0;
@@ -2136,8 +2139,16 @@ static void test_direct_helper_paths(void)
     ts.tv_sec = 2;
     ts.tv_nsec = 1;
     assert(chaos_net_wait_timespec_ms(&ts) == 2001);
+    /* A timeout the kernel refuses (EINVAL) is left to the real call, as none. */
     ts.tv_sec = -1;
-    assert(chaos_net_wait_timespec_ms(&ts) == 0);
+    assert(chaos_net_wait_timespec_ms(&ts) == -1);
+    ts.tv_sec = 0;
+    ts.tv_nsec = 1000000000L;
+    assert(chaos_net_wait_timespec_ms(&ts) == -1);
+    tv.tv_sec = 0;
+    tv.tv_usec = 1000000L;
+    assert(chaos_net_wait_timeval_ms(&tv) == -1);
+    ts.tv_nsec = 1;
     ts.tv_sec = (time_t)INT32_MAX;
     assert(chaos_net_wait_timespec_ms(&ts) == INT32_MAX);
     tv.tv_sec = 1;
@@ -3144,9 +3155,13 @@ static void test_dup_replays_the_last_payload(void)
     rc = recv(4, buffer, sizeof(buffer), 0);
     assert(g_recv_calls == 4);
 
-    /* MSG_PEEK and a rule that does not fire receive for real. */
+    /* MSG_PEEK and a rule that does not fire receive for real; so does MSG_WAITALL,
+     * which a kept payload shorter than the buffer would answer short. */
     rc = recv(4, buffer, sizeof(buffer), MSG_PEEK);
     assert(g_recv_calls == 5);
+    rc = recv(4, buffer, sizeof(buffer), MSG_WAITALL);
+    assert(g_recv_calls == 6);
+    g_recv_calls = 5;
     g_should_trigger = 0;
     rc = recv(4, buffer, sizeof(buffer), 0);
     assert(g_recv_calls == 6);
@@ -3580,6 +3595,7 @@ static void test_wrappers_forward_inside_library(void)
     FD_SET(3, &readfds);
 
     g_chaos_net_tls_guard = 1;
+    g_sockaddr_lookups = 0;
     errno = 0;
     assert(bind(3, (const struct sockaddr *)&address, (socklen_t)sizeof(address)) == 0);
     assert(listen(3, 1) == 0);
@@ -3625,6 +3641,8 @@ static void test_wrappers_forward_inside_library(void)
     assert(g_accept_calls == 1);
 #endif
     assert(g_latency_calls == 0);
+    /* Nothing was looked up for calls the library makes itself. */
+    assert(g_sockaddr_lookups == 0);
     reset_wrapper_stubs();
 }
 
@@ -3871,7 +3889,7 @@ static void test_wait_sets_and_unmatched_descriptors(void)
 
     ts.tv_sec = 1;
     ts.tv_nsec = -1L;
-    assert(chaos_net_wait_timespec_ms(&ts) == 0);
+    assert(chaos_net_wait_timespec_ms(&ts) == -1);
     FD_ZERO(&writefds);
     FD_SET(4, &writefds);
     chaos_net_wait_clear_fdsets(NULL, &writefds, NULL);

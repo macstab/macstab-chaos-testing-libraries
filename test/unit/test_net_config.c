@@ -2005,9 +2005,10 @@ static void test_rule_checks_and_selection_order(void)
     chaos_net_endpoint_t endpoint;
     chaos_net_rule_t rules[2];
     chaos_net_rule_t rule;
-    /* Writable, like the line buffer of a real rule: the parser trims in place. */
-    char unit_suffix[] = "10ms";
-    char trailing_blanks[] = "10 \t";
+    /* The parser leaves its text as it is: string literals do. */
+    const char *unit_suffix = "10ms";
+    const char *trailing_blanks = "10 \t";
+    char kept[] = "10 x";
     unsigned int latency_ms = 7U;
     size_t rule_count = 0U;
     size_t index;
@@ -2016,6 +2017,7 @@ static void test_rule_checks_and_selection_order(void)
     assert(latency_ms == 7U);
     assert(chaos_net_parse_latency(trailing_blanks, &latency_ms) == 0);
     assert(latency_ms == 10U);
+    assert(chaos_net_parse_latency(kept, &latency_ms) == -1 && strcmp(kept, "10 x") == 0);
     assert(chaos_net_parse_latency("10", NULL) == -1);
 
     for (index = 0U; index < sizeof(every_operation) / sizeof(every_operation[0]); ++index)

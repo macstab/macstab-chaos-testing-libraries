@@ -680,6 +680,16 @@ int main(void)
             FD_SET(server, &readable);
             assert(PASSES(decide(__NR_select, (uint64_t)server + 1U, 0U, P(&readable), 0, 0, 0)));
             assert(PASSES(decide(__NR_select, (uint64_t)server + 1U, 0U, P(&readable), 0, 8U, 0)));
+            /* One the kernel refuses (EINVAL) is left to the real call. */
+            tick.tv_sec = 0;
+            tick.tv_usec = -5;
+            assert(
+                PASSES(decide(__NR_select, (uint64_t)server + 1U, 0U, P(&readable), 0, P(&tick), 0))
+            );
+            tick.tv_usec = 1000000L;
+            assert(
+                PASSES(decide(__NR_select, (uint64_t)server + 1U, 0U, P(&readable), 0, P(&tick), 0))
+            );
             assert(FD_ISSET(server, &readable));
         }
 #endif
@@ -712,11 +722,14 @@ int main(void)
             assert(decide(__NR_ppoll, P(set), 3U, P(&wait), 0, 0, 0).action == CHAOS_INIT_DELAY);
             assert(PASSES(decide(__NR_ppoll, P(set), 2U, P(&wait), 0, 0, 0)));
         }
-        /* A timeout that cannot be read is no timeout; a negative one is 0. */
+        /* A timeout that cannot be read is no timeout; one the kernel refuses
+         * (EINVAL) is left to the real call too. */
         assert(PASSES(decide(__NR_ppoll, P(polled), 2U, 8U, 0, 0, 0)));
         now.tv_sec = 0;
         now.tv_nsec = -1L;
-        assert(decide(__NR_ppoll, P(polled), 2U, P(&now), 0, 0, 0).action == CHAOS_INIT_RETURN);
+        assert(PASSES(decide(__NR_ppoll, P(polled), 2U, P(&now), 0, 0, 0)));
+        now.tv_nsec = 1000000000L;
+        assert(PASSES(decide(__NR_ppoll, P(polled), 2U, P(&now), 0, 0, 0)));
         now.tv_nsec = 0L;
         /* select sets: none for nfds 0, an unreadable one is skipped, and at most
          * CHAOS_INIT_NET_MAX_WAIT descriptors are looked at, the last one included. */
@@ -750,9 +763,8 @@ int main(void)
             FD_SET(server, &last); /* the 1025th: not looked at */
             assert(PASSES(decide(__NR_pselect6, FD_SETSIZE, P(&many), P(&last), 0, P(&wait), 0)));
         }
-        now.tv_sec = -1;
-        verdict = decide(__NR_ppoll, P(polled), 2U, P(&now), 0, 0, 0);
-        assert(verdict.action == CHAOS_INIT_RETURN);
+        now.tv_sec = -1; /* refused by the kernel: the real call reports it */
+        assert(PASSES(decide(__NR_ppoll, P(polled), 2U, P(&now), 0, 0, 0)));
         now.tv_sec = (time_t)INT32_MAX;
         verdict = decide(__NR_ppoll, P(polled), 2U, P(&now), 0, 0, 0);
         assert(verdict.action == CHAOS_INIT_DELAY && verdict.delay_ms == (unsigned)INT32_MAX);

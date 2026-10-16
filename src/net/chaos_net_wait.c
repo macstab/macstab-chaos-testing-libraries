@@ -410,16 +410,16 @@ chaos_net_wait_pre_call(const chaos_net_rule_t *rule, int64_t timeout_ms, int *s
     return chaos_net_wait_pre_call_masked(rule, timeout_ms, NULL, synthetic_timeout);
 }
 
-/** @brief Milliseconds of a timespec timeout, rounded up; -1 for none (NULL). */
+/**
+ * @brief Milliseconds of a timespec timeout, rounded up; -1 for none (NULL), and for
+ *        one the kernel refuses (EINVAL), which TIMEOUT then leaves to the real call.
+ */
 static int64_t chaos_net_wait_timespec_ms(const struct timespec *timeout)
 {
-    if (timeout == NULL)
+    if (timeout == NULL || timeout->tv_sec < 0 || timeout->tv_nsec < 0 ||
+        timeout->tv_nsec >= 1000000000L)
     {
         return -1;
-    }
-    if (timeout->tv_sec < 0 || timeout->tv_nsec < 0)
-    {
-        return 0;
     }
     if (timeout->tv_sec > (time_t)(INT32_MAX / 1000))
     {

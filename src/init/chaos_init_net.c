@@ -806,9 +806,9 @@ static int64_t chaos_init_net_timespec_ms(uint64_t address)
     {
         return -1;
     }
-    if (timeout.tv_sec < 0 || timeout.tv_nsec < 0)
+    if (timeout.tv_sec < 0 || timeout.tv_nsec < 0 || timeout.tv_nsec >= 1000000000L)
     {
-        return 0;
+        return -1; /* the kernel refuses it (EINVAL): left to the real call */
     }
     if (timeout.tv_sec > (time_t)(INT32_MAX / 1000))
     {
@@ -845,8 +845,8 @@ static int64_t chaos_init_net_wait_timeout(const chaos_init_call_t *call)
         {
             return -1;
         }
-        timeout.tv_usec = timeout.tv_usec < 0 ? 0 : timeout.tv_usec;
-        return timeout.tv_sec < 0 ? 0
+        return timeout.tv_sec < 0 || timeout.tv_usec < 0 || timeout.tv_usec >= 1000000L
+                   ? -1 /* the kernel refuses it (EINVAL): left to the real call */
                : timeout.tv_sec > (time_t)(INT32_MAX / 1000)
                    ? INT32_MAX
                    : (int64_t)timeout.tv_sec * 1000 + (timeout.tv_usec + 999L) / 1000L;

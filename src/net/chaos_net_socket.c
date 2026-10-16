@@ -920,16 +920,18 @@ static void chaos_net_dup_forget(int fd)
 
 /** @brief Receive flags under which DUP receives for real (nothing is consumed or kept). */
 #ifdef MSG_ERRQUEUE
-#define CHAOS_NET_DUP_SKIP_FLAGS (MSG_PEEK | MSG_TRUNC | MSG_OOB | MSG_ERRQUEUE)
+#define CHAOS_NET_DUP_SKIP_FLAGS (MSG_PEEK | MSG_TRUNC | MSG_OOB | MSG_WAITALL | MSG_ERRQUEUE)
 #else
-#define CHAOS_NET_DUP_SKIP_FLAGS (MSG_PEEK | MSG_TRUNC | MSG_OOB)
+#define CHAOS_NET_DUP_SKIP_FLAGS (MSG_PEEK | MSG_TRUNC | MSG_OOB | MSG_WAITALL)
 #endif
 
 /**
  * @brief Whether a receive of @p requested bytes with @p flags goes through DUP.
  *
  * @details Peeks consume nothing; MSG_TRUNC may report more than the buffer
- * holds; out-of-band and error-queue data is not the stream. An empty buffer
+ * holds; out-of-band and error-queue data is not the stream; MSG_WAITALL asks for
+ * the whole buffer, which a kept payload shorter than it would not give, as with
+ * TRICKLE. An empty buffer
  * is left alone too: a replay into it would return 0, which reads as EOF.
  */
 static int chaos_net_dups(const chaos_net_rule_t *rule, int flags, uint64_t requested)
@@ -1109,13 +1111,15 @@ CHAOS_NET_EXPORT ssize_t sendto(
 
     chaos_net_ensure_symbols();
 
-    /* Use the explicit destination if provided; fall back to getpeername for connected mode. */
-    matched =
-        address_ptr != NULL
-            ? chaos_net_endpoint_from_sockaddr_fd(sockfd, address_ptr, address_length, &endpoint) &&
-                  chaos_net_config_match_endpoint(CHAOS_NET_OP_SEND, &endpoint, &rule)
-            : chaos_net_match_connected(sockfd, CHAOS_NET_OP_SEND, 1, &rule);
-    if (chaos_net_in_internal() || !matched)
+    /* Use the explicit destination if provided; fall back to getpeername for connected
+     * mode. A call from inside the library is not looked at. */
+    matched = !chaos_net_in_internal() &&
+              (address_ptr != NULL
+                   ? chaos_net_endpoint_from_sockaddr_fd(
+                         sockfd, address_ptr, address_length, &endpoint
+                     ) && chaos_net_config_match_endpoint(CHAOS_NET_OP_SEND, &endpoint, &rule)
+                   : chaos_net_match_connected(sockfd, CHAOS_NET_OP_SEND, 1, &rule));
+    if (!matched)
     {
         return chaos_net_call_real_sendto(sockfd, buffer, size, flags, address_ptr, address_length);
     }
@@ -1143,15 +1147,16 @@ CHAOS_NET_EXPORT ssize_t sendmsg(int sockfd, const struct msghdr *message, int f
 
     chaos_net_ensure_symbols();
 
-    matched = message != NULL && message->msg_name != NULL
-                  ? chaos_net_endpoint_from_sockaddr_fd(
-                        sockfd,
-                        (const struct sockaddr *)message->msg_name,
-                        (socklen_t)message->msg_namelen,
-                        &endpoint
-                    ) && chaos_net_config_match_endpoint(CHAOS_NET_OP_SEND, &endpoint, &rule)
-                  : chaos_net_match_connected(sockfd, CHAOS_NET_OP_SEND, 1, &rule);
-    if (chaos_net_in_internal() || !matched)
+    matched = !chaos_net_in_internal() &&
+              (message != NULL && message->msg_name != NULL
+                   ? chaos_net_endpoint_from_sockaddr_fd(
+                         sockfd,
+                         (const struct sockaddr *)message->msg_name,
+                         (socklen_t)message->msg_namelen,
+                         &endpoint
+                     ) && chaos_net_config_match_endpoint(CHAOS_NET_OP_SEND, &endpoint, &rule)
+                   : chaos_net_match_connected(sockfd, CHAOS_NET_OP_SEND, 1, &rule));
+    if (!matched)
     {
         return chaos_net_call_real_sendmsg(sockfd, message, flags);
     }
