@@ -634,6 +634,30 @@ static void test_parse_line_and_buffer(void)
         char invalid_line[] = "fork:FAIL_AFTER:EAGAIN,1@2.0";
         assert(chaos_process_config_parse_line(invalid_line, &rule) < 0);
     }
+    /* The count is digits: no sign (strtoull would read -1 as the largest count,
+     * one that never fails), nothing past 64 bits, which would be cut to them. */
+    {
+        static const char *const counts[] = {
+            "fork:FAIL_AFTER:EAGAIN,-1",
+            "fork:FAIL_AFTER:EAGAIN,+1",
+            "fork:FAIL_AFTER:EAGAIN,x",
+            "fork:FAIL_AFTER:EAGAIN,18446744073709551616",
+        };
+        char largest[] = "fork:FAIL_AFTER:EAGAIN, 18446744073709551615";
+        size_t index;
+
+        for (index = 0U; index < sizeof(counts) / sizeof(counts[0]); ++index)
+        {
+            char line[64];
+
+            (void)strcpy(line, counts[index]);
+            errno = 1234;
+            assert(chaos_process_config_parse_line(line, &rule) < 0);
+            assert(errno == 1234);
+        }
+        assert(chaos_process_config_parse_line(largest, &rule) == 1);
+        assert(rule.fail_after_count == UINT64_MAX);
+    }
 
     assert(chaos_process_config_parse_buffer(buffer, rules, &rule_count) == 0);
     assert(rule_count == 4U);

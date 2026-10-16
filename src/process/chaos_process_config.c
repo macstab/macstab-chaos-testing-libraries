@@ -706,16 +706,29 @@ static int chaos_process_parse_latency(const char *text, unsigned int *latency_m
  */
 static int chaos_process_parse_fail_after_count(const char *text, uint64_t *count)
 {
+    const int saved_errno = errno;
     char *end = NULL;
     unsigned long long value;
+    int out_of_range;
 
     if (text == NULL || count == NULL)
     {
         return -1;
     }
-
+    while (*text == ' ' || *text == '\t')
+    {
+        ++text;
+    }
+    /* Digits only: strtoull() would take "-1" as the largest count, never failing. */
+    if (*text < '0' || *text > '9')
+    {
+        return -1;
+    }
+    errno = 0;
     value = strtoull(text, &end, 10);
-    if (end == text || *chaos_process_trim(end) != '\0')
+    out_of_range = errno == ERANGE;
+    errno = saved_errno;
+    if (out_of_range || *chaos_process_trim(end) != '\0')
     {
         return -1;
     }
