@@ -248,7 +248,7 @@ int main(void)
     struct epoll_event event;
     struct iovec vector[2];
     struct msghdr message;
-    struct mmsghdr messages[1];
+    struct mmsghdr messages[3];
     char rules[2048];
     char buffer[64] = "0123456789abcdefghij";
     fd_set readable;
@@ -389,6 +389,39 @@ int main(void)
     memset(messages, 0, sizeof(messages));
     messages[0].msg_hdr = message;
     assert(FAILS(decide(__NR_sendmmsg, (uint64_t)udp, P(messages), 1U, 0, 0, 0), ECONNREFUSED));
+    assert(PASSES(decide(__NR_sendmmsg, (uint64_t)udp, P(messages), 0U, 0, 0, 0))); /* no message */
+    assert(PASSES(decide(__NR_sendmmsg, (uint64_t)udp, 0U, 1U, 0, 0, 0)));          /* unreadable */
+    /* Every message of a batch is looked at, not only the first, as in the library. */
+    messages[0].msg_hdr.msg_name = &other_address;
+    messages[1].msg_hdr.msg_name = &other_address;
+    messages[1].msg_hdr.msg_namelen = sizeof(other_address);
+    messages[2].msg_hdr = message;
+    assert(PASSES(decide(__NR_sendmmsg, (uint64_t)udp, P(messages), 2U, 0, 0, 0)));
+    assert(FAILS(decide(__NR_sendmmsg, (uint64_t)udp, P(messages), 3U, 0, 0, 0), ECONNREFUSED));
+    /* A message without a destination goes to the connection: the client's peer,
+     * whose send rule needs @size>10 over the whole batch. */
+    memset(messages, 0, sizeof(messages));
+    messages[0].msg_hdr.msg_iov = vector;
+    messages[0].msg_hdr.msg_iovlen = 1U; /* 10 bytes */
+    messages[1].msg_hdr.msg_iov = vector;
+    messages[1].msg_hdr.msg_iovlen = 1U;
+    assert(PASSES(decide(__NR_sendmmsg, (uint64_t)client, P(messages), 1U, 0, 0, 0)));
+    assert(FAILS(decide(__NR_sendmmsg, (uint64_t)client, P(messages), 2U, 0, 0, 0), EPIPE));
+    messages[1].msg_hdr.msg_iov = (struct iovec *)8; /* unreadable: no size, no @size match */
+    assert(PASSES(decide(__NR_sendmmsg, (uint64_t)client, P(messages), 2U, 0, 0, 0)));
+    /* A named destination that does not resolve matches nothing: the connection's
+     * rule is not used in its place, as in the library. */
+    {
+        struct sockaddr bad;
+
+        memset(&bad, 0, sizeof(bad));
+        bad.sa_family = AF_APPLETALK;
+        assert(PASSES(decide(__NR_sendto, (uint64_t)client, P(buffer), 20U, 0, P(&bad), sizeof(bad))
+        ));
+        message.msg_name = &bad;
+        message.msg_namelen = sizeof(bad);
+        assert(PASSES(decide(__NR_sendmsg, (uint64_t)client, P(&message), 0, 0, 0, 0)));
+    }
     message.msg_name = NULL;
     /* No destination and no peer: matched by the socket's own address, the other end. */
     assert(FAILS(decide(__NR_sendmsg, (uint64_t)udp, P(&message), 0, 0, 0, 0), ECONNREFUSED));

@@ -306,7 +306,7 @@ typedef enum chaos_init_net_kind
     CHAOS_INIT_NET_ACTIVITY, /**< Own address, else the peer. */
     CHAOS_INIT_NET_SENDTO,   /**< sendto(): the destination argument, else the peer. */
     CHAOS_INIT_NET_SENDMSG,  /**< sendmsg(): msg_name, else the peer. */
-    CHAOS_INIT_NET_SENDMMSG, /**< sendmmsg(): the first message's msg_name, else the peer. */
+    CHAOS_INIT_NET_SENDMMSG, /**< sendmmsg(): the first message whose msg_name or peer matches. */
     CHAOS_INIT_NET_POLL,     /**< poll()/ppoll(): every descriptor of the pollfd array. */
     CHAOS_INIT_NET_SELECT,   /**< select()/pselect6(): every descriptor of the sets. */
     CHAOS_INIT_NET_EPOLL     /**< epoll_wait()/epoll_pwait(): the instance's descriptors. */
@@ -319,7 +319,7 @@ typedef struct chaos_init_net_call
     chaos_init_net_kind_t kind;
     int shared; /**< Also an io call: a net call only on a socket. */
     int size;   /**< Argument index of the byte count; -1 none, -2 iovec (args 1-2),
-                     -3 a msghdr (arg 1). */
+                     -3 a msghdr (arg 1), -4 an mmsghdr batch (args 1-2). */
 } chaos_init_net_call_t;
 
 static const chaos_init_net_call_t g_chaos_init_net_calls[] = {
@@ -332,7 +332,7 @@ static const chaos_init_net_call_t g_chaos_init_net_calls[] = {
     {__NR_shutdown, CHAOS_NET_OP_SHUTDOWN, CHAOS_INIT_NET_ACTIVITY, 0, -1},
     {__NR_sendto, CHAOS_NET_OP_SEND, CHAOS_INIT_NET_SENDTO, 0, 2},
     {__NR_sendmsg, CHAOS_NET_OP_SEND, CHAOS_INIT_NET_SENDMSG, 0, -3},
-    {__NR_sendmmsg, CHAOS_NET_OP_SEND, CHAOS_INIT_NET_SENDMMSG, 0, -1},
+    {__NR_sendmmsg, CHAOS_NET_OP_SEND, CHAOS_INIT_NET_SENDMMSG, 0, -4},
     {__NR_recvfrom, CHAOS_NET_OP_RECV, CHAOS_INIT_NET_LOCAL, 0, 2},
     {__NR_recvmsg, CHAOS_NET_OP_RECV, CHAOS_INIT_NET_LOCAL, 0, -3},
     {__NR_recvmmsg, CHAOS_NET_OP_RECV, CHAOS_INIT_NET_LOCAL, 0, -1},
@@ -475,16 +475,48 @@ static uint64_t chaos_init_net_message_size(uint64_t address)
     );
 }
 
-/** @brief The destination a message in the thread's memory names (msg_name); 0 when none. */
+/** @brief Most messages the kernel moves in one sendmmsg call (UIO_MAXIOV), as in the library. */
+#define CHAOS_INIT_NET_MMSG_MAX 1024U
+
+/** @brief Bytes of a sendmmsg batch (its first messages); CHAOS_POLICY_NO_SIZE if unknown. */
+static uint64_t chaos_init_net_batch_size(uint64_t address, uint64_t vlen)
+{
+    const uint64_t count = vlen < CHAOS_INIT_NET_MMSG_MAX ? vlen : CHAOS_INIT_NET_MMSG_MAX;
+    uint64_t total = 0U;
+    uint64_t index;
+
+    for (index = 0U; index < count; ++index)
+    {
+        const uint64_t part = chaos_init_net_message_size(address + index * sizeof(struct mmsghdr));
+
+        if (part == CHAOS_POLICY_NO_SIZE || part > UINT64_MAX / 2U - total)
+        {
+            return CHAOS_POLICY_NO_SIZE;
+        }
+        total += part;
+    }
+    return total;
+}
+
+/**
+ * @brief The destination a message in the thread's memory names (msg_name).
+ * @return 1 resolved, 0 named but not resolved, -1 none named, -2 unreadable.
+ */
 static int chaos_init_net_message(int fd, uint64_t address, chaos_net_endpoint_t *endpoint)
 {
     struct msghdr message;
 
-    return chaos_init_read_memory(g_chaos_init_net_tid, address, &message, sizeof(message)) == 0 &&
-           message.msg_name != NULL &&
-           chaos_init_net_sockaddr(
-               fd, (uint64_t)(uintptr_t)message.msg_name, (uint64_t)message.msg_namelen, endpoint
-           );
+    if (chaos_init_read_memory(g_chaos_init_net_tid, address, &message, sizeof(message)) != 0)
+    {
+        return -2;
+    }
+    if (message.msg_name == NULL)
+    {
+        return -1;
+    }
+    return chaos_init_net_sockaddr(
+        fd, (uint64_t)(uintptr_t)message.msg_name, (uint64_t)message.msg_namelen, endpoint
+    );
 }
 
 /**
@@ -507,6 +539,44 @@ static int chaos_init_net_match_ends(
     return (peer_first ? chaos_net_endpoint_from_local_fd(fd, &endpoint)
                        : chaos_net_endpoint_from_peer_fd(fd, &endpoint)) &&
            chaos_net_config_match_endpoint_loaded(operation, &endpoint, rule);
+}
+
+/**
+ * @brief The SEND rule for a sendmmsg batch: the first message whose destination
+ *        matches, the connection standing for every message without one, as the
+ *        library scans it (chaos_net_extra.c).
+ */
+static int
+chaos_init_net_match_batch(int fd, uint64_t address, uint64_t vlen, chaos_net_rule_t *rule)
+{
+    const uint64_t count = vlen < CHAOS_INIT_NET_MMSG_MAX ? vlen : CHAOS_INIT_NET_MMSG_MAX;
+    int connected_checked = 0;
+    uint64_t index;
+
+    for (index = 0U; index < count; ++index)
+    {
+        chaos_net_endpoint_t endpoint;
+        const int named =
+            chaos_init_net_message(fd, address + index * sizeof(struct mmsghdr), &endpoint);
+
+        if (named == -2)
+        {
+            return 0; /* the kernel fails the call (EFAULT) */
+        }
+        if (named > 0 && chaos_net_config_match_endpoint_loaded(CHAOS_NET_OP_SEND, &endpoint, rule))
+        {
+            return 1;
+        }
+        if (named < 0 && !connected_checked)
+        {
+            connected_checked = 1;
+            if (chaos_init_net_match_ends(fd, CHAOS_NET_OP_SEND, 1, rule))
+            {
+                return 1;
+            }
+        }
+    }
+    return 0;
 }
 
 /** @brief Matches the first descriptor of @p fds with an endpoint and a POLL rule. */
@@ -655,18 +725,25 @@ static int chaos_init_net_match(
         break;
     case CHAOS_INIT_NET_SENDTO:
     case CHAOS_INIT_NET_SENDMSG:
-    case CHAOS_INIT_NET_SENDMMSG:
-        /* The destination named in the call, else either end of the connection. For
-         * sendmmsg the first message stands for the batch, as in the library: its
-         * msghdr opens the first mmsghdr. */
-        if (entry->kind == CHAOS_INIT_NET_SENDTO
-                ? chaos_init_net_sockaddr(fd, call->args[4], call->args[5], &endpoint)
-                : chaos_init_net_message(fd, call->args[1], &endpoint))
+    {
+        /* The destination named in the call, else either end of the connection. A
+         * destination that does not resolve matches nothing, as in the library. */
+        const int named =
+            entry->kind == CHAOS_INIT_NET_SENDTO
+                ? (call->args[4] == 0U
+                       ? -1
+                       : chaos_init_net_sockaddr(fd, call->args[4], call->args[5], &endpoint))
+                : chaos_init_net_message(fd, call->args[1], &endpoint);
+
+        if (named >= 0)
         {
-            found = 1;
+            found = named;
             break;
         }
         return chaos_init_net_match_ends(fd, entry->operation, 1, rule);
+    }
+    case CHAOS_INIT_NET_SENDMMSG:
+        return chaos_init_net_match_batch(fd, call->args[1], call->args[2], rule);
     case CHAOS_INIT_NET_POLL:
         return chaos_init_net_match_any(
             fds, chaos_init_net_poll_fds(call->args[0], call->args[1], fds), rule
@@ -841,6 +918,11 @@ int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *v
     }
     verdict->action = CHAOS_INIT_PASS;
     g_chaos_init_net_tid = call->tid;
+    if (!chaos_net_config_prepare() || !chaos_init_net_match(entry, call, &rule))
+    {
+        return 1;
+    }
+    /* Measured only for a call a rule matched: a batch takes a read per message. */
     if (entry->size >= 0)
     {
         size = call->args[entry->size];
@@ -853,9 +935,9 @@ int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *v
     {
         size = chaos_init_net_message_size(call->args[1]);
     }
-    if (!chaos_net_config_prepare() || !chaos_init_net_match(entry, call, &rule))
+    else if (entry->size == -4)
     {
-        return 1;
+        size = chaos_init_net_batch_size(call->args[1], call->args[2]);
     }
     /* Only ERRNO, LATENCY and TIMEOUT rules get here (see chaos_init_net_supported).
      * A wait without a timeout never times out: TIMEOUT does not apply to it. */
