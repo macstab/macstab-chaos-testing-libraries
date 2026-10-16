@@ -29,9 +29,10 @@ typedef enum chaos_init_action
 typedef struct chaos_init_verdict
 {
     chaos_init_action_t action;
-    int error;
+    int error; /**< FAIL, or DELAY that then fails: the error number. */
     unsigned delay_ms;
-    long value;
+    long value;  /**< RETURN, or DELAY that then returns: the value. */
+    int returns; /**< DELAY: returns `value` when due instead of running. */
 } chaos_init_verdict_t;
 
 #endif

@@ -177,6 +177,11 @@ expect "Go: another port dials" "$($init --libs net -- $go dial 7779)" "ok"
 at_least "Go: recv LATENCY delays the server read" "$($init --libs net -- $go recvms 7778)" 150
 expect "Go: io and net together" "$($init --libs io,net -- $go open /tmp/sec/data/x) $($init --libs io,net -- $go dial 7777)" "EIO ECONNREFUSED"
 expect "net status reports the rules" "$(head -2 /tmp/.chaos-net.status | tr "\n" " ")" "state=ok rules=2 "
+printf "%s\n" "tcp4://127.0.0.1:7781:poll:TIMEOUT:1.0 # t" > /tmp/.chaos-net.conf
+expect "C: TIMEOUT waits out select and poll, with nothing left ready" \
+    "$($init --libs net -- /tmp/probe waits 7781)" "select=0,0,waited poll=0,0 forever=1"
+printf "%s\n" "tcp4://127.0.0.1:7777:connect:ECONNREFUSED:1.0 # t" \
+    "tcp4://127.0.0.1:7778:recv:LATENCY:150 # t" > /tmp/.chaos-net.conf
 
 printf "%s\n" "mmap/anon:ERRNO:ENOMEM @size>1234566 @size<1234568 # t" > /tmp/.chaos-memory.conf
 expect "C: mmap rule fails a mapping of its size" "$($init --libs memory -- /tmp/probe mmap 1234567)" "ENOMEM"

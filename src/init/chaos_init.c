@@ -333,17 +333,20 @@ chaos_init_answer(int listener, unsigned libs, void *request, void *response, si
     {
         return;
     }
-    if (verdict.action == CHAOS_INIT_DELAY &&
-        chaos_init_delay_add(
-            notification->id, &call, chaos_init_now_ms() + verdict.delay_ms, verdict.error
-        ) == 0)
-    {
-        return;
-    }
     if (verdict.action == CHAOS_INIT_DELAY)
     {
+        const chaos_init_verdict_t answer = chaos_init_delay_answer(&verdict);
+
+        /* The clock is read in whole milliseconds, rounded down: one more keeps a
+         * delay from ending up to a millisecond short. */
+        if (chaos_init_delay_add(
+                notification->id, &call, chaos_init_now_ms() + verdict.delay_ms + 1U, &answer
+            ) == 0)
+        {
+            return;
+        }
         /* The queue is full: no delay, the rest of the verdict now. */
-        verdict.action = verdict.error != 0 ? CHAOS_INIT_FAIL : CHAOS_INIT_PASS;
+        verdict = answer;
     }
     chaos_init_reply(listener, notification->id, &verdict, response, response_size);
 }
@@ -362,10 +365,8 @@ static void chaos_init_on_time(int timer, int listener, void *response, size_t r
 
     chaos_init_verdict_t due_verdict;
 
-    memset(&due_verdict, 0, sizeof(due_verdict));
-    while (chaos_init_delay_pop(now, &id, &due_verdict.error))
+    while (chaos_init_delay_pop(now, &id, &due_verdict))
     {
-        due_verdict.action = due_verdict.error != 0 ? CHAOS_INIT_FAIL : CHAOS_INIT_PASS;
         chaos_init_reply(listener, id, &due_verdict, response, response_size);
     }
     if (chaos_init_tracee_pending() && now - last_flush_ms >= CHAOS_HITS_INTERVAL_MS)

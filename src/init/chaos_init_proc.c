@@ -36,6 +36,26 @@ int chaos_init_read_memory(pid_t pid, uint64_t address, void *out, size_t size)
     return 0;
 }
 
+int chaos_init_write_memory(pid_t pid, uint64_t address, const void *data, size_t size)
+{
+    struct iovec local;
+    struct iovec remote;
+
+    local.iov_base = (void *)(uintptr_t)data;
+    local.iov_len = size;
+    remote.iov_base = (void *)(uintptr_t)address;
+    remote.iov_len = size;
+    if (process_vm_writev(pid, &local, 1, &remote, 1, 0) != (ssize_t)size)
+    {
+        if (errno == 0)
+        {
+            errno = EFAULT;
+        }
+        return -1;
+    }
+    return 0;
+}
+
 long chaos_init_read_string(pid_t pid, uint64_t address, char *out, size_t size)
 {
     size_t length = 0U;

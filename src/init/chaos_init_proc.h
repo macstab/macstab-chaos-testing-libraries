@@ -22,6 +22,12 @@
 int chaos_init_read_memory(pid_t pid, uint64_t address, void *out, size_t size);
 
 /**
+ * @brief Copies @p size bytes of @p data to @p address of process @p pid.
+ * @return 0, or -1 with errno set.
+ */
+int chaos_init_write_memory(pid_t pid, uint64_t address, const void *data, size_t size);
+
+/**
  * @brief Copies the NUL-terminated string at @p address of @p pid into @p out.
  *
  * @details Reads page by page, so a string that ends just before an unmapped page

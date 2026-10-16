@@ -58,6 +58,7 @@ static ssize_t test_getxattr(const char *path, const char *name, void *value, si
 #include <arpa/inet.h>
 #include <assert.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 
 static chaos_init_verdict_t
 decide(int nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
@@ -395,19 +396,68 @@ int main(void)
     /* Own address, else peer. */
     assert(FAILS(decide(__NR_shutdown, (uint64_t)server, SHUT_RDWR, 0, 0, 0, 0), ENOTCONN));
 
-    /* The poll family: any socket in the set with a rule; TIMEOUT returns 0. */
-    polled[0].fd = pipe_fds[0];
-    polled[1].fd = server;
-    verdict = decide(__NR_ppoll, P(polled), 2U, 0, 0, 0, 0);
-    assert(verdict.action == CHAOS_INIT_RETURN && verdict.value == 0);
-    assert(PASSES(decide(__NR_ppoll, P(polled), 1U, 0, 0, 0, 0)));
-    assert(PASSES(decide(__NR_ppoll, 0U, 2U, 0, 0, 0, 0)));
-    FD_ZERO(&readable);
-    FD_SET(server, &readable);
-    assert(
-        decide(__NR_pselect6, (uint64_t)server + 1U, 0U, P(&readable), 0, 0, 0).action ==
-        CHAOS_INIT_RETURN
-    );
+    /* The poll family: any socket in the set with a rule. TIMEOUT waits out the
+     * call's timeout and returns 0, with nothing ready in the caller's buffers; a
+     * wait without a timeout never times out. */
+    {
+        struct timespec wait = {0, 5000000L};
+        struct timespec now = {0, 0L};
+
+        polled[0].fd = pipe_fds[0];
+        polled[1].fd = server;
+        polled[0].revents = POLLIN;
+        polled[1].revents = POLLIN | POLLOUT;
+        verdict = decide(__NR_ppoll, P(polled), 2U, P(&wait), 0, 0, 0);
+        assert(verdict.action == CHAOS_INIT_DELAY && verdict.delay_ms == 5U);
+        assert(verdict.returns == 1 && verdict.value == 0);
+        assert(polled[0].revents == 0 && polled[1].revents == 0);
+        verdict = decide(__NR_ppoll, P(polled), 2U, P(&now), 0, 0, 0);
+        assert(verdict.action == CHAOS_INIT_RETURN && verdict.value == 0);
+        assert(PASSES(decide(__NR_ppoll, P(polled), 2U, 0U, 0, 0, 0))); /* no timeout */
+        assert(PASSES(decide(__NR_ppoll, P(polled), 1U, P(&wait), 0, 0, 0)));
+        assert(PASSES(decide(__NR_ppoll, 0U, 2U, P(&wait), 0, 0, 0)));
+        FD_ZERO(&readable);
+        FD_SET(server, &readable);
+        verdict = decide(__NR_pselect6, (uint64_t)server + 1U, 0U, P(&readable), 0, P(&wait), 0);
+        assert(verdict.action == CHAOS_INIT_DELAY && verdict.returns == 1);
+        assert(!FD_ISSET(server, &readable));
+        FD_SET(server, &readable);
+        assert(PASSES(decide(__NR_pselect6, (uint64_t)server + 1U, 0U, P(&readable), 0, 0, 0)));
+        assert(FD_ISSET(server, &readable));
+#ifdef __NR_select
+        {
+            struct timeval tick = {0, 1500};
+
+            verdict = decide(__NR_select, (uint64_t)server + 1U, 0U, P(&readable), 0, P(&tick), 0);
+            assert(verdict.action == CHAOS_INIT_DELAY && verdict.delay_ms == 2U);
+            assert(!FD_ISSET(server, &readable) && tick.tv_usec == 0);
+        }
+#endif
+#ifdef __NR_poll
+        verdict = decide(__NR_poll, P(polled), 2U, 7U, 0, 0, 0);
+        assert(verdict.action == CHAOS_INIT_DELAY && verdict.delay_ms == 7U);
+        assert(PASSES(decide(__NR_poll, P(polled), 2U, (uint64_t)-1, 0, 0, 0)));
+#endif
+        /* A pollfd array the caller cannot have written to: cleared as far as it goes. */
+        {
+            struct pollfd *locked =
+                mmap(NULL, 4096U, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+            assert(locked != MAP_FAILED);
+            memcpy(locked, polled, 2U * sizeof(*polled));
+            locked[1].revents = POLLIN;
+            assert(mprotect(locked, 4096U, PROT_READ) == 0);
+            verdict = decide(__NR_ppoll, P(locked), 2U, P(&wait), 0, 0, 0);
+            assert(verdict.action == CHAOS_INIT_DELAY && locked[1].revents == POLLIN);
+            (void)munmap(locked, 4096U);
+        }
+        now.tv_sec = -1;
+        verdict = decide(__NR_ppoll, P(polled), 2U, P(&now), 0, 0, 0);
+        assert(verdict.action == CHAOS_INIT_RETURN);
+        now.tv_sec = (time_t)INT32_MAX;
+        verdict = decide(__NR_ppoll, P(polled), 2U, P(&now), 0, 0, 0);
+        assert(verdict.action == CHAOS_INIT_DELAY && verdict.delay_ms == (unsigned)INT32_MAX);
+    }
     epoll_fd = epoll_create1(0);
     memset(&event, 0, sizeof(event));
     event.events = EPOLLIN;
@@ -416,6 +466,15 @@ int main(void)
         decide(__NR_epoll_pwait, (uint64_t)epoll_fd, 0, 1U, 0, 0, 0).action == CHAOS_INIT_RETURN
     );
     assert(PASSES(decide(__NR_epoll_pwait, 999U, 0, 1U, 0, 0, 0)));
+    assert(PASSES(decide(__NR_epoll_pwait, (uint64_t)epoll_fd, 0, 1U, (uint64_t)-1, 0, 0)));
+#ifdef __NR_epoll_pwait2
+    {
+        struct timespec wait = {0, 3000000L};
+
+        verdict = decide(__NR_epoll_pwait2, (uint64_t)epoll_fd, 0, 1U, P(&wait), 0, 0);
+        assert(verdict.action == CHAOS_INIT_DELAY && verdict.delay_ms == 3U);
+    }
+#endif
 
     /* A process that ended is not counted, and its call runs. */
     g_fail_process = 1;

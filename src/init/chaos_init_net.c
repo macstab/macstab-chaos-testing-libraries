@@ -560,6 +560,12 @@ static size_t chaos_init_net_poll_fds(uint64_t address, uint64_t count, int *fds
     return found;
 }
 
+/** @brief Bytes of an fd_set that @p nfds descriptors take (whole 64-bit words). */
+static size_t chaos_init_net_set_bytes(int nfds)
+{
+    return nfds <= 0 ? 0U : ((size_t)nfds + 63U) / 64U * 8U;
+}
+
 /** @brief The descriptors set in the fd_sets of a select call. */
 static size_t chaos_init_net_select_fds(const chaos_init_call_t *call, int *fds)
 {
@@ -572,8 +578,12 @@ static size_t chaos_init_net_select_fds(const chaos_init_call_t *call, int *fds)
         fd_set bits;
         int fd;
 
+        /* Only the bytes nfds covers: a smaller set may end where its mapping does. */
+        memset(&bits, 0, sizeof(bits));
         if (call->args[set] == 0U ||
-            chaos_init_read_memory(g_chaos_init_net_tid, call->args[set], &bits, sizeof(bits)) != 0)
+            chaos_init_read_memory(
+                g_chaos_init_net_tid, call->args[set], &bits, chaos_init_net_set_bytes(count)
+            ) != 0)
         {
             continue;
         }
@@ -679,12 +689,140 @@ static int chaos_init_net_is_socket(pid_t tid, uint64_t fd)
            strncmp(link, "socket:", 7U) == 0;
 }
 
+/** @brief Milliseconds of a timespec at @p address of the thread, rounded up; -1 for none. */
+static int64_t chaos_init_net_timespec_ms(uint64_t address)
+{
+    struct timespec timeout;
+
+    if (address == 0U ||
+        chaos_init_read_memory(g_chaos_init_net_tid, address, &timeout, sizeof(timeout)) != 0)
+    {
+        return -1;
+    }
+    if (timeout.tv_sec < 0 || timeout.tv_nsec < 0)
+    {
+        return 0;
+    }
+    if (timeout.tv_sec > (time_t)(INT32_MAX / 1000))
+    {
+        return INT32_MAX;
+    }
+    return (int64_t)timeout.tv_sec * 1000 + (timeout.tv_nsec + 999999L) / 1000000L;
+}
+
+/**
+ * @brief The timeout of wait call @p call in milliseconds, as the library reads it;
+ *        -1 when it waits without one (or the timeout cannot be read).
+ */
+static int64_t chaos_init_net_wait_timeout(const chaos_init_call_t *call)
+{
+    switch (call->nr)
+    {
+    case __NR_ppoll:
+        return chaos_init_net_timespec_ms(call->args[2]);
+    case __NR_pselect6:
+        return chaos_init_net_timespec_ms(call->args[4]);
+#ifdef __NR_epoll_pwait2
+    case __NR_epoll_pwait2:
+        return chaos_init_net_timespec_ms(call->args[3]);
+#endif
+#ifdef __NR_select
+    case __NR_select:
+    {
+        struct timeval timeout;
+
+        if (call->args[4] == 0U ||
+            chaos_init_read_memory(
+                g_chaos_init_net_tid, call->args[4], &timeout, sizeof(timeout)
+            ) != 0)
+        {
+            return -1;
+        }
+        timeout.tv_usec = timeout.tv_usec < 0 ? 0 : timeout.tv_usec;
+        return timeout.tv_sec < 0 ? 0
+               : timeout.tv_sec > (time_t)(INT32_MAX / 1000)
+                   ? INT32_MAX
+                   : (int64_t)timeout.tv_sec * 1000 + (timeout.tv_usec + 999L) / 1000L;
+    }
+#endif
+#ifdef __NR_poll
+    case __NR_poll:
+        return (int)call->args[2] < 0 ? -1 : (int64_t)(int)call->args[2];
+#endif
+    default: /* epoll_wait, epoll_pwait: milliseconds in the fourth argument */
+        return (int)call->args[3] < 0 ? -1 : (int64_t)(int)call->args[3];
+    }
+}
+
+/**
+ * @brief Writes "nothing ready" into the buffers of wait call @p call, as a real
+ *        timeout leaves them: revents cleared, the descriptor sets emptied, and
+ *        select()'s timeout at 0. epoll writes no event, so nothing to do.
+ */
+static void chaos_init_net_clear_ready(const chaos_init_call_t *call)
+{
+    static const char zeros[sizeof(fd_set)];
+    const int nr = call->nr;
+
+    if (nr == __NR_ppoll
+#ifdef __NR_poll
+        || nr == __NR_poll
+#endif
+    )
+    {
+        const uint64_t count =
+            call->args[1] < CHAOS_INIT_NET_MAX_WAIT ? call->args[1] : CHAOS_INIT_NET_MAX_WAIT;
+        uint64_t index;
+
+        for (index = 0U; index < count; ++index)
+        {
+            const uint64_t address =
+                call->args[0] + index * sizeof(struct pollfd) + offsetof(struct pollfd, revents);
+            const short none = 0;
+
+            if (chaos_init_write_memory(g_chaos_init_net_tid, address, &none, sizeof(none)) != 0)
+            {
+                break;
+            }
+        }
+        return;
+    }
+    if (nr == __NR_pselect6
+#ifdef __NR_select
+        || nr == __NR_select
+#endif
+    )
+    {
+        const int nfds = (int)call->args[0] < FD_SETSIZE ? (int)call->args[0] : FD_SETSIZE;
+        int set;
+
+        for (set = 1; set <= 3; ++set)
+        {
+            if (call->args[set] != 0U)
+            {
+                (void)chaos_init_write_memory(
+                    g_chaos_init_net_tid, call->args[set], zeros, chaos_init_net_set_bytes(nfds)
+                );
+            }
+        }
+#ifdef __NR_select
+        if (nr == __NR_select && call->args[4] != 0U)
+        {
+            const struct timeval none = {0, 0};
+
+            (void)chaos_init_write_memory(g_chaos_init_net_tid, call->args[4], &none, sizeof(none));
+        }
+#endif
+    }
+}
+
 int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *verdict)
 {
     const chaos_init_net_call_t *entry = NULL;
     const chaos_net_config_state_t *state;
     chaos_net_rule_t rule;
     uint64_t size = CHAOS_POLICY_NO_SIZE;
+    int64_t timeout_ms = -1;
     size_t index;
 
     for (index = 0U; index < sizeof(g_chaos_init_net_calls) / sizeof(g_chaos_init_net_calls[0]);
@@ -718,7 +856,13 @@ int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *v
     {
         return 1;
     }
-    /* Only ERRNO, LATENCY and TIMEOUT rules get here (see chaos_init_net_supported). */
+    /* Only ERRNO, LATENCY and TIMEOUT rules get here (see chaos_init_net_supported).
+     * A wait without a timeout never times out: TIMEOUT does not apply to it. */
+    if (rule.effect == CHAOS_NET_EFFECT_TIMEOUT &&
+        (timeout_ms = chaos_init_net_wait_timeout(call)) < 0)
+    {
+        return 1;
+    }
     /* The rule's counters are the calling process's, not the snapshot's. */
     state = chaos_net_config_active_state();
     rule.call_size = size;
@@ -742,7 +886,11 @@ int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *v
     }
     else
     {
-        verdict->action = CHAOS_INIT_RETURN;
+        /* Nothing became ready within the timeout: waited out, then 0. */
+        chaos_init_net_clear_ready(call);
+        verdict->action = timeout_ms > 0 ? CHAOS_INIT_DELAY : CHAOS_INIT_RETURN;
+        verdict->delay_ms = (unsigned)timeout_ms;
+        verdict->returns = 1;
         verdict->value = 0;
     }
     return 1;

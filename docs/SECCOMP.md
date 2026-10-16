@@ -68,7 +68,7 @@ images.
 | Library | Applied | Matched on |
 |---|---|---|
 | io | ERRNO, LATENCY on open, read, write, pread, pwrite, close (LATENCY), fsync, fdatasync, truncate, allocate, unlink, rename | the path: absolute, or joined to `/proc/<pid>/cwd` or the directory fd; fds through `/proc/<pid>/fd` |
-| net | ERRNO, LATENCY on socket, bind, listen, connect, accept, shutdown, send, recv, close (LATENCY), poll; TIMEOUT on the poll family | the endpoint: sockaddr arguments from memory, a socket's own address and peer from `/proc/<pid>/net/*`, its type from its `system.sockprotoname` attribute |
+| net | ERRNO, LATENCY on socket, bind, listen, connect, accept, shutdown, send, recv, close (LATENCY), poll; TIMEOUT on the poll family (as in the library: the wait's own timeout is waited out, its revents and descriptor sets are cleared, select's timeout reads 0; a wait without a timeout is left alone) | the endpoint: sockaddr arguments from memory, a socket's own address and peer from `/proc/<pid>/net/*`, its type from its `system.sockprotoname` attribute |
 | memory | ERRNO, LATENCY on mmap (anon/file), munmap, mprotect, madvise | the arguments (flags, length for `@size`) |
 | process | ERRNO, LATENCY, FAIL_AFTER on pthread_create, fork, posix_spawn, execve, execveat, waitpid | the system call and clone's flags (§5) |
 | dns, time | nothing (§6) | |

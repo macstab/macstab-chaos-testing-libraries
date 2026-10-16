@@ -18,10 +18,18 @@
 #define CHAOS_INIT_MAX_DELAYED 1024U
 
 /**
- * @brief Parks notification @p id of @p call until @p due_ms; then it fails with
- *        @p error, or runs when @p error is 0. @return 0, or -1 when full.
+ * @brief The answer a DELAY verdict ends in: it fails with its error, returns its
+ *        value (`returns`), or runs.
  */
-int chaos_init_delay_add(uint64_t id, const chaos_init_call_t *call, uint64_t due_ms, int error);
+chaos_init_verdict_t chaos_init_delay_answer(const chaos_init_verdict_t *verdict);
+
+/**
+ * @brief Parks notification @p id of @p call until @p due_ms, when it gets
+ *        @p answer (PASS, FAIL or RETURN). @return 0, or -1 when full.
+ */
+int chaos_init_delay_add(
+    uint64_t id, const chaos_init_call_t *call, uint64_t due_ms, const chaos_init_verdict_t *answer
+);
 
 /**
  * @brief Takes over a parked call that came back as notification @p id.
@@ -39,7 +47,8 @@ int chaos_init_delay_resume(const chaos_init_call_t *call, uint64_t id);
 /** @brief The earliest due time into @p due_ms. @return 0 when nothing is parked. */
 int chaos_init_delay_next(uint64_t *due_ms);
 
-/** @brief Removes one call due at @p now_ms into @p id and @p error. @return 0 when none is due. */
-int chaos_init_delay_pop(uint64_t now_ms, uint64_t *id, int *error);
+/** @brief Removes one call due at @p now_ms into @p id and @p answer. @return 0 when none is due.
+ */
+int chaos_init_delay_pop(uint64_t now_ms, uint64_t *id, chaos_init_verdict_t *answer);
 
 #endif

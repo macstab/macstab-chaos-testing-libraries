@@ -11,6 +11,10 @@
  *        seccomp_probe connect <port> listens on 127.0.0.1:<port>, connects to it:
  *                                     "ok" or the errno name
  *        seccomp_probe mmap <bytes>   maps that many anonymous bytes
+ *        seccomp_probe waits <port>   a readable socket waited on by select and poll
+ *                                     with 200 ms, and by select without a timeout:
+ *                                     "select=<rc>,<set>,<ms> poll=<rc>,<revents>
+ *                                     forever=<rc>"
  *        seccomp_probe orphan <path> <out> exits 3 at once, leaving a child that
  *                                     opens <path> 300 ms later and writes the
  *                                     result ("ok" or the errno name) to <out>
@@ -25,12 +29,14 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <signal.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -160,6 +166,55 @@ int main(int argc, char **argv)
             _exit(0);
         }
         return child > 0 ? 3 : 1;
+    }
+    if (argc == 3 && strcmp(argv[1], "waits") == 0)
+    {
+        struct sockaddr_in address;
+        struct timespec start;
+        struct timespec end;
+        struct timeval wait = {0, 200000};
+        struct pollfd polled;
+        fd_set readable;
+        const int listener = socket(AF_INET, SOCK_STREAM, 0);
+        const int client = socket(AF_INET, SOCK_STREAM, 0);
+        int server;
+        int selected;
+        int polled_rc;
+
+        memset(&address, 0, sizeof(address));
+        address.sin_family = AF_INET;
+        address.sin_port = htons((uint16_t)atoi(argv[2]));
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+            listen(listener, 1) != 0 ||
+            connect(client, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+            (server = accept(listener, NULL, NULL)) < 0 || write(client, "x", 1U) != 1)
+        {
+            return 1;
+        }
+        FD_ZERO(&readable);
+        FD_SET(server, &readable);
+        (void)clock_gettime(CLOCK_MONOTONIC, &start);
+        selected = select(server + 1, &readable, NULL, NULL, &wait);
+        (void)clock_gettime(CLOCK_MONOTONIC, &end);
+        polled.fd = server;
+        polled.events = POLLIN;
+        polled.revents = POLLIN;
+        polled_rc = poll(&polled, 1U, 200);
+        (void)printf(
+            "select=%d,%d,%s poll=%d,%d ",
+            selected,
+            FD_ISSET(server, &readable) ? 1 : 0,
+            (end.tv_sec - start.tv_sec) * 1000L + (end.tv_nsec - start.tv_nsec) / 1000000L >= 150L
+                ? "waited"
+                : "early",
+            polled_rc,
+            (int)polled.revents
+        );
+        FD_ZERO(&readable);
+        FD_SET(server, &readable);
+        (void)printf("forever=%d\n", select(server + 1, &readable, NULL, NULL, NULL));
+        return 0;
     }
     if (argc == 3 && strcmp(argv[1], "connect") == 0)
     {
