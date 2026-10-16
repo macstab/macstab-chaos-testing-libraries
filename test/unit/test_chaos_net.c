@@ -130,6 +130,9 @@ static socklen_t g_recvfrom_reported_name = 0;
 /** @brief Cumulative count of `chaos_net_corrupt_buffer*` stub invocations. */
 static int g_corrupt_calls = 0;
 
+/** @brief Size the last `chaos_net_corrupt_buffer*` stub call was given. */
+static size_t g_last_corrupt_size = 0U;
+
 /* --- Wait-path injection flags (Linux-only when guarded) --- */
 
 /**
@@ -463,6 +466,7 @@ void chaos_net_corrupt_buffer_sample(
     unsigned char *bytes = (unsigned char *)buffer;
 
     ++g_corrupt_calls;
+    g_last_corrupt_size = size;
     if (buffer != NULL && size > 0U)
     {
         bytes[index_sample % size] ^= (unsigned char)(1U << (bit_sample & 7U));
@@ -3115,8 +3119,62 @@ static void test_dup_skips_and_close_races(void)
     (void)rc;
 }
 
+/**
+ * @brief Invariant: CORRUPT flips a bit only in bytes the receive wrote.
+ *
+ * Expected observable behaviour: with MSG_TRUNC a datagram receive returns more
+ *   than the buffer holds, and the corruption stays within the buffer; a stream
+ *   receive with MSG_TRUNC writes nothing, and nothing is corrupted (or counted).
+ */
+static void test_corrupt_stays_in_the_buffer(void)
+{
+    char buffer[16] = "dataXXXXXXXXXXX";
+    char vector_bytes[8];
+    struct iovec iov;
+    struct msghdr message;
+
+    reset_wrapper_stubs();
+    g_stub_endpoint_from_local = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_CORRUPT;
+    g_should_trigger = 1;
+
+    /* A 60000-byte datagram into a 4-byte buffer: only the 4 bytes may change. */
+    g_test_socket_type = SOCK_DGRAM;
+    g_recv_result = 60000;
+    assert(recv(5, buffer, 4U, MSG_TRUNC) == 60000);
+    assert(g_corrupt_calls == 1 && g_last_corrupt_size == 4U);
+    g_recvfrom_result = 60000;
+    assert(recvfrom(5, buffer, 4U, MSG_TRUNC, NULL, NULL) == 60000);
+    assert(g_corrupt_calls == 2 && g_last_corrupt_size == 4U);
+
+    /* recvmsg aims inside the vector, so a too-long result still corrupts it. */
+    iov.iov_base = vector_bytes;
+    iov.iov_len = sizeof(vector_bytes);
+    memset(&message, 0, sizeof(message));
+    message.msg_iov = &iov;
+    message.msg_iovlen = 1U;
+    g_recvmsg_result = 60000;
+    assert(recvmsg(5, &message, MSG_TRUNC) == 60000);
+    assert(g_corrupt_calls == 3 && g_last_corrupt_size == sizeof(vector_bytes));
+    assert(recvmsg(5, NULL, 0) == 60000); /* no message: nothing to corrupt */
+    assert(g_corrupt_calls == 3);
+
+    /* A stream receive with MSG_TRUNC discards the data: nothing is corrupted. */
+    g_test_socket_type = SOCK_STREAM;
+    g_should_trigger = 0; /* would refuse if asked: the rule is not even asked */
+    assert(recv(5, buffer, 4U, MSG_TRUNC) == 60000);
+    assert(recvfrom(5, buffer, 4U, MSG_TRUNC, NULL, NULL) == 60000);
+    assert(recvmsg(5, &message, MSG_TRUNC) == 60000);
+    assert(g_corrupt_calls == 3);
+    g_recv_result = 4;
+    g_recvfrom_result = 4;
+    g_recvmsg_result = 4;
+}
+
 int main(void)
 {
+    test_corrupt_stays_in_the_buffer();
     test_dup_skips_and_close_races();
     test_trickle_and_dup_edges();
     test_dup_replays_the_last_payload();

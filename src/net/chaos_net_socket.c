@@ -865,6 +865,22 @@ static int chaos_net_is_stream(int fd)
 }
 
 /**
+ * @brief Bytes of a @p size-byte buffer that a receive returning @p rc filled.
+ *
+ * @details With MSG_TRUNC a datagram receive returns the datagram's full length,
+ * which can exceed the buffer, and a stream receive discards the data without
+ * writing the buffer at all. CORRUPT must stay inside what was written.
+ */
+static size_t chaos_net_received_bytes(int fd, ssize_t rc, size_t size, int flags)
+{
+    if (rc <= 0 || ((flags & MSG_TRUNC) != 0 && chaos_net_is_stream(fd)))
+    {
+        return 0U;
+    }
+    return (size_t)rc < size ? (size_t)rc : size;
+}
+
+/**
  * @brief Whether a TRICKLE rule fires for a receive of @p requested bytes on @p fd.
  *
  * @details Only a stream socket and a request larger than the chunk are shortened,
@@ -1109,10 +1125,15 @@ CHAOS_NET_EXPORT ssize_t recv(int sockfd, void *buffer, size_t size, int flags)
         size = rule.chunk_bytes;
     }
     rc = chaos_net_call_real_recv(sockfd, buffer, size, flags);
-    /* Apply corruption only to successfully received data. */
-    if (rc > 0 && rule.effect == CHAOS_NET_EFFECT_CORRUPT && chaos_net_rule_should_trigger(&rule))
+    /* Apply corruption only to the received bytes the buffer holds. */
+    if (rule.effect == CHAOS_NET_EFFECT_CORRUPT)
     {
-        chaos_net_corrupt_buffer(buffer, (size_t)rc);
+        const size_t filled = chaos_net_received_bytes(sockfd, rc, size, flags);
+
+        if (filled > 0U && chaos_net_rule_should_trigger(&rule))
+        {
+            chaos_net_corrupt_buffer(buffer, filled);
+        }
     }
     return rc;
 }
@@ -1195,9 +1216,14 @@ CHAOS_NET_EXPORT ssize_t recvfrom(
         return rc;
     }
     rc = chaos_net_call_real_recvfrom(sockfd, buffer, size, flags, address_ptr, address_length);
-    if (rc > 0 && rule.effect == CHAOS_NET_EFFECT_CORRUPT && chaos_net_rule_should_trigger(&rule))
+    if (rule.effect == CHAOS_NET_EFFECT_CORRUPT)
     {
-        chaos_net_corrupt_buffer(buffer, (size_t)rc);
+        const size_t filled = chaos_net_received_bytes(sockfd, rc, size, flags);
+
+        if (filled > 0U && chaos_net_rule_should_trigger(&rule))
+        {
+            chaos_net_corrupt_buffer(buffer, filled);
+        }
     }
     return rc;
 }
@@ -1291,13 +1317,18 @@ CHAOS_NET_EXPORT ssize_t recvmsg(int sockfd, struct msghdr *message, int flags)
         return rc;
     }
     rc = chaos_net_call_real_recvmsg(sockfd, message, flags);
-    if (rc > 0 && rule.effect == CHAOS_NET_EFFECT_CORRUPT && chaos_net_rule_should_trigger(&rule))
+    if (message != NULL && rule.effect == CHAOS_NET_EFFECT_CORRUPT)
     {
-        chaos_net_corrupt_iovecs(
-            message != NULL ? message->msg_iov : NULL,
-            message != NULL ? (int)message->msg_iovlen : 0,
-            (size_t)rc
+        /* With MSG_TRUNC rc can exceed the vector: aim inside what it holds. */
+        const uint64_t capacity = chaos_net_message_size(message);
+        const size_t filled = chaos_net_received_bytes(
+            sockfd, rc, capacity == CHAOS_POLICY_NO_SIZE ? 0U : (size_t)capacity, flags
         );
+
+        if (filled > 0U && chaos_net_rule_should_trigger(&rule))
+        {
+            chaos_net_corrupt_iovecs(message->msg_iov, (int)message->msg_iovlen, filled);
+        }
     }
     return rc;
 }
