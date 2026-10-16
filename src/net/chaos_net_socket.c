@@ -64,6 +64,7 @@
 #include <pthread.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #ifdef __linux__
 #include <sys/syscall.h>
 #endif
@@ -525,6 +526,7 @@ typedef struct chaos_net_dup_slot
     volatile int lock;
     volatile int fd;          /**< Owner of the stored payload; -1 when empty. */
     volatile unsigned closes; /**< Closes of descriptors in this slot, see dup_store(). */
+    uint64_t socket;          /**< Identity of the socket the payload came from. */
     size_t length;
     socklen_t name_length; /**< Sender address length (datagrams); 0 when none. */
     struct sockaddr_storage name;
@@ -560,6 +562,31 @@ typedef struct chaos_net_dup_slot
  */
 #ifndef CHAOS_NET_DUP_BEFORE_TAG
 #define CHAOS_NET_DUP_BEFORE_TAG(fd) ((void)(fd))
+#endif
+
+/**
+ * @brief Identity of the socket behind @p fd (its inode and device); 0 when unknown.
+ *
+ * @details A descriptor number outlives its socket when it is closed or replaced
+ * where net does not see it (dup2(), fclose() of an fdopen() stream, a raw close):
+ * a payload is replayed only on the socket it came from. Unit tests define
+ * CHAOS_NET_DUP_SOCKET before including this file.
+ */
+#ifndef CHAOS_NET_DUP_SOCKET
+static uint64_t chaos_net_dup_socket(int fd)
+{
+    const int saved_errno = errno;
+    struct stat info;
+    uint64_t identity = 0U;
+
+    if (fstat(fd, &info) == 0)
+    {
+        identity = (uint64_t)info.st_ino ^ ((uint64_t)info.st_dev << 32);
+    }
+    errno = saved_errno;
+    return identity;
+}
+#define CHAOS_NET_DUP_SOCKET(fd) chaos_net_dup_socket(fd)
 #endif
 
 /** @brief The slot table, mapped on the first DUP rule; NULL before (or if mapping failed). */
@@ -683,10 +710,11 @@ static void chaos_net_dup_store(
 )
 {
     chaos_net_dup_slot_t *slot;
+    uint64_t socket;
     size_t remaining;
     int index;
 
-    if (received <= 0)
+    if (received <= 0 || (socket = CHAOS_NET_DUP_SOCKET(fd)) == 0U)
     {
         return;
     }
@@ -714,6 +742,7 @@ static void chaos_net_dup_store(
         slot->length += part;
         remaining -= part;
     }
+    slot->socket = socket;
     slot->name_length = 0;
     if (name != NULL && name_length > 0 && (size_t)name_length <= sizeof(slot->name))
     {
@@ -760,7 +789,19 @@ static ssize_t chaos_net_dup_replay(
     {
         return -1;
     }
-    if (slot->fd != fd || !chaos_net_rule_should_trigger(rule))
+    if (slot->fd != fd)
+    {
+        chaos_net_dup_unlock(slot);
+        return -1;
+    }
+    if (slot->socket != CHAOS_NET_DUP_SOCKET(fd))
+    {
+        /* The number names another socket now: its payload is not this one's. */
+        slot->fd = -1;
+        chaos_net_dup_unlock(slot);
+        return -1;
+    }
+    if (!chaos_net_rule_should_trigger(rule))
     {
         chaos_net_dup_unlock(slot);
         return -1;

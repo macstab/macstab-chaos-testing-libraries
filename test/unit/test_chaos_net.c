@@ -1057,6 +1057,11 @@ static void chaos_net_test_dup_unmap(void *address, size_t size);
 /* Closes the descriptor between a store's close check and its tag when set. */
 static int g_dup_close_before_tag = 0;
 static void chaos_net_test_dup_before_tag(int fd);
+/* Identity of the socket behind a descriptor: changes with g_dup_socket_epoch, as
+ * when the number is reused for another socket; 0 (unknown) while it is 0. */
+static uint64_t g_dup_socket_epoch = 1U;
+#define CHAOS_NET_DUP_SOCKET(fd)                                                                   \
+    (g_dup_socket_epoch == 0U ? 0U : (uint64_t)(fd) + (g_dup_socket_epoch << 32))
 #define CHAOS_NET_DUP_BEFORE_TAG(fd) chaos_net_test_dup_before_tag(fd)
 #define CHAOS_NET_DUP_MAP(size) chaos_net_test_dup_map(size)
 #define CHAOS_NET_DUP_UNMAP(address, size) chaos_net_test_dup_unmap((address), (size))
@@ -2902,12 +2907,38 @@ static void test_dup_replays_the_last_payload(void)
     rc = recv(4 + CHAOS_NET_DUP_SLOTS, buffer, sizeof(buffer), 0);
     assert(g_recv_calls == 9);
 
+    /* The number names another socket now (dup2, a close net did not see): the
+     * kept payload is dropped, not replayed there. */
+    {
+        int calls;
+
+        do /* until a real receive has kept a payload for descriptor 4 */
+        {
+            calls = g_recv_calls;
+            rc = recv(4, buffer, sizeof(buffer), 0);
+        } while (g_recv_calls == calls);
+        ++g_dup_socket_epoch;
+        calls = g_recv_calls;
+        rc = recv(4, buffer, sizeof(buffer), 0);
+        assert(g_recv_calls == calls + 1);
+        /* An unknown socket keeps nothing: every receive is real. */
+        g_dup_socket_epoch = 0U;
+        rc = recv(4, buffer, sizeof(buffer), 0);
+        rc = recv(4, buffer, sizeof(buffer), 0);
+        assert(g_recv_calls == calls + 3);
+        g_dup_socket_epoch = 1U;
+    }
+
     /* A failed receive keeps nothing. */
-    g_recv_result = -1;
-    rc = recv(5, buffer, sizeof(buffer), 0);
-    g_recv_result = 4;
-    rc = recv(5, buffer, sizeof(buffer), 0);
-    assert(g_recv_calls == 11);
+    {
+        const int calls = g_recv_calls;
+
+        g_recv_result = -1;
+        rc = recv(5, buffer, sizeof(buffer), 0);
+        g_recv_result = 4;
+        rc = recv(5, buffer, sizeof(buffer), 0);
+        assert(g_recv_calls == calls + 2);
+    }
 
     /* recvfrom keeps and replays the sender address. */
     from_length = (socklen_t)sizeof(from);

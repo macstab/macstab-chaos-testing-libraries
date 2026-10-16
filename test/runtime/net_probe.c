@@ -1365,6 +1365,46 @@ static int probe_recv_dup(void)
 }
 
 /**
+ * @brief A kept DUP payload is replayed only on the socket it came from: after
+ *        dup2() puts another connection under the number, that one is read for real.
+ */
+static int probe_recv_dup_after_dup2(void)
+{
+    char buffer[8];
+    int first_server;
+    int first_client;
+    int second_server;
+    int second_client;
+    int rc = write_config("tcp4://127.0.0.1:41034:recv:DUP:1.0");
+
+    if (rc != 0)
+    {
+        return rc;
+    }
+    if (create_tcp_pair(41034U, &first_server, &first_client) != 0 ||
+        create_tcp_pair(41034U, &second_server, &second_client) != 0)
+    {
+        return 220;
+    }
+    if (send(first_client, "AAAA", 4U, 0) != 4 ||
+        recv(first_server, buffer, sizeof(buffer), 0) != 4 ||
+        send(second_client, "BBBB", 4U, 0) != 4 || dup2(second_server, first_server) < 0)
+    {
+        return 221;
+    }
+    memset(buffer, 0, sizeof(buffer));
+    if (recv(first_server, buffer, sizeof(buffer), 0) != 4 || memcmp(buffer, "BBBB", 4U) != 0)
+    {
+        return 222;
+    }
+    close(first_client);
+    close(first_server);
+    close(second_client);
+    close(second_server);
+    return 0;
+}
+
+/**
  * @brief TRICKLE on a datagram socket changes nothing: a shorter buffer would cut the
  *        datagram and the kernel would drop the rest.
  */
@@ -1435,6 +1475,9 @@ int main(void)
     if (rc != 0)
         return rc;
     rc = probe_recv_dup();
+    if (rc != 0)
+        return rc;
+    rc = probe_recv_dup_after_dup2();
     if (rc != 0)
         return rc;
     rc = probe_recv_trickle_datagram();
