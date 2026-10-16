@@ -31,6 +31,9 @@
  * - `nanosleep` wrapper: guard bypass; NULL request passthrough; LATENCY; ERRNO (EINTR)
  *   with remaining filled from request; real call skipped on ERRNO.
  * - `usleep` wrapper: guard bypass; LATENCY; ERRNO (EINTR).
+ * - `chaos_time_call_real_*()` with NULL real pointers: each makes the system call
+ *   itself (real clock reads, real sleeps, EINVAL from clock_nanosleep, an
+ *   interrupted sleep reporting the seconds left).
  *
  * What is NOT tested here:
  * - Constructor and symbol resolution (`chaos_time_init()`).
@@ -41,6 +44,10 @@
 #include "../support/test_time_support.h"
 
 #include "../../src/time/chaos_time_config.h"
+
+#include <signal.h>
+#include <sys/syscall.h>
+#include <sys/time.h>
 
 CHAOS_TIME_DEFINE_TEST_GLOBALS();
 
@@ -1026,6 +1033,94 @@ static void test_rules_that_do_not_fire(void)
     assert(g_real_clock_nanosleep_request.tv_sec == request.tv_sec);
 }
 
+/** @brief SIGALRM handler for the interrupted-sleep check; only interrupts. */
+static void chaos_time_test_on_alarm(int signal_number)
+{
+    (void)signal_number;
+}
+
+/** @brief Monotonic milliseconds read straight from the kernel. */
+static long long chaos_time_test_now_ms(void)
+{
+    struct timespec now;
+
+    assert(syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &now) == 0);
+    return (long long)now.tv_sec * 1000LL + (long long)(now.tv_nsec / 1000000L);
+}
+
+/**
+ * @brief Invariant: with every real pointer still NULL (a call that arrives while the
+ *   symbols resolve) the `chaos_time_call_real_*` helpers make the system call
+ *   instead of crashing.
+ *
+ * Expected observable behaviour:
+ * - clock_gettime, gettimeofday, time and timespec_get(TIME_UTC) read the real
+ *   wall clock (within a few seconds of the kernel's); time fills a non-NULL out;
+ *   timespec_get with another base returns 0.
+ * - nanosleep, usleep, clock_nanosleep and sleep really sleep; clock_nanosleep on
+ *   an invalid clock returns EINVAL and leaves errno alone.
+ * - sleep cut short by a signal returns the whole seconds left.
+ */
+static void test_call_real_helpers_without_pointers(void)
+{
+    struct sigaction action;
+    struct sigaction previous_action;
+    struct itimerval timer;
+    struct timespec kernel_now;
+    struct timespec value;
+    struct timespec request;
+    struct timeval wall;
+    time_t out = 0;
+    long long started;
+
+    reset_wrapper_state();
+    assert(syscall(SYS_clock_gettime, CLOCK_REALTIME, &kernel_now) == 0);
+
+    value.tv_sec = 0;
+    assert(chaos_time_call_real_clock_gettime(CLOCK_REALTIME, &value) == 0);
+    assert(value.tv_sec >= kernel_now.tv_sec && value.tv_sec <= kernel_now.tv_sec + 5);
+    wall.tv_sec = 0;
+    assert(chaos_time_call_real_gettimeofday(&wall, NULL) == 0);
+    assert(wall.tv_sec >= kernel_now.tv_sec && wall.tv_sec <= kernel_now.tv_sec + 5);
+    assert(chaos_time_call_real_time(&out) >= kernel_now.tv_sec);
+    assert(out >= kernel_now.tv_sec && out <= kernel_now.tv_sec + 5);
+    assert(chaos_time_call_real_time(NULL) <= kernel_now.tv_sec + 5);
+    value.tv_sec = 0;
+    assert(chaos_time_call_real_timespec_get(&value, TIME_UTC) == TIME_UTC);
+    assert(value.tv_sec >= kernel_now.tv_sec && value.tv_sec <= kernel_now.tv_sec + 5);
+    assert(chaos_time_call_real_timespec_get(&value, TIME_UTC + 1) == 0);
+
+    request.tv_sec = 0;
+    request.tv_nsec = 20000000L;
+    started = chaos_time_test_now_ms();
+    assert(chaos_time_call_real_nanosleep(&request, NULL) == 0);
+    assert(chaos_time_test_now_ms() - started >= 15LL);
+    started = chaos_time_test_now_ms();
+    assert(chaos_time_call_real_usleep(20000U) == 0);
+    assert(chaos_time_test_now_ms() - started >= 15LL);
+    started = chaos_time_test_now_ms();
+    assert(chaos_time_call_real_clock_nanosleep(CLOCK_MONOTONIC, 0, &request, NULL) == 0);
+    assert(chaos_time_test_now_ms() - started >= 15LL);
+    errno = 4242;
+    assert(chaos_time_call_real_clock_nanosleep((clockid_t)-1, 0, &request, NULL) == EINVAL);
+    assert(errno == 4242);
+    assert(chaos_time_call_real_sleep(0U) == 0U);
+
+    /* A signal 50ms into sleep(2): it returns early, with the remainder rounded up. */
+    (void)memset(&action, 0, sizeof(action));
+    action.sa_handler = chaos_time_test_on_alarm;
+    (void)sigemptyset(&action.sa_mask);
+    assert(sigaction(SIGALRM, &action, &previous_action) == 0);
+    (void)memset(&timer, 0, sizeof(timer));
+    timer.it_value.tv_usec = 50000;
+    assert(setitimer(ITIMER_REAL, &timer, NULL) == 0);
+    started = chaos_time_test_now_ms();
+    assert(chaos_time_call_real_sleep(2U) == 2U);
+    assert(chaos_time_test_now_ms() - started >= 40LL);
+    assert(chaos_time_test_now_ms() - started < 1900LL);
+    assert(sigaction(SIGALRM, &previous_action, NULL) == 0);
+}
+
 int main(void)
 {
     test_clock_read_applies_regress();
@@ -1038,5 +1133,6 @@ int main(void)
     test_clock_nanosleep_paths();
     test_sleep_and_timespec_get_paths();
     test_rules_that_do_not_fire();
+    test_call_real_helpers_without_pointers();
     return 0;
 }

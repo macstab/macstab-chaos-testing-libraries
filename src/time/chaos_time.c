@@ -27,11 +27,10 @@
  *     CHAOS_TIME_MTIME_UNKNOWN, which ensures the first intercepted call
  *     triggers a config reload.
  *
- * @invariant  After chaos_time_init() returns, g_chaos_time_real_clock_gettime,
- *             g_chaos_time_real_nanosleep, and g_chaos_time_real_usleep are all
- *             non-NULL.  If any RTLD_NEXT lookup fails, abort(3) is called
- *             immediately so the process cannot proceed with null function
- *             pointers.
+ * @invariant  A lookup that dlerror() reports as failed calls abort(3).  A
+ *             pointer can still be NULL (a symbol absent from the chain, or a
+ *             call that arrives while resolution runs); the call helpers in
+ *             chaos_time_hooks.c then make the system call directly.
  *
  * @module chaos-time
  * @stability Internal.

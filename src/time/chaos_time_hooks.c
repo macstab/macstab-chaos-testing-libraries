@@ -49,7 +49,9 @@
  * pointers that raise the reentrancy guard for the duration of the real call.
  * They are used by the hooks for the actual dispatch step (step 4 above) so
  * that any intercepted symbol called by the real implementation is also
- * suppressed.
+ * suppressed.  While a pointer is still NULL (a call that arrives during
+ * symbol resolution, or a symbol the lookup did not find) each helper makes
+ * the system call that libc would have made instead.
  *
  * @module chaos-time
  * @stability Internal — symbol names are public (exported ABI), implementation
@@ -79,6 +81,12 @@ static int chaos_time_call_real_clock_gettime(clockid_t clock_id, struct timespe
     int previous;
     int rc;
 
+    if (g_chaos_time_real_clock_gettime == NULL)
+    {
+        /* Not resolved yet: a call from inside the symbol lookup (a preloaded
+         * allocator or a signal handler). The system call does what libc would. */
+        return (int)syscall(SYS_clock_gettime, clock_id, value);
+    }
     previous = chaos_time_enter_internal();
     rc = g_chaos_time_real_clock_gettime(clock_id, value);
     chaos_time_leave_internal(previous);
@@ -99,6 +107,10 @@ chaos_time_call_real_nanosleep(const struct timespec *request, struct timespec *
     int previous;
     int rc;
 
+    if (g_chaos_time_real_nanosleep == NULL)
+    {
+        return (int)syscall(SYS_nanosleep, request, remaining);
+    }
     previous = chaos_time_enter_internal();
     rc = g_chaos_time_real_nanosleep(request, remaining);
     chaos_time_leave_internal(previous);
@@ -116,6 +128,14 @@ static int chaos_time_call_real_usleep(useconds_t usec)
     int previous;
     int rc;
 
+    if (g_chaos_time_real_usleep == NULL)
+    {
+        struct timespec request;
+
+        request.tv_sec = (time_t)(usec / 1000000U);
+        request.tv_nsec = (long)(usec % 1000000U) * 1000L;
+        return (int)syscall(SYS_nanosleep, &request, NULL);
+    }
     previous = chaos_time_enter_internal();
     rc = g_chaos_time_real_usleep(usec);
     chaos_time_leave_internal(previous);
@@ -134,6 +154,10 @@ static int chaos_time_call_real_gettimeofday(struct timeval *value, void *zone)
     int previous;
     int rc;
 
+    if (g_chaos_time_real_gettimeofday == NULL)
+    {
+        return (int)syscall(SYS_gettimeofday, value, zone);
+    }
     previous = chaos_time_enter_internal();
     rc = g_chaos_time_real_gettimeofday(value, zone);
     chaos_time_leave_internal(previous);
@@ -151,6 +175,20 @@ static time_t chaos_time_call_real_time(time_t *out)
     int previous;
     time_t result;
 
+    if (g_chaos_time_real_time == NULL)
+    {
+        /* aarch64 has no time system call; read the realtime clock. A failed
+         * read leaves the (time_t)-1 that time(2) reports errors with. */
+        struct timespec now;
+
+        now.tv_sec = (time_t)-1;
+        (void)syscall(SYS_clock_gettime, CLOCK_REALTIME, &now);
+        if (out != NULL)
+        {
+            *out = now.tv_sec;
+        }
+        return now.tv_sec;
+    }
     previous = chaos_time_enter_internal();
     result = g_chaos_time_real_time(out);
     chaos_time_leave_internal(previous);
@@ -173,6 +211,15 @@ static int chaos_time_call_real_clock_nanosleep(
     int previous;
     int rc;
 
+    if (g_chaos_time_real_clock_nanosleep == NULL)
+    {
+        /* clock_nanosleep reports the error number and leaves errno alone. */
+        const int saved_errno = errno;
+
+        rc = syscall(SYS_clock_nanosleep, clock_id, flags, request, remaining) == 0 ? 0 : errno;
+        errno = saved_errno;
+        return rc;
+    }
     previous = chaos_time_enter_internal();
     rc = g_chaos_time_real_clock_nanosleep(clock_id, flags, request, remaining);
     chaos_time_leave_internal(previous);
@@ -190,6 +237,19 @@ static unsigned int chaos_time_call_real_sleep(unsigned int seconds)
     int previous;
     unsigned int rc;
 
+    if (g_chaos_time_real_sleep == NULL)
+    {
+        /* sleep returns the whole seconds left when a signal cuts it short. */
+        struct timespec request;
+
+        request.tv_sec = (time_t)seconds;
+        request.tv_nsec = 0L;
+        if (syscall(SYS_nanosleep, &request, &request) == 0)
+        {
+            return 0U;
+        }
+        return (unsigned int)request.tv_sec + (request.tv_nsec != 0L ? 1U : 0U);
+    }
     previous = chaos_time_enter_internal();
     rc = g_chaos_time_real_sleep(seconds);
     chaos_time_leave_internal(previous);
@@ -208,6 +268,15 @@ static int chaos_time_call_real_timespec_get(struct timespec *value, int base)
     int previous;
     int rc;
 
+    if (g_chaos_time_real_timespec_get == NULL)
+    {
+        /* TIME_UTC is the realtime clock; any other base, or a failed read, is 0. */
+        if (base != TIME_UTC || syscall(SYS_clock_gettime, CLOCK_REALTIME, value) != 0)
+        {
+            return 0;
+        }
+        return base;
+    }
     previous = chaos_time_enter_internal();
     rc = g_chaos_time_real_timespec_get(value, base);
     chaos_time_leave_internal(previous);
