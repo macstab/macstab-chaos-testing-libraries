@@ -199,20 +199,27 @@ static int chaos_init_net_name(int fd, struct sockaddr *address, socklen_t *leng
     {
         char local[64];
         char remote[64];
-        char unix_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
         unsigned long row_inode = 0U;
+        int end = 0;
 
         if (protocol->family == AF_UNIX)
         {
-            unix_path[0] = '\0';
-            if (sscanf(line, "%*s %*s %*s %*s %*s %*s %lu %107s", &row_inode, unix_path) >= 1 &&
+            /* The path is the rest of the line, spaces included; an abstract name
+             * shows as '@name', the text the library gives it too. */
+            if (sscanf(line, "%*s %*s %*s %*s %*s %*s %lu%n", &row_inode, &end) >= 1 &&
                 row_inode == inode)
             {
                 struct sockaddr_un *un = (struct sockaddr_un *)&found;
+                const char *name = line + end + (line[end] == ' ' ? 1 : 0);
+                const size_t name_length = strcspn(name, "\n") < sizeof(un->sun_path)
+                                               ? strcspn(name, "\n")
+                                               : sizeof(un->sun_path);
 
+                /* As getsockname() reports it: a name that fills sun_path has no NUL. */
                 un->sun_family = AF_UNIX;
-                memcpy(un->sun_path, unix_path, strlen(unix_path) + 1U);
-                found_length = (socklen_t)sizeof(*un);
+                memcpy(un->sun_path, name, name_length);
+                found_length = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + name_length +
+                                           (name_length < sizeof(un->sun_path) ? 1U : 0U));
                 have = 1;
             }
         }

@@ -24,8 +24,8 @@
  *     reentrancy guard before the call and restore it on all exit paths,
  *     preventing libchaos-net from intercepting its own internal queries.
  *   - Port values are always stored in host byte order (ntohs applied on input).
- *   - Abstract UNIX socket paths (sun_path[0] == '\0') are rejected because they
- *     cannot be represented as a printable config selector string.
+ *   - Abstract UNIX socket names (sun_path[0] == '\0') are written as Linux shows
+ *     them in /proc/net/unix, '@' for each NUL, so unix://@name selects them.
  *   - UNIX sun_path is never scanned beyond what address_length accounts for. The
  *     field is neither guaranteed to be present (unnamed sockets report
  *     address_length == sizeof(sa_family_t)) nor guaranteed to be NUL-terminated.

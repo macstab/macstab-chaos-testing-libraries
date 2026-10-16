@@ -188,6 +188,60 @@ static void test_socket_queries(
     );
     length = (socklen_t)sizeof(name);
     assert(chaos_init_net_getpeername(unix_fd, (struct sockaddr *)&name, &length) == -1);
+    /* A path with spaces is read whole; an abstract name reads '@name', the text
+     * libchaos-net gives it; an unnamed socket has an empty one. */
+    {
+        struct sockaddr_un bound;
+        int spaced = socket(AF_UNIX, SOCK_STREAM, 0);
+        int abstract = socket(AF_UNIX, SOCK_DGRAM, 0);
+        int unnamed = socket(AF_UNIX, SOCK_STREAM, 0);
+
+        memset(&bound, 0, sizeof(bound));
+        bound.sun_family = AF_UNIX;
+        strcpy(bound.sun_path, "/tmp/init net sock");
+        (void)unlink(bound.sun_path);
+        assert(bind(spaced, (struct sockaddr *)&bound, sizeof(bound)) == 0);
+        assert(listen(spaced, 1) == 0);
+        memset(&bound, 0, sizeof(bound));
+        bound.sun_family = AF_UNIX;
+        memcpy(bound.sun_path, "\0initnet-abstract", 17U);
+        assert(
+            bind(
+                abstract, (struct sockaddr *)&bound, offsetof(struct sockaddr_un, sun_path) + 17U
+            ) == 0
+        );
+        length = (socklen_t)sizeof(name);
+        assert(
+            chaos_init_net_getsockname(spaced, (struct sockaddr *)&name, &length) == 0 &&
+            strcmp(un->sun_path, "/tmp/init net sock") == 0
+        );
+        length = (socklen_t)sizeof(name);
+        assert(
+            chaos_init_net_getsockname(abstract, (struct sockaddr *)&name, &length) == 0 &&
+            strcmp(un->sun_path, "@initnet-abstract") == 0
+        );
+        length = (socklen_t)sizeof(name);
+        assert(
+            chaos_init_net_getsockname(unnamed, (struct sockaddr *)&name, &length) == 0 &&
+            un->sun_path[0] == '\0'
+        );
+        /* An abstract name that fills sun_path, without a NUL, at its full length. */
+        (void)close(abstract);
+        abstract = socket(AF_UNIX, SOCK_DGRAM, 0);
+        memset(bound.sun_path, 'x', sizeof(bound.sun_path));
+        bound.sun_path[0] = '\0';
+        assert(bind(abstract, (struct sockaddr *)&bound, sizeof(bound)) == 0);
+        length = (socklen_t)sizeof(name);
+        assert(
+            chaos_init_net_getsockname(abstract, (struct sockaddr *)&name, &length) == 0 &&
+            length == (socklen_t)sizeof(bound) && un->sun_path[0] == '@' &&
+            memcmp(un->sun_path + 1, bound.sun_path + 1, sizeof(bound.sun_path) - 1U) == 0
+        );
+        (void)close(spaced);
+        (void)close(abstract);
+        (void)close(unnamed);
+        (void)unlink("/tmp/init net sock");
+    }
     length = (socklen_t)sizeof(name);
     assert(
         chaos_init_net_getsockname(pipe_fd, (struct sockaddr *)&name, &length) == -1 &&
