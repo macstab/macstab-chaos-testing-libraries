@@ -114,6 +114,7 @@ static void chaos_dns_test_freeaddrinfo(struct addrinfo *result)
 #define calloc chaos_dns_test_calloc
 #include "../../src/dns/chaos_dns_actions.c"
 #undef calloc
+#include "../../src/dns/chaos_dns_owned.c"
 
 /**
  * @brief Allocate a single addrinfo node with a real sockaddr and optional canonname.
@@ -441,8 +442,66 @@ static void test_should_trigger_honours_qualifiers(void)
     assert(chaos_dns_rule_should_trigger(&rule) == 0);
 }
 
+/**
+ * @brief Invariant: the canonical name stays on the head, and a list of ours is
+ *   only unlinked, never freed node by node.
+ *
+ * Triggering condition: lists shaped like the C libraries' (canonname on the first
+ *   node only) filtered and shuffled; a list built by chaos_dns_owned_copy() filtered
+ *   and limited.
+ *
+ * Expected observable behaviour: after FILTER drops the head and after SHUFFLE, the
+ *   new head carries the name and no other node does; dropping every node frees the
+ *   name with the last one; nodes of our own list are not passed to freeaddrinfo.
+ */
+static void test_canonname_and_owned_lists(void)
+{
+    struct addrinfo *head;
+    struct addrinfo *parts[1];
+    struct addrinfo *owned;
+    int index;
+
+    reset_actions_state();
+    head = make_result_node(AF_INET6, "canon");
+    head->ai_next = make_result_node(AF_INET, NULL);
+    head->ai_next->ai_next = make_result_node(AF_INET6, NULL);
+    head->ai_next->ai_next->ai_next = make_result_node(AF_INET, NULL);
+    assert(chaos_dns_filter_result_list(&head, CHAOS_DNS_FAMILY_INET4));
+    assert(head->ai_canonname != NULL && strcmp(head->ai_canonname, "canon") == 0);
+    assert(head->ai_next->ai_canonname == NULL);
+
+    for (index = 0; index < 20; ++index)
+    {
+        chaos_dns_shuffle_result_list(&head);
+        assert(head->ai_canonname != NULL && head->ai_next->ai_canonname == NULL);
+    }
+    chaos_dns_test_freeaddrinfo(head);
+
+    /* Everything dropped: the name goes with the last node. */
+    g_freeaddrinfo_calls = 0;
+    head = make_result_node(AF_INET6, "gone");
+    head->ai_next = make_result_node(AF_INET6, NULL);
+    assert(!chaos_dns_filter_result_list(&head, CHAOS_DNS_FAMILY_INET4));
+    assert(head == NULL && g_freeaddrinfo_calls == 2);
+
+    /* A list of ours: FILTER and LIMIT unlink, the owner frees the block. */
+    reset_actions_state();
+    parts[0] = make_result_node(AF_INET, NULL);
+    parts[0]->ai_next = make_result_node(AF_INET6, NULL);
+    parts[0]->ai_next->ai_next = make_result_node(AF_INET, NULL);
+    owned = chaos_dns_owned_copy(parts, 1U, "name");
+    chaos_dns_test_freeaddrinfo(parts[0]);
+    g_freeaddrinfo_calls = 0;
+    head = owned;
+    assert(chaos_dns_filter_result_list(&head, CHAOS_DNS_FAMILY_INET4));
+    chaos_dns_limit_result_list(&head, 1U);
+    assert(head == owned && head->ai_next == NULL && g_freeaddrinfo_calls == 0);
+    assert(chaos_dns_owned_free(head) == 1);
+}
+
 int main(void)
 {
+    test_canonname_and_owned_lists();
     test_should_trigger_honours_qualifiers();
     test_should_trigger_counts_hits();
     test_probability_and_gai_helpers();

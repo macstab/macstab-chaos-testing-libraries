@@ -265,6 +265,68 @@ static int probe_override_filter_limit(void)
     return 0;
 }
 
+/** @brief Resident set size of this process in pages. */
+static long resident_pages(void)
+{
+    long size = 0L;
+    long resident = -1L;
+    FILE *statm = fopen("/proc/self/statm", "r");
+
+    if (statm != NULL && fscanf(statm, "%ld %ld", &size, &resident) != 2)
+    {
+        resident = -1L;
+    }
+    if (statm != NULL)
+    {
+        (void)fclose(statm);
+    }
+    return resident;
+}
+
+/**
+ * @brief OVERRIDE with several literals, shuffled and cut, many times over.
+ *
+ * musl allocates each getaddrinfo() result as one reference-counted block; a list
+ * spliced from several of them leaked on every lookup and, once SHUFFLE and LIMIT
+ * reordered and cut it, freed a block still in use. The list is one of the
+ * library's own now: the loop must neither crash nor grow. The canonical name
+ * is the queried name, on the head, after every shuffle.
+ */
+static int probe_override_many(void)
+{
+    struct addrinfo hints;
+    long before;
+    long after;
+    int index;
+    int rc = write_config("dns://many.test:OVERRIDE:127.0.0.1,127.0.0.2,[::1]\n"
+                          "dns://many.test:SHUFFLE:1.0\n"
+                          "dns://many.test:LIMIT:2");
+
+    if (rc != 0)
+    {
+        return rc;
+    }
+    (void)memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_CANONNAME;
+    before = resident_pages();
+    for (index = 0; index < 20000; ++index)
+    {
+        struct addrinfo *result = NULL;
+
+        if (getaddrinfo("many.test", "80", &hints, &result) != 0 || result == NULL ||
+            result->ai_next == NULL || result->ai_next->ai_next != NULL ||
+            result->ai_canonname == NULL || strcmp(result->ai_canonname, "many.test") != 0)
+        {
+            return 60;
+        }
+        freeaddrinfo(result);
+    }
+    after = resident_pages();
+    /* A leak of even one small block per lookup would grow by megabytes. */
+    return before > 0L && after - before < 256L ? 0 : 61;
+}
+
 static int probe_reverse_gai_error(void)
 {
     struct sockaddr_in address;
@@ -462,6 +524,9 @@ int main(void)
     if (rc != 0)
         return rc;
     rc = probe_override_filter_limit();
+    if (rc != 0)
+        return rc;
+    rc = probe_override_many();
     if (rc != 0)
         return rc;
     rc = probe_reverse_gai_error();

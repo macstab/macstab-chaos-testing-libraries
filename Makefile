@@ -77,7 +77,8 @@ LIB_SRCS_dns := \
 	$(SRC_DNS_DIR)/chaos_dns.c \
 	$(SRC_DNS_DIR)/chaos_dns_actions.c \
 	$(SRC_DNS_DIR)/chaos_dns_config.c \
-	$(SRC_DNS_DIR)/chaos_dns_lookup.c
+	$(SRC_DNS_DIR)/chaos_dns_lookup.c \
+	$(SRC_DNS_DIR)/chaos_dns_owned.c
 
 LIB_SRCS_time := \
 	$(SRC_TIME_DIR)/chaos_time.c \
@@ -105,7 +106,8 @@ LIB_HDRS_net := \
 LIB_HDRS_dns := \
 	$(SRC_DNS_DIR)/chaos_dns_internal.h \
 	$(SRC_DNS_DIR)/chaos_dns_config.h \
-	$(SRC_DNS_DIR)/chaos_dns_actions.h
+	$(SRC_DNS_DIR)/chaos_dns_actions.h \
+	$(SRC_DNS_DIR)/chaos_dns_owned.h
 LIB_HDRS_time := \
 	$(SRC_TIME_DIR)/chaos_time_internal.h \
 	$(SRC_TIME_DIR)/chaos_time_config.h \
@@ -216,6 +218,7 @@ CHAOS_NET_TEST := $(BUILD_DIR)/test_chaos_net
 DNS_ACTIONS_TEST := $(BUILD_DIR)/test_dns_actions
 DNS_CONFIG_TEST := $(BUILD_DIR)/test_dns_config
 DNS_RUNTIME_TEST := $(BUILD_DIR)/test_dns_runtime
+DNS_OWNED_TEST := $(BUILD_DIR)/test_dns_owned
 CHAOS_DNS_TEST := $(BUILD_DIR)/test_chaos_dns
 TIME_ACTIONS_TEST := $(BUILD_DIR)/test_time_actions
 TIME_CONFIG_TEST := $(BUILD_DIR)/test_time_config
@@ -237,7 +240,7 @@ CHAOS_INIT_MEMORY_TEST := $(BUILD_DIR)/test_chaos_init_memory
 CHAOS_INIT_PROCESS_TEST := $(BUILD_DIR)/test_chaos_init_process
 UNIT_TESTS := $(CONFIG_TEST) $(ACTIONS_TEST) $(FDCACHE_TEST) $(CHAOS_IO_TEST) \
 	$(NET_ACTIONS_TEST) $(NET_ENDPOINT_TEST) $(NET_CONFIG_TEST) $(NET_RUNTIME_TEST) $(CHAOS_NET_TEST) \
-	$(DNS_ACTIONS_TEST) $(DNS_CONFIG_TEST) $(DNS_RUNTIME_TEST) $(CHAOS_DNS_TEST) \
+	$(DNS_ACTIONS_TEST) $(DNS_CONFIG_TEST) $(DNS_RUNTIME_TEST) $(DNS_OWNED_TEST) $(CHAOS_DNS_TEST) \
 	$(TIME_ACTIONS_TEST) $(TIME_CONFIG_TEST) $(TIME_RUNTIME_TEST) $(CHAOS_TIME_TEST) \
 	$(MEMORY_ACTIONS_TEST) $(MEMORY_CONFIG_TEST) $(MEMORY_RUNTIME_TEST) $(CHAOS_MEMORY_TEST) \
 	$(PROCESS_ACTIONS_TEST) $(PROCESS_CONFIG_TEST) $(PROCESS_RUNTIME_TEST) $(CHAOS_PROCESS_TEST) \
@@ -313,6 +316,7 @@ unit: $(UNIT_TESTS)
 	./$(DNS_ACTIONS_TEST)
 	./$(DNS_CONFIG_TEST)
 	./$(DNS_RUNTIME_TEST)
+	./$(DNS_OWNED_TEST)
 	./$(CHAOS_DNS_TEST)
 	./$(TIME_ACTIONS_TEST)
 	./$(TIME_CONFIG_TEST)

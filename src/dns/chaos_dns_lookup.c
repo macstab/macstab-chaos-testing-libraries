@@ -70,6 +70,7 @@
 #include "chaos_dns_actions.h"
 #include "chaos_dns_config.h"
 #include "chaos_dns_internal.h"
+#include "chaos_dns_owned.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -280,41 +281,6 @@ static int chaos_dns_reverse_query_from_sockaddr(
 }
 
 /**
- * @brief Append all nodes of @p next to the end of the list at @p head.
- *
- * @details Used by chaos_dns_apply_override() to concatenate per-IP-literal
- * result lists from the real getaddrinfo into a single combined list.
- *
- * Ownership of @p next is transferred to @p head: after the call, the nodes
- * from @p next are reachable via the chain starting at *head.  The caller
- * must not free @p next independently.
- *
- * @param head  Pointer to the head of the target list; set to @p next if empty.
- * @param next  Head of the list to append; no-op if NULL.
- */
-static void chaos_dns_append_result_list(struct addrinfo **head, struct addrinfo *next)
-{
-    struct addrinfo *tail;
-
-    if (head == NULL || next == NULL)
-    {
-        return;
-    }
-    if (*head == NULL)
-    {
-        *head = next;
-        return;
-    }
-
-    tail = *head;
-    while (tail->ai_next != NULL)
-    {
-        tail = tail->ai_next;
-    }
-    tail->ai_next = next;
-}
-
-/**
  * @brief Strip IPv6 square-bracket notation from an address token.
  *
  * @details OVERRIDE rule text stores IPv6 addresses as `[::1]` so that the
@@ -365,64 +331,62 @@ static int chaos_dns_strip_ipv6_brackets(const char *token, char *host, size_t h
  * ------------------------------------------------------------------------- */
 
 /**
- * @brief Build a synthetic addrinfo result list from a comma-separated list of IP literals.
+ * @brief The address family of IP literal @p host; 0 when it is neither.
+ */
+static int chaos_dns_literal_family(const char *host)
+{
+    unsigned char address[sizeof(struct in6_addr)];
+
+    if (inet_pton(AF_INET, host, address) == 1)
+    {
+        return AF_INET;
+    }
+    return inet_pton(AF_INET6, host, address) == 1 ? AF_INET6 : 0;
+}
+
+/** @brief Most literals one OVERRIDE rule may list. */
+#define CHAOS_DNS_MAX_OVERRIDE 32U
+
+/**
+ * @brief Resolve the comma-separated IP literals of an OVERRIDE rule.
  *
- * @details For each IP literal in `rule->text`:
- *   1. Strip IPv6 brackets if present.
- *   2. Call the real getaddrinfo with AI_NUMERICHOST | caller's hints flags
- *      so that no DNS resolution is performed — only address parsing.
- *   3. Append the partial result to the `combined` list.
- *
- * If any token fails (bracket stripping or getaddrinfo), the entire combined
- * list built so far is freed via g_chaos_dns_real_freeaddrinfo and the
- * function returns an error.  This is an all-or-nothing contract: either all
- * IP literals produce valid result nodes, or the call fails cleanly.
- *
- * ### Ownership of the returned list
- *
- * Every node in `*result` on success was allocated by the real getaddrinfo
- * via the real-call path.  The caller (getaddrinfo interposer) owns the
- * list and must ensure it is eventually freed by the real freeaddrinfo.
- * Because the nodes were created by real getaddrinfo, post-call transforms
- * (FILTER_FAMILY, LIMIT) can safely call chaos_dns_call_real_freeaddrinfo
- * on individual nodes from this list.
+ * @details Each literal is resolved by the real getaddrinfo with AI_NUMERICHOST
+ * (so @p service and the hints' socket type expand as usual, without a DNS
+ * query); literals of a family the hints exclude are skipped. The nodes are
+ * copied into one list of our own (chaos_dns_owned.h) and the real results are
+ * released at once, so no list ever spans several of the C library's
+ * allocations. With AI_CANONNAME the queried @p name is the canonical name.
  *
  * @param rule     Matched OVERRIDE rule; `rule->text` is the IP literal list.
+ * @param name     The name looked up.
  * @param service  Service/port string to pass to each real getaddrinfo call.
- * @param hints    Hints from the original getaddrinfo call; AI_NUMERICHOST is
- *                 added internally.  May be NULL.
- * @param result   Output; set to the combined list on success.
- * @return  0 on success with at least one node; EAI_NONAME if the combined
- *          list is unexpectedly empty; EAI_FAIL on any internal error.
+ * @param hints    Hints from the original getaddrinfo call; may be NULL.
+ * @param result   Output; set to the list on success.
+ * @return 0; EAI_NONAME when no literal fits the hints; EAI_MEMORY when the list
+ *         cannot be allocated; EAI_FAIL for a malformed rule; or the error of a
+ *         literal the real getaddrinfo rejects.
  */
 static int chaos_dns_apply_override(
     const chaos_dns_rule_t *rule,
+    const char *name,
     const char *service,
     const struct addrinfo *hints,
     struct addrinfo **result
 )
 {
     char override_text[CHAOS_DNS_MAX_VALUE];
-    char *cursor;
+    struct addrinfo *partials[CHAOS_DNS_MAX_OVERRIDE];
     struct addrinfo hints_copy;
-    const struct addrinfo *lookup_hints;
-    struct addrinfo *combined = NULL;
+    size_t count = 0U;
+    size_t index;
+    char *cursor;
+    int rc = 0;
 
-    if (rule == NULL || result == NULL)
+    if (rule == NULL || result == NULL || strlen(rule->text) >= sizeof(override_text))
     {
         return EAI_FAIL;
     }
-    if (strlen(rule->text) >= sizeof(override_text))
-    {
-        return EAI_FAIL;
-    }
-
-    /* Work on a local copy of rule->text so we can tokenise with NUL writes. */
     (void)memcpy(override_text, rule->text, strlen(rule->text) + 1U);
-
-    /* Build a hints copy that forces numeric-host resolution so that the real
-     * getaddrinfo does not perform another DNS lookup for what must be a
-     * literal IP address. */
     if (hints != NULL)
     {
         hints_copy = *hints;
@@ -432,16 +396,14 @@ static int chaos_dns_apply_override(
         (void)memset(&hints_copy, 0, sizeof(hints_copy));
     }
     hints_copy.ai_flags |= AI_NUMERICHOST;
-    lookup_hints = &hints_copy;
 
     cursor = override_text;
-    while (*cursor != '\0')
+    while (*cursor != '\0' && rc == 0)
     {
         char *token = cursor;
         char *separator = strchr(cursor, ',');
         char host[CHAOS_DNS_MAX_TEXT];
-        struct addrinfo *partial = NULL;
-        int rc;
+        int family;
 
         if (separator != NULL)
         {
@@ -452,36 +414,42 @@ static int chaos_dns_apply_override(
         {
             cursor += strlen(cursor);
         }
-
-        /* Skip leading whitespace in the token. */
         token = token + strspn(token, " \t\r\n");
-        if (chaos_dns_strip_ipv6_brackets(token, host, sizeof(host)) != 0)
+        if (chaos_dns_strip_ipv6_brackets(token, host, sizeof(host)) != 0 ||
+            count == CHAOS_DNS_MAX_OVERRIDE)
         {
-            /* Bracket stripping failed: free whatever we accumulated and bail. */
-            if (combined != NULL)
-            {
-                g_chaos_dns_real_freeaddrinfo(combined);
-            }
-            return EAI_FAIL;
+            rc = EAI_FAIL;
+            break;
         }
-
-        rc = chaos_dns_call_real_getaddrinfo(host, service, lookup_hints, &partial);
-        if (rc != 0)
+        family = chaos_dns_literal_family(host);
+        if (hints_copy.ai_family != AF_UNSPEC && family != 0 && family != hints_copy.ai_family)
         {
-            /* Real call failed for this token: free accumulated list and return
-             * the error so the interposer can surface it to the application. */
-            if (combined != NULL)
-            {
-                g_chaos_dns_real_freeaddrinfo(combined);
-            }
-            return rc;
+            continue; /* the caller asked for the other family */
         }
-        /* Ownership of 'partial' is transferred to 'combined'. */
-        chaos_dns_append_result_list(&combined, partial);
+        partials[count] = NULL;
+        rc = chaos_dns_call_real_getaddrinfo(host, service, &hints_copy, &partials[count]);
+        if (rc == 0)
+        {
+            ++count;
+        }
     }
 
-    *result = combined;
-    return combined != NULL ? 0 : EAI_NONAME;
+    if (rc == 0 && count == 0U)
+    {
+        rc = EAI_NONAME;
+    }
+    if (rc == 0)
+    {
+        *result = chaos_dns_owned_copy(
+            partials, count, (hints_copy.ai_flags & AI_CANONNAME) != 0 ? name : NULL
+        );
+        rc = *result != NULL ? 0 : EAI_MEMORY;
+    }
+    for (index = 0U; index < count; ++index)
+    {
+        g_chaos_dns_real_freeaddrinfo(partials[index]);
+    }
+    return rc;
 }
 
 /* =========================================================================
@@ -511,6 +479,7 @@ static int chaos_dns_resolve_with_rules(
     char service_buffer[CHAOS_DNS_MAX_VALUE];
     const char *effective_node = node;
     const char *effective_service = service;
+    const struct addrinfo *owned = NULL;
     int rc;
 
     /* 4. NULL result pointer: pass through (real API semantics unchanged). */
@@ -551,7 +520,8 @@ static int chaos_dns_resolve_with_rules(
     if (chaos_dns_config_match(CHAOS_DNS_EFFECT_OVERRIDE, node, &override_rule) &&
         chaos_dns_rule_should_trigger(&override_rule))
     {
-        rc = chaos_dns_apply_override(&override_rule, effective_service, hints, result);
+        rc = chaos_dns_apply_override(&override_rule, node, effective_service, hints, result);
+        owned = rc == 0 ? *result : NULL;
     }
     else
     {
@@ -566,10 +536,12 @@ static int chaos_dns_resolve_with_rules(
      * Must run before SHUFFLE and LIMIT so that those transforms see only
      * the set of nodes that will actually be returned. */
     if (chaos_dns_config_match(CHAOS_DNS_EFFECT_FILTER_FAMILY, node, &filter_rule) &&
-        chaos_dns_rule_should_trigger(&filter_rule) &&
+        filter_rule.family != CHAOS_DNS_FAMILY_ANY && chaos_dns_rule_should_trigger(&filter_rule) &&
         !chaos_dns_filter_result_list(result, filter_rule.family))
     {
-        /* All nodes were filtered out; the real resolver found nothing matching. */
+        /* All nodes were filtered out; the real resolver found nothing matching.
+         * A list of ours is freed as a whole (its nodes were only unlinked). */
+        (void)chaos_dns_owned_free(owned);
         return EAI_NONAME;
     }
 
@@ -589,6 +561,7 @@ static int chaos_dns_resolve_with_rules(
         chaos_dns_limit_result_list(result, limit_rule.limit);
         if (*result == NULL)
         {
+            (void)chaos_dns_owned_free(owned);
             return EAI_NONAME;
         }
     }
@@ -642,11 +615,10 @@ static int chaos_dns_resolve_with_rules(
  *
  * **addrinfo ownership**
  *
- * `*result` on successful return points to a list of nodes all allocated by
- * the real getaddrinfo.  The application is responsible for calling
- * freeaddrinfo on this list.  The interposed freeaddrinfo (if present in the
- * library) delegates to the real freeaddrinfo; there is no special ownership
- * state that differs from what a non-interposed call would produce.
+ * `*result` on successful return points to a list allocated by the real
+ * getaddrinfo, or, after OVERRIDE, to one allocation of our own
+ * (chaos_dns_owned.h). The application frees either with freeaddrinfo, which
+ * this library interposes to tell them apart.
  *
  * @param node     Hostname or address string (may be NULL).
  * @param service  Service name or port number string (may be NULL).
@@ -684,11 +656,31 @@ CHAOS_DNS_EXPORT int getaddrinfo(
     if (chaos_dns_config_match(CHAOS_DNS_EFFECT_GAI, node, &gai_rule) &&
         chaos_dns_rule_apply_gai(&gai_rule, &gai_error))
     {
+        if (gai_error == EAI_SYSTEM)
+        {
+            errno = EIO; /* EAI_SYSTEM means "see errno": give it a system error */
+        }
         return gai_error;
     }
 
     /* 4.-10. Result-shaping rules, shared with the gethostbyname family. */
     return chaos_dns_resolve_with_rules(node, service, hints, result);
+}
+
+/**
+ * @brief Interposed freeaddrinfo(3): frees a list of ours (OVERRIDE), else the real one.
+ *
+ * @details Any node of a list of ours frees it: SHUFFLE may have made any of them
+ * the head the application holds.
+ */
+CHAOS_DNS_EXPORT void freeaddrinfo(struct addrinfo *result)
+{
+    chaos_dns_ensure_symbols();
+    if (chaos_dns_owned_free(result) || g_chaos_dns_real_freeaddrinfo == NULL)
+    {
+        return;
+    }
+    g_chaos_dns_real_freeaddrinfo(result);
 }
 
 /**
@@ -1036,9 +1028,12 @@ static int chaos_dns_hostent_from_rules(
         return 0;
     }
     rc = chaos_dns_fill_hostent(name, family, list, entry, buffer, buffer_size);
-    previous = chaos_dns_enter_internal();
-    g_chaos_dns_real_freeaddrinfo(list);
-    chaos_dns_leave_internal(previous);
+    if (!chaos_dns_owned_free(list))
+    {
+        previous = chaos_dns_enter_internal();
+        g_chaos_dns_real_freeaddrinfo(list);
+        chaos_dns_leave_internal(previous);
+    }
     if (rc == ERANGE)
     {
         *h_error = NETDB_INTERNAL;

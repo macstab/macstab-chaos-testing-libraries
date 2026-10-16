@@ -37,7 +37,7 @@
  *   IPv4 strings unchanged; NULL input returns non-zero.
  * - `chaos_dns_reverse_query_from_sockaddr()`: extracts dotted-decimal IPv4 from sockaddr_in;
  *   fails when address_len < sizeof(sockaddr_in).
- * - `chaos_dns_append_result_list()`: builds a two-node linked list in order.
+ * - `chaos_dns_literal_family()`: IPv4, IPv6 and non-literal text.
  * - `chaos_dns_call_real_getaddrinfo()` and `chaos_dns_call_real_getnameinfo()`: dispatch
  *   to the real stubs and return their values.
  * - `getaddrinfo` passthrough: NULL or empty node → real lookup; TLS guard set → bypass; NULL
@@ -70,6 +70,7 @@
 #include <stdio.h>
 
 #include "../../src/dns/chaos_dns_config.h"
+#include "../../src/dns/chaos_dns_owned.h"
 
 CHAOS_DNS_DEFINE_TEST_GLOBALS();
 
@@ -275,7 +276,11 @@ int chaos_dns_filter_result_list(struct addrinfo **result, chaos_dns_family_filt
     ++g_filter_calls;
     if (g_filter_drop_all != 0 && result != NULL && *result != NULL)
     {
-        g_chaos_dns_real_freeaddrinfo(*result);
+        /* Like the real filter: a list of ours is only unlinked. */
+        if (!chaos_dns_owned_contains(*result))
+        {
+            g_chaos_dns_real_freeaddrinfo(*result);
+        }
         *result = NULL;
         return 0;
     }
@@ -304,6 +309,15 @@ void chaos_dns_shuffle_result_list(struct addrinfo **result)
 void chaos_dns_limit_result_list(struct addrinfo **result, unsigned int limit)
 {
     ++g_limit_calls;
+    if (result != NULL && *result != NULL && limit == 0U)
+    {
+        /* Like the real limit: a list of ours is only unlinked. */
+        if (!chaos_dns_owned_contains(*result))
+        {
+            g_chaos_dns_real_freeaddrinfo(*result);
+        }
+        *result = NULL;
+    }
     if (result != NULL && *result != NULL && limit == 1U && (*result)->ai_next != NULL)
     {
         struct addrinfo *tail = (*result)->ai_next;
@@ -575,6 +589,7 @@ static int chaos_dns_test_gethostbyaddr_r(
 }
 
 #include "../../src/dns/chaos_dns_lookup.c"
+#include "../../src/dns/chaos_dns_owned.c"
 
 /**
  * @brief Invariant: static helper functions enforce bounds and produce correct output.
@@ -584,7 +599,7 @@ static int chaos_dns_test_gethostbyaddr_r(
  * - `chaos_dns_copy_output_text()` with valid and too-long inputs.
  * - `chaos_dns_strip_ipv6_brackets()` with bracketed IPv6, plain IPv4, and NULL.
  * - `chaos_dns_reverse_query_from_sockaddr()` with valid and too-short sockaddr_in.
- * - `chaos_dns_append_result_list()` builds a two-node list.
+ * - `chaos_dns_literal_family()` tells IPv4 and IPv6 literals from names.
  * - `chaos_dns_call_real_getaddrinfo()` and `chaos_dns_call_real_getnameinfo()` dispatch
  *   correctly with call counters incremented.
  *
@@ -641,11 +656,10 @@ static void test_static_helpers(void)
         (const struct sockaddr *)&ipv4, (socklen_t)sizeof(sa_family_t), host, sizeof(host)
     ));
 
-    chaos_dns_append_result_list(&head, make_result_node(AF_INET));
-    chaos_dns_append_result_list(&head, make_result_node(AF_INET6));
-    assert(head != NULL);
-    assert(head->ai_next != NULL);
-    chaos_dns_test_freeaddrinfo(head);
+    assert(chaos_dns_literal_family("10.0.0.1") == AF_INET);
+    assert(chaos_dns_literal_family("fd00::1") == AF_INET6);
+    assert(chaos_dns_literal_family("example.com") == 0);
+    (void)head;
 
     g_chaos_dns_real_getaddrinfo = chaos_dns_test_getaddrinfo;
     g_chaos_dns_real_getnameinfo = chaos_dns_test_getnameinfo;
@@ -945,7 +959,33 @@ static void test_rewrite_service_and_override_paths(void)
     assert(g_real_getaddrinfo_calls == 2);
     assert(result != NULL);
     assert(result->ai_next != NULL);
-    chaos_dns_test_freeaddrinfo(result);
+    /* One list of ours; the real results were released at once. */
+    assert(chaos_dns_owned_contains(result) && g_real_freeaddrinfo_calls == 2);
+    freeaddrinfo(result);
+    assert(!chaos_dns_owned_contains(result));
+
+    /* With AI_CANONNAME the queried name is the canonical name; the hints' family
+     * skips the other literals. */
+    {
+        struct addrinfo hints;
+
+        (void)memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET6;
+        hints.ai_flags = AI_CANONNAME;
+        assert(getaddrinfo("api.example.com", "443", &hints, &result) == 0);
+        assert(result->ai_family == AF_INET6 && result->ai_next == NULL);
+        assert(strcmp(result->ai_canonname, "api.example.com") == 0);
+        freeaddrinfo(result);
+        (void)memcpy(g_stub_rules[CHAOS_DNS_EFFECT_OVERRIDE].text, "127.0.0.1", 10U);
+        assert(getaddrinfo("api.example.com", "443", &hints, &result) == EAI_NONAME);
+    }
+
+    /* freeaddrinfo hands real results to the real freeaddrinfo. */
+    g_real_freeaddrinfo_calls = 0;
+    freeaddrinfo(make_result_node(AF_INET));
+    assert(g_real_freeaddrinfo_calls == 1);
+    g_chaos_dns_real_freeaddrinfo = NULL;
+    freeaddrinfo(NULL);
 }
 
 /**
@@ -975,24 +1015,71 @@ static void test_override_error_and_post_rules(void)
     reset_wrapper_state();
     g_chaos_dns_real_getaddrinfo = chaos_dns_test_getaddrinfo;
     g_chaos_dns_real_freeaddrinfo = chaos_dns_test_freeaddrinfo;
-    assert(chaos_dns_apply_override(NULL, NULL, NULL, &result) == EAI_FAIL);
+    assert(chaos_dns_apply_override(NULL, NULL, NULL, NULL, &result) == EAI_FAIL);
 
     (void)memset(&rule, 0, sizeof(rule));
     rule.effect = CHAOS_DNS_EFFECT_OVERRIDE;
     (void)memcpy(rule.text, "127.0.0.1,[::1]", 16U);
     g_real_getaddrinfo_error = EAI_AGAIN;
     g_real_getaddrinfo_error_call = 2;
-    assert(chaos_dns_apply_override(&rule, NULL, NULL, &result) == EAI_AGAIN);
+    assert(chaos_dns_apply_override(&rule, "x", NULL, NULL, &result) == EAI_AGAIN);
     assert(g_real_freeaddrinfo_calls == 1);
+
+    /* A malformed literal list fails, also one longer than the rule allows. */
+    (void)memcpy(rule.text, "1.1.1.1,,2.2.2.2", 17U);
+    g_real_freeaddrinfo_calls = 0;
+    assert(chaos_dns_apply_override(&rule, "x", NULL, NULL, &result) == EAI_FAIL);
+    assert(g_real_freeaddrinfo_calls == 1); /* the first literal's result */
+    (void)memset(rule.text, 0, sizeof(rule.text));
+    {
+        size_t index;
+
+        for (index = 0U; index < CHAOS_DNS_MAX_OVERRIDE + 1U; ++index)
+        {
+            (void)strcat(rule.text, index == 0U ? "1.1.1.1" : ",1.1.1.1");
+        }
+    }
+    reset_wrapper_state();
+    g_chaos_dns_real_getaddrinfo = chaos_dns_test_getaddrinfo;
+    g_chaos_dns_real_freeaddrinfo = chaos_dns_test_freeaddrinfo;
+    assert(chaos_dns_apply_override(&rule, "x", NULL, NULL, &result) == EAI_FAIL);
+    assert(g_real_freeaddrinfo_calls == (int)CHAOS_DNS_MAX_OVERRIDE);
 
     reset_wrapper_state();
     g_chaos_dns_real_getaddrinfo = chaos_dns_test_getaddrinfo;
     g_chaos_dns_real_freeaddrinfo = chaos_dns_test_freeaddrinfo;
     g_stub_match[CHAOS_DNS_EFFECT_FILTER_FAMILY] = 1;
     g_stub_rules[CHAOS_DNS_EFFECT_FILTER_FAMILY].effect = CHAOS_DNS_EFFECT_FILTER_FAMILY;
+    g_stub_rules[CHAOS_DNS_EFFECT_FILTER_FAMILY].family = CHAOS_DNS_FAMILY_INET4;
     g_filter_drop_all = 1;
     assert(getaddrinfo("api.example.com", NULL, NULL, &result) == EAI_NONAME);
     assert(g_filter_calls == 1);
+
+    /* FILTER_FAMILY any filters nothing: the lookup succeeds with its list. */
+    g_stub_rules[CHAOS_DNS_EFFECT_FILTER_FAMILY].family = CHAOS_DNS_FAMILY_ANY;
+    assert(getaddrinfo("api.example.com", NULL, NULL, &result) == 0 && result != NULL);
+    assert(g_filter_calls == 1);
+    chaos_dns_test_freeaddrinfo(result);
+
+    /* A list of ours that FILTER or LIMIT empties is freed as a whole. */
+    g_stub_match[CHAOS_DNS_EFFECT_OVERRIDE] = 1;
+    g_stub_rules[CHAOS_DNS_EFFECT_OVERRIDE].effect = CHAOS_DNS_EFFECT_OVERRIDE;
+    (void)memcpy(g_stub_rules[CHAOS_DNS_EFFECT_OVERRIDE].text, "127.0.0.1", 10U);
+    g_stub_rules[CHAOS_DNS_EFFECT_FILTER_FAMILY].family = CHAOS_DNS_FAMILY_INET6;
+    assert(getaddrinfo("api.example.com", NULL, NULL, &result) == EAI_NONAME);
+    g_stub_match[CHAOS_DNS_EFFECT_FILTER_FAMILY] = 0;
+    g_stub_match[CHAOS_DNS_EFFECT_LIMIT] = 1;
+    g_stub_rules[CHAOS_DNS_EFFECT_LIMIT].effect = CHAOS_DNS_EFFECT_LIMIT;
+    g_stub_rules[CHAOS_DNS_EFFECT_LIMIT].limit = 0U;
+    assert(getaddrinfo("api.example.com", NULL, NULL, &result) == EAI_NONAME);
+    {
+        size_t index;
+
+        for (index = 0U; index < CHAOS_DNS_MAX_OWNED; ++index)
+        {
+            assert(g_chaos_dns_owned[index] == NULL);
+        }
+    }
 
     reset_wrapper_state();
     g_chaos_dns_real_getaddrinfo = chaos_dns_test_getaddrinfo;

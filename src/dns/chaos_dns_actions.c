@@ -48,6 +48,8 @@
 #include "chaos_dns_actions.h"
 #include "chaos_sleep.h"
 
+#include "chaos_dns_owned.h"
+
 #include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -160,7 +162,9 @@ static void chaos_dns_call_real_freeaddrinfo(struct addrinfo *result)
 {
     int previous;
 
-    if (result == NULL || g_chaos_dns_real_freeaddrinfo == NULL)
+    /* A node of a list we built (OVERRIDE) stays in its allocation until the
+     * list itself is freed; only real results are released node by node. */
+    if (result == NULL || g_chaos_dns_real_freeaddrinfo == NULL || chaos_dns_owned_contains(result))
     {
         return;
     }
@@ -222,6 +226,14 @@ int chaos_dns_filter_result_list(struct addrinfo **result, chaos_dns_family_filt
 
         if (current->ai_family != wanted_family)
         {
+            /* The canonical name lives on the first node: hand it on rather than
+             * free it with the node, so the list's new head keeps it. A last node
+             * keeps it, and frees it, when nothing is left. */
+            if (current->ai_canonname != NULL && next != NULL && next->ai_canonname == NULL)
+            {
+                next->ai_canonname = current->ai_canonname;
+                current->ai_canonname = NULL;
+            }
             /* Unlink this node from the list. */
             if (previous == NULL)
             {
@@ -243,6 +255,8 @@ int chaos_dns_filter_result_list(struct addrinfo **result, chaos_dns_family_filt
         current = next;
     }
 
+    /* The name only moves on from a dropped node to the next one, so it ends on
+     * the first survivor, the new head (or with the last node, if none is left). */
     return *result != NULL;
 }
 
@@ -315,6 +329,7 @@ void chaos_dns_shuffle_result_list(struct addrinfo **result)
 {
     struct addrinfo **nodes;
     struct addrinfo *current;
+    char *canonname;
     size_t count;
     size_t index;
 
@@ -357,7 +372,12 @@ void chaos_dns_shuffle_result_list(struct addrinfo **result)
         nodes[swap_index] = tmp;
     }
 
-    /* Step 3: relink the shuffled pointers into a singly-linked list. */
+    /* Step 3: relink the shuffled pointers into a singly-linked list. The
+     * canonical name belongs to the head (callers read it there): swap it with
+     * the new head's (NULL in what the C libraries return), so none is lost. */
+    canonname = (*result)->ai_canonname;
+    (*result)->ai_canonname = nodes[0]->ai_canonname;
+    nodes[0]->ai_canonname = canonname;
     for (index = 0U; index + 1U < count; ++index)
     {
         nodes[index]->ai_next = nodes[index + 1U];

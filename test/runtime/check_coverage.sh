@@ -73,6 +73,7 @@ resolve_gcno() {
 
 CONFIG_GCNO=$(resolve_gcno test_config_parse)
 CHAOS_INIT_GCNO=$(resolve_gcno test_chaos_init)
+DNS_OWNED_GCNO=$(resolve_gcno test_dns_owned)
 CHAOS_INIT_IO_GCNO=$(resolve_gcno test_chaos_init_io)
 CHAOS_INIT_NET_GCNO=$(resolve_gcno test_chaos_init_net)
 CHAOS_INIT_MEMORY_GCNO=$(resolve_gcno test_chaos_init_memory)
@@ -135,6 +136,7 @@ check_target "$PROCESS_CONFIG_GCNO" "src/process/chaos_process_config.c" "100.00
 check_target "$PROCESS_RUNTIME_GCNO" "src/process/chaos_process.c" "100.00"
 check_target "$CHAOS_PROCESS_GCNO" "src/process/chaos_process_hooks.c" "100.00"
 
+check_target "$DNS_OWNED_GCNO" "src/dns/chaos_dns_owned.c" "100.00"
 check_target "$CHAOS_INIT_GCNO" "src/init/chaos_init_core.c" "100.00"
 check_target "$CHAOS_INIT_GCNO" "src/init/chaos_init_delay.c" "100.00"
 check_target "$CHAOS_INIT_GCNO" "src/init/chaos_init_proc.c" "100.00"
