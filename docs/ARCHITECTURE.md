@@ -427,8 +427,17 @@ applied, and each process reports its counts in
 - A hit is counted where the library decides the effect fires
   (`chaos_<lib>_rule_should_trigger`, and FAIL_AFTER in libchaos-process): a
   call the probability gate lets through is not a hit.
-- The counter lives in the snapshot; every rule copy a wrapper gets carries a
-  pointer to it. A rule whose text is unchanged by a reload keeps its count.
+- The counters live in a pool of slots beside the two snapshots; every rule
+  copy a wrapper gets carries a pointer to its slot and the slot's generation.
+  A rule whose text is unchanged by a reload keeps the very same slot, so its
+  count, `@first` claims and REGRESS state go on, and a firing through a copy
+  taken before the reload still lands. A slot whose rule left the file gets a
+  new generation: a copy held across a blocking call by then neither fires nor
+  counts, also once the slot belongs to another rule. `@first` claims are taken
+  in one compare-and-swap with the generation.
+- A snapshot's sequence is odd while a reload rewrites it (a seqlock): a reader
+  that copied a rule out of a snapshot rewritten meanwhile does not use the
+  copy, and the call passes through.
 - The file is rewritten on each of a process's first 64 hits, then at most
   every 100 ms on a hit, and at normal exit. A hit that is not due to be written
   makes no system call (the time comes from the vDSO). A writer flag inherited
@@ -450,9 +459,6 @@ Known limits, kept on purpose:
 
 - A rule is identified across reloads by its first 200 bytes of text; two
   rules that share them share a count and an `@first` budget.
-- A wrapper holds its rule copy across a blocking call. If the rule file is
-  reloaded twice during that call, a post-call effect (CORRUPT on `read`)
-  counts its hit against whatever rule then sits at that index.
 - `@size` compares the byte count the call asked for, also for effects
   applied after the call (CORRUPT, TRICKLE, DUP).
 - Writes use the same raw-syscall rename as the status file.

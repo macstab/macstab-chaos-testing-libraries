@@ -259,15 +259,37 @@ static inline int chaos_policy_size_ok(const chaos_rule_policy_t *policy, uint64
  * @brief Completes a firing that passed every other check: claims an `@first`
  *        slot and counts the hit.
  *
- * @return 1 when the effect fires, 0 when the rule has used up its `@first=N`.
+ * @param policy      The rule's qualifiers.
+ * @param slot        The rule's hit slot; NULL for a rule outside a snapshot.
+ * @param generation  The slot's generation the rule copy was given with it.
+ * @return 1 when the effect fires, 0 when the rule has used up its `@first=N` or
+ *         is no longer in the rule file (its slot moved on, see chaos_hits.h).
  */
-static inline int chaos_policy_fire(const chaos_rule_policy_t *policy, chaos_hit_slot_t *slot)
+static inline int
+chaos_policy_fire(const chaos_rule_policy_t *policy, chaos_hit_slot_t *slot, uint64_t generation)
 {
-    /* Claims are per process: each library's atfork handler clears them in a child. */
-    if (policy->first != 0U && slot != NULL &&
-        __sync_fetch_and_add(&slot->claimed, 1U) >= policy->first)
+    if (!chaos_hit_slot_current(slot, generation))
     {
         return 0;
+    }
+    /* Claims are per process: each library's atfork handler clears them in a child.
+     * Claimed only in the word tagged with this copy's generation: a copy that
+     * passed the check above while its slot went to another rule fails here. */
+    if (policy->first != 0U && slot != NULL)
+    {
+        const uint64_t mine = chaos_hit_claims_none(generation);
+        uint64_t claimed;
+
+        do
+        {
+            claimed = slot->claimed;
+            if ((claimed & ~UINT64_C(0xffffffff)) != mine ||
+                chaos_hit_claims(claimed) >= policy->first ||
+                chaos_hit_claims(claimed) == UINT64_C(0xffffffff))
+            {
+                return 0;
+            }
+        } while (!__sync_bool_compare_and_swap(&slot->claimed, claimed, claimed + 1U));
     }
     chaos_hit_record(slot);
     return 1;

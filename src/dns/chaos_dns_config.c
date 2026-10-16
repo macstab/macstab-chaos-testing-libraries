@@ -97,11 +97,13 @@
  */
 typedef struct chaos_dns_config_state
 {
+    /** Odd while a reload rewrites the snapshot (see chaos_snapshot_read_begin()). */
+    volatile uint64_t sequence;
     chaos_dns_rule_t rules[CHAOS_DNS_MAX_RULES]; /**< Parsed rules in file order. */
     size_t rule_count;                           /**< Number of valid entries in rules[]. */
     int parse_ok; /**< 1 if this snapshot is usable; 0 if parse failed. */
     /** Hit counters, one per rule (see chaos_hits.h). */
-    chaos_hit_slot_t hits[CHAOS_DNS_MAX_RULES];
+    chaos_hit_slot_t *hits[CHAOS_DNS_MAX_RULES];
     /** Each rule as written in the file, reported with its count. */
     char text[CHAOS_DNS_MAX_RULES][CHAOS_STATUS_TEXT_MAX + 1U];
 } chaos_dns_config_state_t;
@@ -112,6 +114,9 @@ typedef struct chaos_dns_config_state
 
 /** Both config snapshots; indexed by g_chaos_dns_active_config_index. */
 static chaos_dns_config_state_t g_chaos_dns_config_states[2];
+
+/** @brief Hit slots of the rules of both snapshots (see chaos_hits_assign()). */
+static chaos_hit_slot_t g_chaos_dns_hit_pool[2U * CHAOS_DNS_MAX_RULES];
 
 /**
  * @brief Index (0 or 1) of the currently active config snapshot.
@@ -210,12 +215,18 @@ static char g_chaos_dns_hits_buffer[CHAOS_DNS_MAX_RULES * CHAOS_HITS_LINE_MAX + 
  */
 static void chaos_dns_config_reset_state(chaos_dns_config_state_t *state, int parse_ok)
 {
+    uint64_t sequence;
+
     if (state == NULL)
     {
         return;
     }
 
+    /* A reader still holding this snapshot sees that it changed. */
+    chaos_snapshot_write_begin(&state->sequence);
+    sequence = state->sequence;
     (void)memset(state, 0, sizeof(*state));
+    state->sequence = sequence;
     state->parse_ok = parse_ok;
 }
 
@@ -258,6 +269,7 @@ static const chaos_dns_config_state_t *chaos_dns_config_active_state(void)
  */
 static void chaos_dns_config_publish(unsigned int next_index, uint64_t observed_mtime)
 {
+    chaos_snapshot_write_end(&g_chaos_dns_config_states[next_index].sequence);
     __sync_synchronize();
     g_chaos_dns_active_config_index = next_index;
     __sync_synchronize();
@@ -1309,6 +1321,9 @@ void chaos_dns_config_init(void)
 {
     g_chaos_dns_hits_pid = (uint64_t)getpid();
     g_chaos_dns_hits_file = chaos_hits_file_number(CHAOS_DNS_HITS_PREFIX);
+    chaos_hits_pool_reset(
+        g_chaos_dns_hit_pool, sizeof(g_chaos_dns_hit_pool) / sizeof(g_chaos_dns_hit_pool[0])
+    );
     if (!g_chaos_dns_atfork_registered)
     {
         g_chaos_dns_atfork_registered = 1;
@@ -1318,6 +1333,8 @@ void chaos_dns_config_init(void)
     (void)chaos_clock_now_ns();
     chaos_dns_config_reset_state(&g_chaos_dns_config_states[0], 1);
     chaos_dns_config_reset_state(&g_chaos_dns_config_states[1], 1);
+    chaos_snapshot_write_end(&g_chaos_dns_config_states[0].sequence);
+    chaos_snapshot_write_end(&g_chaos_dns_config_states[1].sequence);
     g_chaos_dns_active_config_index = 0U;
     g_chaos_dns_cached_mtime = CHAOS_DNS_MTIME_UNKNOWN;
 }
@@ -1759,8 +1776,6 @@ static void chaos_dns_config_report_hits(chaos_hit_slot_t *slot)
  */
 static void chaos_dns_config_after_fork(void)
 {
-    size_t which;
-
     if (g_chaos_dns_cached_mtime == CHAOS_DNS_MTIME_RELOADING)
     {
         g_chaos_dns_cached_mtime = CHAOS_DNS_MTIME_UNKNOWN;
@@ -1774,21 +1789,9 @@ static void chaos_dns_config_after_fork(void)
     /* The child must not draw the parent's numbers (pre-fork workers would all
      * decide alike): its PRNG reseeds from its own thread id on the next draw. */
     g_chaos_dns_tls_prng_state = 0U;
-    for (which = 0U; which < 2U; ++which)
-    {
-        chaos_hit_slot_t *slots = g_chaos_dns_config_states[which].hits;
-        size_t index;
-
-        for (index = 0U; index < CHAOS_DNS_MAX_RULES; ++index)
-        {
-            slots[index].count = 0U;
-            slots[index].claimed = 0U;
-            if (slots[index].state == 3U)
-            {
-                slots[index].state = 1U;
-            }
-        }
-    }
+    chaos_hits_pool_after_fork(
+        g_chaos_dns_hit_pool, sizeof(g_chaos_dns_hit_pool) / sizeof(g_chaos_dns_hit_pool[0])
+    );
 }
 
 /** @brief Reports the hits not yet written when the process exits normally. */
@@ -1800,8 +1803,9 @@ __attribute__((destructor)) static void chaos_dns_config_report_hits_at_exit(voi
 /**
  * @brief Gives each rule of a freshly parsed snapshot its counter and text.
  *
- * @details A rule whose text is unchanged from the active snapshot keeps its count,
- * so adding one rule does not reset the counts of the others.
+ * @details A rule whose text is unchanged from the active snapshot keeps its slot
+ * (chaos_hits_assign()), so adding one rule does not reset the counts of the
+ * others and a firing through an older rule copy still lands.
  */
 static void chaos_dns_config_attach_hits(chaos_dns_config_state_t *next_state)
 {
@@ -1810,27 +1814,28 @@ static void chaos_dns_config_attach_hits(chaos_dns_config_state_t *next_state)
 
     for (index = 0U; index < next_state->rule_count; ++index)
     {
-        size_t previous;
-
         (void)memcpy(
             next_state->text[index],
             g_chaos_dns_config_texts[index],
             sizeof(next_state->text[index])
         );
-        next_state->hits[index].report = chaos_dns_config_report_hits;
-        for (previous = 0U; active != next_state && previous < active->rule_count; ++previous)
-        {
-            if (strcmp(active->text[previous], next_state->text[index]) == 0)
-            {
-                next_state->hits[index].count = active->hits[previous].count;
-                next_state->hits[index].claimed = active->hits[previous].claimed;
-                /* A REGRESS decision in progress belongs to the old slot. */
-                next_state->hits[index].state =
-                    active->hits[previous].state == 3U ? 1U : active->hits[previous].state;
-                break;
-            }
-        }
-        next_state->rules[index].hit = &next_state->hits[index];
+    }
+    chaos_hits_assign(
+        g_chaos_dns_hit_pool,
+        sizeof(g_chaos_dns_hit_pool) / sizeof(g_chaos_dns_hit_pool[0]),
+        active->hits,
+        (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) active->text,
+        active != next_state ? active->rule_count : 0U,
+        next_state->hits,
+        (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) next_state->text,
+        next_state->rule_count,
+        chaos_dns_config_report_hits
+    );
+    for (index = 0U; index < next_state->rule_count; ++index)
+    {
+        next_state->rules[index].hit = next_state->hits[index];
+        next_state->rules[index].hit_generation =
+            next_state->hits[index] != NULL ? next_state->hits[index]->generation : 0U;
     }
 }
 
@@ -2001,6 +2006,14 @@ static int chaos_dns_config_refresh(void)
     g_chaos_dns_config_content = content;
     chaos_dns_config_attach_hits(next_state);
     chaos_dns_config_report(observed_mtime, next_state);
+    /* Slots of rules that leave with this load: freed, and outdated in rule copies
+     * still held. Before the publish, while this thread still holds the claim. */
+    chaos_hits_release(
+        g_chaos_dns_hit_pool,
+        sizeof(g_chaos_dns_hit_pool) / sizeof(g_chaos_dns_hit_pool[0]),
+        next_state->hits,
+        next_state->rule_count
+    );
     chaos_dns_config_publish(next_index, observed_mtime);
     return next_state->parse_ok != 0 && next_state->rule_count != 0U;
 }
@@ -2029,13 +2042,15 @@ int chaos_dns_config_match_loaded(
 )
 {
     const chaos_dns_config_state_t *state = chaos_dns_config_active_state();
+    const uint64_t sequence = chaos_snapshot_read_begin(&state->sequence);
 
     if (state->parse_ok == 0)
     {
         return 0;
     }
 
-    return chaos_dns_config_select_rule(state->rules, state->rule_count, effect, name, rule);
+    return chaos_dns_config_select_rule(state->rules, state->rule_count, effect, name, rule) &&
+           chaos_snapshot_read_valid(&state->sequence, sequence);
 }
 
 /**
@@ -2046,6 +2061,7 @@ int chaos_dns_config_match_reverse_loaded(
 )
 {
     const chaos_dns_config_state_t *state = chaos_dns_config_active_state();
+    const uint64_t sequence = chaos_snapshot_read_begin(&state->sequence);
 
     if (state->parse_ok == 0)
     {
@@ -2053,8 +2069,9 @@ int chaos_dns_config_match_reverse_loaded(
     }
 
     return chaos_dns_config_select_reverse_rule(
-        state->rules, state->rule_count, effect, address, rule
-    );
+               state->rules, state->rule_count, effect, address, rule
+           ) &&
+           chaos_snapshot_read_valid(&state->sequence, sequence);
 }
 
 /**

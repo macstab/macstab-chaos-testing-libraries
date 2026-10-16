@@ -93,6 +93,7 @@ static int chaos_init_memory_fires(
     rule->hit = chaos_init_tracee_hit(
         &g_chaos_init_memory_rules, call->tid, state->hits, state->rule_count, rule->hit
     );
+    rule->hit_generation = rule->hit != NULL ? rule->hit->generation : 0U;
     return rule->hit != NULL && chaos_memory_rule_should_trigger(rule);
 }
 

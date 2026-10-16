@@ -268,6 +268,7 @@ HOST_RUNTIME_TESTS := \
 	$(TEST_RUNTIME_DIR)/test_path_forms.sh \
 	$(TEST_RUNTIME_DIR)/test_status.sh \
 	$(TEST_RUNTIME_DIR)/test_hits.sh \
+	$(TEST_RUNTIME_DIR)/test_reload.sh \
 	$(TEST_RUNTIME_DIR)/test_fork.sh \
 	$(TEST_RUNTIME_DIR)/test_init.sh \
 	$(TEST_RUNTIME_DIR)/test_seccomp.sh \

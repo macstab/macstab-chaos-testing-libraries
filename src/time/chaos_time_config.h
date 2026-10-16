@@ -200,8 +200,10 @@ typedef struct chaos_time_rule
      * move data; CHAOS_POLICY_NO_SIZE otherwise, which no `@size` gate passes.
      */
     uint64_t call_size;
-    /** Hit counter of this rule in its snapshot; NULL for a rule outside a snapshot. */
+    /** Hit counter of this rule (see chaos_hits.h); NULL for a rule outside a snapshot. */
     chaos_hit_slot_t *hit;
+    /** Generation of @c hit when the rule was published; a later one means the rule left. */
+    uint64_t hit_generation;
 } chaos_time_rule_t;
 
 /**

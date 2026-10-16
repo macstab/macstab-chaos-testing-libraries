@@ -216,7 +216,7 @@ int chaos_time_rule_should_trigger(const chaos_time_rule_t *rule)
     {
         return 0;
     }
-    return chaos_policy_fire(&rule->policy, rule->hit);
+    return chaos_policy_fire(&rule->policy, rule->hit, rule->hit_generation);
 }
 
 /**
@@ -307,7 +307,7 @@ void chaos_time_rule_apply_regress(const chaos_time_rule_t *rule, struct timespe
     chaos_hit_slot_t *slot;
 
     if (rule == NULL || value == NULL || rule->effect != CHAOS_TIME_EFFECT_REGRESS ||
-        rule->hit == NULL)
+        rule->hit == NULL || !chaos_hit_slot_current(rule->hit, rule->hit_generation))
     {
         return;
     }

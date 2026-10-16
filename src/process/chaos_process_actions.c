@@ -100,7 +100,7 @@ int chaos_process_rule_should_trigger(const chaos_process_rule_t *rule)
     {
         return 0;
     }
-    return chaos_policy_fire(&rule->policy, rule->hit);
+    return chaos_policy_fire(&rule->policy, rule->hit, rule->hit_generation);
 }
 
 /**
@@ -181,7 +181,7 @@ int chaos_process_rule_fail_after_error(
 
     if (!chaos_policy_window_open(&rule->policy) ||
         !chaos_policy_size_ok(&rule->policy, rule->call_size) ||
-        !chaos_policy_fire(&rule->policy, rule->hit))
+        !chaos_policy_fire(&rule->policy, rule->hit, rule->hit_generation))
     {
         return 0;
     }

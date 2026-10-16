@@ -1387,7 +1387,7 @@ static void test_hits_are_counted_and_reported(void)
     assert(chaos_net_config_prepare() == 1);
     state = (chaos_net_config_state_t *)chaos_net_config_active_state();
     assert(state->rule_count == 1U);
-    assert(state->rules[0].hit == &state->hits[0]);
+    assert(state->rules[0].hit == state->hits[0]);
     assert(strcmp(state->text[0], "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 # a") == 0);
     chaos_hit_record(state->rules[0].hit);
     chaos_hit_record(state->rules[0].hit);
@@ -1402,7 +1402,7 @@ static void test_hits_are_counted_and_reported(void)
     assert(chaos_net_config_prepare() == 1);
     state = (chaos_net_config_state_t *)chaos_net_config_active_state();
     assert(state->rule_count == 2U);
-    assert(state->hits[0].count == 2U);
+    assert(state->hits[0]->count == 2U);
     chaos_hit_record(state->rules[1].hit);
     assert(read_hits_file(hits, sizeof(hits)));
     assert(
@@ -1431,7 +1431,7 @@ static void test_hits_are_counted_and_reported(void)
     g_chaos_net_hits_total = CHAOS_HITS_EAGER;
     g_chaos_net_hits_last_ms = chaos_hits_now_ms();
     chaos_hit_record(state->rules[1].hit);
-    assert(state->hits[1].count == 3U);
+    assert(state->hits[1]->count == 3U);
     assert(read_hits_file(hits, sizeof(hits)));
     assert(
         strcmp(
@@ -1673,22 +1673,38 @@ static void test_first_budget_is_per_process(void)
     write_config_text("tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 @first=1\n", 91);
     assert(chaos_net_config_prepare() == 1);
     state = (chaos_net_config_state_t *)chaos_net_config_active_state();
-    assert(chaos_policy_fire(&state->rules[0].policy, state->rules[0].hit) == 1);
-    assert(chaos_policy_fire(&state->rules[0].policy, state->rules[0].hit) == 0);
+    assert(
+        chaos_policy_fire(
+            &state->rules[0].policy, state->rules[0].hit, state->rules[0].hit_generation
+        ) == 1
+    );
+    assert(
+        chaos_policy_fire(
+            &state->rules[0].policy, state->rules[0].hit, state->rules[0].hit_generation
+        ) == 0
+    );
     child = fork();
     assert(child >= 0);
     if (child == 0)
     {
         _exit(
-            chaos_policy_fire(&state->rules[0].policy, state->rules[0].hit) == 1 &&
-                    chaos_policy_fire(&state->rules[0].policy, state->rules[0].hit) == 0
+            chaos_policy_fire(
+                &state->rules[0].policy, state->rules[0].hit, state->rules[0].hit_generation
+            ) == 1 &&
+                    chaos_policy_fire(
+                        &state->rules[0].policy, state->rules[0].hit, state->rules[0].hit_generation
+                    ) == 0
                 ? 0
                 : 1
         );
     }
     assert(waitpid(child, &status, 0) == child);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-    assert(chaos_policy_fire(&state->rules[0].policy, state->rules[0].hit) == 0);
+    assert(
+        chaos_policy_fire(
+            &state->rules[0].policy, state->rules[0].hit, state->rules[0].hit_generation
+        ) == 0
+    );
     (void)unlink(CHAOS_NET_CONFIG_PATH);
 }
 
@@ -1770,6 +1786,83 @@ static void test_pending_hits_written_after_interval(void)
     g_chaos_net_check_interval_ns = interval;
 }
 
+/**
+ * @brief Invariant: a rule copy taken before a reload counts on the slot its rule
+ *        keeps, and a copy of a rule that left neither fires nor charges the rule
+ *        that now uses its slot.
+ *
+ * Triggering condition: a copy of rule a (`@first=5`); a reload that keeps a; two
+ * reloads that drop a and give its slot to c (`@first=1`), as a blocking recv()
+ * holding the copy would see them.
+ *
+ * Expected observable behaviour: the first firing through the old copy is counted
+ * in the new snapshot; after a left, its copy does not fire, and c keeps its one
+ * firing and a count of zero.
+ */
+static void test_rule_copies_across_reloads(void)
+{
+    const chaos_net_config_state_t *state;
+    const uint64_t interval = g_chaos_net_check_interval_ns;
+    chaos_net_rule_t copy;
+
+    g_chaos_net_check_interval_ns = 0U;
+    chaos_net_config_init();
+    write_config_text("tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 @first=5 # a\n", 70);
+    assert(chaos_net_config_prepare());
+    copy = chaos_net_config_active_state()->rules[0];
+
+    write_config_text(
+        "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 @first=5 # a\n"
+        "tcp4://127.0.0.1:9011:connect:ECONNREFUSED:1.0 # b\n",
+        71
+    );
+    assert(chaos_net_config_prepare());
+    state = chaos_net_config_active_state();
+    assert(state->hits[0] == copy.hit);
+    assert(chaos_policy_fire(&copy.policy, copy.hit, copy.hit_generation) == 1);
+    assert(state->hits[0]->count == 1U);
+
+    write_config_text("tcp4://127.0.0.1:9011:connect:ECONNREFUSED:1.0 # b\n", 72);
+    assert(chaos_net_config_prepare());
+    write_config_text(
+        "tcp4://127.0.0.1:9011:connect:ECONNREFUSED:1.0 # b\n"
+        "tcp4://127.0.0.1:9012:connect:ECONNREFUSED:1.0 @first=1 # c\n",
+        73
+    );
+    assert(chaos_net_config_prepare());
+    state = chaos_net_config_active_state();
+    assert(state->hits[1] == copy.hit); /* c took the slot a left */
+    assert(chaos_policy_fire(&copy.policy, copy.hit, copy.hit_generation) == 0);
+    assert(state->hits[1]->count == 0U && chaos_hit_claims(state->hits[1]->claimed) == 0U);
+    assert(
+        chaos_policy_fire(
+            &state->rules[1].policy, state->rules[1].hit, state->rules[1].hit_generation
+        ) == 1
+    );
+
+    /* A copy made while a reload rewrites the snapshot is not used: the snapshot's
+     * sequence is odd from the rewrite until the publish. */
+    {
+        chaos_net_config_state_t *active = (chaos_net_config_state_t *)state;
+        chaos_net_endpoint_t endpoint = {0};
+        chaos_net_rule_t rule;
+        uint64_t begin;
+
+        assert(chaos_net_endpoint_parse_selector("tcp4://127.0.0.1:9011", &endpoint));
+        assert(chaos_net_config_match_endpoint_loaded(CHAOS_NET_OP_CONNECT, &endpoint, &rule));
+        begin = chaos_snapshot_read_begin(&active->sequence);
+        chaos_snapshot_write_begin(&active->sequence);
+        assert(!chaos_snapshot_read_valid(&active->sequence, begin));
+        assert(!chaos_net_config_match_endpoint_loaded(CHAOS_NET_OP_CONNECT, &endpoint, &rule));
+        chaos_snapshot_write_end(&active->sequence);
+        assert(!chaos_snapshot_read_valid(&active->sequence, begin));
+        assert(chaos_net_config_match_endpoint_loaded(CHAOS_NET_OP_CONNECT, &endpoint, &rule));
+    }
+
+    (void)unlink(CHAOS_NET_CONFIG_PATH);
+    g_chaos_net_check_interval_ns = interval;
+}
+
 int main(void)
 {
     /* Look at the rule file on every call; the throttle has its own test. */
@@ -1799,5 +1892,6 @@ int main(void)
     test_interrupted_read_is_retried();
     test_racy_rewrite_is_seen();
     test_pending_hits_written_after_interval();
+    test_rule_copies_across_reloads();
     return 0;
 }

@@ -106,12 +106,19 @@ static void chaos_init_tracee_write(chaos_init_rules_t *rules, int tracee)
     uint64_t generation;
     const size_t count = rules->snapshot(&texts, &generation);
 
+    static chaos_hit_slot_t *slots[CHAOS_INIT_MAX_RULES];
+    size_t index;
+
     chaos_init_tracee_sync(rules, tracee);
     rules->pending[tracee] = 0U;
+    for (index = 0U; index < rules->max_rules; ++index)
+    {
+        slots[index] = &rules->slots[(size_t)tracee * rules->max_rules + index];
+    }
     chaos_hits_write_for(
         rules->hits_prefix,
         (long)g_chaos_init_tracees[tracee].tgid,
-        &rules->slots[(size_t)tracee * rules->max_rules],
+        slots,
         (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) texts,
         count < rules->max_rules ? count : rules->max_rules,
         rules->buffer,
@@ -255,18 +262,22 @@ chaos_hit_slot_t *chaos_init_tracee_slot(chaos_init_rules_t *rules, int tracee, 
 chaos_hit_slot_t *chaos_init_tracee_hit(
     chaos_init_rules_t *rules,
     pid_t tid,
-    const chaos_hit_slot_t *hits,
+    chaos_hit_slot_t *const *hits,
     size_t count,
     const chaos_hit_slot_t *hit
 )
 {
+    size_t index;
     int tracee;
 
-    if (hit < hits || hit >= hits + count || (tracee = chaos_init_tracee_of(tid)) < 0)
+    for (index = 0U; index < count && hits[index] != hit; ++index)
+    {
+    }
+    if (hit == NULL || index == count || (tracee = chaos_init_tracee_of(tid)) < 0)
     {
         return NULL;
     }
-    return chaos_init_tracee_slot(rules, tracee, (size_t)(hit - hits));
+    return chaos_init_tracee_slot(rules, tracee, index);
 }
 
 void chaos_init_tracee_flush(int all)

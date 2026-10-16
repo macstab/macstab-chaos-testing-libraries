@@ -363,6 +363,7 @@ int chaos_init_io_decide(const chaos_init_call_t *call, chaos_init_verdict_t *ve
     rule.hit = chaos_init_tracee_hit(
         &g_chaos_init_io_rules, call->tid, state->hits, state->rule_count, rule.hit
     );
+    rule.hit_generation = rule.hit != NULL ? rule.hit->generation : 0U;
     if (rule.hit == NULL || !chaos_io_rule_should_trigger(&rule))
     {
         return 1;

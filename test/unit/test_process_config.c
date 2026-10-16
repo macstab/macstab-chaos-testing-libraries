@@ -1262,7 +1262,7 @@ static void test_hits_are_counted_and_reported(void)
     assert(chaos_process_config_prepare() == 1);
     state = (chaos_process_config_state_t *)chaos_process_config_active_state();
     assert(state->rule_count == 1U);
-    assert(state->rules[0].hit == &state->hits[0]);
+    assert(state->rules[0].hit == state->hits[0]);
     assert(strcmp(state->text[0], "fork:ERRNO:EAGAIN # a") == 0);
     chaos_hit_record(state->rules[0].hit);
     chaos_hit_record(state->rules[0].hit);
@@ -1273,7 +1273,7 @@ static void test_hits_are_counted_and_reported(void)
     assert(chaos_process_config_prepare() == 1);
     state = (chaos_process_config_state_t *)chaos_process_config_active_state();
     assert(state->rule_count == 2U);
-    assert(state->hits[0].count == 2U);
+    assert(state->hits[0]->count == 2U);
     chaos_hit_record(state->rules[1].hit);
     assert(read_hits_file(hits, sizeof(hits)));
     assert(strcmp(hits, "2\tfork:ERRNO:EAGAIN # a\n1\tfork:ERRNO:EAGAIN # b\n") == 0);
@@ -1290,7 +1290,7 @@ static void test_hits_are_counted_and_reported(void)
     g_chaos_process_hits_total = CHAOS_HITS_EAGER;
     g_chaos_process_hits_last_ms = chaos_hits_now_ms();
     chaos_hit_record(state->rules[1].hit);
-    assert(state->hits[1].count == 3U);
+    assert(state->hits[1]->count == 3U);
     assert(read_hits_file(hits, sizeof(hits)));
     assert(strcmp(hits, "2\tfork:ERRNO:EAGAIN # a\n1\tfork:ERRNO:EAGAIN # b\n") == 0);
 

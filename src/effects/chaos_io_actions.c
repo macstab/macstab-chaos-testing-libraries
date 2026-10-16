@@ -197,13 +197,13 @@ int chaos_io_rule_should_trigger(const chaos_io_rule_t *rule)
     }
     if (rule->effect == CHAOS_IO_EFFECT_LATENCY)
     {
-        return chaos_policy_fire(&rule->policy, rule->hit);
+        return chaos_policy_fire(&rule->policy, rule->hit, rule->hit_generation);
     }
     if (!chaos_io_probability_hit(rule->probability))
     {
         return 0;
     }
-    return chaos_policy_fire(&rule->policy, rule->hit);
+    return chaos_policy_fire(&rule->policy, rule->hit, rule->hit_generation);
 }
 
 /**

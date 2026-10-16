@@ -120,7 +120,7 @@ int chaos_memory_rule_should_trigger(const chaos_memory_rule_t *rule)
     {
         return 0;
     }
-    return chaos_policy_fire(&rule->policy, rule->hit);
+    return chaos_policy_fire(&rule->policy, rule->hit, rule->hit_generation);
 }
 
 /**

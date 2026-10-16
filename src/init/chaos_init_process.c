@@ -139,6 +139,7 @@ static int chaos_init_process_slot(const chaos_init_call_t *call, chaos_process_
     rule->hit = chaos_init_tracee_hit(
         &g_chaos_init_process_rules, call->tid, state->hits, state->rule_count, rule->hit
     );
+    rule->hit_generation = rule->hit != NULL ? rule->hit->generation : 0U;
     return rule->hit != NULL;
 }
 

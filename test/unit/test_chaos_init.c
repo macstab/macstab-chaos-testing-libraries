@@ -502,14 +502,16 @@ static void test_tracee_table(void)
 
     /* The slot for a rule copy: of the snapshot's slots, for a known process. */
     {
-        chaos_hit_slot_t snapshot[2];
+        chaos_hit_slot_t pool[2];
+        chaos_hit_slot_t *snapshot[2] = {&pool[0], &pool[1]};
 
         assert(
-            chaos_init_tracee_hit(&g_test_lib, 10, snapshot, 2U, &snapshot[1]) ==
+            chaos_init_tracee_hit(&g_test_lib, 10, snapshot, 2U, &pool[1]) ==
             chaos_init_tracee_slot(&g_test_lib, chaos_init_tracee_of(10), 1U)
         );
-        assert(chaos_init_tracee_hit(&g_test_lib, 10, snapshot, 1U, &snapshot[1]) == NULL);
-        assert(chaos_init_tracee_hit(&g_test_lib, 0, snapshot, 2U, &snapshot[0]) == NULL);
+        assert(chaos_init_tracee_hit(&g_test_lib, 10, snapshot, 1U, &pool[1]) == NULL);
+        assert(chaos_init_tracee_hit(&g_test_lib, 10, snapshot, 2U, NULL) == NULL);
+        assert(chaos_init_tracee_hit(&g_test_lib, 0, snapshot, 2U, &pool[0]) == NULL);
     }
 
     /* A slot of no registered library is ignored. */

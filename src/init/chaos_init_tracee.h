@@ -95,7 +95,7 @@ chaos_hit_slot_t *chaos_init_tracee_slot(chaos_init_rules_t *rules, int tracee, 
 chaos_hit_slot_t *chaos_init_tracee_hit(
     chaos_init_rules_t *rules,
     pid_t tid,
-    const chaos_hit_slot_t *hits,
+    chaos_hit_slot_t *const *hits,
     size_t count,
     const chaos_hit_slot_t *hit
 );

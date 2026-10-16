@@ -707,6 +707,7 @@ int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *v
     rule.hit = chaos_init_tracee_hit(
         &g_chaos_init_net_rules, call->tid, state->hits, state->rule_count, rule.hit
     );
+    rule.hit_generation = rule.hit != NULL ? rule.hit->generation : 0U;
     if (rule.hit == NULL || !chaos_net_rule_should_trigger(&rule))
     {
         return 1;
