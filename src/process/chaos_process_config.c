@@ -203,6 +203,8 @@ static volatile uint64_t g_chaos_process_hits_pid = 0U;
 
 /** @brief Number of this image's hits file (chaos_hits_file_number()). */
 static long g_chaos_process_hits_file = 0L;
+/** @brief Whether this image created that file (chaos_hits_write_for()). */
+static int g_chaos_process_hits_owned = 0;
 
 /** @brief Scratch for the hits file; used only by the thread that writes it. */
 static char g_chaos_process_hits_buffer[CHAOS_PROCESS_MAX_RULES * CHAOS_HITS_LINE_MAX + 1U];
@@ -999,6 +1001,7 @@ void chaos_process_config_init(void)
 {
     g_chaos_process_hits_pid = (uint64_t)getpid();
     g_chaos_process_hits_file = chaos_hits_file_number(CHAOS_PROCESS_HITS_PREFIX);
+    g_chaos_process_hits_owned = 0;
     chaos_hits_pool_reset(
         g_chaos_process_hit_pool,
         sizeof(g_chaos_process_hit_pool) / sizeof(g_chaos_process_hit_pool[0])
@@ -1354,7 +1357,9 @@ static void chaos_process_config_report_hits(chaos_hit_slot_t *slot)
             __sync_synchronize();
             chaos_hits_write_for(
                 CHAOS_PROCESS_HITS_PREFIX,
-                g_chaos_process_hits_file,
+                (long)getpid(),
+                &g_chaos_process_hits_file,
+                &g_chaos_process_hits_owned,
                 state->hits,
                 (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) state->text,
                 state->rule_count,
@@ -1390,6 +1395,7 @@ static void chaos_process_config_after_fork(void)
     g_chaos_process_hits_last_ms = 0U;
     g_chaos_process_hits_pid = (uint64_t)getpid();
     g_chaos_process_hits_file = chaos_hits_file_number(CHAOS_PROCESS_HITS_PREFIX);
+    g_chaos_process_hits_owned = 0;
     /* The child must not draw the parent's numbers (pre-fork workers would all
      * decide alike): its PRNG reseeds from its own thread id on the next draw. */
     g_chaos_process_tls_prng_state = 0U;

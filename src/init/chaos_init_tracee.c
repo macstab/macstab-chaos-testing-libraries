@@ -118,21 +118,28 @@ static void chaos_init_tracee_write(chaos_init_rules_t *rules, int tracee)
     {
         slots[index] = &rules->slots[(size_t)tracee * rules->max_rules + index];
     }
-    /* A file of this pid may hold the hits of the image an execve replaced. */
-    if (rules->file[tracee] == 0)
+    const long tgid = (long)g_chaos_init_tracees[tracee].tgid;
+    /* The number of a file this process created, 0 before its first write. A file
+     * of this pid may hold the hits of the image an execve replaced. */
+    long number = rules->file[tracee];
+    int owned = number != 0;
+
+    if (!owned)
     {
-        rules->file[tracee] =
-            chaos_hits_file_number_for(rules->hits_prefix, (long)g_chaos_init_tracees[tracee].tgid);
+        number = chaos_hits_file_number_for(rules->hits_prefix, tgid);
     }
     chaos_hits_write_for(
         rules->hits_prefix,
-        rules->file[tracee],
+        tgid,
+        &number,
+        &owned,
         slots,
         (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) texts,
         count < rules->max_rules ? count : rules->max_rules,
         rules->buffer,
         rules->max_rules * CHAOS_HITS_LINE_MAX + 1U
     );
+    rules->file[tracee] = owned ? number : 0;
 }
 
 static void chaos_init_tracee_report(chaos_hit_slot_t *slot)

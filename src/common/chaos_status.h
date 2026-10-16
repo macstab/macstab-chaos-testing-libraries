@@ -175,6 +175,7 @@ static inline size_t chaos_status_format(
 #define CHAOS_STATUS_WRITE(fd, data, length) syscall(SYS_write, (fd), (data), (length))
 #define CHAOS_STATUS_CLOSE(fd) syscall(SYS_close, (fd))
 #define CHAOS_STATUS_UNLINK(path) syscall(SYS_unlinkat, AT_FDCWD, (path), 0)
+#define CHAOS_STATUS_LINK(from, to) syscall(SYS_linkat, AT_FDCWD, (from), AT_FDCWD, (to), 0)
 #define CHAOS_STATUS_EXISTS(path) (syscall(SYS_faccessat, AT_FDCWD, (path), F_OK, 0) == 0)
 #ifdef SYS_renameat
 #define CHAOS_STATUS_RENAME(from, to) syscall(SYS_renameat, AT_FDCWD, (from), AT_FDCWD, (to))
@@ -189,6 +190,7 @@ static inline size_t chaos_status_format(
 #define CHAOS_STATUS_WRITE(fd, data, length) write((fd), (data), (length))
 #define CHAOS_STATUS_CLOSE(fd) close(fd)
 #define CHAOS_STATUS_UNLINK(path) unlink(path)
+#define CHAOS_STATUS_LINK(from, to) link((from), (to))
 #define CHAOS_STATUS_EXISTS(path) (access((path), F_OK) == 0)
 #define CHAOS_STATUS_RENAME(from, to) rename((from), (to))
 #endif
@@ -276,8 +278,15 @@ static inline int chaos_status_write_all(int fd, const char *data, size_t length
  *
  * Best effort: on any other failure the staging file is removed and @p path is
  * left as it was. errno is left untouched.
+ *
+ * With @p exclusive, @p path is only created, never replaced: the staging file is
+ * linked to it, which fails when it exists. A file system without hard links
+ * replaces it after all.
+ *
+ * @return 1 when @p exclusive and @p path exists (nothing written), else 0.
  */
-static inline void chaos_status_replace_file(const char *path, const char *data, size_t length)
+static inline int
+chaos_status_publish(const char *path, const char *data, size_t length, int exclusive)
 {
     const int saved_errno = errno;
     const char *slash = strrchr(path, '/');
@@ -308,7 +317,7 @@ static inline void chaos_status_replace_file(const char *path, const char *data,
             ) >= sizeof(staging))
         {
             errno = saved_errno;
-            return;
+            return 0;
         }
         fd = CHAOS_STATUS_OPEN(staging);
         if (fd >= 0 || errno != EEXIST)
@@ -319,15 +328,26 @@ static inline void chaos_status_replace_file(const char *path, const char *data,
     if (fd < 0)
     {
         errno = saved_errno;
-        return;
+        return 0;
     }
     (void)CHAOS_STATUS_SHARE(fd);
     complete = chaos_status_write_all(fd, data, length);
     (void)CHAOS_STATUS_CLOSE(fd);
+    if (complete && exclusive)
+    {
+        const int taken = CHAOS_STATUS_LINK(staging, path) != 0;
+
+        if (!taken || errno == EEXIST)
+        {
+            (void)CHAOS_STATUS_UNLINK(staging);
+            errno = saved_errno;
+            return taken;
+        }
+    }
     if (complete && CHAOS_STATUS_RENAME(staging, path) == 0)
     {
         errno = saved_errno;
-        return;
+        return 0;
     }
     if (complete && (errno == EPERM || errno == EACCES))
     {
@@ -341,6 +361,13 @@ static inline void chaos_status_replace_file(const char *path, const char *data,
     }
     (void)CHAOS_STATUS_UNLINK(staging);
     errno = saved_errno;
+    return 0;
+}
+
+/** @brief chaos_status_publish(), replacing @p path. */
+static inline void chaos_status_replace_file(const char *path, const char *data, size_t length)
+{
+    (void)chaos_status_publish(path, data, length, 0);
 }
 
 /**

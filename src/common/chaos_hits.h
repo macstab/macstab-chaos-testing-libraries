@@ -364,13 +364,19 @@ static inline long chaos_hits_file_number(const char *prefix)
 }
 
 /**
- * @brief Writes the hits file numbered @p pid.
+ * @brief Writes the hits file of process @p pid.
  *
- * @details chaos-init writes them for the processes it supervises, by pid; the
- * libraries write their own under chaos_hits_file_number().
+ * @details The file is numbered *@p number (chaos_hits_file_number_for()). That
+ * number is checked when it is chosen, but another process may take the same name
+ * before either has written: containers sharing /tmp each run their application
+ * as pid 1. So the first write only creates the file, never replaces one; when the
+ * name is taken, the next number is chosen and *@p number updated. Once a write
+ * has created it, *@p owned is set and later writes replace it.
  *
  * @param prefix  File name without the number, e.g. `/tmp/.chaos-net.hits`.
- * @param pid     Number of the file: a pid, or chaos_hits_file_number().
+ * @param pid     The process whose hits these are.
+ * @param number  Number of its file; updated when the name is taken.
+ * @param owned   Whether the file was created by this process; 0 before.
  * @param slots   Counters, @p count entries; a NULL entry counts as 0.
  * @param texts   Rule texts, @p count entries of CHAOS_STATUS_TEXT_MAX + 1 bytes.
  * @param count   Number of rules.
@@ -379,6 +385,8 @@ static inline long chaos_hits_file_number(const char *prefix)
 static inline void chaos_hits_write_for(
     const char *prefix,
     long pid,
+    long *number,
+    int *owned,
     chaos_hit_slot_t *const *slots,
     const char (*texts)[CHAOS_STATUS_TEXT_MAX + 1U],
     size_t count,
@@ -389,11 +397,8 @@ static inline void chaos_hits_write_for(
     char path[128];
     size_t length = 0U;
     size_t index;
+    unsigned attempt;
 
-    if ((size_t)snprintf(path, sizeof(path), "%s.%ld", prefix, pid) >= sizeof(path))
-    {
-        return;
-    }
     for (index = 0U; index < count; ++index)
     {
         const unsigned long long hits = slots[index] != NULL ? slots[index]->count : 0U;
@@ -406,7 +411,24 @@ static inline void chaos_hits_write_for(
         }
         length += (size_t)rc;
     }
-    chaos_status_replace_file(path, buffer, length);
+    for (attempt = 0U; attempt < 4U; ++attempt)
+    {
+        if ((size_t)snprintf(path, sizeof(path), "%s.%ld", prefix, *number) >= sizeof(path))
+        {
+            return;
+        }
+        if (*owned)
+        {
+            chaos_status_replace_file(path, buffer, length);
+            return;
+        }
+        if (chaos_status_publish(path, buffer, length, 1) == 0)
+        {
+            *owned = 1;
+            return;
+        }
+        *number = chaos_hits_file_number_for(prefix, pid);
+    }
 }
 
 #endif

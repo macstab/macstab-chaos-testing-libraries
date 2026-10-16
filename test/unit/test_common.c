@@ -59,6 +59,8 @@ static int test_open(const char *path);
 static int test_open_existing(const char *path);
 static long test_write(int fd, const void *data, size_t length);
 static int test_rename(const char *from, const char *to);
+static int g_link_fails = 0; /* errno for the link, 0 = real */
+static int test_link(const char *from, const char *to);
 #define CHAOS_STATUS_OPEN(path) test_open(path)
 #define CHAOS_STATUS_OPEN_EXISTING(path) test_open_existing(path)
 #define CHAOS_STATUS_SHARE(fd) fchmod((fd), 0666)
@@ -67,6 +69,7 @@ static int test_rename(const char *from, const char *to);
 #define CHAOS_STATUS_UNLINK(path) unlink(path)
 #define CHAOS_STATUS_EXISTS(path) (access((path), F_OK) == 0)
 #define CHAOS_STATUS_RENAME(from, to) test_rename((from), (to))
+#define CHAOS_STATUS_LINK(from, to) test_link((from), (to))
 
 /* Sleep system call: records the requests, interrupted or failing on request. */
 static int g_sleep_interrupts = 0;
@@ -139,6 +142,16 @@ static long test_write(int fd, const void *data, size_t length)
         return -1;
     }
     return (long)write(fd, data, length);
+}
+
+static int test_link(const char *from, const char *to)
+{
+    if (g_link_fails != 0)
+    {
+        errno = g_link_fails;
+        return -1;
+    }
+    return link(from, to);
 }
 
 static int test_rename(const char *from, const char *to)
@@ -350,22 +363,105 @@ static void test_hits(void)
     prefix[0] = '/';
     prefix[sizeof(prefix) - 1U] = '\0';
     g_opens = 0U;
-    chaos_hits_write_for(prefix, 1L, next, texts, 2U, buffer, sizeof(buffer));
-    chaos_hits_write_for(
-        "/tmp/chaos-common-test/hits", 1L, next, texts, 2U, buffer, sizeof(buffer)
-    );
-    assert(g_opens == 0U);
-    assert(access("/tmp/chaos-common-test/hits.1", F_OK) != 0);
-
-    /* With room, a rule without a slot is written with 0. */
     {
         char room[2U * CHAOS_HITS_LINE_MAX + 1U];
+        long number = 1L;
+        int owned = 0;
 
+        chaos_hits_write_for(prefix, 1L, &number, &owned, next, texts, 2U, room, sizeof(room));
         chaos_hits_write_for(
-            "/tmp/chaos-common-test/hits", 1L, next, texts, 2U, room, sizeof(room)
+            "/tmp/chaos-common-test/hits",
+            1L,
+            &number,
+            &owned,
+            next,
+            texts,
+            2U,
+            buffer,
+            sizeof(buffer)
         );
+        assert(g_opens == 0U && number == 1L && !owned);
+        assert(access("/tmp/chaos-common-test/hits.1", F_OK) != 0);
+
+        /* The first write creates the file, a rule without a slot written with 0;
+         * later writes replace it. An errno left from before decides nothing. */
+        errno = EEXIST;
+        chaos_hits_write_for(
+            "/tmp/chaos-common-test/hits", 1L, &number, &owned, next, texts, 2U, room, sizeof(room)
+        );
+        assert(number == 1L && owned && errno == EEXIST);
         assert(read_file("/tmp/chaos-common-test/hits.1", contents, sizeof(contents)) > 0L);
         assert(strcmp(contents, "3\t/a:open:EIO:1.0\n0\t/b:open:EIO:1.0\n") == 0);
+        pool[0].count = 4U;
+        chaos_hits_write_for(
+            "/tmp/chaos-common-test/hits", 1L, &number, &owned, next, texts, 2U, room, sizeof(room)
+        );
+        assert(read_file("/tmp/chaos-common-test/hits.1", contents, sizeof(contents)) > 0L);
+        assert(strncmp(contents, "4\t", 2U) == 0);
+
+        /* Another process with the same pid (a container sharing /tmp) chose the
+         * same name before either wrote: it takes the next number and leaves this
+         * file alone. */
+        {
+            long other = 1L;
+            int other_owned = 0;
+            char path[64];
+
+            pool[0].count = 9U;
+            chaos_hits_write_for(
+                "/tmp/chaos-common-test/hits",
+                1L,
+                &other,
+                &other_owned,
+                next,
+                texts,
+                2U,
+                room,
+                sizeof(room)
+            );
+            assert(other_owned && other > 1000000000L && other < 2000000000L);
+            (void)snprintf(path, sizeof(path), "/tmp/chaos-common-test/hits.%ld", other);
+            assert(read_file(path, contents, sizeof(contents)) > 0L);
+            assert(strncmp(contents, "9\t", 2U) == 0);
+            assert(read_file("/tmp/chaos-common-test/hits.1", contents, sizeof(contents)) > 0L);
+            assert(strncmp(contents, "4\t", 2U) == 0);
+            (void)unlink(path);
+        }
+
+        /* Names taken on every attempt: nothing is written, and none is owned. */
+        {
+            long other = 1L;
+            int other_owned = 0;
+
+            g_link_fails = EEXIST;
+            chaos_hits_write_for(
+                "/tmp/chaos-common-test/hits",
+                1L,
+                &other,
+                &other_owned,
+                next,
+                texts,
+                2U,
+                room,
+                sizeof(room)
+            );
+            g_link_fails = 0;
+            assert(!other_owned);
+            assert(!staging_left());
+        }
+        (void)unlink("/tmp/chaos-common-test/hits.1");
+
+        /* A file system without hard links: the file is created by rename. */
+        number = 1L;
+        owned = 0;
+        g_link_fails = EPERM;
+        chaos_hits_write_for(
+            "/tmp/chaos-common-test/hits", 1L, &number, &owned, next, texts, 2U, room, sizeof(room)
+        );
+        g_link_fails = 0;
+        assert(owned && number == 1L);
+        assert(read_file("/tmp/chaos-common-test/hits.1", contents, sizeof(contents)) > 0L);
+        assert(!staging_left());
         (void)unlink("/tmp/chaos-common-test/hits.1");
     }
 }

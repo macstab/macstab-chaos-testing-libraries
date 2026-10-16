@@ -451,6 +451,11 @@ applied, and each process reports its counts in
   exists, the new image writes `<pid>` followed by nine digits of its load time
   instead: a number beyond any pid, so the hits before the exec stay. Readers
   sum every `.hits.<digits>` file.
+- Two processes can choose the same number before either has written: containers
+  sharing /tmp each run their application as pid 1. A process's first write only
+  creates its file, never replaces one (a hard link of the staging file, which
+  fails when the name exists); when the name is taken, it takes the next number
+  the same way. Later writes replace the file it created.
 - A reader sums the files of all processes. Files of finished processes stay,
   so counts are cumulative until the files are removed (one file per process
   that ever hit a rule: remove them between test runs).
