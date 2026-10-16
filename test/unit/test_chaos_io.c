@@ -71,6 +71,9 @@
 
 #include "../support/test_chaos_io_harness.h"
 
+#include <dirent.h>
+#include <sys/resource.h>
+
 /**
  * @brief Invariant: `chaos_io_resolve_symbol()` wires a pointer and `chaos_io_read_seed_material()`
  *   returns the seeded value or a PID-based fallback.
@@ -2124,6 +2127,22 @@ static void test_glibc_alternate_entries(void)
  *   nothing.
  * - Without a real close_range the wrapper fails with ENOSYS.
  */
+/**
+ * @brief Releases what the closedir/pclose test opened, with the C library's own
+ *        functions (the interposed ones only reached stubs).
+ */
+static int closedir_real_release(DIR *directory, FILE *stream)
+{
+    void *closedir_symbol = dlsym(RTLD_NEXT, "closedir");
+    void *fclose_symbol = dlsym(RTLD_NEXT, "fclose");
+    int (*real_closedir)(DIR *);
+    int (*real_fclose)(FILE *);
+
+    (void)memcpy(&real_closedir, &closedir_symbol, sizeof(real_closedir));
+    (void)memcpy(&real_fclose, &fclose_symbol, sizeof(real_fclose));
+    return real_closedir(directory) | real_fclose(stream);
+}
+
 static void test_descriptor_reassignment_wrappers(void)
 {
     chaos_test_reset_state();
@@ -2170,6 +2189,60 @@ static void test_descriptor_reassignment_wrappers(void)
     assert(close_range(5U, 7U, 0) == -1);
     assert(errno == ENOSYS);
     chaos_test_bind_real_functions();
+
+    /* Descriptors the C library closes with its own system calls: forgotten too. */
+    {
+        /* Through pointers: the compiler knows these free their argument. */
+        int (*volatile closedir_wrapper)(DIR *) = closedir;
+        int (*volatile pclose_wrapper)(FILE *) = pclose;
+        struct rlimit original;
+        struct rlimit narrow;
+        DIR *directory = opendir("/");
+        FILE *stream = tmpfile();
+        int directory_fd;
+        int stream_fd;
+
+        assert(directory != NULL && stream != NULL);
+        directory_fd = dirfd(directory);
+        stream_fd = fileno(stream);
+
+        chaos_test_reset_state();
+        chaos_test_bind_real_functions();
+        errno = 4242;
+        assert(closedir_wrapper(directory) == 0);
+        assert(errno == 4242);
+        assert(g_real_closedir_calls == 1);
+        assert(g_fdcache_invalidate_calls == 1 && g_last_invalidate_fd == directory_fd);
+        assert(closedir_wrapper(NULL) == 0);
+        assert(g_fdcache_invalidate_calls == 2 && g_last_invalidate_fd == -1);
+
+        assert(pclose_wrapper(stream) == 7);
+        assert(g_real_pclose_calls == 1);
+        assert(g_fdcache_invalidate_calls == 3 && g_last_invalidate_fd == stream_fd);
+        assert(pclose_wrapper(NULL) == 7);
+        /* The stubs closed nothing: release what the test opened. */
+        assert(closedir_real_release(directory, stream) == 0);
+
+        closefrom(9);
+        assert(g_real_closefrom_calls == 1 && g_real_closefrom_lowfd == 9);
+        assert(g_fdcache_reset_calls == 1);
+
+        /* Without closefrom in the C library: close_range, else each descriptor. */
+        g_chaos_io_real_closefrom = NULL;
+        g_sys_close_range_result = 0;
+        errno = 4242;
+        closefrom(-5);
+        assert(errno == 4242 && g_sys_close_calls == 0 && g_fdcache_reset_calls == 2);
+        g_sys_close_range_result = -1;
+        assert(getrlimit(RLIMIT_NOFILE, &original) == 0);
+        narrow = original;
+        narrow.rlim_cur = 16U;
+        assert(setrlimit(RLIMIT_NOFILE, &narrow) == 0);
+        closefrom(10);
+        assert(setrlimit(RLIMIT_NOFILE, &original) == 0);
+        assert(errno == 4242 && g_sys_close_calls == 6 && g_fdcache_reset_calls == 3);
+        chaos_test_bind_real_functions();
+    }
 }
 
 /**

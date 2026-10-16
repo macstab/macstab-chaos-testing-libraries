@@ -60,6 +60,7 @@
 #include "../../src/config/chaos_io_config.h"
 #include "../../src/config/chaos_io_fdcache.h"
 
+#include <dirent.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <setjmp.h>
@@ -1075,6 +1076,38 @@ static int chaos_test_real_dup2_impl(int oldfd, int newfd)
     return g_real_dup_return;
 }
 
+/** @brief Calls of the stub closedir / pclose / closefrom functions. */
+static int g_real_closedir_calls = 0;
+static int g_real_pclose_calls = 0;
+static int g_real_closefrom_calls = 0;
+/** @brief `lowfd` the stub closefrom was last given. */
+static int g_real_closefrom_lowfd = -1;
+/** @brief Result of the raw close_range system call in the syscall stub. */
+static long g_sys_close_range_result = -1;
+
+/** @brief Stub for the real `closedir`; counts calls, returns 0. */
+static int chaos_test_real_closedir_impl(DIR *directory)
+{
+    (void)directory;
+    ++g_real_closedir_calls;
+    return 0;
+}
+
+/** @brief Stub for the real `pclose`; counts calls, returns 7 (an exit status). */
+static int chaos_test_real_pclose_impl(FILE *stream)
+{
+    (void)stream;
+    ++g_real_pclose_calls;
+    return 7;
+}
+
+/** @brief Stub for the real `closefrom`; counts calls. */
+static void chaos_test_real_closefrom_impl(int lowfd)
+{
+    ++g_real_closefrom_calls;
+    g_real_closefrom_lowfd = lowfd;
+}
+
 /** @brief Stub for the real `close_range`; counts calls. */
 static int chaos_test_real_close_range_impl(unsigned int first, unsigned int last, int flags)
 {
@@ -1428,6 +1461,18 @@ static void *chaos_test_dlsym(void *handle, const char *symbol)
     {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_dup2_fn, chaos_test_real_dup2_impl);
     }
+    if (strcmp(symbol, "closedir") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_closedir_fn, chaos_test_real_closedir_impl);
+    }
+    if (strcmp(symbol, "pclose") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_pclose_fn, chaos_test_real_pclose_impl);
+    }
+    if (strcmp(symbol, "closefrom") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_closefrom_fn, chaos_test_real_closefrom_impl);
+    }
     if (strcmp(symbol, "close_range") == 0)
     {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_close_range_fn, chaos_test_real_close_range_impl);
@@ -1587,6 +1632,17 @@ static long chaos_test_syscall(long number, ...)
         ++g_sys_close_calls;
         result = g_sys_close_result;
     }
+#ifdef SYS_close_range
+    else if (number == SYS_close_range)
+    {
+        result = g_sys_close_range_result;
+    }
+#else
+    else if (number == 436)
+    {
+        result = g_sys_close_range_result;
+    }
+#endif
     va_end(args);
 
     return result;
@@ -1744,6 +1800,11 @@ static void chaos_test_bind_real_stdio(void)
  */
 static void chaos_test_reset_state(void)
 {
+    g_real_closedir_calls = 0;
+    g_real_pclose_calls = 0;
+    g_real_closefrom_calls = 0;
+    g_real_closefrom_lowfd = -1;
+    g_sys_close_range_result = -1;
     g_vm_readv_calls = 0;
     g_vm_readv_errno = 0;
     (void)memset(&g_config_rule, 0, sizeof(g_config_rule));
@@ -2002,6 +2063,9 @@ static void chaos_test_bind_real_functions(void)
     g_chaos_io_real_close = chaos_test_real_close_impl;
     g_chaos_io_real_dup2 = chaos_test_real_dup2_impl;
     g_chaos_io_real_close_range = chaos_test_real_close_range_impl;
+    g_chaos_io_real_closedir = chaos_test_real_closedir_impl;
+    g_chaos_io_real_pclose = chaos_test_real_pclose_impl;
+    g_chaos_io_real_closefrom = chaos_test_real_closefrom_impl;
 #ifdef __linux__
     g_chaos_io_real_dup3 = chaos_test_real_dup3_impl;
 #endif

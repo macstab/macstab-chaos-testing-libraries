@@ -317,8 +317,9 @@ For a typical descriptor-backed call such as `write(fd, buf, count)`:
 9. Any post-call state updates occur:
    - `CORRUPT` may mutate the returned read buffer
    - `close()` invalidates the fd-cache entry for every thread, whatever the real
-     close returned (Linux releases the descriptor either way); `dup2()`, `dup3()`
-     and `close_range()` invalidate the descriptors they free or reassign
+     close returned (Linux releases the descriptor either way); `dup2()`, `dup3()`,
+     `close_range()`, `closedir()`, `pclose()` and `closefrom()` invalidate the
+     descriptors they free or reassign
    - successful `renameat()` and `unlinkat()` reset the whole cache
 
 ### What happens on `open()` and `openat()`
@@ -574,9 +575,10 @@ Trade-off:
 
 - collisions are possible by construction
 - a slot held by another writer is skipped (best effort); lookups never block
-- descriptors freed by calls the library does not see (raw system calls, stdio's
-  internal `close`) are not invalidated; those descriptors were never cached
-  through an interposed call in the first place in the common case
+- descriptors freed by calls the library does not see (a raw `syscall(SYS_close)`)
+  are not invalidated until an open-style call returns that number again (it
+  clears the slot first); the C library's own closes are covered by `closedir()`,
+  `pclose()`, `closefrom()` and `fclose()`
 
 Full lookup, seeding, and invalidation flow ([source](diagrams/fdcache.puml)):
 
@@ -774,7 +776,9 @@ FD-cache entry transitions:
 
 1. empty
 2. populated on successful open or first `/proc/self/fd` resolution
-3. invalidated for every thread by `close()`, `dup2()`, `dup3()` or `close_range()`
+3. invalidated for every thread by `close()`, `dup2()`, `dup3()`, `close_range()`,
+   `closedir()`, `pclose()`, `closefrom()` or `fclose()`, and before an open-style
+   call caches the number anew
 4. fully reset by a successful `renameat()` or `unlinkat()`
 
 ### Consistency model

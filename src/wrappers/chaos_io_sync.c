@@ -47,6 +47,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <sys/syscall.h>
 
 /**
  * @brief Interposed `close(2)` entry point.
@@ -176,6 +177,116 @@ CHAOS_IO_EXPORT int close_range(unsigned int first, unsigned int last, int flags
         chaos_io_fdcache_invalidate((int)fd);
     }
     return rc;
+}
+
+/**
+ * @brief Interposed `closedir(3)`: closes the directory, then forgets its descriptor.
+ *
+ * @details The C library closes a directory's descriptor with its own system call,
+ * which the close() wrapper never sees; the next descriptor with that number would
+ * otherwise be taken for the directory.
+ */
+CHAOS_IO_EXPORT int closedir(DIR *directory)
+{
+    const int saved_errno = errno;
+    int previous;
+    int fd;
+    int rc;
+
+    /* Declared nonnull: read through a volatile so a NULL test is not dropped. */
+    DIR *volatile checked = directory;
+
+    chaos_io_ensure_symbols();
+    fd = checked != NULL ? dirfd(directory) : -1;
+    errno = saved_errno;
+    previous = chaos_io_enter_internal();
+    rc = g_chaos_io_real_closedir(directory);
+    chaos_io_leave_internal(previous);
+    chaos_io_fdcache_invalidate(fd);
+    return rc;
+}
+
+/**
+ * @brief Interposed `pclose(3)`: closes the pipe stream, then forgets its descriptor.
+ *
+ * @details Like closedir(): the C library closes the descriptor itself.
+ */
+CHAOS_IO_EXPORT int pclose(FILE *stream)
+{
+    const int saved_errno = errno;
+    int previous;
+    int fd;
+    int rc;
+
+    FILE *volatile checked = stream;
+
+    chaos_io_ensure_symbols();
+    fd = checked != NULL ? fileno(stream) : -1;
+    errno = saved_errno;
+    previous = chaos_io_enter_internal();
+    rc = g_chaos_io_real_pclose(stream);
+    chaos_io_leave_internal(previous);
+    chaos_io_fdcache_invalidate(fd);
+    return rc;
+}
+
+#ifndef SYS_close_range
+/** @brief close_range(2), Linux 5.9: the same number on x86_64 and aarch64. */
+#define SYS_close_range 436
+#endif
+
+/**
+ * @brief closefrom() where the C library has none: the close_range system call
+ *        (Linux 5.9), else every descriptor up to the limit, as glibc does.
+ */
+static void chaos_io_close_from(int lowfd)
+{
+    const int saved_errno = errno;
+    long fd;
+    long limit;
+
+    if (lowfd < 0)
+    {
+        lowfd = 0;
+    }
+    if (syscall(SYS_close_range, (unsigned int)lowfd, ~0U, 0) == 0)
+    {
+        errno = saved_errno;
+        return;
+    }
+    limit = sysconf(_SC_OPEN_MAX);
+    for (fd = lowfd; fd < limit; ++fd)
+    {
+        (void)syscall(SYS_close, fd);
+    }
+    errno = saved_errno;
+}
+
+/**
+ * @brief Interposed `closefrom(3)`: closes every descriptor from @p lowfd up, then
+ *        forgets them all.
+ *
+ * @details glibc closes them with the close_range system call, which the
+ * close_range() wrapper never sees. Exported also where the C library has no
+ * closefrom (musl, glibc before 2.34), so it works there too instead of being a
+ * function that does nothing.
+ */
+CHAOS_IO_EXPORT void closefrom(int lowfd)
+{
+    int previous;
+
+    chaos_io_ensure_symbols();
+    previous = chaos_io_enter_internal();
+    if (g_chaos_io_real_closefrom != NULL)
+    {
+        g_chaos_io_real_closefrom(lowfd);
+    }
+    else
+    {
+        chaos_io_close_from(lowfd);
+    }
+    chaos_io_leave_internal(previous);
+    chaos_io_fdcache_reset();
 }
 
 /**

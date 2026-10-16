@@ -32,6 +32,7 @@
  * still keeping the final shared object small.
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdint.h>
@@ -224,6 +225,12 @@ typedef int (*chaos_io_dup2_fn)(int, int);
 
 /** @brief Type of the real `close_range(2)` libc symbol (glibc 2.34+; may be absent). */
 typedef int (*chaos_io_close_range_fn)(unsigned int, unsigned int, int);
+/** @brief Signature of `closedir`. */
+typedef int (*chaos_io_closedir_fn)(DIR *);
+/** @brief Signature of `pclose`. */
+typedef int (*chaos_io_pclose_fn)(FILE *);
+/** @brief Signature of `closefrom` (glibc 2.34; absent from musl). */
+typedef void (*chaos_io_closefrom_fn)(int);
 
 /**
  * @brief Type shared by the real `fsync(2)` and `fdatasync(2)` libc symbols.
@@ -349,6 +356,10 @@ extern chaos_io_close_fn g_chaos_io_real_close;   /**< Downstream `close`. */
 extern chaos_io_dup2_fn g_chaos_io_real_dup2;     /**< Downstream `dup2`. */
 extern chaos_io_close_range_fn
     g_chaos_io_real_close_range; /**< Downstream `close_range`; NULL when libc lacks it. */
+extern chaos_io_closedir_fn g_chaos_io_real_closedir; /**< Downstream `closedir`. */
+extern chaos_io_pclose_fn g_chaos_io_real_pclose;     /**< Downstream `pclose`. */
+extern chaos_io_closefrom_fn
+    g_chaos_io_real_closefrom; /**< Downstream `closefrom`; NULL when libc lacks it. */
 extern chaos_io_sync_fn g_chaos_io_real_fsync;          /**< Downstream `fsync`. */
 extern chaos_io_sync_fn g_chaos_io_real_fdatasync;      /**< Downstream `fdatasync`. */
 extern chaos_io_pread_fn g_chaos_io_real_pread;         /**< Downstream `pread`. */
