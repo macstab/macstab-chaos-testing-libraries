@@ -56,14 +56,30 @@ static ssize_t test_getxattr(const char *path, const char *name, void *value, si
 }
 #define CHAOS_INIT_NET_GETXATTR test_getxattr
 
+/* The sock_diag netlink socket: real, or failing on request. */
+static int g_diag_socket_fails = 0;
+static int test_diag_socket(void);
+#define CHAOS_INIT_NET_DIAG_SOCKET() test_diag_socket()
+
 #include "../../src/init/chaos_init_net.c"
 #include "../../src/init/chaos_init_proc.c"
 #include "../../src/init/chaos_init_tracee.c"
+
+static int test_diag_socket(void)
+{
+    if (g_diag_socket_fails)
+    {
+        errno = EACCES;
+        return -1;
+    }
+    return socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_SOCK_DIAG);
+}
 
 #include <arpa/inet.h>
 #include <assert.h>
 #include <sys/epoll.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 static chaos_init_verdict_t
 decide(int nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
@@ -122,6 +138,110 @@ static void write_rules(const char *rules)
 
     assert(file != NULL && fputs(rules, file) >= 0 && fclose(file) == 0);
     assert(rename("/tmp/.chaos-net.conf.new", "/tmp/.chaos-net.conf") == 0);
+}
+
+/**
+ * @brief Sockets no /proc/net table lists (MPTCP) are asked of sock_diag: here with
+ *        TCP sockets, whose answers have the same form, and hand-made answers.
+ */
+static void test_sock_diag(int listener, int client, const struct sockaddr_in *server_address)
+{
+    struct sockaddr_storage found;
+    struct sockaddr_in *in = (struct sockaddr_in *)&found;
+    socklen_t found_length = 0;
+    struct stat info;
+
+    /* A socket's own address and its peer, by inode. */
+    assert(fstat(listener, &info) == 0);
+    assert(chaos_init_net_diag_name(
+        AF_INET, IPPROTO_TCP, (unsigned long)info.st_ino, 0, &found, &found_length
+    ));
+    assert(in->sin_family == AF_INET && in->sin_port == server_address->sin_port);
+    assert(in->sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    assert(found_length == (socklen_t)sizeof(struct sockaddr_in));
+    assert(fstat(client, &info) == 0);
+    assert(chaos_init_net_diag_name(
+        AF_INET, IPPROTO_TCP, (unsigned long)info.st_ino, 1, &found, &found_length
+    ));
+    assert(in->sin_port == server_address->sin_port);
+    /* IPv6. */
+    {
+        struct sockaddr_in6 any6;
+        struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)&found;
+        const int six = socket(AF_INET6, SOCK_STREAM, 0);
+
+        memset(&any6, 0, sizeof(any6));
+        any6.sin6_family = AF_INET6;
+        assert(six >= 0 && bind(six, (struct sockaddr *)&any6, sizeof(any6)) == 0);
+        assert(listen(six, 1) == 0 && fstat(six, &info) == 0);
+        assert(chaos_init_net_diag_name(
+            AF_INET6, IPPROTO_TCP, (unsigned long)info.st_ino, 0, &found, &found_length
+        ));
+        assert(in6->sin6_family == AF_INET6 && in6->sin6_port != 0);
+        assert(found_length == (socklen_t)sizeof(struct sockaddr_in6));
+        (void)close(six);
+    }
+    /* A socket that is not there, and no netlink socket to ask with. */
+    assert(!chaos_init_net_diag_name(AF_INET, IPPROTO_TCP, 1UL, 0, &found, &found_length));
+    g_diag_socket_fails = 1;
+    assert(fstat(listener, &info) == 0);
+    assert(!chaos_init_net_diag_name(
+        AF_INET, IPPROTO_TCP, (unsigned long)info.st_ino, 0, &found, &found_length
+    ));
+    g_diag_socket_fails = 0;
+
+    /* Answers: the end of a dump or an error ends the search; a message too short
+     * for a socket is passed over. */
+    {
+        struct
+        {
+            struct nlmsghdr header;
+            struct inet_diag_msg message;
+        } answer;
+
+        memset(&answer, 0, sizeof(answer));
+        answer.header.nlmsg_len = (uint32_t)NLMSG_LENGTH(0);
+        answer.header.nlmsg_type = NLMSG_DONE;
+        assert(
+            chaos_init_net_diag_parse(&answer, sizeof(answer), 7UL, 0, &found, &found_length) == -1
+        );
+        answer.header.nlmsg_type = NLMSG_ERROR;
+        assert(
+            chaos_init_net_diag_parse(&answer, sizeof(answer), 7UL, 0, &found, &found_length) == -1
+        );
+        answer.header.nlmsg_type = SOCK_DIAG_BY_FAMILY;
+        assert(
+            chaos_init_net_diag_parse(
+                &answer, answer.header.nlmsg_len, 7UL, 0, &found, &found_length
+            ) == 0
+        );
+        answer.header.nlmsg_len = (uint32_t)sizeof(answer);
+        answer.message.idiag_inode = 8U;
+        assert(
+            chaos_init_net_diag_parse(&answer, sizeof(answer), 7UL, 0, &found, &found_length) == 0
+        );
+    }
+
+    /* An MPTCP socket is a stream socket; its addresses are sock_diag's: this one is
+     * TCP, so sock_diag knows no MPTCP socket of its inode, and it reads as unbound. */
+    {
+        socklen_t length = (socklen_t)sizeof(found);
+        int type = 0;
+        socklen_t type_length = (socklen_t)sizeof(type);
+
+        g_fake_protocol = "MPTCP";
+        assert(
+            chaos_init_net_getsockopt(listener, SOL_SOCKET, SO_TYPE, &type, &type_length) == 0 &&
+            type == SOCK_STREAM
+        );
+        assert(chaos_init_net_getsockname(listener, (struct sockaddr *)&found, &length) == 0);
+        assert(in->sin_family == AF_INET && in->sin_port == 0);
+        g_fake_protocol = "MPTCPv6";
+        length = (socklen_t)sizeof(found);
+        assert(chaos_init_net_getsockname(listener, (struct sockaddr *)&found, &length) == 0);
+        assert(found.ss_family == AF_INET6);
+        g_fake_protocol = NULL;
+    }
 }
 
 static void test_socket_queries(
@@ -423,6 +543,7 @@ int main(void)
     assert(pipe(pipe_fds) == 0);
 
     test_socket_queries(listener, client, unbound, udp, unix_fd, pipe_fds[0], &server_address);
+    test_sock_diag(listener, client, &server_address);
     test_parse_address();
 
     /* Not a net call; read/write/close on a pipe are io's. */

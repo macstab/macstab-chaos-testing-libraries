@@ -37,6 +37,10 @@ static int chaos_init_net_supported(const struct chaos_net_rule *rule);
 #include "chaos_init_tracee.h"
 
 #include <poll.h>
+#include <linux/inet_diag.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <linux/sock_diag.h>
 #include <sys/random.h>
 #include <sys/select.h>
 #include <sys/syscall.h>
@@ -58,24 +62,150 @@ static pid_t g_chaos_init_net_tid = 0;
 #define CHAOS_INIT_NET_GETXATTR getxattr
 #endif
 
+#ifndef IPPROTO_MPTCP
+#define IPPROTO_MPTCP 262
+#endif
+
 /** @brief A socket's protocol as the kernel names it, mapped to what getsockopt says. */
 typedef struct chaos_init_net_protocol
 {
     const char *name;  /**< system.sockprotoname */
     int type;          /**< SOCK_STREAM or SOCK_DGRAM */
     int family;        /**< AF_INET, AF_INET6 or AF_UNIX */
-    const char *table; /**< /proc/<pid>/net/<table> */
+    const char *table; /**< /proc/<pid>/net/<table>; NULL: asked through sock_diag */
+    int diag;          /**< The protocol to ask sock_diag for when there is no table. */
 } chaos_init_net_protocol_t;
 
 static const chaos_init_net_protocol_t g_chaos_init_net_protocols[] = {
-    {"TCP", SOCK_STREAM, AF_INET, "tcp"},
-    {"UDP", SOCK_DGRAM, AF_INET, "udp"},
-    {"TCPv6", SOCK_STREAM, AF_INET6, "tcp6"},
-    {"UDPv6", SOCK_DGRAM, AF_INET6, "udp6"},
-    {"UNIX-STREAM", SOCK_STREAM, AF_UNIX, "unix"},
-    {"UNIX-DGRAM", SOCK_DGRAM, AF_UNIX, "unix"},
-    {"UNIX", SOCK_STREAM, AF_UNIX, "unix"}, /* kernels before 5.x name every UNIX socket so */
+    {"TCP", SOCK_STREAM, AF_INET, "tcp", 0},
+    {"UDP", SOCK_DGRAM, AF_INET, "udp", 0},
+    {"TCPv6", SOCK_STREAM, AF_INET6, "tcp6", 0},
+    {"UDPv6", SOCK_DGRAM, AF_INET6, "udp6", 0},
+    {"UNIX-STREAM", SOCK_STREAM, AF_UNIX, "unix", 0},
+    {"UNIX-DGRAM", SOCK_DGRAM, AF_UNIX, "unix", 0},
+    {"UNIX", SOCK_STREAM, AF_UNIX, "unix", 0}, /* kernels before 5.x name every UNIX socket so */
+    /* Multipath TCP (Go listens with it by default from 1.24): a stream socket, but
+     * in no /proc/net table. */
+    {"MPTCP", SOCK_STREAM, AF_INET, NULL, IPPROTO_MPTCP},
+    {"MPTCPv6", SOCK_STREAM, AF_INET6, NULL, IPPROTO_MPTCP},
 };
+
+/** @brief The netlink socket sock_diag is asked through; unit tests make it fail. */
+#ifndef CHAOS_INIT_NET_DIAG_SOCKET
+#define CHAOS_INIT_NET_DIAG_SOCKET() socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_SOCK_DIAG)
+#endif
+
+/**
+ * @brief Looks for socket @p inode in @p length bytes of a sock_diag answer and
+ *        puts its own address (@p peer 0) or its peer's into @p found.
+ * @return 1 found; 0 not in this part; -1 the answer is over (done, or an error).
+ */
+static int chaos_init_net_diag_parse(
+    const void *answer,
+    size_t length,
+    unsigned long inode,
+    int peer,
+    struct sockaddr_storage *found,
+    socklen_t *found_length
+)
+{
+    const struct nlmsghdr *header = answer;
+    int left = (int)length;
+
+    for (; NLMSG_OK(header, left); header = NLMSG_NEXT(header, left))
+    {
+        const struct inet_diag_msg *message = NLMSG_DATA(header);
+        const uint32_t *address;
+
+        if (header->nlmsg_type == NLMSG_DONE || header->nlmsg_type == NLMSG_ERROR)
+        {
+            return -1;
+        }
+        if (header->nlmsg_len < NLMSG_LENGTH(sizeof(*message)) || message->idiag_inode != inode)
+        {
+            continue;
+        }
+        address = peer ? message->id.idiag_dst : message->id.idiag_src;
+        memset(found, 0, sizeof(*found));
+        if (message->idiag_family == AF_INET6)
+        {
+            struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)found;
+
+            in6->sin6_family = AF_INET6;
+            in6->sin6_port = peer ? message->id.idiag_dport : message->id.idiag_sport;
+            memcpy(&in6->sin6_addr, address, sizeof(in6->sin6_addr));
+            *found_length = (socklen_t)sizeof(*in6);
+        }
+        else
+        {
+            struct sockaddr_in *in = (struct sockaddr_in *)found;
+
+            in->sin_family = AF_INET;
+            in->sin_port = peer ? message->id.idiag_dport : message->id.idiag_sport;
+            in->sin_addr.s_addr = address[0];
+            *found_length = (socklen_t)sizeof(*in);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/**
+ * @brief The own address or peer of socket @p inode of @p protocol and @p family,
+ *        asked of sock_diag (as `ss` does): for sockets no /proc/net table lists.
+ *
+ * @details The protocol goes in an INET_DIAG_REQ_PROTOCOL attribute (5.10+), as
+ * MPTCP's number does not fit the request's own byte. The answer is the
+ * supervisor's network namespace, which is the container's.
+ *
+ * @return 1 with the address in @p found, else 0.
+ */
+static int chaos_init_net_diag_name(
+    int family,
+    int protocol,
+    unsigned long inode,
+    int peer,
+    struct sockaddr_storage *found,
+    socklen_t *found_length
+)
+{
+    static long answer[2048];
+    struct
+    {
+        struct nlmsghdr header;
+        struct inet_diag_req_v2 request;
+        struct rtattr attribute;
+        uint32_t protocol;
+    } query;
+    const int link = CHAOS_INIT_NET_DIAG_SOCKET();
+    int result = 0;
+    ssize_t length;
+
+    if (link < 0)
+    {
+        return 0;
+    }
+    memset(&query, 0, sizeof(query));
+    query.header.nlmsg_len = (uint32_t)sizeof(query);
+    query.header.nlmsg_type = SOCK_DIAG_BY_FAMILY;
+    query.header.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    query.request.sdiag_family = (uint8_t)family;
+    query.request.sdiag_protocol = (uint8_t)(protocol < 256 ? protocol : 0);
+    query.request.idiag_states = ~0U;
+    query.attribute.rta_len = (unsigned short)RTA_LENGTH(sizeof(query.protocol));
+    query.attribute.rta_type = INET_DIAG_REQ_PROTOCOL;
+    query.protocol = (uint32_t)protocol;
+    if (send(link, &query, sizeof(query), 0) == (ssize_t)sizeof(query))
+    {
+        while (result == 0 && (length = recv(link, answer, sizeof(answer), 0)) > 0)
+        {
+            result =
+                chaos_init_net_diag_parse(answer, (size_t)length, inode, peer, found, found_length);
+        }
+    }
+    (void)close(link);
+    return result > 0;
+}
 
 /** @brief The protocol of descriptor @p fd of the current thread; NULL if not a known socket. */
 static const chaos_init_net_protocol_t *chaos_init_net_protocol(int fd)
@@ -192,9 +322,20 @@ static int chaos_init_net_name(int fd, struct sockaddr *address, socklen_t *leng
         return -1;
     }
     memset(&found, 0, sizeof(found));
-    (void
-    )snprintf(path, sizeof(path), "/proc/%ld/net/%s", (long)g_chaos_init_net_tid, protocol->table);
-    table = fopen(path, "r");
+    if (protocol->table == NULL)
+    {
+        have = chaos_init_net_diag_name(
+            protocol->family, protocol->diag, inode, peer, &found, &found_length
+        );
+        table = NULL;
+    }
+    else
+    {
+        (void)snprintf(
+            path, sizeof(path), "/proc/%ld/net/%s", (long)g_chaos_init_net_tid, protocol->table
+        );
+        table = fopen(path, "r");
+    }
     while (table != NULL && !have && fgets(line, sizeof(line), table) != NULL)
     {
         char local[64];

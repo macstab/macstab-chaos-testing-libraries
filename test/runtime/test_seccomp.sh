@@ -260,7 +260,7 @@ docker run --rm \
     -v "$ROOT_DIR/test/runtime/seccomp_go:/src:ro" \
     -v "$TMP_DIR/out:/out" \
     -w /src \
-    golang:1.23-alpine \
+    golang:1.24-alpine \
     go build -o /out/seccomp-go main.go
 if [ ! -x "$TMP_DIR/out/chaos-init-$ARCH" ] || [ ! -x "$TMP_DIR/out/seccomp-go" ]; then
     echo "FAIL chaos-init-$ARCH or the Go probe was not built" >&2
