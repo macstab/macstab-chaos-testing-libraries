@@ -17,7 +17,8 @@
 # - an mmap rule fails a mapping of its size (C and Go), a fork rule fails fork
 #   (C), a posix_spawn rule fails Go's os/exec, an execve rule fails a later
 #   exec but never the start of the application itself;
-# - a rule SECCOMP mode cannot apply (TORN) rejects its file, named in the status.
+# - a rule SECCOMP mode cannot apply (TORN) rejects its file, named in the status;
+# - the dynamic loader of a program is faulted like the program (glibc).
 #
 # Without chaos-init the same opens succeed. Under emulation (amd64 on an arm64
 # host) seccomp is unavailable and the test is skipped.
@@ -201,6 +202,15 @@ expect "C: mmap rule fails a mapping of its size" "$($init --libs memory -- /tmp
 expect "C: other sizes map" "$($init --libs memory -- /tmp/probe mmap 4096)" "ok"
 expect "Go: mmap rule fails a mapping of its size" "$($init --libs memory -- $go mmap 1234567)" "ENOMEM"
 expect "Go: other sizes map, the runtime runs" "$($init --libs memory -- $go mmap 4096)" "ok"
+# The dynamic loader is a part of the process too (docs/SECCOMP.md section 5): a
+# rule on file mappings keeps a dynamic program from mapping its libraries.
+if [ "$LIBC" = glibc ]; then
+    printf "%s\n" "mmap/file:ERRNO:ENOMEM # t" > /tmp/.chaos-memory.conf
+    code=0
+    $init --libs memory -- /bin/ls / >/dev/null 2>&1 || code=$?
+    expect "the loader of a dynamic program is faulted too" "$code" "127"
+fi
+rm -f /tmp/.chaos-memory.conf
 
 printf "%s\n" "fork:ERRNO:ENOMEM # t" "posix_spawn:ERRNO:EAGAIN # t" "execve:ERRNO:EACCES # t" > /tmp/.chaos-process.conf
 expect "C: the application starts despite an execve rule" "$($init --libs process -- /tmp/probe open /tmp/sec/other)" "ok"
