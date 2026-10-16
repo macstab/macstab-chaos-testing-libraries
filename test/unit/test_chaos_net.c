@@ -1087,6 +1087,7 @@ static void *chaos_net_test_dup_map(size_t size)
 
     if (g_dup_map_mode == 1)
     {
+        errno = ENOMEM;
         return MAP_FAILED;
     }
     mapped = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -2899,10 +2900,12 @@ static void test_dup_replays_the_last_payload(void)
     g_stub_rule.effect = CHAOS_NET_EFFECT_DUP;
     g_should_trigger = 1;
 
-    /* The table cannot be mapped: every receive is real. */
+    /* The table cannot be mapped: every receive is real, and errno is the caller's. */
     g_chaos_net_dup_slots = NULL;
     g_dup_map_mode = 1;
+    errno = 4242;
     rc = recv(4, buffer, sizeof(buffer), 0);
+    assert(errno == 4242);
     rc = recv(4, buffer, sizeof(buffer), 0);
     assert(g_recv_calls == 2);
 

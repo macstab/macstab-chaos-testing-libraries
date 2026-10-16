@@ -630,7 +630,13 @@ static chaos_net_dup_slot_t *chaos_net_dup_table(void)
     {
         return table;
     }
-    mapped = CHAOS_NET_DUP_MAP(size);
+    {
+        /* The library's own allocation: a failure must not show in the caller's errno. */
+        const int saved_errno = errno;
+
+        mapped = CHAOS_NET_DUP_MAP(size);
+        errno = saved_errno;
+    }
     if (mapped == MAP_FAILED)
     {
         return NULL;
