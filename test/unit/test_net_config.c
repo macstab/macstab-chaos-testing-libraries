@@ -37,6 +37,12 @@
  * - LD_PRELOAD wrapper call paths.
  */
 
+#include <stdint.h>
+
+/** @brief Staging-name nonce of the status writer (chaos_status.h), fixed by the tests. */
+static uint64_t g_test_status_nonce = 0U;
+#define CHAOS_STATUS_NONCE(staging) ((void)(staging), g_test_status_nonce)
+
 /* The rule file is read through these stubs (defined below) instead of raw system calls. */
 #define CHAOS_CONFIG_FILE_OPEN(path) open((path), O_RDONLY)
 #define CHAOS_CONFIG_FILE_READ(fd, buffer, size) read((fd), (buffer), (size))
@@ -1236,21 +1242,29 @@ static void test_prepare_reports_status(void)
     );
     assert(strcmp(status, expected) == 0);
 
-    /* The status is staged under a name of its own; a leftover of an earlier
-     * process with this pid is replaced, not left behind. */
+    /* The status is staged under a name of its own. One that exists belongs to
+     * another writer with this pid (a container sharing /tmp): it is left alone,
+     * and the next name is used. */
     {
         char staging[128];
-        FILE *leftover;
+        FILE *other;
 
+        g_test_status_nonce = UINT64_C(0x10);
         (void)snprintf(
-            staging, sizeof(staging), "/tmp/.chaos-staging-%ld-chaos-net.status", (long)getpid()
+            staging, sizeof(staging), "/tmp/.chaos-staging-%ld-10-chaos-net.status", (long)getpid()
         );
-        leftover = fopen(staging, "w");
-        assert(leftover != NULL);
-        assert(fclose(leftover) == 0);
+        other = fopen(staging, "w");
+        assert(other != NULL);
+        assert(fclose(other) == 0);
         write_config_text("tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0\n", 52);
         assert(chaos_net_config_prepare() == 1);
+        assert(access(staging, F_OK) == 0);
+        assert(unlink(staging) == 0);
+        (void)snprintf(
+            staging, sizeof(staging), "/tmp/.chaos-staging-%ld-11-chaos-net.status", (long)getpid()
+        );
         assert(access(staging, F_OK) != 0);
+        g_test_status_nonce = 0U;
     }
     assert(read_status_file(status, sizeof(status)));
     (void)snprintf(expected, sizeof(expected), "state=ok\nrules=1\npid=%ld\n", (long)getpid());

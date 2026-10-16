@@ -402,7 +402,7 @@ pid=4711
 - The library constructor loads the rules, so starting any program (even
   `/bin/true`) under `LD_PRELOAD` writes a fresh report.
 - Without a rule file the status file is removed.
-- The report is written to `/tmp/.chaos-staging-<pid>-<name>` and renamed over
+- The report is written to `/tmp/.chaos-staging-<pid>-<nonce>-<name>` and renamed over
   the old one (a name no reader of status or hits files lists), with
   raw system calls: libchaos-io interposes `open`, `write` and `rename`, and
   a user's io rule must not be able to fail the report. Writing is best

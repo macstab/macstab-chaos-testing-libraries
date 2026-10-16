@@ -31,6 +31,8 @@
 #ifndef CHAOS_STATUS_H
 #define CHAOS_STATUS_H
 
+#include "chaos_clock.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
@@ -226,6 +228,11 @@ static inline uint64_t chaos_config_content_hash(const char *data, size_t size)
     return hash;
 }
 
+/** @brief Varies the staging name between writers with the same pid; unit tests fix it. */
+#ifndef CHAOS_STATUS_NONCE
+#define CHAOS_STATUS_NONCE(staging) (chaos_clock_now_ns() ^ (uint64_t)(uintptr_t)(staging))
+#endif
+
 /** @brief Writes @p length bytes of @p data to @p fd; 1 when all were written. */
 static inline int chaos_status_write_all(int fd, const char *data, size_t length)
 {
@@ -251,10 +258,12 @@ static inline int chaos_status_write_all(int fd, const char *data, size_t length
 /**
  * @brief Replaces the file at @p path with @p length bytes of @p data.
  *
- * @details Writes `<dir>/.chaos-staging-<pid>-<name>` and renames it over @p path,
- * so a reader sees the old file or the new one, never a mix. The staging name
- * starts differently from every status and hits file, so nothing that lists
- * those (`.chaos-net.hits.*`) picks up a half-written one.
+ * @details Writes `<dir>/.chaos-staging-<pid>-<nonce>-<name>` and renames it over
+ * @p path, so a reader sees the old file or the new one, never a mix. The staging
+ * name starts differently from every status and hits file, so nothing that lists
+ * those (`.chaos-net.hits.*`) picks up a half-written one. The nonce keeps apart
+ * writers with the same pid: containers that share /tmp each run their own PID 1.
+ * A name that exists is another writer's; the next nonce is tried instead.
  *
  * Files are created readable and writable by everyone (0666): in a shared, sticky
  * /tmp another user may not rename over a file it does not own, as when an image
@@ -271,33 +280,38 @@ static inline void chaos_status_replace_file(const char *path, const char *data,
     const char *slash = strrchr(path, '/');
     const char *name = slash == NULL ? path : slash + 1;
     const int dir_length = (int)(name - path);
-    char staging[160];
+    char staging[192];
+    const uint64_t nonce = CHAOS_STATUS_NONCE(staging);
+    unsigned attempt;
     int complete;
-    int fd;
+    int fd = -1;
 
     if (name[0] == '.')
     {
         ++name;
     }
-    if ((size_t)snprintf(
-            staging,
-            sizeof(staging),
-            "%.*s.chaos-staging-%ld-%s",
-            dir_length,
-            path,
-            (long)getpid(),
-            name
-        ) >= sizeof(staging))
+    /* A new file only, never through a link: /tmp is shared. */
+    for (attempt = 0U; attempt < 4U; ++attempt)
     {
-        return;
-    }
-    /* A new file only, never through a link: the name is predictable and /tmp is
-     * shared. A leftover of an earlier process with the same pid is removed once. */
-    fd = CHAOS_STATUS_OPEN(staging);
-    if (fd < 0 && errno == EEXIST)
-    {
-        (void)CHAOS_STATUS_UNLINK(staging);
+        if ((size_t)snprintf(
+                staging,
+                sizeof(staging),
+                "%.*s.chaos-staging-%ld-%llx-%s",
+                dir_length,
+                path,
+                (long)getpid(),
+                (unsigned long long)(nonce + attempt),
+                name
+            ) >= sizeof(staging))
+        {
+            errno = saved_errno;
+            return;
+        }
         fd = CHAOS_STATUS_OPEN(staging);
+        if (fd >= 0 || errno != EEXIST)
+        {
+            break;
+        }
     }
     if (fd < 0)
     {
