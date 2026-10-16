@@ -48,7 +48,7 @@ if [ -z "$DOCKER_PLATFORM" ]; then
             ;;
         *)
             echo "seccomp test skipped: unsupported host architecture $(uname -m)" >&2
-            exit 0
+            exit "${CHAOS_SKIP_EXIT:-0}"
             ;;
     esac
 fi
@@ -62,7 +62,7 @@ case "$DOCKER_PLATFORM" in
         ;;
     *)
         echo "seccomp test skipped: unsupported docker platform $DOCKER_PLATFORM" >&2
-        exit 0
+        exit "${CHAOS_SKIP_EXIT:-0}"
         ;;
 esac
 
@@ -74,12 +74,12 @@ trap cleanup EXIT INT TERM
 
 if ! command -v docker >/dev/null 2>&1; then
     echo "seccomp test skipped: docker not available" >&2
-    exit 0
+    exit "${CHAOS_SKIP_EXIT:-0}"
 fi
 
 if ! docker version >/dev/null 2>&1; then
     echo "seccomp test skipped: docker daemon not accessible" >&2
-    exit 0
+    exit "${CHAOS_SKIP_EXIT:-0}"
 fi
 
 CHECK_SCRIPT='
@@ -118,7 +118,7 @@ mkdir -p /tmp/sec/data /tmp/sec/slow /tmp/sec/once
 state=$($init --libs io -- /bin/cat /tmp/.chaos-init.status | head -1)
 if [ "$state" != "state=active" ]; then
     echo "skip $LIBC: seccomp mode unavailable here ($($init --libs io -- /bin/cat /tmp/.chaos-init.status | sed -n 2p))"
-    exit 0
+    exit "${CHAOS_SKIP_EXIT:-0}"
 fi
 
 expect "C: no rules, no chaos-init: open works" "$(/tmp/probe open /tmp/sec/data/x)" "ok"
@@ -276,6 +276,7 @@ for libc in glibc musl; do
     docker run --rm \
         --platform "$DOCKER_PLATFORM" \
         -e LIBC="$libc" \
+        -e CHAOS_SKIP_EXIT="${CHAOS_SKIP_EXIT:-0}" \
         -v "$TMP_DIR/out:/out:ro" \
         -v "$ROOT_DIR:/work:ro" \
         "$base" \

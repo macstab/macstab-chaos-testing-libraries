@@ -70,6 +70,10 @@ jobs:
       - name: Build native libraries
         run: make native
       - name: Run integration tests
+        # A suite that cannot run here (no docker, another architecture) fails
+        # the job instead of passing as skipped.
+        env:
+          CHAOS_SKIP_EXIT: "1"
         run: |
           set -eu
           for script in \
@@ -86,6 +90,17 @@ jobs:
             test/runtime/test_memory_alpine.sh \
             test/runtime/test_process_glibc.sh \
             test/runtime/test_process_alpine.sh \
+            test/runtime/test_errno_glibc.sh \
+            test/runtime/test_variants_glibc.sh \
+            test/runtime/test_sharing_glibc.sh \
+            test/runtime/test_baseline_glibc.sh \
+            test/runtime/test_isolation_glibc.sh \
+            test/runtime/test_path_forms.sh \
+            test/runtime/test_status.sh \
+            test/runtime/test_hits.sh \
+            test/runtime/test_reload.sh \
+            test/runtime/test_fork.sh \
+            test/runtime/test_stdio.sh \
             test/runtime/test_init.sh \
             test/runtime/test_seccomp.sh
           do

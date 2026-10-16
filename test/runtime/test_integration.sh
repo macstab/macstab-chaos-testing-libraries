@@ -39,7 +39,7 @@ trap cleanup EXIT INT TERM
 
 if [ "$(uname -s)" != "Linux" ]; then
     echo "integration test skipped: requires Linux" >&2
-    exit 0
+    exit "${CHAOS_SKIP_EXIT:-0}"
 fi
 
 if [ -f "$CONFIG_PATH" ]; then

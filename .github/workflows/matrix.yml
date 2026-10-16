@@ -13,6 +13,8 @@ concurrency:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # A runtime suite that cannot run (no docker, another architecture) fails.
+  CHAOS_SKIP_EXIT: "1"
 
 jobs:
   cross-build:

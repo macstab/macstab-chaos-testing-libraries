@@ -46,7 +46,7 @@ if [ -z "$DOCKER_PLATFORM" ]; then
             ;;
         *)
             echo "init test skipped: unsupported host architecture $(uname -m)" >&2
-            exit 0
+            exit "${CHAOS_SKIP_EXIT:-0}"
             ;;
     esac
 fi
@@ -60,7 +60,7 @@ case "$DOCKER_PLATFORM" in
         ;;
     *)
         echo "init test skipped: unsupported docker platform $DOCKER_PLATFORM" >&2
-        exit 0
+        exit "${CHAOS_SKIP_EXIT:-0}"
         ;;
 esac
 
@@ -72,12 +72,12 @@ trap cleanup EXIT INT TERM
 
 if ! command -v docker >/dev/null 2>&1; then
     echo "init test skipped: docker not available" >&2
-    exit 0
+    exit "${CHAOS_SKIP_EXIT:-0}"
 fi
 
 if ! docker version >/dev/null 2>&1; then
     echo "init test skipped: docker daemon not accessible" >&2
-    exit 0
+    exit "${CHAOS_SKIP_EXIT:-0}"
 fi
 
 CHECK_SCRIPT='
