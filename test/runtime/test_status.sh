@@ -23,6 +23,9 @@ set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 TMP_DIR=$(mktemp -d)
+# Mounted into the containers, where another user (setpriv) loads the libraries
+# from it: mktemp makes it private to this user.
+chmod 755 "$TMP_DIR"
 
 if [ "$#" -gt 1 ]; then
     echo "usage: $0 [linux/amd64|linux/arm64]" >&2
