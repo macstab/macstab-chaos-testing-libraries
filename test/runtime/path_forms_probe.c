@@ -10,6 +10,10 @@
  * form. Every call below runs under a rule that fails its operation, then once more
  * without a rule to show the real call still works.
  *
+ * Vectored writes under a matching rule also get the kernel's answer for an array
+ * the kernel rejects (unmapped, longer than IOV_MAX) instead of a crash in the
+ * wrapper, and a vector too long to tear is written whole.
+ *
  * Usage: path_forms_probe   (under LD_PRELOAD of libchaos-io)
  * Exit code 0 when every call was faulted and then succeeded, 1 otherwise.
  */
@@ -25,7 +29,10 @@
 #include <sys/syscall.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <stdint.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #define DIR "/tmp/path-forms-probe"
@@ -89,6 +96,37 @@ static void make_file(const char *path)
         perror(path);
         exit(2);
     }
+}
+
+/** @brief writev through a pointer, so libc's attributes accept invalid arguments. */
+static ssize_t (*volatile g_writev)(int, const struct iovec *, int) = writev;
+
+/** @brief Vectored writes with arrays the wrapper must not walk or cannot tear. */
+static void check_vectored_writes(void)
+{
+    static struct iovec many[100];
+    static char bytes[100];
+    struct iovec pair[2] = {{bytes, 1U}, {bytes + 1, 1U}};
+    int index;
+    int fd;
+
+    for (index = 0; index < 100; ++index)
+    {
+        many[index].iov_base = &bytes[index];
+        many[index].iov_len = 1U;
+    }
+    write_rules(DIR ":write:TORN:1.0\n");
+    fd = open(DIR "/vector.bin", O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    errno = 0;
+    expect(
+        "writev unmapped array",
+        fd >= 0 && g_writev(fd, (const struct iovec *)(uintptr_t)8U, 2) == -1 && errno == EFAULT
+    );
+    errno = 0;
+    expect("writev past IOV_MAX", g_writev(fd, pair, IOV_MAX + 1) == -1 && errno == EINVAL);
+    expect("writev too long to tear", g_writev(fd, many, 100) == 100);
+    expect("writev torn", g_writev(fd, pair, 2) == 1 && close(fd) == 0);
+    expect("vector file removed", unlink(DIR "/vector.bin") == 0);
 }
 
 int main(void)
@@ -161,6 +199,8 @@ int main(void)
             errno == ENOSPC
     );
 #endif
+
+    check_vectored_writes();
 
     write_rules("# idle\n");
     fd = open(DIR "/source.bin", O_WRONLY);

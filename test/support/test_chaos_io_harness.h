@@ -1601,6 +1601,28 @@ static long chaos_test_syscall(long number, ...)
  * automatically at library load time.
  * --------------------------------------------------------------------- */
 
+/** @brief Calls of the iovec copy (process_vm_readv) made by the vectored wrappers. */
+static int g_vm_readv_calls = 0;
+/** @brief errno the iovec copy fails with; 0 copies the array. */
+static int g_vm_readv_errno = 0;
+
+/**
+ * @brief Stub for the wrappers' checked iovec copy: copies, or fails with
+ *   `g_vm_readv_errno` (EFAULT: unreadable array; ENOSYS/EPERM: copy unavailable).
+ */
+static long chaos_test_process_vm_readv(const struct iovec *local, const struct iovec *remote)
+{
+    ++g_vm_readv_calls;
+    if (g_vm_readv_errno != 0)
+    {
+        errno = g_vm_readv_errno;
+        return -1;
+    }
+    (void)memcpy(local->iov_base, remote->iov_base, remote->iov_len);
+    return (long)remote->iov_len;
+}
+
+#define CHAOS_IO_PROCESS_VM_READV(local, remote) chaos_test_process_vm_readv((local), (remote))
 #define dlsym chaos_test_dlsym
 #define dlerror chaos_test_dlerror
 #define abort chaos_test_abort
@@ -1722,6 +1744,8 @@ static void chaos_test_bind_real_stdio(void)
  */
 static void chaos_test_reset_state(void)
 {
+    g_vm_readv_calls = 0;
+    g_vm_readv_errno = 0;
     (void)memset(&g_config_rule, 0, sizeof(g_config_rule));
     g_config_init_calls = 0;
     g_config_prepare_calls = 0;

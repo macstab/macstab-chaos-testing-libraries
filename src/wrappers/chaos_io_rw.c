@@ -32,8 +32,13 @@
  * For `writev` and `pwritev`, a torn write cannot be expressed as a simple
  * byte-count reduction; the real call expects a valid iovec array.
  * `chaos_io_build_torn_iovecs()` converts the total torn byte budget back
- * into a truncated iovec view.  The VLA `torn_iov[iovcnt]` is used to avoid
- * a heap allocation in the hot path.
+ * into a truncated iovec view, built from a bounded copy of the caller's array
+ * (at most CHAOS_IO_TORN_MAX_IOV entries; longer vectors are not torn).
+ *
+ * **The caller's iovec array.**  It is read only once a rule matched, never past
+ * IOV_MAX entries, and through a checked copy (process_vm_readv on this process),
+ * so an invalid array still fails in the kernel with EINVAL or EFAULT instead of
+ * crashing in the wrapper.
  *
  * **Corruption over vectored reads.**
  * `readv` and `preadv` return bytes scattered across multiple iovec segments.
@@ -61,6 +66,55 @@
 #include "chaos_io_actions.h"
 #include "chaos_io_internal.h"
 #include "chaos_io_wrappers.h"
+
+#include <limits.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+
+/** @brief Most iovec entries the kernel accepts. */
+#ifdef IOV_MAX
+#define CHAOS_IO_MAX_IOV IOV_MAX
+#else
+#define CHAOS_IO_MAX_IOV 1024
+#endif
+
+/** @brief Longest vector TORN shortens; a longer one is written whole. */
+#define CHAOS_IO_TORN_MAX_IOV 64
+
+/**
+ * @brief Copies @p count entries of the caller's array at @p iov into @p out.
+ *
+ * @details Through process_vm_readv on this very process, so an unmapped array
+ * is reported instead of faulting. Where that call is unavailable (ENOSYS, or a
+ * sandbox's EPERM) the array is copied directly, as the kernel will read it anyway.
+ * Unit tests replace the copy.
+ *
+ * @return 0, or -1 when the array cannot be read.
+ */
+#ifndef CHAOS_IO_PROCESS_VM_READV
+#define CHAOS_IO_PROCESS_VM_READV(local, remote)                                                   \
+    syscall(SYS_process_vm_readv, syscall(SYS_getpid), (local), 1UL, (remote), 1UL, 0UL)
+#endif
+static int chaos_io_read_iovecs(const struct iovec *iov, int count, struct iovec *out)
+{
+    const int saved_errno = errno;
+    struct iovec local;
+    struct iovec remote;
+    long copied;
+
+    local.iov_base = out;
+    local.iov_len = (size_t)count * sizeof(*out);
+    remote.iov_base = (void *)(uintptr_t)iov;
+    remote.iov_len = local.iov_len;
+    copied = (long)CHAOS_IO_PROCESS_VM_READV(&local, &remote);
+    if (copied < 0 && (errno == ENOSYS || errno == EPERM))
+    {
+        (void)memcpy(out, iov, local.iov_len);
+        copied = (long)local.iov_len;
+    }
+    errno = saved_errno;
+    return copied == (long)local.iov_len ? 0 : -1;
+}
 
 /**
  * @brief Returns the total byte count covered by an iovec array when it fits in `ssize_t`.
@@ -111,10 +165,29 @@ static int chaos_io_iovec_total_bytes(const struct iovec *iov, int iovcnt, size_
 /** @brief Byte count of an iovec array for `@size` gates; CHAOS_POLICY_NO_SIZE if unknown. */
 static uint64_t chaos_io_iovec_size(const struct iovec *iov, int iovcnt)
 {
-    size_t total;
+    struct iovec chunk[CHAOS_IO_TORN_MAX_IOV];
+    uint64_t total = 0U;
+    int done = 0;
 
-    return chaos_io_iovec_total_bytes(iov, iovcnt, &total) != 0 ? (uint64_t)total
-                                                                : CHAOS_POLICY_NO_SIZE;
+    if (iov == NULL || iovcnt < 0 || iovcnt > CHAOS_IO_MAX_IOV)
+    {
+        return CHAOS_POLICY_NO_SIZE; /* the kernel rejects it: nothing to read */
+    }
+    while (done < iovcnt)
+    {
+        const int count =
+            iovcnt - done < CHAOS_IO_TORN_MAX_IOV ? iovcnt - done : CHAOS_IO_TORN_MAX_IOV;
+        size_t part;
+
+        if (chaos_io_read_iovecs(iov + done, count, chunk) != 0 ||
+            !chaos_io_iovec_total_bytes(chunk, count, &part) || part > (uint64_t)SSIZE_MAX - total)
+        {
+            return CHAOS_POLICY_NO_SIZE;
+        }
+        total += part;
+        done += count;
+    }
+    return total;
 }
 
 /**
@@ -221,6 +294,21 @@ static int chaos_io_build_torn_iovecs(
     }
 
     return chaos_io_trim_iovecs(source, source_count, torn_total, target, target_count);
+}
+
+/**
+ * @brief Shortens the caller's vector for TORN into @p torn; 0 when it cannot be.
+ *
+ * @details Works on a checked copy of at most CHAOS_IO_TORN_MAX_IOV entries, so
+ * neither an invalid array nor a long one reaches anything but the kernel.
+ */
+static int chaos_io_tear_iovecs(const struct iovec *iov, int iovcnt, struct iovec *torn, int *count)
+{
+    struct iovec copy[CHAOS_IO_TORN_MAX_IOV];
+
+    return iov != NULL && iovcnt > 0 && iovcnt <= CHAOS_IO_TORN_MAX_IOV &&
+           chaos_io_read_iovecs(iov, iovcnt, copy) == 0 &&
+           chaos_io_build_torn_iovecs(copy, iovcnt, torn, count);
 }
 
 /**
@@ -406,12 +494,12 @@ CHAOS_IO_EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
     ssize_t rc;
 
     chaos_io_ensure_symbols();
-    if (chaos_io_in_internal() || !chaos_io_match_fd_rule_sized(
-                                      fd, CHAOS_IO_OP_READ, chaos_io_iovec_size(iov, iovcnt), &rule
-                                  ))
+    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_READ, &rule))
     {
         return chaos_io_call_real_readv(fd, iov, iovcnt);
     }
+    /* Read only now that a rule matched: an invalid array costs nothing before. */
+    rule.call_size = chaos_io_iovec_size(iov, iovcnt);
 
     if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
     {
@@ -485,7 +573,7 @@ CHAOS_IO_EXPORT ssize_t write(int fd, const void *buffer, size_t count)
  * @details `TORN` is applied across the logical total byte span, then translated back
  * into a shortened iovec array for the real libc call.
  *
- * The VLA `torn_iov[iovcnt]` is allocated on the stack rather than the heap
+ * The shortened vector lives in a bounded stack array rather than the heap
  * to avoid any dynamic allocation in the hot path.  The library is compiled
  * with `-fno-stack-protector`, so VLA usage is safe from the canary-write
  * reentrancy hazard.
@@ -500,12 +588,12 @@ CHAOS_IO_EXPORT ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
     chaos_io_rule_t rule;
 
     chaos_io_ensure_symbols();
-    if (chaos_io_in_internal() || !chaos_io_match_fd_rule_sized(
-                                      fd, CHAOS_IO_OP_WRITE, chaos_io_iovec_size(iov, iovcnt), &rule
-                                  ))
+    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_WRITE, &rule))
     {
         return chaos_io_call_real_writev(fd, iov, iovcnt);
     }
+    /* Read only now that a rule matched: an invalid array costs nothing before. */
+    rule.call_size = chaos_io_iovec_size(iov, iovcnt);
 
     if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
     {
@@ -515,17 +603,16 @@ CHAOS_IO_EXPORT ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
     {
         return -1;
     }
-    else if (rule.effect == CHAOS_IO_EFFECT_TORN && chaos_io_rule_should_trigger(&rule))
+    else if (rule.effect == CHAOS_IO_EFFECT_TORN)
     {
-        if (iov != NULL && iovcnt > 0)
-        {
-            struct iovec torn_iov[iovcnt];
-            int torn_iovcnt;
+        struct iovec torn_iov[CHAOS_IO_TORN_MAX_IOV];
+        int torn_iovcnt;
 
-            if (chaos_io_build_torn_iovecs(iov, iovcnt, torn_iov, &torn_iovcnt))
-            {
-                return chaos_io_call_real_writev(fd, torn_iov, torn_iovcnt);
-            }
+        /* Counted only when it can be applied. */
+        if (chaos_io_tear_iovecs(iov, iovcnt, torn_iov, &torn_iovcnt) &&
+            chaos_io_rule_should_trigger(&rule))
+        {
+            return chaos_io_call_real_writev(fd, torn_iov, torn_iovcnt);
         }
     }
 
@@ -736,12 +823,12 @@ CHAOS_IO_EXPORT ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_
     ssize_t rc;
 
     chaos_io_ensure_symbols();
-    if (chaos_io_in_internal() || !chaos_io_match_fd_rule_sized(
-                                      fd, CHAOS_IO_OP_PREAD, chaos_io_iovec_size(iov, iovcnt), &rule
-                                  ))
+    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_PREAD, &rule))
     {
         return chaos_io_call_real_preadv(fd, iov, iovcnt, offset);
     }
+    /* Read only now that a rule matched: an invalid array costs nothing before. */
+    rule.call_size = chaos_io_iovec_size(iov, iovcnt);
 
     if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
     {
@@ -815,7 +902,7 @@ CHAOS_IO_EXPORT ssize_t pwrite(int fd, const void *buffer, size_t count, off_t o
  * @details Semantics match `pwrite()`, with torn writes modeled over the logical total
  * byte span before translating the shortened request back to an iovec array.
  *
- * The VLA `torn_iov[iovcnt]` is stack-allocated for the same reason as in the
+ * The shortened vector is a bounded stack array for the same reason as in the
  * `writev` wrapper.
  *
  * @param[in] fd      File descriptor.
@@ -829,13 +916,11 @@ CHAOS_IO_EXPORT ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off
     chaos_io_rule_t rule;
 
     chaos_io_ensure_symbols();
-    if (chaos_io_in_internal() ||
-        !chaos_io_match_fd_rule_sized(
-            fd, CHAOS_IO_OP_PWRITE, chaos_io_iovec_size(iov, iovcnt), &rule
-        ))
+    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_PWRITE, &rule))
     {
         return chaos_io_call_real_pwritev(fd, iov, iovcnt, offset);
     }
+    rule.call_size = chaos_io_iovec_size(iov, iovcnt);
 
     if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
     {
@@ -845,17 +930,15 @@ CHAOS_IO_EXPORT ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off
     {
         return -1;
     }
-    else if (rule.effect == CHAOS_IO_EFFECT_TORN && chaos_io_rule_should_trigger(&rule))
+    else if (rule.effect == CHAOS_IO_EFFECT_TORN)
     {
-        if (iov != NULL && iovcnt > 0)
-        {
-            struct iovec torn_iov[iovcnt];
-            int torn_iovcnt;
+        struct iovec torn_iov[CHAOS_IO_TORN_MAX_IOV];
+        int torn_iovcnt;
 
-            if (chaos_io_build_torn_iovecs(iov, iovcnt, torn_iov, &torn_iovcnt))
-            {
-                return chaos_io_call_real_pwritev(fd, torn_iov, torn_iovcnt, offset);
-            }
+        if (chaos_io_tear_iovecs(iov, iovcnt, torn_iov, &torn_iovcnt) &&
+            chaos_io_rule_should_trigger(&rule))
+        {
+            return chaos_io_call_real_pwritev(fd, torn_iov, torn_iovcnt, offset);
         }
     }
 

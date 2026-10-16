@@ -1126,6 +1126,137 @@ static void test_readv_and_writev_wrappers(void)
     assert(g_real_writev_calls == 0);
 }
 
+/** @brief Arms a matching rule with @p effect for the vectored-input tests. */
+static void chaos_test_arm_vector_rule(chaos_io_effect_t effect)
+{
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/vector.bin");
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = effect;
+    g_rule_should_trigger_result = 1;
+}
+
+/**
+ * @brief Invariant: the vectored wrappers read the caller's iovec array only once a
+ *   rule matched, never past IOV_MAX entries, and only through the checked copy; an
+ *   array they cannot read reaches the kernel unchanged instead of crashing them.
+ *
+ * Expected observable behaviour:
+ * - No rule: the array is not read at all.
+ * - LATENCY: `call_size` is the vector's byte total, also across copy chunks of 64.
+ * - Unreadable array (EFAULT), negative or over-IOV_MAX counts, a total past
+ *   SSIZE_MAX: `call_size` is unknown and the call is passed through with the
+ *   caller's own arguments and errno.
+ * - Copy unavailable (ENOSYS, EPERM): the array is copied directly.
+ * - TORN: an unreadable array, or one longer than 64 entries, is written whole and
+ *   the rule is not counted.
+ */
+static void test_vectored_input_checks(void)
+{
+    static struct iovec many[CHAOS_IO_TORN_MAX_IOV + 36];
+    static char bytes[CHAOS_IO_TORN_MAX_IOV + 36];
+    struct iovec pair[CHAOS_TEST_IOV_SNAPSHOT_COUNT]; /* the stubs snapshot this many */
+    int index;
+    /* Called through a pointer: libc's attributes would reject the invalid arguments. */
+    ssize_t (*volatile writev_unchecked)(int, const struct iovec *, int) = writev;
+
+    (void)memset(pair, 0, sizeof(pair));
+    pair[0].iov_base = (void *)"ab";
+    pair[0].iov_len = 2U;
+    pair[1].iov_base = (void *)"cdef";
+    pair[1].iov_len = 4U;
+    for (index = 0; index < CHAOS_IO_TORN_MAX_IOV + 36; ++index)
+    {
+        many[index].iov_base = &bytes[index];
+        many[index].iov_len = 1U;
+    }
+
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_LATENCY);
+    g_config_match_loaded_result = 0;
+    g_real_writev_return = 6;
+    assert(writev(9, pair, 2) == 6);
+    assert(g_vm_readv_calls == 0);
+
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_LATENCY);
+    g_real_writev_return = 6;
+    assert(writev(9, pair, 2) == 6);
+    assert(g_last_call_size == 6U);
+
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_LATENCY);
+    g_real_readv_return = 4; /* the stub fills from a 64-byte pattern */
+    assert(readv(9, many, CHAOS_IO_TORN_MAX_IOV + 36) == 4);
+    assert(g_vm_readv_calls == 2);
+    assert(g_last_call_size == (uint64_t)CHAOS_IO_TORN_MAX_IOV + 36U);
+
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_LATENCY);
+    g_vm_readv_errno = EFAULT;
+    g_real_preadv_return = -1;
+    errno = 0;
+    assert(preadv(9, pair, 2, 0) == -1);
+    assert(errno == 0);
+    assert(g_last_call_size == CHAOS_POLICY_NO_SIZE);
+    assert(g_real_preadv_calls == 1);
+
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_LATENCY);
+    g_vm_readv_errno = ENOSYS;
+    g_real_pwritev_return = 6;
+    errno = 0;
+    assert(pwritev(9, pair, 2, 0) == 6);
+    assert(errno == 0);
+    assert(g_last_call_size == 6U);
+
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_LATENCY);
+    g_vm_readv_errno = EPERM;
+    g_real_writev_return = 6;
+    assert(writev(9, pair, 2) == 6);
+    assert(g_last_call_size == 6U);
+
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_LATENCY);
+    g_real_writev_return = -1;
+    assert(writev_unchecked(9, pair, CHAOS_IO_MAX_IOV + 1) == -1);
+    assert(writev_unchecked(9, pair, -1) == -1);
+    assert(writev_unchecked(9, NULL, 2) == -1);
+    assert(g_vm_readv_calls == 0);
+    assert(g_last_call_size == CHAOS_POLICY_NO_SIZE);
+    assert(g_real_writev_calls == 3);
+    assert(g_real_writev_iovcnt == 2);
+
+    /* The first chunk of 64 sums to exactly SSIZE_MAX; the second overflows it. */
+    many[0].iov_len = (size_t)SSIZE_MAX - (size_t)(CHAOS_IO_TORN_MAX_IOV - 1);
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_LATENCY);
+    g_real_writev_return = -1;
+    assert(writev(9, many, CHAOS_IO_TORN_MAX_IOV + 1) == -1);
+    assert(g_vm_readv_calls == 2);
+    assert(g_last_call_size == CHAOS_POLICY_NO_SIZE);
+    many[0].iov_len = 1U;
+
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_TORN);
+    g_torn_count_result = 1U;
+    g_real_writev_return = CHAOS_IO_TORN_MAX_IOV + 1;
+    assert(writev(9, many, CHAOS_IO_TORN_MAX_IOV + 1) == CHAOS_IO_TORN_MAX_IOV + 1);
+    assert(g_real_writev_iovcnt == CHAOS_IO_TORN_MAX_IOV + 1);
+    assert(g_rule_should_trigger_calls == 0);
+
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_TORN);
+    g_torn_count_result = 1U;
+    g_real_pwritev_return = CHAOS_IO_TORN_MAX_IOV;
+    assert(pwritev(9, many, CHAOS_IO_TORN_MAX_IOV, 0) == CHAOS_IO_TORN_MAX_IOV);
+    assert(g_real_pwritev_iovcnt == 1);
+    assert(g_rule_should_trigger_calls == 1);
+
+    chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_TORN);
+    g_torn_count_result = 3U;
+    g_vm_readv_errno = EFAULT;
+    g_real_pwritev_return = 6;
+    assert(pwritev(9, pair, 2, 0) == 6);
+    assert(g_real_pwritev_iovcnt == 2);
+    assert(g_real_pwritev_lengths[1] == 4U);
+    assert(g_rule_should_trigger_calls == 0);
+}
+
 #ifdef __linux__
 /**
  * @brief Invariant: the `sendfile` wrapper bypasses chaos for re-entrant calls and
@@ -2531,6 +2662,7 @@ int main(void)
     test_read_and_write_wrappers();
     test_vectored_helpers();
     test_readv_and_writev_wrappers();
+    test_vectored_input_checks();
 #ifdef __linux__
     test_sendfile_wrapper();
     test_copy_file_range_wrapper();
