@@ -599,7 +599,8 @@ static void test_call_real_helpers(void)
     assert(chaos_process_call_real_pthread_create(&thread, NULL, stub_start_routine, NULL) == 0);
     assert(g_real_pthread_create_calls == 2);
 
-    /* Still absent: the thread cannot be created, reported as a resource shortage. */
+    /* Still absent: no system call creates a thread, so the call fails with EAGAIN,
+     * the error pthread_create() documents for a thread it cannot create. */
     g_chaos_process_real_pthread_create = NULL;
     g_test_late_pthread_create = NULL;
     assert(
@@ -626,12 +627,14 @@ static void test_call_real_helpers(void)
     assert(chaos_process_call_real_execveat(AT_FDCWD, "/bin/echo", argv, envp, 0) == 0);
     assert(g_real_execveat_calls == 1);
 
-    /* Cover the "execveat unavailable on musl" fallback: ENOSYS without
-     * incrementing the stub call count. */
+    /* execveat unavailable (musl) or not resolved yet: the system call runs, so a
+     * missing program is reported by the kernel, without the stub. */
     g_chaos_process_real_execveat = NULL;
     errno = 0;
-    assert(chaos_process_call_real_execveat(AT_FDCWD, "/bin/echo", argv, envp, 0) == -1);
-    assert(errno == ENOSYS);
+    assert(
+        chaos_process_call_real_execveat(AT_FDCWD, "/nonexistent/chaos-tool", argv, envp, 0) == -1
+    );
+    assert(errno == ENOENT);
     assert(g_real_execveat_calls == 1);
     g_chaos_process_real_execveat = stub_execveat;
 #endif
@@ -1373,6 +1376,116 @@ static void test_rules_that_do_not_fire(void)
     assert(g_real_exec_family_calls == 2);
 }
 
+/**
+ * @brief Forks a child that exits with @p code at once; returns its pid.
+ */
+static pid_t spawn_exiting_child(int code)
+{
+    pid_t child = fork();
+
+    assert(child >= 0);
+    if (child == 0)
+    {
+        _exit(code);
+    }
+    return child;
+}
+
+/**
+ * @brief Runs @p run_exec in a child whose real exec pointers are NULL; returns the
+ *   child's exit status (99 when the exec returned).
+ */
+static int exit_status_of_exec_child(int use_execveat)
+{
+    char *argv[] = {(char *)"sh", (char *)"-c", (char *)"exit 7", NULL};
+    char *envp[] = {NULL};
+    int status = 0;
+    pid_t child = fork();
+
+    assert(child >= 0);
+    if (child == 0)
+    {
+        g_chaos_process_real_execve = NULL;
+#ifdef __linux__
+        g_chaos_process_real_execveat = NULL;
+        if (use_execveat)
+        {
+            (void)chaos_process_test_execveat_wrapper(AT_FDCWD, "/bin/sh", argv, envp, 0);
+            _exit(99);
+        }
+#endif
+        (void)chaos_process_test_execve_wrapper("/bin/sh", argv, envp);
+        _exit(99);
+    }
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFEXITED(status));
+    return WEXITSTATUS(status);
+}
+
+/**
+ * @brief Invariant: a wrapper whose real function is not resolved yet never crashes.
+ *
+ * Triggering condition: every real-function pointer NULL, as during the symbol
+ *   lookup itself.
+ *
+ * Expected observable behaviour:
+ * - Thin system-call wrappers make the system call: execve and execveat run the
+ *   program (exit status 7) or report the kernel's ENOENT; waitpid, wait4 and waitid
+ *   reap a real child and return its exit status.
+ * - fork, posix_spawn, posix_spawnp, system and popen have no single system call and
+ *   fail with ENOSYS as each reports errors.
+ */
+static void test_unresolved_fallbacks(void)
+{
+    char *argv[] = {(char *)"tool", NULL};
+    char *envp[] = {NULL};
+    struct rusage usage;
+    siginfo_t info;
+    pid_t pid = 42;
+    pid_t child;
+    int status = 0;
+
+    reset_wrapper_state();
+
+    errno = 0;
+    assert(chaos_process_test_fork_wrapper() == -1);
+    assert(errno == ENOSYS);
+    assert(
+        chaos_process_test_posix_spawn_wrapper(&pid, "/bin/true", NULL, NULL, argv, envp) == ENOSYS
+    );
+    assert(chaos_process_test_posix_spawnp_wrapper(&pid, "true", NULL, NULL, argv, envp) == ENOSYS);
+    assert(pid == 42);
+    errno = 0;
+    assert(chaos_process_test_system_wrapper("true") == -1);
+    assert(errno == ENOSYS);
+    errno = 0;
+    assert(chaos_process_test_popen_wrapper("true", "r") == NULL);
+    assert(errno == ENOSYS);
+
+    errno = 0;
+    assert(chaos_process_test_execve_wrapper("/nonexistent/chaos-tool", argv, envp) == -1);
+    assert(errno == ENOENT);
+    assert(exit_status_of_exec_child(0) == 7);
+#ifdef __linux__
+    assert(exit_status_of_exec_child(1) == 7);
+#endif
+
+    child = spawn_exiting_child(5);
+    assert(chaos_process_test_waitpid_wrapper(child, &status, 0) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 5);
+
+    child = spawn_exiting_child(6);
+    (void)memset(&usage, 0, sizeof(usage));
+    assert(chaos_process_test_wait4_wrapper(child, &status, 0, &usage) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 6);
+
+    child = spawn_exiting_child(9);
+    (void)memset(&info, 0, sizeof(info));
+    assert(chaos_process_test_waitid_wrapper(P_PID, (id_t)child, &info, WEXITED) == 0);
+    assert(info.si_pid == child);
+    assert(info.si_status == 9);
+}
+
 int main(void)
 {
     test_call_real_helpers();
@@ -1388,5 +1501,6 @@ int main(void)
     test_wait_family_paths();
     test_exec_family_paths();
     test_rules_that_do_not_fire();
+    test_unresolved_fallbacks();
     return 0;
 }

@@ -105,6 +105,13 @@ static int chaos_dns_call_real_getaddrinfo(
     int previous;
     int rc;
 
+    if (g_chaos_dns_real_getaddrinfo == NULL)
+    {
+        /* Not resolved yet (a call from inside the symbol lookup): there is no
+         * system call to fall back to, so fail as getaddrinfo reports errors. */
+        errno = ENOSYS;
+        return EAI_SYSTEM;
+    }
     previous = chaos_dns_enter_internal();
     rc = g_chaos_dns_real_getaddrinfo(node, service, hints, result);
     chaos_dns_leave_internal(previous);
@@ -138,12 +145,38 @@ static int chaos_dns_call_real_getnameinfo(
     int previous;
     int rc;
 
+    if (g_chaos_dns_real_getnameinfo == NULL)
+    {
+        errno = ENOSYS;
+        return EAI_SYSTEM;
+    }
     previous = chaos_dns_enter_internal();
     rc = g_chaos_dns_real_getnameinfo(
         address, address_len, host, host_len, service, service_len, flags
     );
     chaos_dns_leave_internal(previous);
     return rc;
+}
+
+/**
+ * @brief Call the real freeaddrinfo under the reentrancy guard.
+ *
+ * @details Not resolved yet, the list is left alone: there is no system call that
+ * frees it, and leaking it is the only safe choice.
+ *
+ * @param result  List allocated by the real getaddrinfo.
+ */
+static void chaos_dns_call_real_freeaddrinfo(struct addrinfo *result)
+{
+    int previous;
+
+    if (g_chaos_dns_real_freeaddrinfo == NULL)
+    {
+        return;
+    }
+    previous = chaos_dns_enter_internal();
+    g_chaos_dns_real_freeaddrinfo(result);
+    chaos_dns_leave_internal(previous);
 }
 
 /* -------------------------------------------------------------------------
@@ -406,7 +439,7 @@ static int chaos_dns_apply_override(
     }
     for (index = 0U; index < count; ++index)
     {
-        g_chaos_dns_real_freeaddrinfo(partials[index]);
+        chaos_dns_call_real_freeaddrinfo(partials[index]);
     }
     return rc;
 }
@@ -624,11 +657,10 @@ CHAOS_DNS_EXPORT int getaddrinfo(
 CHAOS_DNS_EXPORT void freeaddrinfo(struct addrinfo *result)
 {
     chaos_dns_ensure_symbols();
-    if (chaos_dns_owned_free(result) || g_chaos_dns_real_freeaddrinfo == NULL)
+    if (!chaos_dns_owned_free(result))
     {
-        return;
+        chaos_dns_call_real_freeaddrinfo(result);
     }
-    g_chaos_dns_real_freeaddrinfo(result);
 }
 
 /**
@@ -961,7 +993,6 @@ static int chaos_dns_hostent_from_rules(
 {
     struct addrinfo hints;
     struct addrinfo *list = NULL;
-    int previous;
     int rc;
 
     *result = NULL;
@@ -978,9 +1009,7 @@ static int chaos_dns_hostent_from_rules(
     rc = chaos_dns_fill_hostent(name, family, list, entry, buffer, buffer_size);
     if (!chaos_dns_owned_free(list))
     {
-        previous = chaos_dns_enter_internal();
-        g_chaos_dns_real_freeaddrinfo(list);
-        chaos_dns_leave_internal(previous);
+        chaos_dns_call_real_freeaddrinfo(list);
     }
     if (rc == ERANGE)
     {
@@ -997,6 +1026,40 @@ static int chaos_dns_hostent_from_rules(
     return 0;
 }
 
+/**
+ * @brief The failure of a reentrant hostent resolver that is not resolved yet.
+ *
+ * @details No system call resolves a name: fail as these functions report a
+ * system error, NETDB_INTERNAL with errno ENOSYS.
+ *
+ * @return ENOSYS.
+ */
+static int chaos_dns_hostent_r_unresolved(struct hostent **result, int *h_error)
+{
+    if (result != NULL)
+    {
+        *result = NULL;
+    }
+    if (h_error != NULL)
+    {
+        *h_error = NETDB_INTERNAL;
+    }
+    errno = ENOSYS;
+    return ENOSYS;
+}
+
+/**
+ * @brief The failure of a non-reentrant hostent resolver that is not resolved yet.
+ *
+ * @return NULL, with h_errno NETDB_INTERNAL and errno ENOSYS.
+ */
+static struct hostent *chaos_dns_hostent_unresolved(void)
+{
+    h_errno = NETDB_INTERNAL;
+    errno = ENOSYS;
+    return NULL;
+}
+
 /** @brief Calls the real gethostbyname2_r under the reentrancy guard. */
 static int chaos_dns_call_real_gethostbyname2_r(
     const char *name,
@@ -1011,6 +1074,10 @@ static int chaos_dns_call_real_gethostbyname2_r(
     int previous;
     int rc;
 
+    if (g_chaos_dns_real_gethostbyname2_r == NULL)
+    {
+        return chaos_dns_hostent_r_unresolved(result, h_error);
+    }
     previous = chaos_dns_enter_internal();
     rc = g_chaos_dns_real_gethostbyname2_r(
         name, family, entry, buffer, buffer_size, result, h_error
@@ -1025,6 +1092,10 @@ static struct hostent *chaos_dns_call_real_gethostbyname2(const char *name, int 
     struct hostent *entry;
     int previous;
 
+    if (g_chaos_dns_real_gethostbyname2 == NULL)
+    {
+        return chaos_dns_hostent_unresolved();
+    }
     previous = chaos_dns_enter_internal();
     entry = g_chaos_dns_real_gethostbyname2(name, family);
     chaos_dns_leave_internal(previous);
@@ -1207,6 +1278,10 @@ CHAOS_DNS_EXPORT int gethostbyaddr_r(
         }
     }
 
+    if (g_chaos_dns_real_gethostbyaddr_r == NULL)
+    {
+        return chaos_dns_hostent_r_unresolved(result, h_error);
+    }
     previous = chaos_dns_enter_internal();
     rc = g_chaos_dns_real_gethostbyaddr_r(
         address, length, family, entry, buffer, buffer_size - reserved, result, h_error
@@ -1243,6 +1318,10 @@ CHAOS_DNS_EXPORT struct hostent *gethostbyaddr(const void *address, socklen_t le
         rewrite = chaos_dns_reverse_rewrite(query, &rewrite_rule);
     }
 
+    if (g_chaos_dns_real_gethostbyaddr == NULL)
+    {
+        return chaos_dns_hostent_unresolved();
+    }
     previous = chaos_dns_enter_internal();
     entry = g_chaos_dns_real_gethostbyaddr(address, length, family);
     chaos_dns_leave_internal(previous);

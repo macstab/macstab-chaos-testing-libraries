@@ -1764,6 +1764,96 @@ static void test_rules_that_do_not_fire(void)
     assert(entry.h_name == NULL);
 }
 
+/**
+ * @brief Invariant: a lookup whose real resolver is not resolved yet fails cleanly.
+ *
+ * Triggering condition: every real-function pointer NULL, as during the symbol
+ *   lookup itself; none of these functions has a system call to fall back to.
+ *
+ * Expected observable behaviour:
+ * - getaddrinfo and getnameinfo return EAI_SYSTEM with errno ENOSYS.
+ * - The _r hostent resolvers return ENOSYS with *result NULL and NETDB_INTERNAL;
+ *   the others return NULL with h_errno NETDB_INTERNAL; errno is ENOSYS.
+ * - freeaddrinfo leaves the list alone (nothing to free it with).
+ */
+static void test_unresolved_fallbacks(void)
+{
+    struct addrinfo *result = NULL;
+    struct addrinfo *node;
+    struct sockaddr_in ipv4;
+    struct in_addr address;
+    struct hostent entry;
+    struct hostent *entry_result = &entry;
+    char buffer[256];
+    char host[64];
+    int h_error = 0;
+
+    reset_wrapper_state();
+
+    errno = 0;
+    assert(getaddrinfo("api.example.com", "80", NULL, &result) == EAI_SYSTEM);
+    assert(errno == ENOSYS);
+    assert(result == NULL);
+
+    (void)memset(&ipv4, 0, sizeof(ipv4));
+    ipv4.sin_family = AF_INET;
+    assert(inet_pton(AF_INET, "127.0.0.1", &ipv4.sin_addr) == 1);
+    errno = 0;
+    assert(
+        getnameinfo(
+            (const struct sockaddr *)&ipv4, (socklen_t)sizeof(ipv4), host, sizeof(host), NULL, 0, 0
+        ) == EAI_SYSTEM
+    );
+    assert(errno == ENOSYS);
+
+    node = make_result_node(AF_INET);
+    freeaddrinfo(node);
+    assert(g_real_freeaddrinfo_calls == 0);
+    chaos_dns_test_freeaddrinfo(node);
+
+    errno = 0;
+    assert(
+        gethostbyname2_r(
+            "api.example.com", AF_INET, &entry, buffer, sizeof(buffer), &entry_result, &h_error
+        ) == ENOSYS
+    );
+    assert(entry_result == NULL);
+    assert(h_error == NETDB_INTERNAL);
+    assert(errno == ENOSYS);
+
+    errno = 0;
+    h_errno = 0;
+    assert(gethostbyname2("api.example.com", AF_INET) == NULL);
+    assert(h_errno == NETDB_INTERNAL);
+    assert(errno == ENOSYS);
+
+    address = ipv4.sin_addr;
+    entry_result = &entry;
+    h_error = 0;
+    errno = 0;
+    assert(
+        gethostbyaddr_r(
+            &address,
+            (socklen_t)sizeof(address),
+            AF_INET,
+            &entry,
+            buffer,
+            sizeof(buffer),
+            &entry_result,
+            &h_error
+        ) == ENOSYS
+    );
+    assert(entry_result == NULL);
+    assert(h_error == NETDB_INTERNAL);
+    assert(errno == ENOSYS);
+
+    errno = 0;
+    h_errno = 0;
+    assert(gethostbyaddr(&address, (socklen_t)sizeof(address), AF_INET) == NULL);
+    assert(h_errno == NETDB_INTERNAL);
+    assert(errno == ENOSYS);
+}
+
 int main(void)
 {
     test_static_helpers();
@@ -1776,5 +1866,6 @@ int main(void)
     test_forward_hostent_paths();
     test_reverse_hostent_paths();
     test_rules_that_do_not_fire();
+    test_unresolved_fallbacks();
     return 0;
 }

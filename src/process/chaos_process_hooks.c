@@ -164,6 +164,9 @@ static int chaos_process_call_real_pthread_create(
         chaos_process_resolve_pthread_create();
         if (g_chaos_process_real_pthread_create == NULL)
         {
+            /* A thread needs libc's own setup (TLS, stack, TID cache): there is
+             * no system call to fall back to. EAGAIN, the error pthread_create()
+             * documents for a thread it cannot create, is the one callers handle. */
             return EAGAIN;
         }
     }
@@ -187,6 +190,13 @@ static pid_t chaos_process_call_real_fork(void)
     int previous;
     pid_t rc;
 
+    if (g_chaos_process_real_fork == NULL)
+    {
+        /* Not resolved yet (a call from inside the symbol lookup). A bare clone
+         * would skip libc's atfork handlers and caches, so fail instead. */
+        errno = ENOSYS;
+        return -1;
+    }
     previous = chaos_process_enter_internal();
     rc = g_chaos_process_real_fork();
     chaos_process_leave_internal(previous);
@@ -213,6 +223,10 @@ static int chaos_process_call_real_posix_spawn(
     int previous;
     int rc;
 
+    if (g_chaos_process_real_posix_spawn == NULL)
+    {
+        return ENOSYS; /* no single system call; reported as posix_spawn reports errors */
+    }
     previous = chaos_process_enter_internal();
     rc = g_chaos_process_real_posix_spawn(pid, path, file_actions, attributes, argv, envp);
     chaos_process_leave_internal(previous);
@@ -236,6 +250,10 @@ static int chaos_process_call_real_posix_spawnp(
     int previous;
     int rc;
 
+    if (g_chaos_process_real_posix_spawnp == NULL)
+    {
+        return ENOSYS;
+    }
     previous = chaos_process_enter_internal();
     rc = g_chaos_process_real_posix_spawnp(pid, file, file_actions, attributes, argv, envp);
     chaos_process_leave_internal(previous);
@@ -255,6 +273,11 @@ static int chaos_process_call_real_execve(const char *path, char *const argv[], 
     int previous;
     int rc;
 
+    if (g_chaos_process_real_execve == NULL)
+    {
+        /* Not resolved yet: the system call does what libc would. */
+        return (int)syscall(SYS_execve, path, argv, envp);
+    }
     previous = chaos_process_enter_internal();
     rc = g_chaos_process_real_execve(path, argv, envp);
     chaos_process_leave_internal(previous);
@@ -265,9 +288,9 @@ static int chaos_process_call_real_execve(const char *path, char *const argv[], 
 /**
  * @brief Calls the real `execveat` under the re-entrancy guard (Linux only).
  *
- * Returns -1 with `errno = ENOSYS` immediately if
- * `g_chaos_process_real_execveat` is NULL (musl without a public
- * `execveat` export).  On success this function does not return; see the
+ * Makes the system call directly if `g_chaos_process_real_execveat` is
+ * NULL (musl without a public `execveat` export, or not resolved yet).
+ * On success this function does not return; see the
  * `execve` call-through wrapper for the exec-success/failure explanation.
  */
 static int chaos_process_call_real_execveat(
@@ -279,8 +302,12 @@ static int chaos_process_call_real_execveat(
 
     if (g_chaos_process_real_execveat == NULL)
     {
+#ifdef SYS_execveat
+        return (int)syscall(SYS_execveat, directory_fd, path, argv, envp, flags);
+#else
         errno = ENOSYS;
         return -1;
+#endif
     }
 
     previous = chaos_process_enter_internal();
@@ -301,6 +328,10 @@ static pid_t chaos_process_call_real_waitpid(pid_t pid, int *status, int options
     int previous;
     pid_t rc;
 
+    if (g_chaos_process_real_waitpid == NULL)
+    {
+        return (pid_t)syscall(SYS_wait4, pid, status, options, NULL);
+    }
     previous = chaos_process_enter_internal();
     rc = g_chaos_process_real_waitpid(pid, status, options);
     chaos_process_leave_internal(previous);
@@ -314,6 +345,10 @@ chaos_process_call_real_wait4(pid_t pid, int *status, int options, struct rusage
     int previous;
     pid_t rc;
 
+    if (g_chaos_process_real_wait4 == NULL)
+    {
+        return (pid_t)syscall(SYS_wait4, pid, status, options, usage);
+    }
     previous = chaos_process_enter_internal();
     rc = g_chaos_process_real_wait4(pid, status, options, usage);
     chaos_process_leave_internal(previous);
@@ -326,6 +361,11 @@ static int chaos_process_call_real_waitid(idtype_t type, id_t id, siginfo_t *inf
     int previous;
     int rc;
 
+    if (g_chaos_process_real_waitid == NULL)
+    {
+        /* The system call takes a fifth argument, the rusage, which libc passes as NULL. */
+        return (int)syscall(SYS_waitid, type, id, info, options, NULL);
+    }
     previous = chaos_process_enter_internal();
     rc = g_chaos_process_real_waitid(type, id, info, options);
     chaos_process_leave_internal(previous);
@@ -905,6 +945,11 @@ CHAOS_PROCESS_EXPORT int system(const char *command)
         errno = error_code;
         return -1;
     }
+    if (g_chaos_process_real_system == NULL)
+    {
+        errno = ENOSYS;
+        return -1;
+    }
     previous = chaos_process_enter_internal();
     rc = g_chaos_process_real_system(command);
     chaos_process_leave_internal(previous);
@@ -929,6 +974,11 @@ CHAOS_PROCESS_EXPORT FILE *popen(const char *command, const char *mode)
         errno = error_code;
         return NULL;
     }
+    if (g_chaos_process_real_popen == NULL)
+    {
+        errno = ENOSYS;
+        return NULL;
+    }
     previous = chaos_process_enter_internal();
     stream = g_chaos_process_real_popen(command, mode);
     chaos_process_leave_internal(previous);
@@ -941,7 +991,7 @@ CHAOS_PROCESS_EXPORT FILE *popen(const char *command, const char *mode)
  *
  * Same process-image-replacement semantics as `execve`.  If the real
  * `execveat` symbol was not available at library load time (musl without a
- * public export), the call-through wrapper returns -1/ENOSYS immediately.
+ * public export), the call-through wrapper makes the system call directly.
  *
  * On injected failure: sets `errno` and returns -1.
  * On passthrough with exec success: does not return; library state is gone.
