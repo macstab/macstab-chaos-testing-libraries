@@ -276,11 +276,13 @@ static int g_epoll_pwait_result = 1;
 /**
  * @brief Stub for `chaos_net_config_prepare()`.
  *
- * Returns `g_stub_prepare`. When 0, wrappers skip rule matching entirely.
+ * Returns whether rules are loaded: `g_stub_prepare`, or a matching rule
+ * (`g_stub_match_endpoint`). When 0, wrappers skip rule matching entirely.
  */
 int chaos_net_config_prepare(void)
 {
-    return g_stub_prepare;
+    /* A rule that matches is a rule that is loaded. */
+    return g_stub_prepare || g_stub_match_endpoint;
 }
 
 /**
@@ -3151,6 +3153,44 @@ static void test_dup_skips_and_close_races(void)
 }
 
 /**
+ * @brief Invariant: send and receive rules match either end of a connected socket:
+ *   a receive tries its local end, then its peer; a send its peer, then its local end.
+ *
+ * Expected observable behaviour: with only the peer known a recv rule applies (a
+ * client's rule for its server), with only the local end a send rule applies (a
+ * server's rule for its own port); with neither end, or without rules, the real
+ * calls run.
+ */
+static void test_rules_match_either_end(void)
+{
+    char buffer[8];
+
+    reset_wrapper_stubs();
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_ERRNO;
+    g_stub_rule.errnum = ECONNRESET;
+    g_errno_trigger = 1;
+
+    g_stub_endpoint_from_peer = 1;
+    errno = 0;
+    assert(recv(5, buffer, sizeof(buffer), 0) == -1 && errno == ECONNRESET);
+    assert(read(5, buffer, sizeof(buffer)) == -1 && errno == ECONNRESET);
+    g_stub_endpoint_from_peer = 0;
+
+    g_stub_endpoint_from_local = 1;
+    errno = 0;
+    assert(send(5, "x", 1U, 0) == -1 && errno == ECONNRESET);
+    assert(write(5, "x", 1U) == -1 && errno == ECONNRESET);
+    g_stub_endpoint_from_local = 0;
+
+    assert(recv(5, buffer, sizeof(buffer), 0) == g_recv_result);
+    assert(send(5, "x", 1U, 0) == g_send_result);
+    g_stub_match_endpoint = 0;
+    g_stub_endpoint_from_peer = 1;
+    assert(recv(5, buffer, sizeof(buffer), 0) == g_recv_result);
+}
+
+/**
  * @brief Invariant: CORRUPT flips a bit only in bytes the receive wrote.
  *
  * Expected observable behaviour: with MSG_TRUNC a datagram receive returns more
@@ -3206,6 +3246,7 @@ static void test_corrupt_stays_in_the_buffer(void)
 int main(void)
 {
     test_corrupt_stays_in_the_buffer();
+    test_rules_match_either_end();
     test_dup_skips_and_close_races();
     test_trickle_and_dup_edges();
     test_dup_replays_the_last_payload();

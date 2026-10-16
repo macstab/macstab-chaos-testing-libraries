@@ -236,8 +236,14 @@ Current runtime contract:
 - matching is endpoint-based, not fd-number-based
 - `bind` and `connect` match the supplied sockaddr-derived endpoint
 - `listen` and `accept` match the local endpoint
-- `send` matches the peer endpoint or explicit destination sockaddr
-- `recv` matches the local endpoint
+- `send` matches the explicit destination sockaddr, else either end of the
+  connection: the peer first, then the local endpoint
+- `recv` matches either end of the connection: the local endpoint first, then
+  the peer; so a client's rule for its server (`tcp4://db:5432:recv:...`) and a
+  server's rule for its own port both apply, also for a unix client socket that
+  was never bound
+- `read`, `write`, `readv` and `writev` on a socket follow the `recv` and `send`
+  rules; on anything else they are forwarded
 - `socket` matches a wildcard endpoint derived from family and type
 - `shutdown` matches the best available local or peer endpoint
 - `poll` matches ready-set endpoints; Linux `epoll_*` derives watched fds from
@@ -250,8 +256,7 @@ Current runtime contract:
 - Docker runtime proof passes on glibc/musl and amd64/arm64
 - the strict repository source-line coverage gate asserts both shipped
   libraries
-- generic socket `read()` or `write()` traffic remains outside endpoint-aware
-  `libchaos-net` matching by design
+- `read()` and `write()` on a socket follow the `recv` and `send` rules
 
 ## 2. Architectural Context
 

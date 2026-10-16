@@ -342,14 +342,15 @@ sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, CHAOS_NET_MMSG_F
         struct msghdr *message = &msgvec[index].msg_hdr;
 
         /* Use msg_name if present (datagram send); otherwise use getpeername. */
-        matched = message->msg_name != NULL ? chaos_net_endpoint_from_sockaddr_fd(
-                                                  sockfd,
-                                                  (const struct sockaddr *)message->msg_name,
-                                                  message->msg_namelen,
-                                                  &endpoint
-                                              )
-                                            : chaos_net_endpoint_from_peer_fd(sockfd, &endpoint);
-        if (matched && chaos_net_config_match_endpoint(CHAOS_NET_OP_SEND, &endpoint, &rule))
+        matched = message->msg_name != NULL
+                      ? chaos_net_endpoint_from_sockaddr_fd(
+                            sockfd,
+                            (const struct sockaddr *)message->msg_name,
+                            message->msg_namelen,
+                            &endpoint
+                        ) && chaos_net_config_match_endpoint(CHAOS_NET_OP_SEND, &endpoint, &rule)
+                      : chaos_net_match_connected(sockfd, CHAOS_NET_OP_SEND, 1, &rule);
+        if (matched)
         {
             if (chaos_net_apply_simple_pre_call_rule(&rule) != 0)
             {
@@ -383,14 +384,12 @@ CHAOS_NET_EXPORT int recvmmsg(
     struct timespec *timeout
 )
 {
-    chaos_net_endpoint_t endpoint;
     chaos_net_rule_t rule;
     int rc;
 
     chaos_net_ensure_symbols();
 
-    if (chaos_net_in_internal() || !chaos_net_endpoint_from_local_fd(sockfd, &endpoint) ||
-        !chaos_net_config_match_endpoint(CHAOS_NET_OP_RECV, &endpoint, &rule))
+    if (chaos_net_in_internal() || !chaos_net_match_connected(sockfd, CHAOS_NET_OP_RECV, 0, &rule))
     {
         return chaos_net_call_real_recvmmsg(sockfd, msgvec, vlen, flags, timeout);
     }

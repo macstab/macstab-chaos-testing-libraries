@@ -63,6 +63,7 @@
 #include <sys/epoll.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -1365,6 +1366,67 @@ static int probe_recv_dup(void)
 }
 
 /**
+ * @brief A receive rule written for the server's address also applies on the
+ *        client side, where that address is the socket's peer, for TCP and for a
+ *        unix socket the client never bound.
+ */
+static int probe_recv_rule_on_client_side(void)
+{
+    struct sockaddr_un address;
+    char buffer[8];
+    int server;
+    int client;
+    int listener;
+    int rc = write_config("tcp4://127.0.0.1:41036:recv:ECONNRESET:1.0");
+
+    if (rc != 0)
+    {
+        return rc;
+    }
+    if (create_tcp_pair(41036U, &server, &client) != 0 || send(server, "data", 4U, 0) != 4)
+    {
+        return 230;
+    }
+    errno = 0;
+    if (recv(client, buffer, sizeof(buffer), 0) != -1 || errno != ECONNRESET)
+    {
+        return 231;
+    }
+    close(client);
+    close(server);
+
+    rc = write_config("unix:///tmp/net-probe-client.sock:recv:ECONNRESET:1.0");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    (void)snprintf(address.sun_path, sizeof(address.sun_path), "%s", "/tmp/net-probe-client.sock");
+    (void)unlink(address.sun_path);
+    listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    client = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (listener < 0 || client < 0 ||
+        bind(listener, (struct sockaddr *)&address, (socklen_t)sizeof(address)) != 0 ||
+        listen(listener, 1) != 0 ||
+        connect(client, (struct sockaddr *)&address, (socklen_t)sizeof(address)) != 0 ||
+        (server = accept(listener, NULL, NULL)) < 0 || send(server, "data", 4U, 0) != 4)
+    {
+        return 232;
+    }
+    errno = 0;
+    if (recv(client, buffer, sizeof(buffer), 0) != -1 || errno != ECONNRESET)
+    {
+        return 233;
+    }
+    close(client);
+    close(server);
+    close(listener);
+    (void)unlink(address.sun_path);
+    return 0;
+}
+
+/**
  * @brief A kept DUP payload is replayed only on the socket it came from: after
  *        dup2() puts another connection under the number, that one is read for real.
  */
@@ -1478,6 +1540,9 @@ int main(void)
     if (rc != 0)
         return rc;
     rc = probe_recv_dup_after_dup2();
+    if (rc != 0)
+        return rc;
+    rc = probe_recv_rule_on_client_side();
     if (rc != 0)
         return rc;
     rc = probe_recv_trickle_datagram();

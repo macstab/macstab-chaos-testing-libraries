@@ -29,12 +29,16 @@
  * "inject on accept for port 8080" refers to the listening port, not the ephemeral
  * client port that only becomes known after the call.
  *
- * @par write() exclusion:
- * write(2) on a socket file descriptor is owned by libchaos-io, not libchaos-net.
- * This file deliberately does not intercept write(). Intercepting write() here would
- * violate the one-symbol-one-owner invariant and could cause double-injection when
- * both libraries are loaded simultaneously. The send* family covers all socket-
- * specific send operations.
+ * @par read() and write():
+ * read, write, readv, writev and close are interposed too, and follow the recv,
+ * send and close rules on sockets only; on anything else they are forwarded. On a
+ * socket libchaos-io leaves them alone (its `*` rule matches files only).
+ *
+ * @par Which end a rule names:
+ * A rule names an address. On a connected socket a client's rule names its server
+ * (the peer), a server's rule its own port (the local end), so send and receive
+ * rules are matched on either end (chaos_net_match_connected()): receives try the
+ * local end first, sends the peer.
  *
  * @par Receive-side CORRUPT application:
  * Corruption is applied only when:
@@ -999,6 +1003,27 @@ static uint64_t chaos_net_message_size(const struct msghdr *message)
     return chaos_net_iovec_size(message->msg_iov, (int)message->msg_iovlen);
 }
 
+int chaos_net_match_connected(
+    int fd, chaos_net_operation_t operation, int peer_first, chaos_net_rule_t *rule
+)
+{
+    chaos_net_endpoint_t endpoint;
+
+    if (!chaos_net_config_prepare())
+    {
+        return 0;
+    }
+    if ((peer_first ? chaos_net_endpoint_from_peer_fd(fd, &endpoint)
+                    : chaos_net_endpoint_from_local_fd(fd, &endpoint)) &&
+        chaos_net_config_match_endpoint_loaded(operation, &endpoint, rule))
+    {
+        return 1;
+    }
+    return (peer_first ? chaos_net_endpoint_from_local_fd(fd, &endpoint)
+                       : chaos_net_endpoint_from_peer_fd(fd, &endpoint)) &&
+           chaos_net_config_match_endpoint_loaded(operation, &endpoint, rule);
+}
+
 /**
  * @brief Interposed send(2).
  *
@@ -1008,13 +1033,11 @@ static uint64_t chaos_net_message_size(const struct msghdr *message)
  */
 CHAOS_NET_EXPORT ssize_t send(int sockfd, const void *buffer, size_t size, int flags)
 {
-    chaos_net_endpoint_t endpoint;
     chaos_net_rule_t rule;
 
     chaos_net_ensure_symbols();
 
-    if (chaos_net_in_internal() || !chaos_net_endpoint_from_peer_fd(sockfd, &endpoint) ||
-        !chaos_net_config_match_endpoint(CHAOS_NET_OP_SEND, &endpoint, &rule))
+    if (chaos_net_in_internal() || !chaos_net_match_connected(sockfd, CHAOS_NET_OP_SEND, 1, &rule))
     {
         return chaos_net_call_real_send(sockfd, buffer, size, flags);
     }
@@ -1056,10 +1079,10 @@ CHAOS_NET_EXPORT ssize_t sendto(
     /* Use the explicit destination if provided; fall back to getpeername for connected mode. */
     matched =
         address_ptr != NULL
-            ? chaos_net_endpoint_from_sockaddr_fd(sockfd, address_ptr, address_length, &endpoint)
-            : chaos_net_endpoint_from_peer_fd(sockfd, &endpoint);
-    if (chaos_net_in_internal() || !matched ||
-        !chaos_net_config_match_endpoint(CHAOS_NET_OP_SEND, &endpoint, &rule))
+            ? chaos_net_endpoint_from_sockaddr_fd(sockfd, address_ptr, address_length, &endpoint) &&
+                  chaos_net_config_match_endpoint(CHAOS_NET_OP_SEND, &endpoint, &rule)
+            : chaos_net_match_connected(sockfd, CHAOS_NET_OP_SEND, 1, &rule);
+    if (chaos_net_in_internal() || !matched)
     {
         return chaos_net_call_real_sendto(sockfd, buffer, size, flags, address_ptr, address_length);
     }
@@ -1093,10 +1116,9 @@ CHAOS_NET_EXPORT ssize_t sendmsg(int sockfd, const struct msghdr *message, int f
                         (const struct sockaddr *)message->msg_name,
                         (socklen_t)message->msg_namelen,
                         &endpoint
-                    )
-                  : chaos_net_endpoint_from_peer_fd(sockfd, &endpoint);
-    if (chaos_net_in_internal() || !matched ||
-        !chaos_net_config_match_endpoint(CHAOS_NET_OP_SEND, &endpoint, &rule))
+                    ) && chaos_net_config_match_endpoint(CHAOS_NET_OP_SEND, &endpoint, &rule)
+                  : chaos_net_match_connected(sockfd, CHAOS_NET_OP_SEND, 1, &rule);
+    if (chaos_net_in_internal() || !matched)
     {
         return chaos_net_call_real_sendmsg(sockfd, message, flags);
     }
@@ -1123,14 +1145,12 @@ CHAOS_NET_EXPORT ssize_t sendmsg(int sockfd, const struct msghdr *message, int f
  */
 CHAOS_NET_EXPORT ssize_t recv(int sockfd, void *buffer, size_t size, int flags)
 {
-    chaos_net_endpoint_t endpoint;
     chaos_net_rule_t rule;
     ssize_t rc;
 
     chaos_net_ensure_symbols();
 
-    if (chaos_net_in_internal() || !chaos_net_endpoint_from_local_fd(sockfd, &endpoint) ||
-        !chaos_net_config_match_endpoint(CHAOS_NET_OP_RECV, &endpoint, &rule))
+    if (chaos_net_in_internal() || !chaos_net_match_connected(sockfd, CHAOS_NET_OP_RECV, 0, &rule))
     {
         return chaos_net_call_real_recv(sockfd, buffer, size, flags);
     }
@@ -1196,14 +1216,12 @@ CHAOS_NET_EXPORT ssize_t recvfrom(
 )
 {
     struct sockaddr *address_ptr = CHAOS_NET_SOCKADDR_VALUE(address);
-    chaos_net_endpoint_t endpoint;
     chaos_net_rule_t rule;
     ssize_t rc;
 
     chaos_net_ensure_symbols();
 
-    if (chaos_net_in_internal() || !chaos_net_endpoint_from_local_fd(sockfd, &endpoint) ||
-        !chaos_net_config_match_endpoint(CHAOS_NET_OP_RECV, &endpoint, &rule))
+    if (chaos_net_in_internal() || !chaos_net_match_connected(sockfd, CHAOS_NET_OP_RECV, 0, &rule))
     {
         return chaos_net_call_real_recvfrom(
             sockfd, buffer, size, flags, address_ptr, address_length
@@ -1279,14 +1297,12 @@ CHAOS_NET_EXPORT ssize_t recvfrom(
  */
 CHAOS_NET_EXPORT ssize_t recvmsg(int sockfd, struct msghdr *message, int flags)
 {
-    chaos_net_endpoint_t endpoint;
     chaos_net_rule_t rule;
     ssize_t rc;
 
     chaos_net_ensure_symbols();
 
-    if (chaos_net_in_internal() || !chaos_net_endpoint_from_local_fd(sockfd, &endpoint) ||
-        !chaos_net_config_match_endpoint(CHAOS_NET_OP_RECV, &endpoint, &rule))
+    if (chaos_net_in_internal() || !chaos_net_match_connected(sockfd, CHAOS_NET_OP_RECV, 0, &rule))
     {
         return chaos_net_call_real_recvmsg(sockfd, message, flags);
     }
@@ -1567,19 +1583,16 @@ static int chaos_net_match_descriptor_rule(
     {
         return 0;
     }
-    if (operation == CHAOS_NET_OP_SEND)
+    if (operation == CHAOS_NET_OP_SEND || operation == CHAOS_NET_OP_RECV)
     {
-        found = chaos_net_endpoint_from_peer_fd(fd, &endpoint);
-    }
-    else if (operation == CHAOS_NET_OP_RECV)
-    {
-        found = chaos_net_endpoint_from_local_fd(fd, &endpoint);
+        found = chaos_net_match_connected(fd, operation, operation == CHAOS_NET_OP_SEND, rule);
     }
     else
     {
-        found = chaos_net_endpoint_from_activity_fd(fd, &endpoint);
+        found = chaos_net_endpoint_from_activity_fd(fd, &endpoint) &&
+                chaos_net_config_match_endpoint_loaded(operation, &endpoint, rule);
     }
-    if (!found || !chaos_net_config_match_endpoint_loaded(operation, &endpoint, rule))
+    if (!found)
     {
         return 0;
     }

@@ -372,4 +372,19 @@ int chaos_net_config_select_endpoint_rule(
     chaos_net_rule_t *rule
 );
 
+/**
+ * @brief The rule for @p operation on connected socket @p fd, matched on one end of
+ *        the connection and, failing that, the other.
+ *
+ * @details A rule names an address: a client writes the server's (its peer), a
+ * server its own (its local end), for receives and sends alike. Receives try the
+ * local end first, sends the peer (@p peer_first); the first end that matches
+ * wins. Nothing is looked up while there are no rules.
+ *
+ * Defined in chaos_net_socket.c, with the socket wrappers it serves.
+ */
+int chaos_net_match_connected(
+    int fd, chaos_net_operation_t operation, int peer_first, chaos_net_rule_t *rule
+);
+
 #endif

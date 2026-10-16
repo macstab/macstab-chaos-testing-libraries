@@ -389,7 +389,8 @@ int main(void)
     messages[0].msg_hdr = message;
     assert(FAILS(decide(__NR_sendmmsg, (uint64_t)udp, P(messages), 1U, 0, 0, 0), ECONNREFUSED));
     message.msg_name = NULL;
-    assert(PASSES(decide(__NR_sendmsg, (uint64_t)udp, P(&message), 0, 0, 0, 0))); /* no peer */
+    /* No destination and no peer: matched by the socket's own address, the other end. */
+    assert(FAILS(decide(__NR_sendmsg, (uint64_t)udp, P(&message), 0, 0, 0, 0), ECONNREFUSED));
 
     /* Own address, else peer. */
     assert(FAILS(decide(__NR_shutdown, (uint64_t)server, SHUT_RDWR, 0, 0, 0, 0), ENOTCONN));

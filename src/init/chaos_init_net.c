@@ -474,23 +474,38 @@ static uint64_t chaos_init_net_message_size(uint64_t address)
     );
 }
 
-/** @brief The destination of a message in the thread's memory: its msg_name, else the peer. */
+/** @brief The destination a message in the thread's memory names (msg_name); 0 when none. */
 static int chaos_init_net_message(int fd, uint64_t address, chaos_net_endpoint_t *endpoint)
 {
     struct msghdr message;
 
-    if (chaos_init_read_memory(g_chaos_init_net_tid, address, &message, sizeof(message)) != 0)
-    {
-        return chaos_net_endpoint_from_peer_fd(fd, endpoint);
-    }
-    if (message.msg_name != NULL &&
-        chaos_init_net_sockaddr(
-            fd, (uint64_t)(uintptr_t)message.msg_name, (uint64_t)message.msg_namelen, endpoint
-        ))
+    return chaos_init_read_memory(g_chaos_init_net_tid, address, &message, sizeof(message)) == 0 &&
+           message.msg_name != NULL &&
+           chaos_init_net_sockaddr(
+               fd, (uint64_t)(uintptr_t)message.msg_name, (uint64_t)message.msg_namelen, endpoint
+           );
+}
+
+/**
+ * @brief The rule for @p operation on connected socket @p fd, on one end of the
+ *        connection and, failing that, the other, as the library matches it
+ *        (chaos_net_match_connected()).
+ */
+static int chaos_init_net_match_ends(
+    int fd, chaos_net_operation_t operation, int peer_first, chaos_net_rule_t *rule
+)
+{
+    chaos_net_endpoint_t endpoint;
+
+    if ((peer_first ? chaos_net_endpoint_from_peer_fd(fd, &endpoint)
+                    : chaos_net_endpoint_from_local_fd(fd, &endpoint)) &&
+        chaos_net_config_match_endpoint_loaded(operation, &endpoint, rule))
     {
         return 1;
     }
-    return chaos_net_endpoint_from_peer_fd(fd, endpoint);
+    return (peer_first ? chaos_net_endpoint_from_local_fd(fd, &endpoint)
+                       : chaos_net_endpoint_from_peer_fd(fd, &endpoint)) &&
+           chaos_net_config_match_endpoint_loaded(operation, &endpoint, rule);
 }
 
 /** @brief Matches the first descriptor of @p fds with an endpoint and a POLL rule. */
@@ -620,24 +635,27 @@ static int chaos_init_net_match(
         found = chaos_init_net_sockaddr(fd, call->args[1], call->args[2], &endpoint);
         break;
     case CHAOS_INIT_NET_LOCAL:
-        found = chaos_net_endpoint_from_local_fd(fd, &endpoint);
-        break;
     case CHAOS_INIT_NET_PEER:
-        found = chaos_net_endpoint_from_peer_fd(fd, &endpoint);
-        break;
+        return chaos_init_net_match_ends(
+            fd, entry->operation, entry->kind == CHAOS_INIT_NET_PEER, rule
+        );
     case CHAOS_INIT_NET_ACTIVITY:
         found = chaos_net_endpoint_from_activity_fd(fd, &endpoint);
         break;
     case CHAOS_INIT_NET_SENDTO:
-        found = chaos_init_net_sockaddr(fd, call->args[4], call->args[5], &endpoint) ||
-                chaos_net_endpoint_from_peer_fd(fd, &endpoint);
-        break;
     case CHAOS_INIT_NET_SENDMSG:
     case CHAOS_INIT_NET_SENDMMSG:
-        /* For sendmmsg the first message stands for the batch, as in the library: its
+        /* The destination named in the call, else either end of the connection. For
+         * sendmmsg the first message stands for the batch, as in the library: its
          * msghdr opens the first mmsghdr. */
-        found = chaos_init_net_message(fd, call->args[1], &endpoint);
-        break;
+        if (entry->kind == CHAOS_INIT_NET_SENDTO
+                ? chaos_init_net_sockaddr(fd, call->args[4], call->args[5], &endpoint)
+                : chaos_init_net_message(fd, call->args[1], &endpoint))
+        {
+            found = 1;
+            break;
+        }
+        return chaos_init_net_match_ends(fd, entry->operation, 1, rule);
     case CHAOS_INIT_NET_POLL:
         return chaos_init_net_match_any(
             fds, chaos_init_net_poll_fds(call->args[0], call->args[1], fds), rule
