@@ -166,11 +166,15 @@ void chaos_io_corrupt_buffer(void *buffer, size_t size)
  *
  * @details Sleeps with chaos_sleep_ms(), a direct system call, so that no other
  * preloaded library (libchaos-time in particular) can shorten or lengthen the
- * delay. The full latency always elapses, and errno is preserved.
+ * delay. A rule whose qualifiers let it fire delays the call by its full latency,
+ * and errno is preserved.
  */
 void chaos_io_rule_apply_latency(const chaos_io_rule_t *rule)
 {
-    if (rule == NULL || rule->effect != CHAOS_IO_EFFECT_LATENCY)
+    /* The qualifiers (@first, @from, @until, @size) and the hit count apply to a
+     * delay as to any other effect. */
+    if (rule == NULL || rule->effect != CHAOS_IO_EFFECT_LATENCY ||
+        !chaos_io_rule_should_trigger(rule))
     {
         return;
     }
@@ -180,10 +184,9 @@ void chaos_io_rule_apply_latency(const chaos_io_rule_t *rule)
 /**
  * @brief Returns non-zero when the rule should trigger for the current call.
  *
- * @details `LATENCY` is unconditional because the sleep duration IS the
- * probability-free effect: every matched call is delayed by exactly
- * `latency_ms` milliseconds.  All other effects are gated through
- * `chaos_io_probability_hit()`.
+ * @details Every effect is gated by the rule's qualifiers (`@first`, `@from`,
+ * `@until`, `@size`). `LATENCY` has no probability; all other effects are also
+ * gated through `chaos_io_probability_hit()`.
  */
 int chaos_io_rule_should_trigger(const chaos_io_rule_t *rule)
 {

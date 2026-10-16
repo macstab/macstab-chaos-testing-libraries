@@ -126,6 +126,27 @@ for lib in io net dns time memory process; do
     rm -f /tmp/.chaos-$lib.conf /tmp/.chaos-$lib.hits.*
 done
 
+# A delay is a hit like any other effect and honours @first: hits_probe calls the
+# operation twice, so @first=1 delays once per process.
+for lib in io net; do
+    so=/out/libchaos-$lib-$LIBC-'"$ARCH"'.so
+    case "$lib" in
+        io) rule="/tmp/hits-data:open:LATENCY:1" ;;
+        net) rule="tcp4://127.0.0.1:9:connect:LATENCY:1" ;;
+    esac
+    echo "$rule @first=1 # delay" > /tmp/.chaos-$lib.conf
+    LD_PRELOAD=$so /tmp/hits-probe "$lib"
+    LD_PRELOAD=$so /tmp/hits-probe "$lib"
+    delays=$(cat /tmp/.chaos-$lib.hits.* 2>/dev/null | awk -F "\t" "\$2 ~ /# delay/ { s += \$1 } END { print s + 0 }")
+    if [ "$delays" -eq 2 ]; then
+        echo "ok   $LIBC $lib: LATENCY @first=1 delayed once per process"
+    else
+        echo "FAIL $LIBC $lib: LATENCY @first=1 hits=$delays" >&2
+        failures=$((failures + 1))
+    fi
+    rm -f /tmp/.chaos-$lib.conf /tmp/.chaos-$lib.hits.*
+done
+
 # @size: hits_probe maps 4096 bytes, so only the gate below that size fires.
 so=/out/libchaos-memory-$LIBC-'"$ARCH"'.so
 { echo "mmap/anon:ERRNO:ENOMEM @size>4095 # small"; echo "mmap/anon:LATENCY:1 @size>4096 # large"; } > /tmp/.chaos-memory.conf

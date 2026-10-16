@@ -167,6 +167,48 @@ static void test_corrupt_helpers(void)
  * - LATENCY effect → 1 (unconditional).
  * - ERRNO + probability=0.0 → 0; ERRNO + probability=1.0 → 1.
  */
+/**
+ * @brief Invariant: a LATENCY rule delays only the calls its qualifiers let it fire on,
+ *   and counts each delay as a hit.
+ *
+ * Expected observable behaviour: `@first=1` delays once, then never; a window that
+ * has not started and a size gate the call fails do not delay; every delay is a hit.
+ */
+static void test_latency_honours_qualifiers(void)
+{
+    chaos_io_rule_t rule;
+    chaos_hit_slot_t slot;
+
+    (void)memset(&rule, 0, sizeof(rule));
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.effect = CHAOS_IO_EFFECT_LATENCY;
+    rule.latency_ms = 5U;
+    rule.hit = &slot;
+    rule.policy.first = 1U;
+
+    chaos_test_sleep_reset();
+    chaos_io_rule_apply_latency(&rule);
+    chaos_io_rule_apply_latency(&rule);
+    assert(g_test_sleep_calls == 1U);
+    assert(slot.count == 1U);
+
+    (void)memset(&rule.policy, 0, sizeof(rule.policy));
+    rule.policy.from_ms = INT64_C(4000000000000);
+    chaos_io_rule_apply_latency(&rule);
+    assert(g_test_sleep_calls == 1U);
+
+    (void)memset(&rule.policy, 0, sizeof(rule.policy));
+    rule.policy.has_size_above = 1U;
+    rule.policy.size_above = 100U;
+    rule.call_size = 10U;
+    chaos_io_rule_apply_latency(&rule);
+    assert(g_test_sleep_calls == 1U);
+    rule.call_size = 101U;
+    chaos_io_rule_apply_latency(&rule);
+    assert(g_test_sleep_calls == 2U);
+    assert(slot.count == 2U);
+}
+
 static void test_latency_and_trigger_helpers(void)
 {
     chaos_io_rule_t rule;
@@ -330,6 +372,7 @@ int main(void)
     test_torn_helpers();
     test_corrupt_helpers();
     test_latency_and_trigger_helpers();
+    test_latency_honours_qualifiers();
     test_errno_application();
     return 0;
 }

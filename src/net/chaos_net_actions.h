@@ -120,7 +120,7 @@ void chaos_net_corrupt_buffer(void *buffer, size_t size);
  *
  * @param rule  Matched rule with effect == LATENCY. May be NULL (no-op).
  * @par Thread-safety: blocks only the calling thread; safe.
- * @par Blocking: always blocks for approximately rule->latency_ms milliseconds.
+ * @par Blocking: blocks for approximately rule->latency_ms milliseconds when the rule fires.
  */
 void chaos_net_rule_apply_latency(const chaos_net_rule_t *rule);
 
