@@ -989,21 +989,23 @@ int chaos_net_match_connected(
     int fd, chaos_net_operation_t operation, int peer_first, chaos_net_rule_t *rule
 )
 {
-    chaos_net_endpoint_t endpoint;
+    chaos_net_endpoint_t local;
+    chaos_net_endpoint_t peer;
+    int have_local;
+    int have_peer;
 
     if (!chaos_net_config_prepare())
     {
         return 0;
     }
-    if ((peer_first ? chaos_net_endpoint_from_peer_fd(fd, &endpoint)
-                    : chaos_net_endpoint_from_local_fd(fd, &endpoint)) &&
-        chaos_net_config_match_endpoint_loaded(operation, &endpoint, rule))
-    {
-        return 1;
-    }
-    return (peer_first ? chaos_net_endpoint_from_local_fd(fd, &endpoint)
-                       : chaos_net_endpoint_from_peer_fd(fd, &endpoint)) &&
-           chaos_net_config_match_endpoint_loaded(operation, &endpoint, rule);
+    have_local = chaos_net_endpoint_from_local_fd(fd, &local);
+    have_peer = chaos_net_endpoint_from_peer_fd(fd, &peer);
+    return peer_first ? chaos_net_config_match_either_loaded(
+                            operation, have_peer ? &peer : NULL, have_local ? &local : NULL, rule
+                        )
+                      : chaos_net_config_match_either_loaded(
+                            operation, have_local ? &local : NULL, have_peer ? &peer : NULL, rule
+                        );
 }
 
 /**

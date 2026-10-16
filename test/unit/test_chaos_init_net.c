@@ -769,6 +769,20 @@ int main(void)
     ));
     assert(g_protocol_lookups > 0U);
 
+    /* Both ends of a connection are searched together: the catch-all rule that
+     * matches the client's own end does not shadow the exact rule for its peer. */
+    (void)snprintf(
+        rules,
+        sizeof(rules),
+        "*:recv:LATENCY:10\ntcp4://127.0.0.1:%u:recv:ECONNRESET:1.0\n",
+        ntohs(server_address.sin_port)
+    );
+    write_rules(rules);
+    assert(FAILS(decide(__NR_recvfrom, (uint64_t)client, P(buffer), 8U, 0, 0, 0), ECONNRESET));
+    assert(
+        decide(__NR_recvfrom, (uint64_t)unbound, P(buffer), 8U, 0, 0, 0).action == CHAOS_INIT_DELAY
+    );
+
     /* Rules SECCOMP mode cannot apply reject the whole file: data effects, RESET,
      * ERRNO on close. */
     write_rules("*:connect:ECONNREFUSED:1.0\n*:recv:CORRUPT:1.0\n");

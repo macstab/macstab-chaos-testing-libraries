@@ -864,6 +864,46 @@ static void test_file_and_state_edges(void)
     assert(chaos_net_config_match_endpoint_loaded(CHAOS_NET_OP_CONNECT, &endpoint, &rule));
     assert(rule.errnum == ECONNREFUSED);
 
+    /* The two ends of a connection are searched together: a wildcard for the end
+     * tried first does not shadow a more specific rule for the other; between
+     * equally specific rules, the first end's wins. */
+    {
+        chaos_net_endpoint_t local;
+        chaos_net_endpoint_t peer;
+
+        assert(chaos_net_endpoint_parse_selector("tcp4://127.0.0.1:5433", &local));
+        assert(chaos_net_endpoint_parse_selector("tcp4://127.0.0.1:5432", &peer));
+        write_config_text("*:recv:LATENCY:10\ntcp4://127.0.0.1:5432:recv:ECONNRESET:1.0\n", 32);
+        g_chaos_net_cached_mtime = CHAOS_NET_MTIME_UNKNOWN;
+        assert(chaos_net_config_prepare());
+        assert(chaos_net_config_match_either_loaded(CHAOS_NET_OP_RECV, &local, &peer, &rule));
+        assert(rule.effect == CHAOS_NET_EFFECT_ERRNO && rule.errnum == ECONNRESET);
+        assert(chaos_net_config_match_either_loaded(CHAOS_NET_OP_RECV, &peer, &local, &rule));
+        assert(rule.errnum == ECONNRESET);
+        assert(chaos_net_config_match_either_loaded(CHAOS_NET_OP_RECV, &local, NULL, &rule));
+        assert(rule.effect == CHAOS_NET_EFFECT_LATENCY);
+        assert(chaos_net_config_match_either_loaded(CHAOS_NET_OP_RECV, NULL, &peer, &rule));
+        assert(rule.errnum == ECONNRESET);
+        assert(!chaos_net_config_match_either_loaded(CHAOS_NET_OP_RECV, NULL, NULL, &rule));
+        assert(!chaos_net_config_match_either_loaded(CHAOS_NET_OP_SEND, &local, &peer, &rule));
+
+        write_config_text(
+            "tcp4://127.0.0.1:5433:recv:ECONNRESET:1.0\n"
+            "tcp4://127.0.0.1:5432:recv:ETIMEDOUT:1.0\n",
+            33
+        );
+        g_chaos_net_cached_mtime = CHAOS_NET_MTIME_UNKNOWN;
+        assert(chaos_net_config_prepare());
+        assert(chaos_net_config_match_either_loaded(CHAOS_NET_OP_RECV, &local, &peer, &rule));
+        assert(rule.errnum == ECONNRESET);
+        assert(chaos_net_config_match_either_loaded(CHAOS_NET_OP_RECV, &peer, &local, &rule));
+        assert(rule.errnum == ETIMEDOUT);
+
+        write_config_text("tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0\n", 30);
+        g_chaos_net_cached_mtime = CHAOS_NET_MTIME_UNKNOWN;
+        assert(chaos_net_config_prepare());
+    }
+
     g_chaos_net_cached_mtime = chaos_net_config_observed_mtime();
     assert(chaos_net_config_prepare());
 
@@ -881,6 +921,7 @@ static void test_file_and_state_edges(void)
 
     chaos_net_config_reset_state(&g_chaos_net_config_states[g_chaos_net_active_config_index], 0);
     assert(!chaos_net_config_match_endpoint_loaded(CHAOS_NET_OP_CONNECT, &endpoint, &rule));
+    assert(!chaos_net_config_match_either_loaded(CHAOS_NET_OP_CONNECT, &endpoint, NULL, &rule));
 
     restore_file(CHAOS_NET_CONFIG_PATH, &backup);
     free_backup(&backup);

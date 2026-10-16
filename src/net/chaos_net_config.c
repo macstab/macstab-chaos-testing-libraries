@@ -1168,23 +1168,25 @@ const chaos_status_error_t *chaos_net_config_last_error(void)
  * beats `*`, giving operators intuitive precedence without requiring an
  * explicit rule ordering in the config file.
  */
-int chaos_net_config_select_endpoint_rule(
+/** @brief The best match so far over one or more endpoints. */
+typedef struct chaos_net_best_rule
+{
+    unsigned int rank;
+    size_t length;
+    int found;
+} chaos_net_best_rule_t;
+
+/** @brief Replaces @p rule with a rule for @p endpoint more specific than @p best's. */
+static void chaos_net_config_select_better(
     const chaos_net_rule_t *rules,
     size_t rule_count,
     chaos_net_operation_t operation,
     const chaos_net_endpoint_t *endpoint,
-    chaos_net_rule_t *rule
+    chaos_net_rule_t *rule,
+    chaos_net_best_rule_t *best
 )
 {
     size_t index;
-    unsigned int best_rank = 0U;
-    size_t best_len = 0U;
-    int found = 0;
-
-    if (rules == NULL || endpoint == NULL || rule == NULL)
-    {
-        return 0;
-    }
 
     for (index = 0U; index < rule_count; ++index)
     {
@@ -1199,17 +1201,33 @@ int chaos_net_config_select_endpoint_rule(
             continue;
         }
         /* Prefer higher rank; break ties by longer selector text (more specific). */
-        if (!found || rank > best_rank ||
-            (rank == best_rank && rules[index].selector.selector_len > best_len))
+        if (!best->found || rank > best->rank ||
+            (rank == best->rank && rules[index].selector.selector_len > best->length))
         {
             *rule = rules[index];
-            best_rank = rank;
-            best_len = rules[index].selector.selector_len;
-            found = 1;
+            best->rank = rank;
+            best->length = rules[index].selector.selector_len;
+            best->found = 1;
         }
     }
+}
 
-    return found;
+int chaos_net_config_select_endpoint_rule(
+    const chaos_net_rule_t *rules,
+    size_t rule_count,
+    chaos_net_operation_t operation,
+    const chaos_net_endpoint_t *endpoint,
+    chaos_net_rule_t *rule
+)
+{
+    chaos_net_best_rule_t best = {0U, 0U, 0};
+
+    if (rules == NULL || endpoint == NULL || rule == NULL)
+    {
+        return 0;
+    }
+    chaos_net_config_select_better(rules, rule_count, operation, endpoint, rule, &best);
+    return best.found;
 }
 
 /**
@@ -1593,6 +1611,38 @@ int chaos_net_config_match_endpoint_loaded(
                state->rules, state->rule_count, operation, endpoint, rule
            ) &&
            chaos_snapshot_read_valid(&state->sequence, sequence);
+}
+
+int chaos_net_config_match_either_loaded(
+    chaos_net_operation_t operation,
+    const chaos_net_endpoint_t *first,
+    const chaos_net_endpoint_t *second,
+    chaos_net_rule_t *rule
+)
+{
+    const chaos_net_config_state_t *state = chaos_net_config_active_state();
+    const uint64_t sequence = chaos_snapshot_read_begin(&state->sequence);
+    chaos_net_best_rule_t best = {0U, 0U, 0};
+
+    if (state->parse_ok == 0)
+    {
+        return 0;
+    }
+    /* One search over both ends: a wildcard for the end tried first must not
+     * shadow a more specific rule for the other. */
+    if (first != NULL)
+    {
+        chaos_net_config_select_better(
+            state->rules, state->rule_count, operation, first, rule, &best
+        );
+    }
+    if (second != NULL)
+    {
+        chaos_net_config_select_better(
+            state->rules, state->rule_count, operation, second, rule, &best
+        );
+    }
+    return best.found && chaos_snapshot_read_valid(&state->sequence, sequence);
 }
 
 /**

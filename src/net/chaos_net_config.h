@@ -275,6 +275,20 @@ int chaos_net_config_match_endpoint_loaded(
 );
 
 /**
+ * @brief chaos_net_config_match_endpoint_loaded() for the two ends of a connection:
+ *        the most specific rule for either end, @p first's on a tie.
+ *
+ * @param first   The end tried first; NULL when it cannot be resolved.
+ * @param second  The other end; NULL when it cannot be resolved.
+ */
+int chaos_net_config_match_either_loaded(
+    chaos_net_operation_t operation,
+    const chaos_net_endpoint_t *first,
+    const chaos_net_endpoint_t *second,
+    chaos_net_rule_t *rule
+);
+
+/**
  * @brief Triggers a config reload if necessary, then searches for a matching rule.
  *
  * @details Convenience wrapper: calls chaos_net_config_prepare() first, then
@@ -418,9 +432,10 @@ static inline uint64_t chaos_net_message_size(const struct msghdr *message)
  *        the connection and, failing that, the other.
  *
  * @details A rule names an address: a client writes the server's (its peer), a
- * server its own (its local end), for receives and sends alike. Receives try the
- * local end first, sends the peer (@p peer_first); the first end that matches
- * wins. Nothing is looked up while there are no rules.
+ * server its own (its local end), for receives and sends alike. The most specific
+ * rule for either end wins, as among the rules for one end; on a tie, receives
+ * take the local end's, sends the peer's (@p peer_first). Nothing is looked up
+ * while there are no rules.
  *
  * Defined in chaos_net_socket.c, with the socket wrappers it serves.
  */

@@ -327,6 +327,21 @@ int chaos_net_config_match_endpoint_loaded(
 }
 
 /**
+ * @brief Stub for `chaos_net_config_match_either_loaded()`: the ends in order,
+ *        each through the same stub (rule precedence is test_net_config's).
+ */
+int chaos_net_config_match_either_loaded(
+    chaos_net_operation_t operation,
+    const chaos_net_endpoint_t *first,
+    const chaos_net_endpoint_t *second,
+    chaos_net_rule_t *rule
+)
+{
+    return (first != NULL && chaos_net_config_match_endpoint(operation, first, rule)) ||
+           (second != NULL && chaos_net_config_match_endpoint(operation, second, rule));
+}
+
+/**
  * @brief Stub for `chaos_net_endpoint_from_sockaddr_fd()`.
  *
  * Used by `bind`, `connect`, `sendto`, and `sendmsg` to obtain the remote endpoint.

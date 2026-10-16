@@ -237,11 +237,14 @@ Current runtime contract:
 - `bind` and `connect` match the supplied sockaddr-derived endpoint
 - `listen` and `accept` match the local endpoint
 - `send` matches the explicit destination sockaddr, else either end of the
-  connection: the peer first, then the local endpoint
-- `recv` matches either end of the connection: the local endpoint first, then
-  the peer; so a client's rule for its server (`tcp4://db:5432:recv:...`) and a
-  server's rule for its own port both apply, also for a unix client socket that
-  was never bound
+  connection
+- `recv` matches either end of the connection, so a client's rule for its
+  server (`tcp4://db:5432:recv:...`) and a server's rule for its own port both
+  apply, also for a unix client socket that was never bound
+- for either end, the most specific rule for the two ends wins, as among the
+  rules for one end: `*` for the client's own end does not shadow
+  `tcp4://db:5432` for its peer. Between equally specific rules, `send` takes
+  the peer's, `recv` the local end's
 - `read`, `write`, `readv` and `writev` on a socket follow the `recv` and `send`
   rules; on anything else they are forwarded
 - `socket` matches a wildcard endpoint derived from family and type
