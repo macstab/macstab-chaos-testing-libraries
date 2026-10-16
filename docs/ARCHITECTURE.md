@@ -437,6 +437,11 @@ applied, and each process reports its counts in
   `@first` budgets and once-only effects (REGRESS) are per process too: a child
   starts its own. A `vfork` child counts into the parent's slots and writes no
   file of its own.
+- A program started by `execve` keeps its pid but loads the library anew, and
+  the image it replaced ran no exit report. When a file of its pid already
+  exists, the new image writes `<pid>` followed by nine digits of its load time
+  instead: a number beyond any pid, so the hits before the exec stay. Readers
+  sum every `.hits.<digits>` file.
 - A reader sums the files of all processes. Files of finished processes stay,
   so counts are cumulative until the files are removed (one file per process
   that ever hit a rule: remove them between test runs).

@@ -6,6 +6,8 @@
  *        hits_probe burst   (libchaos-io) opens the faulted file 100 times, waits
  *                           past the hits interval, makes one unrelated call and
  *                           prints the hits its own file reports while it runs
+ *        hits_probe exec    (libchaos-io) opens the faulted file 3 times, then
+ *                           executes itself as `hits_probe io` (2 more)
  *
  * Results are ignored; test_hits.sh checks the hits files the library wrote.
  */
@@ -133,6 +135,14 @@ int main(int argc, char **argv)
     if (strcmp(argv[1], "burst") == 0)
     {
         return burst();
+    }
+    if (strcmp(argv[1], "exec") == 0)
+    {
+        call_once("io");
+        call_once("io");
+        call_once("io");
+        (void)execl("/proc/self/exe", argv[0], "io", (char *)NULL);
+        return 1;
     }
     call_once(argv[1]);
     call_once(argv[1]);

@@ -1126,7 +1126,7 @@ static int read_hits_file(char *buffer, size_t size)
     FILE *file;
     size_t length;
 
-    (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_IO_HITS_PREFIX, (long)getpid());
+    (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_IO_HITS_PREFIX, g_chaos_io_hits_file);
     file = fopen(path, "r");
     if (file == NULL)
     {
@@ -1149,6 +1149,28 @@ static int read_hits_file(char *buffer, size_t size)
  * Expected observable behaviour: the hits file lists "2<TAB>rule # a", then also
  *   "1<TAB>rule # b" with the first count unchanged.
  */
+/**
+ * @brief Invariant: an image whose pid already has a hits file (the image an execve
+ *        replaced) writes its own file under a number no pid reaches.
+ */
+static void test_hits_file_survives_exec(void)
+{
+    char path[64];
+    FILE *file;
+    long number;
+
+    (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_IO_HITS_PREFIX, (long)getpid());
+    (void)unlink(path);
+    assert(chaos_hits_file_number(CHAOS_IO_HITS_PREFIX) == (long)getpid());
+    file = fopen(path, "w");
+    assert(file != NULL && fclose(file) == 0);
+    errno = 4242;
+    number = chaos_hits_file_number(CHAOS_IO_HITS_PREFIX);
+    assert(errno == 4242);
+    assert(number > 4194304L && number / 1000000000L == (long)getpid());
+    assert(unlink(path) == 0);
+}
+
 static void test_hits_are_counted_and_reported(void)
 {
     char hits[1024];
@@ -1230,7 +1252,7 @@ static void test_hits_are_counted_and_reported(void)
     g_chaos_io_hits_pending = 0;
     g_chaos_io_hits_pid = (uint64_t)getpid();
 
-    (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_IO_HITS_PREFIX, (long)getpid());
+    (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_IO_HITS_PREFIX, g_chaos_io_hits_file);
     (void)unlink(path);
     (void)unlink(CHAOS_IO_CONFIG_PATH);
 }
@@ -1401,6 +1423,7 @@ int main(void)
 
     test_parse_buffer_reports_rejected_line();
     test_prepare_reports_status();
+    test_hits_file_survives_exec();
     test_hits_are_counted_and_reported();
     test_rule_file_check_is_throttled();
     test_rule_qualifiers();

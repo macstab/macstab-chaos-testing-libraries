@@ -168,6 +168,7 @@ static inline size_t chaos_status_format(
 #define CHAOS_STATUS_WRITE(fd, data, length) syscall(SYS_write, (fd), (data), (length))
 #define CHAOS_STATUS_CLOSE(fd) syscall(SYS_close, (fd))
 #define CHAOS_STATUS_UNLINK(path) syscall(SYS_unlinkat, AT_FDCWD, (path), 0)
+#define CHAOS_STATUS_EXISTS(path) (syscall(SYS_faccessat, AT_FDCWD, (path), F_OK, 0) == 0)
 #ifdef SYS_renameat
 #define CHAOS_STATUS_RENAME(from, to) syscall(SYS_renameat, AT_FDCWD, (from), AT_FDCWD, (to))
 #else
@@ -179,6 +180,7 @@ static inline size_t chaos_status_format(
 #define CHAOS_STATUS_WRITE(fd, data, length) write((fd), (data), (length))
 #define CHAOS_STATUS_CLOSE(fd) close(fd)
 #define CHAOS_STATUS_UNLINK(path) unlink(path)
+#define CHAOS_STATUS_EXISTS(path) (access((path), F_OK) == 0)
 #define CHAOS_STATUS_RENAME(from, to) rename((from), (to))
 #endif
 

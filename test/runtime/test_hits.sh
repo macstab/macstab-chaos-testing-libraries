@@ -139,6 +139,19 @@ else
 fi
 rm -f /tmp/.chaos-io.conf /tmp/.chaos-io.hits.*
 
+# A program started by execve keeps the pid: the hits counted before the exec stay.
+echo "/tmp/hits-data:open:EIO:1.0 # exec" > /tmp/.chaos-io.conf
+LD_PRELOAD=$so /tmp/hits-probe exec
+files=$(ls /tmp/.chaos-io.hits.* 2>/dev/null | wc -l)
+total=$(cat /tmp/.chaos-io.hits.* 2>/dev/null | awk -F "\t" "\$2 ~ /# exec/ { s += \$1 } END { print s + 0 }")
+if [ "$files" -eq 2 ] && [ "$total" -eq 5 ]; then
+    echo "ok   $LIBC io: 5 hits across an execve, in 2 files"
+else
+    echo "FAIL $LIBC io: $total hits in $files files across an execve, want 5 in 2" >&2
+    failures=$((failures + 1))
+fi
+rm -f /tmp/.chaos-io.conf /tmp/.chaos-io.hits.*
+
 # A delay is a hit like any other effect and honours @first: hits_probe calls the
 # operation twice, so @first=1 delays once per process.
 for lib in io net; do

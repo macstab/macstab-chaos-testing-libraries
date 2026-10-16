@@ -190,6 +190,9 @@ static uint64_t g_chaos_net_hits_last_ms = 0U;
 /** @brief Process the counters belong to: set at start and in a forked child. */
 static volatile uint64_t g_chaos_net_hits_pid = 0U;
 
+/** @brief Number of this image's hits file (chaos_hits_file_number()). */
+static long g_chaos_net_hits_file = 0L;
+
 /** @brief Scratch for the hits file; used only by the thread that writes it. */
 static char g_chaos_net_hits_buffer[CHAOS_NET_MAX_RULES * CHAOS_HITS_LINE_MAX + 1U];
 
@@ -887,6 +890,7 @@ static int chaos_net_split_rule_fields(
 void chaos_net_config_init(void)
 {
     g_chaos_net_hits_pid = (uint64_t)getpid();
+    g_chaos_net_hits_file = chaos_hits_file_number(CHAOS_NET_HITS_PREFIX);
     if (!g_chaos_net_atfork_registered)
     {
         g_chaos_net_atfork_registered = 1;
@@ -1253,8 +1257,9 @@ static void chaos_net_config_report_hits(chaos_hit_slot_t *slot)
         {
             g_chaos_net_hits_pending = 0;
             __sync_synchronize();
-            chaos_hits_write(
+            chaos_hits_write_for(
                 CHAOS_NET_HITS_PREFIX,
+                g_chaos_net_hits_file,
                 state->hits,
                 (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) state->text,
                 state->rule_count,
@@ -1291,6 +1296,7 @@ static void chaos_net_config_after_fork(void)
     g_chaos_net_hits_total = 0U;
     g_chaos_net_hits_last_ms = 0U;
     g_chaos_net_hits_pid = (uint64_t)getpid();
+    g_chaos_net_hits_file = chaos_hits_file_number(CHAOS_NET_HITS_PREFIX);
     /* The child must not draw the parent's numbers (pre-fork workers would all
      * decide alike): its PRNG reseeds from its own thread id on the next draw. */
     g_chaos_net_tls_prng_state = 0U;

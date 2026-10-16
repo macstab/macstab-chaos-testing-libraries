@@ -1,12 +1,13 @@
 /**
  * @file chaos_hits.h
- * @brief Per-rule hit counters, reported in `/tmp/.chaos-<lib>.hits.<pid>`.
+ * @brief Per-rule hit counters, reported in `/tmp/.chaos-<lib>.hits.<number>`.
  *
  * @details
  * A rule that parses but never fires is the other silent failure next to a
  * rejected rule file (see chaos_status.h): the selector does not match what the
  * program really does. Every library therefore counts, per rule, how often the
- * rule's effect was applied, and each process reports its counts in its own file:
+ * rule's effect was applied, and each process reports its counts in its own file,
+ * named by its pid (see chaos_hits_file_number() for a program started by execve):
  *
  * @code
  * 3<TAB>tcp4://127.0.0.1:5432:connect:ECONNREFUSED:1.0 # net
@@ -36,6 +37,7 @@
 #include "chaos_clock.h"
 #include "chaos_status.h"
 
+#include <errno.h>
 #include <stdint.h>
 #include <time.h>
 
@@ -111,13 +113,47 @@ static inline uint64_t chaos_hits_now_ms(void)
 }
 
 /**
- * @brief Writes the hits file of process @p pid.
+ * @brief Number of the calling image's hits file: its pid, or a number beyond any
+ *        pid when a file of that pid already exists.
  *
- * @details chaos-init writes them for the processes it supervises; the libraries
- * write their own through chaos_hits_write().
+ * @details A program started by execve keeps the pid but loads the library anew,
+ * and no destructor ran in the image it replaced: that image's file holds the hits
+ * counted before the exec, and writing to the same name would wipe them. The pid
+ * followed by nine digits of the load time is beyond pid_max (at most 2^22), so a
+ * reader summing every `<prefix>.<digits>` counts both. A file a dead process with
+ * the same pid left behind is kept the same way. Called at load and in a forked
+ * child; errno is left as it was.
+ */
+static inline long chaos_hits_file_number(const char *prefix)
+{
+    const int saved_errno = errno;
+    const long pid = (long)getpid();
+    const uint64_t salt = chaos_clock_now_ns();
+    long number = pid;
+    char path[128];
+    unsigned attempt;
+
+    for (attempt = 0U; attempt < 8U; ++attempt)
+    {
+        if ((size_t)snprintf(path, sizeof(path), "%s.%ld", prefix, number) >= sizeof(path) ||
+            !CHAOS_STATUS_EXISTS(path))
+        {
+            break;
+        }
+        number = pid * 1000000000L + (long)((salt + attempt) % UINT64_C(1000000000));
+    }
+    errno = saved_errno;
+    return number;
+}
+
+/**
+ * @brief Writes the hits file numbered @p pid.
  *
- * @param prefix  File name without the pid, e.g. `/tmp/.chaos-net.hits`.
- * @param pid     Process the counts belong to.
+ * @details chaos-init writes them for the processes it supervises, by pid; the
+ * libraries write their own under chaos_hits_file_number().
+ *
+ * @param prefix  File name without the number, e.g. `/tmp/.chaos-net.hits`.
+ * @param pid     Number of the file: a pid, or chaos_hits_file_number().
  * @param slots   Counters, @p count entries.
  * @param texts   Rule texts, @p count entries of CHAOS_STATUS_TEXT_MAX + 1 bytes.
  * @param count   Number of rules.
@@ -158,27 +194,6 @@ static inline void chaos_hits_write_for(
         length += (size_t)rc;
     }
     chaos_status_replace_file(path, buffer, length);
-}
-
-/**
- * @brief Writes the hits file of the calling process.
- *
- * @param prefix  File name without the pid, e.g. `/tmp/.chaos-net.hits`.
- * @param slots   Counters, @p count entries.
- * @param texts   Rule texts, @p count entries of CHAOS_STATUS_TEXT_MAX + 1 bytes.
- * @param count   Number of rules.
- * @param buffer  Scratch of at least @p count * CHAOS_HITS_LINE_MAX + 1 bytes.
- */
-static inline void chaos_hits_write(
-    const char *prefix,
-    const chaos_hit_slot_t *slots,
-    const char (*texts)[CHAOS_STATUS_TEXT_MAX + 1U],
-    size_t count,
-    char *buffer,
-    size_t buffer_size
-)
-{
-    chaos_hits_write_for(prefix, (long)getpid(), slots, texts, count, buffer, buffer_size);
 }
 
 #endif

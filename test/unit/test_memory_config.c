@@ -1225,7 +1225,8 @@ static int read_hits_file(char *buffer, size_t size)
     FILE *file;
     size_t length;
 
-    (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_MEMORY_HITS_PREFIX, (long)getpid());
+    (void
+    )snprintf(path, sizeof(path), "%s.%ld", CHAOS_MEMORY_HITS_PREFIX, g_chaos_memory_hits_file);
     file = fopen(path, "r");
     if (file == NULL)
     {
@@ -1323,7 +1324,8 @@ static void test_hits_are_counted_and_reported(void)
     g_chaos_memory_hits_pending = 0;
     g_chaos_memory_hits_pid = (uint64_t)getpid();
 
-    (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_MEMORY_HITS_PREFIX, (long)getpid());
+    (void
+    )snprintf(path, sizeof(path), "%s.%ld", CHAOS_MEMORY_HITS_PREFIX, g_chaos_memory_hits_file);
     (void)unlink(path);
     (void)unlink(CHAOS_MEMORY_CONFIG_PATH);
 }
