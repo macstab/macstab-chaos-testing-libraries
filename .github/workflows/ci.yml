@@ -102,6 +102,7 @@ jobs:
             test/runtime/test_fork.sh \
             test/runtime/test_stdio.sh \
             test/runtime/test_init.sh \
+            test/runtime/test_mptcp.sh \
             test/runtime/test_seccomp.sh
           do
             echo "::group::$script"

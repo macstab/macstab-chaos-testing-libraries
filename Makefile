@@ -274,6 +274,7 @@ HOST_RUNTIME_TESTS := \
 	$(TEST_RUNTIME_DIR)/test_reload.sh \
 	$(TEST_RUNTIME_DIR)/test_fork.sh \
 	$(TEST_RUNTIME_DIR)/test_init.sh \
+	$(TEST_RUNTIME_DIR)/test_mptcp.sh \
 	$(TEST_RUNTIME_DIR)/test_seccomp.sh \
 	$(TEST_RUNTIME_DIR)/test_stdio.sh
 MATRIX_RUNTIME_TESTS := \
