@@ -485,6 +485,20 @@ This is a known design limitation in the current implementation. It is acceptabl
 for test/staging environments where the entire machine is controlled by the test
 operator. It is not appropriate for multi-tenant production environments.
 
+**Symbolic links.** The rule file is opened without `O_NOFOLLOW` on purpose: rule
+files mounted through a link (Kubernetes ConfigMap volumes go through `..data`)
+must keep working. A link another user planted in a sticky `/tmp` is not followed
+where `fs.protected_symlinks` is set (the default on current distributions); the
+status and hits files are always created without following links (`O_EXCL`,
+`O_NOFOLLOW`). The rule file is opened `O_CLOEXEC`, so a descriptor of a reload in
+progress does not leak into a program another thread executes.
+
+**Signal handlers.** An interposed call made in a signal handler can take over a
+due reload. The parsers then use no locale and allocate nothing; the status and
+hits reports are formatted with `snprintf` using `%s`, `%lu` and `%llu` only, and
+written with raw system calls. A handler that interrupts the thread doing the
+reload finds the reload claimed and uses the active rules.
+
 ---
 
 ## 10. Interaction with Sanitisers and Debug Runtimes
