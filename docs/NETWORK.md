@@ -589,6 +589,10 @@ Supported selector forms:
 - `dns://api.example.com`
 - `*`
 
+An IPv6 socket that talks to an IPv4 address (`::ffff:10.0.0.15`, the dual-stack
+sockets of Java, Go and most servers) carries IPv4 traffic: `tcp4://` and `udp4://`
+selectors match it, `tcp6://[::ffff:...]` does not.
+
 ### Rule grammar
 
 ```text

@@ -397,6 +397,49 @@ static int probe_connect_errno(void)
     return 0;
 }
 
+/**
+ * @brief A dual-stack IPv6 socket reaching an IPv4 address (::ffff:127.0.0.1), as
+ *        Java and Go do, is matched by the tcp4:// rule for that address.
+ */
+static int probe_connect_v4_mapped(void)
+{
+    struct sockaddr_in6 address;
+    int listener = create_tcp_listener(41033U);
+    int fd;
+    int rc;
+
+    if (listener < 0)
+    {
+        return 210;
+    }
+    rc = write_config("tcp4://127.0.0.1:41033:connect:EHOSTUNREACH:1.0");
+    if (rc != 0)
+    {
+        close(listener);
+        return rc;
+    }
+    fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd < 0)
+    {
+        close(listener);
+        return 211;
+    }
+    memset(&address, 0, sizeof(address));
+    address.sin6_family = AF_INET6;
+    address.sin6_port = htons(41033U);
+    if (inet_pton(AF_INET6, "::ffff:127.0.0.1", &address.sin6_addr) != 1)
+    {
+        close(fd);
+        close(listener);
+        return 212;
+    }
+    errno = 0;
+    rc = connect(fd, (const struct sockaddr *)&address, (socklen_t)sizeof(address));
+    close(fd);
+    close(listener);
+    return rc == -1 && errno == EHOSTUNREACH ? 0 : 213;
+}
+
 static int probe_accept_errno(void)
 {
     int listener = create_tcp_listener(41004U);
@@ -1371,6 +1414,9 @@ int main(void)
     if (rc != 0)
         return rc;
     rc = probe_connect_errno();
+    if (rc != 0)
+        return rc;
+    rc = probe_connect_v4_mapped();
     if (rc != 0)
         return rc;
     rc = probe_accept_errno();

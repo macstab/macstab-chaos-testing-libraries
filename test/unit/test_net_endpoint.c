@@ -474,6 +474,36 @@ static void test_endpoint_resolution_from_sockaddr_and_fd(void)
     ));
     assert(endpoint.kind == CHAOS_NET_ENDPOINT_UDP6);
 
+    /* An IPv4-mapped address on a dual-stack socket is IPv4 traffic: tcp4/udp4
+     * rules match it, tcp6 rules on the mapped form do not. */
+    {
+        chaos_net_endpoint_t selector;
+
+        chaos_net_test_set_ipv6(&ipv6, "::ffff:10.1.2.3", 5432U);
+        g_stub_socket_type = SOCK_STREAM;
+        assert(chaos_net_endpoint_from_sockaddr_fd(
+            7, (const struct sockaddr *)&ipv6, (socklen_t)sizeof(ipv6), &endpoint
+        ));
+        assert(endpoint.kind == CHAOS_NET_ENDPOINT_TCP4);
+        assert(endpoint.port == 5432U);
+        assert(endpoint.value.ipv4.s_addr == inet_addr("10.1.2.3"));
+        assert(chaos_net_endpoint_parse_selector("tcp4://10.1.2.3:5432", &selector));
+        assert(chaos_net_endpoint_matches(&selector, &endpoint, NULL));
+        assert(chaos_net_endpoint_parse_selector("tcp6://[::ffff:10.1.2.3]:5432", &selector));
+        assert(!chaos_net_endpoint_matches(&selector, &endpoint, NULL));
+        g_stub_socket_type = SOCK_DGRAM;
+        assert(chaos_net_endpoint_from_sockaddr_fd(
+            7, (const struct sockaddr *)&ipv6, (socklen_t)sizeof(ipv6), &endpoint
+        ));
+        assert(endpoint.kind == CHAOS_NET_ENDPOINT_UDP4);
+        /* ::ffff:0:0/96 only; the deprecated IPv4-compatible ::a.b.c.d stays IPv6. */
+        chaos_net_test_set_ipv6(&ipv6, "::10.1.2.3", 5432U);
+        assert(chaos_net_endpoint_from_sockaddr_fd(
+            7, (const struct sockaddr *)&ipv6, (socklen_t)sizeof(ipv6), &endpoint
+        ));
+        assert(endpoint.kind == CHAOS_NET_ENDPOINT_UDP6);
+    }
+
     (void)memset(&unix_address, 0, sizeof(unix_address));
     unix_address.sun_family = AF_UNIX;
     (void)snprintf(unix_address.sun_path, sizeof(unix_address.sun_path), "%s", "/tmp/chaos.sock");

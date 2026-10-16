@@ -569,6 +569,8 @@ chaos_net_endpoint_kind_from_socket(int fd, sa_family_t family, chaos_net_endpoi
  *     present nor guaranteed to be NUL-terminated. Rejects abstract paths
  *     (sun_path[0] == '\0') and an address_length that covers no path byte at all
  *     (unnamed sockets report address_length == sizeof(sa_family_t)).
+ *   - AF_INET6 with an IPv4-mapped address (::ffff:a.b.c.d): TCP4/UDP4 with
+ *     the IPv4 address, so IPv4 rules match a dual-stack socket's IPv4 traffic.
  *   - Other families: rejected (return 0).
  *
  * @param fd              Used for SO_TYPE query; must be a valid socket fd.
@@ -622,6 +624,16 @@ static int chaos_net_endpoint_from_sockaddr(
             return 0;
         }
         endpoint->port = ntohs(ipv6->sin6_port);
+        if (IN6_IS_ADDR_V4MAPPED(&ipv6->sin6_addr))
+        {
+            /* A dual-stack socket talking to an IPv4 address (::ffff:a.b.c.d), as
+             * Java, Go and most servers do: the traffic is IPv4, so it is matched
+             * by tcp4:// and udp4:// rules. */
+            endpoint->kind = endpoint->kind == CHAOS_NET_ENDPOINT_TCP6 ? CHAOS_NET_ENDPOINT_TCP4
+                                                                       : CHAOS_NET_ENDPOINT_UDP4;
+            (void)memcpy(&endpoint->value.ipv4, &ipv6->sin6_addr.s6_addr[12], 4U);
+            return 1;
+        }
         /* sin6_flowinfo and sin6_scope_id are intentionally not stored;
          * config selectors cannot express them and they would break matching. */
         endpoint->value.ipv6 = ipv6->sin6_addr;
