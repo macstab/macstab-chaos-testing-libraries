@@ -13,7 +13,8 @@
 #define CHAOS_INIT_MAX_LIBS 6U
 
 /**
- * @brief How a process is told from another: its pid and its start time.
+ * @brief How a process is told from another: its pid, its start time and its image
+ *        (chaos_init_process_of()).
  *        Unit tests replace the lookup.
  */
 #ifndef CHAOS_INIT_PROCESS_OF
@@ -115,9 +116,15 @@ static void chaos_init_tracee_write(chaos_init_rules_t *rules, int tracee)
     {
         slots[index] = &rules->slots[(size_t)tracee * rules->max_rules + index];
     }
+    /* A file of this pid may hold the hits of the image an execve replaced. */
+    if (rules->file[tracee] == 0)
+    {
+        rules->file[tracee] =
+            chaos_hits_file_number_for(rules->hits_prefix, (long)g_chaos_init_tracees[tracee].tgid);
+    }
     chaos_hits_write_for(
         rules->hits_prefix,
-        (long)g_chaos_init_tracees[tracee].tgid,
+        rules->file[tracee],
         slots,
         (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) texts,
         count < rules->max_rules ? count : rules->max_rules,
@@ -168,6 +175,7 @@ static void chaos_init_tracee_drop(int tracee)
         rules->generation[tracee] = 0U;
         rules->count[tracee] = 0U;
         rules->total[tracee] = 0U;
+        rules->file[tracee] = 0;
     }
     g_chaos_init_tracees[tracee].tgid = 0;
 }

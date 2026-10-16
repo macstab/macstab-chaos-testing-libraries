@@ -450,6 +450,30 @@ static void test_memory_and_proc(void)
     assert(chaos_init_process_of(getpid(), &tgid, &start) == -1);
     g_fake_stat = "12 (a) b) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242 99";
     assert(chaos_init_process_of(getpid(), &tgid, &start) == 0 && tgid == 12 && start == 4242U);
+    /* An execve keeps pid and start time; the start of code (26) and stack (28) tell
+     * the new image from the old. */
+    {
+        uint64_t image;
+
+        g_fake_stat =
+            "12 (x) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242 1 2 3 4096 5 8192 7";
+        assert(chaos_init_process_of(getpid(), &tgid, &image) == 0 && image != 4242U);
+        g_fake_stat =
+            "12 (x) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242 1 2 3 4097 5 8192 7";
+        assert(
+            chaos_init_process_of(getpid(), &tgid, &start) == 0 && start != image && start != 4242U
+        );
+        g_fake_stat =
+            "12 (x) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242 1 2 3 4096 5 8193 7";
+        assert(
+            chaos_init_process_of(getpid(), &tgid, &start) == 0 && start != image && start != 4242U
+        );
+        g_fake_stat =
+            "12 (x) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242 1 2 3 4096 5 8192 9";
+        assert(chaos_init_process_of(getpid(), &tgid, &start) == 0 && start == image);
+        g_fake_stat = "12 (x) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242 1 2 3 0 5 0 7";
+        assert(chaos_init_process_of(getpid(), &tgid, &start) == 0 && start == 4242U);
+    }
     g_fake_stat = "12 no-paren";
     assert(chaos_init_process_of(getpid(), &tgid, &start) == -1);
     g_fake_status = NULL;
@@ -480,6 +504,7 @@ static chaos_init_rules_t g_test_lib = {
     g_test_rules_total,
     g_test_rules_pending,
     g_test_rules_buffer,
+    g_test_rules_file,
 };
 
 /** @brief The hits file of process @p tgid into @p out; 0 when there is none. */
@@ -586,8 +611,18 @@ static void test_tracee_table(void)
     g_fake_start[10] = 6U;
     g_fake_start[11] = 6U;
     assert(chaos_init_tracee_of(10) >= 0);
-    assert(read_hits(10, hits, sizeof(hits)));
     assert(chaos_init_tracee_slot(&g_test_lib, chaos_init_tracee_of(10), 0U)->count == 0U);
+    /* Its hits go to a file of its own; the ended one's file is kept. */
+    chaos_hit_record(chaos_init_tracee_slot(&g_test_lib, chaos_init_tracee_of(10), 0U));
+    {
+        const long number = g_test_rules_file[chaos_init_tracee_of(10)];
+        char path[64];
+
+        assert(number > 10L * 1000000000L);
+        (void)snprintf(path, sizeof(path), "/tmp/.chaos-inittest.hits.%ld", number);
+        assert(unlink(path) == 0);
+    }
+    assert(read_hits(10, hits, sizeof(hits)) && strncmp(hits, "67\t", 3U) == 0);
 
     /* A full table frees ended processes first... */
     for (index = 0; index < (int)CHAOS_INIT_MAX_TRACEES - 1; ++index)

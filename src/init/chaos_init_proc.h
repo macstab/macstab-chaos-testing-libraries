@@ -44,10 +44,12 @@ long chaos_init_read_string(pid_t pid, uint64_t address, char *out, size_t size)
 long chaos_init_proc_link(pid_t pid, const char *name, char *out, size_t size);
 
 /**
- * @brief The process (thread group) thread @p tid belongs to, and its start time.
+ * @brief The process (thread group) thread @p tid belongs to, and its identity.
  *
  * @details The start time (clock ticks since boot, /proc/<pid>/stat field 22)
- * tells a process from a later one that got the same pid.
+ * tells a process from a later one that got the same pid; the start of its code
+ * and stack (fields 26 and 28) tell the image an execve put in from the one
+ * before, so the rules start over as they do under LD_PRELOAD.
  *
  * @return 0, or -1 when the thread is gone.
  */

@@ -321,21 +321,21 @@ static inline uint64_t chaos_hits_now_ms(void)
 }
 
 /**
- * @brief Number of the calling image's hits file: its pid, or a number beyond any
- *        pid when a file of that pid already exists.
+ * @brief Number of the hits file of the image running as @p pid: the pid, or a
+ *        number beyond any pid when a file of that pid already exists.
  *
  * @details A program started by execve keeps the pid but loads the library anew,
  * and no destructor ran in the image it replaced: that image's file holds the hits
  * counted before the exec, and writing to the same name would wipe them. The pid
  * followed by nine digits of the load time is beyond pid_max (at most 2^22), so a
  * reader summing every `<prefix>.<digits>` counts both. A file a dead process with
- * the same pid left behind is kept the same way. Called at load and in a forked
- * child; errno is left as it was.
+ * the same pid left behind is kept the same way. The libraries call it at load and
+ * in a forked child, chaos-init for each process it supervises; errno is left as
+ * it was.
  */
-static inline long chaos_hits_file_number(const char *prefix)
+static inline long chaos_hits_file_number_for(const char *prefix, long pid)
 {
     const int saved_errno = errno;
-    const long pid = (long)getpid();
     const uint64_t salt = chaos_clock_now_ns();
     long number = pid;
     char path[128];
@@ -352,6 +352,12 @@ static inline long chaos_hits_file_number(const char *prefix)
     }
     errno = saved_errno;
     return number;
+}
+
+/** @brief chaos_hits_file_number_for() the calling process. */
+static inline long chaos_hits_file_number(const char *prefix)
+{
+    return chaos_hits_file_number_for(prefix, (long)getpid());
 }
 
 /**

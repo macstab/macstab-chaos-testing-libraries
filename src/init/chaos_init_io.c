@@ -153,6 +153,7 @@ static chaos_init_rules_t g_chaos_init_io_rules = {
     g_chaos_init_io_total,
     g_chaos_init_io_pending,
     g_chaos_init_io_buffer,
+    g_chaos_init_io_file,
 };
 
 void chaos_init_io_start(void)

@@ -10,7 +10,7 @@
 # - an open rule fails the open with its errno (C and Go), unmatched paths open;
 # - a LATENCY rule delays the open (C and Go);
 # - @first=1 fires once per process, a forked child included, and each process
-#   writes its own hits file;
+#   writes its own hits file; a program an execve starts counts as a new process;
 # - the io status file reports the loaded rules;
 # - a connect rule refuses the connection (C and Go), a recv LATENCY rule delays
 #   the server side's read (Go), and the net status file reports the rules;
@@ -172,6 +172,12 @@ expect "@first=1 once per process, forked child included" \
 files=$(ls /tmp/.chaos-io.hits.* | wc -l)
 once=$(cat /tmp/.chaos-io.hits.* | awk -F "\t" "\$2 ~ /once/ { s += \$1 } END { print s + 0 }")
 expect "one hits file per process, @first hits summed" "$files $once" "2 2"
+rm -f /tmp/.chaos-io.hits.*
+expect "@first=1 again after an execve, as for a new process" \
+    "$($init --libs io -- sh -c "{ true; } 3</tmp/sec/once/x 2>/dev/null; exec /tmp/probe open /tmp/sec/once/x")" "EACCES"
+files=$(ls /tmp/.chaos-io.hits.* | wc -l)
+once=$(cat /tmp/.chaos-io.hits.* | awk -F "\t" "\$2 ~ /once/ { s += \$1 } END { print s + 0 }")
+expect "the image an execve replaced keeps its hits file" "$files $once" "2 2"
 expect "io status reports the rules" "$(head -2 /tmp/.chaos-io.status | tr "\n" " ")" "state=ok rules=3 "
 
 printf "%s\n" "tcp4://127.0.0.1:7777:connect:ECONNREFUSED:1.0 # t" \

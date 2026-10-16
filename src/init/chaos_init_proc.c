@@ -159,6 +159,25 @@ int chaos_init_process_of(pid_t tid, pid_t *tgid, uint64_t *start)
     {
         return -1;
     }
+    /* Fields 26 (start of code) and 28 (start of stack) change with every execve,
+     * which keeps pid and start time: a new image is a new process for the rules,
+     * as it is under LD_PRELOAD. 0 where the kernel hides them. */
+    for (; index < 28; ++index)
+    {
+        field = strchr(field + 1, ' ');
+        if (field == NULL)
+        {
+            break;
+        }
+        if (index == 25 || index == 27)
+        {
+            unsigned long long address = 0ULL;
+
+            (void)sscanf(field, " %llu", &address);
+            ticks ^= address *
+                     (index == 25 ? UINT64_C(0x9e3779b97f4a7c15) : UINT64_C(0xbf58476d1ce4e5b9));
+        }
+    }
     *tgid = (pid_t)group;
     *start = (uint64_t)ticks;
     return 0;

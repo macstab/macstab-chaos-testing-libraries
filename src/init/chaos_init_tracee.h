@@ -52,6 +52,7 @@ typedef struct chaos_init_rules
     uint64_t *total;         /**< Per process: hits counted. */
     unsigned char *pending;  /**< Per process: hits not yet written. */
     char *buffer;            /**< Hits file scratch: max_rules * CHAOS_HITS_LINE_MAX + 1. */
+    long *file;              /**< Per process: its hits file's number; 0 before the first. */
 } chaos_init_rules_t;
 
 /** @brief Declares the storage of a library's chaos_init_rules_t (at file scope). */
@@ -62,7 +63,8 @@ typedef struct chaos_init_rules
     static size_t name##_count[CHAOS_INIT_MAX_TRACEES];                                            \
     static uint64_t name##_total[CHAOS_INIT_MAX_TRACEES];                                          \
     static unsigned char name##_pending[CHAOS_INIT_MAX_TRACEES];                                   \
-    static char name##_buffer[(max) * CHAOS_HITS_LINE_MAX + 1U]
+    static char name##_buffer[(max) * CHAOS_HITS_LINE_MAX + 1U];                                   \
+    static long name##_file[CHAOS_INIT_MAX_TRACEES]
 
 /**
  * @brief Registers a library; at most CHAOS_INIT_MAX_LIBS, with at most

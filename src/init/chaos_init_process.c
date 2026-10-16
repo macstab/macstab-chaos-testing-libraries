@@ -71,6 +71,7 @@ static chaos_init_rules_t g_chaos_init_process_rules = {
     g_chaos_init_process_total,
     g_chaos_init_process_pending,
     g_chaos_init_process_buffer,
+    g_chaos_init_process_file,
 };
 
 void chaos_init_process_start(pid_t application)

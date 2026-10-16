@@ -395,6 +395,7 @@ static chaos_init_rules_t g_chaos_init_net_rules = {
     g_chaos_init_net_total,
     g_chaos_init_net_pending,
     g_chaos_init_net_buffer,
+    g_chaos_init_net_file,
 };
 
 void chaos_init_net_start(void)

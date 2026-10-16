@@ -32,8 +32,10 @@ container PID 1: chaos-init --libs io,net -- <entrypoint> [args...]
   as the unit tests do. `src/init/chaos_init_<lib>.c` only turns a notified system
   call into what the library's wrapper would pass to the core.
 - **Per process, as with the libraries.** `@first`, hits and FAIL_AFTER are kept per
-  supervised process (by pid and start time), counts follow rule texts across
-  reloads, and every process writes its own `/tmp/.chaos-<lib>.hits.<pid>`.
+  supervised process (by pid, start time and image), counts follow rule texts
+  across reloads, and every process writes its own `/tmp/.chaos-<lib>.hits.<pid>`.
+  A program an execve starts is a new process, as under `LD_PRELOAD`: its counts
+  start over, and its hits go to a file of its own beside the replaced image's.
 - **Only the requested libraries' system calls** are passed to the supervisor; every
   other call runs untouched by the filter.
 

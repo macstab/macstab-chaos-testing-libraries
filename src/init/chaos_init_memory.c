@@ -56,6 +56,7 @@ static chaos_init_rules_t g_chaos_init_memory_rules = {
     g_chaos_init_memory_total,
     g_chaos_init_memory_pending,
     g_chaos_init_memory_buffer,
+    g_chaos_init_memory_file,
 };
 
 void chaos_init_memory_start(void)
