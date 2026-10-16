@@ -85,7 +85,8 @@ jobs:
             test/runtime/test_memory_glibc.sh \
             test/runtime/test_memory_alpine.sh \
             test/runtime/test_process_glibc.sh \
-            test/runtime/test_process_alpine.sh
+            test/runtime/test_process_alpine.sh \
+            test/runtime/test_init.sh
           do
             echo "::group::$script"
             sh "$script"

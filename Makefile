@@ -29,6 +29,7 @@ SRC_DNS_DIR := $(SRC_DIR)/dns
 SRC_TIME_DIR := $(SRC_DIR)/time
 SRC_PROCESS_DIR := $(SRC_DIR)/process
 SRC_MEMORY_DIR := $(SRC_DIR)/memory
+SRC_INIT_DIR := $(SRC_DIR)/init
 TEST_UNIT_DIR := $(TEST_DIR)/unit
 TEST_SUPPORT_DIR := $(TEST_DIR)/support
 TEST_RUNTIME_DIR := $(TEST_DIR)/runtime
@@ -118,6 +119,19 @@ LIB_HDRS_memory := \
 	$(SRC_MEMORY_DIR)/chaos_memory_config.h \
 	$(SRC_MEMORY_DIR)/chaos_memory_actions.h
 
+# chaos-init: the static seccomp supervisor of the SECCOMP injection mode. One binary
+# per architecture serves glibc and musl images alike (and images without a libc).
+INIT_SRCS := \
+	$(SRC_INIT_DIR)/chaos_init.c \
+	$(SRC_INIT_DIR)/chaos_init_core.c
+INIT_HDRS := \
+	$(SRC_INIT_DIR)/chaos_init_core.h \
+	$(SRC_COMMON_DIR)/chaos_status.h
+INIT_CC ?= $(CC)
+INIT_CFLAGS := $(CPPFLAGS) -I$(SRC_INIT_DIR) $(CFLAGS) -static
+INIT_LDFLAGS := $(LDFLAGS) -Wl,--strip-all
+NATIVE_INIT := $(BUILD_DIR)/chaos-init
+
 NATIVE_io_LIB := $(BUILD_DIR)/libchaos-io.so
 NATIVE_net_LIB := $(BUILD_DIR)/libchaos-net.so
 NATIVE_dns_LIB := $(BUILD_DIR)/libchaos-dns.so
@@ -185,13 +199,14 @@ PROCESS_CONFIG_TEST := $(BUILD_DIR)/test_process_config
 PROCESS_RUNTIME_TEST := $(BUILD_DIR)/test_process_runtime
 CHAOS_PROCESS_TEST := $(BUILD_DIR)/test_chaos_process
 PROPTEST_TEST := $(BUILD_DIR)/test_config_proptest
+CHAOS_INIT_TEST := $(BUILD_DIR)/test_chaos_init
 UNIT_TESTS := $(CONFIG_TEST) $(ACTIONS_TEST) $(FDCACHE_TEST) $(CHAOS_IO_TEST) \
 	$(NET_ACTIONS_TEST) $(NET_ENDPOINT_TEST) $(NET_CONFIG_TEST) $(NET_RUNTIME_TEST) $(CHAOS_NET_TEST) \
 	$(DNS_ACTIONS_TEST) $(DNS_CONFIG_TEST) $(DNS_RUNTIME_TEST) $(CHAOS_DNS_TEST) \
 	$(TIME_ACTIONS_TEST) $(TIME_CONFIG_TEST) $(TIME_RUNTIME_TEST) $(CHAOS_TIME_TEST) \
 	$(MEMORY_ACTIONS_TEST) $(MEMORY_CONFIG_TEST) $(MEMORY_RUNTIME_TEST) $(CHAOS_MEMORY_TEST) \
 	$(PROCESS_ACTIONS_TEST) $(PROCESS_CONFIG_TEST) $(PROCESS_RUNTIME_TEST) $(CHAOS_PROCESS_TEST) \
-	$(PROPTEST_TEST)
+	$(PROPTEST_TEST) $(CHAOS_INIT_TEST)
 HOST_RUNTIME_TESTS := \
 	$(TEST_RUNTIME_DIR)/test_integration.sh \
 	$(TEST_RUNTIME_DIR)/test_glibc.sh \
@@ -215,6 +230,7 @@ HOST_RUNTIME_TESTS := \
 	$(TEST_RUNTIME_DIR)/test_status.sh \
 	$(TEST_RUNTIME_DIR)/test_hits.sh \
 	$(TEST_RUNTIME_DIR)/test_fork.sh \
+	$(TEST_RUNTIME_DIR)/test_init.sh \
 	$(TEST_RUNTIME_DIR)/test_stdio.sh
 MATRIX_RUNTIME_TESTS := \
 	$(TEST_RUNTIME_DIR)/test_glibc.sh \
@@ -233,6 +249,7 @@ MATRIX_RUNTIME_TESTS := \
 .PHONY: all check clean coverage native test unit docker-build-all fmt fmt-check qa test-matrix \
 	fuzz fuzz-clean verify-docs \
 	cross-glibc-amd64 cross-glibc-arm64 cross-musl-amd64 cross-musl-arm64 \
+	native-init cross-init-amd64 cross-init-arm64 \
 	$(foreach lib,$(LIB_NAMES),native-$(lib)) \
 	$(foreach lib,$(LIB_NAMES),cross-glibc-amd64-$(lib)) \
 	$(foreach lib,$(LIB_NAMES),cross-glibc-arm64-$(lib)) \
@@ -273,6 +290,7 @@ unit: $(UNIT_TESTS)
 	./$(PROCESS_RUNTIME_TEST)
 	./$(CHAOS_PROCESS_TEST)
 	./$(PROPTEST_TEST)
+	./$(CHAOS_INIT_TEST)
 
 coverage:
 	BUILD_DIR=$(BUILD_DIR)-coverage CC="$(CC)" CPPFLAGS='$(CPPFLAGS)' CFLAGS='$(CFLAGS)' ./$(TEST_RUNTIME_DIR)/check_coverage.sh
@@ -380,6 +398,20 @@ cross-glibc-arm64: $(GLIBC_ARM64_DISTS)
 
 cross-musl-amd64: $(MUSL_AMD64_DISTS)
 
+native-init: $(NATIVE_INIT)
+
+# Built natively inside an image of the target architecture (docker/Dockerfile.build):
+# the system call numbers in the filter come from that architecture's headers.
+cross-init-amd64: $(DIST_DIR)/chaos-init-amd64
+
+cross-init-arm64: $(DIST_DIR)/chaos-init-arm64
+
+$(NATIVE_INIT): $(INIT_SRCS) $(INIT_HDRS) | $(BUILD_DIR)
+	$(INIT_CC) $(INIT_CFLAGS) -o $@ $(INIT_SRCS) $(INIT_LDFLAGS)
+
+$(DIST_DIR)/chaos-init-%: $(INIT_SRCS) $(INIT_HDRS) | $(DIST_DIR)
+	$(INIT_CC) $(INIT_CFLAGS) -o $@ $(INIT_SRCS) $(INIT_LDFLAGS)
+
 cross-musl-arm64: $(MUSL_ARM64_DISTS)
 
 docker-build-all: | $(BUILD_DIR) $(DIST_DIR)
@@ -398,7 +430,7 @@ $(BUILD_DIR):
 $(DIST_DIR):
 	mkdir -p $(DIST_DIR)
 
-$(BUILD_DIR)/test_%: $(TEST_UNIT_DIR)/test_%.c $(LIB_SRCS_io) $(LIB_HDRS_io) $(LIB_SRCS_net) $(LIB_HDRS_net) $(LIB_SRCS_dns) $(LIB_HDRS_dns) $(LIB_SRCS_time) $(LIB_HDRS_time) $(LIB_SRCS_process) $(LIB_HDRS_process) $(LIB_SRCS_memory) $(LIB_HDRS_memory) $(TEST_SUPPORT_HDRS) | $(BUILD_DIR)
+$(BUILD_DIR)/test_%: $(TEST_UNIT_DIR)/test_%.c $(LIB_SRCS_io) $(LIB_HDRS_io) $(LIB_SRCS_net) $(LIB_HDRS_net) $(LIB_SRCS_dns) $(LIB_HDRS_dns) $(LIB_SRCS_time) $(LIB_HDRS_time) $(LIB_SRCS_process) $(LIB_HDRS_process) $(LIB_SRCS_memory) $(LIB_HDRS_memory) $(INIT_SRCS) $(INIT_HDRS) $(TEST_SUPPORT_HDRS) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $<
 

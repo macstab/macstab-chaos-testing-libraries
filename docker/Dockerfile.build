@@ -13,7 +13,7 @@ RUN if ! command -v gcc >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1; th
         if command -v apt-get >/dev/null 2>&1; then \
             apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev make && rm -rf /var/lib/apt/lists/*; \
         else \
-            apk add --no-cache build-base musl-dev make; \
+            apk add --no-cache build-base musl-dev make linux-headers; \
         fi; \
     fi && \
     case "$MAKE_TARGET" in \
@@ -21,9 +21,11 @@ RUN if ! command -v gcc >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1; th
         cross-glibc-arm64) make cross-glibc-arm64 GLIBC_ARM64_CC=gcc ;; \
         cross-musl-amd64) make cross-musl-amd64 MUSL_AMD64_CC=gcc ;; \
         cross-musl-arm64) make cross-musl-arm64 MUSL_ARM64_CC=gcc ;; \
+        cross-init-amd64) make cross-init-amd64 INIT_CC=gcc ;; \
+        cross-init-arm64) make cross-init-arm64 INIT_CC=gcc ;; \
     esac && \
     mkdir -p /out && \
-    cp dist/*.so /out/
+    cp dist/* /out/
 
 FROM scratch AS export
 COPY --from=build /out/ /
