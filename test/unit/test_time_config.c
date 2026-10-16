@@ -1450,6 +1450,64 @@ static void test_regress_rule(void)
     assert(chaos_time_config_parse_line(sleep_rule, &rule) == -1);
 }
 
+/**
+ * @brief Invariant: a rewrite in place within one mtime tick is still seen, and a
+ *        provisional load that reads the file again unchanged keeps its snapshot.
+ *
+ * Triggering condition: a rule file loaded right after it was written, then
+ * rewritten in place with the same size and its mtime set back to the first one,
+ * so that mtime, size, inode and device all stay as they were.
+ *
+ * Expected observable behaviour: the load is provisional; reading the unchanged
+ * file again keeps the snapshot; the rewrite is loaded; an mtime older than
+ * the window ends the provisional state.
+ */
+static void test_racy_rewrite_is_seen(void)
+{
+    static const char rule[] = "nanosleep:ERRNO:EINTR\n";
+    char rewritten[sizeof(rule)];
+    char status[512];
+    struct timespec times[2];
+    struct stat first;
+    FILE *file;
+    const uint64_t interval = g_chaos_time_check_interval_ns;
+
+    g_chaos_time_check_interval_ns = 0U;
+    (void)unlink(CHAOS_TIME_CONFIG_PATH);
+    chaos_time_config_init();
+    file = fopen(CHAOS_TIME_CONFIG_PATH, "w");
+    assert(file != NULL && fputs(rule, file) >= 0 && fclose(file) == 0);
+    assert(stat(CHAOS_TIME_CONFIG_PATH, &first) == 0);
+    assert(chaos_time_config_prepare());
+    assert(g_chaos_time_config_provisional == 1);
+    assert(read_status_file(status, sizeof(status)) && strstr(status, "rules=1\n") != NULL);
+
+    /* Read again, nothing changed: the same snapshot stays. */
+    assert(chaos_time_config_prepare());
+    assert(g_chaos_time_config_content == chaos_config_content_hash(rule, sizeof(rule) - 1U));
+
+    /* The same bytes but the first commented out, written in place, same mtime. */
+    (void)memcpy(rewritten, rule, sizeof(rule));
+    rewritten[0] = '#';
+    file = fopen(CHAOS_TIME_CONFIG_PATH, "r+");
+    assert(file != NULL && fputs(rewritten, file) >= 0 && fflush(file) == 0);
+    times[0] = first.st_atim;
+    times[1] = first.st_mtim;
+    assert(futimens(fileno(file), times) == 0 && fclose(file) == 0);
+    assert(chaos_time_config_prepare() == 0);
+    assert(read_status_file(status, sizeof(status)) && strstr(status, "rules=0\n") != NULL);
+
+    /* An mtime outside the window: the load is final and not read again. */
+    times[1].tv_sec = 60;
+    times[1].tv_nsec = 0L;
+    assert(utimensat(AT_FDCWD, CHAOS_TIME_CONFIG_PATH, times, 0) == 0);
+    assert(chaos_time_config_prepare() == 0);
+    assert(g_chaos_time_config_provisional == 0);
+
+    (void)unlink(CHAOS_TIME_CONFIG_PATH);
+    g_chaos_time_check_interval_ns = interval;
+}
+
 int main(void)
 {
     /* Look at the rule file on every call; the throttle has its own test. */
@@ -1473,5 +1531,6 @@ int main(void)
     test_fork_takes_over_orphaned_reload();
     test_prepare_preserves_errno();
     test_interrupted_read_is_retried();
+    test_racy_rewrite_is_seen();
     return 0;
 }

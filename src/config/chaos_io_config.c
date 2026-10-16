@@ -122,6 +122,15 @@ static volatile unsigned int g_chaos_io_active_config_index = 0U;
 static volatile uint64_t g_chaos_io_cached_mtime = CHAOS_IO_MTIME_UNKNOWN;
 
 /**
+ * @brief The loaded file's mtime was too recent to trust its stamp
+ *        (chaos_clock_stamp_is_recent): the next look reads it again.
+ */
+static volatile int g_chaos_io_config_provisional = 0;
+
+/** @brief chaos_config_content_hash() of the loaded file; 0 when none was read. */
+static uint64_t g_chaos_io_config_content = 0U;
+
+/**
  * @brief Buffer the reload thread reads the config file into.
  *
  * @details Sized CHAOS_IO_MAX_CONFIG_BYTES + 1 for the NUL terminator appended by
@@ -686,6 +695,8 @@ static int chaos_io_config_read_file(size_t *size_out, uint64_t expected_stamp)
         chaos_io_leave_internal(previous);
         return -1;
     }
+    g_chaos_io_config_provisional =
+        chaos_clock_stamp_is_recent((int64_t)CHAOS_IO_STAT_SEC(&st), (long)CHAOS_IO_STAT_NSEC(&st));
 
     (void)g_chaos_io_real_close(fd);
     chaos_io_leave_internal(previous);
@@ -943,11 +954,13 @@ static void chaos_io_config_reload(uint64_t observed_mtime, uint64_t previous_mt
     chaos_io_config_state_t *next_state = &g_chaos_io_config_states[next_index];
     size_t file_size = 0U;
     int read_rc;
+    uint64_t content = 0U;
 
     chaos_io_config_reset_state(next_state, 1);
 
     if (observed_mtime == CHAOS_IO_MTIME_MISSING)
     {
+        g_chaos_io_config_content = 0U;
         chaos_io_config_report(CHAOS_IO_MTIME_MISSING, next_state);
         chaos_io_config_publish(next_index, CHAOS_IO_MTIME_MISSING);
         return;
@@ -970,6 +983,18 @@ static void chaos_io_config_reload(uint64_t observed_mtime, uint64_t previous_mt
         g_chaos_io_cached_mtime = previous_mtime;
         return;
     }
+    if (read_rc == 0)
+    {
+        content = chaos_config_content_hash(g_chaos_io_config_buffer, file_size);
+        if (observed_mtime == previous_mtime && content == g_chaos_io_config_content)
+        {
+            /* A provisional load read again and found nothing new: the snapshot
+             * stays, with its counts and claims. */
+            __sync_synchronize();
+            g_chaos_io_cached_mtime = previous_mtime;
+            return;
+        }
+    }
 
     if (read_rc == 0 && memchr(g_chaos_io_config_buffer, '\0', file_size) != NULL)
     {
@@ -985,6 +1010,7 @@ static void chaos_io_config_reload(uint64_t observed_mtime, uint64_t previous_mt
         chaos_io_config_reset_state(next_state, 0);
     }
 
+    g_chaos_io_config_content = content;
     chaos_io_config_attach_hits(next_state);
     chaos_io_config_report(observed_mtime, next_state);
     chaos_io_config_publish(next_index, observed_mtime);
@@ -1057,7 +1083,7 @@ static int chaos_io_config_refresh(void)
     observed_mtime = chaos_io_config_observed_mtime();
     cached_mtime = chaos_io_atomic_load_u64(&g_chaos_io_cached_mtime);
 
-    if (cached_mtime == observed_mtime)
+    if (cached_mtime == observed_mtime && !g_chaos_io_config_provisional)
     {
         return chaos_io_config_active_state()->rule_count != 0U;
     }
@@ -1071,6 +1097,7 @@ static int chaos_io_config_refresh(void)
     }
     if (chaos_io_atomic_cas_u64(&g_chaos_io_cached_mtime, cached_mtime, CHAOS_IO_MTIME_RELOADING))
     {
+        g_chaos_io_config_provisional = 0;
         chaos_io_config_reload(observed_mtime, cached_mtime);
     }
     return chaos_io_config_active_state()->rule_count != 0U;

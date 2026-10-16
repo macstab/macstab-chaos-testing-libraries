@@ -34,6 +34,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -200,6 +201,23 @@ static inline size_t chaos_status_format(
 #define CHAOS_CONFIG_FILE_CLOSE(fd) (void)close(fd)
 #endif
 #endif
+
+/**
+ * @brief FNV-1a hash of a rule file's bytes: lets a provisional load that reads the
+ *        file again (chaos_clock_stamp_is_recent) see that nothing changed.
+ */
+static inline uint64_t chaos_config_content_hash(const char *data, size_t size)
+{
+    uint64_t hash = UINT64_C(1469598103934665603);
+    size_t index;
+
+    for (index = 0U; index < size; ++index)
+    {
+        hash ^= (unsigned char)data[index];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
 
 /**
  * @brief Replaces the file at @p path with @p length bytes of @p data.

@@ -207,6 +207,28 @@ static inline int64_t chaos_clock_realtime_ms(void)
     return (int64_t)now.tv_sec * 1000 + (int64_t)(now.tv_nsec / 1000000L);
 }
 
+/** @brief How long after its mtime a rule file may still change unseen, in ms. */
+#define CHAOS_RACY_WINDOW_MS 20
+
+/**
+ * @brief Whether a file stamped @p sec / @p nsec (mtime) is so recent that it may
+ *        still change without its stamp changing.
+ *
+ * @details File systems take mtime from a coarse clock (a few milliseconds). A
+ * rewrite in place with the same size within that tick leaves mtime, size, inode
+ * and device as they were, so the change stamp misses it. A load of a file this
+ * recent is therefore provisional: the file is read again on the next look until
+ * its mtime is older than the window, as git treats "racily clean" entries. A
+ * stamp further ahead (a writer with a skewed clock) is not waited for.
+ */
+static inline int chaos_clock_stamp_is_recent(int64_t sec, long nsec)
+{
+    const int64_t now = chaos_clock_realtime_ms();
+    const int64_t stamp = sec * 1000 + (int64_t)(nsec / 1000000L);
+
+    return now != 0 && now - stamp < CHAOS_RACY_WINDOW_MS && stamp - now < CHAOS_RACY_WINDOW_MS;
+}
+
 /** @brief Longest a library goes without looking at its rule file. */
 #define CHAOS_CHECK_INTERVAL_NS UINT64_C(1000000)
 

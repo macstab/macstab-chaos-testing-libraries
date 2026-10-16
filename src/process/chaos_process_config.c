@@ -144,6 +144,15 @@ static volatile unsigned int g_chaos_process_active_config_index = 0U;
 static volatile uint64_t g_chaos_process_cached_mtime = CHAOS_PROCESS_MTIME_UNKNOWN;
 
 /**
+ * @brief The loaded file's mtime was too recent to trust its stamp
+ *        (chaos_clock_stamp_is_recent): the next look reads it again.
+ */
+static volatile int g_chaos_process_config_provisional = 0;
+
+/** @brief chaos_config_content_hash() of the loaded file; 0 when none was read. */
+static uint64_t g_chaos_process_config_content = 0U;
+
+/**
  * @brief Buffer the reload thread reads the config file into.
  *
  * @details Sized CHAOS_PROCESS_MAX_CONFIG_BYTES + 1 for the NUL terminator appended by
@@ -909,6 +918,9 @@ static int chaos_process_config_read_file(size_t *size_out, uint64_t expected_st
         chaos_process_leave_internal(previous);
         return -1;
     }
+    g_chaos_process_config_provisional = chaos_clock_stamp_is_recent(
+        (int64_t)CHAOS_PROCESS_STAT_SEC(&st), (long)CHAOS_PROCESS_STAT_NSEC(&st)
+    );
 
     CHAOS_CONFIG_FILE_CLOSE(fd);
     chaos_process_leave_internal(previous);
@@ -1478,6 +1490,7 @@ static int chaos_process_config_refresh(void)
     unsigned int active_index;
     unsigned int next_index;
     size_t config_size = 0U;
+    uint64_t content = 0U;
     chaos_process_config_state_t *next_state;
 
     if (chaos_process_config_checked_recently())
@@ -1487,7 +1500,7 @@ static int chaos_process_config_refresh(void)
     observed_mtime = chaos_process_config_observed_mtime();
     cached_mtime = chaos_process_atomic_load_u64(&g_chaos_process_cached_mtime);
 
-    if (observed_mtime == cached_mtime)
+    if (observed_mtime == cached_mtime && !g_chaos_process_config_provisional)
     {
         return chaos_process_config_active_state()->rule_count != 0U;
     }
@@ -1507,6 +1520,7 @@ static int chaos_process_config_refresh(void)
     {
         return chaos_process_config_active_state()->rule_count != 0U;
     }
+    g_chaos_process_config_provisional = 0;
 
     active_index = g_chaos_process_active_config_index;
     next_index = active_index == 0U ? 1U : 0U;
@@ -1534,6 +1548,18 @@ static int chaos_process_config_refresh(void)
             g_chaos_process_cached_mtime = cached_mtime;
             return chaos_process_config_active_state()->rule_count != 0U;
         }
+        if (read_rc == 0)
+        {
+            content = chaos_config_content_hash(g_chaos_process_config_buffer, config_size);
+            if (observed_mtime == cached_mtime && content == g_chaos_process_config_content)
+            {
+                /* A provisional load read again and found nothing new: the snapshot
+                 * stays, with its counts, claims and FAIL_AFTER counters. */
+                __sync_synchronize();
+                g_chaos_process_cached_mtime = cached_mtime;
+                return chaos_process_config_active_state()->rule_count != 0U;
+            }
+        }
         if (config_size > 0U && memchr(g_chaos_process_config_buffer, '\0', config_size) != NULL)
         {
             /* The parser would stop at the NUL and drop every rule after it unreported. */
@@ -1550,6 +1576,7 @@ static int chaos_process_config_refresh(void)
         }
     }
 
+    g_chaos_process_config_content = content;
     chaos_process_config_attach_hits(next_state);
     chaos_process_config_report(observed_mtime, next_state);
     chaos_process_config_publish(next_index, observed_mtime);

@@ -91,6 +91,10 @@ Config refresh guarantees, identical in every library:
 
 - **Writes within one mtime tick are seen.** File systems stamp mtime from a coarse clock, so the
   change stamp also covers size (an append) and inode (a rewrite through rename, e.g. `sed -i`).
+  A rewrite in place with the same size changes none of them; so a file loaded within 20 ms of
+  its mtime is provisional and read again on each look until its mtime is older (as git treats
+  "racily clean" files). A re-read that finds the same bytes keeps the snapshot, with its hit
+  counts, `@first` claims and FAIL_AFTER counters.
 - **A failed read keeps the rules.** If the file cannot be opened or read, the active snapshot stays
   and the claim is released with the previous stamp, so the next call retries; `EINTR` is retried
   inside the read loop. Only a missing file or a file that fails to parse changes the rules.
