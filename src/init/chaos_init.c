@@ -129,7 +129,7 @@ static void chaos_init_signal_set(sigset_t *set)
  * @return 0 when the child may execute the command, -1 when it must not (a filter
  *         is installed that nobody would answer).
  */
-static int chaos_init_install_and_hand_over(unsigned libs)
+static int chaos_init_install_and_hand_over(unsigned libs, int handover)
 {
     struct sock_filter filter[CHAOS_INIT_MAX_FILTER];
     struct sock_fprog program;
@@ -144,7 +144,8 @@ static int chaos_init_install_and_hand_over(unsigned libs)
     int error = 0;
     int listener = -1;
 
-    program.len = (unsigned short)chaos_init_build_filter(libs, filter, CHAOS_INIT_MAX_FILTER);
+    program.len =
+        (unsigned short)chaos_init_build_filter(libs, handover, filter, CHAOS_INIT_MAX_FILTER);
     program.filter = filter;
     if (uname(&name) != 0 || !chaos_init_kernel_supported(CHAOS_INIT_RELEASE(&name)))
     {
@@ -183,8 +184,7 @@ static int chaos_init_install_and_hand_over(unsigned libs)
         control.header.cmsg_len = CMSG_LEN(sizeof(int));
         memcpy(CMSG_DATA(&control.header), &listener, sizeof(int));
     }
-    if (sendmsg(CHAOS_INIT_HANDOVER_FD, &message, CHAOS_INIT_HANDOVER_FLAGS) !=
-        (ssize_t)sizeof(error))
+    if (sendmsg(handover, &message, CHAOS_INIT_HANDOVER_FLAGS) != (ssize_t)sizeof(error))
     {
         return listener >= 0 ? -1 : 0;
     }
@@ -515,9 +515,10 @@ int main(int argc, char **argv)
         (void)sigaddset(&go, CHAOS_INIT_GO_SIGNAL);
         /* The go signal is blocked (it is among the forwarded ones) until it is
          * waited for, so it cannot be lost if it comes early. */
-        if (dup3(pair[1], CHAOS_INIT_HANDOVER_FD, O_CLOEXEC) < 0 ||
-            chaos_init_install_and_hand_over(options.libs) != 0 || sigwait(&go, &received) != 0 ||
-            sigprocmask(SIG_SETMASK, &original, NULL) != 0)
+        /* Sent on pair[1] as it is: a fixed number would fail under a low file limit
+         * and could clobber a descriptor the application inherits. */
+        if (chaos_init_install_and_hand_over(options.libs, pair[1]) != 0 ||
+            sigwait(&go, &received) != 0 || sigprocmask(SIG_SETMASK, &original, NULL) != 0)
         {
             _exit(CHAOS_INIT_EXIT_HANDOVER);
         }

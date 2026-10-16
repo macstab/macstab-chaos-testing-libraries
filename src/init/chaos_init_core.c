@@ -191,7 +191,8 @@ static const long g_chaos_init_process_calls[] = {
         }                                                                                          \
     } while (0)
 
-size_t chaos_init_build_filter(unsigned libs, struct sock_filter *out, size_t capacity)
+size_t
+chaos_init_build_filter(unsigned libs, int handover_fd, struct sock_filter *out, size_t capacity)
 {
     long calls[CHAOS_INIT_MAX_FILTER];
     size_t count = 0U;
@@ -244,13 +245,13 @@ size_t chaos_init_build_filter(unsigned libs, struct sock_filter *out, size_t ca
 #endif
     if (handover)
     {
-        /* sendmsg(CHAOS_INIT_HANDOVER_FD, ..., CHAOS_INIT_HANDOVER_FLAGS) passes, any
+        /* sendmsg(handover_fd, ..., CHAOS_INIT_HANDOVER_FLAGS) passes, any
          * other sendmsg is notified. The accumulator still holds nr when it skips. */
         out[length++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_sendmsg, 0, 6);
         out[length++] = (struct sock_filter
         )BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]));
         out[length++] =
-            (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, CHAOS_INIT_HANDOVER_FD, 0, 3);
+            (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (unsigned)handover_fd, 0, 3);
         out[length++] = (struct sock_filter
         )BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[2]));
         out[length++] = (struct sock_filter

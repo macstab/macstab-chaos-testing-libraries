@@ -30,15 +30,15 @@
 /**@}*/
 
 /**
- * @brief Descriptor the child hands the listener over on.
+ * @brief Flags of the sendmsg() the child hands the listener over with.
  *
  * @details The filter is already installed when the child sends the listener, so
  * the one sendmsg() doing it must not be passed to the supervisor that is waiting
- * for it. The filter lets through a sendmsg() on exactly this descriptor with
- * exactly CHAOS_INIT_HANDOVER_FLAGS, a combination no program uses
- * (MSG_CMSG_CLOEXEC only means something to recvmsg()).
+ * for it. The filter lets through a sendmsg() on exactly the handover descriptor
+ * with exactly these flags, a combination no program uses (MSG_CMSG_CLOEXEC only
+ * means something to recvmsg()). The descriptor is the child's end of the
+ * socketpair, whatever its number; it is closed when the command is executed.
  */
-#define CHAOS_INIT_HANDOVER_FD 1000
 #define CHAOS_INIT_HANDOVER_FLAGS (MSG_NOSIGNAL | MSG_CMSG_CLOEXEC)
 
 /** @brief Where chaos-init reports whether the mode is active. */
@@ -65,11 +65,12 @@ int chaos_init_parse_args(int argc, char **argv, chaos_init_options_t *options);
  *
  * @details Calls of another architecture pass. The system calls of the libraries
  * are passed to the supervisor (SECCOMP_RET_USER_NOTIF), everything else is allowed,
- * except the one handover sendmsg() (see CHAOS_INIT_HANDOVER_FD).
+ * except the one handover sendmsg() on @p handover_fd (see CHAOS_INIT_HANDOVER_FLAGS).
  *
  * @return Number of instructions, or 0 if @p capacity is too small.
  */
-size_t chaos_init_build_filter(unsigned libs, struct sock_filter *out, size_t capacity);
+size_t
+chaos_init_build_filter(unsigned libs, int handover_fd, struct sock_filter *out, size_t capacity);
 
 /** @brief Exit code for a waitpid() status: the child's, or 128 + its signal. */
 int chaos_init_exit_code(int status);

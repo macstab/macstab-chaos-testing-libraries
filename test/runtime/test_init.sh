@@ -12,6 +12,7 @@
 # - the status file says active (or unsupported, with the reason);
 # - exit codes and death by signal pass through; SIGTERM reaches the application;
 # - orphans are reaped; a missing command exits 127;
+# - a file limit of 256 neither stops the application nor the mode;
 # - a kernel older than 5.5 (test build) starts the application without a filter.
 #
 # Under emulation (amd64 on an arm64 host) seccomp is unavailable: then only the
@@ -122,6 +123,13 @@ while ! grep -q ready /tmp/term.out 2>/dev/null && [ $tries -lt 50 ]; do sleep 0
 kill -TERM $pid; wait $pid; expect "SIGTERM reaches the application" "$?" "42"
 set -e
 expect "orphans are reaped" "$($init --libs $all -- /tmp/probe orphans)" "zombies=0"
+
+# The listener goes over whatever descriptor the child has, so a low file limit
+# neither stops the container nor the mode.
+expect "file limit 256: the application starts" "$( (ulimit -n 256; $init --libs $all -- /tmp/probe work) 2>&1)" "work ok (0)"
+if [ "$emulated" -eq 0 ]; then
+    expect "file limit 256: the mode is active" "$( (ulimit -n 256; $init --libs io -- /tmp/probe status) | head -1)" "state=active"
+fi
 
 old=$(/tmp/chaos-init-old --libs io -- /tmp/probe status | head -2 | tr "\n" " ")
 expect "old kernel: unsupported, with the reason" "$old" "state=unsupported reason=kernel older than 5.5 "

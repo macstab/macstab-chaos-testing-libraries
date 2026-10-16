@@ -117,12 +117,16 @@ run_filter(const struct sock_filter *filter, size_t length, const struct seccomp
     return 0U;
 }
 
+/* Descriptor the filters of decide() let the handover sendmsg through on. */
+static int g_test_handover = 1000;
+
 /** @brief The decision for system call @p nr with arguments @p fd and @p flags. */
 static uint32_t decide(unsigned libs, long nr, uint64_t fd, uint64_t flags, uint32_t arch)
 {
     struct sock_filter filter[CHAOS_INIT_MAX_FILTER];
     struct seccomp_data data;
-    const size_t length = chaos_init_build_filter(libs, filter, CHAOS_INIT_MAX_FILTER);
+    const size_t length =
+        chaos_init_build_filter(libs, g_test_handover, filter, CHAOS_INIT_MAX_FILTER);
 
     assert(length > 0U);
     memset(&data, 0, sizeof(data));
@@ -188,19 +192,17 @@ static void test_filter_decisions(void)
 
     /* Of all sendmsg calls only the handover passes. */
     assert(
-        decide(
-            CHAOS_INIT_LIB_NET,
-            __NR_sendmsg,
-            CHAOS_INIT_HANDOVER_FD,
-            CHAOS_INIT_HANDOVER_FLAGS,
-            ARCH
-        ) == ALLOW
+        decide(CHAOS_INIT_LIB_NET, __NR_sendmsg, 1000U, CHAOS_INIT_HANDOVER_FLAGS, ARCH) == ALLOW
     );
-    assert(
-        decide(CHAOS_INIT_LIB_NET, __NR_sendmsg, CHAOS_INIT_HANDOVER_FD, MSG_NOSIGNAL, ARCH) ==
-        NOTIFY
-    );
+    assert(decide(CHAOS_INIT_LIB_NET, __NR_sendmsg, 1000U, MSG_NOSIGNAL, ARCH) == NOTIFY);
     assert(decide(CHAOS_INIT_LIB_NET, __NR_sendmsg, 7U, CHAOS_INIT_HANDOVER_FLAGS, ARCH) == NOTIFY);
+    /* The handover descriptor is whichever the child has, a low one included. */
+    g_test_handover = 4;
+    assert(decide(CHAOS_INIT_LIB_NET, __NR_sendmsg, 4U, CHAOS_INIT_HANDOVER_FLAGS, ARCH) == ALLOW);
+    assert(
+        decide(CHAOS_INIT_LIB_NET, __NR_sendmsg, 1000U, CHAOS_INIT_HANDOVER_FLAGS, ARCH) == NOTIFY
+    );
+    g_test_handover = 1000;
 
     /* Another architecture passes, and so does the x32 ABI. */
     assert(decide(CHAOS_INIT_LIB_NET, __NR_connect, 0U, 0U, 0x12345678U) == ALLOW);
@@ -209,7 +211,7 @@ static void test_filter_decisions(void)
 #endif
 
     /* Too little room is refused, not overrun. */
-    assert(chaos_init_build_filter(0x3fU, small, sizeof(small) / sizeof(small[0])) == 0U);
+    assert(chaos_init_build_filter(0x3fU, 4, small, sizeof(small) / sizeof(small[0])) == 0U);
 }
 
 static void test_exit_code(void)
