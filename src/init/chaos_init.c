@@ -101,6 +101,14 @@ static const int g_chaos_init_forwarded[] = {
  *        queue then recognises a restarted call instead (chaos_init_delay_resume).
  *        Runtime tests build a variant without it to reach that path.
  */
+/* The handover of the listener (or of why there is none); a runtime test build
+ * makes it fail. */
+#ifdef CHAOS_INIT_TEST_HANDOVER_FAILS
+#define CHAOS_INIT_SENDMSG(fd, message, flags) ((void)(message), errno = ENOBUFS, (ssize_t) - 1)
+#else
+#define CHAOS_INIT_SENDMSG(fd, message, flags) sendmsg((fd), (message), (flags))
+#endif
+
 #ifdef CHAOS_INIT_TEST_NO_KILLABLE_WAIT
 #define CHAOS_INIT_FILTER_FLAGS SECCOMP_FILTER_FLAG_NEW_LISTENER
 #else
@@ -191,9 +199,11 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover)
         control.header.cmsg_len = CMSG_LEN(sizeof(int));
         memcpy(CMSG_DATA(&control.header), &listener, sizeof(int));
     }
-    if (sendmsg(handover, &message, CHAOS_INIT_HANDOVER_FLAGS) != (ssize_t)sizeof(error))
+    /* Not sent: the parent would wait for it while this child waits for the go
+     * signal. The child gives up, which the parent sees as the end of the socket. */
+    if (CHAOS_INIT_SENDMSG(handover, &message, CHAOS_INIT_HANDOVER_FLAGS) != (ssize_t)sizeof(error))
     {
-        return listener >= 0 ? -1 : 0;
+        return -1;
     }
     return 0;
 }

@@ -14,6 +14,7 @@
 # - orphans are reaped; a missing command exits 127;
 # - a file limit of 256 neither stops the application nor the mode;
 # - a kernel older than 5.5 (test build) starts the application without a filter;
+# - a handover the child cannot send (test build) ends the start instead of hanging;
 # - a profile that refuses seccomp starts it without a filter and without
 #   no_new_privs.
 #
@@ -98,6 +99,9 @@ gcc -D_GNU_SOURCE -std=c99 -Wall -Wextra -Werror -pedantic -O2 -static -o /tmp/p
 gcc -D_GNU_SOURCE -I/work/src -I/work/src/common -I/work/src/core -I/work/src/config -I/work/src/effects \
     -I/work/src/init -std=c99 -Wall -Wextra -Werror -pedantic -O2 -static \
     -DCHAOS_INIT_TEST_RELEASE="\"4.19.0\"" -o /tmp/chaos-init-old /work/src/init/chaos_init*.c
+gcc -D_GNU_SOURCE -I/work/src -I/work/src/common -I/work/src/core -I/work/src/config -I/work/src/effects \
+    -I/work/src/init -std=c99 -Wall -Wextra -Werror -pedantic -O2 -static \
+    -DCHAOS_INIT_TEST_RELEASE="\"4.19.0\"" -DCHAOS_INIT_TEST_HANDOVER_FAILS -o /tmp/chaos-init-lost /work/src/init/chaos_init*.c
 init=/out/chaos-init-'"$ARCH"'
 all=io,net,dns,time,memory,process
 
@@ -136,6 +140,9 @@ fi
 old=$(/tmp/chaos-init-old --libs io -- /tmp/probe status | head -2 | tr "\n" " ")
 expect "old kernel: unsupported, with the reason" "$old" "state=unsupported reason=kernel older than 5.5 "
 expect "old kernel: the application still runs" "$(/tmp/chaos-init-old --libs $all -- /tmp/probe work)" "work ok (0)"
+code=0
+timeout -s KILL 10 /tmp/chaos-init-lost --libs io -- /tmp/probe work >/dev/null 2>&1 || code=$?
+expect "a handover that cannot be sent ends the start, no hang" "$code" "125"
 [ "$failures" -eq 0 ]
 '
 
