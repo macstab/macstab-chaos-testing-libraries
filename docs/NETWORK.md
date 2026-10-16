@@ -671,7 +671,10 @@ Reason:
   then the error is reported: Linux releases the descriptor even when close
   fails, and programs never retry it)
 - `LATENCY`
-  valid for all implemented operations
+  valid for all implemented operations. The delay sleeps in the calling thread,
+  also for a non-blocking socket (`O_NONBLOCK`, `MSG_DONTWAIT`): in an event loop
+  that stalls every connection the loop serves, not only the matched one, which
+  is what a slow system call does to such a loop
 - `CORRUPT`
   valid only for `recv`
 - `TIMEOUT`
