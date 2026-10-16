@@ -83,6 +83,7 @@ static void test_probability_helpers(void)
  * - 2500 ms → one sleep of {2 s, 500 ms}.
  * - 5 ms with one EINTR → two sleeps, the second for the remaining time.
  * - probability=0.0 → no sleep.
+ * - NULL rule, or an ERRNO rule → no sleep.
  */
 static void test_latency_helper(void)
 {
@@ -109,6 +110,13 @@ static void test_latency_helper(void)
     rule.probability = 0.0;
     chaos_process_rule_apply_latency(&rule);
     assert(g_test_sleep_calls == 0U);
+
+    /* No rule, or a rule of another effect, never sleeps. */
+    rule.probability = 1.0;
+    chaos_process_rule_apply_latency(NULL);
+    rule.effect = CHAOS_PROCESS_EFFECT_ERRNO;
+    chaos_process_rule_apply_latency(&rule);
+    assert(g_test_sleep_calls == 0U);
 }
 
 /**
@@ -122,6 +130,7 @@ static void test_latency_helper(void)
  * - probability=0.0 → returns false, `errnum` unchanged (still 0).
  * - NULL rule → returns false.
  * - NULL errnum output → returns false.
+ * - A FAIL_AFTER rule → returns false, `errnum` unchanged.
  */
 static void test_error_number_helpers(void)
 {
@@ -142,6 +151,12 @@ static void test_error_number_helpers(void)
     assert(errnum == 0);
     assert(!chaos_process_rule_error_number(NULL, &errnum));
     assert(!chaos_process_rule_error_number(&rule, NULL));
+
+    /* A rule of another effect never yields an error number. */
+    rule.probability = 1.0;
+    rule.effect = CHAOS_PROCESS_EFFECT_FAIL_AFTER;
+    assert(!chaos_process_rule_error_number(&rule, &errnum));
+    assert(errnum == 0);
 }
 
 /**
@@ -156,6 +171,7 @@ static void test_error_number_helpers(void)
  * - After `reset_action_state()`, count=0: fires immediately on first call.
  * - probability=0.0: never fires regardless of counter.
  * - NULL rule, INVALID operation, NULL errnum: all return false without modifying state.
+ * - An operation past the last one, or an ERRNO rule: false; counters untouched.
  */
 static void test_fail_after_helper(void)
 {
@@ -183,6 +199,17 @@ static void test_fail_after_helper(void)
     assert(!chaos_process_rule_fail_after_error(NULL, CHAOS_PROCESS_OP_FORK, &errnum));
     assert(!chaos_process_rule_fail_after_error(&rule, CHAOS_PROCESS_OP_INVALID, &errnum));
     assert(!chaos_process_rule_fail_after_error(&rule, CHAOS_PROCESS_OP_FORK, NULL));
+
+    /* An operation past the last one, or a rule of another effect, never fires and
+     * leaves the counters alone. */
+    reset_action_state();
+    rule.probability = 1.0;
+    errnum = 0;
+    assert(!chaos_process_rule_fail_after_error(&rule, CHAOS_PROCESS_OP_COUNT, &errnum));
+    rule.effect = CHAOS_PROCESS_EFFECT_ERRNO;
+    assert(!chaos_process_rule_fail_after_error(&rule, CHAOS_PROCESS_OP_FORK, &errnum));
+    assert(errnum == 0);
+    assert(g_chaos_process_fail_after_counters[CHAOS_PROCESS_OP_FORK] == 0U);
 }
 
 /**
@@ -261,7 +288,7 @@ static void test_should_trigger_honours_qualifiers(void)
 }
 
 /**
- * @brief Invariant: FAIL_AFTER honours the rule's window and `@first`.
+ * @brief Invariant: FAIL_AFTER honours the rule's window, `@first` and size gate.
  */
 static void test_fail_after_honours_qualifiers(void)
 {
@@ -282,6 +309,18 @@ static void test_fail_after_honours_qualifiers(void)
     assert(chaos_process_rule_fail_after_error(&rule, CHAOS_PROCESS_OP_FORK, &errnum) == 1);
     assert(errnum == EAGAIN);
     assert(chaos_process_rule_fail_after_error(&rule, CHAOS_PROCESS_OP_FORK, &errnum) == 0);
+
+    /* A size gate the call does not pass keeps the rule from firing. */
+    memset(&rule.policy, 0, sizeof(rule.policy));
+    rule.policy.has_size_above = 1U;
+    rule.policy.size_above = 100U;
+    rule.call_size = 100U;
+    errnum = 0;
+    assert(chaos_process_rule_fail_after_error(&rule, CHAOS_PROCESS_OP_FORK, &errnum) == 0);
+    assert(errnum == 0);
+    rule.call_size = 101U;
+    assert(chaos_process_rule_fail_after_error(&rule, CHAOS_PROCESS_OP_FORK, &errnum) == 1);
+    assert(errnum == EAGAIN);
 }
 
 int main(void)

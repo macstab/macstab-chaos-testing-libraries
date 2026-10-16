@@ -80,6 +80,11 @@ int main(void)
     assert(copy->ai_next->ai_next->ai_next->ai_next == NULL);
     assert(chaos_dns_owned_contains(copy->ai_next->ai_next));
     assert(!chaos_dns_owned_contains(first));
+    /* The block's bounds are exact: the byte before its first node and the slot past
+     * its last node are not in it. */
+    assert(!chaos_dns_owned_contains((const struct addrinfo *)((uintptr_t)copy - 1U)));
+    assert(chaos_dns_owned_contains(copy + 3));
+    assert(!chaos_dns_owned_contains(copy + 4));
     assert(chaos_dns_owned_free(copy->ai_next) == 1); /* any node frees it */
     assert(!chaos_dns_owned_contains(copy) && chaos_dns_owned_free(copy) == 0);
 

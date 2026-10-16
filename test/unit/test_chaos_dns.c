@@ -500,6 +500,8 @@ static int g_real_hostent_calls = 0;
 static int g_real_hostent_missing = 0;
 /** @brief `buffer_size` passed to the most recent stubbed gethostbyaddr_r call. */
 static size_t g_real_hostent_buffer_size = 0U;
+/** @brief When non-zero, the stubbed gethostbyaddr_r fails with this return value. */
+static int g_real_hostent_rc = 0;
 /** @brief The entry the stubbed non-reentrant resolvers return. */
 static struct hostent g_real_hostent;
 /** @brief Name of the stubbed real entries. */
@@ -575,6 +577,12 @@ static int chaos_dns_test_gethostbyaddr_r(
     if (result == NULL || h_error == NULL)
     {
         return 0;
+    }
+    if (g_real_hostent_rc != 0)
+    {
+        *result = NULL;
+        *h_error = NETDB_INTERNAL;
+        return g_real_hostent_rc;
     }
     if (g_real_hostent_missing)
     {
@@ -1191,6 +1199,7 @@ static void bind_hostent_stubs(void)
     g_real_hostent_calls = 0;
     g_real_hostent_missing = 0;
     g_real_hostent_buffer_size = 0U;
+    g_real_hostent_rc = 0;
 }
 
 /**
@@ -1504,6 +1513,257 @@ static void test_reverse_hostent_paths(void)
     assert(g_real_hostent_buffer_size == sizeof(buffer));
 }
 
+/**
+ * @brief Invariant: rules that match but do not fire change nothing, short or missing
+ *   addresses bypass the reverse rules, and the hostent and OVERRIDE paths handle a
+ *   failing resolver, a full registry of our lists and a list of ours to release.
+ *
+ * Expected observable behaviour:
+ * - getaddrinfo with every rule matched but none firing: the real resolver gets the
+ *   original name and service, no transform runs, no delay, the real list returns.
+ * - FILTER_FAMILY that keeps nodes: the lookup succeeds with the filtered list.
+ * - getnameinfo with no address, or an address shorter than its family field: the real
+ *   call, nothing matched; with REWRITE/SERVICE/LATENCY/GAI matched but not firing: the
+ *   real host and service; asked for only the service or only the host, the rule for
+ *   that output alone is applied.
+ * - OVERRIDE whose first literal fails to resolve: that error, the second literal never
+ *   tried; OVERRIDE with the registry of our lists full: EAI_MEMORY, the partial result
+ *   freed.
+ * - gethostbyname2_r through OVERRIDE: the entry is built and our list released, not
+ *   handed to the real freeaddrinfo.
+ * - hostent prelude with LATENCY and GAI matched but not firing: the real resolver.
+ * - gethostbyaddr_r without an h_error pointer: the rules are skipped; with no rule:
+ *   the real entry; a real failure with a REWRITE: its return value, no rewrite.
+ */
+static void test_rules_that_do_not_fire(void)
+{
+    struct addrinfo *result = NULL;
+    struct addrinfo *copies[CHAOS_DNS_MAX_OWNED];
+    struct addrinfo *lists[1];
+    struct sockaddr_in ipv4;
+    struct in_addr address;
+    struct hostent entry;
+    struct hostent *entry_result = NULL;
+    char buffer[256];
+    char host[64];
+    char service[64];
+    int h_error = 0;
+    int effect;
+    size_t index;
+
+    /* Every rule matched, none fires. */
+    reset_wrapper_state();
+    g_chaos_dns_real_getaddrinfo = chaos_dns_test_getaddrinfo;
+    g_chaos_dns_real_freeaddrinfo = chaos_dns_test_freeaddrinfo;
+    g_chaos_dns_real_getnameinfo = chaos_dns_test_getnameinfo;
+    for (effect = 0; effect < (int)(sizeof(g_stub_match) / sizeof(g_stub_match[0])); ++effect)
+    {
+        g_stub_match[effect] = 1;
+        g_stub_rules[effect].effect = (chaos_dns_effect_t)effect;
+    }
+    g_stub_rules[CHAOS_DNS_EFFECT_GAI].gai_error = EAI_FAIL;
+    g_stub_rules[CHAOS_DNS_EFFECT_FILTER_FAMILY].family = CHAOS_DNS_FAMILY_INET6;
+    (void)snprintf(g_stub_rules[CHAOS_DNS_EFFECT_REWRITE].text, sizeof(host), "alt.example");
+    (void)snprintf(g_stub_rules[CHAOS_DNS_EFFECT_SERVICE].text, sizeof(host), "8443");
+    (void)snprintf(g_stub_rules[CHAOS_DNS_EFFECT_OVERRIDE].text, sizeof(host), "192.0.2.1");
+    g_should_trigger = 0;
+    assert(getaddrinfo("api.example.com", "443", NULL, &result) == 0);
+    assert(result != NULL && result->ai_family == AF_INET);
+    assert(strcmp(g_last_node, "api.example.com") == 0);
+    assert(strcmp(g_last_service, "443") == 0);
+    assert(g_real_getaddrinfo_calls == 1);
+    assert(g_latency_calls == 0);
+    assert(g_filter_calls == 0 && g_shuffle_calls == 0 && g_limit_calls == 0);
+    chaos_dns_test_freeaddrinfo(result);
+
+    (void)memset(&ipv4, 0, sizeof(ipv4));
+    ipv4.sin_family = AF_INET;
+    assert(inet_pton(AF_INET, "127.0.0.1", &ipv4.sin_addr) == 1);
+    assert(
+        getnameinfo(
+            (const struct sockaddr *)&ipv4,
+            (socklen_t)sizeof(ipv4),
+            host,
+            (socklen_t)sizeof(host),
+            service,
+            (socklen_t)sizeof(service),
+            0
+        ) == 0
+    );
+    assert(strcmp(host, "localhost") == 0 && strcmp(service, "http") == 0);
+    assert(g_latency_calls == 0);
+
+    /* No address, or one too short to hold its family: straight to the real call. */
+    g_real_getnameinfo_calls = 0;
+    g_should_trigger = 1;
+    g_gai_trigger = 1;
+    assert(getnameinfo(NULL, 0U, host, (socklen_t)sizeof(host), NULL, 0U, 0) == 0);
+    assert(
+        getnameinfo(
+            (const struct sockaddr *)&ipv4, 1U, host, (socklen_t)sizeof(host), NULL, 0U, 0
+        ) == 0
+    );
+    assert(strcmp(host, "localhost") == 0);
+    assert(g_real_getnameinfo_calls == 2);
+    assert(g_latency_calls == 0);
+
+    /* A caller that asks only for the service, or only for the host: the rule for
+     * the other output is not applied, the requested one is. */
+    g_gai_trigger = 0;
+    assert(
+        getnameinfo(
+            (const struct sockaddr *)&ipv4,
+            (socklen_t)sizeof(ipv4),
+            NULL,
+            0U,
+            service,
+            (socklen_t)sizeof(service),
+            0
+        ) == 0
+    );
+    assert(strcmp(service, "8443") == 0);
+    assert(
+        getnameinfo(
+            (const struct sockaddr *)&ipv4, (socklen_t)sizeof(ipv4), host, 0U, service, 0U, 0
+        ) == 0
+    );
+    assert(
+        getnameinfo(
+            (const struct sockaddr *)&ipv4,
+            (socklen_t)sizeof(ipv4),
+            host,
+            (socklen_t)sizeof(host),
+            NULL,
+            0U,
+            0
+        ) == 0
+    );
+    assert(strcmp(host, "alt.example") == 0);
+
+    /* FILTER_FAMILY that keeps nodes: the lookup goes on with them. */
+    reset_wrapper_state();
+    g_chaos_dns_real_getaddrinfo = chaos_dns_test_getaddrinfo;
+    g_chaos_dns_real_freeaddrinfo = chaos_dns_test_freeaddrinfo;
+    g_stub_match[CHAOS_DNS_EFFECT_FILTER_FAMILY] = 1;
+    g_stub_rules[CHAOS_DNS_EFFECT_FILTER_FAMILY].effect = CHAOS_DNS_EFFECT_FILTER_FAMILY;
+    g_stub_rules[CHAOS_DNS_EFFECT_FILTER_FAMILY].family = CHAOS_DNS_FAMILY_INET4;
+    assert(getaddrinfo("api.example.com", NULL, NULL, &result) == 0 && result != NULL);
+    assert(g_filter_calls == 1);
+    chaos_dns_test_freeaddrinfo(result);
+
+    /* OVERRIDE: the first literal fails, the second is never tried. */
+    reset_wrapper_state();
+    g_chaos_dns_real_getaddrinfo = chaos_dns_test_getaddrinfo;
+    g_chaos_dns_real_freeaddrinfo = chaos_dns_test_freeaddrinfo;
+    g_stub_match[CHAOS_DNS_EFFECT_OVERRIDE] = 1;
+    g_stub_rules[CHAOS_DNS_EFFECT_OVERRIDE].effect = CHAOS_DNS_EFFECT_OVERRIDE;
+    (void
+    )snprintf(g_stub_rules[CHAOS_DNS_EFFECT_OVERRIDE].text, sizeof(host), "192.0.2.1,192.0.2.2");
+    g_real_getaddrinfo_error = EAI_AGAIN;
+    g_real_getaddrinfo_error_call = 1;
+    assert(getaddrinfo("api.example.com", NULL, NULL, &result) == EAI_AGAIN);
+    assert(g_real_getaddrinfo_calls == 1);
+    assert(g_real_freeaddrinfo_calls == 0);
+
+    /* OVERRIDE with every slot for our lists taken: EAI_MEMORY, the partial freed. */
+    g_real_getaddrinfo_error = 0;
+    g_real_getaddrinfo_calls = 0;
+    lists[0] = make_result_node(AF_INET);
+    for (index = 0U; index < CHAOS_DNS_MAX_OWNED; ++index)
+    {
+        copies[index] = chaos_dns_owned_copy(lists, 1U, NULL);
+        assert(copies[index] != NULL);
+    }
+    assert(getaddrinfo("api.example.com", NULL, NULL, &result) == EAI_MEMORY);
+    assert(g_real_getaddrinfo_calls == 2);
+    assert(g_real_freeaddrinfo_calls == 2);
+    for (index = 0U; index < CHAOS_DNS_MAX_OWNED; ++index)
+    {
+        assert(chaos_dns_owned_free(copies[index]) == 1);
+    }
+    chaos_dns_test_freeaddrinfo(lists[0]);
+
+    /* A hostent answer built from a list of ours releases that list itself. */
+    bind_hostent_stubs();
+    g_stub_match[CHAOS_DNS_EFFECT_OVERRIDE] = 1;
+    g_stub_rules[CHAOS_DNS_EFFECT_OVERRIDE].effect = CHAOS_DNS_EFFECT_OVERRIDE;
+    (void)snprintf(g_stub_rules[CHAOS_DNS_EFFECT_OVERRIDE].text, sizeof(host), "192.0.2.1");
+    assert(
+        gethostbyname2_r(
+            "a.example", AF_INET, &entry, buffer, sizeof(buffer), &entry_result, &h_error
+        ) == 0
+    );
+    assert(entry_result == &entry && entry.h_addrtype == AF_INET);
+    assert(g_real_freeaddrinfo_calls == 1); /* the literal's partial, not our list */
+    for (index = 0U; index < CHAOS_DNS_MAX_OWNED; ++index)
+    {
+        assert(g_chaos_dns_owned[index] == NULL);
+    }
+
+    /* The hostent prelude with LATENCY and GAI matched but not firing. */
+    bind_hostent_stubs();
+    g_stub_match[CHAOS_DNS_EFFECT_LATENCY] = 1;
+    g_stub_rules[CHAOS_DNS_EFFECT_LATENCY].effect = CHAOS_DNS_EFFECT_LATENCY;
+    g_stub_match[CHAOS_DNS_EFFECT_GAI] = 1;
+    g_stub_rules[CHAOS_DNS_EFFECT_GAI].effect = CHAOS_DNS_EFFECT_GAI;
+    g_stub_rules[CHAOS_DNS_EFFECT_GAI].gai_error = EAI_FAIL;
+    g_should_trigger = 0;
+    assert(gethostbyname2("a.example", AF_INET) == &g_real_hostent);
+    assert(g_latency_calls == 0);
+    assert(g_real_hostent_calls == 1);
+
+    /* gethostbyaddr_r: no h_errno pointer skips the rules; no rule, the real entry;
+     * a real failure keeps its return value and no rewrite is applied. */
+    address.s_addr = htonl(INADDR_LOOPBACK);
+    bind_hostent_stubs();
+    g_stub_match[CHAOS_DNS_EFFECT_GAI] = 1;
+    g_stub_rules[CHAOS_DNS_EFFECT_GAI].effect = CHAOS_DNS_EFFECT_GAI;
+    g_stub_rules[CHAOS_DNS_EFFECT_GAI].gai_error = EAI_FAIL;
+    g_gai_trigger = 1;
+    assert(
+        gethostbyaddr_r(
+            &address, sizeof(address), AF_INET, &entry, buffer, sizeof(buffer), &entry_result, NULL
+        ) == 0
+    );
+    assert(g_real_hostent_calls == 1);
+
+    bind_hostent_stubs();
+    assert(
+        gethostbyaddr_r(
+            &address,
+            sizeof(address),
+            AF_INET,
+            &entry,
+            buffer,
+            sizeof(buffer),
+            &entry_result,
+            &h_error
+        ) == 0
+    );
+    assert(entry_result == &entry && strcmp(entry.h_name, "real.example") == 0);
+    assert(g_real_hostent_buffer_size == sizeof(buffer));
+
+    g_stub_match[CHAOS_DNS_EFFECT_REWRITE] = 1;
+    g_stub_rules[CHAOS_DNS_EFFECT_REWRITE].effect = CHAOS_DNS_EFFECT_REWRITE;
+    (void)snprintf(g_stub_rules[CHAOS_DNS_EFFECT_REWRITE].text, sizeof(host), "ptr.example");
+    g_real_hostent_rc = ERANGE;
+    entry.h_name = NULL;
+    assert(
+        gethostbyaddr_r(
+            &address,
+            sizeof(address),
+            AF_INET,
+            &entry,
+            buffer,
+            sizeof(buffer),
+            &entry_result,
+            &h_error
+        ) == ERANGE
+    );
+    assert(entry_result == NULL && h_error == NETDB_INTERNAL);
+    assert(entry.h_name == NULL);
+}
+
 int main(void)
 {
     test_static_helpers();
@@ -1515,5 +1775,6 @@ int main(void)
     test_hostent_helpers();
     test_forward_hostent_paths();
     test_reverse_hostent_paths();
+    test_rules_that_do_not_fire();
     return 0;
 }

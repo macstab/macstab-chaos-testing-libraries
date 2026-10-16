@@ -85,6 +85,12 @@ static int g_test_config_force_read_fail = 0;
 /** Number of upcoming config reads that fail with EINTR, as a signal would make them. */
 static int g_test_config_read_eintr = 0;
 
+/** Number of upcoming config opens that fail with EINTR, as a signal would make them. */
+static int g_test_config_open_eintr = 0;
+
+/** When non-zero, the open stub fails with this errno (EACCES, EPERM, ...). */
+static int g_test_config_open_errno = 0;
+
 /**
  * @brief When non-zero, the CAS stub always returns 0 (CAS fails).
  *
@@ -105,6 +111,8 @@ static const int g_test_config_fake_fd = 9124;
 /**
  * @brief Stub open function with configurable failure modes and real-fd passthrough.
  *
+ * When `g_test_config_open_eintr` is positive: consumes one and fails with EINTR.
+ * When `g_test_config_open_errno` is set: returns -1 with that errno.
  * When `g_test_config_force_open_fail` is set: returns -1 with errno ENOENT.
  * When `g_test_config_force_read_fail` is set: returns `g_test_config_fake_fd` without
  *   touching the filesystem.
@@ -117,6 +125,17 @@ static const int g_test_config_fake_fd = 9124;
  */
 static int chaos_dns_test_config_open(const char *path, int flags, ...)
 {
+    if (g_test_config_open_eintr > 0)
+    {
+        --g_test_config_open_eintr;
+        errno = EINTR;
+        return -1;
+    }
+    if (g_test_config_open_errno != 0)
+    {
+        errno = g_test_config_open_errno;
+        return -1;
+    }
     if (g_test_config_force_open_fail != 0)
     {
         errno = ENOENT;
@@ -1261,6 +1280,18 @@ static void test_hits_are_counted_and_reported(void)
     );
     assert(g_chaos_dns_hits_pending == 0);
     chaos_dns_config_report_hits(NULL);
+
+    /* Past the eager hits, a hit once the interval is over is written at once. */
+    g_chaos_dns_hits_last_ms = chaos_hits_now_ms() - CHAOS_HITS_INTERVAL_MS;
+    chaos_hit_record(state->rules[1].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(
+        strcmp(
+            hits,
+            "2\tdns://api.example.com:LATENCY:20 # a\n4\tdns://api.example.com:LATENCY:20 # b\n"
+        ) == 0
+    );
+    assert(g_chaos_dns_hits_pending == 0);
     g_chaos_dns_hits_total = 0U;
 
     /* A writer flag held when the process forked is released in the child, which
@@ -1591,7 +1622,209 @@ static void test_rejections(void)
         rules, 2U, CHAOS_DNS_EFFECT_SHUFFLE, "edge.api.example.com", &rule
     ));
     assert(strcmp(rule.selector.text, "api.example.com") == 0);
+    rules[0] = rules[1];
+    (void)snprintf(line, sizeof(line), "dns://*.example.com:SHUFFLE:1.0");
+    assert(chaos_dns_config_parse_line(line, &rules[1]) == 1);
+    assert(chaos_dns_config_select_rule(
+        rules, 2U, CHAOS_DNS_EFFECT_SHUFFLE, "edge.api.example.com", &rule
+    ));
+    assert(strcmp(rule.selector.text, "api.example.com") == 0);
+    /* A less specific rank listed later does not replace a more specific one. */
+    (void)snprintf(line, sizeof(line), "*:SHUFFLE:1.0");
+    assert(chaos_dns_config_parse_line(line, &rules[1]) == 1);
+    assert(chaos_dns_config_select_rule(
+        rules, 2U, CHAOS_DNS_EFFECT_SHUFFLE, "edge.api.example.com", &rule
+    ));
+    assert(rule.selector.kind == CHAOS_DNS_SELECTOR_SUFFIX);
     assert(count == 7U);
+}
+
+/**
+ * @brief Invariant: the value parsers and selector checks accept exactly what fits and
+ *   reject the first value beyond a limit, trailing garbage, empty parts and malformed
+ *   address tokens; every effect rejects a value it cannot parse.
+ *
+ * Expected observable behaviour:
+ * - latency 4294967295 and limit 4294967295 accepted; 4294967296, "12x" and limit 0
+ *   rejected.
+ * - "ipv4"/"ipv6" are the INET4/INET6 families.
+ * - names compare equal only at equal length, either way round.
+ * - a suffix selector with nothing after its `*.`, and a name longer than the
+ *   selector buffer, are not selectors.
+ * - an empty name or a lookup selector asked about a reverse query does not match;
+ *   matching works the same with or without a rank output.
+ * - "[" alone, "[::1" and an empty list element are not override addresses.
+ * - the mtime sentinels never come out of normalisation unchanged.
+ * - "*x...", a bracketed reverse address without ':' after ']', an empty value and
+ *   each effect with an unparseable value reject the line.
+ * - a buffer whose last line has no newline still yields that rule.
+ * - reverse lookups allow only GAI, LATENCY, REWRITE and SERVICE.
+ * - match and match_reverse with an empty name or no output rule match nothing.
+ */
+static void test_parse_boundaries(void)
+{
+    static chaos_dns_rule_t rules[2];
+    char payload[4];
+    /* The parsers trim the text after the number in place, so it must be writable. */
+    char latency_garbage[] = "12x";
+    char limit_garbage[] = "12x";
+    char long_name[CHAOS_DNS_MAX_TEXT + 16U];
+    char line[CHAOS_DNS_MAX_TEXT + 64U];
+    char buffer[] = "# rules\ndns://api.example.com:EAI_AGAIN:1.0";
+    char *selector_text = NULL;
+    char *effect_text = NULL;
+    unsigned int value = 0U;
+    unsigned int rank = 9U;
+    size_t count = 0U;
+    chaos_dns_selector_t selector;
+    chaos_dns_rule_t rule;
+
+    assert(chaos_dns_parse_latency("4294967295", &value) == 0 && value == 4294967295U);
+    assert(chaos_dns_parse_latency("4294967296", &value) == -1);
+    assert(chaos_dns_parse_latency(latency_garbage, &value) == -1);
+    assert(chaos_dns_parse_limit("4294967295", &value) == 0 && value == 4294967295U);
+    assert(chaos_dns_parse_limit("4294967296", &value) == -1);
+    assert(chaos_dns_parse_limit(limit_garbage, &value) == -1);
+    assert(chaos_dns_parse_limit("0", &value) == -1);
+    assert(chaos_dns_parse_limit("x", &value) == -1);
+    assert(value == 4294967295U);
+
+    assert(chaos_dns_parse_family_filter("ipv4") == CHAOS_DNS_FAMILY_INET4);
+    assert(chaos_dns_parse_family_filter("ipv6") == CHAOS_DNS_FAMILY_INET6);
+    assert(chaos_dns_copy_text_value("abcd", payload, sizeof(payload)) == -1);
+    assert(chaos_dns_copy_text_value("abc", payload, sizeof(payload)) == 0);
+
+    assert(chaos_dns_ascii_case_equal("Example.COM", "example.com"));
+    assert(!chaos_dns_ascii_case_equal("example.com", "example.co"));
+    assert(!chaos_dns_ascii_case_equal("example.co", "example.com"));
+
+    assert(!chaos_dns_selector_parse("dns://*.", &selector));
+    memset(long_name, 'a', sizeof(long_name) - 1U);
+    long_name[sizeof(long_name) - 1U] = '\0';
+    (void)snprintf(line, sizeof(line), "dns://%s", long_name);
+    assert(!chaos_dns_selector_parse(line, &selector));
+
+    assert(chaos_dns_selector_parse("dns://api.example.com", &selector));
+    assert(
+        !chaos_dns_selector_matches_domain(&selector, CHAOS_DNS_SELECTOR_DOMAIN_LOOKUP, "", &rank)
+    );
+    assert(
+        !chaos_dns_selector_matches_domain(&selector, CHAOS_DNS_SELECTOR_DOMAIN_LOOKUP, NULL, &rank)
+    );
+    assert(rank == 0U);
+    assert(!chaos_dns_selector_matches_domain(
+        &selector, CHAOS_DNS_SELECTOR_DOMAIN_REVERSE, "api.example.com", NULL
+    ));
+    assert(!chaos_dns_selector_matches_domain(
+        &selector, CHAOS_DNS_SELECTOR_DOMAIN_LOOKUP, "api.example.co", NULL
+    ));
+    assert(chaos_dns_selector_matches_domain(
+        &selector, CHAOS_DNS_SELECTOR_DOMAIN_LOOKUP, "API.example.com", NULL
+    ));
+    assert(chaos_dns_selector_parse("dns://*.example.com", &selector));
+    assert(chaos_dns_selector_matches_domain(
+        &selector, CHAOS_DNS_SELECTOR_DOMAIN_LOOKUP, "api.example.com", NULL
+    ));
+    assert(chaos_dns_selector_parse("*", &selector));
+    assert(chaos_dns_selector_matches_domain(
+        &selector, CHAOS_DNS_SELECTOR_DOMAIN_LOOKUP, "api.example.com", NULL
+    ));
+
+    assert(!chaos_dns_override_token_valid("["));
+    assert(!chaos_dns_override_token_valid("[]"));
+    assert(!chaos_dns_override_token_valid("[::1"));
+    assert(chaos_dns_override_token_valid("[::1]"));
+    assert(!chaos_dns_validate_override_value("192.0.2.1,,192.0.2.2"));
+    assert(chaos_dns_validate_override_value("192.0.2.1, 192.0.2.2"));
+
+    assert(
+        chaos_dns_config_normalize_mtime_hash(CHAOS_DNS_MTIME_MISSING) != CHAOS_DNS_MTIME_MISSING
+    );
+    assert(
+        chaos_dns_config_normalize_mtime_hash(CHAOS_DNS_MTIME_RELOADING) !=
+        CHAOS_DNS_MTIME_RELOADING
+    );
+
+    {
+        static const char *const bad[] = {
+            "*x:EAI_AGAIN:1.0",
+            "rdns://[::1]x:EAI_AGAIN:1.0",
+            "dns://api.example.com:LATENCY: ",
+            "dns://api.example.com:EAI_AGAIN:2",
+            "dns://api.example.com:LATENCY:soon",
+            "dns://api.example.com:LIMIT:0",
+            "dns://api.example.com:SHUFFLE:2",
+        };
+        size_t index;
+
+        for (index = 0U; index < sizeof(bad) / sizeof(bad[0]); ++index)
+        {
+            (void)snprintf(line, sizeof(line), "%s", bad[index]);
+            assert(chaos_dns_config_parse_line(line, &rule) == -1);
+        }
+    }
+    (void)snprintf(line, sizeof(line), "dns://api.example.com:EAI_AGAIN:1.0");
+    assert(!chaos_dns_split_rule_fields(line, &selector_text, &effect_text, NULL));
+    assert(!chaos_dns_split_rule_fields(line, &selector_text, NULL, NULL));
+    assert(!chaos_dns_split_rule_fields(line, NULL, NULL, NULL));
+    assert(chaos_dns_config_parse_line(line, NULL) == -1);
+
+    assert(chaos_dns_config_parse_buffer(buffer, rules, &count) == 0);
+    assert(count == 1U && rules[0].effect == CHAOS_DNS_EFFECT_GAI);
+    assert(chaos_dns_config_parse_buffer(buffer, NULL, &count) == -1);
+    assert(chaos_dns_config_parse_buffer(buffer, rules, NULL) == -1);
+    assert(!chaos_dns_config_select_rule(rules, 1U, CHAOS_DNS_EFFECT_GAI, NULL, &rule));
+    assert(!chaos_dns_config_select_rule(rules, 1U, CHAOS_DNS_EFFECT_GAI, "api.example.com", NULL));
+
+    assert(chaos_dns_selector_parse("rdns://127.0.0.1", &selector));
+    assert(chaos_dns_effect_allowed(&selector, CHAOS_DNS_EFFECT_GAI));
+    assert(chaos_dns_effect_allowed(&selector, CHAOS_DNS_EFFECT_LATENCY));
+    assert(chaos_dns_effect_allowed(&selector, CHAOS_DNS_EFFECT_REWRITE));
+    assert(chaos_dns_effect_allowed(&selector, CHAOS_DNS_EFFECT_SERVICE));
+    assert(!chaos_dns_effect_allowed(&selector, CHAOS_DNS_EFFECT_OVERRIDE));
+
+    assert(!chaos_dns_config_match(CHAOS_DNS_EFFECT_GAI, "", &rule));
+    assert(!chaos_dns_config_match(CHAOS_DNS_EFFECT_GAI, "api.example.com", NULL));
+    assert(!chaos_dns_config_match_reverse(CHAOS_DNS_EFFECT_GAI, "", &rule));
+    assert(!chaos_dns_config_match_reverse(CHAOS_DNS_EFFECT_GAI, "127.0.0.1", NULL));
+}
+
+/**
+ * @brief Invariant: opening the rule file is retried after a signal, a missing
+ *   permission is reported as lasting, and other open errors as retryable; with
+ *   no rule file, nothing matches.
+ *
+ * Triggering condition: the first open fails with EINTR; then every open fails with
+ *   EACCES, EPERM, then EMFILE; finally the file is removed and a lookup matched.
+ *
+ * Expected observable behaviour: the interrupted open is retried and the file read
+ *   (0, its full size); EACCES and EPERM return -3; EMFILE returns -1; without a
+ *   rule file match and match_reverse return 0.
+ */
+static void test_open_errors(void)
+{
+    size_t size = 0U;
+    uint64_t stamp;
+    chaos_dns_rule_t rule;
+
+    write_config_text("# open errors\n", 43);
+    stamp = chaos_dns_config_observed_mtime();
+    g_test_config_open_eintr = 1;
+    assert(chaos_dns_config_read_file(&size, stamp) == 0);
+    assert(g_test_config_open_eintr == 0);
+    assert(size == strlen("# open errors\n"));
+
+    g_test_config_open_errno = EACCES;
+    assert(chaos_dns_config_read_file(&size, stamp) == -3);
+    g_test_config_open_errno = EPERM;
+    assert(chaos_dns_config_read_file(&size, stamp) == -3);
+    g_test_config_open_errno = EMFILE;
+    assert(chaos_dns_config_read_file(&size, stamp) == -1);
+    g_test_config_open_errno = 0;
+
+    (void)unlink(CHAOS_DNS_CONFIG_PATH);
+    assert(!chaos_dns_config_match(CHAOS_DNS_EFFECT_GAI, "api.example.com", &rule));
+    assert(!chaos_dns_config_match_reverse(CHAOS_DNS_EFFECT_GAI, "127.0.0.1", &rule));
 }
 
 int main(void)
@@ -1618,5 +1851,7 @@ int main(void)
     test_interrupted_read_is_retried();
     test_racy_rewrite_is_seen();
     test_pending_hits_written_after_interval();
+    test_parse_boundaries();
+    test_open_errors();
     return 0;
 }

@@ -620,6 +620,47 @@ static void test_posix_madvise_paths(void)
     assert(g_real_posix_madvise_calls == 0);
 }
 
+/**
+ * @brief Invariant: an ERRNO rule that matches but whose probability does not fire
+ *   leaves every wrapper to the real call.
+ *
+ * Triggering condition: an ERRNO rule matched for each operation while the errno stub
+ *   reports that the rule did not fire.
+ *
+ * Expected observable behaviour: each wrapper returns the real call's success value
+ *   and the real function ran exactly once.
+ */
+static void test_errno_rule_that_does_not_fire(void)
+{
+    int operation;
+
+    reset_wrapper_state();
+    g_real_posix_madvise_calls = 0;
+    g_chaos_memory_real_mmap = chaos_memory_test_mmap;
+    g_chaos_memory_real_munmap = chaos_memory_test_munmap;
+    g_chaos_memory_real_mprotect = chaos_memory_test_mprotect;
+    g_chaos_memory_real_madvise = chaos_memory_test_madvise;
+    g_chaos_memory_real_posix_madvise = chaos_memory_test_posix_madvise;
+    for (operation = CHAOS_MEMORY_OP_MMAP; operation <= CHAOS_MEMORY_OP_MUNMAP; ++operation)
+    {
+        g_stub_match[CHAOS_MEMORY_EFFECT_ERRNO][operation] = 1;
+        g_stub_rules[CHAOS_MEMORY_EFFECT_ERRNO][operation].effect = CHAOS_MEMORY_EFFECT_ERRNO;
+        g_stub_rules[CHAOS_MEMORY_EFFECT_ERRNO][operation].errnum = ENOMEM;
+    }
+    g_errno_trigger = 0;
+
+    assert(mmap(NULL, 4096U, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == g_real_mmap_result);
+    assert(munmap((void *)(uintptr_t)0x2000U, 4096U) == 0);
+    assert(mprotect((void *)(uintptr_t)0x1000U, 4096U, PROT_READ) == 0);
+    assert(madvise((void *)(uintptr_t)0x1000U, 4096U, 7) == 0);
+    assert(posix_madvise((void *)(uintptr_t)0x1000U, 4096U, POSIX_MADV_NORMAL) == 0);
+    assert(g_real_mmap_calls == 1);
+    assert(g_real_munmap_calls == 1);
+    assert(g_real_mprotect_calls == 1);
+    assert(g_real_madvise_calls == 1);
+    assert(g_real_posix_madvise_calls == 1);
+}
+
 int main(void)
 {
     test_call_real_helpers();
@@ -628,5 +669,6 @@ int main(void)
     test_mprotect_paths();
     test_madvise_paths();
     test_posix_madvise_paths();
+    test_errno_rule_that_does_not_fire();
     return 0;
 }

@@ -67,6 +67,12 @@ static int g_test_config_force_read_fail = 0;
 
 /** Number of upcoming config reads that fail with EINTR, as a signal would make them. */
 static int g_test_config_read_eintr = 0;
+
+/** Number of upcoming config opens that fail with EINTR, as a signal would make them. */
+static int g_test_config_open_eintr = 0;
+
+/** When non-zero, the open stub fails with this errno (EACCES, EPERM, ...). */
+static int g_test_config_open_errno = 0;
 /** @brief When non-zero, the CAS stub always returns 0 (failure). */
 static int g_test_config_force_cas_fail = 0;
 /**
@@ -79,6 +85,8 @@ static const int g_test_config_fake_fd = 8124;
  * @brief Stub for `open(2)` / `open(2)` with O_CREAT.
  *
  * Behaviour depends on fault-injection flags:
+ * - `g_test_config_open_eintr` positive: consumes one and fails with EINTR.
+ * - `g_test_config_open_errno`: returns -1 with that errno.
  * - `g_test_config_force_open_fail`: returns -1 with errno=ENOENT.
  * - `g_test_config_force_read_fail`: returns `g_test_config_fake_fd`.
  * - O_CREAT: extracts mode from va_args and delegates to the real `open`.
@@ -91,6 +99,17 @@ static const int g_test_config_fake_fd = 8124;
  */
 static int chaos_time_test_config_open(const char *path, int flags, ...)
 {
+    if (g_test_config_open_eintr > 0)
+    {
+        --g_test_config_open_eintr;
+        errno = EINTR;
+        return -1;
+    }
+    if (g_test_config_open_errno != 0)
+    {
+        errno = g_test_config_open_errno;
+        return -1;
+    }
     if (g_test_config_force_open_fail != 0)
     {
         errno = ENOENT;
@@ -718,6 +737,7 @@ static void test_rule_selection(void)
     char clock_line[] = "clock_gettime:ERRNO:EFAULT";
     char exact_line[] = "clock_gettime/monotonic:ERRNO:EINTR";
     char nanosleep_line[] = "nanosleep:LATENCY:20";
+    char late_any_line[] = "*:ERRNO:EINVAL";
 
     assert(chaos_time_config_parse_line(any_line, &rules[0]) == 1);
     assert(chaos_time_config_parse_line(clock_line, &rules[1]) == 1);
@@ -757,6 +777,23 @@ static void test_rule_selection(void)
     tie_rules[1] = tie_rules[0];
     tie_rules[1].selector.selector_len = 12U;
     tie_rules[1].errnum = EPERM;
+    assert(chaos_time_config_select_rule(
+        tie_rules, 2U, CHAOS_TIME_EFFECT_ERRNO, CHAOS_TIME_OP_CLOCK_GETTIME, CLOCK_REALTIME, &rule
+    ));
+    assert(rule.errnum == EPERM);
+
+    /* Listed the other way round, the shorter selector of the same rank does not
+     * replace the longer one... */
+    tie_rules[0] = tie_rules[1];
+    tie_rules[1].selector.selector_len = 10U;
+    tie_rules[1].errnum = EINVAL;
+    assert(chaos_time_config_select_rule(
+        tie_rules, 2U, CHAOS_TIME_EFFECT_ERRNO, CHAOS_TIME_OP_CLOCK_GETTIME, CLOCK_REALTIME, &rule
+    ));
+    assert(rule.errnum == EPERM);
+
+    /* ...nor does a less specific selector listed after a more specific one. */
+    assert(chaos_time_config_parse_line(late_any_line, &tie_rules[1]) == 1);
     assert(chaos_time_config_select_rule(
         tie_rules, 2U, CHAOS_TIME_EFFECT_ERRNO, CHAOS_TIME_OP_CLOCK_GETTIME, CLOCK_REALTIME, &rule
     ));
@@ -1346,6 +1383,13 @@ static void test_hits_are_counted_and_reported(void)
     assert(strcmp(hits, "2\tnanosleep:ERRNO:EINTR # a\n3\tnanosleep:ERRNO:EINTR # b\n") == 0);
     assert(g_chaos_time_hits_pending == 0);
     chaos_time_config_report_hits(NULL);
+
+    /* Past the eager hits, a hit once the interval is over is written at once. */
+    g_chaos_time_hits_last_ms = chaos_hits_now_ms() - CHAOS_HITS_INTERVAL_MS;
+    chaos_hit_record(state->rules[1].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(strcmp(hits, "2\tnanosleep:ERRNO:EINTR # a\n4\tnanosleep:ERRNO:EINTR # b\n") == 0);
+    assert(g_chaos_time_hits_pending == 0);
     g_chaos_time_hits_total = 0U;
 
     /* A writer flag held when the process forked is released in the child, which
@@ -1541,6 +1585,132 @@ static void test_pending_hits_written_after_interval(void)
     g_chaos_time_check_interval_ns = interval;
 }
 
+/**
+ * @brief Invariant: the value parsers accept a value exactly at their limit and reject
+ *   the first one beyond it, trailing garbage, and non-positive errno numbers.
+ *
+ * Expected observable behaviour:
+ * - errno numbers: 2147483647 accepted; 0, -5, 2147483648 and "12x" rejected.
+ * - latency: 4294967295 accepted; 4294967296 and "12x" rejected; a bad latency
+ *   rejects the line.
+ * - clock ids and offsets with trailing garbage are rejected.
+ * - a REGRESS rule whose value is not a valid `<ms>@<probability>` is rejected.
+ * - a value that fills its buffer exactly (no room for the terminator) is rejected,
+ *   one byte shorter is accepted; the same holds for the payload before `@`.
+ * - an empty effect or value field rejects the line.
+ * - selector matching reports a match the same with or without a rank output;
+ *   matching without an output rule matches nothing.
+ */
+static void test_parse_boundaries(void)
+{
+    char payload[4];
+    /* The parsers trim the text after the number in place, so it must be writable. */
+    char errno_garbage[] = "12x";
+    char latency_garbage[] = "12x";
+    char clock_garbage[] = "7x";
+    char offset_garbage[] = "5x";
+    char empty_effect_line[] = "nanosleep::EINTR";
+    char empty_value_line[] = "nanosleep:ERRNO: ";
+    char bad_latency_line[] = "nanosleep:LATENCY:soon";
+    char bad_regress_line[] = "clock_gettime/monotonic:REGRESS:5000@2";
+    char split_line[] = "nanosleep:ERRNO:EINTR";
+    char *selector_text = NULL;
+    char *effect_text = NULL;
+    unsigned int latency = 0U;
+    int64_t offset = 0;
+    clockid_t clock_id = CLOCK_REALTIME;
+    double probability = 0.0;
+    chaos_time_selector_t selector;
+    chaos_time_rule_t rule;
+
+    assert(chaos_time_parse_errno_name("2147483647") == 2147483647);
+    assert(chaos_time_parse_errno_name("0") == -1);
+    assert(chaos_time_parse_errno_name("-5") == -1);
+    assert(chaos_time_parse_errno_name("2147483648") == -1);
+    assert(chaos_time_parse_errno_name(errno_garbage) == -1);
+
+    assert(chaos_time_parse_latency("4294967295", &latency) == 0);
+    assert(latency == 4294967295U);
+    assert(chaos_time_parse_latency("4294967296", &latency) != 0);
+    assert(chaos_time_parse_latency(latency_garbage, &latency) != 0);
+    assert(latency == 4294967295U);
+
+    assert(!chaos_time_parse_clock_id(clock_garbage, &clock_id));
+    assert(clock_id == CLOCK_REALTIME);
+    assert(chaos_time_parse_offset(offset_garbage, &offset) != 0);
+    assert(offset == 0);
+
+    assert(chaos_time_copy_text_value("abcd", payload, sizeof(payload)) != 0);
+    assert(chaos_time_copy_text_value("abc", payload, sizeof(payload)) == 0);
+    assert(strcmp(payload, "abc") == 0);
+    assert(
+        chaos_time_parse_payload_probability("abcd@0.5", payload, sizeof(payload), &probability) !=
+        0
+    );
+    assert(
+        chaos_time_parse_payload_probability("abc@0.5", payload, sizeof(payload), &probability) == 0
+    );
+    assert(strcmp(payload, "abc") == 0);
+    assert(probability == 0.5);
+    assert(chaos_time_parse_payload_probability("abc", NULL, sizeof(payload), &probability) != 0);
+    assert(chaos_time_parse_payload_probability("abc", payload, sizeof(payload), NULL) != 0);
+
+    assert(chaos_time_config_parse_line(empty_effect_line, &rule) < 0);
+    assert(chaos_time_config_parse_line(empty_value_line, &rule) < 0);
+    assert(chaos_time_config_parse_line(bad_latency_line, &rule) < 0);
+    assert(chaos_time_config_parse_line(bad_regress_line, &rule) < 0);
+    assert(!chaos_time_split_rule_fields(split_line, &selector_text, &effect_text, NULL));
+    assert(!chaos_time_split_rule_fields(split_line, &selector_text, NULL, NULL));
+
+    assert(chaos_time_selector_parse("*", &selector));
+    assert(chaos_time_selector_matches(&selector, CHAOS_TIME_OP_USLEEP, CLOCK_REALTIME, NULL));
+    assert(chaos_time_selector_parse("nanosleep", &selector));
+    assert(chaos_time_selector_matches(&selector, CHAOS_TIME_OP_NANOSLEEP, CLOCK_REALTIME, NULL));
+    assert(chaos_time_selector_parse("clock_gettime/monotonic", &selector));
+    assert(
+        chaos_time_selector_matches(&selector, CHAOS_TIME_OP_CLOCK_GETTIME, CLOCK_MONOTONIC, NULL)
+    );
+    assert(
+        !chaos_time_selector_matches(&selector, CHAOS_TIME_OP_CLOCK_GETTIME, CLOCK_REALTIME, NULL)
+    );
+
+    assert(!chaos_time_config_match(
+        CHAOS_TIME_EFFECT_ERRNO, CHAOS_TIME_OP_NANOSLEEP, CLOCK_REALTIME, NULL
+    ));
+}
+
+/**
+ * @brief Invariant: opening the rule file is retried after a signal, a missing
+ *   permission is reported as lasting, and other open errors as retryable.
+ *
+ * Triggering condition: the first open fails with EINTR; then every open fails with
+ *   EACCES, EPERM, then EMFILE.
+ *
+ * Expected observable behaviour: the interrupted open is retried and the file read
+ *   (0, its full size); EACCES and EPERM return -3; EMFILE returns -1.
+ */
+static void test_open_errors(void)
+{
+    size_t size = 0U;
+    uint64_t stamp;
+
+    write_config_text("# open errors\n", 43);
+    stamp = chaos_time_config_observed_mtime();
+    g_test_config_open_eintr = 1;
+    assert(chaos_time_config_read_file(&size, stamp) == 0);
+    assert(g_test_config_open_eintr == 0);
+    assert(size == strlen("# open errors\n"));
+
+    g_test_config_open_errno = EACCES;
+    assert(chaos_time_config_read_file(&size, stamp) == -3);
+    g_test_config_open_errno = EPERM;
+    assert(chaos_time_config_read_file(&size, stamp) == -3);
+    g_test_config_open_errno = EMFILE;
+    assert(chaos_time_config_read_file(&size, stamp) == -1);
+    g_test_config_open_errno = 0;
+    (void)unlink(CHAOS_TIME_CONFIG_PATH);
+}
+
 int main(void)
 {
     /* Look at the rule file on every call; the throttle has its own test. */
@@ -1566,5 +1736,7 @@ int main(void)
     test_interrupted_read_is_retried();
     test_racy_rewrite_is_seen();
     test_pending_hits_written_after_interval();
+    test_parse_boundaries();
+    test_open_errors();
     return 0;
 }

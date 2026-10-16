@@ -192,6 +192,7 @@ static void reset_actions_state(void)
  *   `EAI_AGAIN` and returns true.
  * - GAI rule with probability=0.0: `apply_gai` returns false and does not modify the output.
  * - NULL rule or NULL output pointer: `apply_gai` and `should_trigger` return false.
+ * - A LATENCY rule: `apply_gai` returns false and does not modify the output.
  */
 static void test_probability_and_gai_helpers(void)
 {
@@ -219,6 +220,13 @@ static void test_probability_and_gai_helpers(void)
     assert(!chaos_dns_rule_apply_gai(NULL, &gai_error));
     assert(!chaos_dns_rule_apply_gai(&rule, NULL));
     assert(!chaos_dns_rule_should_trigger(NULL));
+
+    /* A rule of another effect never yields an error code. */
+    gai_error = 0;
+    rule.probability = 1.0;
+    rule.effect = CHAOS_DNS_EFFECT_LATENCY;
+    assert(!chaos_dns_rule_apply_gai(&rule, &gai_error));
+    assert(gai_error == 0);
 }
 
 /**
@@ -499,6 +507,66 @@ static void test_canonname_and_owned_lists(void)
     assert(chaos_dns_owned_free(head) == 1);
 }
 
+/**
+ * @brief Invariant: FILTER keeps exactly the wanted family, ANY leaves the list alone,
+ *   LIMIT keeps lists that are short enough and ignores missing lists, and dropped
+ *   nodes are only released through a resolved real freeaddrinfo.
+ *
+ * Expected observable behaviour:
+ * - {v4, v6, v4} filtered to INET6 → {v6}; two nodes freed.
+ * - ANY on a non-empty list → 0, list and node count unchanged, nothing freed.
+ * - LIMIT 5 on a two-node list → unchanged; LIMIT on a NULL list pointer or an empty
+ *   list, with or without a zero limit → nothing happens.
+ * - Without a real freeaddrinfo, a dropped node is unlinked but not freed.
+ * - apply_latency(NULL) returns without sleeping.
+ */
+static void test_filter_and_limit_edges(void)
+{
+    struct addrinfo *head;
+    struct addrinfo *dropped;
+
+    reset_actions_state();
+    head = make_result_node(AF_INET, "v4");
+    head->ai_next = make_result_node(AF_INET6, NULL);
+    head->ai_next->ai_next = make_result_node(AF_INET, NULL);
+    assert(chaos_dns_filter_result_list(&head, CHAOS_DNS_FAMILY_INET6));
+    assert(head != NULL && head->ai_family == AF_INET6 && head->ai_next == NULL);
+    assert(head->ai_canonname != NULL && strcmp(head->ai_canonname, "v4") == 0);
+    assert(g_freeaddrinfo_calls == 2);
+
+    head->ai_next = make_result_node(AF_INET, NULL);
+    assert(!chaos_dns_filter_result_list(&head, CHAOS_DNS_FAMILY_ANY));
+    assert(chaos_dns_result_count(head) == 2U);
+    assert(g_freeaddrinfo_calls == 2);
+
+    chaos_dns_limit_result_list(&head, 5U);
+    assert(chaos_dns_result_count(head) == 2U);
+    assert(g_freeaddrinfo_calls == 2);
+    chaos_dns_test_freeaddrinfo(head);
+
+    g_freeaddrinfo_calls = 0;
+    head = NULL;
+    chaos_dns_limit_result_list(NULL, 0U);
+    chaos_dns_limit_result_list(NULL, 1U);
+    chaos_dns_limit_result_list(&head, 0U);
+    chaos_dns_limit_result_list(&head, 1U);
+    assert(head == NULL && g_freeaddrinfo_calls == 0);
+
+    /* No real freeaddrinfo resolved: the node is unlinked, not freed. */
+    g_chaos_dns_real_freeaddrinfo = NULL;
+    head = make_result_node(AF_INET6, NULL);
+    dropped = head;
+    head->ai_next = make_result_node(AF_INET, NULL);
+    assert(chaos_dns_filter_result_list(&head, CHAOS_DNS_FAMILY_INET4));
+    assert(head != dropped && head->ai_family == AF_INET && head->ai_next == NULL);
+    assert(dropped->ai_next == NULL);
+    assert(g_freeaddrinfo_calls == 0);
+    chaos_dns_test_freeaddrinfo(dropped);
+    chaos_dns_test_freeaddrinfo(head);
+
+    chaos_dns_rule_apply_latency(NULL);
+}
+
 int main(void)
 {
     test_canonname_and_owned_lists();
@@ -508,5 +576,6 @@ int main(void)
     test_latency_and_count_helpers();
     test_filter_and_limit_helpers();
     test_shuffle_helper();
+    test_filter_and_limit_edges();
     return 0;
 }

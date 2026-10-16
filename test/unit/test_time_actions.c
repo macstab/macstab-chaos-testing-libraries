@@ -54,6 +54,8 @@ static int g_nanosleep_calls = 0;
  * Tests set this before calling the action under test.
  */
 static int g_nanosleep_eintr_count = 0;
+/** @brief When non-zero, the nanosleep stub fails with this errno (not retried unless EINTR). */
+static int g_nanosleep_error = 0;
 /** @brief The `request` argument captured by the most recent nanosleep stub call. */
 static struct timespec g_last_nanosleep_request;
 
@@ -100,6 +102,11 @@ static int chaos_time_test_nanosleep(const struct timespec *request, struct time
         errno = EINTR;
         return -1;
     }
+    if (g_nanosleep_error != 0)
+    {
+        errno = g_nanosleep_error;
+        return -1;
+    }
     if (remaining != NULL)
     {
         remaining->tv_sec = 0;
@@ -124,6 +131,7 @@ static void reset_action_state(void)
     g_sleep_count = 0U;
     g_nanosleep_calls = 0;
     g_nanosleep_eintr_count = 0;
+    g_nanosleep_error = 0;
     g_last_nanosleep_request.tv_sec = 0;
     g_last_nanosleep_request.tv_nsec = 0L;
     for (index = 0U; index < sizeof(g_sleep_chunks) / sizeof(g_sleep_chunks[0]); ++index)
@@ -167,6 +175,8 @@ static void test_probability_helpers(void)
  * - 1 ms → `g_sleep_count == 0`, `g_nanosleep_calls == 1`,
  *   `g_last_nanosleep_request.tv_nsec == 1000000`.
  * - 1 ms with one EINTR → `g_nanosleep_calls == 2`.
+ * - 1 ms with nanosleep failing EINVAL → one call, no retry; errno untouched.
+ * - No real usleep or nanosleep → no sleep; NULL rule or ERRNO rule → no sleep.
  * - probability=0.0 → both counters remain 0.
  */
 static void test_latency_helper(void)
@@ -215,6 +225,33 @@ static void test_latency_helper(void)
     rule.latency_ms = 100U;
     chaos_time_rule_apply_latency(&rule);
     assert(g_sleep_count == 0U);
+
+    /* No rule, or a rule of another effect, never sleeps. */
+    rule.probability = 1.0;
+    chaos_time_rule_apply_latency(NULL);
+    rule.effect = CHAOS_TIME_EFFECT_ERRNO;
+    chaos_time_rule_apply_latency(&rule);
+    assert(g_sleep_count == 0U);
+
+    /* A nanosleep failure other than EINTR ends the chunk instead of retrying it; the
+     * caller's errno survives. */
+    reset_action_state();
+    g_chaos_time_real_nanosleep = chaos_time_test_nanosleep;
+    g_nanosleep_error = EINVAL;
+    rule.effect = CHAOS_TIME_EFFECT_LATENCY;
+    rule.latency_ms = 1U;
+    errno = 4242;
+    chaos_time_rule_apply_latency(&rule);
+    assert(g_nanosleep_calls == 1);
+    assert(errno == 4242);
+
+    /* With neither real sleep function resolved, the delay is skipped. */
+    reset_action_state();
+    errno = 4242;
+    chaos_time_rule_apply_latency(&rule);
+    assert(g_sleep_count == 0U);
+    assert(g_nanosleep_calls == 0);
+    assert(errno == 4242);
 }
 
 /**
@@ -237,6 +274,8 @@ static void test_latency_helper(void)
  * - `add_offset_ms({1s, 900ms}, 200)` → {2s, 100ms} (nanosecond carry).
  * - `apply_offset(NULL, &value)` → no crash; value unchanged.
  * - `apply_offset(&rule, NULL)` → no crash.
+ * - errno: probability=0.0 or a LATENCY rule → false, errno untouched.
+ * - offset: probability=0.0 or a REGRESS rule → value unchanged.
  */
 static void test_errno_and_offset_helpers(void)
 {
@@ -252,6 +291,15 @@ static void test_errno_and_offset_helpers(void)
     assert(chaos_time_rule_apply_errno(&rule));
     assert(errno == EINVAL);
     assert(!chaos_time_rule_apply_errno(NULL));
+
+    /* A rule that does not fire, or one of another effect, leaves errno alone. */
+    errno = 4242;
+    rule.probability = 0.0;
+    assert(!chaos_time_rule_apply_errno(&rule));
+    rule.probability = 1.0;
+    rule.effect = CHAOS_TIME_EFFECT_LATENCY;
+    assert(!chaos_time_rule_apply_errno(&rule));
+    assert(errno == 4242);
 
     reset_action_state();
     (void)memset(&rule, 0, sizeof(rule));
@@ -302,6 +350,15 @@ static void test_errno_and_offset_helpers(void)
     assert(value.tv_sec == 7);
     assert(value.tv_nsec == 0L);
     chaos_time_rule_apply_offset(&rule, NULL);
+
+    /* An offset that does not fire, or a rule of another effect, shifts nothing. */
+    rule.probability = 0.0;
+    chaos_time_rule_apply_offset(&rule, &value);
+    rule.probability = 1.0;
+    rule.effect = CHAOS_TIME_EFFECT_REGRESS;
+    chaos_time_rule_apply_offset(&rule, &value);
+    assert(value.tv_sec == 7);
+    assert(value.tv_nsec == 0L);
 }
 
 /**
@@ -381,7 +438,8 @@ static void test_should_trigger_honours_qualifiers(void)
 
 /**
  * @brief Invariant: REGRESS leaves the first read real, jumps back on a later read
- *   where it fires, and stays shifted after that; without a slot it does nothing.
+ *   where it fires, and stays shifted after that; without a slot, or with a slot
+ *   that now belongs to another rule, it does nothing.
  */
 static void test_regress_goes_back_once(void)
 {
@@ -430,6 +488,13 @@ static void test_regress_goes_back_once(void)
     chaos_time_rule_apply_regress(&rule, &value);
     assert(value.tv_sec == 101 && slot.state == 3U);
     slot.state = 2U;
+
+    /* A slot handed to another rule since this copy was taken shifts nothing. */
+    slot.generation = 1U;
+    value.tv_sec = 101;
+    chaos_time_rule_apply_regress(&rule, &value);
+    assert(value.tv_sec == 101 && slot.state == 2U);
+    slot.generation = 0U;
 
     rule.effect = CHAOS_TIME_EFFECT_OFFSET;
     value.tv_sec = 101;

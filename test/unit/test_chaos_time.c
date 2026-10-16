@@ -120,7 +120,8 @@ static void reset_wrapper_state(void)
     size_t operation_index;
 
     chaos_time_test_reset_runtime();
-    for (effect_index = 0U; effect_index < 3U; ++effect_index)
+    /* Every effect row, REGRESS included: a match left set leaks into later tests. */
+    for (effect_index = 0U; effect_index <= (size_t)CHAOS_TIME_EFFECT_REGRESS; ++effect_index)
     {
         for (operation_index = 0U; operation_index < 3U; ++operation_index)
         {
@@ -947,6 +948,84 @@ static void test_clock_read_applies_regress(void)
     assert(g_regress_calls == 1);
 }
 
+/**
+ * @brief Invariant: an ERRNO rule that matches but does not fire leaves every wrapper
+ *   to the real call; clock_gettime with no buffer skips the rules; an injected
+ *   nanosleep error other than EINTR leaves `remaining` alone; an absolute
+ *   clock_nanosleep with only a REGRESS rule keeps its deadline until the clock jumped.
+ *
+ * Expected observable behaviour:
+ * - clock_gettime, nanosleep, sleep, clock_nanosleep and usleep each return the real
+ *   stub's success value, and each real stub ran once.
+ * - clock_gettime(CLOCK_REALTIME, NULL) with a firing ERRNO rule: the real call's
+ *   EFAULT, not the rule's EINVAL.
+ * - nanosleep with an injected EINVAL: -1, errno EINVAL, `remaining` untouched.
+ * - TIMER_ABSTIME with a REGRESS rule only: the deadline is offered for conversion and,
+ *   unchanged, reaches the real clock_nanosleep.
+ */
+static void test_rules_that_do_not_fire(void)
+{
+    struct timespec value;
+    struct timespec request;
+    struct timespec remaining;
+
+    request.tv_sec = 2;
+    request.tv_nsec = 300000000L;
+
+    reset_wrapper_state();
+    g_real_sleep_calls = 0;
+    g_chaos_time_real_clock_gettime = chaos_time_test_clock_gettime;
+    g_chaos_time_real_nanosleep = chaos_time_test_nanosleep;
+    g_chaos_time_real_sleep = chaos_time_test_sleep;
+    g_chaos_time_real_clock_nanosleep = chaos_time_test_clock_nanosleep;
+    g_chaos_time_real_usleep = chaos_time_test_usleep;
+    g_stub_match[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_CLOCK_GETTIME] = 1;
+    g_stub_rules[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_CLOCK_GETTIME].effect =
+        CHAOS_TIME_EFFECT_ERRNO;
+    g_stub_rules[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_CLOCK_GETTIME].errnum = EINVAL;
+    g_stub_match[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_NANOSLEEP] = 1;
+    g_stub_rules[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_NANOSLEEP].effect = CHAOS_TIME_EFFECT_ERRNO;
+    g_stub_rules[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_NANOSLEEP].errnum = EINVAL;
+    g_stub_match[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_USLEEP] = 1;
+    g_stub_rules[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_USLEEP].effect = CHAOS_TIME_EFFECT_ERRNO;
+    g_stub_rules[CHAOS_TIME_EFFECT_ERRNO][CHAOS_TIME_OP_USLEEP].errnum = EINVAL;
+
+    assert(clock_gettime(CLOCK_MONOTONIC, &value) == 0);
+    assert(value.tv_sec == 10);
+    assert(nanosleep(&request, &remaining) == 0);
+    assert(sleep(3U) == 0U);
+    assert(clock_nanosleep(CLOCK_MONOTONIC, 0, &request, &remaining) == 0);
+    assert(usleep(1234U) == 0);
+    assert(g_real_clock_gettime_calls == 1);
+    assert(g_real_nanosleep_calls == 1);
+    assert(g_real_sleep_calls == 1);
+    assert(g_real_clock_nanosleep_calls == 1);
+    assert(g_real_usleep_calls == 1);
+
+    /* An injected error other than EINTR does not report time left. */
+    g_errno_trigger = 1;
+    remaining.tv_sec = 9;
+    remaining.tv_nsec = 9L;
+    errno = 0;
+    assert(nanosleep(&request, &remaining) == -1);
+    assert(errno == EINVAL);
+    assert(remaining.tv_sec == 9 && remaining.tv_nsec == 9L);
+    assert(g_real_nanosleep_calls == 1);
+
+    /* An absolute deadline with only a REGRESS rule: offered for conversion, and
+     * unchanged (the stub converts only OFFSET) it reaches the real call. */
+    reset_wrapper_state();
+    g_unshift_calls = 0;
+    g_chaos_time_real_clock_nanosleep = chaos_time_test_clock_nanosleep;
+    g_stub_match[CHAOS_TIME_EFFECT_REGRESS][CHAOS_TIME_OP_CLOCK_GETTIME] = 1;
+    g_stub_rules[CHAOS_TIME_EFFECT_REGRESS][CHAOS_TIME_OP_CLOCK_GETTIME].effect =
+        CHAOS_TIME_EFFECT_REGRESS;
+    assert(clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &request, NULL) == 0);
+    assert(g_unshift_calls == 1);
+    assert(g_real_clock_nanosleep_calls == 1);
+    assert(g_real_clock_nanosleep_request.tv_sec == request.tv_sec);
+}
+
 int main(void)
 {
     test_clock_read_applies_regress();
@@ -958,5 +1037,6 @@ int main(void)
     test_time_paths();
     test_clock_nanosleep_paths();
     test_sleep_and_timespec_get_paths();
+    test_rules_that_do_not_fire();
     return 0;
 }

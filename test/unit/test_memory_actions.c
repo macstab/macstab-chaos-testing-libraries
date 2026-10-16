@@ -80,6 +80,7 @@ static void test_probability_helpers(void)
  * - LATENCY, probability=1.0, latency_ms=2500: one sleep of {2 s, 500 ms}.
  * - Same with one EINTR: a second sleep for the remaining time; errno untouched.
  * - probability=0.0, latency_ms=100: no sleep.
+ * - NULL rule, or an ERRNO rule: no sleep.
  */
 static void test_latency_helper(void)
 {
@@ -108,6 +109,13 @@ static void test_latency_helper(void)
     rule.latency_ms = 100U;
     chaos_memory_rule_apply_latency(&rule);
     assert(g_test_sleep_calls == 0U);
+
+    /* No rule, or a rule of another effect, never sleeps. */
+    rule.probability = 1.0;
+    chaos_memory_rule_apply_latency(NULL);
+    rule.effect = CHAOS_MEMORY_EFFECT_ERRNO;
+    chaos_memory_rule_apply_latency(&rule);
+    assert(g_test_sleep_calls == 0U);
 }
 
 /**
@@ -122,6 +130,7 @@ static void test_latency_helper(void)
  *   ENOMEM is the canonical allocation-failure code for memory interceptors and is used here
  *   to verify that the specific error code from the rule is what actually gets injected.
  * - `apply_errno(NULL)` → false (NULL guard).
+ * - probability=0.0, or a LATENCY rule → false; errno untouched.
  */
 static void test_errno_helper(void)
 {
@@ -136,6 +145,15 @@ static void test_errno_helper(void)
     assert(chaos_memory_rule_apply_errno(&rule));
     assert(errno == ENOMEM);
     assert(!chaos_memory_rule_apply_errno(NULL));
+
+    /* A rule that does not fire, or one of another effect, leaves errno alone. */
+    errno = 4242;
+    rule.probability = 0.0;
+    assert(!chaos_memory_rule_apply_errno(&rule));
+    rule.probability = 1.0;
+    rule.effect = CHAOS_MEMORY_EFFECT_LATENCY;
+    assert(!chaos_memory_rule_apply_errno(&rule));
+    assert(errno == 4242);
 }
 
 /**

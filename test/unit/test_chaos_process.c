@@ -1300,6 +1300,79 @@ static void test_exec_family_paths(void)
     assert(g_real_exec_family_calls == 5);
 }
 
+/**
+ * @brief Invariant: ERRNO and FAIL_AFTER rules that match but do not fire leave every
+ *   wrapper to the real call; fexecve under the guard skips the rules.
+ *
+ * Triggering condition: an ERRNO and a FAIL_AFTER rule matched for every operation
+ *   while the stubs report that neither fired; then fexecve with the guard set while
+ *   its ERRNO rule would fire.
+ *
+ * Expected observable behaviour: each wrapper returns the real stub's result and each
+ *   real stub ran; the guarded fexecve reaches the real fexecve (ENOENT), not EACCES.
+ */
+static void test_rules_that_do_not_fire(void)
+{
+    pthread_t thread = (pthread_t)0;
+    pid_t pid = 0;
+    char *argv[] = {(char *)"echo", NULL};
+    char *envp[] = {NULL};
+    int operation;
+
+    reset_wrapper_state();
+    g_real_exec_family_calls = 0;
+    g_chaos_process_real_pthread_create = stub_pthread_create;
+    g_chaos_process_real_fork = stub_fork;
+    g_chaos_process_real_posix_spawn = stub_posix_spawn;
+    g_chaos_process_real_posix_spawnp = stub_posix_spawnp;
+    g_chaos_process_real_execve = stub_execve;
+#ifdef __linux__
+    g_chaos_process_real_execveat = stub_execveat;
+#endif
+    g_chaos_process_real_waitpid = stub_waitpid;
+    g_chaos_process_real_execvpe = stub_execvpe;
+    g_chaos_process_real_fexecve = stub_fexecve;
+    for (operation = 0; operation < (int)CHAOS_PROCESS_OP_COUNT; ++operation)
+    {
+        g_stub_match[CHAOS_PROCESS_EFFECT_ERRNO][operation] = 1;
+        g_stub_rules[CHAOS_PROCESS_EFFECT_ERRNO][operation].effect = CHAOS_PROCESS_EFFECT_ERRNO;
+        g_stub_rules[CHAOS_PROCESS_EFFECT_ERRNO][operation].errnum = EACCES;
+        g_stub_match[CHAOS_PROCESS_EFFECT_FAIL_AFTER][operation] = 1;
+        g_stub_rules[CHAOS_PROCESS_EFFECT_FAIL_AFTER][operation].effect =
+            CHAOS_PROCESS_EFFECT_FAIL_AFTER;
+        g_stub_rules[CHAOS_PROCESS_EFFECT_FAIL_AFTER][operation].errnum = ENOMEM;
+    }
+
+    assert(chaos_process_test_pthread_create_wrapper(&thread, NULL, stub_start_routine, NULL) == 0);
+    assert(chaos_process_test_fork_wrapper() == 123);
+    assert(chaos_process_test_posix_spawn_wrapper(&pid, "/bin/echo", NULL, NULL, argv, envp) == 0);
+    assert(chaos_process_test_posix_spawnp_wrapper(&pid, "echo", NULL, NULL, argv, envp) == 0);
+    assert(chaos_process_test_execve_wrapper("/bin/echo", argv, envp) == 0);
+#ifdef __linux__
+    assert(chaos_process_test_execveat_wrapper(AT_FDCWD, "/bin/echo", argv, envp, 0) == 0);
+    assert(g_real_execveat_calls == 1);
+#endif
+    assert(chaos_process_test_waitpid_wrapper(456, NULL, WNOHANG) == 321);
+    errno = 0;
+    assert(chaos_process_test_execvpe_wrapper("echo", argv, envp) == -1);
+    assert(errno == ENOENT);
+    assert(g_real_pthread_create_calls == 1);
+    assert(g_real_fork_calls == 1);
+    assert(g_real_posix_spawn_calls == 1);
+    assert(g_real_posix_spawnp_calls == 1);
+    assert(g_real_execve_calls == 1);
+    assert(g_real_waitpid_calls == 1);
+    assert(g_real_exec_family_calls == 1);
+
+    g_errno_trigger = 1;
+    g_chaos_process_tls_guard = 1;
+    errno = 0;
+    assert(chaos_process_test_fexecve_wrapper(3, argv, envp) == -1);
+    assert(errno == ENOENT);
+    g_chaos_process_tls_guard = 0;
+    assert(g_real_exec_family_calls == 2);
+}
+
 int main(void)
 {
     test_call_real_helpers();
@@ -1314,5 +1387,6 @@ int main(void)
     test_waitpid_paths();
     test_wait_family_paths();
     test_exec_family_paths();
+    test_rules_that_do_not_fire();
     return 0;
 }
