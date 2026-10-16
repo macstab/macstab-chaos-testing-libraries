@@ -7,7 +7,8 @@
  * (CLONE_THREAD) is pthread_create, a child that shares the memory until it
  * executes (CLONE_VFORK, as posix_spawn() and Go's os/exec make it) is
  * posix_spawn, any other child is fork. posix_spawnp cannot be told from
- * posix_spawn here: the path search happens in the C library.
+ * posix_spawn here: the path search happens in the C library, so a posix_spawnp
+ * rule, which could never fire, rejects its file (CHAOS_PROCESS_RULE_SUPPORTED).
  *
  * As in the hooks: LATENCY delays the call, then ERRNO or FAIL_AFTER fails it.
  * FAIL_AFTER counts calls per operation in each process, from 0 again after a
@@ -16,6 +17,10 @@
  */
 
 #include "chaos_init_process.h"
+
+struct chaos_process_rule;
+static int chaos_init_process_supported(const struct chaos_process_rule *rule);
+#define CHAOS_PROCESS_RULE_SUPPORTED(rule) chaos_init_process_supported(rule)
 
 #include "../process/chaos_process_actions.c"
 #include "../process/chaos_process_config.c"
@@ -31,6 +36,12 @@ __thread int g_chaos_process_tls_guard = 0;
 __thread uint64_t g_chaos_process_tls_prng_state = 0U;
 uint64_t g_chaos_process_process_seed = UINT64_C(0xbb67ae8584caa73b);
 volatile uint64_t g_chaos_process_fail_after_counters[CHAOS_PROCESS_OP_COUNT] = {0U};
+
+static int chaos_init_process_supported(const struct chaos_process_rule *rule)
+{
+    return rule->selector.kind != CHAOS_PROCESS_SELECTOR_OPERATION ||
+           rule->selector.operation != CHAOS_PROCESS_OP_POSIX_SPAWNP;
+}
 
 /* Per-process hit slots and FAIL_AFTER counters of the process rules. */
 CHAOS_INIT_RULES_STORAGE(g_chaos_init_process, CHAOS_PROCESS_MAX_RULES);

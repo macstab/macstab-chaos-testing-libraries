@@ -88,9 +88,10 @@ No rule of that file applies.
 | io TORN, CORRUPT; net CORRUPT, TRICKLE, DUP | They change data the kernel moves. Seccomp can fail or delay a call, not change what it transfers. |
 | net RESET | It needs the socket itself (SO_LINGER). Taking another process's descriptor (`pidfd_getfd`) needs CAP_SYS_PTRACE. |
 | io and net ERRNO on close | The libraries close, then report the error, as Linux does for a failing close. A notified call either runs or fails, not both. |
+| process posix_spawnp | The path search is in the C library; the system calls are those of posix_spawn, whose rules apply to it. |
 
 The check is a build hook in the parsers (`CHAOS_IO_RULE_SUPPORTED`,
-`CHAOS_NET_RULE_SUPPORTED`), so the status file reports the rejection together with
+`CHAOS_NET_RULE_SUPPORTED`, `CHAOS_PROCESS_RULE_SUPPORTED`), so the status file reports the rejection together with
 the load, never a passing `state=ok` first.
 
 ## 5. How calls map to the libraries' operations
@@ -99,7 +100,9 @@ the load, never a passing `state=ok` first.
 - clone with CLONE_THREAD is pthread_create. With CLONE_VFORK (glibc's posix_spawn,
   Go's os/exec) it is posix_spawn. Otherwise it is fork. clone3 is classified by the
   flags in its argument structure. posix_spawnp cannot be told from posix_spawn: the
-  path search is in the C library.
+  path search is in the C library, so posix_spawn rules apply to it, and a
+  posix_spawnp rule rejects its file (§4). system() and popen() are posix_spawn, as
+  in the library.
 - wait4 and waitid are waitpid.
 - The first execve of the application, the one that starts it, is never faulted. With
   `LD_PRELOAD` the library is not loaded at that point either. chaos-init looks a

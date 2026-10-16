@@ -148,6 +148,20 @@ int main(void)
     assert(decide(__NR_clone, SIGCHLD).action == CHAOS_INIT_PASS);
     g_fail_process = 0;
 
+    /* posix_spawnp cannot be told from posix_spawn: its rule rejects the file. */
+    write_rules("fork:ERRNO:ENOMEM\nposix_spawnp:ERRNO:EPERM\n");
+    assert(decide(__NR_clone, SIGCHLD).action == CHAOS_INIT_PASS);
+    {
+        char status[256] = {0};
+        FILE *file = fopen("/tmp/.chaos-process.status", "r");
+
+        assert(file != NULL && fread(status, 1U, sizeof(status) - 1U, file) > 0U);
+        (void)fclose(file);
+        assert(strstr(status, "line=2\nreason=unsupported in seccomp mode\n") != NULL);
+    }
+    write_rules("*:ERRNO:ENOMEM\n");
+    assert(fails(decide(__NR_clone, SIGCHLD), ENOMEM));
+
     (void)snprintf(hits, sizeof(hits), "/tmp/.chaos-process.hits.%ld", (long)getpid());
     assert(access(hits, F_OK) == 0);
     (void)unlink(hits);
