@@ -31,6 +31,10 @@ cc -D_GNU_SOURCE -I"$ROOT_DIR/src" -I"$ROOT_DIR/src/common" -I"$ROOT_DIR/src/net
     -I"$ROOT_DIR/src/init" -std=c99 -Wall -Wextra -Werror -pedantic -O1 \
     -o "$TMP_DIR/mptcp_probe" "$ROOT_DIR/test/runtime/mptcp_probe.c"
 
+# What decides whether sock_diag can answer for MPTCP sockets.
+echo "kernel $(uname -r); net.mptcp.enabled=$(cat /proc/sys/net/mptcp/enabled 2>/dev/null || echo none);" \
+    "mptcp_diag $(grep -q '^mptcp_diag ' /proc/modules 2>/dev/null && echo loaded || echo 'not loaded');" \
+    "module $(find /lib/modules/"$(uname -r)" -name 'mptcp_diag*' 2>/dev/null | head -1 || true)"
 rc=0
 "$TMP_DIR/mptcp_probe" || rc=$?
 if [ "$rc" = 77 ]; then

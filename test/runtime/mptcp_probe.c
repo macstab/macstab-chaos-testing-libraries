@@ -122,6 +122,48 @@ int main(void)
         perror("accept");
         return 1;
     }
+    /* What sock_diag answers when asked for MPTCP sockets at all. */
+    {
+        struct
+        {
+            struct nlmsghdr header;
+            struct inet_diag_req_v2 request;
+            struct rtattr attribute;
+            uint32_t protocol;
+        } query;
+        static long answer[2048];
+        const int link = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_SOCK_DIAG);
+        ssize_t got;
+
+        memset(&query, 0, sizeof(query));
+        query.header.nlmsg_len = (uint32_t)sizeof(query);
+        query.header.nlmsg_type = SOCK_DIAG_BY_FAMILY;
+        query.header.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+        query.request.sdiag_family = AF_INET;
+        query.request.idiag_states = ~0U;
+        query.attribute.rta_len = (unsigned short)RTA_LENGTH(sizeof(query.protocol));
+        query.attribute.rta_type = INET_DIAG_REQ_PROTOCOL;
+        query.protocol = IPPROTO_MPTCP;
+        if (link >= 0 && send(link, &query, sizeof(query), 0) == (ssize_t)sizeof(query) &&
+            (got = recv(link, answer, sizeof(answer), 0)) > 0)
+        {
+            const struct nlmsghdr *first = (const struct nlmsghdr *)(const void *)answer;
+
+            (void)printf(
+                "sock_diag for MPTCP: %ld bytes, first message type %u%s%d\n",
+                (long)got,
+                (unsigned)first->nlmsg_type,
+                first->nlmsg_type == NLMSG_ERROR ? ", error " : ", ",
+                first->nlmsg_type == NLMSG_ERROR
+                    ? ((const struct nlmsgerr *)NLMSG_DATA(first))->error
+                    : 0
+            );
+        }
+        if (link >= 0)
+        {
+            (void)close(link);
+        }
+    }
     check("MPTCP listener", listener);
     check("MPTCP client", client);
     check("MPTCP accepted", server);
