@@ -181,7 +181,7 @@ The grammar is continuously validated by the property-based parser test suite.
 Run it to confirm all six parsers accept valid inputs and reject malformed ones:
 
 ```sh verified
-make unit 2>&1 | grep -E 'PROPTEST|test_config|OK'
+make unit 2>&1 | grep -E 'PROPTEST|test_config|OK|Assertion|Abort|Error'
 ```
 
 ---
