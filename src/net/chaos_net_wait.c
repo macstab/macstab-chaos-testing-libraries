@@ -41,7 +41,9 @@
  *
  * @par TIMEOUT effect:
  * When a TIMEOUT rule fires, the interposed wrapper does NOT call the real wait
- * syscall. It waits out the call's own timeout, as if nothing became ready, then:
+ * syscall. It waits out the call's own timeout, as if nothing became ready (a
+ * ppoll on no descriptors, under ppoll's, pselect's or epoll_pwait's signal mask,
+ * so a signal ends it with EINTR as it would end the real wait), then:
  *   - For poll/ppoll: zeroes all revents fields and returns 0 (timeout).
  *   - For select/pselect: zeroes all fd_sets and returns 0 (timeout); select's
  *     timeout reads 0 afterwards, as Linux leaves it.
@@ -58,7 +60,6 @@
 #include "chaos_net_config.h"
 #include "chaos_net_endpoint.h"
 #include "chaos_net_internal.h"
-#include "chaos_sleep.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -66,6 +67,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 
 /**
@@ -342,8 +344,28 @@ static int chaos_net_wait_match_epoll(int epfd, chaos_net_rule_t *rule)
  * @return 0 to indicate the real syscall should proceed or a synthetic timeout
  *         should be returned; -1 if ERRNO injection fired (set errno, skip real call).
  */
-static int
-chaos_net_wait_pre_call(const chaos_net_rule_t *rule, int64_t timeout_ms, int *synthetic_timeout)
+/**
+ * @brief The wait of a firing TIMEOUT: ppoll on no descriptors for @p wait under
+ *        @p sigmask (NULL: the thread's own), with the kernel's 8-byte signal set.
+ *        Unit tests replace it.
+ */
+#ifndef CHAOS_NET_TIMEOUT_WAIT
+#define CHAOS_NET_TIMEOUT_WAIT(wait, sigmask)                                                      \
+    syscall(SYS_ppoll, NULL, 0, (wait), (sigmask), (size_t)8U)
+#endif
+
+/**
+ * @brief chaos_net_wait_pre_call() for a wait that runs under @p sigmask (ppoll,
+ *        pselect, epoll_pwait): a firing TIMEOUT waits under it too.
+ * @return As chaos_net_wait_pre_call(); -1 with errno EINTR when a signal ends
+ *         the TIMEOUT's wait, as it would end the real one.
+ */
+static int chaos_net_wait_pre_call_masked(
+    const chaos_net_rule_t *rule,
+    int64_t timeout_ms,
+    const sigset_t *sigmask,
+    int *synthetic_timeout
+)
 {
     if (synthetic_timeout != NULL)
     {
@@ -365,7 +387,14 @@ chaos_net_wait_pre_call(const chaos_net_rule_t *rule, int64_t timeout_ms, int *s
     if (rule->effect == CHAOS_NET_EFFECT_TIMEOUT && timeout_ms >= 0 &&
         chaos_net_rule_should_trigger(rule))
     {
-        chaos_sleep_ms((uint64_t)timeout_ms);
+        struct timespec wait;
+
+        wait.tv_sec = (time_t)(timeout_ms / 1000);
+        wait.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
+        if (CHAOS_NET_TIMEOUT_WAIT(&wait, sigmask) != 0)
+        {
+            return -1;
+        }
         if (synthetic_timeout != NULL)
         {
             *synthetic_timeout = 1;
@@ -373,6 +402,12 @@ chaos_net_wait_pre_call(const chaos_net_rule_t *rule, int64_t timeout_ms, int *s
         return 0;
     }
     return 0;
+}
+
+static int
+chaos_net_wait_pre_call(const chaos_net_rule_t *rule, int64_t timeout_ms, int *synthetic_timeout)
+{
+    return chaos_net_wait_pre_call_masked(rule, timeout_ms, NULL, synthetic_timeout);
 }
 
 /** @brief Milliseconds of a timespec timeout, rounded up; -1 for none (NULL). */
@@ -605,8 +640,9 @@ ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout, const sig
     {
         return chaos_net_call_real_ppoll(fds, nfds, timeout, sigmask);
     }
-    if (chaos_net_wait_pre_call(&rule, chaos_net_wait_timespec_ms(timeout), &synthetic_timeout) !=
-        0)
+    if (chaos_net_wait_pre_call_masked(
+            &rule, chaos_net_wait_timespec_ms(timeout), sigmask, &synthetic_timeout
+        ) != 0)
     {
         return -1;
     }
@@ -677,8 +713,9 @@ CHAOS_NET_EXPORT int pselect(
     {
         return chaos_net_call_real_pselect(nfds, readfds, writefds, exceptfds, timeout, sigmask);
     }
-    if (chaos_net_wait_pre_call(&rule, chaos_net_wait_timespec_ms(timeout), &synthetic_timeout) !=
-        0)
+    if (chaos_net_wait_pre_call_masked(
+            &rule, chaos_net_wait_timespec_ms(timeout), sigmask, &synthetic_timeout
+        ) != 0)
     {
         return -1;
     }
@@ -741,8 +778,9 @@ CHAOS_NET_EXPORT int epoll_pwait(
     {
         return chaos_net_call_real_epoll_pwait(epfd, events, maxevents, timeout, sigmask);
     }
-    if (chaos_net_wait_pre_call(&rule, timeout < 0 ? -1 : (int64_t)timeout, &synthetic_timeout) !=
-        0)
+    if (chaos_net_wait_pre_call_masked(
+            &rule, timeout < 0 ? -1 : (int64_t)timeout, sigmask, &synthetic_timeout
+        ) != 0)
     {
         return -1;
     }

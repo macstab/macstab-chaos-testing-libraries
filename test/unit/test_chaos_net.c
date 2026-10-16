@@ -1148,6 +1148,24 @@ static void chaos_net_test_dup_unmap(void *address, size_t size)
 #undef snprintf
 #define snprintf chaos_net_test_wait_snprintf
 #endif
+/* The wait of a firing TIMEOUT: recorded, and failing with EINTR on request. */
+static int g_timeout_wait_calls = 0;
+static int g_timeout_wait_interrupted = 0;
+static const sigset_t *g_timeout_wait_mask = NULL;
+static struct timespec g_timeout_wait_for;
+static long chaos_net_test_timeout_wait(const struct timespec *wait, const sigset_t *sigmask)
+{
+    ++g_timeout_wait_calls;
+    g_timeout_wait_for = *wait;
+    g_timeout_wait_mask = sigmask;
+    if (g_timeout_wait_interrupted)
+    {
+        errno = EINTR;
+        return -1;
+    }
+    return 0;
+}
+#define CHAOS_NET_TIMEOUT_WAIT(wait, sigmask) chaos_net_test_timeout_wait((wait), (sigmask))
 #include "../../src/net/chaos_net_wait.c"
 #ifdef __linux__
 #undef snprintf
@@ -1775,6 +1793,41 @@ static void test_wait_paths(void)
     assert(ppoll(fds, 1U, &ts, NULL) == 0);
     assert(g_ppoll_calls == 0);
     assert(fds[0].revents == 0);
+
+    /* The TIMEOUT waits out the call's timeout under the call's signal mask; a
+     * signal ends it with EINTR, as it ends the real wait, and nothing is cleared. */
+    {
+        sigset_t mask;
+        struct timespec wait = {1, 250000000L};
+
+        sigemptyset(&mask);
+        g_timeout_wait_calls = 0;
+        fds[0].revents = POLLIN;
+        assert(ppoll(fds, 1U, &wait, &mask) == 0);
+        assert(g_timeout_wait_calls == 1 && g_timeout_wait_mask == &mask);
+        assert(g_timeout_wait_for.tv_sec == 1 && g_timeout_wait_for.tv_nsec == 250000000L);
+        assert(poll(fds, 1U, 20) == 0);
+        assert(g_timeout_wait_calls == 2 && g_timeout_wait_mask == NULL);
+        assert(g_timeout_wait_for.tv_sec == 0 && g_timeout_wait_for.tv_nsec == 20000000L);
+        g_timeout_wait_interrupted = 1;
+        fds[0].revents = POLLIN;
+        errno = 0;
+        assert(ppoll(fds, 1U, &wait, &mask) == -1 && errno == EINTR);
+        assert(fds[0].revents == POLLIN && g_ppoll_calls == 0);
+        errno = 0;
+        assert(poll(fds, 1U, 20) == -1 && errno == EINTR);
+        assert(g_poll_calls == 0);
+        g_timeout_wait_interrupted = 0;
+#ifdef SYS_ppoll
+        /* The default wait's own call: no descriptors and the kernel's 8-byte
+         * signal set, under a mask or without one. */
+        wait.tv_sec = 0;
+        wait.tv_nsec = 1000000L;
+        assert(syscall(SYS_ppoll, NULL, 0, &wait, &mask, (size_t)8U) == 0);
+        wait.tv_nsec = 1000000L;
+        assert(syscall(SYS_ppoll, NULL, 0, &wait, NULL, (size_t)8U) == 0);
+#endif
+    }
 
     reset_wrapper_stubs();
     fds[0].fd = 9;

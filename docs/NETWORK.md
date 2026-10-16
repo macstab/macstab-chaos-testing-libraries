@@ -826,6 +826,9 @@ The library should preserve the same operational principle as `libchaos-io`:
 
 - `TIMEOUT` means a zero-ready result after the caller's own timeout has passed
 - it does not fabricate events, and it does not apply to a wait without a timeout
+- the wait is a real one: a signal ends it with `EINTR`, and `ppoll()`, `pselect()`
+  and `epoll_pwait()` wait under the signal mask the caller passed, so a handler
+  that only runs during the wait (a shutdown signal, say) still runs
 - `select()` leaves 0 in its timeout afterwards, as Linux does; `ppoll()` and
   `pselect()` leave theirs as given
 
