@@ -61,12 +61,15 @@ static void check(const char *what, int fd)
         const int seen_rc =
             peer ? chaos_init_net_getpeername(fd, (struct sockaddr *)&seen, &seen_length)
                  : chaos_init_net_getsockname(fd, (struct sockaddr *)&seen, &seen_length);
+        const int expected = g_unresolvable && strncmp(protocol, "MPTCP", 5U) == 0;
         const int same = real_rc == seen_rc && (real_rc != 0 || (real.ss_family == seen.ss_family &&
                                                                  port_of(&real) == port_of(&seen)));
 
         (void)printf(
             "%s %-24s %-8s inode %-8lu %s: kernel %d port %d, chaos-init %d port %d\n",
-            same ? "ok  " : "FAIL",
+            same       ? "ok  "
+            : expected ? "n/a "
+                       : "FAIL",
             what,
             protocol,
             (unsigned long)info.st_ino,
@@ -76,7 +79,7 @@ static void check(const char *what, int fd)
             seen_rc,
             seen_rc == 0 ? port_of(&seen) : 0
         );
-        g_failures += same || (g_unresolvable && strncmp(protocol, "MPTCP", 5U) == 0) ? 0 : 1;
+        g_failures += same || expected ? 0 : 1;
     }
 }
 
