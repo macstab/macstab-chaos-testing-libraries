@@ -20,7 +20,9 @@
  *   copy_file_range are writes to their output.
  * - Renames are decided like renameat(): the destination wins on a longer or equal
  *   prefix.
- * - `@first` and hits are per process.
+ * - `@first` and hits are per process; counts follow rule texts, also across two
+ *   reloads between the process's calls.
+ * - /proc, /sys and /dev are never faulted, on either side of a rename.
  */
 
 #include <stdint.h>
@@ -143,6 +145,14 @@ int main(void)
 
     /* Without a rule file every call runs. */
     assert(PASSES(decide(__NR_openat, (uint64_t)AT_FDCWD, P("/tmp/initio/data/x"), 0, 0, 0)));
+    assert(PASSES(decide(
+        __NR_renameat2,
+        (uint64_t)AT_FDCWD,
+        P("/tmp/initio/ren/from/a"),
+        (uint64_t)AT_FDCWD,
+        P("/tmp/initio/x"),
+        0
+    )));
 
     write_rules("/tmp/initio/data:open:EIO:1.0\n"
                 "/tmp/initio/slow:open:LATENCY:25\n"
@@ -177,6 +187,15 @@ int main(void)
     g_fail_cwd = 1;
     assert(PASSES(decide(__NR_openat, (uint64_t)AT_FDCWD, P("data/y"), 0, 0, 0)));
     g_fail_cwd = 0;
+    /* A relative path that fits PATH_MAX alone but not joined to the cwd. */
+    {
+        static char long_path[CHAOS_IO_MAX_PATH];
+
+        memcpy(long_path, "data/", 5U);
+        memset(long_path + 5, 'a', CHAOS_IO_MAX_PATH - 11U);
+        long_path[CHAOS_IO_MAX_PATH - 6U] = '\0';
+        assert(PASSES(decide(__NR_openat, (uint64_t)AT_FDCWD, P(long_path), 0, 0, 0)));
+    }
     assert(chdir("/") == 0);
 
     /* A process that ended after its call matched is not counted, and its call runs. */
@@ -221,6 +240,7 @@ int main(void)
     assert(PASSES(decide(__NR_readv, (uint64_t)big, 0U, 3U, 0, 0)));
     assert(PASSES(decide(__NR_read, 1U, P(buffer), 500U, 0, 0)));
     assert(PASSES(decide(__NR_read, (uint64_t)pipe_fds[0], P(buffer), 500U, 0, 0)));
+    assert(PASSES(decide(__NR_read, 999U, P(buffer), 500U, 0, 0))); /* not open */
 
     /* ENOSPC on writes, also through sendfile and copy_file_range to the file. */
     full = open_file("/tmp/initio/w/f");
@@ -234,6 +254,8 @@ int main(void)
     assert(FAILS(decide(__NR_fsync, (uint64_t)syncing, 0, 0, 0, 0), EIO));
     assert(PASSES(decide(__NR_fdatasync, (uint64_t)syncing, 0, 0, 0, 0)));
     assert(FAILS(decide(__NR_truncate, P("/tmp/initio/t/f"), 0, 0, 0, 0), EROFS));
+    assert(PASSES(decide(__NR_truncate, P("/tmp/initio/data/f"), 0, 0, 0, 0))); /* no rule */
+    assert(PASSES(decide(__NR_truncate, 0U, 0, 0, 0, 0)));                      /* unreadable */
     (void)close(open_file("/tmp/initio/t/f"));
     assert(PASSES(decide(__NR_ftruncate, (uint64_t)full, 0, 0, 0, 0)));
     assert(
@@ -294,6 +316,30 @@ int main(void)
         0
     )));
     assert(PASSES(decide(__NR_renameat2, (uint64_t)AT_FDCWD, 0U, (uint64_t)AT_FDCWD, 0U, 0)));
+    /* Both sides match, the source on the longer prefix: the source's rule. */
+    assert(FAILS(
+        decide(
+            __NR_renameat2,
+            (uint64_t)AT_FDCWD,
+            P("/tmp/initio/ren/from/a"),
+            (uint64_t)AT_FDCWD,
+            P("/tmp/initio/ren/to/b"),
+            0
+        ),
+        EACCES
+    ));
+    /* A destination that cannot be read leaves the source to decide. */
+    assert(FAILS(
+        decide(
+            __NR_renameat2,
+            (uint64_t)AT_FDCWD,
+            P("/tmp/initio/ren/from/a"),
+            (uint64_t)AT_FDCWD,
+            0U,
+            0
+        ),
+        EACCES
+    ));
 #ifdef __NR_rename
     assert(
         FAILS(decide(__NR_rename, P("/tmp/initio/ren/from/a"), P("/tmp/initio/x"), 0, 0, 0), EACCES)
@@ -360,6 +406,43 @@ int main(void)
     write_rules("/tmp/initio/c:close:LATENCY:5\n");
     assert(decide(__NR_close, (uint64_t)closing, 0, 0, 0, 0).action == CHAOS_INIT_DELAY);
 
+    /* /proc is never faulted, also as the source of a rename a rule names it for. */
+    write_rules("/proc:rename_from:EROFS:1.0\n/tmp/initio:rename_from:EROFS:1.0\n");
+    assert(PASSES(decide(
+        __NR_renameat2,
+        (uint64_t)AT_FDCWD,
+        P("/proc/self/x"),
+        (uint64_t)AT_FDCWD,
+        P("/tmp/initio/x"),
+        0
+    )));
+    assert(FAILS(
+        decide(
+            __NR_renameat2,
+            (uint64_t)AT_FDCWD,
+            P("/tmp/initio/x"),
+            (uint64_t)AT_FDCWD,
+            P("/tmp/initio/y"),
+            0
+        ),
+        EROFS
+    ));
+
+    /* The rule file changes twice between two calls the process makes, the second
+     * change bringing back the snapshot buffer of the first: the new text still
+     * starts at zero instead of taking the count of the one it replaced. */
+    write_rules("/tmp/initio/data:open:EIO:1.0 @first=1\n");
+    assert(FAILS(decide(__NR_openat, (uint64_t)AT_FDCWD, P("/tmp/initio/data/x"), 0, 0, 0), EIO));
+    assert(PASSES(decide(__NR_openat, (uint64_t)AT_FDCWD, P("/tmp/initio/data/x"), 0, 0, 0)));
+    write_rules("/tmp/initio/other:open:EIO:1.0\n");
+    assert(PASSES(decide(__NR_openat, (uint64_t)AT_FDCWD, P("/tmp/initio/data/x"), 0, 0, 0)));
+    write_rules("/tmp/initio/data:open:EACCES:1.0 @first=1\n");
+    assert(FAILS(decide(__NR_openat, (uint64_t)AT_FDCWD, P("/tmp/initio/data/x"), 0, 0, 0), EACCES)
+    );
+    assert(PASSES(decide(__NR_openat, (uint64_t)AT_FDCWD, P("/tmp/initio/data/x"), 0, 0, 0)));
+
+    (void)snprintf(buffer, sizeof(buffer), "/tmp/.chaos-io.hits.%ld", (long)getpid());
+    (void)unlink(buffer);
     (void)unlink("/tmp/.chaos-io.conf");
     return 0;
 }

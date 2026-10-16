@@ -16,7 +16,10 @@
  * - LATENCY delays, ERRNO fails, both together delay and then fail;
  * - FAIL_AFTER counts per process and starts over after a reload; a fork child
  *   starts with its parent's counts at the fork, once; a new process that gets
- *   an ended one's entry starts from 0.
+ *   an ended one's entry starts from 0, and so does the child of a fork made
+ *   under an earlier rule load;
+ * - a rule whose probability is 0, or a process that ended, gets neither a delay
+ *   nor an error.
  */
 
 #include <stdint.h>
@@ -176,6 +179,28 @@ int main(void)
         assert(kill(later, SIGKILL) == 0 && waitpid(later, NULL, 0) == later);
     }
 
+    /* The counts of a fork made before a reload are not handed on: the child
+     * starts from 0 under the new rules, as its parent does. */
+    {
+        pid_t forked;
+
+        assert(fails(decide(__NR_wait4, 0U), EINTR)); /* the parent's count is past 1 */
+        assert(decide(__NR_clone, SIGCHLD).action == CHAOS_INIT_PASS);
+        write_rules("waitpid:FAIL_AFTER:EINTR,1 # reloaded again\n");
+        forked = fork();
+        if (forked == 0)
+        {
+            pause();
+            _exit(0);
+        }
+        assert(forked > 0);
+        assert(decide_for(forked, __NR_wait4, 0U).action == CHAOS_INIT_PASS);
+        assert(fails(decide_for(forked, __NR_wait4, 0U), EINTR));
+        assert(kill(forked, SIGKILL) == 0 && waitpid(forked, NULL, 0) == forked);
+        (void)snprintf(hits, sizeof(hits), "/tmp/.chaos-process.hits.%ld", (long)forked);
+        (void)unlink(hits);
+    }
+
     /* A new process in an ended one's entry does not get its counts. */
     g_start_offset = 1U;
     assert(decide(__NR_wait4, 0U).action == CHAOS_INIT_PASS);
@@ -187,7 +212,14 @@ int main(void)
     assert(decide(__NR_wait4, 0U).action == CHAOS_INIT_PASS);
     write_rules("fork:ERRNO:ENOMEM\n");
     assert(decide(__NR_clone, SIGCHLD).action == CHAOS_INIT_PASS);
+    write_rules("fork:LATENCY:10\n");
+    assert(decide(__NR_clone, SIGCHLD).action == CHAOS_INIT_PASS);
     g_fail_process = 0;
+
+    /* A rule whose probability is 0 never fires: no delay, no error. */
+    write_rules("fork:LATENCY:10@0.0\nfork:ERRNO:ENOMEM@0.0\n");
+    verdict = decide(__NR_clone, SIGCHLD);
+    assert(verdict.action == CHAOS_INIT_PASS && verdict.error == 0);
 
     /* posix_spawnp cannot be told from posix_spawn: its rule rejects the file. */
     write_rules("fork:ERRNO:ENOMEM\nposix_spawnp:ERRNO:EPERM\n");

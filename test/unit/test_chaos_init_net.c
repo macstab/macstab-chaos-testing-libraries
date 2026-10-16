@@ -15,12 +15,15 @@
  *
  * Properties under test:
  * - getsockopt(SO_TYPE), getsockname() and getpeername() answer for another
- *   process's descriptor like the kernel would, also for unbound and UNIX sockets.
+ *   process's descriptor like the kernel would, also for unbound, IPv6 and UNIX
+ *   sockets.
  * - Every way a net call names its endpoint (socket spec, sockaddr argument, own
  *   address, peer, msg_name, poll/select/epoll sets) reaches the rule core.
  * - ERRNO fails, LATENCY delays, TIMEOUT returns 0 from the poll family; CORRUPT,
  *   RESET and ERRNO on close are not applied; read/write/close on a non-socket are
  *   left to io.
+ * - A connected socket is matched on one end and then the other; a batch, a poll
+ *   set or a select set is scanned past what does not match, up to its limits.
  */
 
 #include <stddef.h>
@@ -153,6 +156,17 @@ static void test_socket_queries(
         chaos_init_net_getsockopt(pipe_fd, SOL_SOCKET, SO_TYPE, &type, &length) == -1 &&
         errno == ENOTSOCK
     );
+    assert(
+        chaos_init_net_getsockopt(listener, IPPROTO_TCP, SO_TYPE, &type, &length) == -1 &&
+        errno == ENOPROTOOPT
+    );
+    assert(chaos_init_net_getsockopt(listener, SOL_SOCKET, SO_TYPE, NULL, &length) == -1);
+    assert(chaos_init_net_getsockopt(listener, SOL_SOCKET, SO_TYPE, &type, NULL) == -1);
+    length = (socklen_t)sizeof(type) - 1;
+    assert(
+        chaos_init_net_getsockopt(listener, SOL_SOCKET, SO_TYPE, &type, &length) == -1 &&
+        errno == ENOPROTOOPT
+    );
 
     /* Own address and peer from /proc/<pid>/net. */
     length = (socklen_t)sizeof(name);
@@ -269,7 +283,64 @@ static void test_socket_queries(
         chaos_init_net_getsockname(unbound, (struct sockaddr *)&name, &length) == 0 &&
         name.ss_family == AF_UNIX && length == (socklen_t)sizeof(sa_family_t)
     );
+    /* A socket closed between the type lookup and the inode lookup. */
+    g_fake_protocol = "TCP";
+    length = (socklen_t)sizeof(name);
+    assert(
+        chaos_init_net_getsockname(999, (struct sockaddr *)&name, &length) == -1 &&
+        errno == ENOTSOCK
+    );
     g_fake_protocol = NULL;
+    assert(chaos_init_net_getsockname(listener, NULL, &length) == -1);
+    assert(chaos_init_net_getsockname(listener, (struct sockaddr *)&name, NULL) == -1);
+
+    /* IPv6, through an IPv4-mapped peer (no IPv6 address needed): unbound, bound
+     * and not connected (peer port 0), connected. */
+    {
+        struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)&name;
+        struct sockaddr_in6 address;
+        const int v6_unbound = socket(AF_INET6, SOCK_STREAM, 0);
+        const int v6_udp = socket(AF_INET6, SOCK_DGRAM, 0);
+
+        assert(v6_unbound >= 0 && v6_udp >= 0);
+        length = (socklen_t)sizeof(name);
+        assert(
+            chaos_init_net_getsockname(v6_unbound, (struct sockaddr *)&name, &length) == 0 &&
+            in6->sin6_family == AF_INET6 && length == (socklen_t)sizeof(struct sockaddr_in6)
+        );
+        length = (socklen_t)sizeof(name);
+        assert(
+            chaos_init_net_getpeername(v6_unbound, (struct sockaddr *)&name, &length) == -1 &&
+            errno == ENOTCONN
+        );
+        memset(&address, 0, sizeof(address));
+        address.sin6_family = AF_INET6;
+        address.sin6_addr = in6addr_any;
+        assert(bind(v6_udp, (struct sockaddr *)&address, sizeof(address)) == 0);
+        length = (socklen_t)sizeof(name);
+        assert(
+            chaos_init_net_getsockname(v6_udp, (struct sockaddr *)&name, &length) == 0 &&
+            in6->sin6_family == AF_INET6 && in6->sin6_port != 0
+        );
+        length = (socklen_t)sizeof(name);
+        assert(
+            chaos_init_net_getpeername(v6_udp, (struct sockaddr *)&name, &length) == -1 &&
+            errno == ENOTCONN
+        );
+        address.sin6_port = server_address->sin_port;
+        address.sin6_addr.s6_addr[10] = 0xffU;
+        address.sin6_addr.s6_addr[11] = 0xffU;
+        memcpy(&address.sin6_addr.s6_addr[12], &server_address->sin_addr, 4U);
+        assert(connect(v6_udp, (struct sockaddr *)&address, sizeof(address)) == 0);
+        length = (socklen_t)sizeof(name);
+        assert(
+            chaos_init_net_getpeername(v6_udp, (struct sockaddr *)&name, &length) == 0 &&
+            in6->sin6_port == server_address->sin_port &&
+            memcmp(&in6->sin6_addr, &address.sin6_addr, sizeof(address.sin6_addr)) == 0
+        );
+        (void)close(v6_unbound);
+        (void)close(v6_udp);
+    }
 }
 
 static void test_parse_address(void)
@@ -350,6 +421,8 @@ int main(void)
     call.nr = __NR_read;
     call.args[0] = (uint64_t)pipe_fds[0];
     assert(chaos_init_net_decide(&call, &verdict) == 0);
+    call.args[0] = 999U; /* not open */
+    assert(chaos_init_net_decide(&call, &verdict) == 0);
 
     /* Without a rule file every call runs. */
     assert(PASSES(
@@ -393,6 +466,8 @@ int main(void)
         ECONNREFUSED
     ));
     assert(PASSES(decide(__NR_connect, (uint64_t)unbound, 0U, sizeof(server_address), 0, 0, 0)));
+    assert(PASSES(decide(__NR_connect, (uint64_t)unbound, P(&server_address), 0U, 0, 0, 0)));
+    assert(PASSES(decide(__NR_connect, (uint64_t)unbound, 8U, sizeof(server_address), 0, 0, 0)));
     assert(FAILS(
         decide(__NR_bind, (uint64_t)unbound, P(&other_address), sizeof(other_address), 0, 0, 0),
         EADDRINUSE
@@ -425,6 +500,10 @@ int main(void)
     assert(
         decide(__NR_recvmsg, (uint64_t)server, P(&message), 0, 0, 0, 0).action == CHAOS_INIT_DELAY
     );
+    /* A connected socket whose own address matches no rule: its peer's does. */
+    assert(decide(__NR_read, (uint64_t)client, P(buffer), 8U, 0, 0, 0).action == CHAOS_INIT_DELAY);
+    /* No peer and an own address no rule is for: nothing matches. */
+    assert(PASSES(decide(__NR_read, (uint64_t)unbound, P(buffer), 8U, 0, 0, 0)));
 
     /* By the peer, with the byte count for @size. */
     assert(PASSES(decide(__NR_write, (uint64_t)client, P(buffer), 5U, 0, 0, 0)));
@@ -433,6 +512,17 @@ int main(void)
     assert(FAILS(decide(__NR_sendto, (uint64_t)client, P(buffer), 20U, 0, 0, 0), EPIPE));
     assert(FAILS(decide(__NR_sendmsg, (uint64_t)client, P(&message), 0, 0, 0, 0), EPIPE));
     assert(PASSES(decide(__NR_sendmsg, (uint64_t)client, 0U, 0, 0, 0, 0))); /* size unknown */
+    /* A peer no rule is for: the socket's own address. */
+    assert(FAILS(decide(__NR_write, (uint64_t)server, P(buffer), 20U, 0, 0, 0), EPIPE));
+    /* A socket of a protocol chaos-init does not know (netlink): neither end
+     * resolves, nothing matches. */
+    {
+        const int netlink = socket(AF_NETLINK, SOCK_RAW, 0);
+
+        assert(netlink >= 0);
+        assert(PASSES(decide(__NR_write, (uint64_t)netlink, P(buffer), 20U, 0, 0, 0)));
+        (void)close(netlink);
+    }
 
     /* By the destination argument or msg_name. */
     assert(FAILS(
@@ -481,6 +571,37 @@ int main(void)
     message.msg_name = NULL;
     /* No destination and no peer: matched by the socket's own address, the other end. */
     assert(FAILS(decide(__NR_sendmsg, (uint64_t)udp, P(&message), 0, 0, 0, 0), ECONNREFUSED));
+    /* A batch of a socket whose connection matches nothing: its messages without a
+     * destination are looked at once, and the scan goes on to one that has one. */
+    {
+        struct sockaddr_in spare_address;
+        const int spare = bound_socket(SOCK_DGRAM, &spare_address);
+
+        memset(messages, 0, sizeof(messages));
+        messages[2].msg_hdr.msg_name = &udp_address;
+        messages[2].msg_hdr.msg_namelen = sizeof(udp_address);
+        assert(PASSES(decide(__NR_sendmmsg, (uint64_t)spare, P(messages), 2U, 0, 0, 0)));
+        assert(FAILS(decide(__NR_sendmmsg, (uint64_t)spare, P(messages), 3U, 0, 0, 0), ECONNREFUSED)
+        );
+        /* Connected, and neither end has a rule: nothing matches. */
+        assert(connect(spare, (struct sockaddr *)&other_address, sizeof(other_address)) == 0);
+        assert(PASSES(decide(__NR_read, (uint64_t)spare, P(buffer), 8U, 0, 0, 0)));
+        (void)close(spare);
+    }
+    /* A batch whose byte count would overflow has no size: no @size match. */
+    {
+        struct iovec huge;
+
+        huge.iov_base = buffer;
+        huge.iov_len = (size_t)(UINT64_MAX / 2U + 1U);
+        memset(messages, 0, sizeof(messages));
+        messages[0].msg_hdr.msg_iov = vector;
+        messages[0].msg_hdr.msg_iovlen = 2U; /* 20 bytes */
+        messages[1].msg_hdr.msg_iov = &huge;
+        messages[1].msg_hdr.msg_iovlen = 1U;
+        assert(FAILS(decide(__NR_sendmmsg, (uint64_t)client, P(messages), 1U, 0, 0, 0), EPIPE));
+        assert(PASSES(decide(__NR_sendmmsg, (uint64_t)client, P(messages), 2U, 0, 0, 0)));
+    }
 
     /* Own address, else peer. */
     assert(FAILS(decide(__NR_shutdown, (uint64_t)server, SHUT_RDWR, 0, 0, 0, 0), ENOTCONN));
@@ -520,6 +641,11 @@ int main(void)
             verdict = decide(__NR_select, (uint64_t)server + 1U, 0U, P(&readable), 0, P(&tick), 0);
             assert(verdict.action == CHAOS_INIT_DELAY && verdict.delay_ms == 2U);
             assert(!FD_ISSET(server, &readable) && tick.tv_usec == 0);
+            /* No timeout, or one that cannot be read: a wait that never times out. */
+            FD_SET(server, &readable);
+            assert(PASSES(decide(__NR_select, (uint64_t)server + 1U, 0U, P(&readable), 0, 0, 0)));
+            assert(PASSES(decide(__NR_select, (uint64_t)server + 1U, 0U, P(&readable), 0, 8U, 0)));
+            assert(FD_ISSET(server, &readable));
         }
 #endif
 #ifdef __NR_poll
@@ -539,6 +665,55 @@ int main(void)
             verdict = decide(__NR_ppoll, P(locked), 2U, P(&wait), 0, 0, 0);
             assert(verdict.action == CHAOS_INIT_DELAY && locked[1].revents == POLLIN);
             (void)munmap(locked, 4096U);
+        }
+        /* Negative descriptors are skipped, and so are sockets no rule is for. */
+        {
+            struct pollfd set[3];
+
+            memset(set, 0, sizeof(set));
+            set[0].fd = -1;
+            set[1].fd = udp;
+            set[2].fd = server;
+            assert(decide(__NR_ppoll, P(set), 3U, P(&wait), 0, 0, 0).action == CHAOS_INIT_DELAY);
+            assert(PASSES(decide(__NR_ppoll, P(set), 2U, P(&wait), 0, 0, 0)));
+        }
+        /* A timeout that cannot be read is no timeout; a negative one is 0. */
+        assert(PASSES(decide(__NR_ppoll, P(polled), 2U, 8U, 0, 0, 0)));
+        now.tv_sec = 0;
+        now.tv_nsec = -1L;
+        assert(decide(__NR_ppoll, P(polled), 2U, P(&now), 0, 0, 0).action == CHAOS_INIT_RETURN);
+        now.tv_nsec = 0L;
+        /* select sets: none for nfds 0, an unreadable one is skipped, and at most
+         * CHAOS_INIT_NET_MAX_WAIT descriptors are looked at, the last one included. */
+        FD_ZERO(&readable);
+        FD_SET(server, &readable);
+        assert(PASSES(decide(__NR_pselect6, 0U, P(&readable), 0U, 0, P(&wait), 0)));
+        verdict = decide(__NR_pselect6, (uint64_t)server + 1U, 8U, P(&readable), 0, P(&wait), 0);
+        assert(verdict.action == CHAOS_INIT_DELAY && verdict.returns == 1);
+        {
+            fd_set many;
+            fd_set last;
+
+            memset(&many, 0xff, sizeof(many));
+            FD_CLR(listener, &many);
+            FD_CLR(server, &many);
+            FD_CLR(client, &many); /* 1021 descriptors that match nothing */
+            FD_ZERO(&last);
+            FD_SET(0, &last);
+            FD_SET(1, &last);
+            FD_SET(server, &last); /* the 1024th */
+            verdict = decide(__NR_pselect6, FD_SETSIZE, P(&many), P(&last), 0, P(&wait), 0);
+            assert(verdict.action == CHAOS_INIT_DELAY);
+            memset(&many, 0xff, sizeof(many));
+            FD_CLR(listener, &many);
+            FD_CLR(server, &many);
+            FD_CLR(client, &many);
+            FD_ZERO(&last);
+            FD_SET(0, &last);
+            FD_SET(1, &last);
+            FD_SET(2, &last);
+            FD_SET(server, &last); /* the 1025th: not looked at */
+            assert(PASSES(decide(__NR_pselect6, FD_SETSIZE, P(&many), P(&last), 0, P(&wait), 0)));
         }
         now.tv_sec = -1;
         verdict = decide(__NR_ppoll, P(polled), 2U, P(&now), 0, 0, 0);

@@ -12,6 +12,8 @@
  * - each memory call reaches its operation, mmap with its anon/file kind;
  * - LATENCY delays, ERRNO fails, both together delay and then fail;
  * - `@size` sees the length; other system calls are not memory's.
+ * - a process that ended after its call matched is not counted, and its call runs;
+ * - counts follow rule texts, also across two reloads between the process's calls.
  */
 
 #include "../../src/init/chaos_init_memory.c"
@@ -87,6 +89,28 @@ int main(void)
     assert(verdict.action == CHAOS_INIT_DELAY && verdict.delay_ms == 5U);
     verdict = decide(__NR_madvise, 4096U, 0U);
     assert(verdict.action == CHAOS_INIT_FAIL && verdict.error == EAGAIN);
+
+    /* A process that ended after its call matched is not counted, and its call runs. */
+    memset(&other, 0, sizeof(other));
+    other.tid = 999999999;
+    other.nr = __NR_munmap;
+    other.args[1] = 4096U;
+    verdict.action = CHAOS_INIT_FAIL;
+    assert(chaos_init_memory_decide(&other, &verdict) == 1 && verdict.action == CHAOS_INIT_PASS);
+
+    /* The rule file changes twice between two calls the process makes, the second
+     * change bringing back the snapshot buffer of the first: the new text still
+     * starts at zero instead of taking the count of the one it replaced. */
+    write_rules("madvise:ERRNO:EAGAIN @first=1\n");
+    verdict = decide(__NR_madvise, 4096U, 0U);
+    assert(verdict.action == CHAOS_INIT_FAIL && verdict.error == EAGAIN);
+    assert(decide(__NR_madvise, 4096U, 0U).action == CHAOS_INIT_PASS);
+    write_rules("munmap:ERRNO:EINVAL\n");
+    assert(decide(__NR_madvise, 4096U, 0U).action == CHAOS_INIT_PASS); /* loads, no match */
+    write_rules("madvise:ERRNO:ENOMEM @first=1\n");
+    verdict = decide(__NR_madvise, 4096U, 0U);
+    assert(verdict.action == CHAOS_INIT_FAIL && verdict.error == ENOMEM);
+    assert(decide(__NR_madvise, 4096U, 0U).action == CHAOS_INIT_PASS);
 
     (void)snprintf(hits, sizeof(hits), "/tmp/.chaos-memory.hits.%ld", (long)getpid());
     assert(access(hits, F_OK) == 0);

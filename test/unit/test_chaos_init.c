@@ -293,6 +293,28 @@ static void test_find_command(void)
     assert(!chaos_init_find_command("", NULL, path, sizeof(path)));
     assert(!chaos_init_find_command(NULL, NULL, path, sizeof(path)));
     assert(chaos_init_find_command("sh", NULL, path, sizeof(path)));
+    /* No room to write to. */
+    assert(!chaos_init_find_command("sh", NULL, NULL, sizeof(path)));
+    assert(!chaos_init_find_command("sh", NULL, path, 0U));
+    /* An entry whose joined path does not fit is skipped, not cut short: the next
+     * one that fits is found. */
+    {
+        char small[12];
+
+        assert(chaos_init_find_command(
+            "sh", "/a-directory-name-longer-than-the-buffer:/bin", small, sizeof(small)
+        ));
+        assert(strcmp(small, "/bin/sh") == 0);
+    }
+    /* A regular file without execute permission is skipped, as execvp() skips it. */
+    {
+        FILE *file = fopen("/tmp/chaos-init-not-executable", "w");
+
+        assert(file != NULL && fclose(file) == 0);
+        assert(chmod("/tmp/chaos-init-not-executable", 0644) == 0);
+        assert(!chaos_init_find_command("chaos-init-not-executable", "/tmp", path, sizeof(path)));
+        assert(unlink("/tmp/chaos-init-not-executable") == 0);
+    }
 }
 
 static void test_delays(void)
@@ -493,13 +515,21 @@ static void test_memory_and_proc(void)
     g_fake_status = "Name:\tx\nTgid:\t12\n";
     g_fake_stat = "12 no-paren";
     assert(chaos_init_process_of(getpid(), &tgid, &start) == -1);
-    g_fake_status = NULL;
+    /* A Tgid that is no number; a process whose stat is gone by the time it is read. */
+    g_fake_status = "Name:\tx\nTgid:\tx\n";
+    assert(chaos_init_process_of(getpid(), &tgid, &start) == -1);
+    g_fake_status = "Name:\tx\nTgid:\t999999999\n";
     g_fake_stat = NULL;
+    assert(chaos_init_process_of(getpid(), &tgid, &start) == -1);
+    g_fake_status = NULL;
+    /* The parent of this very process, and of one that is gone. */
+    assert(chaos_init_parent_of(getpid()) == getppid());
+    assert(chaos_init_parent_of(999999999) == -1);
 }
 
 /* A library for the tracee table: two snapshots of rule texts. */
 CHAOS_INIT_RULES_STORAGE(g_test_rules, 4U);
-static chaos_init_text_t g_test_texts[4];
+static chaos_init_text_t g_test_texts[5];
 static size_t g_test_text_count = 0U;
 static uint64_t g_test_generation = 1U;
 
@@ -694,6 +724,66 @@ static void test_tracee_table(void)
     for (index = 0; index < (int)CHAOS_INIT_MAX_TRACEES; ++index)
     {
         assert(g_chaos_init_tracees[index].tgid != 20);
+    }
+
+    /* A full table with two ended processes frees both at once: one whose pid now
+     * has another start time, one whose pid is now a thread of another process.
+     * The new process takes the first entry, the next one the second, and no
+     * live process gives way. */
+    {
+        const int reused = chaos_init_tracee_find(40);
+        const int threaded = chaos_init_tracee_find(42);
+
+        assert(reused >= 0 && threaded >= 0 && reused < threaded);
+        g_fake_start[40] = 2U;
+        g_fake_tgid[42] = 43;
+        g_fake_tgid[152] = 152;
+        g_fake_start[152] = 1U;
+        assert(chaos_init_tracee_of(152) == reused);
+        assert(chaos_init_tracee_find(40) == -1 && chaos_init_tracee_find(42) == -1);
+        g_fake_tgid[153] = 153;
+        g_fake_start[153] = 1U;
+        assert(chaos_init_tracee_of(153) == threaded);
+        assert(chaos_init_tracee_find(10) >= 0 && chaos_init_tracee_find(21) >= 0);
+    }
+
+    /* A full flush writes the processes with hits only. */
+    chaos_init_tracee_flush(1);
+    assert(!read_hits(21, hits, sizeof(hits)));
+
+    /* A snapshot with more rules than the library has slots for: the first
+     * max_rules are counted and written, the rest are not. */
+    strcpy(g_test_texts[0], "/d0:open:EIO:1.0");
+    strcpy(g_test_texts[1], "/d1:open:EIO:1.0");
+    strcpy(g_test_texts[2], "/d2:open:EIO:1.0");
+    strcpy(g_test_texts[3], "/d3:open:EIO:1.0");
+    strcpy(g_test_texts[4], "/d4:open:EIO:1.0");
+    g_test_text_count = 5U;
+    ++g_test_generation;
+    g_fake_tgid[154] = 154;
+    g_fake_start[154] = 1U;
+    first = chaos_init_tracee_of(154);
+    assert(first >= 0 && chaos_init_tracee_slot(&g_test_lib, first, 4U) == NULL);
+    slot = chaos_init_tracee_slot(&g_test_lib, first, 3U);
+    assert(slot != NULL);
+    chaos_hit_record(slot);
+    assert(read_hits(154, hits, sizeof(hits)));
+    assert(
+        strcmp(
+            hits,
+            "0\t/d0:open:EIO:1.0\n0\t/d1:open:EIO:1.0\n0\t/d2:open:EIO:1.0\n1\t/d3:open:EIO:1.0\n"
+        ) == 0
+    );
+    {
+        char path[64];
+
+        (void)snprintf(
+            path,
+            sizeof(path),
+            "/tmp/.chaos-inittest.hits.%ld",
+            g_test_rules_file[chaos_init_tracee_find(10)]
+        );
+        (void)unlink(path);
     }
 }
 
