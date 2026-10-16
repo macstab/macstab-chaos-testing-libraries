@@ -92,8 +92,9 @@ case "$LIBC" in
     musl) apk add --no-cache build-base linux-headers >/dev/null ;;
 esac
 gcc -D_GNU_SOURCE -std=c99 -Wall -Wextra -Werror -pedantic -O2 -static -o /tmp/probe /work/test/runtime/init_probe.c
-gcc -D_GNU_SOURCE -Isrc -I/work/src/common -I/work/src/init -std=c99 -Wall -Wextra -Werror -pedantic -O2 -static \
-    -DCHAOS_INIT_TEST_RELEASE="\"4.19.0\"" -o /tmp/chaos-init-old /work/src/init/chaos_init.c /work/src/init/chaos_init_core.c
+gcc -D_GNU_SOURCE -I/work/src -I/work/src/common -I/work/src/core -I/work/src/config -I/work/src/effects \
+    -I/work/src/init -std=c99 -Wall -Wextra -Werror -pedantic -O2 -static \
+    -DCHAOS_INIT_TEST_RELEASE="\"4.19.0\"" -o /tmp/chaos-init-old /work/src/init/chaos_init*.c
 init=/out/chaos-init-'"$ARCH"'
 all=io,net,dns,time,memory,process
 

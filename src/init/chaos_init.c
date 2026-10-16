@@ -16,7 +16,10 @@
  *    running reads this run's status. When
  *    the filter cannot be installed (old kernel, emulated architecture, a stricter
  *    profile), the application still starts, without chaos, and the status says why.
- * 3. Answers every notification, forwards termination and user signals to the
+ * 3. Answers every notification: the call fails, runs later (LATENCY, parked in
+ *    chaos_init_delay.c so other threads go on) or runs unchanged, by the rules
+ *    of the libraries named in --libs. Hits files are written per process.
+ *    Forwards termination and user signals to the
  *    child, reaps every process that ends up with it (as PID 1, or as a child
  *    subreaper anywhere else), and exits with the child's exit code (128 + signal
  *    when it was killed).
@@ -26,6 +29,9 @@
  */
 
 #include "chaos_init_core.h"
+#include "chaos_init_delay.h"
+#include "chaos_init_io.h"
+#include "chaos_init_tracee.h"
 #include "chaos_status.h"
 
 #include <errno.h>
@@ -41,6 +47,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/timerfd.h>
 #include <sys/uio.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -215,21 +222,115 @@ static long chaos_init_ioctl(int fd, unsigned long request, void *argument)
     return syscall(SYS_ioctl, fd, request, argument);
 }
 
-/** @brief Answers one notification: every call goes on unchanged for now. */
-static void chaos_init_answer(int listener, void *request, void *response, size_t response_size)
+/** @brief CLOCK_MONOTONIC in milliseconds (the supervisor is under no time rule). */
+static uint64_t chaos_init_now_ms(void)
+{
+    struct timespec now;
+
+    (void)clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
+}
+
+/** @brief Sends the answer to notification @p id: fail with @p error, or run the call. */
+static void chaos_init_reply(int listener, uint64_t id, int error, void *response, size_t size)
+{
+    struct seccomp_notif_resp *reply = response;
+
+    memset(reply, 0, size);
+    reply->id = id;
+    if (error != 0)
+    {
+        reply->error = -error;
+    }
+    else
+    {
+        reply->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+    }
+    /* ENOENT: the thread is gone (killed while waiting); nothing to answer. */
+    (void)chaos_init_ioctl(listener, SECCOMP_IOCTL_NOTIF_SEND, reply);
+}
+
+/** @brief Receives one notification and answers it, now or (LATENCY) later. */
+static void
+chaos_init_answer(int listener, unsigned libs, void *request, void *response, size_t response_size)
 {
     struct seccomp_notif *notification = request;
-    struct seccomp_notif_resp *reply = response;
+    chaos_init_verdict_t verdict;
+    chaos_init_call_t call;
+    size_t index;
 
     memset(notification, 0, CHAOS_INIT_NOTIF_BUFFER);
     if (chaos_init_ioctl(listener, SECCOMP_IOCTL_NOTIF_RECV, notification) != 0)
     {
         return; /* EINTR, or the caller died (ENOENT): nothing to answer */
     }
-    memset(reply, 0, response_size);
-    reply->id = notification->id;
-    reply->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
-    (void)chaos_init_ioctl(listener, SECCOMP_IOCTL_NOTIF_SEND, reply);
+    call.tid = (pid_t)notification->pid;
+    call.nr = notification->data.nr;
+    for (index = 0U; index < 6U; ++index)
+    {
+        call.args[index] = notification->data.args[index];
+    }
+    verdict.action = CHAOS_INIT_PASS;
+    if ((libs & CHAOS_INIT_LIB_IO) != 0U)
+    {
+        (void)chaos_init_io_decide(&call, &verdict);
+    }
+    /* The decision read the thread's memory: act on it only if that thread is still
+     * the one waiting (its pid could otherwise belong to another process by now). */
+    if (verdict.action != CHAOS_INIT_PASS &&
+        chaos_init_ioctl(listener, SECCOMP_IOCTL_NOTIF_ID_VALID, &notification->id) != 0)
+    {
+        return;
+    }
+    if (verdict.action == CHAOS_INIT_DELAY &&
+        chaos_init_delay_add(notification->id, chaos_init_now_ms() + verdict.delay_ms) == 0)
+    {
+        return;
+    }
+    chaos_init_reply(
+        listener,
+        notification->id,
+        verdict.action == CHAOS_INIT_FAIL ? verdict.error : 0,
+        response,
+        response_size
+    );
+}
+
+/**
+ * @brief Continues the delayed calls that are due, writes hits files that waited
+ *        for the interval, and sets @p timer to the next of both.
+ */
+static void chaos_init_on_time(int timer, int listener, void *response, size_t response_size)
+{
+    static uint64_t last_flush_ms = 0U;
+    const uint64_t now = chaos_init_now_ms();
+    struct itimerspec next;
+    uint64_t due = 0U;
+    uint64_t id;
+
+    while (chaos_init_delay_pop(now, &id))
+    {
+        chaos_init_reply(listener, id, 0, response, response_size);
+    }
+    if (chaos_init_tracee_pending() && now - last_flush_ms >= CHAOS_HITS_INTERVAL_MS)
+    {
+        chaos_init_tracee_flush(0);
+        last_flush_ms = now;
+    }
+    (void)chaos_init_delay_next(&due);
+    if (chaos_init_tracee_pending() && (due == 0U || last_flush_ms + CHAOS_HITS_INTERVAL_MS < due))
+    {
+        due = last_flush_ms + CHAOS_HITS_INTERVAL_MS;
+    }
+    memset(&next, 0, sizeof(next));
+    if (due != 0U)
+    {
+        /* An absolute time already past fires at once; 0 would disarm the timer. */
+        due = due > now ? due : now + 1U;
+        next.it_value.tv_sec = (time_t)(due / 1000U);
+        next.it_value.tv_nsec = (long)(due % 1000U) * 1000000L;
+    }
+    (void)timerfd_settime(timer, TFD_TIMER_ABSTIME, &next, NULL);
 }
 
 /**
@@ -268,6 +369,7 @@ int main(int argc, char **argv)
     int listener;
     int error;
     int signals;
+    int timer;
     int child_status = 0;
     pid_t child;
 
@@ -341,30 +443,37 @@ int main(int argc, char **argv)
         (void)fprintf(stderr, "chaos-init: the child ended before the filter was set up\n");
         return CHAOS_INIT_EXIT_HANDOVER;
     }
+    if (listener >= 0 && (options.libs & CHAOS_INIT_LIB_IO) != 0U)
+    {
+        chaos_init_io_start();
+    }
     chaos_init_write_status(
         options.libs, listener >= 0 ? NULL : chaos_init_unsupported_reason(error)
     );
     (void)kill(child, CHAOS_INIT_GO_SIGNAL);
 
     signals = signalfd(-1, &forwarded, SFD_CLOEXEC);
-    if (signals < 0)
+    timer = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
+    if (signals < 0 || timer < 0)
     {
-        perror("chaos-init: signalfd");
+        perror("chaos-init: signalfd/timerfd");
         (void)kill(child, SIGKILL);
         return CHAOS_INIT_EXIT_HANDOVER;
     }
     for (;;)
     {
-        struct pollfd watched[2];
-        nfds_t count = 1;
+        struct pollfd watched[3];
+        nfds_t count = 2;
 
         watched[0].fd = signals;
         watched[0].events = POLLIN;
+        watched[1].fd = timer;
+        watched[1].events = POLLIN;
         if (listener >= 0)
         {
-            watched[1].fd = listener;
-            watched[1].events = POLLIN;
-            count = 2;
+            watched[2].fd = listener;
+            watched[2].events = POLLIN;
+            count = 3;
         }
         if (poll(watched, count, -1) < 0)
         {
@@ -382,19 +491,34 @@ int main(int argc, char **argv)
                 }
                 else if (chaos_init_reap(child, &child_status))
                 {
+                    chaos_init_tracee_flush(1);
                     return chaos_init_exit_code(child_status);
                 }
             }
         }
-        if (count == 2 && (watched[1].revents & POLLIN) != 0)
+        if ((watched[1].revents & POLLIN) != 0)
         {
-            chaos_init_answer(listener, request, response, sizes.seccomp_notif_resp);
+            uint64_t expirations;
+
+            /* Only consumes the expiry; what is due is handled below. */
+            if (read(timer, &expirations, sizeof(expirations)) < 0)
+            {
+                expirations = 0U;
+            }
         }
-        else if (count == 2 && (watched[1].revents & (POLLHUP | POLLERR)) != 0)
+        if (count == 3 && (watched[2].revents & POLLIN) != 0)
+        {
+            chaos_init_answer(listener, options.libs, request, response, sizes.seccomp_notif_resp);
+        }
+        else if (count == 3 && (watched[2].revents & (POLLHUP | POLLERR)) != 0)
         {
             /* No process uses the filter any more. */
             (void)close(listener);
             listener = -1;
+        }
+        if (listener >= 0)
+        {
+            chaos_init_on_time(timer, listener, response, sizes.seccomp_notif_resp);
         }
     }
 }

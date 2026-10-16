@@ -111,16 +111,21 @@ static inline uint64_t chaos_hits_now_ms(void)
 }
 
 /**
- * @brief Writes the hits file of the calling process.
+ * @brief Writes the hits file of process @p pid.
+ *
+ * @details chaos-init writes them for the processes it supervises; the libraries
+ * write their own through chaos_hits_write().
  *
  * @param prefix  File name without the pid, e.g. `/tmp/.chaos-net.hits`.
+ * @param pid     Process the counts belong to.
  * @param slots   Counters, @p count entries.
  * @param texts   Rule texts, @p count entries of CHAOS_STATUS_TEXT_MAX + 1 bytes.
  * @param count   Number of rules.
  * @param buffer  Scratch of at least @p count * CHAOS_HITS_LINE_MAX + 1 bytes.
  */
-static inline void chaos_hits_write(
+static inline void chaos_hits_write_for(
     const char *prefix,
+    long pid,
     const chaos_hit_slot_t *slots,
     const char (*texts)[CHAOS_STATUS_TEXT_MAX + 1U],
     size_t count,
@@ -132,7 +137,7 @@ static inline void chaos_hits_write(
     size_t length = 0U;
     size_t index;
 
-    if ((size_t)snprintf(path, sizeof(path), "%s.%ld", prefix, (long)getpid()) >= sizeof(path))
+    if ((size_t)snprintf(path, sizeof(path), "%s.%ld", prefix, pid) >= sizeof(path))
     {
         return;
     }
@@ -153,6 +158,27 @@ static inline void chaos_hits_write(
         length += (size_t)rc;
     }
     chaos_status_replace_file(path, buffer, length);
+}
+
+/**
+ * @brief Writes the hits file of the calling process.
+ *
+ * @param prefix  File name without the pid, e.g. `/tmp/.chaos-net.hits`.
+ * @param slots   Counters, @p count entries.
+ * @param texts   Rule texts, @p count entries of CHAOS_STATUS_TEXT_MAX + 1 bytes.
+ * @param count   Number of rules.
+ * @param buffer  Scratch of at least @p count * CHAOS_HITS_LINE_MAX + 1 bytes.
+ */
+static inline void chaos_hits_write(
+    const char *prefix,
+    const chaos_hit_slot_t *slots,
+    const char (*texts)[CHAOS_STATUS_TEXT_MAX + 1U],
+    size_t count,
+    char *buffer,
+    size_t buffer_size
+)
+{
+    chaos_hits_write_for(prefix, (long)getpid(), slots, texts, count, buffer, buffer_size);
 }
 
 #endif
