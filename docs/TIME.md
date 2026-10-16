@@ -352,8 +352,9 @@ specific and takes precedence per the first-match rule.
 
 ### 5.1 Semantics
 
-`OFFSET:N` adds N milliseconds (signed) to the `timespec` returned by a
-successful `clock_gettime()` call:
+`OFFSET:N` adds N milliseconds (signed, at most 100 years either way:
+|N| ≤ 3155760000000; a larger value rejects the rule file) to the `timespec`
+returned by a successful `clock_gettime()` call:
 
 ```c
 ts->tv_sec  += offset_ms / 1000;

@@ -400,6 +400,19 @@ static void test_helper_functions(void)
     assert(chaos_time_parse_offset("-250", NULL) != 0);
     assert(chaos_time_parse_offset("-250", &(int64_t){0}) == 0);
     assert(chaos_time_parse_offset("bad", &(int64_t){0}) != 0);
+    /* Within 100 years either way; strtoll would clamp beyond int64 silently. */
+    {
+        int64_t offset = 0;
+
+        assert(chaos_time_parse_offset("3155760000000", &offset) == 0);
+        assert(offset == INT64_C(3155760000000));
+        assert(chaos_time_parse_offset("-3155760000000", &offset) == 0);
+        assert(offset == -INT64_C(3155760000000));
+        assert(chaos_time_parse_offset("3155760000001", &offset) != 0);
+        assert(chaos_time_parse_offset("-3155760000001", &offset) != 0);
+        assert(chaos_time_parse_offset("9223372036854775808", &offset) != 0);
+        assert(chaos_time_parse_offset("-9223372036854775809", &offset) != 0);
+    }
     assert(chaos_time_copy_text_value(NULL, payload, sizeof(payload)) != 0);
     assert(chaos_time_copy_text_value("abc", NULL, sizeof(payload)) != 0);
     assert(chaos_time_copy_text_value("abc", payload, 0U) != 0);

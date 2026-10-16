@@ -753,13 +753,15 @@ static int chaos_time_parse_latency(const char *text, unsigned int *latency_ms)
     return 0;
 }
 
+/** @brief Largest OFFSET or REGRESS shift accepted: 100 years in milliseconds. */
+#define CHAOS_TIME_MAX_OFFSET_MS INT64_C(3155760000000)
+
 /**
  * Parses a signed time offset in milliseconds from a decimal string.
  *
- * Accepts the full range of int64_t (negative offsets move time backwards).
- * No range restriction is imposed beyond what strtoll() provides; callers
- * that receive very large offsets will clamp the result to zero (see
- * chaos_time_add_offset_ms()).
+ * Negative offsets move time backwards. At most CHAOS_TIME_MAX_OFFSET_MS either
+ * way: strtoll would clamp a larger value silently, and the shift is negated
+ * (REGRESS, absolute deadlines), which INT64_MIN does not survive.
  *
  * @param text       NUL-terminated signed decimal millisecond value.
  * @param offset_ms  Output: offset in milliseconds.
@@ -775,8 +777,10 @@ static int chaos_time_parse_offset(const char *text, int64_t *offset_ms)
         return -1;
     }
 
+    errno = 0;
     value = strtoll(text, &end, 10);
-    if (end == text || *chaos_time_trim(end) != '\0')
+    if (end == text || *chaos_time_trim(end) != '\0' || errno == ERANGE ||
+        value > CHAOS_TIME_MAX_OFFSET_MS || value < -CHAOS_TIME_MAX_OFFSET_MS)
     {
         return -1;
     }
