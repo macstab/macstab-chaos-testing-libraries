@@ -1410,7 +1410,7 @@ static int chaos_net_config_refresh(void)
     uint64_t cached_mtime;
     unsigned int active_index;
     unsigned int next_index;
-    size_t config_size;
+    size_t config_size = 0U;
     chaos_net_config_state_t *next_state;
 
     if (chaos_net_config_checked_recently())
@@ -1466,6 +1466,12 @@ static int chaos_net_config_refresh(void)
             __sync_synchronize();
             g_chaos_net_cached_mtime = cached_mtime;
             return chaos_net_config_active_state()->rule_count != 0U;
+        }
+        if (config_size > 0U && memchr(g_chaos_net_config_buffer, '\0', config_size) != NULL)
+        {
+            /* The parser would stop at the NUL and drop every rule after it unreported. */
+            chaos_net_config_reject_file(next_state, CHAOS_STATUS_REASON_NUL);
+            config_size = 0U;
         }
         if (config_size > 0U &&
             chaos_net_config_parse_buffer(

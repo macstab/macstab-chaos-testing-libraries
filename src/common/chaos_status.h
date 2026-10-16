@@ -12,7 +12,7 @@
  * state=ok|error
  * rules=<number of active rules>
  * line=<1-based line of the first rejected rule>      (error only)
- * reason=invalid rule|too many rules|file too large|file unreadable
+ * reason=invalid rule|too many rules|file too large|file unreadable|file contains a NUL byte
  *                                                      (error only; line=0 for the last two)
  * text=<that line as written, at most 200 bytes>       (error only)
  * pid=<process that wrote the file>
@@ -74,6 +74,12 @@ typedef struct chaos_status_error
 
 /** @brief Reason for a rule file this process may not open or read (no line is named). */
 #define CHAOS_STATUS_REASON_UNREADABLE "file unreadable"
+
+/**
+ * @brief Reason for a rule file holding a NUL byte (no line is named): the parser
+ *        would stop there and drop every rule after it without a word.
+ */
+#define CHAOS_STATUS_REASON_NUL "file contains a NUL byte"
 
 /** @brief Reason for a valid rule chaos-init cannot apply (data effects, ERRNO on close). */
 #define CHAOS_STATUS_REASON_UNSUPPORTED "unsupported in seccomp mode"

@@ -387,9 +387,10 @@ pid=4711
 - `state=ok` with `rules=<n>` after a successful load; `state=error` with
   the 1-based `line`, the `reason` (`invalid rule` or `too many rules`) and
   the line as written (`text`, at most 200 bytes) after a rejected one.
-- A file at or over the size limit (`reason=file too large`), or one the
+- A file at or over the size limit (`reason=file too large`), one the
   process may not open (EACCES) or that is not a file (`reason=file
-  unreadable`), is reported with `line=0` and not re-read until it changes.
+  unreadable`), or one holding a NUL byte (`reason=file contains a NUL byte`)
+  is reported with `line=0` and not re-read until it changes.
 - `pid` is the process that loaded the rules. Every process with the library
   loaded writes the same report for the same rule file; a writer that wants
   the report for its own change runs one program under `LD_PRELOAD` and

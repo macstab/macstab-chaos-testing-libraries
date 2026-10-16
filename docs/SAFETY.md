@@ -282,6 +282,7 @@ Conditions that trigger fail-open (passthrough):
   pass through. The rejected line is reported in `/tmp/.chaos-<lib>.status`
   so the failure is visible (see ARCHITECTURE.md, Status file).
 - Config file too large (> `CHAOS_*_MAX_CONFIG_BYTES`): rejected, pass through.
+- Config file holding a NUL byte: rejected, pass through.
 - Selector match ambiguous or unresolvable (e.g., fd-to-path resolution failed):
   call passes through unchanged.
 - Probability gate not triggered: call passes through.

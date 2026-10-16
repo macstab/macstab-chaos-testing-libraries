@@ -971,6 +971,13 @@ static void chaos_io_config_reload(uint64_t observed_mtime, uint64_t previous_mt
         return;
     }
 
+    if (read_rc == 0 && memchr(g_chaos_io_config_buffer, '\0', file_size) != NULL)
+    {
+        /* The parser would stop at the NUL and drop every rule after it unreported. */
+        chaos_io_config_reject_file(next_state, CHAOS_STATUS_REASON_NUL);
+        read_rc = -4;
+    }
+
     if (read_rc == 0 && chaos_io_config_parse_buffer(
                             g_chaos_io_config_buffer, next_state->rules, &next_state->rule_count
                         ) != 0)
@@ -978,7 +985,6 @@ static void chaos_io_config_reload(uint64_t observed_mtime, uint64_t previous_mt
         chaos_io_config_reset_state(next_state, 0);
     }
 
-    (void)file_size;
     chaos_io_config_attach_hits(next_state);
     chaos_io_config_report(observed_mtime, next_state);
     chaos_io_config_publish(next_index, observed_mtime);

@@ -1168,6 +1168,27 @@ static void test_prepare_reports_status(void)
 
     (void)unlink(CHAOS_PROCESS_CONFIG_PATH);
 
+    /* A NUL byte rejects the file: the parser would stop there and drop every rule
+     * after it, reporting state=ok. */
+    {
+        static const char text[] = "# rules\n\0\n";
+        FILE *nul = fopen(CHAOS_PROCESS_CONFIG_PATH, "w");
+
+        assert(nul != NULL);
+        assert(fwrite(text, 1U, sizeof(text) - 1U, nul) == sizeof(text) - 1U);
+        assert(fclose(nul) == 0);
+    }
+    assert(chaos_process_config_prepare() == 0);
+    assert(read_status_file(status, sizeof(status)));
+    (void)snprintf(
+        expected,
+        sizeof(expected),
+        "state=error\nrules=0\nline=0\nreason=file contains a NUL byte\ntext=\npid=%ld\n",
+        (long)getpid()
+    );
+    assert(strcmp(status, expected) == 0);
+    (void)unlink(CHAOS_PROCESS_CONFIG_PATH);
+
     /* A rule file that cannot be read is reported too: a directory (EISDIR on read),
      * and, unless running as root, a file without read permission (EACCES on open). */
     assert(mkdir(CHAOS_PROCESS_CONFIG_PATH, 0700) == 0);
