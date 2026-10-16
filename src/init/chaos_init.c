@@ -132,6 +132,50 @@ static void chaos_init_signal_set(sigset_t *set)
     }
 }
 
+/** @brief Installs @p program with a notification listener: the listener, or -1. */
+static int chaos_init_install(const struct sock_fprog *program)
+{
+    int listener =
+        (int)syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, CHAOS_INIT_FILTER_FLAGS, program);
+
+    if (listener < 0 && errno == EINVAL)
+    {
+        /* Before 5.19: without the killable wait. */
+        listener = (int
+        )syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, program);
+    }
+    return listener;
+}
+
+/**
+ * @brief Whether @p program can be installed here, tried in a process that ends at
+ *        once: no_new_privs, which cannot be undone, is then set in this one only
+ *        when the install will work (it fails, for one, with EBUSY under another
+ *        supervisor's listener).
+ * @return 0, or the error the install failed with.
+ */
+static int chaos_init_try_install(const struct sock_fprog *program)
+{
+    const pid_t probe = fork();
+    int status = 0;
+
+    if (probe == 0)
+    {
+        _exit(
+            prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0 && chaos_init_install(program) >= 0 ? 0
+                                                                                            : errno
+        );
+    }
+    if (probe < 0)
+    {
+        return 0; /* no probe: the install itself will tell */
+    }
+    while (waitpid(probe, &status, 0) < 0 && errno == EINTR)
+    {
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : EINVAL;
+}
+
 /**
  * @brief In the child: installs the filter and sends the listener (or the error).
  * @return 0 when the child may execute the command, -1 when it must not (a filter
@@ -166,21 +210,17 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover)
     {
         error = errno;
     }
+    else if ((error = chaos_init_try_install(&program)) != 0)
+    {
+        /* Refused: no chaos, and no no_new_privs either. */
+    }
     else if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
     {
         error = errno;
     }
     else
     {
-        listener =
-            (int)syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, CHAOS_INIT_FILTER_FLAGS, &program);
-        if (listener < 0 && errno == EINVAL)
-        {
-            /* Before 5.19: without the killable wait. */
-            listener = (int)syscall(
-                SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, &program
-            );
-        }
+        listener = chaos_init_install(&program);
         error = listener < 0 ? errno : 0;
     }
 

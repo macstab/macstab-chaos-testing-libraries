@@ -191,3 +191,20 @@ else
     echo "FAIL seccomp refused: got \"$refused\", want \"$want\"" >&2
     exit 1
 fi
+
+# A profile that answers the question but refuses the install itself (as another
+# supervisor's listener makes the kernel do, with EBUSY): the same.
+printf '%s' '{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["seccomp"],"action":"SCMP_ACT_ERRNO","args":[{"index":0,"value":1,"op":"SCMP_CMP_EQ"}]}]}' \
+    > "$TMP_DIR/no-filter.json"
+refused=$(docker run --rm \
+    --platform "$DOCKER_PLATFORM" \
+    --security-opt seccomp="$TMP_DIR/no-filter.json" \
+    -v "$TMP_DIR/out:/out:ro" \
+    alpine:3.20 \
+    sh -c "/out/chaos-init-$ARCH --libs io -- grep NoNewPrivs /proc/self/status | tr -d '\t '; sed -n 2p /tmp/.chaos-init.status")
+if [ "$refused" = "$want" ]; then
+    echo "ok   filter refused: no chaos, no no_new_privs"
+else
+    echo "FAIL filter refused: got \"$refused\", want \"$want\"" >&2
+    exit 1
+fi
