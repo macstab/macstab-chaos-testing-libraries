@@ -685,13 +685,16 @@ Reason:
   (vectors of more than 64 entries are left alone). Only stream sockets are
   shortened, and only requests larger than N (anything else is not counted as a
   hit): on a datagram socket a shorter buffer would cut the datagram and the
-  kernel would drop the rest. Nothing is lost or changed --
+  kernel would drop the rest. A receive with `MSG_WAITALL` asks for the whole
+  count and is left alone. Nothing is lost or changed --
   unlike `TORN`, which truncates -- so it tests message reassembly: length-
   prefixed framing, header parsers and `readLine` loops that assume one read is
   one message
 - `DUP:p`
   valid only for `recv`: every receive on a matching socket keeps a copy of
-  what it returned (up to 4 KiB, with the sender address for datagrams); when
+  what it returned (up to 4 KiB, with the sender address for datagrams; a larger
+  datagram is not kept, and a datagram replayed into smaller buffers is reported
+  with `MSG_TRUNC`, as the kernel reports it); when
   the rule fires, the next receive returns that copy instead of reading the
   socket, once, and the one after reads again. Duplicate delivery is the norm
   in at-least-once messaging and almost never tested: double charges, double

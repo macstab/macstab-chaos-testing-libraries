@@ -2903,6 +2903,9 @@ static void test_trickle_shortens_receives(void)
     assert(g_last_receive_size == 3U);
     rc = recv(4, buffer, 2U, 0);
     assert(g_last_receive_size == 2U);
+    /* MSG_WAITALL asks for the whole count: not shortened. */
+    rc = recv(4, buffer, sizeof(buffer), MSG_WAITALL);
+    assert(g_last_receive_size == sizeof(buffer));
     rc = recvfrom(4, buffer, sizeof(buffer), 0, NULL, NULL);
     rc = recvmsg(4, &message, 0);
     assert(g_last_receive_iovlen == 2U && g_last_receive_iov_bytes == 3U);
@@ -3063,12 +3066,44 @@ static void test_dup_replays_the_last_payload(void)
     rc = recvmsg(7, &message, MSG_PEEK);
     assert(g_recvmsg_calls == 2);
 
+    /* A kept datagram replayed into smaller buffers is reported cut (MSG_TRUNC),
+     * as the kernel reports it; a stream's is not a message and is not. */
+    {
+        struct iovec small;
+
+        small.iov_base = buffer;
+        small.iov_len = 2U;
+        message.msg_iov = &small;
+        message.msg_iovlen = 1U;
+        g_test_socket_type = SOCK_DGRAM;
+        rc = recv(12, buffer, sizeof(buffer), 0);
+        rc = recvmsg(12, &message, 0);
+        assert(rc == 2 && message.msg_flags == MSG_TRUNC);
+        g_test_socket_type = SOCK_STREAM;
+        rc = recv(13, buffer, sizeof(buffer), 0);
+        rc = recvmsg(13, &message, 0);
+        assert(rc == 2 && message.msg_flags == 0);
+    }
+
     /* Payloads beyond the limit are kept cut. */
     g_recv_result = (ssize_t)sizeof(big);
     rc = recv(8, big, sizeof(big), 0);
     g_recv_result = 4;
     rc = recv(8, big, sizeof(big), 0);
     assert(rc == (long)CHAOS_NET_DUP_MAX_BYTES);
+
+    /* A datagram beyond the limit is not kept: cut, it would be another message. */
+    {
+        const int calls = g_recv_calls;
+
+        g_test_socket_type = SOCK_DGRAM;
+        g_recv_result = (ssize_t)sizeof(big);
+        rc = recv(11, big, sizeof(big), 0);
+        g_recv_result = 4;
+        rc = recv(11, big, sizeof(big), 0);
+        assert(rc == 4 && g_recv_calls == calls + 2);
+        g_test_socket_type = SOCK_STREAM;
+    }
 
     /* read and readv on a socket; close drops the kept payload. */
     reset_descriptor_stubs();
