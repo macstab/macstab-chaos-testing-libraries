@@ -715,11 +715,8 @@ static int chaos_process_parse_fail_after_count(const char *text, uint64_t *coun
     {
         return -1;
     }
-    while (*text == ' ' || *text == '\t')
-    {
-        ++text;
-    }
-    /* Digits only: strtoull() would take "-1" as the largest count, never failing. */
+    /* Digits only (the caller trims the blanks around it): strtoull() would take
+     * "-1" as the largest count, one that never fails. */
     if (*text < '0' || *text > '9')
     {
         return -1;
