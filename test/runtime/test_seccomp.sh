@@ -150,6 +150,13 @@ sleep 1
 expect "the orphan is still answered, its rule applied" "$(cat /tmp/sec/orphan.out 2>/dev/null)" "EIO"
 expect "the background chaos-init ends with the last process" \
     "$(grep -l chaos-init /proc/[0-9]*/comm 2>/dev/null | wc -l | tr -d " ")" "0"
+# A rule written with the name of a link covers the files under its real name, which
+# is how /proc names an open descriptor.
+mkdir -p /tmp/sec/real && echo data > /tmp/sec/real/f && ln -sfn /tmp/sec/real /tmp/sec/link
+cp /tmp/.chaos-io.conf /tmp/sec/io.conf
+echo "/tmp/sec/link:read:EIO:1.0 # t" > /tmp/.chaos-io.conf
+expect "C: read rule on the name of a link" "$($init --libs io -- /tmp/probe read /tmp/sec/real/f)" "EIO"
+cp /tmp/sec/io.conf /tmp/.chaos-io.conf
 expect "C: without chaos-init the rule does nothing" "$(/tmp/probe open /tmp/sec/data/x)" "ok"
 expect "C: open rule fails the open" "$($init --libs io -- /tmp/probe open /tmp/sec/data/x)" "EIO"
 expect "C: an unmatched path opens" "$($init --libs io -- /tmp/probe open /tmp/sec/other)" "ok"

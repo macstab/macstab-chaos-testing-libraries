@@ -154,6 +154,15 @@ static void check_path_spellings(void)
         fd >= 0 && read(fd, buffer, sizeof(buffer)) == -1 && errno == EIO && close(fd) == 0
     );
 
+    /* A rule written with the link's name covers the file under its real name. */
+    write_rules(PROBE_DIR "/link:read:EIO:1.0\n");
+    fd = open(PROBE_DIR "/data/f", O_RDONLY);
+    errno = 0;
+    expect(
+        "read rule on a link's name",
+        fd >= 0 && read(fd, buffer, sizeof(buffer)) == -1 && errno == EIO && close(fd) == 0
+    );
+
     write_rules("# idle\n");
     expect(
         "spellings cleaned up",

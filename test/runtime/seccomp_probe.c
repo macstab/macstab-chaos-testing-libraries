@@ -4,6 +4,7 @@
  *
  * Usage: seccomp_probe open <path>    prints "ok" or the errno name
  *        seccomp_probe openms <path>  prints how long the open took, in ms
+ *        seccomp_probe read <path>    opens the file and reads it: "ok" or the errno name
  *        seccomp_probe signalled <path> the same, with a SIGALRM (SA_RESTART)
  *                                     every 20 ms interrupting the open
  *        seccomp_probe first <path>   opens twice, then once in a forked child:
@@ -97,6 +98,20 @@ int main(int argc, char **argv)
     if (argc == 3 && strcmp(argv[1], "open") == 0)
     {
         (void)printf("%s\n", try_open(argv[2]));
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "read") == 0)
+    {
+        char byte;
+        const int fd = open(argv[2], O_RDONLY);
+
+        if (fd < 0)
+        {
+            (void)printf("%s\n", try_open_errno_name(errno));
+            return 0;
+        }
+        (void)printf("%s\n", read(fd, &byte, 1U) >= 0 ? "ok" : try_open_errno_name(errno));
+        (void)close(fd);
         return 0;
     }
     if (argc == 3 && strcmp(argv[1], "openms") == 0)

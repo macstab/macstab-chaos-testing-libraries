@@ -343,10 +343,12 @@ The path flow is:
 6. Cache the returned fd under the kernel's name for it (`/proc/self/fd/<fd>`,
    links resolved), after dropping whatever an earlier fd with that number left.
 
-Symbolic links: an `open` rule matches the path as written, normalised but with
-links unresolved (resolving every component would cost a system call each). The
-descriptor rules (`read`, `write`, `fsync`, ...) match the real path, so a file
-opened through a link is faulted by the rules for where it really is.
+Symbolic links: a call's path is matched as written, normalised but with links
+unresolved (resolving every component would cost a system call each), and a
+descriptor by the kernel's name for its file, links resolved. A rule covers both:
+its path is also resolved when the rules are loaded, so a rule for `/lib` (a link
+to `/usr/lib`) or for a Kubernetes ConfigMap mount (`..data` links) reaches its
+files however they were opened. chaos-init matches the same way.
 
 ### What happens on `renameat()`
 

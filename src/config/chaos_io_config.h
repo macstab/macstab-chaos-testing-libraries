@@ -140,9 +140,16 @@ typedef struct chaos_io_rule
 {
     char path_prefix[CHAOS_IO_MAX_RULE_PATH]; /**< Null-terminated rule path prefix. */
     size_t path_len;                          /**< Cached `strlen(path_prefix)`. */
-    chaos_io_operation_t operation;           /**< Operation this rule applies to. */
-    chaos_io_effect_t effect;                 /**< Fault effect to apply when triggered. */
-    int errnum;                               /**< errno code for ERRNO effect; 0 otherwise. */
+    /**
+     * The prefix with its links resolved, when that differs (`/lib` -> `/usr/lib`):
+     * a descriptor is known by the kernel's name for its file. Points into the rule's
+     * snapshot; NULL when there is none.
+     */
+    const char *resolved_prefix;
+    size_t resolved_len;            /**< `strlen(resolved_prefix)`; 0 when there is none. */
+    chaos_io_operation_t operation; /**< Operation this rule applies to. */
+    chaos_io_effect_t effect;       /**< Fault effect to apply when triggered. */
+    int errnum;                     /**< errno code for ERRNO effect; 0 otherwise. */
     double probability;      /**< Trigger probability [0.0, 1.0] for probabilistic effects. */
     unsigned int latency_ms; /**< Sleep duration in milliseconds for LATENCY effect. */
     /** Qualifiers written after the rule (`@first`, `@from`, `@until`, `@size`). */

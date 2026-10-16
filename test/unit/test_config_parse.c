@@ -1156,6 +1156,36 @@ static int read_hits_file(char *buffer, size_t size)
  *   "1<TAB>rule # b" with the first count unchanged.
  */
 /**
+ * @brief Invariant: a rule written with a link's name also covers the files under
+ *        the link's target, by which descriptors are known; rule paths are
+ *        normalised like the paths they are matched against.
+ */
+static void test_rules_follow_links(void)
+{
+    chaos_io_rule_t rule;
+
+    chaos_test_reset_runtime();
+    chaos_test_use_real_io();
+    (void)unlink("/tmp/chaos-link-dir");
+    (void)mkdir("/tmp/chaos-real-dir", 0700);
+    assert(symlink("/tmp/chaos-real-dir", "/tmp/chaos-link-dir") == 0);
+    chaos_io_config_init();
+    chaos_test_write_text_file(
+        CHAOS_IO_CONFIG_PATH,
+        "/tmp/chaos-link-dir:read:EIO:1.0\n//tmp//plain/:write:EIO:1.0\n*:fsync:EIO:1.0\n"
+    );
+    g_chaos_io_cached_mtime = CHAOS_IO_MTIME_UNKNOWN;
+    assert(chaos_io_config_prepare() == 1);
+    assert(chaos_io_config_match_loaded(CHAOS_IO_OP_READ, "/tmp/chaos-link-dir/f", &rule) == 1);
+    assert(chaos_io_config_match_loaded(CHAOS_IO_OP_READ, "/tmp/chaos-real-dir/f", &rule) == 1);
+    assert(chaos_io_config_match_loaded(CHAOS_IO_OP_READ, "/tmp/chaos-real-dirx", &rule) == 0);
+    assert(chaos_io_config_match_loaded(CHAOS_IO_OP_WRITE, "/tmp/plain/f", &rule) == 1);
+    assert(strcmp(rule.path_prefix, "/tmp/plain") == 0 && rule.resolved_prefix == NULL);
+    assert(unlink("/tmp/chaos-link-dir") == 0 && rmdir("/tmp/chaos-real-dir") == 0);
+    (void)unlink(CHAOS_IO_CONFIG_PATH);
+}
+
+/**
  * @brief Invariant: an image whose pid already has a hits file (the image an execve
  *        replaced) writes its own file under a number no pid reaches.
  */
@@ -1429,6 +1459,7 @@ int main(void)
 
     test_parse_buffer_reports_rejected_line();
     test_prepare_reports_status();
+    test_rules_follow_links();
     test_hits_file_survives_exec();
     test_hits_are_counted_and_reported();
     test_rule_file_check_is_throttled();

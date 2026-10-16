@@ -102,6 +102,8 @@ typedef struct chaos_io_config_state
     chaos_hit_slot_t *hits[CHAOS_IO_MAX_RULES];
     /** Each rule as written in the file, reported with its count. */
     char text[CHAOS_IO_MAX_RULES][CHAOS_STATUS_TEXT_MAX + 1U];
+    /** Each rule's path with its links resolved (see chaos_io_rule_t::resolved_prefix). */
+    char resolved[CHAOS_IO_MAX_RULES][CHAOS_IO_MAX_RULE_PATH];
 } chaos_io_config_state_t;
 
 /** @brief The two interchangeable config snapshots. */
@@ -725,7 +727,8 @@ static int chaos_io_config_read_file(size_t *size_out, uint64_t expected_stamp)
  * @brief Returns non-zero when a rule prefix matches the supplied path.
  *
  * @details The wildcard `"*"` matches every file: an absolute path that is not a
- * memfd (`/memfd:`); pipes, sockets and anonymous inodes only by name.
+ * memfd (`/memfd:`); pipes, sockets and anonymous inodes only by name. A rule
+ * covers a path through its prefix as written or with its links resolved.
  * For explicit prefixes the match is boundary-aware:
  * - An exact match (`path == prefix`) succeeds.
  * - A prefix that ends with `/` succeeds when the path has the same
@@ -737,6 +740,17 @@ static int chaos_io_config_read_file(size_t *size_out, uint64_t expected_stamp)
  * @param[in] path  The resolved path to test.
  * @return Non-zero when the rule matches the path.
  */
+/** @brief Whether @p prefix (@p length bytes) covers @p path, at a path boundary. */
+static int chaos_io_prefix_covers(const char *prefix, size_t length, const char *path)
+{
+    if (strncmp(path, prefix, length) != 0)
+    {
+        return 0;
+    }
+    return path[length] == '\0' || (length > 0U && prefix[length - 1U] == '/') ||
+           path[length] == '/';
+}
+
 static int chaos_io_rule_prefix_matches(const chaos_io_rule_t *rule, const char *path)
 {
     if (rule == NULL || path == NULL)
@@ -751,19 +765,9 @@ static int chaos_io_rule_prefix_matches(const chaos_io_rule_t *rule, const char 
          * eventfd write). A rule that names them still reaches them. */
         return path[0] == '/' && strncmp(path, "/memfd:", 7U) != 0;
     }
-    if (strncmp(path, rule->path_prefix, rule->path_len) != 0)
-    {
-        return 0;
-    }
-    if (path[rule->path_len] == '\0')
-    {
-        return 1;
-    }
-    if (rule->path_len > 0U && rule->path_prefix[rule->path_len - 1U] == '/')
-    {
-        return 1;
-    }
-    return path[rule->path_len] == '/';
+    return chaos_io_prefix_covers(rule->path_prefix, rule->path_len, path) ||
+           (rule->resolved_prefix != NULL &&
+            chaos_io_prefix_covers(rule->resolved_prefix, rule->resolved_len, path));
 }
 
 /**
@@ -881,6 +885,46 @@ static void chaos_io_config_after_fork(void)
 __attribute__((destructor)) static void chaos_io_config_report_hits_at_exit(void)
 {
     chaos_io_config_report_hits(NULL);
+}
+
+/**
+ * @brief Gives each rule of @p state the path its prefix names with links resolved,
+ *        where that differs.
+ *
+ * @details Descriptors are known by the kernel's name for their file
+ * (`/proc/self/fd`), links resolved, while a rule is written with the name the
+ * program uses: `/lib` on a system where it links to `/usr/lib`, a Kubernetes
+ * ConfigMap under its `..data` link. Done once per load, with the rules' files as
+ * they are then. Every absolute prefix is also normalised lexically, as the paths
+ * it is matched against are.
+ */
+static void chaos_io_config_resolve_rules(chaos_io_config_state_t *state)
+{
+    char resolved[PATH_MAX];
+    size_t index;
+
+    for (index = 0U; index < state->rule_count; ++index)
+    {
+        chaos_io_rule_t *rule = &state->rules[index];
+
+        rule->resolved_prefix = NULL;
+        rule->resolved_len = 0U;
+        if (rule->path_prefix[0] != '/')
+        {
+            continue;
+        }
+        /* Matched against normalised paths: written the same way. */
+        chaos_io_normalize_path(rule->path_prefix);
+        rule->path_len = strlen(rule->path_prefix);
+        if (realpath(rule->path_prefix, resolved) != NULL &&
+            strcmp(resolved, rule->path_prefix) != 0 &&
+            strlen(resolved) < sizeof(state->resolved[index]))
+        {
+            (void)memcpy(state->resolved[index], resolved, strlen(resolved) + 1U);
+            rule->resolved_prefix = state->resolved[index];
+            rule->resolved_len = strlen(resolved);
+        }
+    }
 }
 
 /**
@@ -1027,6 +1071,7 @@ static void chaos_io_config_reload(uint64_t observed_mtime, uint64_t previous_mt
     {
         chaos_io_config_reset_state(next_state, 0);
     }
+    chaos_io_config_resolve_rules(next_state);
 
     g_chaos_io_config_content = content;
     chaos_io_config_attach_hits(next_state);
