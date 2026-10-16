@@ -191,6 +191,9 @@ static int chaos_test_stub_close(int fd)
 /* The build hook for rules a build cannot apply (chaos-init defines it): a switch. */
 static int g_test_rules_unsupported = 0;
 #define CHAOS_IO_RULE_SUPPORTED(rule) ((void)(rule), !g_test_rules_unsupported)
+/* How long a load whose rules depend on links is used: tests make it due at once. */
+static unsigned g_test_links_recheck_ms = 1000U;
+#define CHAOS_IO_LINKS_RECHECK_MS g_test_links_recheck_ms
 #include "../../src/config/chaos_io_config.c"
 
 /**
@@ -1186,6 +1189,95 @@ static void test_rules_follow_links(void)
 }
 
 /**
+ * @brief Invariant: a rule names a file under a link even before the file exists,
+ *        and follows the link when it moves (a ConfigMap update), without the rule
+ *        file changing; a load whose links have not moved is kept.
+ */
+static void test_rules_follow_moving_links(void)
+{
+    chaos_io_rule_t rule;
+    unsigned int index;
+    char deep[PATH_MAX];
+    char long_rule[CHAOS_IO_MAX_RULE_PATH];
+    char component[201];
+
+    chaos_test_reset_runtime();
+    chaos_test_use_real_io();
+    (void)unlink("/tmp/chaos-cm");
+    (void)mkdir("/tmp/chaos-cm-a", 0700);
+    (void)mkdir("/tmp/chaos-cm-b", 0700);
+    assert(symlink("/tmp/chaos-cm-a", "/tmp/chaos-cm") == 0);
+    chaos_io_config_init();
+    chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/tmp/chaos-cm/db:write:EIO:1.0\n");
+    g_chaos_io_cached_mtime = CHAOS_IO_MTIME_UNKNOWN;
+    assert(chaos_io_config_prepare() == 1);
+    /* db does not exist yet: its directory is resolved, the name appended. */
+    assert(chaos_io_config_match_loaded(CHAOS_IO_OP_WRITE, "/tmp/chaos-cm-a/db", &rule) == 1);
+    assert(chaos_io_config_active_state()->links);
+
+    /* The link moves: not looked at before it is due, then followed. */
+    assert(unlink("/tmp/chaos-cm") == 0 && symlink("/tmp/chaos-cm-b", "/tmp/chaos-cm") == 0);
+    assert(chaos_io_config_prepare() == 1);
+    assert(chaos_io_config_match_loaded(CHAOS_IO_OP_WRITE, "/tmp/chaos-cm-b/db", &rule) == 0);
+    g_test_links_recheck_ms = 0U;
+    assert(chaos_io_config_prepare() == 1);
+    assert(chaos_io_config_match_loaded(CHAOS_IO_OP_WRITE, "/tmp/chaos-cm-b/db", &rule) == 1);
+    assert(chaos_io_config_match_loaded(CHAOS_IO_OP_WRITE, "/tmp/chaos-cm-a/db", &rule) == 0);
+    /* Due again with nothing moved: the load stays, no new snapshot. */
+    index = g_chaos_io_active_config_index;
+    assert(chaos_io_config_prepare() == 1);
+    assert(g_chaos_io_active_config_index == index);
+    g_test_links_recheck_ms = 1000U;
+
+    /* No link and all of it there: never looked at again. Nothing of it there at
+     * all: looked at again, nothing resolved. A resolution too long for the rest
+     * to be appended: none. */
+    chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/tmp:write:EIO:1.0\n");
+    g_chaos_io_cached_mtime = CHAOS_IO_MTIME_UNKNOWN;
+    assert(chaos_io_config_prepare() == 1);
+    assert(!chaos_io_config_active_state()->links);
+    chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/chaos-no-such-root/x:write:EIO:1.0\n");
+    g_chaos_io_cached_mtime = CHAOS_IO_MTIME_UNKNOWN;
+    assert(chaos_io_config_prepare() == 1);
+    assert(chaos_io_config_active_state()->links);
+    assert(chaos_io_config_active_state()->rules[0].resolved_prefix == NULL);
+    (void)memset(component, 'e', sizeof(component) - 1U);
+    component[sizeof(component) - 1U] = '\0';
+    (void)snprintf(deep, sizeof(deep), "%s", "/tmp/chaos-deeper");
+    (void)mkdir(deep, 0700);
+    while (strlen(deep) < PATH_MAX - 400U)
+    {
+        (void)strcat(deep, "/");
+        (void)strcat(deep, component);
+        assert(mkdir(deep, 0700) == 0 || errno == EEXIST);
+    }
+    (void)unlink("/tmp/chaos-deeper-link");
+    assert(symlink(deep, "/tmp/chaos-deeper-link") == 0);
+    (void
+    )snprintf(long_rule, sizeof(long_rule), "/tmp/chaos-deeper-link/%s/%s/x", component, component);
+    {
+        char text[CHAOS_IO_MAX_RULE_PATH + 32U];
+
+        (void)snprintf(text, sizeof(text), "%s:write:EIO:1.0\n", long_rule);
+        chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, text);
+    }
+    g_chaos_io_cached_mtime = CHAOS_IO_MTIME_UNKNOWN;
+    assert(chaos_io_config_prepare() == 1);
+    assert(chaos_io_config_active_state()->rules[0].resolved_prefix == NULL);
+
+    assert(unlink("/tmp/chaos-deeper-link") == 0);
+    while (strcmp(deep, "/tmp/chaos-deeper") != 0)
+    {
+        assert(rmdir(deep) == 0);
+        *strrchr(deep, '/') = '\0';
+    }
+    assert(rmdir(deep) == 0);
+    assert(unlink("/tmp/chaos-cm") == 0);
+    assert(rmdir("/tmp/chaos-cm-a") == 0 && rmdir("/tmp/chaos-cm-b") == 0);
+    (void)unlink(CHAOS_IO_CONFIG_PATH);
+}
+
+/**
  * @brief Invariant: an image whose pid already has a hits file (the image an execve
  *        replaced) writes its own file under a number no pid reaches.
  */
@@ -1663,6 +1755,7 @@ int main(void)
     test_parse_buffer_reports_rejected_line();
     test_prepare_reports_status();
     test_rules_follow_links();
+    test_rules_follow_moving_links();
     test_hits_file_survives_exec();
     test_hits_are_counted_and_reported();
     test_rule_file_check_is_throttled();

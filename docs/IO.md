@@ -350,6 +350,12 @@ its path is also resolved when the rules are loaded, so a rule for `/lib` (a lin
 to `/usr/lib`) or for a Kubernetes ConfigMap mount (`..data` links) reaches its
 files however they were opened. chaos-init matches the same way.
 
+A rule may name a file that does not exist yet: its longest existing directory is
+resolved and the rest appended. A link may move while the rule file stays as it
+is (a ConfigMap update points `..data` at a new directory): when a loaded rule's
+path went through a link or did not exist in full, its paths are resolved again
+once a second, and the rules reloaded when one moved.
+
 ### What happens on `renameat()`
 
 `renameat()` is the only operation with two path identities in scope at once.

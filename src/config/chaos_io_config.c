@@ -104,7 +104,21 @@ typedef struct chaos_io_config_state
     char text[CHAOS_IO_MAX_RULES][CHAOS_STATUS_TEXT_MAX + 1U];
     /** Each rule's path with its links resolved (see chaos_io_rule_t::resolved_prefix). */
     char resolved[CHAOS_IO_MAX_RULES][CHAOS_IO_MAX_RULE_PATH];
+    /** A rule's path went through a link, or not all of it existed: the
+     *  resolution may change while the file does not (chaos_io_config_refresh()). */
+    int links;
+    /** When the paths were resolved (chaos_hits_now_ms()). */
+    uint64_t resolved_ms;
 } chaos_io_config_state_t;
+
+/**
+ * @brief How long a load whose rules depend on links is used before the paths are
+ *        resolved again: a Kubernetes ConfigMap's `..data` link moves to a new
+ *        directory on every update, without the rule file changing.
+ */
+#ifndef CHAOS_IO_LINKS_RECHECK_MS
+#define CHAOS_IO_LINKS_RECHECK_MS 1000U
+#endif
 
 /** @brief The two interchangeable config snapshots. */
 static chaos_io_config_state_t g_chaos_io_config_states[2];
@@ -906,14 +920,74 @@ __attribute__((destructor)) static void chaos_io_config_report_hits_at_exit(void
  * they are then. Every absolute prefix is also normalised lexically, as the paths
  * it is matched against are.
  */
+/**
+ * @brief Whether the active rules' paths, resolved through links, are due to be
+ *        resolved again (CHAOS_IO_LINKS_RECHECK_MS): the file is then read again.
+ */
+static int chaos_io_config_links_due(void)
+{
+    const chaos_io_config_state_t *state = chaos_io_config_active_state();
+
+    return state->links && chaos_hits_now_ms() - state->resolved_ms >= CHAOS_IO_LINKS_RECHECK_MS;
+}
+
+/** @brief Compile-time check: a rule's path (CHAOS_IO_MAX_RULE_PATH) fits a PATH_MAX buffer. */
+typedef char chaos_io_rule_path_fits_path_max[CHAOS_IO_MAX_RULE_PATH <= PATH_MAX ? 1 : -1];
+
+/**
+ * @brief realpath() of @p path, or, when its end does not exist yet, of its longest
+ *        existing ancestor with the rest appended: a rule may name a file created
+ *        after the rules are loaded.
+ * @return 1 with the name in @p out (PATH_MAX bytes), 0 when none of it resolves.
+ */
+static int chaos_io_config_resolve_path(const char *path, char *out, int *whole)
+{
+    char head[PATH_MAX]; /* a rule's path fits: chaos_io_rule_path_fits_path_max */
+
+    *whole = 1;
+    if (realpath(path, out) != NULL)
+    {
+        return 1;
+    }
+    *whole = 0;
+    (void)memcpy(head, path, strlen(path) + 1U);
+    for (;;)
+    {
+        char *slash = strrchr(head, '/');
+
+        if (slash == NULL || slash == head)
+        {
+            return 0;
+        }
+        *slash = '\0';
+        if (realpath(head, out) != NULL)
+        {
+            const char *rest = path + (slash - head);
+
+            if (strlen(out) + strlen(rest) >= PATH_MAX)
+            {
+                return 0;
+            }
+            (void)strcat(out, rest);
+            chaos_io_normalize_path(out);
+            return 1;
+        }
+    }
+}
+
 static void chaos_io_config_resolve_rules(chaos_io_config_state_t *state)
 {
     char resolved[PATH_MAX];
     size_t index;
 
+    state->links = 0;
+    state->resolved_ms = chaos_hits_now_ms();
+
     for (index = 0U; index < state->rule_count; ++index)
     {
         chaos_io_rule_t *rule = &state->rules[index];
+        int whole;
+        int found;
 
         rule->resolved_prefix = NULL;
         rule->resolved_len = 0U;
@@ -924,8 +998,12 @@ static void chaos_io_config_resolve_rules(chaos_io_config_state_t *state)
         /* Matched against normalised paths: written the same way. */
         chaos_io_normalize_path(rule->path_prefix);
         rule->path_len = strlen(rule->path_prefix);
-        if (realpath(rule->path_prefix, resolved) != NULL &&
-            strcmp(resolved, rule->path_prefix) != 0 &&
+        found = chaos_io_config_resolve_path(rule->path_prefix, resolved, &whole);
+        if (!found || !whole || strcmp(resolved, rule->path_prefix) != 0)
+        {
+            state->links = 1;
+        }
+        if (found && strcmp(resolved, rule->path_prefix) != 0 &&
             strlen(resolved) < sizeof(state->resolved[index]))
         {
             (void)memcpy(state->resolved[index], resolved, strlen(resolved) + 1U);
@@ -933,6 +1011,38 @@ static void chaos_io_config_resolve_rules(chaos_io_config_state_t *state)
             rule->resolved_len = strlen(resolved);
         }
     }
+}
+
+/**
+ * @brief Once the active rules' links are due again, whether their paths now
+ *        resolve differently; when they do not, the next look is put off.
+ */
+static int chaos_io_config_links_moved(void)
+{
+    chaos_io_config_state_t *state = &g_chaos_io_config_states[g_chaos_io_active_config_index];
+    char resolved[PATH_MAX];
+    size_t index;
+
+    if (!chaos_io_config_links_due())
+    {
+        return 0;
+    }
+    for (index = 0U; index < state->rule_count; ++index)
+    {
+        const chaos_io_rule_t *rule = &state->rules[index];
+        int whole;
+
+        if (rule->path_prefix[0] == '/' &&
+            chaos_io_config_resolve_path(rule->path_prefix, resolved, &whole) &&
+            strcmp(
+                resolved, rule->resolved_prefix != NULL ? rule->resolved_prefix : rule->path_prefix
+            ) != 0)
+        {
+            return 1;
+        }
+    }
+    state->resolved_ms = chaos_hits_now_ms();
+    return 0;
 }
 
 /**
@@ -1056,7 +1166,8 @@ static void chaos_io_config_reload(uint64_t observed_mtime, uint64_t previous_mt
     if (read_rc == 0)
     {
         content = chaos_config_content_hash(g_chaos_io_config_buffer, file_size);
-        if (observed_mtime == previous_mtime && content == g_chaos_io_config_content)
+        if (observed_mtime == previous_mtime && content == g_chaos_io_config_content &&
+            !chaos_io_config_links_moved())
         {
             /* A provisional load read again and found nothing new: the snapshot
              * stays, with its counts and claims. */
@@ -1176,7 +1287,8 @@ static int chaos_io_config_refresh(void)
     observed_mtime = chaos_io_config_observed_mtime();
     cached_mtime = chaos_io_atomic_load_u64(&g_chaos_io_cached_mtime);
 
-    if (cached_mtime == observed_mtime && !g_chaos_io_config_provisional)
+    if (cached_mtime == observed_mtime && !g_chaos_io_config_provisional &&
+        !chaos_io_config_links_due())
     {
         return chaos_io_config_active_state()->rule_count != 0U;
     }
