@@ -74,6 +74,7 @@ resolve_gcno() {
 CONFIG_GCNO=$(resolve_gcno test_config_parse)
 CHAOS_INIT_GCNO=$(resolve_gcno test_chaos_init)
 CHAOS_INIT_IO_GCNO=$(resolve_gcno test_chaos_init_io)
+CHAOS_INIT_NET_GCNO=$(resolve_gcno test_chaos_init_net)
 ACTIONS_GCNO=$(resolve_gcno test_actions)
 FDCACHE_GCNO=$(resolve_gcno test_fdcache)
 CHAOS_IO_GCNO=$(resolve_gcno test_chaos_io)
@@ -137,6 +138,7 @@ check_target "$CHAOS_INIT_GCNO" "src/init/chaos_init_delay.c" "100.00"
 check_target "$CHAOS_INIT_GCNO" "src/init/chaos_init_proc.c" "100.00"
 check_target "$CHAOS_INIT_GCNO" "src/init/chaos_init_tracee.c" "100.00"
 check_target "$CHAOS_INIT_IO_GCNO" "src/init/chaos_init_io.c" "100.00"
+check_target "$CHAOS_INIT_NET_GCNO" "src/init/chaos_init_net.c" "100.00"
 
 echo "coverage check passed"
 

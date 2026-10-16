@@ -11,7 +11,8 @@
  * their output, renames decided like renameat().
  *
  * SECCOMP mode applies ERRNO and LATENCY; TORN and CORRUPT change data the kernel
- * moves and are not applied here.
+ * moves, and ERRNO on close would have to close and fail at once (the wrapper
+ * closes, then reports the error): none of these is applied here.
  */
 
 #include "chaos_init_io.h"
@@ -333,7 +334,8 @@ int chaos_init_io_decide(const chaos_init_call_t *call, chaos_init_verdict_t *ve
         break;
     }
     if (!matched ||
-        (rule.effect != CHAOS_IO_EFFECT_ERRNO && rule.effect != CHAOS_IO_EFFECT_LATENCY))
+        (rule.effect != CHAOS_IO_EFFECT_ERRNO && rule.effect != CHAOS_IO_EFFECT_LATENCY) ||
+        (entry->operation == CHAOS_IO_OP_CLOSE && rule.effect == CHAOS_IO_EFFECT_ERRNO))
     {
         return 1;
     }

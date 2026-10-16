@@ -129,7 +129,8 @@ INIT_SRCS := \
 	$(SRC_INIT_DIR)/chaos_init_delay.c \
 	$(SRC_INIT_DIR)/chaos_init_proc.c \
 	$(SRC_INIT_DIR)/chaos_init_tracee.c \
-	$(SRC_INIT_DIR)/chaos_init_io.c
+	$(SRC_INIT_DIR)/chaos_init_io.c \
+	$(SRC_INIT_DIR)/chaos_init_net.c
 INIT_HDRS := \
 	$(SRC_INIT_DIR)/chaos_init_core.h \
 	$(SRC_INIT_DIR)/chaos_init_call.h \
@@ -137,11 +138,16 @@ INIT_HDRS := \
 	$(SRC_INIT_DIR)/chaos_init_proc.h \
 	$(SRC_INIT_DIR)/chaos_init_tracee.h \
 	$(SRC_INIT_DIR)/chaos_init_io.h \
+	$(SRC_INIT_DIR)/chaos_init_net.h \
 	$(SRC_COMMON_DIR)/chaos_status.h \
 	$(SRC_COMMON_DIR)/chaos_hits.h \
 	$(SRC_CONFIG_DIR)/chaos_io_config.c \
 	$(SRC_EFFECTS_DIR)/chaos_io_actions.c \
-	$(LIB_HDRS_io)
+	$(SRC_NET_DIR)/chaos_net_config.c \
+	$(SRC_NET_DIR)/chaos_net_endpoint.c \
+	$(SRC_NET_DIR)/chaos_net_actions.c \
+	$(LIB_HDRS_io) \
+	$(LIB_HDRS_net)
 INIT_CC ?= $(CC)
 INIT_CFLAGS := $(CPPFLAGS) -I$(SRC_INIT_DIR) $(CFLAGS) -static
 INIT_LDFLAGS := $(LDFLAGS) -Wl,--strip-all
@@ -216,13 +222,15 @@ CHAOS_PROCESS_TEST := $(BUILD_DIR)/test_chaos_process
 PROPTEST_TEST := $(BUILD_DIR)/test_config_proptest
 CHAOS_INIT_TEST := $(BUILD_DIR)/test_chaos_init
 CHAOS_INIT_IO_TEST := $(BUILD_DIR)/test_chaos_init_io
+CHAOS_INIT_NET_TEST := $(BUILD_DIR)/test_chaos_init_net
 UNIT_TESTS := $(CONFIG_TEST) $(ACTIONS_TEST) $(FDCACHE_TEST) $(CHAOS_IO_TEST) \
 	$(NET_ACTIONS_TEST) $(NET_ENDPOINT_TEST) $(NET_CONFIG_TEST) $(NET_RUNTIME_TEST) $(CHAOS_NET_TEST) \
 	$(DNS_ACTIONS_TEST) $(DNS_CONFIG_TEST) $(DNS_RUNTIME_TEST) $(CHAOS_DNS_TEST) \
 	$(TIME_ACTIONS_TEST) $(TIME_CONFIG_TEST) $(TIME_RUNTIME_TEST) $(CHAOS_TIME_TEST) \
 	$(MEMORY_ACTIONS_TEST) $(MEMORY_CONFIG_TEST) $(MEMORY_RUNTIME_TEST) $(CHAOS_MEMORY_TEST) \
 	$(PROCESS_ACTIONS_TEST) $(PROCESS_CONFIG_TEST) $(PROCESS_RUNTIME_TEST) $(CHAOS_PROCESS_TEST) \
-	$(PROPTEST_TEST) $(CHAOS_INIT_TEST) $(CHAOS_INIT_IO_TEST)
+	$(PROPTEST_TEST) $(CHAOS_INIT_TEST) $(CHAOS_INIT_IO_TEST) \
+	$(CHAOS_INIT_NET_TEST)
 HOST_RUNTIME_TESTS := \
 	$(TEST_RUNTIME_DIR)/test_integration.sh \
 	$(TEST_RUNTIME_DIR)/test_glibc.sh \
@@ -309,6 +317,7 @@ unit: $(UNIT_TESTS)
 	./$(PROPTEST_TEST)
 	./$(CHAOS_INIT_TEST)
 	./$(CHAOS_INIT_IO_TEST)
+	./$(CHAOS_INIT_NET_TEST)
 
 coverage:
 	BUILD_DIR=$(BUILD_DIR)-coverage CC="$(CC)" CPPFLAGS='$(CPPFLAGS)' CFLAGS='$(CFLAGS)' ./$(TEST_RUNTIME_DIR)/check_coverage.sh

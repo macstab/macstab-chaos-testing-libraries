@@ -31,6 +31,7 @@
 #include "chaos_init_core.h"
 #include "chaos_init_delay.h"
 #include "chaos_init_io.h"
+#include "chaos_init_net.h"
 #include "chaos_init_tracee.h"
 #include "chaos_status.h"
 
@@ -231,16 +232,25 @@ static uint64_t chaos_init_now_ms(void)
     return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
 }
 
-/** @brief Sends the answer to notification @p id: fail with @p error, or run the call. */
-static void chaos_init_reply(int listener, uint64_t id, int error, void *response, size_t size)
+/**
+ * @brief Sends the answer to notification @p id: run the call, fail it with
+ *        @p verdict's error, or return @p verdict's value without running it.
+ */
+static void chaos_init_reply(
+    int listener, uint64_t id, const chaos_init_verdict_t *verdict, void *response, size_t size
+)
 {
     struct seccomp_notif_resp *reply = response;
 
     memset(reply, 0, size);
     reply->id = id;
-    if (error != 0)
+    if (verdict->action == CHAOS_INIT_FAIL)
     {
-        reply->error = -error;
+        reply->error = -verdict->error;
+    }
+    else if (verdict->action == CHAOS_INIT_RETURN)
+    {
+        reply->val = verdict->value;
     }
     else
     {
@@ -271,7 +281,9 @@ chaos_init_answer(int listener, unsigned libs, void *request, void *response, si
         call.args[index] = notification->data.args[index];
     }
     verdict.action = CHAOS_INIT_PASS;
-    if ((libs & CHAOS_INIT_LIB_IO) != 0U)
+    /* net first: it claims read, write and close on sockets; io decides the rest. */
+    if (((libs & CHAOS_INIT_LIB_NET) == 0U || !chaos_init_net_decide(&call, &verdict)) &&
+        (libs & CHAOS_INIT_LIB_IO) != 0U)
     {
         (void)chaos_init_io_decide(&call, &verdict);
     }
@@ -287,13 +299,11 @@ chaos_init_answer(int listener, unsigned libs, void *request, void *response, si
     {
         return;
     }
-    chaos_init_reply(
-        listener,
-        notification->id,
-        verdict.action == CHAOS_INIT_FAIL ? verdict.error : 0,
-        response,
-        response_size
-    );
+    if (verdict.action == CHAOS_INIT_DELAY)
+    {
+        verdict.action = CHAOS_INIT_PASS; /* the queue is full: run it now */
+    }
+    chaos_init_reply(listener, notification->id, &verdict, response, response_size);
 }
 
 /**
@@ -308,9 +318,11 @@ static void chaos_init_on_time(int timer, int listener, void *response, size_t r
     uint64_t due = 0U;
     uint64_t id;
 
+    chaos_init_verdict_t run;
+    run.action = CHAOS_INIT_PASS;
     while (chaos_init_delay_pop(now, &id))
     {
-        chaos_init_reply(listener, id, 0, response, response_size);
+        chaos_init_reply(listener, id, &run, response, response_size);
     }
     if (chaos_init_tracee_pending() && now - last_flush_ms >= CHAOS_HITS_INTERVAL_MS)
     {
@@ -446,6 +458,10 @@ int main(int argc, char **argv)
     if (listener >= 0 && (options.libs & CHAOS_INIT_LIB_IO) != 0U)
     {
         chaos_init_io_start();
+    }
+    if (listener >= 0 && (options.libs & CHAOS_INIT_LIB_NET) != 0U)
+    {
+        chaos_init_net_start();
     }
     chaos_init_write_status(
         options.libs, listener >= 0 ? NULL : chaos_init_unsupported_reason(error)

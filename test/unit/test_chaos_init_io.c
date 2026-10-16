@@ -236,7 +236,8 @@ int main(void)
 
     /* close, fsync, truncate by path and by descriptor, unlinkat. */
     closing = open_file("/tmp/initio/c/f");
-    assert(FAILS(decide(__NR_close, (uint64_t)closing, 0, 0, 0, 0), EIO));
+    /* ERRNO on close is not applied: the call cannot both close and fail. */
+    assert(PASSES(decide(__NR_close, (uint64_t)closing, 0, 0, 0, 0)));
     syncing = open_file("/tmp/initio/s/f");
     assert(FAILS(decide(__NR_fsync, (uint64_t)syncing, 0, 0, 0, 0), EIO));
     assert(PASSES(decide(__NR_fdatasync, (uint64_t)syncing, 0, 0, 0, 0)));

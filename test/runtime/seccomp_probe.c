@@ -6,19 +6,40 @@
  *        seccomp_probe openms <path>  prints how long the open took, in ms
  *        seccomp_probe first <path>   opens twice, then once in a forked child:
  *                                     "parent=<1st>,<2nd> child=<1st>"
+ *        seccomp_probe connect <port> listens on 127.0.0.1:<port>, connects to it:
+ *                                     "ok" or the errno name
  */
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+static const char *try_open_errno_name(int error)
+{
+    switch (error)
+    {
+    case EIO:
+        return "EIO";
+    case EACCES:
+        return "EACCES";
+    case ECONNREFUSED:
+        return "ECONNREFUSED";
+    default:
+        return strerror(error);
+    }
+}
 
 static const char *try_open(const char *path)
 {
@@ -29,15 +50,7 @@ static const char *try_open(const char *path)
         (void)close(fd);
         return "ok";
     }
-    switch (errno)
-    {
-    case EIO:
-        return "EIO";
-    case EACCES:
-        return "EACCES";
-    default:
-        return strerror(errno);
-    }
+    return try_open_errno_name(errno);
 }
 
 int main(int argc, char **argv)
@@ -55,8 +68,10 @@ int main(int argc, char **argv)
         (void)clock_gettime(CLOCK_MONOTONIC, &start);
         (void)try_open(argv[2]);
         (void)clock_gettime(CLOCK_MONOTONIC, &end);
-        (void)printf("%ld\n", (long)((end.tv_sec - start.tv_sec) * 1000L +
-                                     (end.tv_nsec - start.tv_nsec) / 1000000L));
+        (void)printf(
+            "%ld\n",
+            (long)((end.tv_sec - start.tv_sec) * 1000L + (end.tv_nsec - start.tv_nsec) / 1000000L)
+        );
         return 0;
     }
     if (argc == 3 && strcmp(argv[1], "first") == 0)
@@ -85,6 +100,26 @@ int main(int argc, char **argv)
         (void)printf("parent=%s,%s child=%s\n", first, second, child_result);
         return 0;
     }
-    (void)fprintf(stderr, "usage: %s open|openms|first <path>\n", argv[0]);
+    if (argc == 3 && strcmp(argv[1], "connect") == 0)
+    {
+        struct sockaddr_in address;
+        const int listener = socket(AF_INET, SOCK_STREAM, 0);
+        const int client = socket(AF_INET, SOCK_STREAM, 0);
+
+        memset(&address, 0, sizeof(address));
+        address.sin_family = AF_INET;
+        address.sin_port = htons((uint16_t)atoi(argv[2]));
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+            listen(listener, 1) != 0)
+        {
+            return 1;
+        }
+        (void)printf("%s\n", connect(client, (struct sockaddr *)&address, sizeof(address)) == 0
+                                 ? "ok"
+                                 : try_open_errno_name(errno));
+        return 0;
+    }
+    (void)fprintf(stderr, "usage: %s open|openms|first <path> | connect <port>\n", argv[0]);
     return 2;
 }

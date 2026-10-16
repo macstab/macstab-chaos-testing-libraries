@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# test_seccomp.sh — libchaos-io rules in SECCOMP mode, on static programs (Docker).
+# test_seccomp.sh — io and net rules in SECCOMP mode, on static programs (Docker).
 #
 # Builds chaos-init (docker/Dockerfile.build) and a statically linked Go program
 # (CGO_ENABLED=0, the kind LD_PRELOAD cannot reach), then runs them and a static
@@ -11,7 +11,9 @@
 # - a LATENCY rule delays the open (C and Go);
 # - @first=1 fires once per process, a forked child included, and each process
 #   writes its own hits file;
-# - the io status file reports the loaded rules.
+# - the io status file reports the loaded rules;
+# - a connect rule refuses the connection (C and Go), a recv LATENCY rule delays
+#   the server side's read (Go), and the net status file reports the rules.
 #
 # Without chaos-init the same opens succeed. Under emulation (amd64 on an arm64
 # host) seccomp is unavailable and the test is skipped.
@@ -128,6 +130,17 @@ files=$(ls /tmp/.chaos-io.hits.* | wc -l)
 once=$(cat /tmp/.chaos-io.hits.* | awk -F "\t" "\$2 ~ /once/ { s += \$1 } END { print s + 0 }")
 expect "one hits file per process, @first hits summed" "$files $once" "2 2"
 expect "io status reports the rules" "$(head -2 /tmp/.chaos-io.status | tr "\n" " ")" "state=ok rules=3 "
+
+printf "%s\n" "tcp4://127.0.0.1:7777:connect:ECONNREFUSED:1.0 # t" \
+    "tcp4://127.0.0.1:7778:recv:LATENCY:150 # t" > /tmp/.chaos-net.conf
+expect "C: without chaos-init the connect rule does nothing" "$(/tmp/probe connect 7777)" "ok"
+expect "C: connect rule refuses the connection" "$($init --libs net -- /tmp/probe connect 7777)" "ECONNREFUSED"
+expect "C: another port connects" "$($init --libs net -- /tmp/probe connect 7779)" "ok"
+expect "Go: connect rule refuses the dial" "$($init --libs net -- $go dial 7777)" "ECONNREFUSED"
+expect "Go: another port dials" "$($init --libs net -- $go dial 7779)" "ok"
+at_least "Go: recv LATENCY delays the server read" "$($init --libs net -- $go recvms 7778)" 150
+expect "Go: io and net together" "$($init --libs io,net -- $go open /tmp/sec/data/x) $($init --libs io,net -- $go dial 7777)" "EIO ECONNREFUSED"
+expect "net status reports the rules" "$(head -2 /tmp/.chaos-net.status | tr "\n" " ")" "state=ok rules=2 "
 [ "$failures" -eq 0 ]
 '
 
