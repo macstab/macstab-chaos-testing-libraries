@@ -688,9 +688,75 @@ static void test_endpoint_resolution_from_sockaddr_and_fd(void)
     assert(!chaos_net_endpoint_from_activity_fd(7, NULL));
 }
 
+/**
+ * @brief Invariant: malformed selectors are rejected at every field, only
+ *   ::ffff:0:0/96 addresses are taken for IPv4, and an unresolved getsockname or
+ *   getpeername leaves descriptor lookups without an endpoint.
+ *
+ * Expected observable behaviour:
+ * - An empty IPv4 host, a one-character host other than '*', an IPv6 host without
+ *   a closing bracket or with an over-long bracket, a UNIX path that does not fit
+ *   and a NULL output are all rejected.
+ * - IPv6 addresses outside ::ffff:0:0/96 (2001:db8::1, 0:0:1::1) stay TCP6.
+ * - A sockaddr shorter than its family field, or a NULL output, yields nothing.
+ * - Without the real getsockname/getpeername the local/peer lookups return 0.
+ */
+static void test_selector_rejections_and_unresolved_lookups(void)
+{
+    static const char *const not_mapped[] = {"2001:db8::1", "0:0:1::1"};
+    chaos_net_endpoint_t selector;
+    chaos_net_endpoint_t endpoint;
+    struct sockaddr_in6 ipv6;
+    char long_selector[7U + CHAOS_NET_MAX_TEXT + 1U];
+    char long_ipv6[64];
+    size_t index;
+
+    reset_endpoint_stubs();
+    assert(!chaos_net_endpoint_parse_selector("tcp4://:80", &selector));
+    assert(!chaos_net_endpoint_parse_selector("tcp4://1:80", &selector));
+    assert(!chaos_net_endpoint_parse_selector("tcp6://[::1:443", &selector));
+    (void)memset(long_ipv6, '1', sizeof(long_ipv6));
+    (void)memcpy(long_ipv6, "tcp6://[", 8U);
+    (void)memcpy(long_ipv6 + sizeof(long_ipv6) - 5U, "]:80", 5U);
+    assert(!chaos_net_endpoint_parse_selector(long_ipv6, &selector));
+    assert(!chaos_net_endpoint_parse_selector("tcp4://*:80", NULL));
+
+    /* A UNIX path one byte longer than the endpoint holds; one byte less fits. */
+    (void)memcpy(long_selector, "unix://", 7U);
+    (void)memset(long_selector + 7U, 'p', CHAOS_NET_MAX_TEXT);
+    long_selector[sizeof(long_selector) - 1U] = '\0';
+    assert(!chaos_net_endpoint_parse_selector(long_selector, &selector));
+    long_selector[sizeof(long_selector) - 2U] = '\0';
+    assert(chaos_net_endpoint_parse_selector(long_selector, &selector));
+    assert(strlen(selector.value.text) == CHAOS_NET_MAX_TEXT - 1U);
+
+    g_stub_socket_type = SOCK_STREAM;
+    for (index = 0U; index < sizeof(not_mapped) / sizeof(not_mapped[0]); ++index)
+    {
+        chaos_net_test_set_ipv6(&ipv6, not_mapped[index], 443U);
+        assert(chaos_net_endpoint_from_sockaddr_fd(
+            7, (const struct sockaddr *)&ipv6, (socklen_t)sizeof(ipv6), &endpoint
+        ));
+        assert(endpoint.kind == CHAOS_NET_ENDPOINT_TCP6);
+        assert(memcmp(&endpoint.value.ipv6, &ipv6.sin6_addr, sizeof(ipv6.sin6_addr)) == 0);
+    }
+    assert(!chaos_net_endpoint_from_sockaddr_fd(
+        7, (const struct sockaddr *)&ipv6, (socklen_t)sizeof(ipv6), NULL
+    ));
+    assert(!chaos_net_endpoint_from_sockaddr_fd(7, (const struct sockaddr *)&ipv6, 1U, &endpoint));
+
+    /* Before the real symbols are resolved, no descriptor has an endpoint. */
+    g_chaos_net_real_getsockname = NULL;
+    g_chaos_net_real_getpeername = NULL;
+    assert(!chaos_net_endpoint_from_local_fd(7, &endpoint));
+    assert(!chaos_net_endpoint_from_peer_fd(7, &endpoint));
+    reset_endpoint_stubs();
+}
+
 int main(void)
 {
     test_selector_parsing_and_matching();
     test_endpoint_resolution_from_sockaddr_and_fd();
+    test_selector_rejections_and_unresolved_lookups();
     return 0;
 }

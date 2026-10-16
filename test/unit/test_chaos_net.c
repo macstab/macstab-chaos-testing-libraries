@@ -91,6 +91,9 @@ static uint64_t g_last_call_size = 0U;
 /** @brief When non-zero, `chaos_net_config_match_endpoint*` fills @p rule and returns 1. */
 static int g_stub_match_endpoint = 0;
 
+/** @brief Number of upcoming `chaos_net_config_match_endpoint*` calls that match nothing. */
+static int g_stub_match_misses = 0;
+
 /** @brief When non-zero, `chaos_net_endpoint_from_sockaddr_fd` fills @p endpoint and returns 1. */
 static int g_stub_endpoint_from_sockaddr = 0;
 
@@ -299,6 +302,11 @@ int chaos_net_config_match_endpoint(
     (void)endpoint;
     if (g_stub_match_endpoint == 0 || rule == NULL)
     {
+        return 0;
+    }
+    if (g_stub_match_misses > 0)
+    {
+        --g_stub_match_misses;
         return 0;
     }
     *rule = g_stub_rule;
@@ -1175,6 +1183,7 @@ static void reset_wrapper_stubs(void)
     (void)memset(&g_stub_endpoint, 0, sizeof(g_stub_endpoint));
     g_stub_prepare = 0;
     g_stub_match_endpoint = 0;
+    g_stub_match_misses = 0;
     g_stub_endpoint_from_sockaddr = 0;
     g_stub_endpoint_from_socket_spec = 0;
     g_stub_endpoint_from_activity = 0;
@@ -3447,8 +3456,555 @@ static void test_corrupt_stays_in_the_buffer(void)
     g_recvmsg_result = 4;
 }
 
+/**
+ * @brief Arms every endpoint lookup and an always-firing ERRNO rule: any wrapper that
+ *   consulted the rules would fail with ECONNRESET.
+ */
+static void arm_errno_rule_everywhere(void)
+{
+    reset_descriptor_stubs();
+    g_stub_prepare = 1;
+    g_stub_endpoint_from_sockaddr = 1;
+    g_stub_endpoint_from_socket_spec = 1;
+    g_stub_endpoint_from_activity = 1;
+    g_stub_endpoint_from_local = 1;
+    g_stub_endpoint_from_peer = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_ERRNO;
+    g_stub_rule.errnum = ECONNRESET;
+    g_errno_trigger = 1;
+}
+
+/**
+ * @brief Invariant: inside the library (the reentrancy guard set), every wrapper
+ *   forwards its call unchanged, whatever rule would match.
+ *
+ * Triggering condition: an always-firing ERRNO rule that every endpoint lookup
+ *   matches, and the guard set, as while the library itself makes a call.
+ *
+ * Expected observable behaviour: each wrapper returns the real call's result, each
+ *   real call runs once, errno is untouched and no effect is applied.
+ */
+static void test_wrappers_forward_inside_library(void)
+{
+    struct sockaddr_in address;
+    struct msghdr message;
+    struct pollfd fds[1];
+    struct timeval tv = {0, 0};
+    struct timespec ts = {0, 0};
+    fd_set readfds;
+    char buffer[8];
+    int sv[2];
+#ifdef __linux__
+    struct mmsghdr mmsg;
+    struct epoll_event events[1];
+#endif
+
+    arm_errno_rule_everywhere();
+    chaos_net_test_set_ipv4(&address, "127.0.0.1", 9300U);
+    (void)memset(&message, 0, sizeof(message));
+    fds[0].fd = 3;
+    fds[0].events = POLLIN;
+    fds[0].revents = 0;
+    FD_ZERO(&readfds);
+    FD_SET(3, &readfds);
+
+    g_chaos_net_tls_guard = 1;
+    errno = 0;
+    assert(bind(3, (const struct sockaddr *)&address, (socklen_t)sizeof(address)) == 0);
+    assert(listen(3, 1) == 0);
+    assert(connect(3, (const struct sockaddr *)&address, (socklen_t)sizeof(address)) == 0);
+    assert(accept(3, NULL, NULL) == 10);
+    assert(socket(AF_INET, SOCK_STREAM, 0) == 8);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    assert(shutdown(3, SHUT_RDWR) == 0);
+    assert(send(3, "x", 1U, 0) == 4);
+    assert(
+        sendto(3, "x", 1U, 0, (const struct sockaddr *)&address, (socklen_t)sizeof(address)) == 4
+    );
+    assert(sendmsg(3, &message, 0) == 4);
+    assert(recv(3, buffer, sizeof(buffer), 0) == 4);
+    assert(recvfrom(3, buffer, sizeof(buffer), 0, NULL, NULL) == 4);
+    assert(recvmsg(3, &message, 0) == 4);
+    assert(poll(fds, 1U, 0) == 0);
+    assert(ppoll(fds, 1U, &ts, NULL) == 0);
+    assert(select(4, &readfds, NULL, NULL, &tv) == 0);
+    assert(pselect(4, &readfds, NULL, NULL, &ts, NULL) == 0);
+#ifdef __linux__
+    assert(accept4(3, NULL, NULL, 0) == 10);
+    (void)memset(&mmsg, 0, sizeof(mmsg));
+    assert(sendmmsg(3, &mmsg, 1U, 0) == 1);
+    assert(recvmmsg(3, &mmsg, 1U, 0, NULL) == 1);
+    assert(epoll_wait(3, events, 1, 0) == 1);
+    assert(epoll_pwait(3, events, 1, 0, NULL) == 1);
+#endif
+    g_chaos_net_tls_guard = 0;
+
+    assert(errno == 0);
+    assert(g_bind_calls == 1 && g_listen_calls == 1 && g_connect_calls == 1);
+    assert(g_socket_calls == 1 && g_socketpair_calls == 1 && g_shutdown_calls == 1);
+    assert(g_send_calls == 1 && g_sendto_calls == 1 && g_sendmsg_calls == 1);
+    assert(g_recv_calls == 1 && g_recvfrom_calls == 1 && g_recvmsg_calls == 1);
+    assert(g_poll_calls == 1 && g_ppoll_calls == 1);
+    assert(g_select_calls == 1 && g_pselect_calls == 1);
+#ifdef __linux__
+    assert(g_accept_calls == 2);
+    assert(g_sendmmsg_calls == 1 && g_recvmmsg_calls == 1);
+    assert(g_epoll_wait_calls == 1 && g_epoll_pwait_calls == 1);
+#else
+    assert(g_accept_calls == 1);
+#endif
+    assert(g_latency_calls == 0);
+    reset_wrapper_stubs();
+}
+
+/**
+ * @brief Invariant: a socket whose endpoint is known but matches no rule is left
+ *   alone, and a connected socket is matched on its other end when the first end
+ *   matches nothing.
+ *
+ * Triggering condition: rules loaded and every endpoint lookup succeeding, while the
+ *   rule lookup matches nothing (or only from its second call on).
+ *
+ * Expected observable behaviour:
+ * - Without a matching rule every wrapper forwards its call, including sendto,
+ *   sendmsg and sendmmsg with an explicit destination, and close.
+ * - A destination whose endpoint cannot be resolved is forwarded too; sendmsg
+ *   without a message header is matched by the connection.
+ * - recv matches its peer after its local end matched nothing, send its local end
+ *   after its peer; with neither end matching, the real calls run.
+ */
+static void test_unmatched_endpoints_are_forwarded(void)
+{
+    struct sockaddr_in address;
+    struct msghdr message;
+    char buffer[8];
+    int sv[2];
+#ifdef __linux__
+    struct mmsghdr mmsg;
+#endif
+
+    arm_errno_rule_everywhere();
+    chaos_net_test_set_ipv4(&address, "127.0.0.1", 9301U);
+    (void)memset(&message, 0, sizeof(message));
+    message.msg_name = &address;
+    message.msg_namelen = (socklen_t)sizeof(address);
+    g_stub_match_misses = 1000;
+
+    errno = 0;
+    assert(bind(3, (const struct sockaddr *)&address, (socklen_t)sizeof(address)) == 0);
+    assert(listen(3, 1) == 0);
+    assert(connect(3, (const struct sockaddr *)&address, (socklen_t)sizeof(address)) == 0);
+    assert(accept(3, NULL, NULL) == 10);
+    assert(socket(AF_INET, SOCK_STREAM, 0) == 8);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    assert(shutdown(3, SHUT_RDWR) == 0);
+    assert(
+        sendto(3, "x", 1U, 0, (const struct sockaddr *)&address, (socklen_t)sizeof(address)) == 4
+    );
+    assert(sendmsg(3, &message, 0) == 4);
+    assert(close(3) == 0);
+#ifdef __linux__
+    assert(accept4(3, NULL, NULL, 0) == 10);
+    (void)memset(&mmsg, 0, sizeof(mmsg));
+    mmsg.msg_hdr.msg_name = &address;
+    mmsg.msg_hdr.msg_namelen = (socklen_t)sizeof(address);
+    assert(sendmmsg(3, &mmsg, 1U, 0) == 1);
+    assert(g_sendmmsg_calls == 1);
+#endif
+    assert(errno == 0);
+    assert(g_bind_calls == 1 && g_listen_calls == 1 && g_connect_calls == 1);
+    assert(g_socket_calls == 1 && g_socketpair_calls == 1 && g_shutdown_calls == 1);
+    assert(g_sendto_calls == 1 && g_sendmsg_calls == 1 && g_descriptor_calls == 1);
+
+    /* An explicit destination whose endpoint cannot be resolved. */
+    g_stub_match_misses = 0;
+    g_stub_endpoint_from_sockaddr = 0;
+    assert(
+        sendto(3, "x", 1U, 0, (const struct sockaddr *)&address, (socklen_t)sizeof(address)) == 4
+    );
+    assert(sendmsg(3, &message, 0) == 4);
+#ifdef __linux__
+    assert(sendmmsg(3, &mmsg, 1U, 0) == 1);
+    assert(g_sendmmsg_calls == 2);
+#endif
+    assert(g_sendto_calls == 2 && g_sendmsg_calls == 2);
+    assert(errno == 0);
+
+    /* sendmsg without a message header goes by the connection. */
+    errno = 0;
+    assert(sendmsg(3, NULL, 0) == -1 && errno == ECONNRESET);
+    assert(g_sendmsg_calls == 2);
+
+    /* The first end matches nothing, the other one does. */
+    g_stub_match_misses = 1;
+    assert(recv(3, buffer, sizeof(buffer), 0) == -1 && errno == ECONNRESET);
+    g_stub_match_misses = 1;
+    errno = 0;
+    assert(send(3, "x", 1U, 0) == -1 && errno == ECONNRESET);
+    /* Neither end matches. */
+    g_stub_match_misses = 2;
+    errno = 0;
+    assert(recv(3, buffer, sizeof(buffer), 0) == 4);
+    g_stub_match_misses = 2;
+    assert(send(3, "x", 1U, 0) == 4);
+    assert(errno == 0);
+    assert(g_recv_calls == 1 && g_send_calls == 1);
+    reset_wrapper_stubs();
+}
+
+/**
+ * @brief Invariant: a rule whose probability does not fire leaves the call alone.
+ *
+ * Triggering condition: matching ERRNO, CORRUPT and TIMEOUT rules whose sample
+ *   misses (the errno and trigger stubs refuse).
+ *
+ * Expected observable behaviour:
+ * - ERRNO: the real receive runs and its result and data are returned.
+ * - CORRUPT: the received bytes are returned as received, nothing is corrupted;
+ *   a failed or empty recvmmsg batch is not corrupted either.
+ * - TIMEOUT: the real poll runs.
+ * - A TIMEOUT that fires without a flag to report it still waits and returns 0.
+ */
+static void test_rules_that_do_not_fire(void)
+{
+    char buffer[8];
+    struct iovec iov;
+    struct msghdr message;
+    struct pollfd fds[1];
+    chaos_net_rule_t rule;
+    int synthetic_timeout = -1;
+#ifdef __linux__
+    struct mmsghdr mmsg;
+    char mmsg_bytes[8];
+    struct iovec mmsg_iov;
+#endif
+
+    iov.iov_base = buffer;
+    iov.iov_len = sizeof(buffer);
+    (void)memset(&message, 0, sizeof(message));
+    message.msg_iov = &iov;
+    message.msg_iovlen = 1U;
+
+    /* ERRNO whose sample misses. */
+    arm_errno_rule_everywhere();
+    g_errno_trigger = 0;
+    errno = 0;
+    (void)memset(buffer, 0, sizeof(buffer));
+    assert(recv(3, buffer, sizeof(buffer), 0) == 4 && memcmp(buffer, "data", 4U) == 0);
+    (void)memset(buffer, 0, sizeof(buffer));
+    assert(recvfrom(3, buffer, sizeof(buffer), 0, NULL, NULL) == 4);
+    assert(memcmp(buffer, "data", 4U) == 0);
+    (void)memset(buffer, 0, sizeof(buffer));
+    assert(recvmsg(3, &message, 0) == 4 && memcmp(buffer, "data", 4U) == 0);
+    assert(socket(AF_INET, SOCK_STREAM, 0) == 8);
+    assert(errno == 0);
+    rule = g_stub_rule;
+    assert(chaos_net_apply_pre_call_rule(&rule) == 0);
+    assert(chaos_net_apply_simple_pre_call_rule(&rule) == 0);
+    assert(chaos_net_wait_pre_call(&rule, 0, &synthetic_timeout) == 0);
+    assert(synthetic_timeout == 0 && errno == 0);
+
+    /* CORRUPT whose sample misses. */
+    g_stub_rule.effect = CHAOS_NET_EFFECT_CORRUPT;
+    g_should_trigger = 0;
+    (void)memset(buffer, 0, sizeof(buffer));
+    assert(recv(3, buffer, sizeof(buffer), 0) == 4 && memcmp(buffer, "data", 4U) == 0);
+    assert(recvfrom(3, buffer, sizeof(buffer), 0, NULL, NULL) == 4);
+    assert(memcmp(buffer, "data", 4U) == 0);
+    assert(recvmsg(3, &message, 0) == 4 && memcmp(buffer, "data", 4U) == 0);
+    assert(read(3, buffer, sizeof(buffer)) == 4 && memcmp(buffer, "data", 4U) == 0);
+    assert(readv(3, &iov, 1) == (ssize_t)sizeof(buffer));
+#ifdef __linux__
+    mmsg_iov.iov_base = mmsg_bytes;
+    mmsg_iov.iov_len = sizeof(mmsg_bytes);
+    (void)memset(&mmsg, 0, sizeof(mmsg));
+    mmsg.msg_hdr.msg_iov = &mmsg_iov;
+    mmsg.msg_hdr.msg_iovlen = 1U;
+    assert(recvmmsg(3, &mmsg, 1U, 0, NULL) == 1);
+    assert(memcmp(mmsg_bytes, "data", 4U) == 0);
+    /* A failed or empty batch has nothing to corrupt, and the rule is not asked. */
+    g_should_trigger = 1;
+    g_recvmmsg_result = -1;
+    assert(recvmmsg(3, &mmsg, 1U, 0, NULL) == -1);
+    g_recvmmsg_result = 0;
+    assert(recvmmsg(3, &mmsg, 1U, 0, NULL) == 0);
+    g_should_trigger = 0;
+#endif
+    assert(g_corrupt_calls == 0);
+
+    /* TIMEOUT whose sample misses: the real poll runs. */
+    g_stub_rule.effect = CHAOS_NET_EFFECT_TIMEOUT;
+    fds[0].fd = 3;
+    fds[0].events = POLLIN;
+    fds[0].revents = 0;
+    g_poll_result = 1;
+    assert(poll(fds, 1U, 0) == 1);
+    assert(g_poll_calls == 1);
+
+    /* A firing TIMEOUT with nowhere to report it. */
+    g_should_trigger = 1;
+    rule.effect = CHAOS_NET_EFFECT_TIMEOUT;
+    assert(chaos_net_wait_pre_call(&rule, 0, NULL) == 0);
+    rule.effect = CHAOS_NET_EFFECT_LATENCY;
+    assert(chaos_net_wait_pre_call(&rule, 0, NULL) == 0);
+    assert(g_latency_calls == 1);
+    reset_wrapper_stubs();
+}
+
+/**
+ * @brief Invariant: the wait wrappers find a rule through whichever set names the
+ *   descriptor, and forward when no watched descriptor matches.
+ *
+ * Expected observable behaviour:
+ * - select() watching a socket only for exceptions, or only for writes, applies its rule.
+ * - poll() and select() with rules loaded but no watched descriptor matching, and
+ *   with no rules loaded, forward the call.
+ * - A negative tv_nsec counts as an expired timeout; clearing sets skips NULL ones.
+ */
+static void test_wait_sets_and_unmatched_descriptors(void)
+{
+    struct pollfd fds[2];
+    struct timespec ts;
+    fd_set exceptfds;
+    fd_set writefds;
+    chaos_net_rule_t rule;
+
+    arm_errno_rule_everywhere();
+    FD_ZERO(&exceptfds);
+    FD_SET(3, &exceptfds);
+    errno = 0;
+    assert(select(4, NULL, NULL, &exceptfds, NULL) == -1 && errno == ECONNRESET);
+    FD_ZERO(&writefds);
+    FD_SET(3, &writefds);
+    errno = 0;
+    assert(select(4, NULL, &writefds, NULL, NULL) == -1 && errno == ECONNRESET);
+    assert(g_select_calls == 0);
+
+    /* Rules loaded, but no watched descriptor matches one. */
+    g_stub_match_endpoint = 0;
+    fds[0].fd = -1;
+    fds[0].events = POLLIN;
+    fds[1].fd = 3;
+    fds[1].events = POLLIN;
+    assert(poll(fds, 2U, 0) == 0);
+    assert(!chaos_net_wait_match_pollfds(fds, 2U, &rule));
+    assert(!chaos_net_wait_match_fd_loaded(3, &rule));
+    assert(select(4, NULL, NULL, &exceptfds, NULL) == 0);
+    /* No rules loaded. */
+    g_stub_prepare = 0;
+    assert(!chaos_net_wait_match_pollfds(fds, 2U, &rule));
+    assert(!chaos_net_wait_match_fdsets(4, NULL, NULL, &exceptfds, &rule));
+    assert(poll(fds, 2U, 0) == 0);
+    assert(g_poll_calls == 2 && g_select_calls == 1);
+    assert(errno == ECONNRESET);
+
+    ts.tv_sec = 1;
+    ts.tv_nsec = -1L;
+    assert(chaos_net_wait_timespec_ms(&ts) == 0);
+    FD_ZERO(&writefds);
+    FD_SET(4, &writefds);
+    chaos_net_wait_clear_fdsets(NULL, &writefds, NULL);
+    assert(!FD_ISSET(4, &writefds));
+    reset_wrapper_stubs();
+}
+
+/** @brief readv stub that accepts an empty (NULL) vector: reads nothing. */
+static ssize_t chaos_net_test_empty_readv(int fd, const struct iovec *iov, int iovcnt)
+{
+    (void)fd;
+    (void)iov;
+    ++g_descriptor_calls;
+    g_last_receive_iovlen = (size_t)iovcnt;
+    return 0;
+}
+
+/**
+ * @brief Invariant: the receive helpers stay inside the bytes a call delivered,
+ *   skip empty vector entries, and keep or replay DUP payloads across any vector
+ *   shape.
+ *
+ * Expected observable behaviour:
+ * - CORRUPT on a vector skips a leading empty entry and changes the next one; nothing
+ *   is corrupted for an empty vector or no bytes; recvmmsg corruption skips empty
+ *   messages and entries.
+ * - A datagram received with MSG_TRUNC fills at most its buffer.
+ * - TRICKLE does not shorten a receive of unknown size; a limit beyond the vector
+ *   keeps every entry whole.
+ * - DUP keeps a payload received through an empty entry, replays it across several
+ *   buffers (stopping before the last one), drops a sender address too long to keep,
+ *   and replays without one when the caller gives no length; recvfrom and recvmsg
+ *   without an address, or recvfrom with an address but no length, replay too.
+ */
+static void test_receive_helpers_and_vector_shapes(void)
+{
+    static struct iovec too_many[CHAOS_NET_IOV_MAX + 1];
+    char first[4] = "aaa";
+    char second[8] = "data";
+    char third[8];
+    char name[sizeof(struct sockaddr_storage) + 1U];
+    struct sockaddr_in from;
+    socklen_t from_length;
+    struct iovec iov[4];
+    struct iovec limited[3];
+    struct msghdr message;
+    socklen_t name_length;
+    chaos_net_rule_t rule;
+    unsigned generation;
+    char buffer[16];
+#ifdef __linux__
+    struct mmsghdr mmsg[1];
+#endif
+
+    reset_wrapper_stubs();
+    iov[0].iov_base = first;
+    iov[0].iov_len = 0U;
+    iov[1].iov_base = second;
+    iov[1].iov_len = 4U;
+    chaos_net_corrupt_iovecs(iov, 0, 4U);
+    chaos_net_corrupt_iovecs(iov, 2, 0U);
+    assert(g_corrupt_calls == 0);
+    chaos_net_corrupt_iovecs(iov, 2, 4U);
+    assert(g_corrupt_calls == 1 && g_last_corrupt_size == 4U);
+    assert(memcmp(second, "data", 4U) != 0 && strcmp(first, "aaa") == 0);
+
+#ifdef __linux__
+    (void)memcpy(second, "data", 4U);
+    (void)memset(mmsg, 0, sizeof(mmsg));
+    chaos_net_corrupt_mmsghdrs(mmsg, 0U);
+    chaos_net_corrupt_mmsghdrs(mmsg, 1U); /* msg_len 0 */
+    mmsg[0].msg_len = 4U;
+    chaos_net_corrupt_mmsghdrs(mmsg, 1U); /* no vector */
+    mmsg[0].msg_hdr.msg_iov = iov;
+    chaos_net_corrupt_mmsghdrs(mmsg, 1U); /* msg_iovlen 0 */
+    mmsg[0].msg_hdr.msg_iovlen = 1U;
+    chaos_net_corrupt_mmsghdrs(mmsg, 1U); /* only an empty entry */
+    assert(g_corrupt_calls == 1);
+    mmsg[0].msg_hdr.msg_iovlen = 2U;
+    chaos_net_corrupt_mmsghdrs(mmsg, 1U);
+    assert(g_corrupt_calls == 2 && g_last_corrupt_size == 4U);
+    assert(memcmp(second, "data", 4U) != 0);
+#endif
+
+    g_test_socket_type = SOCK_DGRAM;
+    assert(chaos_net_received_bytes(3, 60000, 4U, MSG_TRUNC) == 4U);
+    assert(chaos_net_received_bytes(3, 3, 4U, MSG_TRUNC) == 3U);
+    assert(chaos_net_received_bytes(3, -1, 4U, 0) == 0U);
+    assert(chaos_net_received_bytes(3, 0, 4U, 0) == 0U);
+    g_test_socket_type = SOCK_STREAM;
+
+    (void)memset(&rule, 0, sizeof(rule));
+    rule.effect = CHAOS_NET_EFFECT_TRICKLE;
+    rule.chunk_bytes = 2U;
+    g_should_trigger = 1;
+    assert(chaos_net_trickles(&rule, 3, 16U, 0));
+    assert(!chaos_net_trickles(&rule, 3, CHAOS_POLICY_NO_SIZE, 0));
+    iov[0].iov_len = 3U;
+    iov[1].iov_len = 4U;
+    assert(chaos_net_limit_iovecs(iov, 2, 100U, limited) == 2);
+    assert(limited[0].iov_len == 3U && limited[1].iov_len == 4U);
+
+    /* DUP: kept through an empty entry, replayed across the first buffers of four. */
+    (void)memcpy(second, "data", 4U);
+    iov[0].iov_len = 0U;
+    iov[1].iov_len = sizeof(second);
+    iov[2].iov_base = third;
+    iov[2].iov_len = sizeof(third);
+    generation = chaos_net_dup_generation(30);
+    (void)memset(name, 0, sizeof(name));
+    chaos_net_dup_store(
+        30, iov, 3, 4, (const struct sockaddr *)name, (socklen_t)sizeof(name), generation
+    );
+    iov[0].iov_base = first;
+    iov[0].iov_len = 0U;
+    iov[1].iov_base = buffer;
+    iov[1].iov_len = 2U;
+    iov[2].iov_base = third;
+    iov[2].iov_len = 2U;
+    iov[3].iov_base = first;
+    iov[3].iov_len = sizeof(first);
+    (void)memset(buffer, 0, sizeof(buffer));
+    (void)memset(third, 0, sizeof(third));
+    name_length = (socklen_t)sizeof(name);
+    assert(
+        chaos_net_dup_replay(&rule, 30, iov, 4, (struct sockaddr *)name, &name_length, NULL) == 4
+    );
+    assert(memcmp(buffer, "da", 2U) == 0 && memcmp(third, "ta", 2U) == 0);
+    assert(strcmp(first, "aaa") == 0); /* the payload ended before the last buffer */
+    /* A negative descriptor has no slot. */
+    assert(chaos_net_dup_replay(&rule, -1, iov, 4, NULL, NULL, NULL) == -1);
+    assert(name_length == 0); /* the address was too long to keep */
+
+    /* A replay with an address buffer but no length leaves the address alone. */
+    iov[1].iov_len = sizeof(buffer);
+    generation = chaos_net_dup_generation(31);
+    chaos_net_dup_store(31, &iov[1], 1, 4, NULL, 0, generation);
+    assert(chaos_net_dup_replay(&rule, 31, &iov[1], 1, (struct sockaddr *)name, NULL, NULL) == 4);
+
+    /* recvfrom and recvmsg without an address keep and replay the payload. */
+    g_stub_endpoint_from_local = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_DUP;
+    assert(recvfrom(32, buffer, sizeof(buffer), 0, NULL, NULL) == 4);
+    (void)memset(buffer, 0, sizeof(buffer));
+    assert(recvfrom(32, buffer, sizeof(buffer), 0, NULL, NULL) == 4);
+    assert(memcmp(buffer, "data", 4U) == 0 && g_recvfrom_calls == 1);
+    /* An address buffer without a length: the payload is kept and replayed alone. */
+    (void)memset(&from, 0, sizeof(from));
+    assert(recvfrom(35, buffer, sizeof(buffer), 0, (struct sockaddr *)&from, NULL) == 4);
+    assert(recvfrom(35, buffer, sizeof(buffer), 0, (struct sockaddr *)&from, NULL) == 4);
+    assert(g_recvfrom_calls == 2 && from.sin_family == 0);
+    from_length = (socklen_t)sizeof(from);
+    assert(recvfrom(35, buffer, sizeof(buffer), 0, (struct sockaddr *)&from, &from_length) == 4);
+    assert(g_recvfrom_calls == 3);
+    (void)memset(&message, 0, sizeof(message));
+    message.msg_iov = &iov[1];
+    message.msg_iovlen = 1U;
+    assert(recvmsg(33, &message, 0) == 4);
+    assert(recvmsg(33, &message, 0) == 4);
+    assert(g_recvmsg_calls == 1 && message.msg_namelen == 0);
+
+    /* CORRUPT on a vector longer than the kernel takes: its size is unknown, and
+     * nothing is aimed at it. */
+    g_stub_rule.effect = CHAOS_NET_EFFECT_CORRUPT;
+    too_many[0].iov_base = buffer;
+    too_many[0].iov_len = sizeof(buffer);
+    message.msg_iov = too_many;
+    message.msg_iovlen = CHAOS_NET_IOV_MAX + 1;
+    g_corrupt_calls = 0;
+    assert(recvmsg(33, &message, 0) == 4);
+    assert(g_corrupt_calls == 0);
+
+    /* readv with TRICKLE and no vector is forwarded as it is. */
+    reset_descriptor_stubs();
+    g_stub_prepare = 1;
+    g_stub_endpoint_from_local = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_TRICKLE;
+    g_stub_rule.chunk_bytes = 1U;
+    g_should_trigger = 1;
+    g_chaos_net_real_readv = chaos_net_test_empty_readv;
+    assert(readv(34, NULL, 0) == 0);
+    assert(g_descriptor_calls == 1 && g_last_receive_iovlen == 0U);
+
+    /* close before any payload was kept: nothing to drop. */
+    {
+        chaos_net_dup_slot_t *const table = g_chaos_net_dup_slots;
+
+        g_chaos_net_dup_slots = NULL;
+        chaos_net_dup_forget(30);
+        g_chaos_net_dup_slots = table;
+    }
+    reset_wrapper_stubs();
+}
+
 int main(void)
 {
+    test_wrappers_forward_inside_library();
+    test_unmatched_endpoints_are_forwarded();
+    test_rules_that_do_not_fire();
+    test_wait_sets_and_unmatched_descriptors();
+    test_receive_helpers_and_vector_shapes();
     test_corrupt_stays_in_the_buffer();
     test_rules_match_either_end();
     test_dup_skips_and_close_races();

@@ -79,6 +79,18 @@ static int g_test_config_force_read_fail = 0;
 /** Number of upcoming config reads that fail with EINTR, as a signal would make them. */
 static int g_test_config_read_eintr = 0;
 
+/** Number of upcoming config opens that fail with EINTR, as a signal would make them. */
+static int g_test_config_open_eintr = 0;
+
+/** When non-zero, config opens fail with this errno (EACCES, EPERM, EMFILE, ...). */
+static int g_test_config_open_errno = 0;
+
+/**
+ * When non-zero, the open stub returns the fake fd and reads of it report end of
+ * file at once; fstat() of the fake fd then fails (it is not open).
+ */
+static int g_test_config_fake_eof = 0;
+
 /**
  * @brief When non-zero, causes the CAS stub to return 0 (failure).
  *
@@ -100,12 +112,23 @@ static const int g_test_config_fake_fd = 7331;
  */
 static int chaos_net_test_config_open(const char *path, int flags, ...)
 {
+    if (g_test_config_open_eintr > 0)
+    {
+        --g_test_config_open_eintr;
+        errno = EINTR;
+        return -1;
+    }
+    if (g_test_config_open_errno != 0)
+    {
+        errno = g_test_config_open_errno;
+        return -1;
+    }
     if (g_test_config_force_open_fail != 0)
     {
         errno = ENOENT;
         return -1;
     }
-    if (g_test_config_force_read_fail != 0)
+    if (g_test_config_force_read_fail != 0 || g_test_config_fake_eof != 0)
     {
         (void)path;
         (void)flags;
@@ -145,6 +168,10 @@ static ssize_t chaos_net_test_config_read(int fd, void *buffer, size_t count)
         errno = EIO;
         return -1;
     }
+    if (g_test_config_fake_eof != 0 && fd == g_test_config_fake_fd)
+    {
+        return 0;
+    }
     return read(fd, buffer, count);
 }
 
@@ -156,7 +183,8 @@ static ssize_t chaos_net_test_config_read(int fd, void *buffer, size_t count)
  */
 static int chaos_net_test_config_close(int fd)
 {
-    if (g_test_config_force_read_fail != 0 && fd == g_test_config_fake_fd)
+    if ((g_test_config_force_read_fail != 0 || g_test_config_fake_eof != 0) &&
+        fd == g_test_config_fake_fd)
     {
         return 0;
     }
@@ -1453,6 +1481,19 @@ static void test_hits_are_counted_and_reported(void)
     );
     assert(g_chaos_net_hits_pending == 0);
     chaos_net_config_report_hits(NULL);
+
+    /* Past the eager hits, a hit once the interval has passed is written at once. */
+    g_chaos_net_hits_last_ms = chaos_hits_now_ms() - CHAOS_HITS_INTERVAL_MS;
+    chaos_hit_record(state->rules[1].hit);
+    assert(g_chaos_net_hits_pending == 0);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(
+        strcmp(
+            hits,
+            "2\ttcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 # "
+            "a\n4\ttcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 # b\n"
+        ) == 0
+    );
     g_chaos_net_hits_total = 0U;
 
     /* A writer flag held when the process forked is released in the child, which
@@ -1874,6 +1915,197 @@ static void test_rule_copies_across_reloads(void)
     g_chaos_net_check_interval_ns = interval;
 }
 
+/**
+ * @brief Invariant: value, effect and selector checks decide every rule the same way
+ *   the grammar documents, a last line without a newline is still a rule, and a
+ *   lower-ranked or equally specific later rule never displaces an earlier match.
+ *
+ * Expected observable behaviour:
+ * - A latency with trailing text ("10ms") is rejected; trailing blanks are not.
+ * - ERRNO is valid for every operation, RESET only for close, nothing for INVALID.
+ * - socket rules take any wildcard-host IP selector with port 0 (tcp4/tcp6/udp4/udp6)
+ *   and nothing with a port or a host; other operations take every selector kind
+ *   but INVALID.
+ * - The best match keeps the first exact rule over a later wildcard, and the first
+ *   of two rules of equal rank and length.
+ */
+static void test_rule_checks_and_selection_order(void)
+{
+    static const chaos_net_operation_t every_operation[] = {
+        CHAOS_NET_OP_BIND,
+        CHAOS_NET_OP_LISTEN,
+        CHAOS_NET_OP_CONNECT,
+        CHAOS_NET_OP_ACCEPT,
+        CHAOS_NET_OP_SOCKET,
+        CHAOS_NET_OP_SHUTDOWN,
+        CHAOS_NET_OP_POLL,
+        CHAOS_NET_OP_SEND,
+        CHAOS_NET_OP_RECV,
+        CHAOS_NET_OP_CLOSE,
+    };
+    static const char *const socket_selectors_allowed[] = {
+        "tcp6://*:0",
+        "udp4://*:0",
+        "udp6://*:0",
+    };
+    static const char *const socket_selectors_rejected[] = {
+        "tcp4://*:80",
+        "udp6://*:53",
+        "udp4://127.0.0.1:0",
+        "tcp6://[::1]:0",
+    };
+    static const char *const kinds_for_send[] = {
+        "tcp6://[::1]:443",
+        "udp4://127.0.0.1:53",
+        "udp6://[::1]:53",
+        "unix:///tmp/app.sock",
+    };
+    chaos_net_endpoint_t selector;
+    chaos_net_endpoint_t endpoint;
+    chaos_net_rule_t rules[2];
+    chaos_net_rule_t rule;
+    /* Writable, like the line buffer of a real rule: the parser trims in place. */
+    char unit_suffix[] = "10ms";
+    char trailing_blanks[] = "10 \t";
+    unsigned int latency_ms = 7U;
+    size_t rule_count = 0U;
+    size_t index;
+
+    assert(chaos_net_parse_latency(unit_suffix, &latency_ms) == -1);
+    assert(latency_ms == 7U);
+    assert(chaos_net_parse_latency(trailing_blanks, &latency_ms) == 0);
+    assert(latency_ms == 10U);
+    assert(chaos_net_parse_latency("10", NULL) == -1);
+
+    for (index = 0U; index < sizeof(every_operation) / sizeof(every_operation[0]); ++index)
+    {
+        assert(chaos_net_effect_allowed(every_operation[index], CHAOS_NET_EFFECT_ERRNO));
+        assert(
+            chaos_net_effect_allowed(every_operation[index], CHAOS_NET_EFFECT_RESET) ==
+            (every_operation[index] == CHAOS_NET_OP_CLOSE)
+        );
+    }
+    assert(!chaos_net_effect_allowed(CHAOS_NET_OP_INVALID, CHAOS_NET_EFFECT_ERRNO));
+
+    for (index = 0U; index < sizeof(socket_selectors_allowed) / sizeof(socket_selectors_allowed[0]);
+         ++index)
+    {
+        assert(chaos_net_endpoint_parse_selector(socket_selectors_allowed[index], &selector));
+        assert(chaos_net_selector_allowed(CHAOS_NET_OP_SOCKET, &selector));
+    }
+    for (index = 0U;
+         index < sizeof(socket_selectors_rejected) / sizeof(socket_selectors_rejected[0]);
+         ++index)
+    {
+        assert(chaos_net_endpoint_parse_selector(socket_selectors_rejected[index], &selector));
+        assert(!chaos_net_selector_allowed(CHAOS_NET_OP_SOCKET, &selector));
+    }
+    for (index = 0U; index < sizeof(kinds_for_send) / sizeof(kinds_for_send[0]); ++index)
+    {
+        assert(chaos_net_endpoint_parse_selector(kinds_for_send[index], &selector));
+        assert(chaos_net_selector_allowed(CHAOS_NET_OP_SEND, &selector));
+    }
+    selector.kind = CHAOS_NET_ENDPOINT_INVALID;
+    assert(!chaos_net_selector_allowed(CHAOS_NET_OP_SEND, &selector));
+
+    /* The last line of a file need not end with a newline. */
+    {
+        char unterminated[] = "# rules\ntcp4://127.0.0.1:80:connect:ECONNREFUSED:1.0";
+
+        assert(chaos_net_config_parse_buffer(unterminated, rules, &rule_count) == 0);
+        assert(rule_count == 1U);
+        assert(rules[0].errnum == ECONNREFUSED);
+    }
+
+    /* The exact rule first, the wildcard after it: the wildcard ranks lower. */
+    {
+        char exact_first[] = "tcp4://127.0.0.1:80:connect:EHOSTUNREACH:1.0\n"
+                             "tcp4://*:80:connect:ECONNREFUSED:1.0\n";
+
+        assert(chaos_net_config_parse_buffer(exact_first, rules, &rule_count) == 0);
+        assert(rule_count == 2U);
+        assert(chaos_net_endpoint_parse_selector("tcp4://127.0.0.1:80", &endpoint));
+        assert(chaos_net_config_select_endpoint_rule(
+            rules, rule_count, CHAOS_NET_OP_CONNECT, &endpoint, &rule
+        ));
+        assert(rule.errnum == EHOSTUNREACH);
+    }
+
+    /* Two rules of equal rank and selector length: the first one stays. */
+    {
+        char same_rank[] = "tcp4://*:80:connect:EHOSTUNREACH:1.0\n"
+                           "tcp4://*:80:connect:ECONNREFUSED:1.0\n";
+
+        assert(chaos_net_config_parse_buffer(same_rank, rules, &rule_count) == 0);
+        assert(chaos_net_config_select_endpoint_rule(
+            rules, rule_count, CHAOS_NET_OP_CONNECT, &endpoint, &rule
+        ));
+        assert(rule.errnum == EHOSTUNREACH);
+    }
+}
+
+/**
+ * @brief Invariant: opening the rule file is retried after a signal, a file this
+ *   process may not open is reported as such, and a file that cannot be checked
+ *   after reading it is not used.
+ *
+ * Expected observable behaviour: an open interrupted by EINTR is repeated and the
+ * file read; EACCES and EPERM return -3 (rejected until the file changes); any other
+ * open error (EMFILE) returns -1 (retried); a failing fstat() returns -1. Once the
+ * file is loaded, an endpoint no rule names matches nothing.
+ */
+static void test_read_file_open_errors(void)
+{
+    chaos_net_test_file_backup_t backup;
+    size_t size = 0U;
+    uint64_t stamp;
+
+    backup_file(CHAOS_NET_CONFIG_PATH, &backup);
+    write_config_text("# open\n", 43);
+    stamp = chaos_net_config_observed_mtime();
+
+    g_test_config_open_eintr = 2;
+    assert(chaos_net_config_read_file(&size, stamp) == 0);
+    assert(g_test_config_open_eintr == 0);
+    assert(size == strlen("# open\n"));
+
+    size = 0U;
+    g_test_config_open_errno = EACCES;
+    assert(chaos_net_config_read_file(&size, stamp) == -3);
+    g_test_config_open_errno = EPERM;
+    assert(chaos_net_config_read_file(&size, stamp) == -3);
+    g_test_config_open_errno = EMFILE;
+    assert(chaos_net_config_read_file(&size, stamp) == -1);
+    g_test_config_open_errno = 0;
+    assert(size == 0U);
+    assert(!chaos_net_in_internal());
+
+    g_test_config_fake_eof = 1;
+    assert(chaos_net_config_read_file(&size, stamp) == -1);
+    g_test_config_fake_eof = 0;
+    assert(size == 0U);
+    assert(!chaos_net_in_internal());
+
+    /* Loaded rules: an endpoint no rule names matches nothing. */
+    {
+        chaos_net_endpoint_t endpoint;
+        chaos_net_rule_t rule;
+
+        chaos_net_config_init();
+        write_config_text("tcp4://127.0.0.1:9012:connect:ECONNREFUSED:1.0\n", 44);
+        assert(chaos_net_config_prepare());
+        assert(chaos_net_endpoint_parse_selector("tcp4://127.0.0.1:9013", &endpoint));
+        assert(!chaos_net_config_match_endpoint_loaded(CHAOS_NET_OP_CONNECT, &endpoint, &rule));
+        assert(chaos_net_endpoint_parse_selector("tcp4://127.0.0.1:9012", &endpoint));
+        assert(chaos_net_config_match_endpoint_loaded(CHAOS_NET_OP_CONNECT, &endpoint, &rule));
+        assert(rule.errnum == ECONNREFUSED);
+        (void)unlink(CHAOS_NET_CONFIG_PATH);
+    }
+
+    restore_file(CHAOS_NET_CONFIG_PATH, &backup);
+    free_backup(&backup);
+}
+
 int main(void)
 {
     /* Look at the rule file on every call; the throttle has its own test. */
@@ -1904,5 +2136,7 @@ int main(void)
     test_racy_rewrite_is_seen();
     test_pending_hits_written_after_interval();
     test_rule_copies_across_reloads();
+    test_rule_checks_and_selection_order();
+    test_read_file_open_errors();
     return 0;
 }

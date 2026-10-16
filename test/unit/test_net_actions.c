@@ -48,6 +48,7 @@ CHAOS_NET_DEFINE_TEST_GLOBALS();
  * - `chaos_net_probability_hit(p)` with a seeded PRNG reproduces the result that
  *   would be obtained by manually drawing the next sample and calling
  *   `chaos_net_probability_hit_sample(p, sample)`.
+ * - Seeding with 0 behaves exactly like seeding with 1.
  */
 static void test_probability_helpers(void)
 {
@@ -64,6 +65,16 @@ static void test_probability_helpers(void)
 
         chaos_net_prng_seed_thread(123456U);
         assert(chaos_net_probability_hit(0.25) == expected_hit);
+    }
+
+    /* Seed 0 is taken as 1: the generator never starts from the all-zero state. */
+    chaos_net_prng_seed_thread(1U);
+    {
+        const uint32_t from_one = chaos_net_prng_next_u32();
+
+        chaos_net_prng_seed_thread(0U);
+        assert(g_chaos_net_tls_prng_state != 0U);
+        assert(chaos_net_prng_next_u32() == from_one);
     }
 }
 
@@ -208,6 +219,7 @@ static void test_latency_and_trigger_helpers(void)
  * - Zero-initialised rule (no effect set) returns 0; errno is unchanged.
  * - probability=0.0: returns 0; errno is left at its current value (123).
  * - probability=1.0: returns 1; errno is set to ECONNREFUSED.
+ * - A LATENCY rule with probability 1.0 returns 0; errno is unchanged.
  *
  * ECONNREFUSED is chosen as a representative network errno to verify that the
  * specific error code requested by the rule is what actually gets injected.
@@ -232,6 +244,12 @@ static void test_errno_application(void)
     errno = 0;
     assert(chaos_net_rule_apply_errno(&rule) == 1);
     assert(errno == ECONNREFUSED);
+
+    /* A rule of another effect that would fire sets no errno. */
+    rule.effect = CHAOS_NET_EFFECT_LATENCY;
+    errno = 123;
+    assert(chaos_net_rule_apply_errno(&rule) == 0);
+    assert(errno == 123);
 }
 
 /**
