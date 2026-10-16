@@ -12,7 +12,8 @@
  * Properties under test:
  * - clone is a thread, a spawn (CLONE_VFORK) or a fork by its flags, clone3 too;
  *   fork, vfork, execve, execveat, wait4 and waitid reach their operations;
- * - the application's own first execve is never faulted, later ones are;
+ * - the application's own start is never faulted, retries from chaos-init's image
+ *   included; execs of the application's image are;
  * - LATENCY delays, ERRNO fails, both together delay and then fail;
  * - FAIL_AFTER counts per process and starts over after a reload; a fork child
  *   starts with its parent's counts at the fork, once; a new process that gets
@@ -105,8 +106,14 @@ int main(void)
                 "execveat:LATENCY:3\n"
                 "waitpid:FAIL_AFTER:EINTR,1\n");
 
-    /* The application's own exec starts it; the next one is faulted. */
+    /* The application's own exec starts it, and so does a retry from the same
+     * image after it failed (a script without #! run through /bin/sh); once the
+     * application's image is in, the next one is faulted. */
     assert(decide(__NR_execve, 0U).action == CHAOS_INIT_PASS);
+    assert(decide(__NR_execve, 0U).action == CHAOS_INIT_PASS);
+    g_start_offset = 7U;
+    assert(fails(decide(__NR_execve, 0U), EACCES));
+    g_start_offset = 0U;
     assert(fails(decide(__NR_execve, 0U), EACCES));
     verdict = decide(__NR_execveat, 0U);
     assert(verdict.action == CHAOS_INIT_DELAY && verdict.delay_ms == 3U && verdict.error == 0);

@@ -283,6 +283,7 @@ int chaos_init_exit_code(int status)
 int chaos_init_find_command(const char *command, const char *path, char *out, size_t size)
 {
     const char *entry;
+    int refused = 0;
 
     if (command == NULL || *command == '\0' || out == NULL || size == 0U)
     {
@@ -302,13 +303,17 @@ int chaos_init_find_command(const char *command, const char *path, char *out, si
         if ((size_t
             )snprintf(out, size, "%.*s%s%s", (int)length, entry, length > 0U ? "/" : "", command) <
                 size &&
-            stat(out, &info) == 0 && S_ISREG(info.st_mode) && access(out, X_OK) == 0)
+            stat(out, &info) == 0 && S_ISREG(info.st_mode))
         {
-            return 1;
+            if (access(out, X_OK) == 0)
+            {
+                return 1;
+            }
+            refused = 1;
         }
         if (end == NULL)
         {
-            return 0;
+            return refused ? -1 : 0;
         }
         entry = end + 1;
     }

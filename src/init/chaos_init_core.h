@@ -98,7 +98,8 @@ int chaos_init_caller_gone(int error);
  * with execv(): execvp() would try one directory after another with execve(), and
  * only the application's first execve is exempt from the process rules.
  *
- * @return 1 with the path in @p out; 0 when there is none (or it does not fit).
+ * @return 1 with the path in @p out; 0 when there is none (or it does not fit); -1
+ *         when the only files of that name cannot be executed (execvp(): EACCES).
  */
 int chaos_init_find_command(const char *command, const char *path, char *out, size_t size);
 

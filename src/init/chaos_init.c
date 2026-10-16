@@ -209,6 +209,35 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover)
 }
 
 /**
+ * @brief Runs @p path, which the kernel would not execute, as a shell script, as
+ *        execvp() does: `/bin/sh path args...`. Returns only when that fails.
+ */
+static void chaos_init_exec_shell(const char *path, char **args)
+{
+    size_t count = 0U;
+    char **shell;
+
+    while (args[count] != NULL)
+    {
+        ++count;
+    }
+    shell = calloc(count + 2U, sizeof(*shell));
+    if (shell == NULL)
+    {
+        errno = ENOEXEC;
+        return;
+    }
+    shell[0] = (char *)"/bin/sh";
+    shell[1] = (char *)path;
+    if (count > 1U)
+    {
+        memcpy(shell + 2, args + 1, (count - 1U) * sizeof(*shell));
+    }
+    (void)execv("/bin/sh", shell);
+    free(shell);
+}
+
+/**
  * @brief In the parent: receives the listener; -1 with @p error set when there is none.
  * @return The listener, -1 when seccomp is unsupported (@p error > 0) or the child
  *         died before answering (@p error == 0).
@@ -540,13 +569,17 @@ int main(int argc, char **argv)
         {
             _exit(CHAOS_INIT_EXIT_HANDOVER);
         }
-        if (found)
+        if (found > 0)
         {
             (void)execv(command_path, argv + options.command);
+            if (errno == ENOEXEC)
+            {
+                chaos_init_exec_shell(command_path, argv + options.command);
+            }
         }
         else
         {
-            errno = ENOENT;
+            errno = found < 0 ? EACCES : ENOENT;
         }
         error = errno;
         (void)fprintf(stderr, "chaos-init: %s: %s\n", argv[options.command], strerror(error));

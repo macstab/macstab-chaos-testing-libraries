@@ -224,6 +224,15 @@ expect "C: the application starts despite an execve rule" "$($init --libs proces
 mkdir -p /tmp/sec/bin && cp /tmp/probe /tmp/sec/bin/probe-in-path
 expect "C: one found by PATH search starts too" \
     "$(PATH=/nonexistent:/tmp/sec/bin $init --libs process -- probe-in-path open /tmp/sec/other)" "ok"
+# As execvp() would: a script without #! runs through /bin/sh, still as the start
+# the execve rule leaves alone; a command found only without execute permission
+# is refused (126), not missing (127).
+printf "%s\n" "echo script-ok" > /tmp/sec/noshebang && chmod 755 /tmp/sec/noshebang
+expect "C: a script without #! starts through /bin/sh" "$($init --libs process -- /tmp/sec/noshebang)" "script-ok"
+printf "%s\n" "echo no" > /tmp/sec/bin/not-executable && chmod 644 /tmp/sec/bin/not-executable
+code=0
+PATH=/tmp/sec/bin $init --libs process -- not-executable 2>/dev/null || code=$?
+expect "C: a command that cannot be executed exits 126" "$code" "126"
 expect "C: fork rule fails fork" "$($init --libs process -- /tmp/probe fork)" "ENOMEM"
 expect "C: execve rule fails a later exec" "$($init --libs process -- /tmp/probe exec)" "EACCES"
 expect "Go: posix_spawn rule fails os/exec" "$($init --libs process -- $go spawn)" "EAGAIN"

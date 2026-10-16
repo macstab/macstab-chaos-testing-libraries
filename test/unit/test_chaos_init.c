@@ -306,13 +306,16 @@ static void test_find_command(void)
         ));
         assert(strcmp(small, "/bin/sh") == 0);
     }
-    /* A regular file without execute permission is skipped, as execvp() skips it. */
+    /* A regular file without execute permission is skipped, as execvp() skips it;
+     * when nothing else is found, the command is refused (EACCES), not missing. */
     {
         FILE *file = fopen("/tmp/chaos-init-not-executable", "w");
 
         assert(file != NULL && fclose(file) == 0);
         assert(chmod("/tmp/chaos-init-not-executable", 0644) == 0);
-        assert(!chaos_init_find_command("chaos-init-not-executable", "/tmp", path, sizeof(path)));
+        assert(
+            chaos_init_find_command("chaos-init-not-executable", "/tmp", path, sizeof(path)) == -1
+        );
         assert(unlink("/tmp/chaos-init-not-executable") == 0);
     }
 }

@@ -33,6 +33,10 @@ static int chaos_init_process_supported(const struct chaos_process_rule *rule);
 #include <sys/random.h>
 #include <sys/syscall.h>
 
+#ifndef CHAOS_INIT_PROCESS_OF
+#define CHAOS_INIT_PROCESS_OF(tid, tgid, start) chaos_init_process_of((tid), (tgid), (start))
+#endif
+
 /* What the rule core expects the preload library to provide. */
 __thread int g_chaos_process_tls_guard = 0;
 __thread uint64_t g_chaos_process_tls_prng_state = 0U;
@@ -58,6 +62,8 @@ static uint64_t g_chaos_init_process_forked_owner[CHAOS_INIT_MAX_TRACEES];
 
 /** @brief The application chaos-init started, while its first execve() is pending. */
 static pid_t g_chaos_init_process_application = 0;
+/** @brief The image that makes the application's start (chaos-init's); 0 before. */
+static uint64_t g_chaos_init_process_start_image = 0U;
 
 static uint64_t g_chaos_init_process_load = 0U;
 static const chaos_process_config_state_t *g_chaos_init_process_seen_state = NULL;
@@ -251,8 +257,19 @@ int chaos_init_process_decide(const chaos_init_call_t *call, chaos_init_verdict_
     verdict->action = CHAOS_INIT_PASS;
     if (operation == CHAOS_PROCESS_OP_EXECVE && call->tid == g_chaos_init_process_application)
     {
-        g_chaos_init_process_application = 0; /* the start of the application itself */
-        return 1;
+        pid_t group;
+        uint64_t image;
+
+        /* The start of the application itself, as long as chaos-init's own image
+         * makes it: an execve that failed leaves the image as it was, and the one
+         * that follows (a script without #! run by /bin/sh) is still the start. */
+        if (CHAOS_INIT_PROCESS_OF(call->tid, &group, &image) == 0 &&
+            (g_chaos_init_process_start_image == 0U || image == g_chaos_init_process_start_image))
+        {
+            g_chaos_init_process_start_image = image;
+            return 1;
+        }
+        g_chaos_init_process_application = 0;
     }
     tracee = chaos_init_tracee_of(call->tid);
     (void)chaos_process_config_prepare(); /* the load the decision is made under */
