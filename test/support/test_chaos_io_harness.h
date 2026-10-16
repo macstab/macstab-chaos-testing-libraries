@@ -1082,6 +1082,8 @@ static int g_real_pclose_calls = 0;
 static int g_real_closefrom_calls = 0;
 /** @brief `lowfd` the stub closefrom was last given. */
 static int g_real_closefrom_lowfd = -1;
+/** @brief Raw renameat2 system calls made through the syscall stub. */
+static int g_sys_renameat2_calls = 0;
 /** @brief Result of the raw close_range system call in the syscall stub. */
 static long g_sys_close_range_result = -1;
 
@@ -1632,6 +1634,13 @@ static long chaos_test_syscall(long number, ...)
         ++g_sys_close_calls;
         result = g_sys_close_result;
     }
+#ifdef SYS_renameat2
+    else if (number == SYS_renameat2)
+    {
+        ++g_sys_renameat2_calls;
+        result = 0;
+    }
+#endif
 #ifdef SYS_close_range
     else if (number == SYS_close_range)
     {
@@ -1805,6 +1814,7 @@ static void chaos_test_reset_state(void)
     g_real_closefrom_calls = 0;
     g_real_closefrom_lowfd = -1;
     g_sys_close_range_result = -1;
+    g_sys_renameat2_calls = 0;
     g_vm_readv_calls = 0;
     g_vm_readv_errno = 0;
     (void)memset(&g_config_rule, 0, sizeof(g_config_rule));

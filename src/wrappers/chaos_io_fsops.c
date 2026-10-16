@@ -57,6 +57,7 @@
 #include "chaos_io_wrappers.h"
 
 #include <errno.h>
+#include <sys/syscall.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -116,8 +117,9 @@ static int chaos_io_call_real_posix_fallocate(int fd, off_t offset, off_t length
 /**
  * @brief Calls the real `renameat2()` while preserving the recursion guard.
  *
- * @details Absent on musl and before glibc 2.28; the call then fails with ENOSYS,
- * which is what such a libc reports for the system call.
+ * @details Absent on musl and before glibc 2.28. This library exports renameat2
+ * all the same, so a program that looks for it (dlsym, a weak symbol) finds it:
+ * it then makes the system call itself rather than a function that always fails.
  */
 static int chaos_io_call_real_renameat2(
     int olddirfd, const char *oldpath, int newdirfd, const char *newpath, unsigned int flags
@@ -128,8 +130,12 @@ static int chaos_io_call_real_renameat2(
 
     if (g_chaos_io_real_renameat2 == NULL)
     {
+#ifdef SYS_renameat2
+        return (int)syscall(SYS_renameat2, olddirfd, oldpath, newdirfd, newpath, flags);
+#else
         errno = ENOSYS;
         return -1;
+#endif
     }
     previous = chaos_io_enter_internal();
     result = g_chaos_io_real_renameat2(olddirfd, oldpath, newdirfd, newpath, flags);

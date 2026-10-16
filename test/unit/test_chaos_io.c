@@ -2394,10 +2394,9 @@ static void test_path_form_wrappers(void)
     chaos_test_reset_state();
     chaos_test_bind_real_functions();
     g_chaos_io_real_renameat2 = NULL;
-    errno = 0;
-    assert(renameat2(AT_FDCWD, "/tmp/path-form.a", AT_FDCWD, "/tmp/path-form.b", 0U) == -1);
-    assert(errno == ENOSYS);
-    assert(g_fdcache_reset_calls == 0);
+    /* Without renameat2 in the C library: the system call itself. */
+    assert(renameat2(AT_FDCWD, "/tmp/path-form.a", AT_FDCWD, "/tmp/path-form.b", 0U) == 0);
+    assert(g_sys_renameat2_calls == 1);
 
     /* posix_fallocate(): the allocate rules; errors returned, errno untouched. */
     chaos_test_reset_state();
