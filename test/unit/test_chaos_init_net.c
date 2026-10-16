@@ -38,8 +38,10 @@ static int test_process_of(pid_t tid, pid_t *tgid, uint64_t *start)
 #define CHAOS_INIT_PROCESS_OF(tid, tgid, start) test_process_of((tid), (tgid), (start))
 
 #include <sys/xattr.h>
+static unsigned g_protocol_lookups = 0U;
 static ssize_t test_getxattr(const char *path, const char *name, void *value, size_t size)
 {
+    ++g_protocol_lookups;
     if (g_fake_protocol != NULL)
     {
         const size_t length = strlen(g_fake_protocol);
@@ -567,6 +569,22 @@ int main(void)
     g_fail_process = 1;
     assert(PASSES(decide(__NR_listen, (uint64_t)listener, 4U, 0, 0, 0, 0)));
     g_fail_process = 0;
+
+    /* No rule for the operation: no socket of the call is looked up in /proc. */
+    write_rules("*:connect:ECONNREFUSED:1.0\n");
+    polled[0].fd = server;
+    polled[1].fd = client;
+    g_protocol_lookups = 0U;
+    assert(PASSES(decide(__NR_recvfrom, (uint64_t)server, P(buffer), 8U, 0, 0, 0)));
+    assert(PASSES(decide(__NR_ppoll, P(polled), 2U, 0, 0, 0, 0)));
+    assert(g_protocol_lookups == 0U);
+    assert(FAILS(
+        decide(
+            __NR_connect, (uint64_t)unbound, P(&server_address), sizeof(server_address), 0, 0, 0
+        ),
+        ECONNREFUSED
+    ));
+    assert(g_protocol_lookups > 0U);
 
     /* Rules SECCOMP mode cannot apply reject the whole file: data effects, RESET,
      * ERRNO on close. */

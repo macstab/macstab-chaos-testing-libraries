@@ -763,6 +763,26 @@ static int chaos_init_net_match(
     return found && chaos_net_config_match_endpoint_loaded(entry->operation, &endpoint, rule);
 }
 
+/**
+ * @brief Whether a loaded rule is for @p operation. Endpoints are looked up in
+ *        /proc only then: a recv or poll on many sockets costs nothing while the
+ *        rules are only for connect.
+ */
+static int chaos_init_net_targeted(chaos_net_operation_t operation)
+{
+    const chaos_net_config_state_t *state = chaos_net_config_active_state();
+    size_t index;
+
+    for (index = 0U; index < state->rule_count; ++index)
+    {
+        if (state->rules[index].operation == operation)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /** @brief Whether descriptor @p fd of thread @p tid is a socket. */
 static int chaos_init_net_is_socket(pid_t tid, uint64_t fd)
 {
@@ -925,7 +945,8 @@ int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *v
     }
     verdict->action = CHAOS_INIT_PASS;
     g_chaos_init_net_tid = call->tid;
-    if (!chaos_net_config_prepare() || !chaos_init_net_match(entry, call, &rule))
+    if (!chaos_net_config_prepare() || !chaos_init_net_targeted(entry->operation) ||
+        !chaos_init_net_match(entry, call, &rule))
     {
         return 1;
     }
