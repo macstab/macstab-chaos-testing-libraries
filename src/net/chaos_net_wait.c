@@ -161,6 +161,51 @@ static int chaos_net_wait_match_fdsets(
 
 #ifdef __linux__
 /**
+ * @brief Scans fdinfo text @p buffer for a `tfd:` line whose fd has a POLL rule.
+ *
+ * @details Only lines that end in a newline are read: fdinfo ends every line with
+ * one, so a last line without it was cut by the buffer, and `tfd:  123` cut to
+ * `tfd:  12` would name another descriptor.
+ *
+ * @param buffer  NUL-terminated text; modified (lines are split in place).
+ * @param rule    Output: the matching rule.
+ * @return 1 when a watched descriptor matches.
+ */
+static int chaos_net_wait_scan_fdinfo(char *buffer, chaos_net_rule_t *rule)
+{
+    char *cursor = buffer;
+
+    while (*cursor != '\0')
+    {
+        char *line = cursor;
+
+        while (*cursor != '\0' && *cursor != '\n')
+        {
+            ++cursor;
+        }
+        if (*cursor != '\n')
+        {
+            break; /* cut off by the buffer */
+        }
+        *cursor++ = '\0';
+
+        /* Lines starting with "tfd:" list watched file descriptors. */
+        if (strncmp(line, "tfd:", 4) == 0)
+        {
+            char *end = NULL;
+            long target_fd = strtol(line + 4, &end, 10);
+
+            if (end != line + 4 && target_fd >= 0L &&
+                chaos_net_wait_match_fd_loaded((int)target_fd, rule))
+            {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/**
  * @brief Reads /proc/self/fdinfo/<epfd> and scans for watched fds matching a POLL rule.
  *
  * @details The fdinfo file for an epoll fd contains one `tfd:` line per registered fd.
@@ -229,38 +274,7 @@ static int chaos_net_wait_match_epoll_fdinfo(int epfd, chaos_net_rule_t *rule)
     chaos_net_leave_internal(previous);
     buffer[used] = '\0';
 
-    {
-        char *cursor = buffer;
-
-        while (*cursor != '\0')
-        {
-            char *line = cursor;
-
-            while (*cursor != '\0' && *cursor != '\n')
-            {
-                ++cursor;
-            }
-            if (*cursor == '\n')
-            {
-                *cursor++ = '\0';
-            }
-
-            /* Lines starting with "tfd:" list watched file descriptors. */
-            if (strncmp(line, "tfd:", 4) == 0)
-            {
-                char *end = NULL;
-                long target_fd = strtol(line + 4, &end, 10);
-
-                if (end != line + 4 && target_fd >= 0L &&
-                    chaos_net_wait_match_fd_loaded((int)target_fd, rule))
-                {
-                    return 1;
-                }
-            }
-        }
-    }
-
-    return 0;
+    return chaos_net_wait_scan_fdinfo(buffer, rule);
 }
 
 /**

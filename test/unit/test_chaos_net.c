@@ -2030,6 +2030,23 @@ static void test_direct_helper_paths(void)
     assert(chaos_net_wait_pre_call(&rule, 0, &synthetic_timeout) == 0);
     assert(synthetic_timeout == 0);
 
+    /* fdinfo text: complete tfd lines are read, a line cut by the buffer is not. */
+    {
+        char text[64];
+
+        reset_wrapper_stubs();
+        g_stub_prepare = 1;
+        g_stub_endpoint_from_activity = 1;
+        g_stub_match_endpoint = 1;
+        (void)snprintf(text, sizeof(text), "%s", "pos:\t0\ntfd:  12 events: 19\n");
+        assert(chaos_net_wait_scan_fdinfo(text, &rule) == 1);
+        (void)snprintf(text, sizeof(text), "%s", "pos:\t0\ntfd:  12");
+        assert(chaos_net_wait_scan_fdinfo(text, &rule) == 0);
+        (void)snprintf(text, sizeof(text), "%s", "tfd: x\ntfd: -3\n");
+        assert(chaos_net_wait_scan_fdinfo(text, &rule) == 0);
+        reset_wrapper_stubs();
+    }
+
     chaos_net_wait_clear_pollfds(NULL, 0U);
     fds[0].revents = POLLIN;
     fds[1].revents = POLLOUT;
