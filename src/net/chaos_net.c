@@ -284,7 +284,7 @@ static void chaos_net_resolve_all_symbols(void)
 
 void chaos_net_ensure_symbols(void)
 {
-    chaos_once(&g_chaos_net_symbols_once, chaos_net_resolve_all_symbols);
+    (void)chaos_once(&g_chaos_net_symbols_once, chaos_net_resolve_all_symbols);
 }
 
 /**

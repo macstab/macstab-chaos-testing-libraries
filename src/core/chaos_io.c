@@ -388,7 +388,7 @@ static void chaos_io_resolve_all_symbols(void)
  */
 void chaos_io_ensure_symbols(void)
 {
-    chaos_once(&g_chaos_io_symbols_once, chaos_io_resolve_all_symbols);
+    (void)chaos_once(&g_chaos_io_symbols_once, chaos_io_resolve_all_symbols);
 }
 
 /* --- Library constructor --------------------------------------------------------- */

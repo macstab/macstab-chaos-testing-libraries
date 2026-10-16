@@ -288,7 +288,7 @@ static void chaos_process_resolve_all_symbols(void)
 
 void chaos_process_ensure_symbols(void)
 {
-    chaos_once(&g_chaos_process_symbols_once, chaos_process_resolve_all_symbols);
+    (void)chaos_once(&g_chaos_process_symbols_once, chaos_process_resolve_all_symbols);
 }
 
 /**

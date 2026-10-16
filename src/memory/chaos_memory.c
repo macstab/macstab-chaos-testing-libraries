@@ -286,7 +286,7 @@ static void chaos_memory_resolve_all_symbols(void)
 
 void chaos_memory_ensure_symbols(void)
 {
-    chaos_once(&g_chaos_memory_symbols_once, chaos_memory_resolve_all_symbols);
+    (void)chaos_once(&g_chaos_memory_symbols_once, chaos_memory_resolve_all_symbols);
 }
 
 /**

@@ -251,7 +251,7 @@ static void chaos_time_resolve_all_symbols(void)
 
 void chaos_time_ensure_symbols(void)
 {
-    chaos_once(&g_chaos_time_symbols_once, chaos_time_resolve_all_symbols);
+    (void)chaos_once(&g_chaos_time_symbols_once, chaos_time_resolve_all_symbols);
 }
 
 /**

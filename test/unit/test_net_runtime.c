@@ -723,8 +723,35 @@ static void test_constructor_init(void)
     assert(g_chaos_net_tls_prng_state != 0U);
 }
 
+/** @brief Once-control used by the re-entrant initialiser below. */
+static volatile chaos_once_t g_test_once = CHAOS_ONCE_INIT;
+/** @brief What the nested call returned, and how often the initialiser ran. */
+static int g_test_nested = -1;
+static int g_test_runs = 0;
+
+/** @brief An initialiser that calls back into its own once-control, as a lookup can. */
+static void reentrant_initialiser(void)
+{
+    ++g_test_runs;
+    g_test_nested = chaos_once(&g_test_once, reentrant_initialiser);
+}
+
+/**
+ * @brief Invariant: a call from inside the initialiser, on its thread, returns 0 at
+ *        once instead of waiting for itself; later calls see it done.
+ */
+static void test_once_reentry_does_not_wait(void)
+{
+    assert(chaos_once(&g_test_once, reentrant_initialiser) == 1);
+    assert(g_test_nested == 0 && g_test_runs == 1);
+    assert(g_test_once == CHAOS_ONCE_DONE);
+    assert(chaos_once(&g_test_once, reentrant_initialiser) == 1);
+    assert(g_test_runs == 1);
+}
+
 int main(void)
 {
+    test_once_reentry_does_not_wait();
     test_resolve_symbol_and_seed_helpers();
     test_resolve_symbol_abort_path();
 #ifdef __linux__

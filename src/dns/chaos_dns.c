@@ -212,7 +212,7 @@ static void chaos_dns_resolve_all_symbols(void)
 
 void chaos_dns_ensure_symbols(void)
 {
-    chaos_once(&g_chaos_dns_symbols_once, chaos_dns_resolve_all_symbols);
+    (void)chaos_once(&g_chaos_dns_symbols_once, chaos_dns_resolve_all_symbols);
 }
 
 /**

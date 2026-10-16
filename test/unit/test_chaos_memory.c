@@ -354,27 +354,31 @@ static void test_call_real_helpers(void)
     assert(g_real_madvise_calls == 1);
     assert(g_last_madvise_advice == 7);
 
-    /* Cover the NULL-pointer guard paths in each call-real helper. */
+    /* Not resolved yet (a call from inside the symbol lookup): the system calls
+     * themselves, never a made-up failure. */
     reset_wrapper_state();
-    errno = 0;
-    assert(chaos_memory_call_real_mmap(NULL, 4096U, PROT_READ, MAP_PRIVATE, -1, 0) == MAP_FAILED);
-    assert(errno == ENOMEM);
-    assert(g_real_mmap_calls == 0);
+    {
+        void *page =
+            chaos_memory_call_real_mmap(NULL, 4096U, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        int saved;
 
-    errno = 0;
-    assert(chaos_memory_call_real_munmap((void *)(uintptr_t)0x1000U, 4096U) == -1);
-    assert(errno == ENOMEM);
-    assert(g_real_munmap_calls == 0);
-
-    errno = 0;
-    assert(chaos_memory_call_real_mprotect((void *)(uintptr_t)0x1000U, 4096U, PROT_READ) == -1);
-    assert(errno == ENOMEM);
-    assert(g_real_mprotect_calls == 0);
-
-    errno = 0;
-    assert(chaos_memory_call_real_madvise((void *)(uintptr_t)0x1000U, 4096U, 0) == -1);
-    assert(errno == ENOMEM);
-    assert(g_real_madvise_calls == 0);
+        assert(page != MAP_FAILED);
+        assert(chaos_memory_call_real_mprotect(page, 4096U, PROT_READ | PROT_WRITE) == 0);
+        assert(chaos_memory_call_real_madvise(page, 4096U, MADV_NORMAL) == 0);
+        assert(chaos_memory_call_real_posix_madvise(page, 4096U, POSIX_MADV_NORMAL) == 0);
+        assert(chaos_memory_call_real_munmap(page, 4096U) == 0);
+        errno = 0;
+        assert(chaos_memory_call_real_munmap((void *)(uintptr_t)0x1001U, 4096U) == -1);
+        assert(errno == EINVAL);
+        errno = 4242;
+        saved = chaos_memory_call_real_posix_madvise((void *)(uintptr_t)0x1001U, 4096U, 0);
+        assert(saved == EINVAL && errno == 4242);
+        assert(
+            chaos_memory_call_real_mmap(NULL, 4096U, PROT_READ, MAP_PRIVATE, -1, 0) == MAP_FAILED
+        );
+    }
+    assert(g_real_mmap_calls == 0 && g_real_munmap_calls == 0);
+    assert(g_real_mprotect_calls == 0 && g_real_madvise_calls == 0);
 }
 
 /**
