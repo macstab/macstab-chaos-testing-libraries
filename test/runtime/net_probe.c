@@ -926,7 +926,7 @@ static int probe_poll_timeout(void)
     pfd.fd = server_fd;
     pfd.events = POLLIN;
     pfd.revents = POLLIN;
-    rc = poll(&pfd, 1U, 1000);
+    rc = poll(&pfd, 1U, 200);
     close(server_fd);
     close(client_fd);
     if (rc != 0 || pfd.revents != 0)
@@ -965,8 +965,8 @@ static int probe_ppoll_timeout(void)
     pfd.fd = server_fd;
     pfd.events = POLLIN;
     pfd.revents = POLLIN;
-    timeout.tv_sec = 1;
-    timeout.tv_nsec = 0L;
+    timeout.tv_sec = 0;
+    timeout.tv_nsec = 200000000L;
     rc = ppoll(&pfd, 1U, &timeout, NULL);
     close(server_fd);
     close(client_fd);
@@ -979,6 +979,9 @@ static int probe_ppoll_timeout(void)
 
 static int probe_select_timeout(void)
 {
+    struct timeval wait;
+    struct timespec start;
+    struct timespec end;
     fd_set readfds;
     int server_fd;
     int client_fd;
@@ -1002,14 +1005,30 @@ static int probe_select_timeout(void)
         return 151;
     }
 
+    /* TIMEOUT waits out the 200 ms, then reports nothing ready and no time left. */
+    FD_ZERO(&readfds);
+    FD_SET(server_fd, &readfds);
+    wait.tv_sec = 0;
+    wait.tv_usec = 200000;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    rc = select(server_fd + 1, &readfds, NULL, NULL, &wait);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    if (rc != 0 || FD_ISSET(server_fd, &readfds) || wait.tv_usec != 0 ||
+        elapsed_ms(&start, &end) < 150LL)
+    {
+        close(server_fd);
+        close(client_fd);
+        return 152;
+    }
+    /* A wait without a timeout never times out: the ready socket is reported. */
     FD_ZERO(&readfds);
     FD_SET(server_fd, &readfds);
     rc = select(server_fd + 1, &readfds, NULL, NULL, NULL);
     close(server_fd);
     close(client_fd);
-    if (rc != 0 || FD_ISSET(server_fd, &readfds))
+    if (rc != 1 || !FD_ISSET(server_fd, &readfds))
     {
-        return 152;
+        return 153;
     }
     return 0;
 }
@@ -1042,8 +1061,8 @@ static int probe_pselect_timeout(void)
 
     FD_ZERO(&readfds);
     FD_SET(server_fd, &readfds);
-    timeout.tv_sec = 1;
-    timeout.tv_nsec = 0L;
+    timeout.tv_sec = 0;
+    timeout.tv_nsec = 200000000L;
     rc = pselect(server_fd + 1, &readfds, NULL, NULL, &timeout, NULL);
     close(server_fd);
     close(client_fd);
@@ -1100,7 +1119,7 @@ static int probe_epoll_wait_timeout(void)
         return 159;
     }
 
-    rc = epoll_wait(epfd, events, 1, 1000);
+    rc = epoll_wait(epfd, events, 1, 200);
     close(epfd);
     close(server_fd);
     close(client_fd);
@@ -1153,7 +1172,7 @@ static int probe_epoll_pwait_timeout(void)
         return 164;
     }
 
-    rc = epoll_pwait(epfd, events, 1, 1000, NULL);
+    rc = epoll_pwait(epfd, events, 1, 200, NULL);
     close(epfd);
     close(server_fd);
     close(client_fd);

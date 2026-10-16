@@ -1657,9 +1657,12 @@ static void test_wait_paths(void)
     g_stub_match_endpoint = 1;
     g_stub_rule.effect = CHAOS_NET_EFFECT_TIMEOUT;
     g_should_trigger = 1;
-    assert(poll(fds, 1U, 100) == 0);
+    assert(poll(fds, 1U, 1) == 0);
     assert(g_poll_calls == 0);
     assert(fds[0].revents == 0);
+    /* A wait without a timeout never times out: the real poll runs. */
+    assert(poll(fds, 1U, -1) == 0);
+    assert(g_poll_calls == 1);
 
     reset_wrapper_stubs();
     fds[0].fd = 9;
@@ -1695,9 +1698,16 @@ static void test_wait_paths(void)
     g_stub_match_endpoint = 1;
     g_stub_rule.effect = CHAOS_NET_EFFECT_TIMEOUT;
     g_should_trigger = 1;
-    assert(select(10, &readfds, NULL, NULL, NULL) == 0);
+    tv.tv_sec = 0;
+    tv.tv_usec = 1500;
+    assert(select(10, &readfds, NULL, NULL, &tv) == 0);
     assert(g_select_calls == 0);
     assert(!FD_ISSET(9, &readfds));
+    /* The time not slept is left in the timeout, as Linux does: none. */
+    assert(tv.tv_sec == 0 && tv.tv_usec == 0);
+    /* Without a timeout: the real select runs. */
+    assert(select(10, &readfds, NULL, NULL, NULL) == 0);
+    assert(g_select_calls == 1);
 
     reset_wrapper_stubs();
     FD_ZERO(&readfds);
@@ -1965,13 +1975,13 @@ static void test_direct_helper_paths(void)
     reset_wrapper_stubs();
     assert(chaos_net_apply_pre_call_rule(NULL) == 0);
     assert(chaos_net_apply_simple_pre_call_rule(NULL) == 0);
-    assert(chaos_net_wait_pre_call(NULL, &synthetic_timeout) == 0);
+    assert(chaos_net_wait_pre_call(NULL, 0, &synthetic_timeout) == 0);
     assert(synthetic_timeout == 0);
 
     rule.effect = CHAOS_NET_EFFECT_LATENCY;
     assert(chaos_net_apply_pre_call_rule(&rule) == 0);
     assert(chaos_net_apply_simple_pre_call_rule(&rule) == 0);
-    assert(chaos_net_wait_pre_call(&rule, &synthetic_timeout) == 0);
+    assert(chaos_net_wait_pre_call(&rule, 0, &synthetic_timeout) == 0);
     assert(g_latency_calls == 3);
 
     rule.effect = CHAOS_NET_EFFECT_ERRNO;
@@ -1984,22 +1994,39 @@ static void test_direct_helper_paths(void)
     assert(chaos_net_apply_simple_pre_call_rule(&rule) == -1);
     assert(errno == EAGAIN);
     errno = 0;
-    assert(chaos_net_wait_pre_call(&rule, &synthetic_timeout) == -1);
+    assert(chaos_net_wait_pre_call(&rule, 0, &synthetic_timeout) == -1);
     assert(errno == EAGAIN);
 
     reset_wrapper_stubs();
     rule.effect = CHAOS_NET_EFFECT_TIMEOUT;
     g_should_trigger = 1;
     synthetic_timeout = 0;
-    assert(chaos_net_wait_pre_call(&rule, &synthetic_timeout) == 0);
+    assert(chaos_net_wait_pre_call(&rule, 0, &synthetic_timeout) == 0);
     assert(synthetic_timeout == 1);
+    /* No timeout: TIMEOUT does not apply, and the rule is not consulted. */
+    g_should_trigger = 0;
+    assert(chaos_net_wait_pre_call(&rule, -1, &synthetic_timeout) == 0);
+    assert(synthetic_timeout == 0);
+    g_should_trigger = 1;
+    /* Milliseconds of a timeout, rounded up; none for NULL; capped. */
+    assert(chaos_net_wait_timespec_ms(NULL) == -1 && chaos_net_wait_timeval_ms(NULL) == -1);
+    ts.tv_sec = 2;
+    ts.tv_nsec = 1;
+    assert(chaos_net_wait_timespec_ms(&ts) == 2001);
+    ts.tv_sec = -1;
+    assert(chaos_net_wait_timespec_ms(&ts) == 0);
+    ts.tv_sec = (time_t)INT32_MAX;
+    assert(chaos_net_wait_timespec_ms(&ts) == INT32_MAX);
+    tv.tv_sec = 1;
+    tv.tv_usec = 999;
+    assert(chaos_net_wait_timeval_ms(&tv) == 1001);
 
     reset_wrapper_stubs();
     rule.effect = CHAOS_NET_EFFECT_CORRUPT;
     assert(chaos_net_apply_pre_call_rule(&rule) == 0);
     assert(chaos_net_apply_simple_pre_call_rule(&rule) == 0);
     synthetic_timeout = -1;
-    assert(chaos_net_wait_pre_call(&rule, &synthetic_timeout) == 0);
+    assert(chaos_net_wait_pre_call(&rule, 0, &synthetic_timeout) == 0);
     assert(synthetic_timeout == 0);
 
     chaos_net_wait_clear_pollfds(NULL, 0U);

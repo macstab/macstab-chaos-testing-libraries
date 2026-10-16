@@ -671,7 +671,9 @@ Reason:
 - `CORRUPT`
   valid only for `recv`
 - `TIMEOUT`
-  valid only for `poll`
+  valid only for `poll`: the wait runs out its own timeout as if nothing became
+  ready and returns 0; a wait without a timeout (-1, or NULL for select) never
+  times out, so TIMEOUT leaves it alone
 - `RESET`
   valid only for `close`: arms `SO_LINGER` with a zero timeout before the close,
   so the connection is aborted and the peer receives an RST (`ECONNRESET`)
@@ -805,13 +807,14 @@ The library should preserve the same operational principle as `libchaos-io`:
 
 - pre-call peer identity is not reliably knowable for unconnected datagram
   sockets
-- receive-side matching therefore keys primarily off the local endpoint
+- receive-side matching tries the local endpoint first, then the peer
 
 `poll()` and `ppoll()`:
 
-- `TIMEOUT` should mean a synthetic zero-ready result
-- it should not fabricate events
-- it should not rewrite the caller's requested timeout value
+- `TIMEOUT` means a zero-ready result after the caller's own timeout has passed
+- it does not fabricate events, and it does not apply to a wait without a timeout
+- `select()` leaves 0 in its timeout afterwards, as Linux does; `ppoll()` and
+  `pselect()` leave theirs as given
 
 Resolver behavior owned by `libchaos-dns`:
 
