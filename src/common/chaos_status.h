@@ -155,13 +155,15 @@ static inline size_t chaos_status_format(
             buffer, size, "state=%s\nrules=%lu\npid=%ld\n", names[state], (unsigned long)rules, pid
         );
     }
-    if (length < 0)
+    if (length < 0 || size == 0U)
     {
         return 0U;
     }
     return (size_t)length < size ? (size_t)length : size - 1U;
 }
 
+/* The system calls of status and hits files; unit tests replace them all. */
+#ifndef CHAOS_STATUS_OPEN
 #ifdef __linux__
 #define CHAOS_STATUS_OPEN(path)                                                                    \
     (int)syscall(                                                                                  \
@@ -189,6 +191,7 @@ static inline size_t chaos_status_format(
 #define CHAOS_STATUS_UNLINK(path) unlink(path)
 #define CHAOS_STATUS_EXISTS(path) (access((path), F_OK) == 0)
 #define CHAOS_STATUS_RENAME(from, to) rename((from), (to))
+#endif
 #endif
 
 /*

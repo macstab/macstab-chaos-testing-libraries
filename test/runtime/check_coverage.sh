@@ -53,6 +53,40 @@ check_target() {
     '
 }
 
+# A header every library includes is compiled into many tests: its coverage is
+# that of all of them together, a line counting as run when any test ran it.
+check_union() {
+    source_path=$1
+    key=$(printf '%s' "$source_path" | sed 's|/|#|g')
+    union_dir=$BUILD_DIR/union
+    rm -rf "$union_dir"
+    mkdir -p "$union_dir"
+    index=0
+    for gcno in "$BUILD_DIR"/*.gcno; do
+        index=$((index + 1))
+        mkdir -p "$union_dir/$index"
+        gcov -p "$gcno" >/dev/null 2>&1 || true
+        for report in ./*.gcov; do
+            [ -e "$report" ] && mv "$report" "$union_dir/$index/"
+        done
+    done
+    cat "$union_dir"/*/*"$key.gcov" 2>/dev/null | awk -v file="$source_path" '
+        BEGIN { FS = ":" }
+        {
+            count = $1; gsub(/ /, "", count); line = $2 + 0;
+            if (count == "-" || line == 0) next;
+            seen[line] = 1;
+            if (count != "#####" && count != "=====") run[line] = 1;
+        }
+        END {
+            total = 0; missed = 0;
+            for (line in seen) { total++; if (!(line in run)) { missed++; printf "%s:%d not run by any test\n", file, line } }
+            printf "File \047%s\047 (all tests)\nLines executed:%.2f%% of %d\n", file, total ? 100 * (total - missed) / total : 0, total;
+            exit (total > 0 && missed == 0) ? 0 : 1;
+        }
+    '
+}
+
 resolve_gcno() {
     base_name=$1
     plain_path=$BUILD_DIR/$base_name.gcno
@@ -145,6 +179,13 @@ check_target "$CHAOS_INIT_IO_GCNO" "src/init/chaos_init_io.c" "100.00"
 check_target "$CHAOS_INIT_NET_GCNO" "src/init/chaos_init_net.c" "100.00"
 check_target "$CHAOS_INIT_MEMORY_GCNO" "src/init/chaos_init_memory.c" "100.00"
 check_target "$CHAOS_INIT_PROCESS_GCNO" "src/init/chaos_init_process.c" "100.00"
+for header in src/common/chaos_clock.h src/common/chaos_hits.h src/common/chaos_once.h \
+    src/common/chaos_policy.h src/common/chaos_sleep.h src/common/chaos_status.h \
+    src/core/chaos_io_internal.h src/net/chaos_net_internal.h src/dns/chaos_dns_internal.h \
+    src/time/chaos_time_internal.h src/memory/chaos_memory_internal.h \
+    src/process/chaos_process_internal.h; do
+    check_union "$header"
+done
 
 echo "coverage check passed"
 

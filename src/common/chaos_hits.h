@@ -309,11 +309,7 @@ static inline uint64_t chaos_hits_now_ms(void)
     {
         return vdso_ns / UINT64_C(1000000);
     }
-#ifdef __linux__
-    if (syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &now) != 0)
-#else
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
-#endif
+    if (CHAOS_CLOCK_RAW_GETTIME(CLOCK_MONOTONIC, &now) != 0)
     {
         return 0U;
     }
@@ -393,14 +389,10 @@ static inline void chaos_hits_write_for(
     }
     for (index = 0U; index < count; ++index)
     {
-        const int rc = snprintf(
-            buffer + length,
-            buffer_size - length,
-            "%llu\t%s\n",
-            (unsigned long long)(slots[index] != NULL ? slots[index]->count : 0U),
-            texts[index]
-        );
+        const unsigned long long hits = slots[index] != NULL ? slots[index]->count : 0U;
+        int rc;
 
+        rc = snprintf(buffer + length, buffer_size - length, "%llu\t%s\n", hits, texts[index]);
         if (rc < 0 || (size_t)rc >= buffer_size - length)
         {
             return;

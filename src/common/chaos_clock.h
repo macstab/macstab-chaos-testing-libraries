@@ -33,6 +33,16 @@
 #include <unistd.h>
 #endif
 
+/** @brief clock_gettime without the C library (where it could be interposed); unit tests replace
+ * it. */
+#ifndef CHAOS_CLOCK_RAW_GETTIME
+#ifdef __linux__
+#define CHAOS_CLOCK_RAW_GETTIME(clock, now) syscall(SYS_clock_gettime, (clock), (now))
+#else
+#define CHAOS_CLOCK_RAW_GETTIME(clock, now) clock_gettime((clock), (now))
+#endif
+#endif
+
 /** @brief Signature of the vDSO clock_gettime. */
 typedef int (*chaos_clock_vdso_fn)(clockid_t, struct timespec *);
 
@@ -205,11 +215,7 @@ static inline int64_t chaos_clock_realtime_ms(void)
 
     if (vdso == NULL || vdso(CLOCK_REALTIME, &now) != 0)
     {
-#ifdef __linux__
-        if (syscall(SYS_clock_gettime, CLOCK_REALTIME, &now) != 0)
-#else
-        if (clock_gettime(CLOCK_REALTIME, &now) != 0)
-#endif
+        if (CHAOS_CLOCK_RAW_GETTIME(CLOCK_REALTIME, &now) != 0)
         {
             return 0;
         }

@@ -521,11 +521,8 @@ static inline void chaos_process_prng_ensure_seeded(void)
     seed = g_chaos_process_process_seed;
     seed ^= chaos_process_current_tid();
     seed ^= (uint64_t)(uintptr_t)&seed;
-    g_chaos_process_tls_prng_state = chaos_process_prng_mix(seed);
-    if (g_chaos_process_tls_prng_state == 0U)
-    {
-        g_chaos_process_tls_prng_state = UINT64_C(0x2545f4914f6cdd1d);
-    }
+    /* Odd: never 0, the one state xorshift64* cannot leave. */
+    g_chaos_process_tls_prng_state = chaos_process_prng_mix(seed) | 1U;
 }
 
 /**

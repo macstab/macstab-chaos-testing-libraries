@@ -357,6 +357,12 @@ static void test_fsops_helpers_and_wrappers(void)
     assert(g_config_match_loaded_calls == 0);
     assert(chaos_io_is_excluded_path("/tmp/.chaos") == 0);
     assert(chaos_io_is_excluded_path("/tmp/.chaosx.conf") == 0);
+    assert(chaos_io_is_excluded_path(NULL) == 1);
+    assert(chaos_io_is_excluded_path("") == 1);
+    assert(chaos_io_is_excluded_path("/tmp/.chaos-io.conf") == 1);
+    assert(chaos_io_is_excluded_path("/tmp/.chaos-net.hits.7") == 1);
+    assert(chaos_io_has_reserved_prefix(NULL, "/proc") == 0);
+    assert(chaos_io_has_reserved_prefix("/proc", NULL) == 0);
 
     g_config_match_loaded_result = 1;
     g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
