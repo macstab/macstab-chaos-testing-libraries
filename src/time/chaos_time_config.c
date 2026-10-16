@@ -1443,7 +1443,10 @@ static void chaos_time_config_after_fork(void)
      * decide alike): its PRNG reseeds from its own thread id on the next draw. */
     g_chaos_time_tls_prng_state = 0U;
     chaos_hits_pool_after_fork(
-        g_chaos_time_hit_pool, sizeof(g_chaos_time_hit_pool) / sizeof(g_chaos_time_hit_pool[0])
+        g_chaos_time_hit_pool,
+        sizeof(g_chaos_time_hit_pool) / sizeof(g_chaos_time_hit_pool[0]),
+        chaos_time_config_active_state()->hits,
+        chaos_time_config_active_state()->rule_count
     );
 }
 

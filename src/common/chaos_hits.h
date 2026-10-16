@@ -260,11 +260,18 @@ static inline void chaos_hits_pool_reset(chaos_hit_slot_t *pool, size_t pool_siz
 /**
  * @brief In a forked child: clears the counts and claims the child inherited, so
  *        it starts its own; a REGRESS decision in progress in the parent is undone.
+ *
+ * @details A fork in the middle of a reload leaves the slots of the snapshot that
+ * was being built marked used, with no reload left to release them: they are
+ * released here, all but the @p active_count of the @p active snapshot.
  */
-static inline void chaos_hits_pool_after_fork(chaos_hit_slot_t *pool, size_t pool_size)
+static inline void chaos_hits_pool_after_fork(
+    chaos_hit_slot_t *pool, size_t pool_size, chaos_hit_slot_t *const *active, size_t active_count
+)
 {
     size_t index;
 
+    chaos_hits_release(pool, pool_size, active, active_count);
     for (index = 0U; index < pool_size; ++index)
     {
         pool[index].count = 0U;

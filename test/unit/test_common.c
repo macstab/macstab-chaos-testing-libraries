@@ -811,11 +811,23 @@ static void test_hits_reload(void)
     assert(chaos_hit_slot_current(&pool[0], generation + 1U));
     assert(chaos_hit_slot_current(NULL, generation));
 
-    /* A forked child starts its counts and claims afresh; a jumped REGRESS re-arms. */
+    /* A forked child starts its counts and claims afresh; a jumped REGRESS re-arms.
+     * A reload the fork cut short (its snapshot assigned, never published) leaves
+     * a slot no snapshot of the child holds: it is released. */
+    {
+        static const char cut_short[1][CHAOS_STATUS_TEXT_MAX + 1U] = {"D"};
+        chaos_hit_slot_t *building[1];
+
+        chaos_hits_assign(pool, 3U, next, next_texts, 2U, building, cut_short, 1U, NULL);
+        assert(building[0] == &pool[0] && pool[0].used);
+        generation = pool[0].generation;
+    }
     pool[1].state = 3U;
     pool[2].state = 2U;
-    chaos_hits_pool_after_fork(pool, 3U);
+    chaos_hits_pool_after_fork(pool, 3U, next, 2U);
     assert(pool[1].count == 0U && pool[1].state == 1U && pool[2].state == 2U);
+    assert(!pool[0].used && pool[0].generation == generation + 1U);
+    assert(pool[1].used && pool[2].used);
     chaos_hit_record(NULL);
 }
 

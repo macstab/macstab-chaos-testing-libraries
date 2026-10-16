@@ -1397,7 +1397,9 @@ static void chaos_process_config_after_fork(void)
     chaos_process_reset_fail_after_counters();
     chaos_hits_pool_after_fork(
         g_chaos_process_hit_pool,
-        sizeof(g_chaos_process_hit_pool) / sizeof(g_chaos_process_hit_pool[0])
+        sizeof(g_chaos_process_hit_pool) / sizeof(g_chaos_process_hit_pool[0]),
+        chaos_process_config_active_state()->hits,
+        chaos_process_config_active_state()->rule_count
     );
 }
 

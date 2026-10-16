@@ -1399,7 +1399,9 @@ static void chaos_memory_config_after_fork(void)
     g_chaos_memory_tls_prng_state = 0U;
     chaos_hits_pool_after_fork(
         g_chaos_memory_hit_pool,
-        sizeof(g_chaos_memory_hit_pool) / sizeof(g_chaos_memory_hit_pool[0])
+        sizeof(g_chaos_memory_hit_pool) / sizeof(g_chaos_memory_hit_pool[0]),
+        chaos_memory_config_active_state()->hits,
+        chaos_memory_config_active_state()->rule_count
     );
 }
 
