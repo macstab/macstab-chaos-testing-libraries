@@ -77,6 +77,19 @@ int chaos_init_exit_code(int status);
 /** @brief Whether kernel @p release (uname) has user notification with CONTINUE (5.5+). */
 int chaos_init_kernel_supported(const char *release);
 
+/**
+ * @brief Finds @p command as execvp() would: as given when it holds a '/', else the
+ *        first executable regular file of that name in @p path (":"-separated; NULL
+ *        means "/usr/local/bin:/usr/bin:/bin"; an empty entry is the current directory).
+ *
+ * @details chaos-init looks the command up before the fork and executes the result
+ * with execv(): execvp() would try one directory after another with execve(), and
+ * only the application's first execve is exempt from the process rules.
+ *
+ * @return 1 with the path in @p out; 0 when there is none (or it does not fit).
+ */
+int chaos_init_find_command(const char *command, const char *path, char *out, size_t size);
+
 /** @brief Why seccomp could not be installed, for the status file. */
 const char *chaos_init_unsupported_reason(int error);
 

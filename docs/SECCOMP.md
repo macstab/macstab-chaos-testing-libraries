@@ -100,7 +100,9 @@ the load, never a passing `state=ok` first.
   path search is in the C library.
 - wait4 and waitid are waitpid.
 - The first execve of the application, the one that starts it, is never faulted. With
-  `LD_PRELOAD` the library is not loaded at that point either.
+  `LD_PRELOAD` the library is not loaded at that point either. chaos-init looks a
+  command without a '/' up on `PATH` itself, so that start is a single execve of the
+  right file, not one per `PATH` entry tried.
 
 ## 6. Not possible
 

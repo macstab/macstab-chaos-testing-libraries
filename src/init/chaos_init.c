@@ -44,6 +44,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/signalfd.h>
@@ -463,6 +464,8 @@ int main(int argc, char **argv)
     int timer;
     int child_status = 0;
     int serving_the_rest = 0;
+    int found;
+    static char command_path[4096];
     pid_t child;
 
     memset(&sizes, 0, sizeof(sizes));
@@ -489,6 +492,11 @@ int main(int argc, char **argv)
         return CHAOS_INIT_EXIT_HANDOVER;
     }
 
+    /* Looked up now: the child's execvp() would try one PATH entry after another,
+     * and only the application's first execve is exempt from the process rules. */
+    found = chaos_init_find_command(
+        argv[options.command], getenv("PATH"), command_path, sizeof(command_path)
+    );
     child = fork();
     if (child < 0)
     {
@@ -511,7 +519,14 @@ int main(int argc, char **argv)
         {
             _exit(CHAOS_INIT_EXIT_HANDOVER);
         }
-        (void)execvp(argv[options.command], argv + options.command);
+        if (found)
+        {
+            (void)execv(command_path, argv + options.command);
+        }
+        else
+        {
+            errno = ENOENT;
+        }
         error = errno;
         (void)fprintf(stderr, "chaos-init: %s: %s\n", argv[options.command], strerror(error));
         _exit(error == ENOENT ? CHAOS_INIT_EXIT_NOT_FOUND : CHAOS_INIT_EXIT_NOT_EXECUTABLE);

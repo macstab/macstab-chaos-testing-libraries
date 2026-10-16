@@ -12,7 +12,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
+#include <unistd.h>
 
 #if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
 #error "the filter reads the low word of 64-bit arguments at their offset"
@@ -275,6 +277,40 @@ int chaos_init_exit_code(int status)
         return (status >> 8) & 0xff;
     }
     return 128 + (status & 0x7f);
+}
+
+int chaos_init_find_command(const char *command, const char *path, char *out, size_t size)
+{
+    const char *entry;
+
+    if (command == NULL || *command == '\0' || out == NULL || size == 0U)
+    {
+        return 0;
+    }
+    if (strchr(command, '/') != NULL)
+    {
+        return (size_t)snprintf(out, size, "%s", command) < size;
+    }
+    entry = path != NULL ? path : "/usr/local/bin:/usr/bin:/bin";
+    for (;;)
+    {
+        const char *end = strchr(entry, ':');
+        const size_t length = end != NULL ? (size_t)(end - entry) : strlen(entry);
+        struct stat info;
+
+        if ((size_t
+            )snprintf(out, size, "%.*s%s%s", (int)length, entry, length > 0U ? "/" : "", command) <
+                size &&
+            stat(out, &info) == 0 && S_ISREG(info.st_mode) && access(out, X_OK) == 0)
+        {
+            return 1;
+        }
+        if (end == NULL)
+        {
+            return 0;
+        }
+        entry = end + 1;
+    }
 }
 
 int chaos_init_kernel_supported(const char *release)

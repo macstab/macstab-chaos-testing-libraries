@@ -258,6 +258,35 @@ static void test_status_text(void)
     assert(chaos_init_format_status(tiny, sizeof(tiny), CHAOS_INIT_LIB_NET, NULL, 1L) == 0U);
 }
 
+static void test_find_command(void)
+{
+    char path[256];
+    char tiny[4];
+
+    assert(chaos_init_find_command("sh", "/nonexistent:/bin:/usr/bin", path, sizeof(path)));
+    assert(strcmp(path, "/bin/sh") == 0);
+    /* An empty entry is the current directory. */
+    {
+        char here[256];
+        FILE *file;
+
+        assert(getcwd(here, sizeof(here)) != NULL && chdir("/tmp") == 0);
+        file = fopen("/tmp/chaos-init-find-me", "w");
+        assert(file != NULL && fclose(file) == 0 && chmod("/tmp/chaos-init-find-me", 0755) == 0);
+        assert(chaos_init_find_command("chaos-init-find-me", "/nonexistent:", path, sizeof(path)));
+        assert(strcmp(path, "chaos-init-find-me") == 0);
+        assert(unlink("/tmp/chaos-init-find-me") == 0 && chdir(here) == 0);
+    }
+    assert(!chaos_init_find_command("no-such-command", "/bin:/usr/bin", path, sizeof(path)));
+    assert(!chaos_init_find_command("tmp", "/", path, sizeof(path))); /* a directory */
+    assert(chaos_init_find_command("./x/y", "/bin", path, sizeof(path)));
+    assert(strcmp(path, "./x/y") == 0);
+    assert(!chaos_init_find_command("/bin/sh", NULL, tiny, sizeof(tiny)));
+    assert(!chaos_init_find_command("", NULL, path, sizeof(path)));
+    assert(!chaos_init_find_command(NULL, NULL, path, sizeof(path)));
+    assert(chaos_init_find_command("sh", NULL, path, sizeof(path)));
+}
+
 static void test_delays(void)
 {
     chaos_init_call_t call;
@@ -566,6 +595,7 @@ int main(void)
     test_kernel_and_reasons();
     test_status_text();
     test_delays();
+    test_find_command();
     test_memory_and_proc();
     test_tracee_table();
     return 0;

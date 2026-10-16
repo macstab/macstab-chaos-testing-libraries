@@ -186,6 +186,9 @@ expect "Go: other sizes map, the runtime runs" "$($init --libs memory -- $go mma
 
 printf "%s\n" "fork:ERRNO:ENOMEM # t" "posix_spawn:ERRNO:EAGAIN # t" "execve:ERRNO:EACCES # t" > /tmp/.chaos-process.conf
 expect "C: the application starts despite an execve rule" "$($init --libs process -- /tmp/probe open /tmp/sec/other)" "ok"
+mkdir -p /tmp/sec/bin && cp /tmp/probe /tmp/sec/bin/probe-in-path
+expect "C: one found by PATH search starts too" \
+    "$(PATH=/nonexistent:/tmp/sec/bin $init --libs process -- probe-in-path open /tmp/sec/other)" "ok"
 expect "C: fork rule fails fork" "$($init --libs process -- /tmp/probe fork)" "ENOMEM"
 expect "C: execve rule fails a later exec" "$($init --libs process -- /tmp/probe exec)" "EACCES"
 expect "Go: posix_spawn rule fails os/exec" "$($init --libs process -- $go spawn)" "EAGAIN"
