@@ -215,11 +215,13 @@ static int chaos_init_net_name(int fd, struct sockaddr *address, socklen_t *leng
                                                ? strcspn(name, "\n")
                                                : sizeof(un->sun_path);
 
-                /* As getsockname() reports it: a name that fills sun_path has no NUL. */
+                /* As getsockname() reports it: an unnamed socket has only the
+                 * family, a name that fills sun_path has no NUL. */
                 un->sun_family = AF_UNIX;
                 memcpy(un->sun_path, name, name_length);
-                found_length = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + name_length +
-                                           (name_length < sizeof(un->sun_path) ? 1U : 0U));
+                found_length =
+                    (socklen_t)(offsetof(struct sockaddr_un, sun_path) + name_length +
+                                (name_length > 0U && name_length < sizeof(un->sun_path) ? 1U : 0U));
                 have = 1;
             }
         }

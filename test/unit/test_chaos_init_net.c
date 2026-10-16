@@ -239,8 +239,16 @@ static void test_socket_queries(
         length = (socklen_t)sizeof(name);
         assert(
             chaos_init_net_getsockname(unnamed, (struct sockaddr *)&name, &length) == 0 &&
-            un->sun_path[0] == '\0'
+            length == (socklen_t)sizeof(sa_family_t)
         );
+        /* ...which no unix://@ rule selects: its endpoint text is empty, as the
+         * library's for the same socket. */
+        {
+            chaos_net_endpoint_t endpoint;
+
+            assert(chaos_net_endpoint_from_local_fd(unnamed, &endpoint));
+            assert(endpoint.value.text[0] == '\0');
+        }
         /* An abstract name that fills sun_path, without a NUL, at its full length. */
         (void)close(abstract);
         abstract = socket(AF_UNIX, SOCK_DGRAM, 0);
