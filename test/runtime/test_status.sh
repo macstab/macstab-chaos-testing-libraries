@@ -24,7 +24,7 @@ set -eu
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 TMP_DIR=$(mktemp -d)
 # Mounted into the containers, where another user (setpriv) loads the libraries
-# from it: mktemp makes it private to this user.
+# from it: mktemp makes it private to this user, the builds below may too.
 chmod 755 "$TMP_DIR"
 
 if [ "$#" -gt 1 ]; then
@@ -195,6 +195,7 @@ for libc in glibc musl; do
         --output "type=local,dest=$TMP_DIR/$libc" \
         -f "$ROOT_DIR/docker/Dockerfile.build" \
         "$ROOT_DIR" >/dev/null
+    chmod -R a+rX "$TMP_DIR/$libc"
 
     docker run --rm \
         --platform "$DOCKER_PLATFORM" \
