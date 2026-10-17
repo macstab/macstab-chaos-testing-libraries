@@ -5,12 +5,12 @@
 '                Macstab GmbH · Hamburg, Germany
 '                https://macstab.com
 '
-' libchaos-io process-wide FD cache — direct-mapped lookup,
-' /proc/self/fd miss resolution, and invalidation triggers.
+' libchaos-io process-wide fd cache: direct-mapped lookup with a per-slot
+' seqlock and generation, /proc/self/fd miss resolution, and every
+' invalidation trigger.
 '
-' Reference: docs/IO.md §6 (Component Breakdown → FD cache)
-'            docs/ARCHITECTURE.md §FD Path Resolution
-'            src/config/chaos_io_fdcache.c
+' Reference: docs/IO.md §6 "FD cache", docs/ARCHITECTURE.md "FD Path Resolution"
+'            src/config/chaos_io_fdcache.c, src/wrappers/chaos_io_sync.c
 '
 title libchaos-io Process-Wide FD Cache — Lookup and Invalidation
 
@@ -30,75 +30,90 @@ skinparam sequence {
 hide footbox
 
 participant "Wrapper\n(read/write/fsync/…)" as Wrap
-participant "FD Cache\n(process-wide, direct-mapped)" as Cache
+participant "FD Cache\n(process-wide, 32 slots)" as Cache
 participant "/proc/self/fd\n<fd>" as Proc
 participant "Config Engine" as Config
-participant "Real libc" as Real
+participant "Real function" as Real
 
-== Normal read/write call ==
+note over Cache
+  Table: 32 × {sequence, generation, fd + 1, PATH_MAX path},
+  mapped on the first store with raw SYS_mmap (no allocator,
+  not visible to libchaos-memory); a concurrent mapper that
+  loses the CAS unmaps. Mapping failed: every lookup misses.
+  Generations: static array outside the table, so an
+  invalidation never needs the mapping.
+end note
+
+== Descriptor-based call (fd > 2, after prepare() found rules) ==
 
 Wrap -> Cache : lookup(fd)
 note right of Cache
-  slot = fd % CACHE_SLOTS
-  if cache[slot].fd == fd:
-    return cache[slot].path  (hit)
-  else:
-    return NULL              (miss)
+  slot = fd % 32
+  hit only if: sequence even and unchanged across the copy,
+  slot holds fd, entry generation == slot generation
 end note
 
 alt Cache hit
-  Cache --> Wrap : cached_path
+  Cache --> Wrap : path
 else Cache miss
-  Cache --> Wrap : NULL
-  Wrap -> Proc : readlink("/proc/self/fd/<fd>", buf)
+  Wrap -> Cache : generation = slot generation (read first)
+  Wrap -> Proc : readlink("/proc/self/fd/<fd>")\n(under the guard, errno restored)
   note right of Proc
-    Returns canonical path or socket pseudo-path.
-    Filtered: /proc, /sys, /dev, config path,
-    fd 0/1/2 are excluded from injection.
+    Kernel name, links resolved
+    (pipe:[N], socket:[N], anon_inode:[...] for non-files).
+    Excluded: /proc, /sys, /dev, /tmp/.chaos-*:
+    no match, not cached.
   end note
-  Proc --> Wrap : path_string
-  Wrap -> Cache : store(fd, path_string)
+  Proc --> Wrap : path
+  Wrap -> Cache : store_at(fd, path, generation)
+  note right of Cache
+    seqlock CAS even → odd; skipped if the slot is
+    busy. The entry keeps the generation read before
+    readlink: if a close bumped it meanwhile, the
+    entry is dead on arrival and never returned.
+  end note
 end
 
-Wrap -> Config : select_rule(op, path_string)
-Config --> Wrap : rule or null
-Wrap -> Real : real_symbol(fd, …)
+Wrap -> Config : select one rule (operation, path)
+Config --> Wrap : rule or none
+Wrap -> Real : real_function(fd, …)
 Real --> Wrap : result
 
-== open() seeds the cache ==
+== open-style call returns a descriptor ==
 
 note over Wrap, Cache
-  open(path, flags) / openat(dirfd, path, flags):
-    resolve match_path (pre-open)
-    call real_open()
-    if succeeded: store(returned_fd, match_path)
+  fd = real_open(...) for open, openat, creat, fopen, freopen:
+  1. invalidate(fd): drop what an fd closed behind io's back left
+  2. resolve(fd): cache the kernel's name, links resolved
 end note
 
-== close() invalidates ==
+== Invalidation: atomic ++generation[fd % 32], no lock, no waiting ==
 
 note over Wrap, Cache
-  close(fd):
-    call real_close(fd)
-    generation[fd % SLOTS] += 1  (invalidate, all threads)
-    Always invalidate: Linux releases the descriptor
-    even when close() reports an error.
-    dup2/dup3 invalidate the target, close_range the range.
+  • close(fd): after the real close, whatever it returned
+    (Linux releases the descriptor even on error)
+  • dup2, dup3: newfd, on success (dup2 only if oldfd != newfd)
+  • close_range: each fd of the range, on success; a range of 32 or
+    more fds resets every slot; CLOSE_RANGE_CLOEXEC invalidates nothing
+  • closedir, pclose, fclose: the stream's fd, after the real call
+  • freopen: the stream's fd when an injected open fault fires
 end note
 
-== renameat() / unlinkat() reset ==
+== Full reset: ++generation of all 32 slots ==
 
 note over Wrap, Cache
-  renameat() / unlinkat() success:
-    generation[every slot] += 1  (full reset)
-    Reason: previously resolved /proc/self/fd paths
-    may now point to different inodes or be stale.
+  • closefrom(): always
+  • unlinkat, renameat, renameat2 and the path forms (unlink, rmdir,
+    remove, rename): on success, since any cached path may now name
+    another inode
+  • library constructor: once
 end note
 
 note across
-  Process-wide scope: one lazily mapped table for all threads.
-  An entry is valid only while its slot generation is current,
-  so a close on Thread A is seen by Thread B at once, and a
-  lookup that raced with the close never re-stores a stale path.
+  One table for all threads. An entry is valid only while its slot's
+  generation is unchanged, so a close on thread A is seen by thread B
+  at once, and a lookup that raced with the close never returns the
+  stale path.
 end note
 
 @enduml

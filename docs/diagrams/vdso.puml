@@ -7,12 +7,14 @@
 '
 ' clock_gettime(2) dispatch with libchaos-time.so preloaded.
 '
-' Key fact: the vDSO is invoked INSIDE glibc, downstream of our wrapper.
-' Our interposition stays intact for the common case.
+' Key fact: libc calls the vDSO INSIDE its own clock_gettime, downstream
+' of the wrapper, so the wrapper decides before and mutates after.
+' The libraries' own clocks (rule-file throttle, @from/@until) call the
+' vDSO directly and are therefore outside libchaos-time's reach.
 '
-' Reference: docs/PLATFORM.md §5.2
-'             docs/TIME.md §"Bypass surfaces"
-'             vdso(7) Linux man-pages
+' Reference: docs/PLATFORM.md §5, docs/TIME.md §2 and §10
+'            src/time/chaos_time_hooks.c, src/common/chaos_clock.h
+'            vdso(7) Linux man-pages
 '
 title clock_gettime dispatch with libchaos-time.so preloaded
 
@@ -33,36 +35,48 @@ hide footbox
 
 participant App
 participant "libchaos-time.so" as Wrapper
-participant "libc.so.6"        as Glibc
+participant "libc"             as Glibc
 participant "kernel vDSO"      as Vdso
 participant "kernel syscall"   as Kernel
 
-App     ->  Wrapper : clock_gettime(CLOCK_MONOTONIC, &ts)
-Wrapper ->  Wrapper : match config,\nmaybe LATENCY/ERRNO
+note over Vdso
+  x86_64:  __vdso_clock_gettime   (TSC / pvclock)
+  aarch64: __kernel_clock_gettime (CNTVCT_EL0)
+end note
 
-alt Synthetic ERRNO fires
+App     ->  Wrapper : clock_gettime(CLOCK_MONOTONIC, &ts)
+note right of Wrapper
+  guard set or ts == NULL: straight to the
+  real function. gettimeofday, time and
+  timespec_get(TIME_UTC) take the same path
+  as a CLOCK_REALTIME read.
+end note
+Wrapper ->  Vdso    : config refresh: throttle clock\n(chaos_clock.h, direct vDSO call, CLOCK_MONOTONIC)
+Wrapper ->  Wrapper : LATENCY rule? sleep via real usleep/nanosleep\nERRNO rule? (each effect: own lookup, own decision)
+
+alt ERRNO fires
     Wrapper --> App : -1, errno set
 else Passthrough to real
-    Wrapper ->  Glibc  : real_clock_gettime(...)
-    alt vDSO available on this arch
-        Glibc -> Vdso   : __vdso_clock_gettime
+    Wrapper ->  Glibc  : real clock_gettime(...) under the guard\n(raw SYS_clock_gettime while unresolved)
+    alt clock served by the vDSO
+        Glibc -> Vdso   : __vdso_clock_gettime / __kernel_clock_gettime
         Vdso  --> Glibc : ts
-    else syscall fallback
+    else CPUTIME clocks, or no usable vDSO clocksource
         Glibc -> Kernel : SYS_clock_gettime
         Kernel --> Glibc: ts
     end
     Glibc   --> Wrapper : 0, ts
-    Wrapper ->  Wrapper : maybe OFFSET\n(post-call mutation)
-    Wrapper --> App     : 0, possibly-mutated ts
+    Wrapper ->  Wrapper : maybe OFFSET, then REGRESS\n(post-call mutation of the returned value only)
+    Wrapper --> App     : 0, possibly mutated ts
 end
 
 note across
-  Bypass cases — wrapper NOT invoked:
-  • Application calls syscall(SYS_clock_gettime, ...) directly
-    (Go runtime, hardened daemons, sanitizer interceptors).
-  • Application resolves __vdso_clock_gettime via getauxval(AT_SYSINFO_EHDR)
-    and calls it directly (vanishingly rare in user code).
-  • Statically-linked binary (no dynamic loader → no LD_PRELOAD).
+  Bypass cases — wrapper NOT invoked (docs/TIME.md §10):
+  • Code issues syscall(SYS_clock_gettime, ...) itself.
+  • Code locates the vDSO itself (AT_SYSINFO_EHDR) and calls it: the Go runtime does,
+    with or without cgo.
+  • Calls libc makes to its own functions internally (pthread_cond_timedwait timeouts, ...).
+  • Statically linked binary (no dynamic loader, no LD_PRELOAD).
 end note
 
 @enduml

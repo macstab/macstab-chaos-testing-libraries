@@ -13,10 +13,11 @@
 
 ---
 
-This document specifies the safety model, privilege constraints, and operational
-hazards of the chaos preload libraries. It is not a security controls document;
-these libraries are not security boundaries. It is a guide to what can go wrong
-operationally and why specific design decisions prevent the worst failure modes.
+This document specifies what the libchaos libraries guarantee when something goes wrong,
+which privilege and sandbox boundaries apply to them, and which operational mistakes cause
+damage. The libraries are a fault-injection tool for test and staging environments. They
+are not a security boundary, and anyone who can write a rule file controls the faults of
+every process that loads the matching library.
 
 ---
 
@@ -38,56 +39,76 @@ operationally and why specific design decisions prevent the worst failure modes.
 
 ## 1. AT_SECURE and the Privilege Strip
 
-`AT_SECURE` is an auxiliary vector entry (tag 23) set to `1` by the Linux kernel
-when the process was started with elevated privileges relative to the calling
-user. Specifically, the kernel sets `AT_SECURE=1` when:
+A program started with more privilege than its caller runs in secure-execution mode, and
+the dynamic linker then does not load the libchaos libraries from `LD_PRELOAD`. The
+libraries cannot influence this, and must not: preloading caller-chosen code into a
+privileged program is a privilege escalation.
 
-- The binary has the setuid bit (`S_ISUID`) and the real UID ≠ effective UID.
-- The binary has the setgid bit (`S_ISGID`) and the real GID ≠ effective GID.
-- The binary has file capabilities (`CAP_*` in the file capability set) that were
-  not already in the process's inheritable set.
-- The binary's effective UID is not in the kernel's "secure" set (platform-specific,
-  unusual in standard Linux).
+The kernel signals secure-execution mode with the auxiliary-vector entry `AT_SECURE`
+(tag 23) set to 1. It sets it when the `execve` changes credentials or an LSM asks for it:
 
-When `AT_SECURE=1`, the Linux dynamic linker (`ld.so`) silently ignores
-`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, and other security-sensitive
-`LD_*` environment variables. The chaos libraries are **never loaded** in this
-case.
+- the file is set-user-ID and the effective UID differs from the real UID;
+- the file is set-group-ID and the effective GID differs from the real GID;
+- the file's capabilities (`security.capability` xattr) raise the permitted set;
+- an LSM requests it (an SELinux domain transition without the `noatsecure` permission).
 
-This is a kernel-enforced security boundary that the libraries cannot influence.
-It is correct behaviour: allowing a lesser-privileged caller to inject code
-into a setuid binary via `LD_PRELOAD` would be a privilege escalation.
+What the loader then does with `LD_PRELOAD`:
 
-Reference: `ld.so(8)` §"Secure-execution mode"; Linux kernel `fs/binfmt_elf.c`,
-`ARCH_DLINFO` and `auxv` setup; `getauxval(3)`.
+| Loader | Behaviour under `AT_SECURE=1` |
+|---|---|
+| glibc `ld.so` | Ignores preload entries that contain a `/`. Entries without a slash are loaded only from the standard search directories and only if the object file is itself set-user-ID. The variables in `sysdeps/generic/unsecvars.h` (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, ...) are removed from the program's environment. |
+| musl | Ignores `LD_PRELOAD` and `LD_LIBRARY_PATH` entirely. |
+
+The libchaos libraries are always given as a path (`/path/libchaos-io-glibc-amd64.so`) and
+are never set-user-ID, so in practice they are never loaded into such a program.
+
+Reference: `ld.so(8)` "Secure-execution mode"; `getauxval(3)`; kernel `fs/exec.c` and
+`security/commoncap.c`.
 
 ### 1.1 Verifying AT_SECURE
 
-To verify that `AT_SECURE` is set for a given binary:
+Check the target, not a helper program: `LD_PRELOAD=... printenv LD_PRELOAD` proves
+nothing, because `printenv` is not privileged and does load the library.
 
 ```sh
-# Run a small probe under the target binary:
-LD_PRELOAD=/path/libchaos-io-glibc-amd64.so printenv LD_PRELOAD
+# Is the target privileged at exec? (setuid/setgid bit, or file capabilities)
+stat -c '%A %U:%G %n' /usr/bin/target
+getcap /usr/bin/target
+
+# Did the library load into the running target?
+grep libchaos /proc/<pid>/maps || echo "not loaded"
 ```
 
-If the output is empty, `LD_PRELOAD` was stripped. Alternatively:
+From inside a program you control:
 
 ```c
+#include <stdio.h>
 #include <sys/auxv.h>
-printf("AT_SECURE = %lu\n", getauxval(AT_SECURE));
+
+int main(void)
+{
+    printf("AT_SECURE = %lu\n", getauxval(AT_SECURE));
+    return 0;
+}
 ```
 
 ### 1.2 Workarounds (and Why Not to Use Them)
 
-The only way to preload into a setuid process is to run as root (then the
-effective UID is root, equal to the binary's setuid owner, so no privilege
-elevation occurs). Do not use `sudo` for this in test environments: running
-chaos libraries under root in a test harness blurs the privilege model and can
-cause collateral damage to system files.
+- **Run the caller as the file's owner.** A set-user-ID-root program started by root changes
+  no credentials, so `AT_SECURE` stays 0. It also means running the whole test harness as
+  root, where an injected fault in the harness's own I/O can damage system files.
+- **Start it under `no_new_privs`.** With `PR_SET_NO_NEW_PRIVS` (Kubernetes
+  `allowPrivilegeEscalation: false`) the kernel ignores the set-user-ID bit and file
+  capabilities at `execve`, so `AT_SECURE` stays 0 and the library loads; the program then
+  runs without the privilege it was built to have, which usually changes the behaviour under
+  test.
+- **`/etc/ld.so.preload`.** Read by the loader regardless of the environment and
+  root-controlled; it preloads into every dynamically linked process on the system. Not
+  recommended (see [§7](#7-the-never-preload-into-dev-shell-footgun)).
 
 ### 1.3 AT_SECURE Flow Diagram
 
-Full kernel-to-linker-to-library flow ([source](diagrams/atsecure.puml)):
+Kernel, loader and library at `execve` ([source](diagrams/atsecure.puml)):
 
 ```plantuml
 @startuml atsecure
@@ -109,64 +130,55 @@ skinparam sequence {
 hide footbox
 
 participant "execve() caller\n(user process)" as Caller
-participant "Linux kernel\nbinfmt_elf.c"      as Kernel
+participant "Linux kernel\nfs/exec.c"           as Kernel
 participant "ld.so\n(dynamic linker)"          as Ldso
 participant "libchaos-*.so\n(LD_PRELOAD lib)"  as Chaos
-participant "libc.so.6\n(glibc)"               as Libc
+participant "libc"                             as Libc
 
 Caller -> Kernel : execve("/path/to/target", argv, envp)
 note right of Caller
-  envp contains: LD_PRELOAD=libchaos-io.so
-  LD_PRELOAD will be stripped if AT_SECURE=1.
+  envp contains LD_PRELOAD=/path/libchaos-io.so
 end note
 
-Kernel -> Kernel : load_elf_binary()
+Kernel -> Kernel : load ELF, compute credentials
 note right of Kernel
-  Check privilege escalation:
-  - ruid != euid (setuid binary)?
-  - rgid != egid (setgid binary)?
-  - file capabilities > inheritable set?
-  If any: AT_SECURE = 1 in auxv.
-  Else:   AT_SECURE = 0 in auxv.
+  AT_SECURE = 1 if the exec changes
+  euid/egid (setuid/setgid), raises
+  permitted capabilities (file caps),
+  or an LSM requests it; else 0.
+  no_new_privs: setuid bits and file
+  caps are ignored → no change → 0.
 end note
 
-Kernel -> Ldso : transfer control to ld.so entry point\nwith auxv on stack
+Kernel -> Ldso : enter PT_INTERP with auxv on the stack
 
-Ldso -> Ldso : _dl_sysdep_start() / _dl_start()
-Ldso -> Ldso : getauxval(AT_SECURE)
-
-alt AT_SECURE == 1 (privileged binary)
-  Ldso -> Ldso : ignore LD_PRELOAD, LD_LIBRARY_PATH,\nLD_AUDIT, LD_DEBUG, LD_ORIGIN_PATH
+alt AT_SECURE == 1
+  Ldso -> Ldso : drop LD_PRELOAD entries containing '/'\n(musl: ignore LD_PRELOAD entirely)
+  Ldso -> Libc : map DT_NEEDED, relocate, run initialisers
   note right of Ldso
-    LD_PRELOAD is cleared from the effective
-    search list. libchaos-*.so is NEVER loaded.
-    Kernel-enforced: not overrideable by the caller.
+    libchaos-*.so is never mapped.
+    glibc also removes the unsecvars
+    (LD_PRELOAD, LD_LIBRARY_PATH, ...)
+    from the program's environment.
   end note
-  Ldso -> Libc : load libc normally
-  Libc -> Caller : process runs without any preload injection
-else AT_SECURE == 0 (normal binary)
-  Ldso -> Ldso : process LD_PRELOAD list
-  Ldso -> Chaos : dlopen(libchaos-*.so) for each LD_PRELOAD entry
+  Ldso -> Caller : _start: no interposition
+else AT_SECURE == 0
+  Ldso -> Chaos : map each LD_PRELOAD object
+  Ldso -> Libc : map DT_NEEDED objects
+  Ldso -> Ldso : relocate; application GOT entries\nfor interposed names bind to libchaos
+  Ldso -> Libc : run initialisers, dependencies first
+  Ldso -> Chaos : libchaos constructor
   note right of Chaos
-    Library constructor runs:
-    - dlsym(RTLD_NEXT, …) for real symbols
-    - Seed PRNG
-    - Reset config state
+    resolve real functions (RTLD_NEXT)
+    seed PRNG, reset config state
+    load rule file, write status file
   end note
-  Chaos --> Ldso : constructor complete
-  Ldso -> Libc : load libc (DT_NEEDED resolution)
-  Libc --> Ldso : loaded
-  Ldso -> Caller : transfer to _start / main
-  note right of Caller
-    Process runs with interposed libc symbols.
-    LD_PRELOAD injection is active.
-  end note
+  Ldso -> Caller : _start / main with interposition active
 end
 
 note across
-  Verification: cat /proc/self/auxv | xxd | grep AT_SECURE (tag 23)
-  Or: #include <sys/auxv.h>; getauxval(AT_SECURE) == 1 means stripped.
-  To reproduce: chmod +s ./target && ./target → AT_SECURE=1, no preload.
+  Check a running target: grep libchaos /proc/<pid>/maps
+  Check from inside a program: getauxval(AT_SECURE)
 end note
 
 @enduml
@@ -176,181 +188,199 @@ end note
 
 ## 2. setuid, setgid, and File Capabilities
 
-Beyond `AT_SECURE`, the libraries have no special handling for privilege state.
-Once loaded (in a non-setuid target), they run with the same UID/GID as the
-target process.
+Apart from `AT_SECURE`, the libraries have no notion of privilege. Once loaded they run with
+the target process's credentials, and every file they touch is accessed with those
+credentials.
 
-File capabilities (`cap_get_file()` / `getcap`) are not a special case for the
-library itself; they affect whether `AT_SECURE` is set for the target binary, as
-described in §1.
+File capabilities matter only through `AT_SECURE` ([§1](#1-at_secure-and-the-privilege-strip)).
 
-The config file at `/tmp/.chaos-*.conf` is read with the target process's
-privilege. If the process runs as a low-privilege user and `/tmp/.chaos-*.conf`
-is owned by root with mode `0600`, the config read will fail (EACCES). The
-library will fall back to passthrough (see §5). This is the correct operational
-behaviour.
+A rule file the process may not open (for example root-owned, mode 0600, and a process
+running as another user) fails `open` with `EACCES`. The library then runs with no rules,
+reports `state=error`, `reason=file unreadable` in `/tmp/.chaos-<lib>.status`, and does not
+try again until the file's stamp (mtime, size, inode, device) changes. See
+[§5](#5-fail-open-guarantee).
 
 ---
 
 ## 3. Container Capabilities and LD_PRELOAD
 
-In containers, `LD_PRELOAD` is an ordinary environment variable visible to the
-container process. There is no capability required to use `LD_PRELOAD` for
-dynamically linked non-setuid binaries.
-
-Common container-level concerns:
+In a container `LD_PRELOAD` is an ordinary environment variable. Loading a library into a
+dynamically linked program that is not set-user-ID needs no capability. A statically linked
+program never runs the dynamic linker and is unreachable in LD_PRELOAD mode; SECCOMP mode
+(`chaos-init`, [SECCOMP.md](SECCOMP.md)) covers it.
 
 ### 3.1 Read-Only Filesystem
 
-If the container image has `/ readOnly: true` (Kubernetes `securityContext`),
-the config file at `/tmp/.chaos-*.conf` may not be writable. Solutions:
+Every path the libraries use is compiled in (`/tmp/.chaos-<lib>.conf`, `.status`,
+`.hits.<n>`); there is no environment override. With a read-only root filesystem
+(Kubernetes `readOnlyRootFilesystem: true`) and no writable `/tmp`:
 
-- Mount a writable `emptyDir` volume at `/tmp`.
-- Use a writable config path via `CHAOS_IO_CONFIG` environment variable override
-  (not currently implemented; `/tmp` is hardcoded).
+- rules cannot be written, so nothing is injected;
+- status and hits writes fail; the failure is ignored and errno preserved.
+
+Mount a writable volume (`emptyDir`) at `/tmp`.
 
 ### 3.2 `no-new-privileges` securityContext
 
-`securityContext.allowPrivilegeEscalation: false` (Kubernetes) sets `PR_SET_NO_NEW_PRIVS`
-on the container's init process. This prevents `execve()` from gaining new
-privileges (no setuid-binary privilege escalation). It does not affect
-`LD_PRELOAD`. The chaos libraries are unaffected.
+`allowPrivilegeEscalation: false` sets `PR_SET_NO_NEW_PRIVS` on the container's first
+process, inherited by every descendant. `execve` then gains no privilege from set-user-ID
+bits or file capabilities. It does not affect `LD_PRELOAD`; it makes set-user-ID targets
+reachable, without their privilege ([§1.2](#12-workarounds-and-why-not-to-use-them)).
+`chaos-init` sets `no_new_privs` on its child itself, as seccomp requires for an
+unprivileged filter.
 
 ### 3.3 AppArmor and SELinux
 
-AppArmor and SELinux profiles can restrict `LD_PRELOAD` by denying `mmap(PROT_EXEC)`
-on the preloaded `.so` file or by denying `open()` of the library. This depends
-on the specific policy. If the container's AppArmor/SELinux policy does not allow
-loading external shared libraries, `LD_PRELOAD` will fail silently (the library
-is not loaded; the target process runs normally without injection).
+A profile that denies reading or mapping (`PROT_EXEC`) the library file stops the loader from
+loading it. glibc's loader prints `ERROR: ld.so: object '<path>' from LD_PRELOAD cannot be
+preloaded ...: ignored.` to stderr and runs the program without the library: no rule
+applies and no status file is written. Treat a missing `/tmp/.chaos-<lib>.status` after a
+start with a rule file present as "library not loaded".
 
 ---
 
 ## 4. seccomp Interaction
 
-`seccomp` (Secure Computing Mode) filters syscalls using a BPF program. Strict
-`seccomp` filters (e.g., Docker's default `seccomp` profile) block unusual
-syscalls while allowing common ones.
+A seccomp filter applies to the real system calls a process makes. The libraries add a few
+system calls of their own; an injected ERRNO makes none.
 
 ### 4.1 Syscalls Used by the Libraries
 
-The chaos libraries use the following syscalls beyond what the target application
-uses:
+| System call (as issued on Linux) | Purpose | Path |
+|---|---|---|
+| `newfstatat` or `statx` (via libc `stat`), `fstat` | rule-file change check, read consistency check | at most once per ms per library, plus every reload |
+| `openat`, `read`, `close` | rule-file read | raw system calls (net, dns, time, memory, process); the real `open`/`read`/`close` (io) |
+| `openat`, `read`, `close` | `/dev/urandom` seed | once per library, raw system calls |
+| `openat`, `write`, `fchmod`, `linkat`, `renameat` (`renameat2` on arm64), `unlinkat`, `faccessat` | status and hits files | raw system calls; failures ignored |
+| `clock_nanosleep` | LATENCY | raw system call, restarted on `EINTR` |
+| `gettid` | lazy per-thread PRNG seed | raw system call, first draw per thread |
+| `readlink` or `readlinkat` (via libc `readlink`) | fd → path (`libchaos-io`) | fd-cache miss |
+| `mmap`, `munmap` | fd-cache table (`libchaos-io`) | raw system calls, once per process |
 
-| Syscall         | Used by                           | Blocked by default seccomp? |
-|-----------------|-----------------------------------|-----------------------------|
-| `statx`/`stat`  | Config mtime check (all libs)     | No — in default allowlist   |
-| `openat`        | Config file read (all libs)       | No                          |
-| `read`          | Config file read (all libs)       | No                          |
-| `nanosleep`     | LATENCY effect (all libs)         | No                          |
-| `SYS_gettid`    | TLS PRNG seed (all libs, Linux)   | No                          |
-| `getrandom`     | Process seed at startup           | In Docker default profile   |
-| `open`          | Config, `/dev/urandom` (legacy)   | Deprecated in favor of openat|
+Clock reads for the change-check throttle and the hits schedule go through the vDSO and make
+no system call where the vDSO provides `clock_gettime`. The Docker runtime suites run the
+libraries under Docker's default seccomp profile (none of them relaxes it).
 
-If `getrandom(2)` is blocked by seccomp, the library falls back to seed
-derivation from `getpid()` and `time(NULL)` — less entropy, but functional.
+### 4.2 Failure behaviour under a restrictive filter
 
-### 4.2 Detecting seccomp Filtering
+A filter that denies one of these calls (`SECCOMP_RET_ERRNO`) degrades, never aborts:
 
-If a syscall is blocked by `seccomp`, it returns `EPERM` or `ENOSYS` (depending
-on the `SECCOMP_RET_ERRNO` filter action). The library treats any failure to open
-`/dev/urandom` or `getrandom` at startup as a seed-quality degradation, not a
-fatal error.
+| Denied | Effect |
+|---|---|
+| `/dev/urandom` open/read | seed falls back to `0x6a09e667f3bcc909 ^ getpid()`: per-process, but predictable |
+| `stat` | rule file treated as missing: no rules |
+| rule-file `open`/`read` | `EACCES`/`EPERM`: `reason=file unreadable`, no rules; other errors: active rules kept, retried at the next look |
+| status/hits writes | no report; injection unaffected |
+| `clock_nanosleep` | LATENCY returns at once instead of sleeping |
+| `mmap` (fd cache) | every lookup reads `/proc/self/fd` |
 
 ### 4.3 seccomp and Injected Syscalls
 
-The chaos libraries inject failures at the libc boundary, before the real syscall.
-A synthetic `ERRNO` fires before `real_write()` is called. The seccomp filter
-is in the kernel and only sees real syscalls. Synthetic failures do not reach the
-seccomp layer.
+An injected ERRNO returns before the real function is called, so no system call reaches the
+kernel and the filter sees nothing. A LATENCY or TORN rule still issues the real call (TORN
+with a shorter count), which the filter judges as usual.
+
+SECCOMP mode is the inverse arrangement: `chaos-init` installs a filter with a notification
+listener and decides the faults in the supervisor. It needs Linux 5.5 or later; on an older
+kernel or where the runtime's profile refuses `seccomp`, it reports `state=unsupported` in
+`/tmp/.chaos-init.status` and starts the application without faults.
 
 ---
 
 ## 5. Fail-Open Guarantee
 
-The most important operational safety property:
+The most important operational property:
 
-> **In any error condition, the library falls through to the real libc call.**
-> It never fabricates a synthetic failure for a call that was not intended to
-> be failed.
+> **Any internal error leads to the real call.** The library never fabricates a failure for
+> a call no rule selected.
 
-Conditions that trigger fail-open (passthrough):
+Conditions and outcome:
 
-- Config file absent: all calls pass through.
-- Config file unreadable (EACCES, EIO): all calls pass through.
-- Config file parse error (any invalid line): entire file rejected, all calls
-  pass through. The rejected line is reported in `/tmp/.chaos-<lib>.status`
-  so the failure is visible (see ARCHITECTURE.md, Status file).
-- Config file too large (> `CHAOS_*_MAX_CONFIG_BYTES`): rejected, pass through.
-- Config file holding a NUL byte: rejected, pass through.
-- Selector match ambiguous or unresolvable (e.g., fd-to-path resolution failed):
-  call passes through unchanged.
-- Probability gate not triggered: call passes through.
-- TLS guard set (reentrancy): call passes through immediately.
+| Condition | Outcome |
+|---|---|
+| Rule file absent | no rules; status file removed |
+| Rule file has an invalid line, more than 256 rules, or a rule SECCOMP mode cannot apply | whole file rejected, no rules; status file names the line |
+| Rule file of 256 KiB (262 144 bytes) or more | rejected, no rules, `reason=file too large` |
+| Rule file holds a NUL byte | rejected, no rules, `reason=file contains a NUL byte` |
+| `open` fails with `EACCES`/`EPERM`, or the path is a directory | no rules, `reason=file unreadable`, not retried until the stamp changes |
+| `open`/`read` fails otherwise (`EIO`, `EMFILE`, file vanished), or the file changed while read | **previous rules stay active**; retried at the next look |
+| Another thread is reloading | this call uses the active rules |
+| fd cannot be resolved to a path, or the path is excluded | call passes through |
+| Probability, `@from`/`@until` window, `@size` gate or `@first` budget says no | call passes through |
+| Reentrancy guard set | call passes through at once |
 
-The fail-open guarantee means that removing the config file restores normal
-behaviour within about a millisecond (on the next config mtime check; once
-rules are loaded, each process checks at most every millisecond).
+Removing the rule file restores normal behaviour within about 1 ms: once rules are loaded,
+each library looks at the file at most once per millisecond, and a missing file publishes an
+empty rule set. Every rejection is visible in `/tmp/.chaos-<lib>.status`
+([ARCHITECTURE.md, Status file](ARCHITECTURE.md#status-file)).
 
 ### 5.1 The One Exception: Unresolvable Symbols
 
-Fail-open covers every *operational* error. It does not cover a downstream libc
-symbol that cannot be resolved at all: `chaos_io_resolve_symbol()` calls
-`abort()` when `dlsym(RTLD_NEXT, ...)` reports a symbol missing. There is no
-real function to fall through *to*, and returning a fabricated error would
-violate the "never fabricates a synthetic failure" half of the guarantee.
+Fail-open covers operational errors. It does not cover a real function that does not exist:
+when `dlsym(RTLD_NEXT, ...)` returns NULL with a `dlerror()` set for a required symbol,
+`chaos_<lib>_resolve_symbol()` calls `abort()`. There is nothing to fall through to, and
+returning an invented error would break the guarantee above.
 
-This path is not reachable on any supported platform — all interposed symbols
-are present in both glibc and musl. It is documented because the abort can now
-occur at the first interposed call rather than only at load time, following the
-move to lazy resolution (§ IO.md, "Symbol resolution is lazy").
+Resolution is lazy: the symbol table is filled once, by the constructor or by the first
+wrapper call that happens before it, whichever comes first (IO.md, "Symbol resolution is
+lazy"). The abort therefore happens at load time or at the first interposed call. When
+porting to a libc that lacks an interposed symbol, expect the target to abort, not the load
+to fail.
 
-If you are porting to a libc that lacks one of the interposed symbols, this is
-the first thing that will bite, and it will present as the target process
-aborting rather than as a load failure.
+Symbols older C libraries lack are resolved optionally and do not abort:
 
-`pthread_create` is the deliberate exception. Before glibc 2.34 it lives in
-libpthread, so in a program that never links libpthread it does not exist when
-libchaos-process loads; aborting there killed every such program (`cat`, `sh`)
-before `main()`. libchaos-process therefore resolves it optionally: a missing
-symbol leaves the pointer NULL, the wrapper retries the lookup on each call (the
-program may have loaded libpthread later through `dlopen`), and if it is still
-absent the call returns `EAGAIN`, the error `pthread_create` itself reports when
-a thread cannot be created. A program that can reach the wrapper has libpthread
-loaded, so in practice the lookup succeeds.
+| Library | Optional symbols | Behaviour when absent |
+|---|---|---|
+| `libchaos-io` | `close_range` | `ENOSYS`, as the missing libc function would report |
+| `libchaos-io` | `closefrom` | raw `SYS_close_range`, else `SYS_close` on every fd up to `_SC_OPEN_MAX` |
+| `libchaos-io` | `renameat2` | raw `SYS_renameat2` (`ENOSYS` where the architecture has none) |
+| `libchaos-io` | `__vfprintf_chk`, `__fread_chk`, `__fgets_chk` | the unfortified `vfprintf`, `fread`, `fgets` |
+| `libchaos-process` | `execveat` | raw `SYS_execveat` system call (`ENOSYS` where the architecture has none) |
+| `libchaos-process` | `execvpe`, `fexecve` | `ENOSYS` |
+| `libchaos-process` | `pthread_create` | lookup retried on every call; `EAGAIN` if still absent |
+
+`pthread_create` lives in libpthread before glibc 2.34. In a program that never links
+libpthread (`cat`, `sh`) it does not exist when `libchaos-process` loads, and aborting there
+killed every such program before `main()`. A program that can call `pthread_create` has
+libpthread loaded (possibly later, through `dlopen`), so the retried lookup succeeds in
+practice. `EAGAIN` is the error `pthread_create` itself documents for a thread it cannot
+create. `test_baseline_glibc.sh` checks this on glibc 2.31.
 
 ---
 
 ## 6. Reentrancy Invariant
 
-The reentrancy guard (`__thread int g_chaos_*_tls_guard`) is the mechanism that
-prevents the library from injecting into its own internal calls.
+Each library keeps a per-thread guard (`__thread int g_chaos_<lib>_tls_guard`). While it is
+set, that library's wrappers call the real function without matching a rule.
 
-**Invariant:** For any thread executing inside a chaos library wrapper, the TLS
-guard is set. If that wrapper calls any interposed libc symbol (e.g., the LATENCY
-path calling `nanosleep`, the config-reload path calling `open`/`read`/`stat`),
-those calls bypass all injection logic and go directly to the real libc symbol.
+**Invariant:** a library sets its guard around every libc call it makes on its own behalf
+that it also interposes (the real-function call itself, `stat`, `readlink` on
+`/proc/self/fd`, the `libchaos-io` rule-file read through the real `open`/`read`). Such
+calls never re-enter the library's own rule logic.
 
-**Why this is correct:** The library's own internal I/O to read the config file,
-or its own calls to `nanosleep()` for LATENCY, must not themselves be subject to
-injection. If they were, the library would inject into itself: `open()` of the
-config file would fail (potentially forever), or `nanosleep()` called for LATENCY
-would trigger another LATENCY, causing infinite recursion.
+**Why:** without it the library would inject into itself. A rule on `open` could fail the
+read of its own rule file indefinitely; a wrapper reached from inside a wrapper would
+recurse.
 
-**Corollary:** Calls made by the library internals while the guard is set do
-not count as application calls. They are not subject to rule matching, and they
-do not advance `FAIL_AFTER` counters.
+**Corollary:** calls a library makes while its guard is set are not application calls.
+They match no rule, count no hit and advance no FAIL_AFTER counter.
 
-**Guard restoration:** The guard is restored to its previous value (not
-unconditionally set to 0). This means nested wrapper calls (rare but possible
-during TLS initialisation) are handled correctly. See `docs/MEMORY.md` §14 for
-the full protocol.
+**Cross-library scope:** the guard is per library, so it does not stop a *different*
+library's wrapper. The libraries therefore avoid interposable functions for their own work
+altogether: rule files of net, dns, time, memory and process, all status and hits files,
+injected sleeps and the fd-cache mapping use raw system calls; clocks use the vDSO. No
+library's rules can fault another library's control plane
+(`test/runtime/test_isolation_glibc.sh`).
+
+**Guard restoration:** `chaos_<lib>_enter_internal()` returns the previous value and
+`chaos_<lib>_leave_internal()` restores it (not 0), so nested internal sections unwind
+correctly. See `docs/MEMORY.md` §14 for the protocol.
 
 ---
 
 ## 7. The "Never Preload Into Dev Shell" Footgun
 
-The most common operational error with preload chaos libraries:
+The most common operational error:
 
 ```sh
 export LD_PRELOAD=/path/libchaos-io-glibc-amd64.so
@@ -358,37 +388,34 @@ export LD_PRELOAD=/path/libchaos-io-glibc-amd64.so
 # ... run git, ls, your editor, your CI tool, anything ...
 ```
 
-With `LD_PRELOAD` set in the shell environment, **every dynamically linked
-process spawned by that shell** inherits the preload library. This includes:
+Every dynamically linked process started from that shell inherits the library, and every
+one of them reads the same `/tmp/.chaos-io.conf`. A rule meant for one service then hits:
 
-- `git` — file I/O on `.git/` objects fails → corrupted working tree
-- `ssh` — connection failures → broken terminal sessions
-- `cron` — `fork()`/`exec()` failures → missed jobs
-- `systemd` user units — process lifecycle failures → unit start failures
-- Your test harness runner itself — failures in the runner's own I/O
+- `git`: failed or torn writes under `.git/` corrupt objects and the index;
+- `ssh`, package managers, editors: failed reads and writes, partial files;
+- the test runner itself: failures in its own I/O, reported as test failures;
+- anything spawned later from that shell, long after the test.
 
-**Mitigation pattern:**
-
-Always scope `LD_PRELOAD` to the specific target invocation:
+Scope `LD_PRELOAD` to the target invocation:
 
 ```sh
-LD_PRELOAD=/path/libchaos-io.so TARGET_BINARY [args]
+LD_PRELOAD=/path/libchaos-io-glibc-amd64.so ./target [args]
 ```
 
-Never `export LD_PRELOAD` in a shell session. If you need it for a test suite,
-set it only in the test runner's subprocess environment, not the parent shell.
+Never `export LD_PRELOAD` in an interactive shell. In a test suite, set it only in the
+environment of the subprocess under test.
 
 In Makefiles:
 
 ```makefile
 run-with-chaos:
-    LD_PRELOAD=$(CHAOS_LIB) $(TARGET_BIN)
+	LD_PRELOAD=$(CHAOS_LIB) $(TARGET_BIN)
 ```
 
 Not:
 
 ```makefile
-export LD_PRELOAD = $(CHAOS_LIB)   # WRONG — affects all make recipes
+export LD_PRELOAD = $(CHAOS_LIB)   # WRONG: every recipe, including make's own tools
 ```
 
 ---
@@ -397,227 +424,213 @@ export LD_PRELOAD = $(CHAOS_LIB)   # WRONG — affects all make recipes
 
 ### 8.1 How to Detect a Loaded Preload Library
 
-From outside the process (Linux):
+From outside the process:
 
 ```sh
-# Check process maps
-cat /proc/<pid>/maps | grep "libchaos"
-
-# Check environment
-cat /proc/<pid>/environ | tr '\0' '\n' | grep LD_PRELOAD
-
-# Check loaded DSOs
-cat /proc/<pid>/maps | grep "\.so"
+grep libchaos /proc/<pid>/maps                         # mapped objects
+tr '\0' '\n' < /proc/<pid>/environ | grep LD_PRELOAD   # environment at exec
+ls -l /tmp/.chaos-*.status /tmp/.chaos-*.hits.*       # reports the libraries wrote
 ```
 
-From inside the process (C):
+From inside the process (`_GNU_SOURCE`, link with `-ldl` before glibc 2.34):
 
 ```c
-// Check the link-map
+#define _GNU_SOURCE
+#include <dlfcn.h>
 #include <link.h>
-struct link_map *lm;
-dlinfo(RTLD_SELF, RTLD_DI_LINKMAP, &lm);
-while (lm != NULL) {
-    printf("%s\n", lm->l_name);
-    lm = lm->l_next;
+#include <stdio.h>
+
+int main(void)
+{
+    struct link_map *lm = NULL;
+    void *self = dlopen(NULL, RTLD_NOW);
+
+    if (self == NULL || dlinfo(self, RTLD_DI_LINKMAP, &lm) != 0)
+    {
+        return 1;
+    }
+    for (; lm != NULL; lm = lm->l_next)
+    {
+        printf("%s\n", lm->l_name);
+    }
+    return 0;
 }
 ```
 
 ### 8.2 No Built-In Logging
 
-The chaos libraries emit no logs by default. This is a deliberate design choice:
+The libraries write nothing to stdout or stderr, on purpose:
 
-1. Logging from inside a preload library requires calling `write()`/`fprintf()`,
-   which is interposed by `libchaos-io`. Logging inside `libchaos-io` would
-   trigger the reentrancy guard and log nothing (it would call real `write()`),
-   but it creates a confusing call pattern.
-2. Logging to `stderr` (fd 2) is excluded from injection, but writing large
-   volumes to `stderr` from inside every `write()` call would corrupt application
-   output and degrade performance.
-3. The correct observability signal is the **application's own behaviour**: the
-   error it reports, the latency it measures, the retry it performs. That is
-   exactly what the library is testing.
+1. Output from inside a wrapper would interleave with the application's own output on fds
+   the application owns, and would cost a system call on hot paths.
+2. A `write` from inside `libchaos-io` would need its own reentrancy handling, and from any
+   other library it would pass through `libchaos-io`'s wrapper and its rules.
+
+Observability comes from three files per library instead, all written with raw system calls:
+
+- `/tmp/.chaos-<lib>.status`: the outcome of the last load (rules accepted, or the first
+  rejected line and why);
+- `/tmp/.chaos-<lib>.hits.<n>`: per process, how often each rule fired;
+- the application's own behaviour: the error it reports, the latency it measures, the retry
+  it performs, which is what the test asserts on.
 
 ### 8.3 Indirect Audit Signals
 
-Operators can confirm injection is active by:
+To confirm that injection reaches a target:
 
-- Running with a deliberate `*:ERRNO:ENOENT:1.0` (100% failure rate) and
-  confirming the application receives `ENOENT`.
-- Using `strace` on the target process to observe when the real libc call is
-  not reached: `strace -e trace=write ./target` will show gaps where `write()`
-  never appears (because the injection fired pre-call).
-- Using `perf trace` for the same observation.
+- Load a rule that always fires on a call the target certainly makes
+  (`*:open:ENOENT:1.0` for `libchaos-io`) and check that the hits file counts it.
+- Compare `strace -f -e trace=openat ./target` with and without the rule: an injected ERRNO
+  never reaches the kernel, so the system call is missing from the trace while the
+  application still reports `ENOENT`.
 
 ---
 
 ## 9. Config File Security
 
-The config files (`/tmp/.chaos-*.conf`) are fully trusted by the library. An
-attacker who can write to these files can control the failure patterns applied
-to the target process.
+Rule files are fully trusted. Anyone who can create or replace `/tmp/.chaos-<lib>.conf`
+controls the faults of every process on that machine (or in that mount namespace) that loads
+`libchaos-<lib>`.
 
-**Default location:** `/tmp/.chaos-*.conf`. `/tmp` is world-writable on Linux
-(sticky bit, mode `1777`). Any user on the system can create these files.
+**Default location:** the paths are compiled in under `/tmp`, which is world-writable
+(mode 1777) on Linux. Any local user can create a rule file before the legitimate writer
+does.
 
-The status and hits files are created mode 0666, so that a process of another
-user (an application that dropped root) can still update them; any user can
-also overwrite them with false reports.
+The status and hits files are mode 0666 so that a process of another user (an application
+that dropped root) can still update them; any user can also overwrite them with false
+reports.
 
-**Consequence:** In a multi-tenant environment, any user can:
-1. Create `/tmp/.chaos-io.conf` with `*:write:EIO:1.0`.
-2. Any process running with `LD_PRELOAD=libchaos-io.so` on that machine
-   will immediately fail all writes.
+**Consequence:** on a shared host, any user can write `*:write:EIO:1.0` to
+`/tmp/.chaos-io.conf`, and every process running with `libchaos-io` preloaded fails every
+file write within about 1 ms.
 
 **Mitigations:**
 
-1. **Use a non-world-writable path.** The config path is currently hardcoded.
-   Operators can work around this by mounting a private tmpfs at `/tmp` inside
-   a container (isolates the namespace).
-2. **Container isolation.** Running target processes in separate container
-   namespaces with separate `/tmp` mounts ensures that a malicious host-level
-   user cannot inject config files into the container's `/tmp`.
-3. **Verify file ownership before use** (currently not implemented). A future
-   version could `stat()` the config file and reject it if the file is not
-   owned by the target process's UID or by root.
+1. **Private `/tmp`.** Give each target its own mount namespace with a private `/tmp`
+   (a container, or a tmpfs mounted for the test).
+2. **Container isolation.** A container's `/tmp` is not reachable by host users without
+   access to the container's filesystem.
+3. **No ownership check exists.** The libraries do not verify the rule file's owner; adding
+   one would also reject legitimate cross-user setups (an image that writes rules as root and
+   runs the application as another user).
 
-This is a known design limitation in the current implementation. It is acceptable
-for test/staging environments where the entire machine is controlled by the test
-operator. It is not appropriate for multi-tenant production environments.
+This is a deliberate limitation, acceptable where the test operator controls the whole
+machine or container. The libraries do not belong on multi-tenant production hosts.
 
-**Symbolic links.** The rule file is opened without `O_NOFOLLOW` on purpose: rule
-files mounted through a link (Kubernetes ConfigMap volumes go through `..data`)
-must keep working. A link another user planted in a sticky `/tmp` is not followed
-where `fs.protected_symlinks` is set (the default on current distributions); the
-status and hits files are always created without following links (`O_EXCL`,
-`O_NOFOLLOW`). The rule file is opened `O_CLOEXEC`, so a descriptor of a reload in
-progress does not leak into a program another thread executes.
+**Symbolic links.** The rule file is opened without `O_NOFOLLOW` on purpose: rule files
+mounted through a link (Kubernetes ConfigMap volumes go through `..data`) must keep working.
+A link another user planted in a sticky `/tmp` is not followed where
+`fs.protected_symlinks=1` (the default on current distributions). Status and hits files are
+never written through a link: the staging file is created with
+`O_CREAT | O_EXCL | O_NOFOLLOW` and renamed over the target, and the in-place fallback opens
+the target with `O_NOFOLLOW` and without `O_CREAT` (which `fs.protected_regular` would
+refuse).
 
-**Signal handlers.** An interposed call made in a signal handler can take over a
-due reload. The parsers then use no locale and allocate nothing; the status and
-hits reports are formatted with `snprintf` using `%s`, `%lu` and `%llu` only, and
-written with raw system calls. A handler that interrupts the thread doing the
-reload finds the reload claimed and uses the active rules.
+**Descriptor leaks.** net, dns, time, memory and process open the rule file with
+`O_CLOEXEC`, so the descriptor of a reload in progress does not leak into a program another
+thread executes. `libchaos-io` opens it with plain `O_RDONLY` through the real `open`; a
+concurrent `execve` on another thread can inherit that descriptor for the duration of the
+read.
+
+**Signal handlers.** An interposed call made in a signal handler can take over a due reload.
+Reload and parsing take no lock; probabilities and qualifier numbers are parsed by hand,
+independent of the locale (`strtod` would stop at the `.` of `0.5` under `de_DE`), and the
+parsers call no `malloc`. Status and hits reports are formatted with `snprintf` using only string
+and integer conversions, and written with raw system calls. A handler that
+interrupts the thread holding the reload claim sees `RELOADING` and uses the active rules; one
+that interrupts the hits writer leaves its hit pending for the writer.
 
 ---
 
 ## 10. Interaction with Sanitisers and Debug Runtimes
 
+The libraries are not built with sanitizer instrumentation. A sanitizer therefore sees their
+code as uninstrumented: it checks none of their memory accesses and reports no races inside
+them. What remains is ordering in the link map.
+
 ### 10.1 AddressSanitiser (ASan)
 
-ASan (`-fsanitize=address`) installs its own `LD_PRELOAD`-like interceptors for
-memory allocation and deallocation. ASan intercepts `malloc`, `free`, `mmap`,
-`munmap`, and signal-safe I/O.
+ASan interposes `malloc`, `free`, `mmap`, `munmap` and many libc functions. With libchaos
+in front, a call goes application → libchaos wrapper → `RTLD_NEXT` → ASan interceptor →
+libc. Each layer forwards to the next definition, so both work.
 
-**Interaction with libchaos-memory:** ASan's `mmap` interceptor and
-`libchaos-memory`'s `mmap` wrapper are both PLT-level interposers. Their ordering
-depends on `LD_PRELOAD` load order. If `libchaos-memory` is in front:
-
-1. Application calls `mmap()`.
-2. `libchaos-memory` wrapper fires, checks rules, optionally injects.
-3. `libchaos-memory` calls `real_mmap()` (via RTLD_NEXT).
-4. RTLD_NEXT resolves to ASan's `mmap` interceptor (which is earlier in the
-   link-map than glibc).
-5. ASan's interceptor runs, then calls the real glibc `mmap`.
-
-This chain is correct; double-interposition is handled by RTLD_NEXT walking
-past each layer. The reentrancy guard in `libchaos-memory` prevents re-entry
-from ASan's own internal `mmap` calls (which go directly to the real `mmap`
-via ASan's internal bypass).
+With the dynamic ASan runtime (GCC's default), ASan requires its runtime to come first in the
+initial library list and aborts with "ASan runtime does not come first in initial library
+list" when another preload precedes it. Put `libasan.so` first in `LD_PRELOAD`, or set
+`ASAN_OPTIONS=verify_asan_link_order=0`. ASan's own internal mappings use its own system
+call path and do not reach `libchaos-memory`.
 
 ### 10.2 ThreadSanitiser (TSan)
 
-TSan intercepts `pthread_create`, `pthread_mutex_*`, and memory accesses. If
-`libchaos-process` and TSan are both loaded, `pthread_create()` goes through:
-
-1. `libchaos-process` wrapper.
-2. TSan's `pthread_create` interceptor (via RTLD_NEXT).
-3. Real glibc `pthread_create`.
-
-TSan may report false positives if it observes the `libchaos-process`
-wrapper's internal config access without understanding the TLS guard protocol.
-TSan's suppressions file should suppress races on `g_chaos_process_*` globals
-if they appear.
+TSan interposes `pthread_create`, the `pthread_mutex_*` family and other synchronisation
+functions. With `libchaos-process` loaded, `pthread_create` goes libchaos wrapper → TSan
+interceptor → libc. Because the libchaos objects are uninstrumented, TSan reports no races
+on their globals; their lock-free state (CAS, seqlocks, `__sync` barriers) is invisible to
+it.
 
 ### 10.3 Valgrind
 
-Valgrind instruments code at the machine-instruction level, not at the PLT level.
-All `mmap`, `munmap`, `malloc`, `free` calls are tracked by Valgrind regardless
-of `LD_PRELOAD`. Chaos library injected `munmap` failures that leave mappings
-alive will appear as memory leaks in Valgrind's memcheck tool — this is expected
-and correct (the synthetic failure models the mapping not being freed).
-
-Suppression pattern for Valgrind:
-
-```
-{
-  chaos-munmap-leak
-  Memcheck:Leak
-  fun:mmap
-  ...
-  fun:chaos_memory_munmap
-}
-```
+Valgrind runs the whole client, preloaded objects included, on its synthetic CPU, so
+interposition behaves as without it. Memcheck tracks heap blocks (the `malloc` family), not
+`mmap` regions: an injected `munmap` failure that leaves a mapping in place is not reported
+as a leak, and needs no suppression.
 
 ---
 
 ## 11. Cross-Library Composition Hazards
 
-When multiple chaos libraries are simultaneously loaded via `LD_PRELOAD`, several
-interaction hazards arise.
+All six libraries can be preloaded together. The hazards, and how the code handles each:
 
 ### 11.1 Config Reload Cascades
 
-Each library performs `stat(its_config_path)` on every interposed call. When all
-six libraries are loaded:
-
-- Every `write()` triggers `libchaos-io`'s `stat("/tmp/.chaos-io.conf")`.
-- A LATENCY delay never passes through another library. Each library's TLS
-  guard is its own variable, so it does not stop a *different* library's
-  wrapper: when the delay went through `usleep()` (io, net, dns) or a
-  `dlsym(RTLD_NEXT, "usleep")` pointer (memory, process, reaching
-  `libchaos-time` whenever it comes later in `LD_PRELOAD`), a time rule such as
-  `usleep:ERRNO:EINTR` ended another library's 300 ms delay after 1 ms, and
-  `usleep:LATENCY` lengthened it. Every library now sleeps through
-  `chaos_sleep_ms()` (`src/common/chaos_sleep.h`), a direct `clock_nanosleep`
-  system call that no preloaded library can intercept.
-  `test/runtime/test_isolation_glibc.sh` checks each library's delay under
+- **Change checks multiply.** Each library checks its own rule file, at most once per
+  millisecond per process, with one `stat` each. Six libraries cost at most six `stat`
+  calls per millisecond per process, independent of the call rate.
+- **A LATENCY delay never passes through another library.** Each guard is its own
+  variable, so it does not stop a *different* library's wrapper. When the delay went through
+  `usleep()` (io, net, dns) or a `dlsym(RTLD_NEXT, "usleep")` pointer (memory, process,
+  reaching `libchaos-time` whenever it came later in `LD_PRELOAD`), a time rule such as
+  `usleep:ERRNO:EINTR` ended another library's 300 ms delay after 1 ms, and `usleep:LATENCY`
+  lengthened it. Every library now sleeps through `chaos_sleep_ms()`
+  (`src/common/chaos_sleep.h`), a direct `clock_nanosleep` system call no preloaded library
+  can intercept. `test/runtime/test_isolation_glibc.sh` checks each library's delay under
   hostile time rules in both preload orders.
+- **No library can fault another's rule file.** An io rule on `/tmp` would otherwise fail
+  the other libraries' rule-file reads; they read with raw system calls, and `libchaos-io`
+  excludes every `/tmp/.chaos-*` path from its own rules.
 
 ### 11.2 Simultaneous FAIL_AFTER Counters
 
-`FAIL_AFTER` counters in `libchaos-process` count invocations globally. If both
-`libchaos-process` and `libchaos-net` are loaded and `libchaos-net` internally
-creates sockets (e.g., for epoll fd resolution), those socket-creation calls
-are not `fork()` or `pthread_create()` calls, so they do not advance process
-counters. The counters are per-symbol within each library; there is no cross-library
-counter sharing.
+FAIL_AFTER counters exist only in `libchaos-process`: one counter per operation, shared by
+all threads of a process, incremented atomically. They count only calls that reach a
+`libchaos-process` wrapper with a matching FAIL_AFTER rule; no other library's internal work
+creates processes or threads, so nothing else advances them. They reset when a new rule set is
+published and in a forked child (per process, like `@first`). There is no counter sharing
+between libraries.
 
 ### 11.3 LD_PRELOAD Order and Link-Map
 
-The `LD_PRELOAD` string lists DSOs left-to-right. The dynamic linker adds them
-to the link-map in that order (before the executable's `DT_NEEDED` entries).
+`LD_PRELOAD` lists objects left to right; the loader places them in the global scope in that
+order, after the executable and before its `DT_NEEDED` libraries.
 
-For the ownership invariant: libraries that share a symbol decide for disjoint
-descriptor kinds and forward everything along the chain, so load order does not
-affect which library faults a call. It would matter only if two libraries decided
-for the same descriptor kind (which is the prohibited state).
-
-For `RTLD_NEXT` resolution: each library calls `dlsym(RTLD_NEXT, name)` in its
-constructor. RTLD_NEXT starts from the caller's position in the link-map and
-walks forward. For `libchaos-io`'s `write` wrapper: `RTLD_NEXT("write")` finds
-glibc's `write` (because no other chaos library owns `write`). Correct.
+- **Which library faults a call does not depend on order.** Libraries that export the same
+  name (`read`, `write`, `readv`, `writev`, `close`, `__read_chk`: io and net) decide for
+  disjoint descriptor kinds (files vs sockets) and forward everything else along the chain.
+  Order would matter only if two libraries decided for the same kind, which the
+  ownership rule forbids ([ARCHITECTURE.md](ARCHITECTURE.md#formal-symbol-ownership-theorem)).
+- **Every library sees every call.** Each wrapper forwards with `dlsym(RTLD_NEXT, name)`,
+  resolved once per process (constructor or first call). With `io:net` order, `write` goes
+  application → io → net → libc; with `net:io`, application → net → io → libc.
+  `test_sharing_glibc.sh` checks both orders.
 
 ### 11.4 Constructor Ordering
 
-ELF shared object constructors (`__attribute__((constructor))`) run in
-dependency-resolved order, with `LD_PRELOAD` libraries running before the main
-executable's constructors. The order among `LD_PRELOAD` libraries themselves is
-left-to-right in the `LD_PRELOAD` string.
-
-Each chaos library's constructor resolves its real libc symbols and seeds its
-PRNG. There are no cross-library dependencies in the constructor path. Order
-among chaos constructors does not matter for correctness.
+ELF initialisers run dependencies first. Another object's constructor can therefore call an
+interposed function before a libchaos constructor has run, which is why every wrapper
+resolves the real functions itself (`chaos_<lib>_ensure_symbols()`) instead of relying on
+the constructor. Each libchaos constructor resolves its real functions, seeds its PRNG,
+registers its atfork handler and loads its rule file; none depends on another libchaos
+library, so their relative order does not affect correctness.
 
 ---
 
