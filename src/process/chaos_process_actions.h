@@ -1,25 +1,15 @@
 /**
  * @file chaos_process_actions.h
- * @brief Probability evaluation, latency injection, and error-code dispatch
- *        for the libchaos-process fault-injection subsystem.
+ * @brief Effects of libchaos-process: the probability gate, LATENCY, ERRNO and
+ *        FAIL_AFTER.
  *
  * @details
- * This header declares the action layer — the functions that translate a
- * matched `chaos_process_rule_t` into concrete runtime effects:
- *
- *  - **ERRNO**: sample the probability, and if the shot fires, return the
- *    configured error number to the caller.
- *  - **LATENCY**: sample the probability, and if the shot fires, sleep for
- *    the configured number of milliseconds before returning to the hook.
- *  - **FAIL_AFTER**: increment the per-operation atomic counter and, once the
- *    threshold is crossed, return the configured error number.
- *
- * All probability decisions use the per-thread xorshift64* PRNG maintained
- * in `g_chaos_process_tls_prng_state`.  The PRNG state is not shared across
- * threads, so probability sampling is lock-free.
- *
- * ## Stability
- * Private — not part of the public API.
+ * The wrappers match a rule per effect (chaos_process_config_match()) and hand it here;
+ * these functions decide whether it fires on this call and what it does. A rule fires
+ * only when its `@from`/`@until` window is open, its `@size` gate passes (never, in this
+ * library: no wrapper passes a byte count), its probability draw hits and its `@first`
+ * budget has room (chaos_policy.h); a firing counts one hit. Draws use the calling
+ * thread's xorshift64* PRNG: no lock, no shared state.
  */
 
 #ifndef CHAOS_PROCESS_ACTIONS_H
@@ -28,123 +18,71 @@
 #include "chaos_process_config.h"
 
 /**
- * @brief Determines whether a probability threshold is met given an explicit
- *        PRNG sample.
+ * @brief Whether a draw @p sample hits @p probability: `sample < probability * 2^32`.
  *
- * Maps `probability` onto the range [0, 2^32) and compares against `sample`.
- * A sample value uniformly distributed in [0, 2^32) hits the threshold with
- * probability exactly equal to `probability`.
- *
- * Short-circuits at the extremes:
- *   - `probability <= 0.0`: always returns 0 (never fires).
- *   - `probability >= 1.0`: always returns 1 (always fires).
- *
- * This overload exists for testability: test code can inject a specific
- * sample value rather than relying on the PRNG.
+ * probability <= 0 never hits and >= 1 always hits, without the multiply. Separate
+ * from the draw so unit tests can pass a chosen sample.
  *
  * @param probability Probability in [0.0, 1.0].
- * @param sample      A 32-bit uniform random value to compare against.
- * @return Non-zero if the probability threshold is met; 0 otherwise.
+ * @param sample      Uniform value in [0, 2^32).
+ * @return Non-zero on a hit.
  */
 int chaos_process_probability_hit_sample(double probability, uint32_t sample);
 
 /**
- * @brief Determines whether a probability threshold is met using the
- *        per-thread PRNG.
- *
- * Draws one 32-bit value from `chaos_process_prng_next_u32()` and delegates
- * to `chaos_process_probability_hit_sample()`.  The PRNG is advanced as a
- * side effect; callers must not rely on the state remaining unchanged after
- * this call.
+ * @brief chaos_process_probability_hit_sample() with one draw from the calling thread's
+ *        PRNG (drawn even when @p probability is 0 or 1).
  *
  * @param probability Probability in [0.0, 1.0].
- * @return Non-zero if the probability threshold is met; 0 otherwise.
+ * @return Non-zero on a hit.
  */
 int chaos_process_probability_hit(double probability);
 
 /**
- * @brief Samples the probability of a rule and returns whether it should
- *        trigger on this call.
+ * @brief Whether @p rule fires on this call: window open, size gate passed, probability
+ *        hit, then an `@first` claim; a firing counts one hit.
  *
- * Thin wrapper around `chaos_process_probability_hit(rule->probability)`.
- * Returns 0 if `rule` is NULL.
- *
- * @param rule The rule whose `probability` field is to be sampled.
- * @return Non-zero if the rule should fire on this call; 0 otherwise.
+ * @param rule Rule; NULL returns 0.
+ * @return Non-zero when the rule fires.
  */
 int chaos_process_rule_should_trigger(const chaos_process_rule_t *rule);
 
 /**
- * @brief Applies the LATENCY effect of a rule if the probability fires.
+ * @brief Sleeps `rule->latency_ms` if @p rule is a LATENCY rule that fires.
  *
- * Sleeps for `rule->latency_ms` milliseconds with chaos_sleep_ms() (`src/common/chaos_sleep.h`): a
- * direct clock_nanosleep system call on CLOCK_MONOTONIC, restarted on EINTR, so the full delay
- * always elapses, errno is preserved, and no other preloaded library (libchaos-time in particular)
- * can shorten or lengthen it.
+ * Uses chaos_sleep_ms() (src/common/chaos_sleep.h): a direct clock_nanosleep system call
+ * on CLOCK_MONOTONIC, restarted with the remaining time on EINTR, so the full delay
+ * elapses, errno is preserved and no other preloaded library (libchaos-time) can
+ * shorten or lengthen it. Blocks the calling thread only.
  *
- * This function is a no-op if:
- *   - `rule` is NULL.
- *   - `rule->effect != CHAOS_PROCESS_EFFECT_LATENCY`.
- *   - The probability sampling returns 0.
- *
- * @warning Callers in the `vfork` path must NOT call this function.  The
- *          vfork window (between `vfork()` return in the child and the
- *          child's `exec`/`_exit`) requires strictly async-signal-safe
- *          functions, and no delay may run while the child shares the
- *          parent's address space.
- *          See `chaos_process_hooks.c` for how the `vfork` wrapper handles
- *          this constraint.
- *
- * @param rule The LATENCY rule to apply.
+ * @param rule Rule; NULL, another effect or no firing does nothing.
  */
 void chaos_process_rule_apply_latency(const chaos_process_rule_t *rule);
 
 /**
- * @brief Evaluates an ERRNO rule and, if it fires, returns the error number.
+ * @brief Reports `rule->errnum` if @p rule is an ERRNO rule that fires.
  *
- * Samples the probability and, if the shot fires, writes the rule's `errnum`
- * into `*errnum` and returns non-zero.
- *
- * This function is a no-op (returns 0) if:
- *   - `rule` or `errnum` is NULL.
- *   - `rule->effect != CHAOS_PROCESS_EFFECT_ERRNO`.
- *   - The probability sampling returns 0.
- *
- * @param rule   The ERRNO rule to evaluate.
- * @param errnum Output: set to `rule->errnum` if the rule fires.
- * @return Non-zero if the rule fired and `*errnum` was set; 0 otherwise.
+ * @param rule   Rule; NULL or another effect returns 0.
+ * @param errnum Receives the error; NULL returns 0.
+ * @return Non-zero when the rule fired and *errnum was set.
  */
 int chaos_process_rule_error_number(const chaos_process_rule_t *rule, int *errnum);
 
 /**
- * @brief Evaluates a FAIL_AFTER rule and, once the threshold is crossed,
- *        returns the error number.
+ * @brief Advances the FAIL_AFTER counter of @p operation and reports `rule->errnum`
+ *        once N = rule->fail_after_count calls have gone through.
  *
- * Atomically increments `g_chaos_process_fail_after_counters[operation]`
- * using `__sync_fetch_and_add` (full barrier) and compares the
- * *pre-increment* value against `rule->fail_after_count`:
+ * The counter is incremented first (`__sync_fetch_and_add`) on every call that gets
+ * here, whatever the outcome. The rule fires when the pre-increment value is >= N, the
+ * probability draw hits, the window is open, the size gate passes and an `@first` claim
+ * succeeds. With probability < 1, failures after the threshold are intermittent. Calls
+ * 1..N never fail; N = 0 fails from the first call. See
+ * g_chaos_process_fail_after_counters for sharing and reset.
  *
- *   - If pre-increment < `fail_after_count`: this call is within the allowed
- *     window; returns 0 (do not inject a fault).
- *   - If pre-increment >= `fail_after_count`: the threshold has been crossed;
- *     additionally samples the probability.  If the probability shot also
- *     fires, writes `rule->errnum` into `*errnum` and returns non-zero.
- *
- * Counter semantics:
- *   - Counter starts at 0 (all elements of `g_chaos_process_fail_after_counters`
- *     are zero-initialised and reset to zero on every config reload).
- *   - The first call returns pre-increment value 0.
- *   - With `fail_after_count = N`: calls 1..N succeed (pre-increment 0..N-1),
- *     call N+1 fails (pre-increment N >= N).  With N=0, every call fails.
- *   - Counter is shared across all threads for the operation (intentional:
- *     models system-wide resource exhaustion rather than per-thread limits).
- *   - On uint64_t wraparound (after ~1.8 * 10^19 calls), the counter
- *     restarts at 0, effectively re-arming the FAIL_AFTER trigger.
- *
- * @param rule      The FAIL_AFTER rule to evaluate.
- * @param operation The operation index (determines which counter to use).
- * @param errnum    Output: set to `rule->errnum` if the rule fires.
- * @return Non-zero if the rule fired and `*errnum` was set; 0 otherwise.
+ * @param rule      Rule; NULL or another effect returns 0.
+ * @param operation Counter index; out of range returns 0.
+ * @param errnum    Receives the error; NULL returns 0.
+ * @return Non-zero when the rule fired and *errnum was set.
  */
 int chaos_process_rule_fail_after_error(
     const chaos_process_rule_t *rule, chaos_process_operation_t operation, int *errnum

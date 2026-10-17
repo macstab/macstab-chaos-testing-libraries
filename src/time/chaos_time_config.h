@@ -1,41 +1,55 @@
 /**
  * @file chaos_time_config.h
- * @brief Configuration data model and config-access API for libchaos-time.
+ * @brief Rule model and rule-file API of libchaos-time.
  *
- * Declares the types that represent a parsed chaos rule and the functions that
- * load, reload, parse, and query rules from the config file at
- * CHAOS_TIME_CONFIG_PATH (/tmp/.chaos-time.conf).
+ * @details
+ * ### Rule grammar
  *
- * ### Config file format
- *
- * Each non-blank, non-comment line has the form:
+ * One rule per line of /tmp/.chaos-time.conf; blank lines and `#` comments are ignored:
  * @verbatim
- *   <selector> : <effect> : <value>[@<probability>]
+ *   <selector>:<EFFECT>:<value>[@<probability>] [<qualifier> ...] [# comment]
  * @endverbatim
+ * Fields are split at the first two `:` and trimmed. The probability (default 1) follows
+ * the last `@` of the value field and uses the locale-independent grammar of
+ * chaos_policy_parse_probability(). Qualifiers (`@first=N`, `@from=T`, `@until=T`,
+ * `@size>N`, `@size<N`) are separate words (chaos_policy.h); no time wrapper passes a
+ * byte count, so a rule with `@size` never fires.
  *
- * **Selectors** identify which call sites are affected:
- *  - `*`                        — all intercepted functions
- *  - `clock_gettime`            — all clock_gettime calls regardless of clock
- *  - `clock_gettime/monotonic`  — clock_gettime for CLOCK_MONOTONIC only
- *  - `nanosleep`                — all nanosleep calls
- *  - `usleep`                   — all usleep calls
+ * | Selector                  | Matches                                                |
+ * |---------------------------|--------------------------------------------------------|
+ * | `*`                       | every operation (rank 1)                               |
+ * | `clock_gettime`           | every clock read, any clock (rank 2)                   |
+ * | `clock_gettime/<clock>`   | reads of one clock (rank 3); `realtime`, `monotonic`,  |
+ * |                           | `monotonic_raw`, `realtime_coarse`, `monotonic_coarse`,|
+ * |                           | `boottime`, `tai`, `process_cputime_id`,               |
+ * |                           | `thread_cputime_id` where defined, or a decimal id     |
+ * | `nanosleep`               | nanosleep, clock_nanosleep and sleep (rank 2)          |
+ * | `usleep`                  | usleep (rank 2)                                        |
  *
- * **Effects** and their value syntax:
- *  - `ERRNO EINVAL[@0.5]`    — return -1/errno before the real call
- *  - `LATENCY 250[@0.1]`     — sleep 250 ms before the real call
- *  - `OFFSET -1000[@1.0]`    — shift the returned timespec by -1000 ms
+ * "Clock read" covers clock_gettime, gettimeofday, time and timespec_get(TIME_UTC); the
+ * last three read CLOCK_REALTIME.
  *
- * **OFFSET restriction**: OFFSET is only valid on clock_gettime selectors
- * (not on `*`, `nanosleep`, or `usleep`) because it operates on the
- * struct timespec output parameter, which sleep functions do not produce.
+ * | Effect    | Value                                   | Selectors                  |
+ * |-----------|-----------------------------------------|----------------------------|
+ * | `ERRNO`   | EINVAL, EFAULT, EINTR, EPERM, ENOSYS,   | any                        |
+ * |           | EAGAIN, or a decimal 1..2147483647      |                            |
+ * | `LATENCY` | ms, 0..4294967295, before the call      | any                        |
+ * | `OFFSET`  | signed ms, at most 100 years either way | clock_gettime[/<clock>]    |
+ * | `REGRESS` | ms > 0, at most 100 years               | clock_gettime/<clock> only |
  *
- * ### Live reload
+ * Example: `clock_gettime/monotonic:OFFSET:-5000@0.5 @first=10`.
  *
- * The config file is re-read on every intercepted call that finds the file's
- * mtime hash has changed.  Reload uses a two-snapshot CAS protocol (see
- * chaos_time_config.c) so that readers on other threads always see either the
- * previous complete ruleset or the new complete ruleset — never a partially
- * written one.
+ * Any invalid line rejects the whole file: no rule applies (fail-open) and the status
+ * file names the line.
+ *
+ * ### Reload
+ *
+ * Each process looks at the rule file at most once per CHAOS_CHECK_INTERVAL_NS (1 ms),
+ * timed by the vDSO CLOCK_MONOTONIC (chaos_clock.h); without a vDSO clock it looks on
+ * every call. The first load is never throttled. A look is one stat(); the file is read
+ * only when its change stamp (mtime, size, inode, device) differs, or when the last
+ * load was provisional (an mtime younger than CHAOS_RACY_WINDOW_MS, 20 ms). Readers see
+ * the previous or the new rule set, never a mix (chaos_time_config.c).
  *
  * @module chaos-time
  * @stability Internal.
@@ -50,149 +64,91 @@
 #include "chaos_status.h"
 
 /**
- * @brief Identifies which libc symbol an interceptor invocation came from.
- *
- * Used as a discriminant when matching rules: a rule whose selector names
- * "nanosleep" will only match calls that arrived through the nanosleep wrapper,
- * not through clock_gettime.
+ * @brief Operation a call is matched as; several wrappers share one operation.
  */
 typedef enum chaos_time_operation
 {
-    CHAOS_TIME_OP_INVALID = -1,  /**< Sentinel — never stored in a valid rule. */
-    CHAOS_TIME_OP_CLOCK_GETTIME, /**< Call originated from clock_gettime(2). */
-    CHAOS_TIME_OP_NANOSLEEP,     /**< Call originated from nanosleep(2). */
-    CHAOS_TIME_OP_USLEEP         /**< Call originated from usleep(3). */
+    CHAOS_TIME_OP_INVALID = -1,  /**< Never stored in a valid rule; operation of `*`. */
+    CHAOS_TIME_OP_CLOCK_GETTIME, /**< clock_gettime, gettimeofday, time, timespec_get. */
+    CHAOS_TIME_OP_NANOSLEEP,     /**< nanosleep, clock_nanosleep, sleep. */
+    CHAOS_TIME_OP_USLEEP         /**< usleep. */
 } chaos_time_operation_t;
 
 /**
- * @brief Describes the type of match a selector performs.
- *
- * Determines which fields of chaos_time_selector_t are meaningful and what
- * specificity rank the selector receives during rule selection.
+ * @brief Selector form; also its specificity rank in chaos_time_config_select_rule().
  */
 typedef enum chaos_time_selector_kind
 {
-    CHAOS_TIME_SELECTOR_INVALID = -1, /**< Unparseable or uninitialised selector. */
-    /**
-     * Matches every intercepted function (config text: `*`).
-     * Lowest specificity rank (1); overridden by any operation or clock-ID
-     * selector on the same effect.
-     */
+    CHAOS_TIME_SELECTOR_INVALID = -1, /**< Unparseable; never stored. */
+    /** `*`: every operation; rank 1. */
     CHAOS_TIME_SELECTOR_ANY,
-    /**
-     * Matches all calls to a specific operation regardless of clock_id
-     * (e.g. `clock_gettime`, `nanosleep`, `usleep`).
-     * Medium specificity rank (2).
-     */
+    /** `clock_gettime`, `nanosleep` or `usleep`: one operation, any clock; rank 2. */
     CHAOS_TIME_SELECTOR_OPERATION,
-    /**
-     * Matches a specific operation restricted to a specific POSIX clock ID
-     * (e.g. `clock_gettime/monotonic`).
-     * Highest specificity rank (3).
-     * Only valid for CHAOS_TIME_OP_CLOCK_GETTIME.
-     */
+    /** `clock_gettime/<clock>`: clock reads of one clock id; rank 3. */
     CHAOS_TIME_SELECTOR_CLOCK_ID
 } chaos_time_selector_kind_t;
 
 /**
- * @brief The chaos fault type that a rule injects.
+ * @brief Effect of a rule. Each call resolves at most one rule per effect.
  */
 typedef enum chaos_time_effect
 {
-    CHAOS_TIME_EFFECT_INVALID = -1, /**< Unparseable or uninitialised effect. */
-    /**
-     * Pre-call fault: sets errno and returns -1 without calling the real
-     * function.  Probability-gated.
-     */
+    CHAOS_TIME_EFFECT_INVALID = -1, /**< Unparseable; never stored. */
+    /** Before the call: fail it with errnum without calling the real function. */
     CHAOS_TIME_EFFECT_ERRNO,
-    /**
-     * Pre-call delay: sleeps for a configured number of milliseconds before
-     * calling the real function.  Uses the real sleep implementation to avoid
-     * recursion.  Probability-gated.
-     */
+    /** Before the call: sleep latency_ms through the real usleep/nanosleep. */
     CHAOS_TIME_EFFECT_LATENCY,
     /**
-     * Post-call time shift: applies a signed millisecond delta to the
-     * struct timespec returned by clock_gettime(2).  See chaos_time_rule_t
-     * for the precise semantics and the monotonicity caveat.
-     * Only valid with CHAOS_TIME_SELECTOR_CLOCK_ID or
-     * CHAOS_TIME_SELECTOR_OPERATION on CHAOS_TIME_OP_CLOCK_GETTIME.
-     * Probability-gated.
+     * After a successful clock read: add offset_ms to the returned time, independently on
+     * every read where the rule fires. The kernel clock is untouched. A rule with
+     * probability < 1 makes CLOCK_MONOTONIC jump back and forth between reads; that is
+     * the intended fault.
      */
     CHAOS_TIME_EFFECT_OFFSET,
     /**
-     * The clock goes back once: the first matching read is real, a later read
-     * (where the probability gate fires) jumps back by offset_ms, and from then
-     * on every read stays shifted, so the clock keeps advancing from the earlier
-     * time. Same selectors as OFFSET.
+     * After a successful clock read: step the clock back by offset_ms once. The first
+     * read under the rule is real, the first later read where the rule fires jumps,
+     * and every read after that stays shifted, so the clock advances again from the
+     * earlier time. State lives in the rule's hit slot (chaos_time_rule_apply_regress()).
      */
     CHAOS_TIME_EFFECT_REGRESS
 } chaos_time_effect_t;
 
 /**
- * @brief Parsed representation of a config-file selector token.
+ * @brief Parsed selector.
  *
- * A selector identifies the set of call sites that a rule applies to.  The
- * @c kind field determines which other fields carry meaningful data.
- *
- * @invariant  For CHAOS_TIME_SELECTOR_CLOCK_ID, @c clock_id holds a valid
- *             POSIX clock constant and @c text holds the clock name string
- *             (NUL-terminated, length < CHAOS_TIME_MAX_TEXT).
- * @invariant  For CHAOS_TIME_SELECTOR_ANY, @c operation is
- *             CHAOS_TIME_OP_INVALID and @c clock_id is 0.
- * @invariant  @c selector_len is strlen(original_text_token) at parse time;
- *             used as a tiebreaker during rule selection (longer text = more
- *             specific, though in practice all clock names are distinct).
+ * @invariant  CLOCK_ID: @c operation is CLOCK_GETTIME, @c clock_id the parsed clock and
+ *             @c text the clock as written (NUL-terminated, < CHAOS_TIME_MAX_TEXT bytes).
+ * @invariant  ANY: @c operation is CHAOS_TIME_OP_INVALID and @c clock_id is 0.
  */
 typedef struct chaos_time_selector
 {
-    chaos_time_selector_kind_t kind; /**< Selector type; determines which other fields are valid. */
-    chaos_time_operation_t operation; /**< Intercepted function; INVALID for SELECTOR_ANY. */
-    clockid_t clock_id;  /**< POSIX clock constant; meaningful for SELECTOR_CLOCK_ID only. */
-    size_t selector_len; /**< Length of the original selector text, used as a specificity
-                            tiebreaker. */
-    char text[CHAOS_TIME_MAX_TEXT]; /**< Clock name string for SELECTOR_CLOCK_ID (e.g. "monotonic");
-                                       NUL-terminated. */
+    chaos_time_selector_kind_t kind;  /**< Form; decides which fields below are valid. */
+    chaos_time_operation_t operation; /**< Operation; CHAOS_TIME_OP_INVALID for `*`. */
+    clockid_t clock_id;               /**< Clock id; CLOCK_ID selectors only. */
+    size_t selector_len; /**< strlen of the selector as written; tie-breaker within a rank
+                            (`clock_gettime/monotonic` beats `clock_gettime/1`). */
+    char text[CHAOS_TIME_MAX_TEXT]; /**< Clock as written, e.g. "monotonic"; CLOCK_ID only. */
 } chaos_time_selector_t;
 
 /**
- * @brief A single parsed chaos injection rule.
+ * @brief One parsed rule, as stored in a snapshot and copied out per call.
  *
- * One rule corresponds to one non-blank, non-comment line in the config file.
- * Rules are stored in a fixed-size array inside chaos_time_config_state_t and
- * matched at call time by chaos_time_config_match().
- *
- * ### Effect-specific field semantics
- *
- * - **ERRNO** uses @c errnum and @c probability.
- *   @c latency_ms and @c offset_ms are zero.
- *
- * - **LATENCY** uses @c latency_ms and @c probability.
- *   @c errnum and @c offset_ms are zero.
- *
- * - **OFFSET** uses @c offset_ms and @c probability.
- *   @c errnum and @c latency_ms are zero.
- *   The signed delta is applied after the real clock_gettime returns; it does
- *   **not** modify the kernel clock.  For CLOCK_MONOTONIC this deliberately
- *   breaks the monotonicity guarantee at the ABI boundary — two consecutive
- *   calls that straddle a config reload or are subject to different probability
- *   outcomes may return timestamps that go backwards.  This is intentional: the
- *   purpose is to exercise application code that should tolerate such
- *   conditions.  Thread-safety: the offset is stateless — every call applies
- *   the same delta independently; there is no per-thread accumulation.
+ * Effect fields not used by @c effect are 0: ERRNO uses @c errnum, LATENCY
+ * @c latency_ms, OFFSET and REGRESS @c offset_ms. A wrapper decides on its own copy,
+ * validated against the snapshot sequence, so a concurrent reload cannot tear it.
  *
  * @invariant  @c probability is in [0.0, 1.0].
- * @invariant  @c effect is not CHAOS_TIME_EFFECT_INVALID in a stored rule.
- * @invariant  @c selector.kind is not CHAOS_TIME_SELECTOR_INVALID in a stored rule.
+ * @invariant  @c effect and @c selector.kind are not INVALID in a stored rule.
  */
 typedef struct chaos_time_rule
 {
-    chaos_time_selector_t selector; /**< Identifies the call sites this rule applies to. */
-    chaos_time_effect_t effect;     /**< The fault type to inject. */
-    int errnum;              /**< Errno value to set for EFFECT_ERRNO; 0 for other effects. */
-    double probability;      /**< Injection probability in [0.0, 1.0]; 1.0 = always inject. */
-    unsigned int latency_ms; /**< Pre-call delay in milliseconds for EFFECT_LATENCY; 0 otherwise. */
-    int64_t offset_ms; /**< Signed time shift in milliseconds for EFFECT_OFFSET; 0 otherwise. */
+    chaos_time_selector_t selector; /**< Calls the rule applies to. */
+    chaos_time_effect_t effect;     /**< What it does to them. */
+    int errnum;                     /**< ERRNO: errno to fail with, > 0. */
+    double probability;             /**< Chance per eligible call, [0.0, 1.0]; default 1.0. */
+    unsigned int latency_ms;        /**< LATENCY: delay in ms. */
+    int64_t offset_ms; /**< OFFSET: signed shift in ms; REGRESS: step back in ms, > 0. */
     /** Qualifiers written after the rule (`@first`, `@from`, `@until`, `@size`). */
     chaos_rule_policy_t policy;
     /**
@@ -207,51 +163,43 @@ typedef struct chaos_time_rule
 } chaos_time_rule_t;
 
 /**
- * Initialises the config subsystem to a known clean state.
+ * Resets the rule state: both snapshots empty, hit pool cleared, change stamp unknown.
  *
- * Zeros both config state snapshots, sets the active index to 0, and marks
- * the cached mtime as CHAOS_TIME_MTIME_UNKNOWN so that the very first call to
- * chaos_time_config_prepare() triggers a file reload.
- *
- * Called once from chaos_time_init() during library construction.
- * Not thread-safe; must be called before any wrapper is invoked.
+ * Also records the process id and hits-file number, registers the atfork child handler
+ * (once) and resolves the vDSO clock, so no wrapper does that lookup first inside a
+ * signal handler. Called by the constructor before any rule is loaded; not thread-safe.
  */
 void chaos_time_config_init(void);
 
 /**
- * Checks whether the config file has changed and, if so, reloads it.
+ * Reloads the rule file if it changed; errno is preserved.
  *
- * Implements the two-snapshot CAS reload protocol:
+ * Throttled to one look per CHAOS_CHECK_INTERVAL_NS (1 ms) per process once a first
+ * load has completed and while no reload is in progress; without a vDSO clock every
+ * call looks. A look is one stat(); the file is read and parsed into the
+ * inactive snapshot only when its change stamp differs (or the last load was
+ * provisional), and that snapshot is then published. A caller that finds a reload in
+ * progress on another thread does not wait: it uses the active snapshot. Writes the
+ * status file after each load and the hits file when an interval is overdue.
  *
- *  1. Stat the config file to obtain its current mtime hash.
- *  2. Compare against the cached mtime with an atomic load.
- *  3. If equal, return immediately (no change).
- *  4. Attempt a CAS from the cached value to CHAOS_TIME_MTIME_RELOADING.
- *     If the CAS fails, another thread is already reloading; return the
- *     current active state.
- *  5. Determine the inactive snapshot index (the one not currently pointed to
- *     by g_chaos_time_active_config_index), load and parse the file into it,
- *     then publish it by updating the active index and mtime atomically.
+ * Never blocks except for the file I/O of the thread that owns a reload.
  *
- * @return  Non-zero if at least one rule is currently loaded and the config
- *          parsed without error; zero otherwise.
+ * @return Non-zero when the active snapshot holds at least one rule.
  */
 int chaos_time_config_prepare(void);
 
 /**
- * Queries the active config snapshot for a matching rule without triggering
- * a reload.
+ * Copies the best rule of the active snapshot for one call into @p rule; no reload.
  *
- * Reads the active snapshot index with a full memory barrier, then delegates
- * to chaos_time_config_select_rule().  Intended for internal use when a fresh
- * reload has just been performed by chaos_time_config_prepare().
+ * Lock-free: the copy is validated against the snapshot's sequence afterwards, and a
+ * copy that a concurrent reload may have torn is discarded (0: this call injects
+ * nothing, which is the fail-open choice).
  *
- * @param effect     The fault type to search for.
- * @param operation  The intercepted function the call came from.
- * @param clock_id   The POSIX clock ID; ignored for non-clock_gettime
- *                   operations.
- * @param rule       Output: populated with the matched rule on success.
- * @return           Non-zero if a matching rule was found, zero otherwise.
+ * @param effect     Effect to look for.
+ * @param operation  Operation of the call.
+ * @param clock_id   Clock of a clock read; ignored by non-CLOCK_ID selectors.
+ * @param rule       Receives the rule; may be written even when 0 is returned.
+ * @return           Non-zero when a rule matched and the copy is consistent.
  */
 int chaos_time_config_match_loaded(
     chaos_time_effect_t effect,
@@ -261,20 +209,13 @@ int chaos_time_config_match_loaded(
 );
 
 /**
- * Full-featured rule lookup: reloads config if needed, then searches for a
- * matching rule.
+ * The wrappers' lookup: chaos_time_config_prepare(), then chaos_time_config_match_loaded().
  *
- * This is the primary entry point used by the hook wrappers in
- * chaos_time_hooks.c.  Calls chaos_time_config_prepare() first; if the config
- * is empty or unparseable, returns 0 without populating @p rule.
- *
- * @param effect     The fault type to search for.
- * @param operation  The intercepted function the call came from.
- * @param clock_id   The POSIX clock ID; ignored for non-clock_gettime
- *                   operations.
- * @param rule       Output: populated with the matched rule on success.
- *                   Must not be NULL.
- * @return           Non-zero if a matching rule was found, zero otherwise.
+ * @param effect     Effect to look for.
+ * @param operation  Operation of the call.
+ * @param clock_id   Clock of a clock read; ignored by non-CLOCK_ID selectors.
+ * @param rule       Receives the rule. NULL returns 0.
+ * @return           Non-zero when a rule matched; 0 when none did or no rule is loaded.
  */
 int chaos_time_config_match(
     chaos_time_effect_t effect,
@@ -284,31 +225,31 @@ int chaos_time_config_match(
 );
 
 /**
- * Parses a single config file line into a chaos_time_rule_t.
+ * Parses one rule line whose qualifiers chaos_policy_extract() has already removed.
  *
- * The line is mutated in-place (comment stripped, trimmed, split on ':').
- * Blank and pure-comment lines return 0 (skip); malformed lines return -1
- * (parse error that aborts the whole buffer parse); valid rules return 1.
+ * Edits @p line in place (comment cut, trimmed, split at the first two ':').
  *
- * @param line  Mutable NUL-terminated line buffer.  Modified in-place.
- * @param rule  Output: populated on return value 1.
- * @return      1 on success, 0 on blank/comment line, -1 on parse error.
+ * @param line  Mutable line.
+ * @param rule  Receives the rule; zeroed and filled on 1, partly written on -1.
+ * @return      1 for a rule, 0 for a blank or comment-only line, -1 for an invalid line
+ *              (bad field count, selector, effect, value, probability, or an effect the
+ *              selector does not allow).
  */
 int chaos_time_config_parse_line(char *line, chaos_time_rule_t *rule);
 
 /**
- * Parses a complete NUL-terminated config file buffer into an array of rules.
+ * Parses a whole rule file; any invalid line rejects all of it.
  *
- * Splits @p buffer on newline characters (modifying it in-place) and calls
- * chaos_time_config_parse_line() for each segment.  Stops and returns -1 if
- * any line fails to parse or if the rule count would exceed
- * CHAOS_TIME_MAX_RULES.
+ * Splits @p buffer at '\n' in place, extracts each line's qualifiers, parses the rest
+ * and keeps each accepted line's text for the hits file. Stops at the first invalid
+ * line (or qualifiers on a line without a rule), or at rule CHAOS_TIME_MAX_RULES + 1,
+ * and records that line for chaos_time_config_last_error(). Not thread-safe: only the
+ * reload owner calls it.
  *
- * @param buffer      Mutable NUL-terminated config file content.
- * @param rules       Caller-allocated array of at least CHAOS_TIME_MAX_RULES
- *                    elements.
- * @param rule_count  Output: number of rules written to @p rules.
- * @return            0 on success, -1 on any parse error.
+ * @param buffer      Mutable NUL-terminated file content.
+ * @param rules       Array of CHAOS_TIME_MAX_RULES entries.
+ * @param rule_count  Receives the rule count; 0 on failure.
+ * @return            0 on success, -1 when the file is rejected.
  */
 int chaos_time_config_parse_buffer(char *buffer, chaos_time_rule_t *rules, size_t *rule_count);
 
@@ -321,22 +262,19 @@ int chaos_time_config_parse_buffer(char *buffer, chaos_time_rule_t *rules, size_
 const chaos_status_error_t *chaos_time_config_last_error(void);
 
 /**
- * Selects the best-matching rule from a rule array for a given
- * (effect, operation, clock_id) triple.
+ * Picks the most specific rule for (effect, operation, clock_id) from @p rules.
  *
- * Iterates the entire array and picks the rule with the highest specificity
- * rank (CLOCK_ID > OPERATION > ANY).  If two matching rules share the same
- * rank, the one with the longer selector text string wins (longer text
- * indicates a more specific config line, e.g. "clock_gettime/monotonic" beats
- * "clock_gettime").
+ * Highest rank wins (CLOCK_ID 3 > OPERATION 2 > ANY 1); within a rank the longer
+ * selector text wins (`clock_gettime/monotonic` over `clock_gettime/1`); on a full tie
+ * the earlier line wins. O(rule_count).
  *
- * @param rules       Array of parsed rules.
- * @param rule_count  Number of entries in @p rules.
- * @param effect      The fault type to match.
- * @param operation   The intercepted function to match.
- * @param clock_id    The POSIX clock ID to match (for SELECTOR_CLOCK_ID rules).
- * @param rule        Output: set to the winning rule on success.
- * @return            Non-zero if any matching rule was found, zero otherwise.
+ * @param rules       Rules to search; NULL returns 0.
+ * @param rule_count  Number of rules.
+ * @param effect      Effect to match exactly.
+ * @param operation   Operation of the call.
+ * @param clock_id    Clock of a clock read.
+ * @param rule        Receives the winner; NULL returns 0.
+ * @return            Non-zero when a rule matched.
  */
 int chaos_time_config_select_rule(
     const chaos_time_rule_t *rules,

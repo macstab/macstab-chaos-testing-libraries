@@ -1,39 +1,16 @@
 /**
  * @file chaos_process_actions.c
- * @brief Implementation of probability sampling, latency injection, and
- *        error-code dispatch for the libchaos-process fault-injection subsystem.
+ * @brief Effects of libchaos-process (see chaos_process_actions.h for the contracts).
  *
  * @details
- * This translation unit implements the action layer declared in
- * `chaos_process_actions.h`.  It bridges the parsed rule model (from
- * `chaos_process_config.h`) with the concrete side effects applied by each
- * interposition hook in `chaos_process_hooks.c`.
- *
- * ## Probability model
- *
- * Probability decisions use a fixed-point comparison: `probability` in
- * [0.0, 1.0] is scaled to [0, 2^32) and compared against a uniform 32-bit
- * PRNG sample.  The PRNG is per-thread (no lock required) and advances as a
- * side effect of sampling.
- *
- * ## Latency injection
- *
- * The sleep is chaos_sleep_ms(): a direct clock_nanosleep system call,
- * restarted on EINTR with the remaining time, which no other preloaded library
- * can intercept and which enters no wrapper of this one.
- *
- * ## FAIL_AFTER counter
- *
- * The per-operation counter in `g_chaos_process_fail_after_counters[operation]`
- * is incremented with `__sync_fetch_and_add`, which emits a full memory
- * barrier on all supported architectures.  The returned *pre-increment* value
- * is compared against `rule->fail_after_count` to decide whether to inject
- * a fault.  The probability check is an additional gate applied after the
- * threshold check: even calls beyond the threshold only fail with probability
- * `rule->probability`.
- *
- * ## Stability
- * Private implementation — not part of the public API.
+ * - **Probability:** `probability` is scaled to [0, 2^32] and compared with one draw
+ *   from the calling thread's PRNG.
+ * - **LATENCY:** chaos_sleep_ms(), a direct clock_nanosleep system call restarted on
+ *   EINTR with the remaining time; no other preloaded library can intercept it and it
+ *   enters no wrapper of this one, so no guard is needed.
+ * - **FAIL_AFTER:** the per-operation counter is incremented before anything else is
+ *   decided, so it counts every call that reaches the rule; the threshold, probability
+ *   and qualifiers are checked afterwards.
  */
 
 #include "chaos_process_actions.h"
@@ -43,17 +20,10 @@
 #include <stdint.h>
 
 /**
- * @brief Determines whether a probability threshold is met given an explicit
- *        32-bit PRNG sample.
+ * @copydoc chaos_process_probability_hit_sample
  *
- * Threshold computation: `threshold = probability * 2^32`.  The shot fires
- * iff `(double)sample < threshold`.  Because `sample` is uniformly
- * distributed in [0, 2^32) and `threshold` is in [0, 2^32], this fires with
- * probability exactly equal to `probability` (ignoring double precision
- * rounding, which is < 1 ULP at these magnitudes).
- *
- * Special cases short-circuit before the floating-point multiply to avoid
- * any rounding edge cases at the extremes of the probability range.
+ * Implementation notes: the hit rate is probability rounded to a multiple of 2^-32;
+ * the extremes return before the multiply so 0 and 1 are exact.
  */
 int chaos_process_probability_hit_sample(double probability, uint32_t sample)
 {
@@ -72,21 +42,17 @@ int chaos_process_probability_hit_sample(double probability, uint32_t sample)
     return (double)sample < threshold;
 }
 
-/**
- * @brief Determines whether a probability threshold is met using the
- *        per-thread PRNG.
- *
- * Advances the per-thread PRNG by one step and delegates to
- * `chaos_process_probability_hit_sample()`.
- */
+/** @copydoc chaos_process_probability_hit */
 int chaos_process_probability_hit(double probability)
 {
     return chaos_process_probability_hit_sample(probability, chaos_process_prng_next_u32());
 }
 
 /**
- * @brief Samples the probability of a rule and returns whether it should
- *        trigger on this call.
+ * @copydoc chaos_process_rule_should_trigger
+ *
+ * Implementation notes: the cheap window and size checks come before the draw; the
+ * `@first` claim comes last so a call that loses the draw consumes no budget.
  */
 int chaos_process_rule_should_trigger(const chaos_process_rule_t *rule)
 {
@@ -104,12 +70,9 @@ int chaos_process_rule_should_trigger(const chaos_process_rule_t *rule)
 }
 
 /**
- * @brief Applies the LATENCY effect of a rule if the probability fires.
+ * @copydoc chaos_process_rule_apply_latency
  *
- * @details Sleeps with chaos_sleep_ms(), a direct system call: no other
- * preloaded library (libchaos-time in particular) can shorten or lengthen the
- * delay, and no interposed symbol is entered, so no reentrancy guard is needed.
- * The probability is sampled once; the full delay is either applied or not.
+ * Implementation notes: one decision per call; the full delay is applied or none.
  */
 void chaos_process_rule_apply_latency(const chaos_process_rule_t *rule)
 {
@@ -121,12 +84,7 @@ void chaos_process_rule_apply_latency(const chaos_process_rule_t *rule)
     chaos_sleep_ms((uint64_t)rule->latency_ms);
 }
 
-/**
- * @brief Evaluates an ERRNO rule and, if it fires, returns the error number.
- *
- * Samples the rule's probability; if the shot fires, writes `rule->errnum`
- * into `*errnum` and returns non-zero.  Returns 0 on any no-op path.
- */
+/** @copydoc chaos_process_rule_error_number */
 int chaos_process_rule_error_number(const chaos_process_rule_t *rule, int *errnum)
 {
     if (rule == NULL || errnum == NULL || rule->effect != CHAOS_PROCESS_EFFECT_ERRNO ||
@@ -140,25 +98,11 @@ int chaos_process_rule_error_number(const chaos_process_rule_t *rule, int *errnu
 }
 
 /**
- * @brief Evaluates a FAIL_AFTER rule and, once the threshold is crossed,
- *        returns the error number.
+ * @copydoc chaos_process_rule_fail_after_error
  *
- * Atomically increments `g_chaos_process_fail_after_counters[operation]`
- * using `__sync_fetch_and_add` (full barrier) and captures the
- * *pre-increment* value in `observed`.
- *
- * The fault is injected when both conditions hold:
- *   1. `observed >= rule->fail_after_count` (the N-call grace window has
- *      been exhausted).
- *   2. The per-rule probability sample fires.
- *
- * By incrementing unconditionally before the threshold check, the counter
- * advances on every call — including those where the probability sample
- * fails.  This means probability < 1.0 causes only intermittent failures
- * after the threshold is crossed, but the counter always advances monotonically.
- *
- * Counter overflow (uint64_t wrapping at 2^64) is not guarded; at any
- * realistic call rate wrapping is not achievable in a process lifetime.
+ * Implementation notes: the probability is drawn only past the threshold, and the
+ * window, size gate and `@first` claim are checked after the draw, so calls inside the
+ * first N consume neither draws nor budget. Wraparound at 2^64 is not guarded.
  */
 int chaos_process_rule_fail_after_error(
     const chaos_process_rule_t *rule, chaos_process_operation_t operation, int *errnum

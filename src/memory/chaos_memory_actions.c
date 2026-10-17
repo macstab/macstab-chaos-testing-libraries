@@ -1,50 +1,28 @@
 /**
  * @file chaos_memory_actions.c
- * @brief Implementation of fault-injection actions for libchaos-memory.
+ * @brief The two effects of libchaos-memory (LATENCY, ERRNO) and the decision
+ *        whether a matched rule fires.
  *
  * @details
- * This translation unit implements the two injectable effects (LATENCY and
- * ERRNO) and the shared probability gate that guards both.
+ * A rule fires when, in this order: its `@from`/`@until` window is open, its
+ * `@size` gate passes for the call's length, a draw from the per-thread PRNG falls
+ * below its probability, and chaos_policy_fire() grants an `@first` slot (which
+ * also counts the hit). Only then is the effect applied:
+ *  - LATENCY sleeps latency_ms with chaos_sleep_ms() (a raw clock_nanosleep on
+ *    CLOCK_MONOTONIC, restarted on EINTR, invisible to libchaos-time); the real
+ *    function runs afterwards.
+ *  - ERRNO stores the errno and tells the wrapper to return its failure value
+ *    (MAP_FAILED, -1, or for posix_madvise() the error number) without calling the
+ *    real function.
  *
- * @par LATENCY action
- * chaos_memory_rule_apply_latency() sleeps for rule->latency_ms milliseconds
- * before the intercepted syscall returns, with chaos_sleep_ms(): a direct
- * clock_nanosleep system call restarted on EINTR, which no other preloaded
- * library can intercept.
+ * @par Why there is no CORRUPT/OFFSET effect on mmap()
+ * The only thing to corrupt is the returned address. One that maps nothing turns
+ * the first access into SIGSEGV; one inside another mapping corrupts live data;
+ * writing into the new mapping corrupts application data. None exercises an error
+ * path, so mmap() faults are injected before the call, as ERRNO.
  *
- * @par ERRNO action
- * chaos_memory_rule_apply_errno() sets the calling thread's errno to the
- * configured value and returns 1 to signal that the hook should return the
- * error sentinel.  The calling hook in chaos_memory_hooks.c is responsible for
- * knowing whether the sentinel is MAP_FAILED ((void*)-1) for mmap(2) or -1 for
- * munmap(2)/mprotect(2)/madvise(2).
- *
- * @par Why no CORRUPT or OFFSET effect on mmap
- * mmap(2) returns a pointer to a newly-established virtual memory region.
- * Mutating the pointer after a successful mapping would mean returning a value
- * that either:
- *  a) Does not correspond to any mapping: the first load or store at that
- *     address causes SIGSEGV, which is not a testable error path — it is an
- *     uncatchable crash.
- *  b) Points into an existing mapping (e.g., offset by a known constant):
- *     this corrupts live data or code, causing undefined behaviour in the
- *     application rather than exercising its error handling.
- *  c) Points into the newly-created mapping itself: writing the sentinel
- *     requires touching potentially uninitialized anonymous pages or
- *     overwriting the first bytes of a file-backed mapping, which corrupts
- *     application data.
- * None of these is a useful fault simulation.  Pre-call ERRNO injection is
- * the only safe and semantically meaningful way to test allocator and mmap
- * error paths.
- *
- * @par Thread safety
- * All functions are safe to call concurrently from multiple threads.
- * Probability sampling uses the per-thread TLS PRNG state exclusively; no
- * synchronisation is required.
- *
- * @par Stability
- * Internal — do not depend on the symbols in this file from outside the
- * memory chaos module.
+ * @par Thread and signal safety
+ * Lock-free and allocation-free; the PRNG is thread-local.
  */
 
 #include "chaos_memory_actions.h"
@@ -54,18 +32,11 @@
 #include <stdint.h>
 
 /**
- * @brief Test whether a probability value fires for a given 32-bit PRNG sample.
+ * @brief Bernoulli trial of @p probability with a given 32-bit sample.
  *
- * @details
- * Scales @p probability into the integer range [0, 2^32) by multiplication
- * with 4294967296.0 and compares @p sample against the threshold as a double.
- * IEEE 754 double has 53 significant bits, which is sufficient to represent
- * the threshold for any probability value with at least 5 significant decimal
- * digits without rounding error larger than 1 ULP of the threshold.
- *
- * The fast-path boundary checks for probability <= 0.0 and >= 1.0 ensure
- * correct clamping without relying on double arithmetic edge cases at the
- * extremes.
+ * @details Fires when sample < probability * 2^32 (compared as doubles: the 53-bit
+ * mantissa holds the 32-bit threshold exactly). Probabilities <= 0 and >= 1 are
+ * decided before the arithmetic.
  */
 int chaos_memory_probability_hit_sample(double probability, uint32_t sample)
 {
@@ -84,29 +55,19 @@ int chaos_memory_probability_hit_sample(double probability, uint32_t sample)
     return (double)sample < threshold;
 }
 
-/**
- * @brief Test whether a probability value fires, drawing from the per-thread PRNG.
- *
- * @details
- * Draws a 32-bit value from the per-thread xorshift64* PRNG and passes it to
- * chaos_memory_probability_hit_sample().  The PRNG is lazily seeded on first
- * use by chaos_memory_prng_ensure_seeded(); that seeding path performs no I/O
- * and no heap allocation, so it is safe inside the reentrancy guard.
- */
+/** @brief Bernoulli trial of @p probability with the next value of this thread's PRNG. */
 int chaos_memory_probability_hit(double probability)
 {
     return chaos_memory_probability_hit_sample(probability, chaos_memory_prng_next_u32());
 }
 
 /**
- * @brief Probabilistic trigger gate: returns non-zero if the rule should fire.
+ * @brief Decides whether @p rule fires on this call, and counts the hit if so.
  *
- * @details
- * A NULL rule always returns 0.  Otherwise delegates to
- * chaos_memory_probability_hit(rule->probability).  Separated from the apply
- * functions so that the same gate is used for both LATENCY and ERRNO effects,
- * and so it can be exercised in isolation by unit tests with a deterministic
- * PRNG seed.
+ * @details Checks are ordered cheapest and side-effect-free first: the window and
+ * the size gate consume no PRNG value, so a gated-out call does not shift the
+ * random sequence; chaos_policy_fire() comes last because it claims an `@first`
+ * slot and increments the hit counter.
  */
 int chaos_memory_rule_should_trigger(const chaos_memory_rule_t *rule)
 {
@@ -124,12 +85,11 @@ int chaos_memory_rule_should_trigger(const chaos_memory_rule_t *rule)
 }
 
 /**
- * @brief Applies the LATENCY effect of a rule if the probability fires.
+ * @brief Sleeps latency_ms if @p rule is a LATENCY rule that fires.
  *
- * @details Sleeps with chaos_sleep_ms(), a direct system call: no other
- * preloaded library (libchaos-time in particular) can shorten or lengthen the
- * delay, and no interposed symbol is entered, so no reentrancy guard is needed.
- * The probability is sampled once; the full delay is either applied or not.
+ * @details chaos_sleep_ms() is a raw system call: libchaos-time cannot shorten or
+ * lengthen the delay, and no wrapper is entered, so no reentrancy guard is
+ * needed. One decision per call: the whole delay or none.
  */
 void chaos_memory_rule_apply_latency(const chaos_memory_rule_t *rule)
 {
@@ -142,19 +102,10 @@ void chaos_memory_rule_apply_latency(const chaos_memory_rule_t *rule)
 }
 
 /**
- * @brief Apply an ERRNO rule: set errno and signal short-circuit.
+ * @brief Sets errno to rule->errnum if @p rule is an ERRNO rule that fires.
  *
- * @details
- * Validates preconditions (non-NULL rule, effect == ERRNO, probability fires)
- * and if all pass, writes rule->errnum to the calling thread's errno and
- * returns 1.  The caller in chaos_memory_hooks.c translates this return value
- * into the correct error sentinel for the intercepted syscall:
- *  - mmap(2):    MAP_FAILED ((void*)-1)
- *  - munmap(2):  -1
- *  - mprotect(2): -1
- *  - madvise(2): -1
- *
- * Returns 0 without touching errno if any precondition fails.
+ * @details Returns 1 so the wrapper returns its failure value without calling the
+ * real function; errno is untouched when it returns 0.
  */
 int chaos_memory_rule_apply_errno(const chaos_memory_rule_t *rule)
 {

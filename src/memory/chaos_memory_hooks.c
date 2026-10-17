@@ -1,86 +1,58 @@
 /**
  * @file chaos_memory_hooks.c
- * @brief LD_PRELOAD hook wrappers for mmap(2), munmap(2), mprotect(2), and
- *        madvise(2) in libchaos-memory.
+ * @brief The wrappers of libchaos-memory: mmap(2) (and mmap64 on 64-bit glibc),
+ *        munmap(2), mprotect(2), madvise(2) and posix_madvise(3).
  *
  * @details
- * This translation unit provides the four exported symbols that interpose the
- * corresponding libc functions when the library is preloaded.  Each wrapper
- * follows the same three-phase structure:
+ * Every wrapper runs the same sequence:
+ *  1. chaos_memory_ensure_symbols(): resolve the real functions if no one has.
+ *  2. Reentrancy bypass: inside library code (guard set) call the real function
+ *     without matching rules.
+ *  3. LATENCY pass: match the most specific LATENCY rule; if it fires, sleep.
+ *  4. ERRNO pass: match the most specific ERRNO rule; if it fires, return the
+ *     failure value without calling the real function.
+ *  5. Call the real function under the reentrancy guard.
+ * Matching includes the throttled look at the rule file (at most once per 1 ms;
+ * see chaos_memory_config.c).
  *
- *  1. **Reentrancy bypass**: if the TLS guard is set, forward directly to the
- *     real function with no fault injection.
- *  2. **LATENCY phase**: match a LATENCY rule and sleep if one fires.  The
- *     real syscall is still issued afterwards.
- *  3. **ERRNO phase**: match an ERRNO rule and return the error sentinel if
- *     one fires.  The real syscall is suppressed.
+ * @par Selectors
+ * | Wrapper         | Selectors                                          |
+ * |-----------------|----------------------------------------------------|
+ * | mmap, mmap64    | `mmap`; `mmap/anon` or `mmap/file` by MAP_ANONYMOUS |
+ * | munmap          | `munmap`                                           |
+ * | mprotect        | `mprotect`                                         |
+ * | madvise         | `madvise`                                          |
+ * | posix_madvise   | `madvise`                                          |
+ * `*` matches all of them. Every wrapper passes its length for `@size`.
  *
- * The real-symbol call-through helpers (chaos_memory_call_real_*) set the
- * guard around the call to the resolved function pointer so that any mmap
- * calls triggered by the real syscall's implementation (e.g., the kernel
- * mapping a VDSO page on first use) do not re-enter the injection logic.
+ * @par Failure values
+ * | Function                  | Injected failure                            |
+ * |---------------------------|---------------------------------------------|
+ * | mmap, mmap64              | MAP_FAILED, errno set                       |
+ * | munmap, mprotect, madvise | -1, errno set                               |
+ * | posix_madvise             | the error number returned, errno unchanged  |
  *
- * @par Why reentrancy is especially critical for mmap
- * The mmap hook intercepts one of the lowest-level memory management
- * primitives in the Linux process model.  It can be re-entered from at least
- * four distinct call chains:
+ * @par Why reentrancy matters more here than in other libraries
+ * mmap() is how preloaded allocators get memory, so library code can reach these
+ * wrappers on the same thread:
+ *  - Symbol lookup: dlsym() may allocate, and a preloaded allocator (jemalloc,
+ *    tcmalloc) then calls mmap() while the real pointers are still NULL. The
+ *    call-through helpers detect NULL and issue the system call directly, which is
+ *    what libc's wrapper would do.
+ *  - The look at the rule file and its read run under the guard; anything they
+ *    map passes through uninjected.
+ *  - The real function itself runs under the guard: a further interposer below
+ *    this library that allocates does not re-enter rule matching.
+ * The library allocates nothing itself: buffers are static or on the stack.
  *
- *  1. **Dynamic linker (dlopen)**: RTLD_NEXT resolution in chaos_memory_init()
- *     triggers dlopen-like linker activity.  The linker calls mmap to map
- *     library segments.  Without the guard, this would recurse into the hook
- *     before g_chaos_memory_real_mmap is populated, causing a NULL dereference.
- *
- *  2. **glibc malloc (large allocations)**: any heap allocation larger than
- *     MMAP_THRESHOLD (default 128 KiB) inside the chaos library — including
- *     logging, config parsing if it used dynamic allocation, or any indirect
- *     call through a library that allocates — would call mmap(MAP_ANONYMOUS)
- *     and re-enter the hook.  The implementation avoids all heap allocation
- *     in the hot path for exactly this reason; the guard is the safety net.
- *
- *  3. **TLS block expansion**: the first time a new thread accesses a
- *     `__thread` variable that was not in the initial TLS image, the OS may
- *     map a new TLS block via mmap.  Reading g_chaos_memory_tls_guard itself
- *     is safe because it is part of the initial TLS image (declared in the
- *     library's own .tbss section) and does not require a dynamic mmap.
- *     However, any other `__thread` variable access in a new thread could
- *     trigger this path before the guard is set, which is why setting the
- *     guard is the very first operation in the hook.
- *
- *  4. **Config reload path**: chaos_memory_config_prepare() calls stat(2) and
- *     open()/read() through glibc wrappers.  glibc's file-descriptor table
- *     management may call mmap internally on some code paths.  The reentrancy
- *     guard in chaos_memory_config.c (set before each I/O operation) covers
- *     this; the hook-level guard here is a belt-and-suspenders defence.
- *
- * read(2) and write(2) hooks in other chaos modules face a subset of these
- * hazards (malloc re-entry is possible but the linker and TLS paths are not
- * triggered by those syscalls during normal library initialisation), making
- * the mmap reentrancy problem uniquely acute.
- *
- * @par Error sentinels
- * POSIX specifies different error return values for the four intercepted
- * syscalls:
- *  - mmap(2):    returns MAP_FAILED ((void*)-1) on error; errno is set.
- *  - munmap(2):  returns -1 on error; errno is set.
- *  - mprotect(2): returns -1 on error; errno is set.
- *  - madvise(2): returns -1 on error; errno is set.
- *
- * chaos_memory_rule_apply_errno() sets errno and returns 1 as a signal; the
- * hook then returns the correct sentinel for its syscall.  This separation
- * keeps the action layer unaware of which syscall is being intercepted.
- *
- * @par munmap synthetic failure note
- * When an ERRNO rule fires for munmap(2), the mapping is intentionally left
- * active.  This correctly simulates the kernel returning an error (e.g.,
- * EINVAL for an address not aligned to a page boundary) without corrupting the
- * process address space.  Applications that do not check munmap's return value
- * will leak the mapping; this is an intentional fault-injection outcome to
- * exercise leak detection in the target process.
+ * @par munmap failures
+ * An injected munmap() failure leaves the mapping in place, as a real failure
+ * would. A caller that ignores munmap()'s result leaks the mapping; that is the
+ * fault being tested.
  *
  * @par Stability
- * The exported symbols (mmap, munmap, mprotect, madvise) are part of the
- * library's public interposition interface.  The static call-through helpers
- * are internal.
+ * The exported symbols are the interposition interface; the static helpers are
+ * internal.
  */
 
 #include "chaos_memory_actions.h"
@@ -91,20 +63,20 @@
 #include <unistd.h>
 
 /* =========================================================================
- * Real-symbol call-through helpers
+ * Call-through helpers
  * =========================================================================
- * Each helper sets the TLS reentrancy guard before calling the resolved real
- * function pointer and restores it afterwards.  This ensures that any mmap
- * call triggered inside the real syscall's implementation (e.g., a kernel
- * page fault handler mapping a new page, or a glibc wrapper expanding its
- * internal state) does not re-enter the injection logic.
+ * Each helper calls the real function with the reentrancy guard set, so that
+ * whatever the next definition does that reaches a wrapper of this library again
+ * (an interposer below this one that allocates) passes through uninjected. While
+ * the real pointer is still NULL (a call from inside dlsym()), the helper issues
+ * the system call directly.
  */
 
 /**
  * @brief chaos_memory_config_match() for a call on @p length bytes.
  *
- * @details Records the length in the matched copy so that a rule's `@size>N` /
- * `@size<N` gate is checked when the effect is decided.
+ * @details Stores the length in the matched copy, so the rule's `@size>N` /
+ * `@size<N` gate is checked when the firing is decided.
  */
 static int chaos_memory_match_sized(
     chaos_memory_effect_t effect,
@@ -123,18 +95,13 @@ static int chaos_memory_match_sized(
 }
 
 /**
- * @brief Call the real mmap(2) under the reentrancy guard.
+ * @brief Calls the real mmap(2) with the reentrancy guard set (restored after).
  *
- * @details
- * Sets the TLS guard before the call and restores it afterwards.  The guard
- * is already set when this function is called from the chaos_memory_call_real_mmap
- * path inside the hook (the hook checks chaos_memory_in_internal() first), but
- * the guard is not set when the hook bypasses to this helper directly via the
- * reentrancy bypass branch — in that case this function sets it.
+ * @details Arguments as mmap(2). The SYS_mmap fallback matches libc on the
+ * supported 64-bit targets, where off_t and the system call's offset are both
+ * 64-bit bytes.
  *
- * Calling convention mirrors mmap(2) exactly.
- *
- * @return  The value returned by the real mmap(2), including MAP_FAILED on error.
+ * @return The real result: the mapping, or MAP_FAILED with errno set.
  */
 static void *chaos_memory_call_real_mmap(
     void *address, size_t length, int protection, int flags, int fd, off_t offset
@@ -146,7 +113,8 @@ static void *chaos_memory_call_real_mmap(
     if (g_chaos_memory_real_mmap == NULL)
     {
         /* Not resolved yet: a call from inside the symbol lookup (an allocator
-         * mapping memory for dlsym). The system call does what libc would. */
+         * mapping memory for dlsym()). The system call does what libc's mmap() does;
+         * syscall() returns -1 (== MAP_FAILED) with errno set on failure. */
         return (void *)syscall(SYS_mmap, address, length, protection, flags, fd, offset);
     }
     previous = chaos_memory_enter_internal();
@@ -156,9 +124,10 @@ static void *chaos_memory_call_real_mmap(
 }
 
 /**
- * @brief Call the real mprotect(2) under the reentrancy guard.
+ * @brief Calls the real mprotect(2) with the reentrancy guard set; SYS_mprotect
+ *        while unresolved.
  *
- * @return  0 on success, -1 on error (errno set by the real function).
+ * @return 0 on success; -1 with errno set on failure.
  */
 static int chaos_memory_call_real_mprotect(void *address, size_t length, int protection)
 {
@@ -176,9 +145,10 @@ static int chaos_memory_call_real_mprotect(void *address, size_t length, int pro
 }
 
 /**
- * @brief Call the real munmap(2) under the reentrancy guard.
+ * @brief Calls the real munmap(2) with the reentrancy guard set; SYS_munmap while
+ *        unresolved.
  *
- * @return  0 on success, -1 on error (errno set by the real function).
+ * @return 0 on success; -1 with errno set on failure.
  */
 static int chaos_memory_call_real_munmap(void *address, size_t length)
 {
@@ -196,14 +166,12 @@ static int chaos_memory_call_real_munmap(void *address, size_t length)
 }
 
 /**
- * @brief Call the real madvise(2) under the reentrancy guard.
+ * @brief Calls the real posix_madvise(3) with the reentrancy guard set.
  *
- * @return  0 on success, -1 on error (errno set by the real function).
- */
-/**
- * @brief Calls the real posix_madvise under the reentrancy guard.
+ * @details While unresolved it reproduces glibc and musl: POSIX_MADV_DONTNEED is
+ * a successful no-op, other advice goes to SYS_madvise, and errno is preserved.
  *
- * @return 0 on success; an error number on failure.
+ * @return 0 on success; the error number on failure (errno unchanged).
  */
 static int chaos_memory_call_real_posix_madvise(void *address, size_t length, int advice)
 {
@@ -215,7 +183,7 @@ static int chaos_memory_call_real_posix_madvise(void *address, size_t length, in
         const int saved_errno = errno;
 
         /* POSIX_MADV_DONTNEED is only advice; MADV_DONTNEED, the same number, would
-         * discard the pages. glibc and musl ignore it, so does this. */
+         * discard the pages' contents. glibc and musl ignore it; so does this. */
         if (advice == POSIX_MADV_DONTNEED)
         {
             return 0;
@@ -230,6 +198,12 @@ static int chaos_memory_call_real_posix_madvise(void *address, size_t length, in
     return rc;
 }
 
+/**
+ * @brief Calls the real madvise(2) with the reentrancy guard set; SYS_madvise while
+ *        unresolved.
+ *
+ * @return 0 on success; -1 with errno set on failure.
+ */
 static int chaos_memory_call_real_madvise(void *address, size_t length, int advice)
 {
     int previous;
@@ -246,57 +220,26 @@ static int chaos_memory_call_real_madvise(void *address, size_t length, int advi
 }
 
 /* =========================================================================
- * Exported interposition hooks
+ * Exported wrappers
  * =========================================================================
  */
 
 /**
- * @brief Interposed mmap(2): inject latency and/or errno faults before the
- *        real mapping operation.
+ * @brief mmap(2) wrapper: selectors `mmap`, `mmap/anon`, `mmap/file`, `*`.
  *
- * @details
- * Intercepts every call to mmap(2) in the preloaded process.  The three-phase
- * structure is:
+ * @details A firing LATENCY rule delays the call; a firing ERRNO rule returns
+ * MAP_FAILED with errno set and creates no mapping. `mmap/anon` versus `mmap/file`
+ * is decided by MAP_ANONYMOUS in @p flags; which allocations that reaches is
+ * described at chaos_memory_mmap_is_anonymous(). There is no post-call effect
+ * (see chaos_memory_actions.c). @p length is the size seen by `@size`.
  *
- *  1. **Reentrancy bypass**: if g_chaos_memory_tls_guard is non-zero (the
- *     current thread is already inside the chaos library), forward immediately
- *     to chaos_memory_call_real_mmap() — which sets the guard again (no-op,
- *     it restores the previous value) and calls the real function.
- *
- *  2. **LATENCY**: chaos_memory_config_match() stats and (if stale) reloads
- *     the config file, then selects the best LATENCY rule for this call.  If
- *     found, chaos_memory_rule_apply_latency() draws a PRNG sample; if the
- *     probability fires, it sleeps for rule->latency_ms milliseconds.  The
- *     call proceeds to the real mmap regardless of whether latency was applied.
- *
- *  3. **ERRNO**: similarly selects the best ERRNO rule.  If found and the
- *     probability fires, errno is set to rule->errnum and MAP_FAILED is
- *     returned.  The real mmap is NOT called — the mapping is never created.
- *
- * @par MAP_ANONYMOUS and allocator implications
- * The flags word is passed as-is to both config_match() calls, allowing the
- * selector engine to distinguish mmap/anon (MAP_ANONYMOUS set) from mmap/file
- * (MAP_ANONYMOUS clear) at no extra cost.  Under glibc, ERRNO:ENOMEM on
- * mmap/anon simulates large-allocation pressure (> MMAP_THRESHOLD); small
- * allocations via brk() are unaffected because they do not reach this hook.
- * Under musl, which uses mmap(MAP_ANONYMOUS) for all allocations regardless of
- * size, the same rule causes every malloc() call to fail immediately.
- *
- * @par Why no post-call mutation
- * See the @file docblock for the full rationale.  In summary: mutating the
- * returned pointer after a successful mmap either produces an address with no
- * backing mapping (SIGSEGV on access) or writes into the newly-created mapping
- * (data corruption).  Neither is a useful fault simulation.
- *
- * @param address     Preferred mapping address, or NULL for OS choice.
- * @param length      Length of the mapping in bytes.
+ * @param address     Address hint, or NULL.
+ * @param length      Mapping length, bytes.
  * @param protection  PROT_* flags.
- * @param flags       MAP_* flags; MAP_ANONYMOUS controls mmap/anon selection.
- * @param fd          File descriptor for file-backed mappings; -1 for anonymous.
- * @param offset      Offset into the file for file-backed mappings.
- * @return            Address of the new mapping on success, MAP_FAILED on error.
- *                    errno is set on error (either by fault injection or by the
- *                    real syscall).
+ * @param flags       MAP_* flags.
+ * @param fd          File descriptor; -1 for anonymous mappings.
+ * @param offset      File offset, bytes.
+ * @return The mapping, or MAP_FAILED with errno set (injected or real).
  */
 CHAOS_MEMORY_EXPORT void *
 mmap(void *address, size_t length, int protection, int flags, int fd, off_t offset)
@@ -329,24 +272,15 @@ mmap(void *address, size_t length, int protection, int flags, int fd, off_t offs
 }
 
 /**
- * @brief Interposed munmap(2): inject latency and/or errno faults before the
- *        real unmap operation.
+ * @brief munmap(2) wrapper: selectors `munmap`, `*`.
  *
- * @details
- * Follows the standard three-phase hook structure.  The mmap_flags argument to
- * config_match() is passed as 0 because munmap has no mapping-type flags.
+ * @details A firing ERRNO rule returns -1 and leaves the mapping in place, as a
+ * real failure (e.g. EINVAL for an unaligned address) would; callers that ignore
+ * the result leak it. The injected path does not validate the arguments.
  *
- * @par Synthetic failure semantics
- * When an ERRNO rule fires, -1 is returned without calling the real munmap.
- * The mapping remains active in the process address space.  This is the
- * correct simulation of a kernel-level munmap failure (e.g., EINVAL when the
- * address is not page-aligned) and intentionally exercises leak-detection and
- * error-recovery code paths in the target.
- *
- * @param address  Start of the region to unmap (must be page-aligned for the
- *                 real syscall; the injected error path does not validate this).
- * @param length   Length of the region.
- * @return         0 on success, -1 on error (errno set by injection or real syscall).
+ * @param address  Start of the range.
+ * @param length   Range length, bytes (seen by `@size`).
+ * @return 0 on success; -1 with errno set (injected or real).
  */
 CHAOS_MEMORY_EXPORT int munmap(void *address, size_t length)
 {
@@ -371,7 +305,7 @@ CHAOS_MEMORY_EXPORT int munmap(void *address, size_t length)
         ) &&
         chaos_memory_rule_apply_errno(&errno_rule))
     {
-        /* Synthetic munmap failure intentionally leaves the mapping active. */
+        /* The mapping stays: an injected failure must not change the address space. */
         return -1;
     }
 
@@ -379,19 +313,17 @@ CHAOS_MEMORY_EXPORT int munmap(void *address, size_t length)
 }
 
 /**
- * @brief Interposed mprotect(2): inject latency and/or errno faults before the
- *        real protection-change operation.
+ * @brief mprotect(2) wrapper: selectors `mprotect`, `*`.
  *
- * @details
- * Follows the standard three-phase hook structure.  Common fault modes:
- *  - ERRNO:EACCES — simulates a sealed or execute-protected region.
- *  - ERRNO:EPERM  — simulates seccomp or LSM policy blocking PROT_EXEC.
- *  - LATENCY      — simulates contention on the kernel's mmap_lock.
+ * @details Typical rules: ERRNO:EACCES (protection the mapped file does not allow,
+ * e.g. PROT_WRITE on a shared mapping of a read-only descriptor), ERRNO:EPERM
+ * (PROT_EXEC refused by policy, or a sealed mapping), LATENCY (a slow change, as
+ * under mmap_lock contention). JITs and W^X runtimes call mprotect() on hot paths.
  *
- * @param address     Start of the region (must be page-aligned for real call).
- * @param length      Length of the region.
+ * @param address     Start of the range.
+ * @param length      Range length, bytes (seen by `@size`).
  * @param protection  New PROT_* flags.
- * @return            0 on success, -1 on error (errno set by injection or real syscall).
+ * @return 0 on success; -1 with errno set (injected or real).
  */
 CHAOS_MEMORY_EXPORT int mprotect(void *address, size_t length, int protection)
 {
@@ -423,21 +355,19 @@ CHAOS_MEMORY_EXPORT int mprotect(void *address, size_t length, int protection)
 }
 
 /**
- * @brief Interposed madvise(2): inject latency and/or errno faults before the
- *        real advisory operation.
+ * @brief madvise(2) wrapper: selectors `madvise`, `*`.
  *
- * @details
- * Follows the standard three-phase hook structure.  Common fault modes:
- *  - ERRNO:ENOSYS — simulates a kernel that does not support a given advice
- *    value (e.g., MADV_WIPEONFORK on older kernels).
- *  - ERRNO:EINVAL — simulates an unaligned address or unsupported advice.
- *  - LATENCY      — simulates I/O pressure when MADV_PAGEOUT or MADV_POPULATE_READ
- *    would cause significant kernel work.
+ * @details Typical rules: ERRNO:EINVAL (advice the kernel does not know, which is
+ * how a kernel older than the advice reports it, or an unaligned address),
+ * LATENCY (advice that makes the kernel work, such as MADV_PAGEOUT or
+ * MADV_POPULATE_READ). Preloaded allocators (jemalloc, tcmalloc) call the exported
+ * madvise(MADV_DONTNEED/MADV_FREE) to return memory, so a rule reaches their free()
+ * paths; libc's own allocator uses its internal entry point and is not reached.
  *
- * @param address  Start of the advisory range.
- * @param length   Length of the range.
- * @param advice   MADV_* advice constant.
- * @return         0 on success, -1 on error (errno set by injection or real syscall).
+ * @param address  Start of the range.
+ * @param length   Range length, bytes (seen by `@size`).
+ * @param advice   MADV_* value.
+ * @return 0 on success; -1 with errno set (injected or real).
  */
 CHAOS_MEMORY_EXPORT int madvise(void *address, size_t length, int advice)
 {
@@ -469,13 +399,14 @@ CHAOS_MEMORY_EXPORT int madvise(void *address, size_t length, int advice)
 }
 
 /**
- * @brief Interposed posix_madvise(3): the madvise rules.
+ * @brief posix_madvise(3) wrapper: the `madvise` rules apply.
  *
- * @details glibc and musl implement posix_madvise() with the madvise system call
- * directly, never through madvise(). It reports failure as the returned error
- * number and leaves errno alone.
+ * @details Needed separately because glibc and musl implement posix_madvise() with
+ * the madvise system call, never through madvise(). Following POSIX it returns the
+ * error number and leaves errno alone, so an injected ERRNO is returned and errno
+ * restored to its value before the ERRNO pass.
  *
- * @return 0 on success; an error number on failure.
+ * @return 0 on success; the error number on failure (injected or real).
  */
 CHAOS_MEMORY_EXPORT int posix_madvise(void *address, size_t length, int advice)
 {
@@ -511,9 +442,10 @@ CHAOS_MEMORY_EXPORT int posix_madvise(void *address, size_t length, int advice)
     return chaos_memory_call_real_posix_madvise(address, length, advice);
 }
 
-/* On 64-bit glibc mmap64() is a separate symbol with mmap()'s signature; the JVM,
- * Redis, nginx and MySQL bind to it, and without this alias their mappings would
- * bypass the library. musl has no mmap64, so this is glibc-only. */
+/* On 64-bit glibc mmap64() is a separate symbol with mmap()'s signature (off_t is
+ * already 64-bit); the JVM, Redis, nginx and MySQL bind to it, and without this
+ * alias their mappings would bypass the library. Current musl exports no mmap64,
+ * so the alias is glibc-only. */
 #if defined(__GLIBC__) && defined(__LP64__)
 CHAOS_MEMORY_EXPORT void *
 mmap64(void *address, size_t length, int protection, int flags, int fd, off_t offset)

@@ -1,43 +1,53 @@
 /**
  * @file chaos_process_config.h
- * @brief Rule model, config lifecycle, and rule-matching API for the
- *        libchaos-process fault-injection subsystem.
+ * @brief Rule model and rule-file API of libchaos-process.
  *
  * @details
- * This header defines the data model used to represent chaos rules and
- * exposes the functions that load, parse, and query those rules at runtime.
+ * ### Rule grammar
  *
- * ## Rule file format
+ * One rule per line of /tmp/.chaos-process.conf; blank lines and `#` comments are
+ * ignored:
+ * @code
+ *   <selector>:<EFFECT>:<value>[@<probability>] [<qualifier> ...] [# comment]
+ * @endcode
+ * Fields are split at the first two `:` and trimmed. The probability (default 1)
+ * follows the last `@` of the value field and uses the locale-independent grammar of
+ * chaos_policy_parse_probability(). Qualifiers (`@first=N`, `@from=T`, `@until=T`,
+ * `@size>N`, `@size<N`) are separate words (chaos_policy.h); no wrapper of this library
+ * passes a byte count (call_size is always CHAOS_POLICY_NO_SIZE), so a rule with
+ * `@size` never fires.
  *
- * Rules are read from `CHAOS_PROCESS_CONFIG_PATH` (`/tmp/.chaos-process.conf`
- * by default) on demand.  Each non-blank, non-comment line has the form:
+ * Selectors: `*` (rank 1) or one operation (rank 2): `pthread_create`, `fork`,
+ * `posix_spawn`, `posix_spawnp`, `execve`, `execveat`, `waitpid`. Wrappers without a
+ * selector of their own use another operation's rules (chaos_process_hooks.c).
+ *
+ * | Effect       | Value                       | Behaviour                                |
+ * |--------------|-----------------------------|------------------------------------------|
+ * | `ERRNO`      | errno name or 1..2147483647 | fail the call without calling libc       |
+ * | `LATENCY`    | ms, 0..4294967295           | sleep before the call (chaos_sleep_ms()) |
+ * | `FAIL_AFTER` | `<errno>,<N>`               | let N calls through, then fail           |
+ *
+ * Errno names: EAGAIN, ENOMEM, EACCES, ENOENT, EINTR, ECHILD, EPERM, ESRCH, EBUSY,
+ * EINVAL, ENOSYS, EMFILE, ENFILE, E2BIG.
  *
  * @code
- *   <selector> : <effect> : <value>[@<probability>]
+ *   *:ERRNO:EAGAIN@0.1                 # 10 % of every wrapped call fails with EAGAIN
+ *   fork:LATENCY:50                    # every fork waits 50 ms first
+ *   pthread_create:FAIL_AFTER:ENOMEM,100 @first=5
  * @endcode
  *
- * Examples:
- * @code
- *   *            : ERRNO    : EAGAIN@0.1      # 10% chance on any operation
- *   fork         : LATENCY  : 50             # delay fork by 50 ms, always
- *   pthread_create : FAIL_AFTER : ENOMEM,100 # fail after 100 calls
- * @endcode
+ * Any invalid line rejects the whole file: no rule applies (fail-open) and the status
+ * file names the line.
  *
- * ## Hot reload
+ * ### Reload
  *
- * The config file is stat(2)-checked on every call to
- * `chaos_process_config_match()`.  If the mtime hash has changed since the
- * last load, a single thread wins a compare-and-swap on
- * `g_chaos_process_cached_mtime` and performs the reload; competing threads
- * fall through to the currently active config.  The active slot is one of two
- * ping-pong states (`g_chaos_process_config_states[0/1]`) published with a
- * full barrier so readers always see a consistent view.
- *
- * Reloading resets all `g_chaos_process_fail_after_counters[]` to zero,
- * effectively re-arming any FAIL_AFTER rules.
- *
- * ## Stability
- * Private — not part of the public API.
+ * Each process looks at the rule file at most once per CHAOS_CHECK_INTERVAL_NS (1 ms),
+ * timed by the vDSO CLOCK_MONOTONIC (chaos_clock.h); without a vDSO clock it looks on
+ * every call. The first load and a call during a reload are never throttled. A look is
+ * one stat(); the file is read only when its change stamp (mtime, size, inode, device)
+ * differs, or when the last load was provisional (an mtime younger than
+ * CHAOS_RACY_WINDOW_MS, 20 ms). Readers see the previous or the new rule set, never a
+ * mix. Every published load resets the FAIL_AFTER counters.
  */
 
 #ifndef CHAOS_PROCESS_CONFIG_H
@@ -49,178 +59,110 @@
 #include "chaos_status.h"
 
 /**
- * @brief Enumeration of all interposed operations.
+ * @brief Operation a call is matched as; also the index into
+ *        g_chaos_process_fail_after_counters[].
  *
- * Values are contiguous starting at 0 so they can be used directly as array
- * indices into `g_chaos_process_fail_after_counters[]`.
- *
- * CHAOS_PROCESS_OP_INVALID (-1) is a sentinel for "not set" — it is never
- * stored in a valid rule and never used as an array index.
- *
- * CHAOS_PROCESS_OP_COUNT is the array size sentinel; it must remain the last
- * named enumerator.
+ * Contiguous from 0; CHAOS_PROCESS_OP_COUNT must stay last.
  */
 typedef enum chaos_process_operation
 {
-    CHAOS_PROCESS_OP_INVALID = -1,   /**< Sentinel: invalid / not set. */
-    CHAOS_PROCESS_OP_PTHREAD_CREATE, /**< pthread_create(3) — index 0. */
-    CHAOS_PROCESS_OP_FORK,           /**< fork(2) — index 1. */
-    CHAOS_PROCESS_OP_POSIX_SPAWN,    /**< posix_spawn(3) — index 2. */
-    CHAOS_PROCESS_OP_POSIX_SPAWNP,   /**< posix_spawnp(3) — index 3. */
-    CHAOS_PROCESS_OP_EXECVE,         /**< execve(2) — index 4. */
-    CHAOS_PROCESS_OP_EXECVEAT,       /**< execveat(2) — index 5 (Linux only). */
-    CHAOS_PROCESS_OP_WAITPID,        /**< waitpid(2) — index 6. */
-    CHAOS_PROCESS_OP_COUNT           /**< Total number of operations; array size. */
+    CHAOS_PROCESS_OP_INVALID = -1,   /**< Never stored in a valid rule; operation of `*`. */
+    CHAOS_PROCESS_OP_PTHREAD_CREATE, /**< pthread_create. */
+    CHAOS_PROCESS_OP_FORK,           /**< fork. */
+    CHAOS_PROCESS_OP_POSIX_SPAWN,    /**< posix_spawn, system, popen. */
+    CHAOS_PROCESS_OP_POSIX_SPAWNP,   /**< posix_spawnp. */
+    CHAOS_PROCESS_OP_EXECVE,         /**< execve, execv, execvp, execvpe, execl, execlp, execle. */
+    CHAOS_PROCESS_OP_EXECVEAT,       /**< execveat, fexecve (Linux only). */
+    CHAOS_PROCESS_OP_WAITPID,        /**< waitpid, wait, wait3, wait4, waitid. */
+    CHAOS_PROCESS_OP_COUNT           /**< Number of operations. */
 } chaos_process_operation_t;
 
 /**
- * @brief How a rule targets operations.
- *
- * A selector is either a wildcard that matches every operation, or a
- * specific-operation match.  During rule selection the specific-operation
- * match wins over the wildcard (higher rank = 2 vs rank = 1).
+ * @brief Selector form; also its rank in chaos_process_config_select_rule().
  */
 typedef enum chaos_process_selector_kind
 {
-    CHAOS_PROCESS_SELECTOR_INVALID = -1, /**< Sentinel: invalid / parse error. */
-    CHAOS_PROCESS_SELECTOR_ANY,          /**< Wildcard `*` — matches any operation. */
-    CHAOS_PROCESS_SELECTOR_OPERATION     /**< Exact operation name match. */
+    CHAOS_PROCESS_SELECTOR_INVALID = -1, /**< Unparseable; never stored. */
+    CHAOS_PROCESS_SELECTOR_ANY,          /**< `*`: every operation; rank 1. */
+    CHAOS_PROCESS_SELECTOR_OPERATION     /**< One operation by name; rank 2. */
 } chaos_process_selector_kind_t;
 
 /**
- * @brief The class of chaos effect a rule applies.
- *
- * CHAOS_PROCESS_EFFECT_INVALID is a sentinel for "not set".
+ * @brief Effect of a rule. A call applies at most one rule per effect, in the order
+ *        LATENCY, ERRNO, FAIL_AFTER.
  */
 typedef enum chaos_process_effect
 {
-    CHAOS_PROCESS_EFFECT_INVALID = -1,  /**< Sentinel: invalid / parse error. */
-    CHAOS_PROCESS_EFFECT_ERRNO = 0,     /**< Inject an immediate errno failure. */
-    CHAOS_PROCESS_EFFECT_LATENCY = 1,   /**< Insert an artificial delay (ms). */
-    CHAOS_PROCESS_EFFECT_FAIL_AFTER = 2 /**< Fail after N successful calls. */
+    CHAOS_PROCESS_EFFECT_INVALID = -1,  /**< Unparseable; never stored. */
+    CHAOS_PROCESS_EFFECT_ERRNO = 0,     /**< Fail the call without calling libc. */
+    CHAOS_PROCESS_EFFECT_LATENCY = 1,   /**< Sleep latency_ms before the call. */
+    CHAOS_PROCESS_EFFECT_FAIL_AFTER = 2 /**< Let N calls through, then fail. */
 } chaos_process_effect_t;
 
 /**
- * @brief Parsed representation of the selector portion of a rule line.
- *
- * Thread safety: read-only after parsing; no locking required.
+ * @brief Parsed selector.
  */
 typedef struct chaos_process_selector
 {
-    /**
-     * Whether this selector is a wildcard (`ANY`) or a specific operation
-     * (`OPERATION`).  Drives the match rank during rule selection.
-     */
+    /** Form; decides the rank. */
     chaos_process_selector_kind_t kind;
 
-    /**
-     * The specific operation this selector targets.  Only meaningful when
-     * `kind == CHAOS_PROCESS_SELECTOR_OPERATION`; set to
-     * `CHAOS_PROCESS_OP_INVALID` for wildcard selectors.
-     */
+    /** Operation; CHAOS_PROCESS_OP_INVALID for `*`. */
     chaos_process_operation_t operation;
 
     /**
-     * Byte length of the selector text as it appeared in the config file.
-     * Used as a tiebreaker when two rules have the same rank: the longer
-     * (more-specific) selector wins.  For current selectors this is always
-     * the length of the operation name string.
+     * strlen of the selector as written; tie-breaker within a rank. In this grammar it
+     * never differs within a rank, so on equal rank the earlier line wins.
      */
     size_t selector_len;
 } chaos_process_selector_t;
 
 /**
- * @brief A fully parsed chaos rule ready for effect evaluation.
+ * @brief One parsed rule, as stored in a snapshot and copied out per call.
  *
- * A rule is immutable once parsed.  The active rule set is owned by one of
- * the two ping-pong `chaos_process_config_state_t` slots and replaced
- * atomically on config reload.
- *
- * Thread safety: read-only after publishing; no locking required for reads.
+ * A wrapper decides on its own copy, validated against the snapshot sequence, so a
+ * concurrent reload cannot tear it.
  */
 typedef struct chaos_process_rule
 {
-    /**
-     * The selector that determines which operations this rule applies to.
-     */
+    /** Calls the rule applies to. */
     chaos_process_selector_t selector;
 
-    /**
-     * The type of fault this rule injects.  Determines which fields below
-     * are meaningful.
-     */
+    /** What it does to them; decides which fields below are used. */
     chaos_process_effect_t effect;
 
     /**
-     * Errno value to inject on ERRNO or FAIL_AFTER effects.
-     * For `pthread_create`, this value is returned directly (not via errno),
-     * matching the POSIX specification that `pthread_create` returns the
-     * error number rather than setting `errno` and returning -1.
-     * For all other interposed functions the wrapper sets `errno = errnum`
-     * and returns -1.
-     * Common values:
-     *   - EAGAIN: thread/process limit exceeded
-     *   - ENOMEM: stack or address-space allocation failure
-     *   - ECHILD: no child process (waitpid)
-     *   - EINTR:  interrupted by signal (waitpid)
+     * ERRNO and FAIL_AFTER: the error to report, > 0. pthread_create and
+     * posix_spawn(p) return it; every other wrapper sets errno to it and returns -1
+     * (NULL for popen).
      */
     int errnum;
 
     /**
-     * Probability in [0.0, 1.0] that the effect fires on any given call.
-     * 0.0 means the effect never fires; 1.0 means it always fires.
-     * Evaluated against a per-thread PRNG sample.
-     * Parsed from the `@<probability>` suffix of the value field; defaults
-     * to 1.0 if no `@` suffix is present.
+     * Chance per eligible call, [0.0, 1.0], from the `@<probability>` suffix; default
+     * 1.0. Drawn from the calling thread's PRNG.
      */
     double probability;
 
     /**
-     * Latency to inject in milliseconds (LATENCY effect only).
-     * Applied before calling the real function, with chaos_sleep_ms().
+     * LATENCY: delay in ms, slept with chaos_sleep_ms() before the real call.
      *
-     * @warning For the `fork` wrapper, latency is applied in the *parent*
-     *          before the real `fork()` call.  The child inherits the
-     *          post-fork state and does not experience the delay.
-     *
-     * @warning For the `vfork` wrapper (if implemented): calling `usleep`
-     *          or `nanosleep` in the vfork window (between `vfork()` return
-     *          and the child's `exec`/`_exit`) violates the POSIX
-     *          async-signal-safe constraint for vfork.  See
-     *          `chaos_process_hooks.c` for how this is handled.
-     *
-     * @warning For `execve`/`execveat`: latency is applied before the exec
-     *          syscall.  If the exec succeeds, the process image is replaced
-     *          and the library is no longer loaded; no cleanup of library
-     *          state occurs.  The delay is real and observable (e.g. by the
-     *          parent monitoring the child's startup time).
-     *
-     * @warning For `waitpid`: latency is applied before the real `waitpid`
-     *          call, so the total observed delay is `latency_ms` plus the
-     *          time `waitpid` itself blocks.  This may confuse caller-side
-     *          timeout logic that expects `waitpid` to return promptly.
+     * - fork: the parent sleeps before forking; the child sees no delay.
+     * - execve/execveat: the sleep happens before the exec; a successful exec then
+     *   discards all library state, including hits not yet written to the hits file.
+     * - waitpid family: the caller waits latency_ms plus however long the real call
+     *   blocks, even with WNOHANG.
      */
     unsigned int latency_ms;
 
     /**
-     * Invocation threshold for FAIL_AFTER effect.
+     * FAIL_AFTER: number N of calls let through before failures start.
      *
-     * The interposed function is allowed to succeed for the first
-     * `fail_after_count` calls (when the pre-increment counter value is
-     * < `fail_after_count`) and fails on all subsequent calls.
-     *
-     * The counter used is `g_chaos_process_fail_after_counters[operation]`,
-     * incremented atomically with `__sync_fetch_and_add`.  The
-     * pre-increment value is compared against this field:
-     *
-     *   - pre-increment == 0, fail_after_count == 0: fails on the 1st call
-     *   - pre-increment == 0, fail_after_count == 1: succeeds on 1st call,
-     *     fails from the 2nd onwards (pre-increment == 1 >= 1)
-     *
-     * The counter is shared across all threads (intentional — models a
-     * realistic system-wide resource exhaustion scenario).
-     *
-     * The counter is reset to 0 on every config reload.
+     * g_chaos_process_fail_after_counters[operation] counts up once per call that
+     * reaches this rule; a call whose pre-increment value is >= N fails (subject to
+     * probability and qualifiers). N = 0 fails from the first call. The counter is
+     * per operation and process-wide (all threads), and is reset on every published
+     * load and in a forked child.
      */
     uint64_t fail_after_count;
     /** Qualifiers written after the rule (`@first`, `@from`, `@until`, `@size`). */
@@ -237,97 +179,88 @@ typedef struct chaos_process_rule
 } chaos_process_rule_t;
 
 /**
- * @brief Initialises the config subsystem to a clean state.
+ * @brief Resets the rule state: both snapshots empty, hit pool and FAIL_AFTER counters
+ *        cleared, change stamp unknown.
  *
- * Zeroes both ping-pong config states, resets the active index to 0,
- * sets `g_chaos_process_cached_mtime` to `CHAOS_PROCESS_MTIME_UNKNOWN`
- * (forcing a reload on the next call), and resets all FAIL_AFTER counters.
- *
- * Called once from the library constructor `chaos_process_init()`.
- * Must not be called concurrently with any config reader.
+ * Also records the process id and hits-file number, registers the atfork child handler
+ * (once) and resolves the vDSO clock, so no wrapper does that lookup first inside a
+ * signal handler. Called by the constructor before any rule is loaded; not thread-safe.
  */
 void chaos_process_config_init(void);
 
 /**
- * @brief Checks whether the config file has changed and reloads if necessary.
+ * @brief Reloads the rule file if it changed; errno is preserved.
  *
- * Stats the config file, hashes its mtime, and compares against the cached
- * hash.  If different, races to win a CAS on `g_chaos_process_cached_mtime`
- * to become the sole reloader.  The winner reads and parses the file into the
- * inactive ping-pong slot, then publishes the new slot atomically.
+ * Throttled to one look per CHAOS_CHECK_INTERVAL_NS (1 ms) per process once a first
+ * load has completed and while no reload is in progress; without a vDSO clock every
+ * call looks. A look is one stat(); the file is read and parsed into the inactive
+ * snapshot only when its change stamp differs (or the last load was provisional), and
+ * that snapshot is then published. A caller that finds a reload in progress does not
+ * wait: it uses the active snapshot. Writes the status file after each load and the
+ * hits file when a report is overdue.
  *
- * A failed parse leaves the new slot with `parse_ok = 0` and zero rules;
- * the library behaves as if no config exists (passthrough for all calls).
- *
- * @return Non-zero if the active config is valid and has at least one rule;
- *         0 if no rules are active (either no file or a parse error).
+ * @return Non-zero when the active snapshot holds at least one rule.
  */
 int chaos_process_config_prepare(void);
 
 /**
- * @brief Queries the already-loaded (active) config without triggering a
+ * @brief Copies the best rule of the active snapshot for one call into @p rule; no
  *        reload.
  *
- * Selects the best-matching rule for the given effect and operation from the
- * currently active config state.  Useful in hot paths where the reload check
- * has already been performed by a prior call to `chaos_process_config_match`.
+ * Lock-free: the copy is validated against the snapshot's sequence afterwards, and a
+ * copy a concurrent reload may have torn is discarded (0: this call injects nothing).
  *
- * @param effect    The effect type to search for (ERRNO, LATENCY, FAIL_AFTER).
- * @param operation The operation being intercepted.
- * @param rule      Output: populated with the matched rule on success.
- * @return Non-zero if a matching rule was found; 0 if no match.
+ * @param effect    Effect to look for.
+ * @param operation Operation of the call.
+ * @param rule      Receives the rule; may be written even when 0 is returned.
+ * @return Non-zero when a rule matched and the copy is consistent.
  */
 int chaos_process_config_match_loaded(
     chaos_process_effect_t effect, chaos_process_operation_t operation, chaos_process_rule_t *rule
 );
 
 /**
- * @brief Full entry point: reload-if-stale then match.
+ * @brief The wrappers' lookup: chaos_process_config_prepare(), then
+ *        chaos_process_config_match_loaded().
  *
- * Calls `chaos_process_config_prepare()` to ensure the config is current,
- * then calls `chaos_process_config_match_loaded()` to find the best rule.
- *
- * This is the function called by every interposition hook.
- *
- * @param effect    The effect type to search for.
- * @param operation The operation being intercepted.
- * @param rule      Output: populated with the matched rule on success.
- * @return Non-zero if a matching rule was found and the config is valid;
- *         0 if no match, invalid config, or @p rule is NULL.
+ * @param effect    Effect to look for.
+ * @param operation Operation of the call.
+ * @param rule      Receives the rule. NULL returns 0.
+ * @return Non-zero when a rule matched; 0 when none did or no rule is loaded.
  */
 int chaos_process_config_match(
     chaos_process_effect_t effect, chaos_process_operation_t operation, chaos_process_rule_t *rule
 );
 
 /**
- * @brief Parses a single line from the config file into a rule.
+ * @brief Parses one rule line whose qualifiers chaos_policy_extract() has already
+ *        removed.
  *
- * Strips comments (everything from `#` onwards), trims whitespace, and
- * splits the line on `:` separators into selector, effect, and value fields.
- * Returns 0 for blank/comment-only lines, 1 for a successfully parsed rule,
- * and -1 for a malformed line.
+ * Edits @p line in place (comment cut, trimmed, split at the first two ':').
  *
- * @param line  A mutable NUL-terminated string (modified in-place by the
- *              comment stripper and trimmer).
- * @param rule  Output: populated on successful parse (return value == 1).
- * @return  1  Line parsed successfully; @p rule is populated.
- * @return  0  Blank or comment-only line; @p rule is not modified.
- * @return -1  Parse error; rule file should be treated as invalid.
+ * @param line  Mutable line.
+ * @param rule  Receives the rule; zeroed and filled on 1, partly written on -1.
+ * @return  1  A rule.
+ * @return  0  Blank or comment-only line; @p rule untouched.
+ * @return -1  Invalid line (field count, selector, effect, value or probability); the
+ *             whole file is then rejected.
  */
 int chaos_process_config_parse_line(char *line, chaos_process_rule_t *rule);
 
 /**
- * @brief Parses a NUL-terminated buffer of config text into an array of rules.
+ * @brief Parses a whole rule file; any invalid line rejects all of it.
  *
- * Splits @p buffer on newline characters, calls `chaos_process_config_parse_line`
- * on each, and accumulates valid rules into @p rules.  Stops and returns -1 on
- * the first parse error, or if the rule count would exceed
- * `CHAOS_PROCESS_MAX_RULES`.
+ * Splits @p buffer at '\n' in place, extracts each line's qualifiers, parses the rest
+ * and keeps each accepted line's text for the hits file. Stops at the first invalid
+ * line (or qualifiers on a line without a rule), at rule CHAOS_PROCESS_MAX_RULES + 1,
+ * or at a rule CHAOS_PROCESS_RULE_SUPPORTED rejects (chaos-init), and records that line
+ * for chaos_process_config_last_error(). Not thread-safe: only the reload owner calls
+ * it.
  *
- * @param buffer      Mutable NUL-terminated config text (modified in-place).
- * @param rules       Output array of at least `CHAOS_PROCESS_MAX_RULES` elements.
- * @param rule_count  Output: number of rules written to @p rules.
- * @return 0 on success, -1 on parse error or overflow.
+ * @param buffer      Mutable NUL-terminated file content.
+ * @param rules       Array of CHAOS_PROCESS_MAX_RULES entries.
+ * @param rule_count  Receives the rule count; 0 on failure.
+ * @return 0 on success, -1 when the file is rejected.
  */
 int chaos_process_config_parse_buffer(
     char *buffer, chaos_process_rule_t *rules, size_t *rule_count
@@ -342,21 +275,17 @@ int chaos_process_config_parse_buffer(
 const chaos_status_error_t *chaos_process_config_last_error(void);
 
 /**
- * @brief Selects the best-matching rule from an array for a given
- *        effect/operation pair.
+ * @brief Picks the most specific rule for (effect, operation) from @p rules.
  *
- * Iterates over all rules that match the requested effect and tests each
- * selector against `operation`.  Among matching rules the winner is chosen by:
- *  1. Higher selector rank (OPERATION rank=2 beats ANY rank=1).
- *  2. On equal rank: longer selector text (for future extensibility; in the
- *     current grammar this never differs within a rank).
+ * Highest rank wins (OPERATION 2 > ANY 1); within a rank the longer selector text
+ * (never different in this grammar); on a full tie the earlier line. O(rule_count).
  *
- * @param rules       Array of parsed rules.
- * @param rule_count  Number of elements in @p rules.
- * @param effect      Effect type to filter on.
- * @param operation   Operation to match against.
- * @param rule        Output: populated with the winning rule if found.
- * @return Non-zero if a matching rule was found; 0 otherwise.
+ * @param rules       Rules to search; NULL returns 0.
+ * @param rule_count  Number of rules.
+ * @param effect      Effect to match exactly.
+ * @param operation   Operation of the call.
+ * @param rule        Receives the winner, by value; NULL returns 0.
+ * @return Non-zero when a rule matched.
  */
 int chaos_process_config_select_rule(
     const chaos_process_rule_t *rules,

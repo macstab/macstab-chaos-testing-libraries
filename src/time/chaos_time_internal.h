@@ -1,20 +1,21 @@
 /**
  * @file chaos_time_internal.h
- * @brief Internal shared definitions for the libchaos-time subsystem.
+ * @brief Definitions shared by every translation unit of libchaos-time; not part of the ABI.
  *
- * This header is the single point of truth for all definitions that must be
- * visible to every translation unit inside libchaos-time but that form no part
- * of the public ABI.  It exposes:
+ * @details
+ * Contents:
+ *  - Paths of the rule file, status file and hits file, and the parser limits.
+ *  - The change-stamp sentinels that double as the reload state machine.
+ *  - Typedefs and globals for the eight real functions (clock_gettime, nanosleep, usleep,
+ *    gettimeofday, time, sleep, timespec_get, clock_nanosleep), resolved through
+ *    `dlsym(RTLD_NEXT)`.
+ *  - The per-thread reentrancy guard, which makes every wrapper call straight through to
+ *    the real function while the library itself is running.
+ *  - The per-thread xorshift64* PRNG behind the probability gate: no locks, no shared
+ *    cache lines, independent streams per thread and per forked child.
  *
- *  - Compile-time limits and sentinel mtime values used by the config reload
- *    protocol.
- *  - The visibility macro that marks exported interceptor symbols.
- *  - Function-pointer typedefs for the three intercepted syscall wrappers and
- *    the matching extern declarations of the global real-function pointers.
- *  - TLS variables that implement per-thread reentrancy guarding and PRNG
- *    state.
- *  - Inline helpers for the reentrancy guard, lock-free atomic primitives, and
- *    the per-thread xorshift64* PRNG seeded with SplitMix64 mixing.
+ * Everything here is async-signal-safe: TLS reads and writes, `__sync` builtins and one
+ * gettid system call. No function here sets errno.
  *
  * @module chaos-time
  * @stability Internal — not part of the installed public API.
@@ -40,35 +41,33 @@
  * @{
  */
 
-/** Filesystem path of the configuration file polled for live reload. */
+/** Rule file; looked at no more than once per CHAOS_CHECK_INTERVAL_NS (1 ms) per process. */
 #define CHAOS_TIME_CONFIG_PATH "/tmp/.chaos-time.conf"
 
-/** Status file reporting the outcome of the last load (see chaos_status.h). */
+/** Status file: outcome of the last load (see chaos_status.h). */
 #define CHAOS_TIME_STATUS_PATH "/tmp/.chaos-time.status"
 
-/** Hits file of a process, without the `.<pid>` suffix (see chaos_hits.h). */
+/** Hits file prefix; each image appends `.<n>` (see chaos_hits.h). */
 #define CHAOS_TIME_HITS_PREFIX "/tmp/.chaos-time.hits"
 
-/** Maximum number of rules that may be loaded from a single config snapshot. */
+/** Rules per snapshot; one more rejects the whole file (CHAOS_STATUS_REASON_TOO_MANY). */
 #define CHAOS_TIME_MAX_RULES 256U
 
-/** Maximum byte length of a single config line, including the NUL terminator. */
+/** Nominal bytes per line; only used to size CHAOS_TIME_MAX_CONFIG_BYTES. */
 #define CHAOS_TIME_MAX_LINE_LENGTH 1024U
 
 /**
- * Maximum total config file size accepted by the reader.
+ * Rule-file size limit: 256 * 1024 bytes = 256 KiB.
  *
- * Chosen as CHAOS_TIME_MAX_RULES * CHAOS_TIME_MAX_LINE_LENGTH so that a fully
- * populated file fits exactly within the per-thread read buffer.  Files that
- * reach this byte count without reaching EOF are rejected to avoid truncated
- * rule sets.
+ * A file of this size or larger is rejected as a whole (CHAOS_STATUS_REASON_TOO_LARGE):
+ * parsing a truncated prefix would load a rule set nobody wrote.
  */
 #define CHAOS_TIME_MAX_CONFIG_BYTES (CHAOS_TIME_MAX_RULES * CHAOS_TIME_MAX_LINE_LENGTH)
 
-/** Maximum length of a selector text field stored inside chaos_time_selector_t. */
+/** Capacity of chaos_time_selector_t::text including the NUL; a longer clock name is invalid. */
 #define CHAOS_TIME_MAX_TEXT 128U
 
-/** Maximum length of an effect value payload, used for temporary parse buffers. */
+/** Capacity of the value field (before `@probability`) including the NUL. */
 #define CHAOS_TIME_MAX_VALUE 256U
 
 /** @} */
@@ -79,51 +78,47 @@
  */
 
 /**
- * Marks a symbol as having default ELF visibility.
+ * Default ELF visibility for the eight wrappers.
  *
- * Applied to the three interceptor functions (clock_gettime, nanosleep,
- * usleep) so that the dynamic linker finds them before the libc originals when
- * the library is loaded via LD_PRELOAD.
+ * The library is built with hidden visibility; only symbols marked with this macro enter
+ * the dynamic symbol table, where LD_PRELOAD places them ahead of libc's definitions.
  */
 #define CHAOS_TIME_EXPORT __attribute__((visibility("default")))
 
 /** @} */
 
 /**
- * @defgroup chaos_time_mtime_sentinels Config mtime sentinel values
+ * @defgroup chaos_time_mtime_sentinels Change-stamp sentinels
  *
- * The config reload protocol uses a single @c volatile @c uint64_t
- * (g_chaos_time_cached_mtime) to represent the state machine for live reload.
- * Three sentinel values are reserved; all other values represent a normalised
- * hash of the file's mtime.
+ * g_chaos_time_cached_mtime is both the cached change stamp of the rule file (a hash of
+ * mtime, size, inode and device) and the reload lock. The three values below are
+ * reserved; chaos_time_config_normalize_mtime_hash() keeps a real stamp off the two
+ * high ones. A real stamp of 0 is not remapped: such a file (probability 2^-64 per
+ * stamp) is treated as missing until its stamp changes.
  *
  * @{
  */
 
 /**
- * The config file does not exist (stat returned ENOENT or any error).
+ * stat() of the rule file failed (ENOENT or any other error).
  *
- * When the observed mtime equals this value, the next_state is zeroed and
- * published with an empty rule set (no chaos injected).
+ * A load that observes it publishes an empty snapshot and removes the status file.
  */
 #define CHAOS_TIME_MTIME_MISSING UINT64_C(0)
 
 /**
- * A reload is in progress on another thread.
+ * A thread of this process owns the reload.
  *
- * This value is written into g_chaos_time_cached_mtime atomically via
- * compare-and-swap before the reloading thread begins reading the file.  Any
- * thread that loses the CAS race sees this value and falls back to the
- * currently active config without waiting.
+ * Installed by compare-and-swap before the file is read. Every other caller serves the
+ * active snapshot without waiting. The atfork child handler turns an inherited value
+ * back into UNKNOWN, since the owning thread does not exist in the child.
  */
 #define CHAOS_TIME_MTIME_RELOADING UINT64_C(0xfffffffffffffffe)
 
 /**
- * The cached mtime has never been set (initial state at library load).
+ * No load has completed yet (set by chaos_time_config_init()).
  *
- * chaos_time_config_init() writes this value so that the first call to
- * chaos_time_config_prepare() on any thread will unconditionally attempt a
- * reload.
+ * The next call loads the file unconditionally, bypassing the 1 ms throttle.
  */
 #define CHAOS_TIME_MTIME_UNKNOWN UINT64_C(0xffffffffffffffff)
 
@@ -132,76 +127,64 @@
 /**
  * @defgroup chaos_time_fn_ptrs Real-function pointer types and globals
  *
- * At constructor time, chaos_time_init() resolves each intercepted symbol to
- * the next definition in the dynamic linker chain (RTLD_NEXT) and stores the
- * result here.  All internal call sites that need the real behaviour use these
- * pointers directly rather than calling the symbol by name, which would
- * recurse back into the wrapper.
+ * chaos_time_ensure_symbols() fills each pointer once with the real function
+ * (`dlsym(RTLD_NEXT)`); the constructor and every wrapper call it first. Internal code
+ * calls through these pointers: calling the symbol by name would re-enter the wrapper.
+ *
+ * A pointer stays NULL while resolution is still running (a call from inside dlsym, from
+ * a preloaded allocator, or from a signal handler) or when no later object defines the
+ * symbol. The call helpers in chaos_time_hooks.c then issue the system call directly.
+ * Written only by the resolving thread; read without synchronisation afterwards.
  *
  * @{
  */
 
-/** Function-pointer type matching the POSIX clock_gettime(2) signature. */
+/** clock_gettime(2). */
 typedef int (*chaos_time_clock_gettime_fn)(clockid_t, struct timespec *);
 
-/** Function-pointer type matching the POSIX nanosleep(2) signature. */
+/** nanosleep(2). */
 typedef int (*chaos_time_nanosleep_fn)(const struct timespec *, struct timespec *);
 
-/** Function-pointer type matching the POSIX usleep(3) signature. */
+/** usleep(3). */
 typedef int (*chaos_time_usleep_fn)(useconds_t);
 
-/** Function-pointer type matching gettimeofday(2) as declared by glibc and musl. */
+/** gettimeofday(2); the zone argument is `void *` as in glibc and musl. */
 typedef int (*chaos_time_gettimeofday_fn)(struct timeval *, void *);
 
-/** Function-pointer type matching the POSIX time(2) signature. */
+/** time(2). */
 typedef time_t (*chaos_time_time_fn)(time_t *);
 
-/** Function-pointer type matching the POSIX sleep(3) signature. */
+/** sleep(3). */
 typedef unsigned int (*chaos_time_sleep_fn)(unsigned int);
 
-/** Function-pointer type matching the C11 timespec_get(3) signature. */
+/** timespec_get(3), C11. */
 typedef int (*chaos_time_timespec_get_fn)(struct timespec *, int);
 
-/** Function-pointer type matching the POSIX clock_nanosleep(2) signature. */
+/** clock_nanosleep(2); returns an error number instead of setting errno. */
 typedef int (*chaos_time_clock_nanosleep_fn)(clockid_t, int, const struct timespec *, struct timespec *);
 
-/**
- * Resolved pointer to the real clock_gettime implementation.
- *
- * Set once during chaos_time_init() and never modified afterwards.
- * Read-only from all other translation units.
- */
+/** Real clock_gettime; NULL until resolved. */
 extern chaos_time_clock_gettime_fn g_chaos_time_real_clock_gettime;
 
-/**
- * Resolved pointer to the real nanosleep implementation.
- *
- * Set once during chaos_time_init() and never modified afterwards.
- * Read-only from all other translation units.
- */
+/** Real nanosleep; NULL until resolved. */
 extern chaos_time_nanosleep_fn g_chaos_time_real_nanosleep;
 
-/**
- * Resolved pointer to the real usleep implementation.
- *
- * Set once during chaos_time_init() and never modified afterwards.
- * Read-only from all other translation units.
- */
+/** Real usleep; NULL until resolved. Also used for LATENCY sleeps (chaos_time_actions.c). */
 extern chaos_time_usleep_fn g_chaos_time_real_usleep;
 
-/** Resolved pointer to the real gettimeofday implementation. */
+/** Real gettimeofday; NULL until resolved. */
 extern chaos_time_gettimeofday_fn g_chaos_time_real_gettimeofday;
 
-/** Resolved pointer to the real time implementation. */
+/** Real time; NULL until resolved. */
 extern chaos_time_time_fn g_chaos_time_real_time;
 
-/** Resolved pointer to the real sleep implementation. */
+/** Real sleep; NULL until resolved. */
 extern chaos_time_sleep_fn g_chaos_time_real_sleep;
 
-/** Resolved pointer to the real timespec_get implementation. */
+/** Real timespec_get; NULL until resolved. */
 extern chaos_time_timespec_get_fn g_chaos_time_real_timespec_get;
 
-/** Resolved pointer to the real clock_nanosleep implementation. */
+/** Real clock_nanosleep; NULL until resolved. */
 extern chaos_time_clock_nanosleep_fn g_chaos_time_real_clock_nanosleep;
 
 /** @} */
@@ -212,36 +195,34 @@ extern chaos_time_clock_nanosleep_fn g_chaos_time_real_clock_nanosleep;
  */
 
 /**
- * Per-thread reentrancy guard for the chaos interceptors.
+ * Per-thread reentrancy guard: non-zero while this thread runs library code.
  *
- * Non-zero while the current thread is executing inside the library itself
- * (e.g. during config stat/read, LATENCY sleep, or any other internal
- * operation that calls a function the library intercepts).  When a wrapper
- * entry point detects this flag it bypasses all chaos injection and calls the
- * real function directly, preventing recursive loops.
+ * Set around the rule-file stat and read, LATENCY sleeps and every call of a real
+ * function. A wrapper entered while it is set calls the real function and injects
+ * nothing, so libchaos-time never faults or delays its own work and cannot recurse.
+ * A signal handler that interrupts library code inherits the guard and is not faulted
+ * either.
  *
- * The guard is manipulated exclusively through chaos_time_enter_internal() and
- * chaos_time_leave_internal(), which implement save/restore semantics rather
- * than simple set/clear.  See @ref chaos_time_guard for the detailed rationale.
+ * Changed only through chaos_time_enter_internal() / chaos_time_leave_internal(), which
+ * save and restore instead of set and clear (see @ref chaos_time_guard).
  */
 extern __thread int g_chaos_time_tls_guard;
 
 /**
- * Per-thread PRNG state for the xorshift64* generator.
+ * Per-thread xorshift64* state; 0 means "not seeded yet".
  *
- * Must never be zero; chaos_time_prng_ensure_seeded() enforces this invariant
- * by substituting a fixed non-zero constant if the mixed seed happens to
- * produce zero.  Stored per-thread so that concurrent callers produce
- * independent random streams without synchronisation.
+ * chaos_time_prng_ensure_seeded() replaces 0 with an odd value on the next draw. The
+ * atfork child handler resets the forking thread's state to 0, so each child draws its
+ * own stream instead of repeating the parent's decisions.
  */
 extern __thread uint64_t g_chaos_time_tls_prng_state;
 
 /**
- * Process-wide base seed, set once from /dev/urandom during chaos_time_init().
+ * Process-wide seed: 8 bytes of /dev/urandom read by chaos_time_init().
  *
- * Each thread XORs this value with its TID and a stack-pointer contribution
- * before applying the SplitMix64 finaliser, ensuring that threads started
- * before and after library init all get distinct PRNG streams.
+ * Mixed with the thread id and a stack address when a thread seeds itself. Before the
+ * constructor runs it holds a fixed constant, which the thread id and stack address
+ * still decorrelate per thread.
  */
 extern uint64_t g_chaos_time_process_seed;
 
@@ -250,41 +231,32 @@ extern uint64_t g_chaos_time_process_seed;
 /**
  * @defgroup chaos_time_guard Reentrancy guard helpers
  *
- * The three inline functions below form the complete interface to the
- * per-thread reentrancy guard.  They are deliberately simple so that callers
- * cannot misuse them.
+ * The complete interface to g_chaos_time_tls_guard.
  *
- * ### Why save/restore rather than set-to-1 / set-to-0?
+ * ### Why save/restore, not set/clear
  *
- * Consider a LATENCY injection on @c nanosleep that calls
- * g_chaos_time_real_nanosleep() (via chaos_time_sleep_chunk()).  The call
- * sequence without save/restore would be:
+ * Guarded regions nest: the reload holds the guard around stat() and the file read, and
+ * a LATENCY sleep raises it inside a region that may already hold it. With set/clear the
+ * inner leave would clear the guard while the outer region is still running, and the
+ * rest of that region would be faulted by the library's own rules:
  *
  * @code
- *   nanosleep wrapper enters       guard = 0 → set to 1
- *   LATENCY: sleep_chunk called    (guard is 1)
- *   sleep_chunk: enter_internal    guard = 1 → set to 1   (noop)
- *   real nanosleep returns
- *   sleep_chunk: leave_internal    guard set to 0          ← BUG
- *   // guard is now 0 while outer wrapper is still active
- *   outer wrapper calls real fn    guard = 0 → set to 1 again
- *   ...
+ *   outer region   enter: guard 0 -> 1
+ *   inner region   enter: guard 1 -> 1
+ *   inner region   leave: guard -> 0      <- set/clear: outer region now unguarded
+ *                  leave: guard -> 1      <- save/restore: still guarded
+ *   outer region   leave: guard -> 0
  * @endcode
  *
- * With save/restore the inner leave_internal() restores the guard to the value
- * it had on entry to sleep_chunk (1), not to zero.  The outer leave_internal()
- * then restores it to 0 when the outer call truly finishes.  The same argument
- * applies to any nested internal operation (config stat, clock_gettime LATENCY
- * during a nanosleep LATENCY sleep, etc.).
+ * Only the outermost leave returns the guard to 0.
  *
  * @{
  */
 
 /**
- * Returns non-zero if the calling thread is currently inside the library.
+ * Non-zero while the calling thread runs library code.
  *
- * Entry points call this first; when it returns true they skip chaos injection
- * and forward directly to the real function.
+ * Every wrapper tests this first and, when set, calls the real function unmodified.
  */
 static inline int chaos_time_in_internal(void)
 {
@@ -292,11 +264,10 @@ static inline int chaos_time_in_internal(void)
 }
 
 /**
- * Marks the calling thread as being inside the library.
+ * Raises the calling thread's guard.
  *
- * @return The previous value of the guard.  Callers must pass this to the
- *         matching chaos_time_leave_internal() call; discarding it breaks
- *         correct nesting.
+ * @return The previous guard value; pass it to the matching chaos_time_leave_internal()
+ *         on every exit path of the region.
  */
 static inline int chaos_time_enter_internal(void)
 {
@@ -306,15 +277,9 @@ static inline int chaos_time_enter_internal(void)
 }
 
 /**
- * Restores the guard to the value it had before the matching
- * chaos_time_enter_internal() call.
+ * Restores the guard to its value before the matching chaos_time_enter_internal().
  *
- * @param previous  The value returned by the paired chaos_time_enter_internal().
- *
- * Must only be called by the same thread that called enter_internal().
- * Restores, rather than unconditionally clears, so that nested enter/leave
- * pairs work correctly.  See the module description for the detailed
- * reentrancy example.
+ * @param previous  Value returned by that call, on the same thread.
  */
 static inline void chaos_time_leave_internal(int previous)
 {
@@ -326,18 +291,18 @@ static inline void chaos_time_leave_internal(int previous)
 /**
  * @defgroup chaos_time_atomic Lock-free atomic primitives
  *
- * Thin wrappers around GCC built-in sync operations, used by the two-snapshot
- * config reload protocol.  Full memory barriers are emitted on both sides of
- * each operation.
+ * `__sync` builtins for the reload protocol. `__sync`, not C11 `<stdatomic.h>`: the
+ * library is C99. Both are full barriers. 64-bit loads and stores are single-copy atomic
+ * on the two supported targets (amd64, arm64).
  *
  * @{
  */
 
 /**
- * Atomically loads a uint64_t with a full memory barrier.
+ * Loads @p value after a full barrier.
  *
- * @param value  Pointer to the volatile variable to read.
- * @return       The value observed after the barrier.
+ * @param value  Variable to read.
+ * @return       The value; later loads are not reordered before it.
  */
 static inline uint64_t chaos_time_atomic_load_u64(volatile uint64_t *value)
 {
@@ -346,15 +311,12 @@ static inline uint64_t chaos_time_atomic_load_u64(volatile uint64_t *value)
 }
 
 /**
- * Atomically compares and conditionally swaps a uint64_t.
+ * Replaces @p expected with @p desired atomically; a full barrier either way.
  *
- * Uses __sync_bool_compare_and_swap which issues a full memory barrier on
- * both success and failure paths.
- *
- * @param value     Pointer to the volatile variable to update.
- * @param expected  Value that must be currently stored for the swap to occur.
- * @param desired   Value to write if the swap succeeds.
- * @return          Non-zero if the swap was performed, zero otherwise.
+ * @param value     Variable to update.
+ * @param expected  Value that must be stored for the swap to happen.
+ * @param desired   Value to store.
+ * @return          Non-zero when the swap happened.
  */
 static inline int
 chaos_time_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint64_t desired)
@@ -370,15 +332,12 @@ chaos_time_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint64_t 
  */
 
 /**
- * Returns a numeric identifier for the calling thread.
+ * Kernel thread id of the caller, as seed material only.
  *
- * On Linux, uses SYS_gettid to obtain the kernel thread ID, which is unique
- * within the process and across its lifetime.  On non-Linux platforms falls
- * back to getpid(), which identifies the process but does not distinguish
- * threads; the stack-address contribution to the PRNG seed then provides
- * most of the per-thread entropy.
+ * Raw `SYS_gettid`: the gettid() wrapper exists only since glibc 2.30. Off Linux the pid
+ * stands in and the stack address separates the threads.
  *
- * @return Numeric thread (or process) identifier cast to uint64_t.
+ * @return Thread id (pid off Linux).
  */
 static inline uint64_t chaos_time_current_tid(void)
 {
@@ -394,55 +353,25 @@ static inline uint64_t chaos_time_current_tid(void)
 /**
  * @defgroup chaos_time_prng Per-thread xorshift64* PRNG with SplitMix64 seeding
  *
- * The PRNG has two components:
+ * Drives the probability gate only; not cryptographic.
  *
- * **Seed mixing — SplitMix64 finaliser** (Steele & Vigna, OOPSLA 2014)
- *
- * Raw seed material (process entropy XOR TID XOR stack address) is fed through
- * chaos_time_prng_mix() before being stored as PRNG state.  The function
- * implements the SplitMix64 finaliser:
- *
- *  1. Add the Weyl-sequence increment 0x9e3779b97f4a7c15 (derived from the
- *     golden ratio: floor((2^64) / phi)).
- *  2. Multiply by 0xbf58476d1ce4e5b9 after xorshift-right 30.
- *  3. Multiply by 0x94d049bb133111eb after xorshift-right 27.
- *  4. Final xorshift-right 31.
- *
- * These constants were selected by Steele & Vigna through exhaustive testing
- * for avalanche (every input bit affects every output bit) and minimal linear
- * complexity.  The result is that even seeds differing in a single bit produce
- * statistically independent PRNG streams.
- *
- * **Generator — xorshift64***
- *
- * chaos_time_prng_next_u32() advances the 64-bit state with the shift schedule
- * >>12, <<25, >>27 and then applies the output multiplier 0x2545f4914f6cdd1d
- * before returning the upper 32 bits.  The shift schedule has full period
- * 2^64 − 1 over the non-zero integers.  The output multiplier ensures that
- * low bits of the state are well distributed in the returned value.
- *
- * **Per-thread isolation**
- *
- * State is kept in TLS (g_chaos_time_tls_prng_state) so that concurrent
- * threads produce independent random streams without any synchronisation.
- * Each thread seeds independently from g_chaos_time_process_seed XOR TID XOR
- * stack address, so even threads created simultaneously get different initial
- * states.
+ * - **Seeding:** process seed XOR thread id XOR a stack address, passed through the
+ *   SplitMix64 finaliser, so seeds that differ in one bit give unrelated states. Weyl
+ *   increment 0x9e3779b97f4a7c15 = floor(2^64/phi).
+ * - **Generator:** xorshift64*: shifts 12/25/27, period 2^64 - 1 over non-zero
+ *   states, output multiplier 0x2545f4914f6cdd1d, upper 32 bits returned because the low
+ *   bits of the product are the weakest.
+ * - **Isolation:** state is `__thread`, so draws take no lock and touch no shared cache
+ *   line; a thread seeds itself on its first draw.
  *
  * @{
  */
 
 /**
- * SplitMix64 finaliser — maps an arbitrary uint64_t to a high-quality 64-bit
- * hash suitable for use as a PRNG seed.
+ * SplitMix64 finaliser: a bijective 64-bit mix with full avalanche.
  *
- * The constants and shift amounts are from Steele & Vigna, "Fast Splittable
- * Pseudorandom Number Generators", OOPSLA 2014.  They were chosen to maximise
- * avalanche: every bit of the input affects every bit of the output.
- *
- * @param value  Raw seed material (need not be uniformly distributed).
- * @return       Mixed seed value, never used in zero-detection — the caller is
- *               responsible for substituting a non-zero fallback if required.
+ * @param value  Seed material of any quality.
+ * @return       Mixed value; may be 0, callers that need a non-zero state ensure it.
  */
 static inline uint64_t chaos_time_prng_mix(uint64_t value)
 {
@@ -453,19 +382,11 @@ static inline uint64_t chaos_time_prng_mix(uint64_t value)
 }
 
 /**
- * Lazily initialises the calling thread's PRNG state on first use.
+ * Seeds the calling thread's PRNG unless it already has a state.
  *
- * Combines g_chaos_time_process_seed (set from /dev/urandom at library init),
- * the kernel TID, and the address of a stack variable to produce per-thread
- * seed material.  The material is then mixed through chaos_time_prng_mix()
- * (SplitMix64 finaliser) to produce a high-quality initial state.
- *
- * If the mix result is zero (extremely unlikely but possible), the fallback
- * 0x2545f4914f6cdd1d (the xorshift64* output multiplier itself) is used,
- * ensuring the xorshift generator's invariant that state must not be zero.
- *
- * This function is idempotent: if g_chaos_time_tls_prng_state is already
- * non-zero it returns immediately.
+ * Seed material is the process seed XOR thread id XOR the address of a local, mixed with
+ * chaos_time_prng_mix() and forced odd, so the state is never 0 (the one state
+ * xorshift64* never leaves). Async-signal-safe; errno is not touched.
  */
 static inline void chaos_time_prng_ensure_seeded(void)
 {
@@ -479,22 +400,18 @@ static inline void chaos_time_prng_ensure_seeded(void)
     seed = g_chaos_time_process_seed;
     seed ^= chaos_time_current_tid();
     seed ^= (uint64_t)(uintptr_t)&seed;
-    /* Odd: never 0, the one state xorshift64* cannot leave. */
+    /* Odd, hence never 0: the one state xorshift64* cannot leave. */
     g_chaos_time_tls_prng_state = chaos_time_prng_mix(seed) | 1U;
 }
 
 /**
- * Explicitly seeds the calling thread's PRNG state from a caller-supplied
- * value.
+ * Seeds the calling thread's PRNG with mix(@p seed): the constructor seeds the main
+ * thread this way, and unit tests use it for reproducible streams.
  *
- * Intended for deterministic test scenarios where reproducible random streams
- * are required.  The seed is passed through chaos_time_prng_mix() before
- * storage so that low-quality seeds (e.g. small integers) still produce
- * statistically independent initial states.
+ * Unlike chaos_time_prng_ensure_seeded() the result is not forced odd; a mixed value of
+ * 0 is only treated as "unseeded" and replaced on the next draw.
  *
- * @param seed  Desired seed value.  If zero, the value 1 is substituted
- *              before mixing to prevent the xorshift generator from receiving
- *              a zero state.
+ * @param seed  Seed; 0 is replaced by 1 before mixing.
  */
 static inline void chaos_time_prng_seed_thread(uint64_t seed)
 {
@@ -502,16 +419,9 @@ static inline void chaos_time_prng_seed_thread(uint64_t seed)
 }
 
 /**
- * Advances the per-thread xorshift64* PRNG and returns the next 32-bit value.
+ * Next 32-bit value of the calling thread's xorshift64* stream; seeds it on first use.
  *
- * The generator uses the shift schedule >>12, <<25, >>27 which gives a full
- * period of 2^64 − 1 over the non-zero 64-bit integers.  The upper 32 bits of
- * (state * 0x2545f4914f6cdd1d) are returned; the multiplication scrambles the
- * low bits of the state that the shift operations leave poorly distributed.
- *
- * Calls chaos_time_prng_ensure_seeded() on first use per thread.
- *
- * @return  Pseudo-random uint32_t drawn uniformly from [0, 2^32).
+ * @return Uniform value in [0, 2^32).
  */
 static inline uint32_t chaos_time_prng_next_u32(void)
 {
@@ -529,11 +439,15 @@ static inline uint32_t chaos_time_prng_next_u32(void)
 /** @} */
 
 /**
- * @brief Resolves every downstream symbol once, whichever caller comes first.
+ * @brief Resolves all eight real functions once, on whichever call comes first.
  *
  * @details The constructor alone is not enough: ELF initialisers run in dependency
- * order, so another object's constructor can reach an interposed wrapper before
- * this library's constructor has run. Every exported wrapper calls this first.
+ * order, so another object's constructor can reach a wrapper before this library's
+ * constructor has run. Every wrapper calls this first. Other threads wait (spinning on
+ * sched_yield()) until resolution completes; a call re-entering from the resolving
+ * thread itself (dlsym -> preloaded allocator, or a signal handler) returns at once
+ * and the call helpers fall back to raw system calls (see chaos_once.h). After
+ * completion the cost is one acquire load.
  */
 void chaos_time_ensure_symbols(void);
 

@@ -1,29 +1,28 @@
 /**
  * @file chaos_memory_internal.h
- * @brief Internal shared declarations for the libchaos-memory LD_PRELOAD module.
+ * @brief Shared internals of libchaos-memory: limits, real-function pointers, the
+ *        reentrancy guard, the per-thread PRNG and the mmap kind classifier.
  *
  * @details
- * This header is the spine of the memory chaos subsystem.  It is included by
- * every translation unit in the module and is **not** part of any public API.
+ * Included by every translation unit of libchaos-memory; not an API. It holds:
+ *  - Platform shims (MAP_ANON spelling, gettid).
+ *  - Paths of the rule file, status file and hits file, the parse limits and the
+ *    three reserved change-stamp values of the reload protocol.
+ *  - Typedefs and extern pointers for the real functions (`dlsym(RTLD_NEXT)`).
+ *  - The thread-local reentrancy guard and PRNG state, with inline helpers.
  *
- * Responsibilities carried by this header:
- *  - Platform compatibility shims (MAP_ANONYMOUS normalisation, Linux gettid).
- *  - Compile-time constants governing config file path, rule limits, and magic
- *    sentinel values used by the two-snapshot config reload protocol.
- *  - Function-pointer typedefs and extern declarations for the real libc symbols
- *    resolved once at constructor time.
- *  - The per-thread reentrancy guard and PRNG state variables.
- *  - Inline helpers: reentrancy guard enter/leave, atomic load/CAS, PRNG, and
- *    the MAP_ANONYMOUS classifier that drives mmap/anon vs mmap/file selection.
+ * Why this library needs a reentrancy guard more than any other: the exported mmap(2)
+ * is what preloaded allocators (jemalloc, tcmalloc) call to get memory. Work the
+ * wrapper does (the stat and read of the rule file, the call into the next
+ * definition) may allocate and so call mmap() again on the same thread. The guard
+ * makes such nested calls go straight to the real function.
  *
  * @par Thread safety
- * All mutable global state uses either TLS (`__thread`) or
- * `__sync_*` builtins.  The inline helpers in this header are safe to call
- * from any thread, including from within a reentrancy-guarded frame.
+ * Mutable state is either thread-local (`__thread`) or accessed with `__sync_*`
+ * builtins. Every helper here is async-signal-safe: no locks, no allocation.
  *
  * @par Stability
- * Internal — subject to change without notice.  Do not include from outside the
- * memory chaos module.
+ * Internal; changes without notice.
  */
 #ifndef CHAOS_MEMORY_INTERNAL_H
 #define CHAOS_MEMORY_INTERNAL_H
@@ -42,122 +41,101 @@
 #endif
 
 /**
- * @brief Ensure MAP_ANONYMOUS is defined.
+ * @brief Maps the historical BSD spelling MAP_ANON to MAP_ANONYMOUS.
  *
- * @details
- * On Linux, MAP_ANONYMOUS == 0x20.  Some older or non-Linux BSDs expose the
- * same flag as MAP_ANON.  This shim normalises both spellings to MAP_ANONYMOUS
- * so the rest of the module can use a single constant.
- *
- * This library targets Linux exclusively; the shim exists only to prevent
- * compile-time errors on systems that still use the historical spelling.
+ * @details glibc and musl define both; the shim only keeps non-Linux builds of the
+ * unit tests compiling.
  */
 #if !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
 #define MAP_ANONYMOUS MAP_ANON
 #endif
 
 /**
- * @brief Absolute path to the chaos-memory configuration file.
+ * @brief Rule file of libchaos-memory.
  *
- * @details
- * The file is polled for modification-time changes on every intercepted call.
- * Writing a new config atomically (e.g., via rename(2)) is the recommended
- * way to update rules without races.  An absent file is treated as zero rules
- * (fail-open: all calls proceed normally).
+ * @details Each process looks at it (one stat(2)) at most once per
+ * CHAOS_CHECK_INTERVAL_NS (1 ms, vDSO CLOCK_MONOTONIC) after its first load, and on
+ * every intercepted call where there is no vDSO clock (see chaos_clock.h). Replace
+ * it atomically (temporary file, then rename(2)): a reload that sees the stamp
+ * change during its read discards the copy and retries, but a writer that pauses
+ * mid-file can still be read half-written. An absent file means no rules.
  */
 #define CHAOS_MEMORY_CONFIG_PATH "/tmp/.chaos-memory.conf"
 
 /** Status file reporting the outcome of the last load (see chaos_status.h). */
 #define CHAOS_MEMORY_STATUS_PATH "/tmp/.chaos-memory.status"
 
-/** Hits file of a process, without the `.<pid>` suffix (see chaos_hits.h). */
+/** Hits file of a process, without the `.<n>` suffix (see chaos_hits.h). */
 #define CHAOS_MEMORY_HITS_PREFIX "/tmp/.chaos-memory.hits"
 
 /**
- * @brief Maximum number of rules that can be parsed from the config file.
+ * @brief Maximum number of rules in the rule file.
  *
- * @details
- * Rules beyond this limit cause the entire config reload to be rejected.
- * The limit is sized to bound the per-thread stack-allocated parse buffer.
+ * @details A file with more rules is rejected as a whole (status reason "too
+ * many rules") and the process runs with no rules. The limit sizes the two static
+ * snapshots, the hit pool (2 x 256 slots) and the static read buffer.
  */
 #define CHAOS_MEMORY_MAX_RULES 256U
 
 /**
- * @brief Maximum byte length of a single config file line, including the
- *        newline terminator.
+ * @brief Nominal line length, in bytes, used only to size the read buffer
+ *        (CHAOS_MEMORY_MAX_CONFIG_BYTES); individual lines are not checked against it.
  */
 #define CHAOS_MEMORY_MAX_LINE_LENGTH 1024U
 
 /**
- * @brief Maximum total byte size of the config file that will be read.
+ * @brief Size limit of the rule file: 256 x 1024 = 256 KiB.
  *
- * @details
- * Equals CHAOS_MEMORY_MAX_RULES * CHAOS_MEMORY_MAX_LINE_LENGTH.  A config
- * file that reaches this limit (before the final newline) is rejected so that
- * a partial read cannot be mistaken for the full config.
+ * @details A file of this size or larger is rejected as a whole (status reason
+ * "too large") instead of being parsed truncated: a read that fills the buffer
+ * cannot tell whether more bytes follow.
  */
 #define CHAOS_MEMORY_MAX_CONFIG_BYTES (CHAOS_MEMORY_MAX_RULES * CHAOS_MEMORY_MAX_LINE_LENGTH)
 
 /**
- * @brief Maximum byte length of a single parsed field value (errno name,
- *        latency string, etc.) inside a rule.
+ * @brief Size of the stack buffer that holds a rule's value field without its
+ *        `@<probability>` suffix (errno name or latency); 255 characters plus NUL.
  */
 #define CHAOS_MEMORY_MAX_VALUE 256U
 
 /**
- * @brief Visibility attribute applied to the exported mmap/munmap/mprotect/madvise symbols.
- *
- * @details
- * The symbols must have default ELF visibility so that the dynamic linker
- * interposes them ahead of the libc definitions when the library is preloaded.
+ * @brief Default ELF visibility for the wrappers, so that the dynamic linker binds
+ *        the application's mmap()/munmap()/mprotect()/madvise()/posix_madvise()
+ *        calls to them ahead of libc when the library is preloaded.
  */
 #define CHAOS_MEMORY_EXPORT __attribute__((visibility("default")))
 
 /**
- * @brief Sentinel mtime hash: config file does not exist (stat(2) failed).
+ * @brief Reserved change stamp: the rule file does not exist (stat(2) failed).
  *
- * @details
- * Stored in g_chaos_memory_cached_mtime when a previous stat showed the file
- * absent.  Value 0 is chosen because chaos_memory_config_normalize_mtime_hash()
- * guarantees that a real mtime hash never equals 0 or the other two sentinels.
+ * @details Not excluded from real stamps: a stamp of 0 (probability 2^-64) would
+ * read as "missing" until the file changes again.
  */
 #define CHAOS_MEMORY_MTIME_MISSING UINT64_C(0)
 
 /**
- * @brief Sentinel mtime hash: a config reload is in progress on another thread.
+ * @brief Reserved change stamp: a thread of this process owns the reload.
  *
- * @details
- * The two-snapshot CAS protocol sets g_chaos_memory_cached_mtime to this value
- * atomically before it writes to the inactive config slot.  Any competing thread
- * that observes this value loses the CAS race and skips the reload, falling back
- * to the currently active snapshot.
- *
- * chaos_memory_config_normalize_mtime_hash() shifts real hashes that collide
- * with this sentinel down by one so this value is never produced from real stat
- * timestamps.
+ * @details The owner swaps the cached stamp to this value with a CAS before it
+ * touches the inactive snapshot or the read buffer; every other thread that sees
+ * it serves the active snapshot instead of reloading. The fork child handler turns
+ * a claim inherited from the parent back into CHAOS_MEMORY_MTIME_UNKNOWN.
+ * chaos_memory_config_normalize_mtime_hash() moves a real stamp equal to this value
+ * down by one; see there for the one raw value that still maps onto it.
  */
 #define CHAOS_MEMORY_MTIME_RELOADING UINT64_C(0xfffffffffffffffe)
 
 /**
- * @brief Sentinel mtime hash: cache has not yet been populated (initial state).
- *
- * @details
- * Set at construction time before the first stat.  Forces an unconditional
- * reload on the first call to chaos_memory_config_prepare().
- *
- * chaos_memory_config_normalize_mtime_hash() shifts real hashes that collide
- * with this sentinel down by one so this value is never produced from real stat
- * timestamps.
+ * @brief Reserved change stamp: nothing loaded yet; the next look always reloads
+ *        and is never throttled.
  */
 #define CHAOS_MEMORY_MTIME_UNKNOWN UINT64_C(0xffffffffffffffff)
 
 /* =========================================================================
- * Function-pointer typedefs for real libc symbols
+ * Real function signatures
  * =========================================================================
- * These typedefs capture the exact signatures of the intercepted syscall
- * wrappers.  Storing them as function pointers rather than calling through
- * dlsym() every time avoids repeated symbol lookups in the hot path and
- * makes the call-through explicit in the code.
+ * Each real function is resolved once and called through a pointer; a dlsym()
+ * per call would cost a symbol lookup and could itself allocate.
  */
 
 /** @brief Signature of the real mmap(2). */
@@ -176,110 +154,85 @@ typedef int (*chaos_memory_madvise_fn)(void *, size_t, int);
 typedef int (*chaos_memory_posix_madvise_fn)(void *, size_t, int);
 
 /* =========================================================================
- * Resolved real-symbol pointers
+ * Real function pointers
  * =========================================================================
- * Populated by chaos_memory_init() via dlsym(RTLD_NEXT, ...) before any
- * intercepted call can be made.  All are NULL until the constructor runs.
- * Access is always through the inline call-through helpers in
- * chaos_memory_hooks.c, which hold the reentrancy guard around the call.
+ * Filled by chaos_memory_ensure_symbols(), which every wrapper calls first, so a
+ * wrapper reached from another object's constructor before this library's own
+ * constructor still finds them. A pointer is NULL only while the lookup is in
+ * progress (a call from inside dlsym()); the wrappers then issue the system call
+ * directly (see chaos_memory_hooks.c).
  */
 
-/** @brief Pointer to the real mmap(2) resolved via RTLD_NEXT. */
+/** @brief Real mmap(2). */
 extern chaos_memory_mmap_fn g_chaos_memory_real_mmap;
 
-/** @brief Pointer to the real munmap(2) resolved via RTLD_NEXT. */
+/** @brief Real munmap(2). */
 extern chaos_memory_munmap_fn g_chaos_memory_real_munmap;
 
-/** @brief Pointer to the real mprotect(2) resolved via RTLD_NEXT. */
+/** @brief Real mprotect(2). */
 extern chaos_memory_mprotect_fn g_chaos_memory_real_mprotect;
 
-/** @brief Pointer to the real madvise(2) resolved via RTLD_NEXT. */
+/** @brief Real madvise(2). */
 extern chaos_memory_madvise_fn g_chaos_memory_real_madvise;
 
-/** @brief Pointer to the real posix_madvise(3) resolved via RTLD_NEXT. */
+/** @brief Real posix_madvise(3). */
 extern chaos_memory_posix_madvise_fn g_chaos_memory_real_posix_madvise;
 
 /* =========================================================================
- * TLS reentrancy guard and PRNG state
+ * Thread-local reentrancy guard and PRNG state
  * =========================================================================
  */
 
 /**
- * @brief Per-thread reentrancy depth flag.
+ * @brief Non-zero while this thread runs library code; wrappers then pass the
+ *        call to the real function without matching any rule.
  *
- * @details
- * Non-zero when the current thread is executing inside the chaos library
- * (config I/O, dlsym resolution, sleep calls, or any other internal path).
- * The intercepted symbols check this before applying any fault so that
- * recursive calls from the library's own internals bypass injection entirely.
+ * @details Set around everything the library does that can call back into a
+ * wrapper on the same thread:
+ *  - the call into the real function itself (another interposer below this one
+ *    may allocate);
+ *  - stat(2) of the rule file and its read (open, read, fstat, close);
+ *  - the /dev/urandom read of the constructor.
  *
- * @par Why mmap needs this more than read/write
- * mmap is called by:
- *  1. The dynamic linker during dlopen() — resolving RTLD_NEXT itself may
- *     trigger an mmap call before the guard is set, leading to infinite
- *     recursion.
- *  2. glibc's malloc for allocations above MMAP_THRESHOLD (default 128 KiB).
- *     Any heap allocation inside the chaos path (logging, sprintf, etc.) could
- *     re-enter the mmap hook.
- *  3. TLS block expansion: the first access to a `__thread` variable by a new
- *     thread may require the OS to map a new TLS block.  Reading the guard
- *     itself could therefore trigger an mmap call, creating a bootstrapping
- *     hazard.  The guard's TLS storage is allocated at thread creation time by
- *     the initial TLS image and does not require a dynamic mmap, which is why
- *     the guard can safely be read before it is set.
- *  4. The config read path (open/read/stat via glibc wrappers may internally
- *     call mmap on some allocator code paths).
+ * Reading the guard is safe even on a thread's first call: the library is loaded
+ * at start-up (LD_PRELOAD), so its TLS lives in the static TLS block that glibc and
+ * musl allocate with each thread, and accessing it maps nothing.
  *
- * @note TLS (`__thread`).  Zero-initialised per C thread model.  Never
- *       accessed from a different thread.
+ * @note Thread-local, zero-initialised, never touched by another thread.
  */
 extern __thread int g_chaos_memory_tls_guard;
 
 /**
- * @brief Per-thread xorshift64* PRNG state.
+ * @brief Per-thread xorshift64* state; 0 means "not seeded yet".
  *
- * @details
- * Holds the 64-bit state word for the per-thread PRNG.  Zero is the
- * uninitialised sentinel; chaos_memory_prng_ensure_seeded() populates it on
- * first use.  The seeding path does not allocate memory (it mixes
- * g_chaos_memory_process_seed with the TID and stack address) so it is safe
- * inside the reentrancy guard.
+ * @details Seeded lazily by chaos_memory_prng_ensure_seeded() from the process seed,
+ * the thread id and a stack address, without I/O or allocation. The fork child
+ * handler resets it to 0 so that a child does not repeat its parent's sequence.
  *
- * @note TLS (`__thread`).  Each thread gets an independent PRNG stream so
- *       probability evaluations do not require synchronisation.
+ * @note Thread-local: probability draws need no synchronisation.
  */
 extern __thread uint64_t g_chaos_memory_tls_prng_state;
 
 /**
- * @brief Process-wide seed derived from /dev/urandom at constructor time.
+ * @brief Process-wide seed: 8 bytes of /dev/urandom read by the constructor.
  *
- * @details
- * Read once in chaos_memory_init() using raw syscalls (SYS_openat + SYS_read)
- * to avoid re-entering the mmap hook via glibc's stdio path.  Every thread's
- * TLS PRNG is seeded by XOR-ing this value with the thread ID and a stack
- * address, producing independent per-thread streams that are still causally
- * linked to the process entropy pool.
- *
- * If /dev/urandom is unavailable, a deterministic fallback
- * (0x6a09e667f3bcc909 ^ getpid()) is used; fault injection remains
- * probabilistic but reproducible across runs with the same PID.
+ * @details Read with raw system calls (SYS_openat, SYS_read, SYS_close): nothing
+ * allocates and no other preloaded library's open()/read() wrapper sees the read.
+ * When /dev/urandom cannot be read the seed is `0x6a09e667f3bcc909 ^ getpid()`,
+ * so decisions remain pseudo-random but repeat for the same PID.
  */
 extern uint64_t g_chaos_memory_process_seed;
 
 /* =========================================================================
- * Reentrancy guard — inline helpers
+ * Reentrancy guard helpers
  * =========================================================================
  */
 
 /**
- * @brief Test whether the current thread is inside an internal chaos frame.
+ * @brief Whether this thread is inside library code.
  *
- * @details
- * Returns non-zero if g_chaos_memory_tls_guard is set.  Callers that receive
- * a non-zero result must forward the call to the real symbol immediately
- * without any fault injection.
- *
- * @return Non-zero if already inside internal code, zero otherwise.
+ * @return Non-zero inside library code: the caller must pass the call to the real
+ *         function without matching rules.
  */
 static inline int chaos_memory_in_internal(void)
 {
@@ -287,17 +240,11 @@ static inline int chaos_memory_in_internal(void)
 }
 
 /**
- * @brief Enter an internal chaos frame, acquiring the reentrancy guard.
+ * @brief Sets the reentrancy guard.
  *
- * @details
- * Sets g_chaos_memory_tls_guard to 1 and returns the previous value so that
- * the caller can restore it with chaos_memory_leave_internal().  The
- * save/restore pattern supports nested enter/leave pairs, which occur when
- * the config read path calls open()/read() whose wrappers might themselves
- * call into this module (though those symbols are not intercepted, the
- * pattern is defensive).
- *
- * @return Previous value of g_chaos_memory_tls_guard (0 or 1).
+ * @return The previous guard value, to be passed to chaos_memory_leave_internal();
+ *         restoring the saved value instead of clearing keeps nested enter/leave
+ *         pairs correct.
  */
 static inline int chaos_memory_enter_internal(void)
 {
@@ -307,11 +254,9 @@ static inline int chaos_memory_enter_internal(void)
 }
 
 /**
- * @brief Leave an internal chaos frame, restoring the reentrancy guard.
+ * @brief Restores the reentrancy guard.
  *
- * @param previous  Value returned by the matching chaos_memory_enter_internal()
- *                  call.  Restores exactly the depth that existed before the
- *                  paired enter, supporting nested frames correctly.
+ * @param previous  Value returned by the matching chaos_memory_enter_internal().
  */
 static inline void chaos_memory_leave_internal(int previous)
 {
@@ -319,20 +264,19 @@ static inline void chaos_memory_leave_internal(int previous)
 }
 
 /* =========================================================================
- * Atomic helpers (GCC built-ins, C99 compatible)
+ * Atomic helpers (GCC builtins, C99)
  * =========================================================================
  */
 
 /**
- * @brief Sequentially consistent load of a 64-bit value.
+ * @brief Loads a 64-bit value after a full barrier.
  *
- * @details
- * Issues a full memory barrier before the load so that the caller observes
- * the most recent store from any thread.  Used to read g_chaos_memory_cached_mtime
- * and g_chaos_memory_active_config_index without tearing.
+ * @details Used for g_chaos_memory_cached_mtime. A naturally aligned 64-bit load
+ * does not tear on the supported targets (amd64, arm64); the barrier orders it
+ * after every earlier access of this thread.
  *
- * @param value  Pointer to the volatile uint64_t to load.
- * @return       The value after the memory barrier.
+ * @param value  Variable to load.
+ * @return The loaded value.
  */
 static inline uint64_t chaos_memory_atomic_load_u64(volatile uint64_t *value)
 {
@@ -341,19 +285,15 @@ static inline uint64_t chaos_memory_atomic_load_u64(volatile uint64_t *value)
 }
 
 /**
- * @brief Compare-and-swap on a 64-bit value (GCC __sync built-in).
+ * @brief Compare-and-swap of a 64-bit value (full barrier).
  *
- * @details
- * Atomically compares *value with @p expected; if equal, stores @p desired and
- * returns 1.  Otherwise returns 0 and leaves *value unchanged.  Used to
- * implement the single-winner reload protocol: exactly one thread per mtime
- * change wins the CAS and performs the reload; all others fall back to the
- * currently active snapshot.
+ * @details Claims the reload: of all threads that see the same changed stamp,
+ * exactly one swaps it to CHAOS_MEMORY_MTIME_RELOADING and reloads.
  *
- * @param value     Pointer to the volatile uint64_t to update.
- * @param expected  Value that must be observed for the swap to succeed.
- * @param desired   Value to write if the swap succeeds.
- * @return          1 if the swap succeeded, 0 if it did not.
+ * @param value     Variable to update.
+ * @param expected  Value that must be present for the swap to happen.
+ * @param desired   Value stored on success.
+ * @return 1 if the swap happened, 0 otherwise.
  */
 static inline int
 chaos_memory_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint64_t desired)
@@ -367,16 +307,10 @@ chaos_memory_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint64_
  */
 
 /**
- * @brief Return a per-thread numeric identifier used for PRNG seeding.
+ * @brief Kernel thread id (SYS_gettid) for PRNG seeding; the PID on non-Linux test
+ *        builds, where the stack-address term alone separates threads.
  *
- * @details
- * On Linux this is the kernel TID obtained via SYS_gettid, which is unique
- * process-wide.  On other platforms (compilation fallback only; this library
- * targets Linux) the PID is returned instead, which gives all threads the
- * same value — acceptable since the stack-address term still differentiates
- * them.
- *
- * @return A uint64_t that is unique per kernel thread on Linux.
+ * @details A raw system call: gettid() is a libc function only since glibc 2.30.
  */
 static inline uint64_t chaos_memory_current_tid(void)
 {
@@ -388,25 +322,16 @@ static inline uint64_t chaos_memory_current_tid(void)
 }
 
 /* =========================================================================
- * PRNG — xorshift64* with splitmix64 finaliser
+ * PRNG: xorshift64* seeded through the splitmix64 finaliser
  * =========================================================================
  */
 
 /**
- * @brief Apply the splitmix64 finaliser to a 64-bit value.
+ * @brief splitmix64 finaliser: spreads seed material (process seed ^ tid ^ stack
+ *        address) over all 64 bits so that threads with close tids and stacks get
+ *        unrelated streams.
  *
- * @details
- * Used to mix seed material (process seed XOR tid XOR stack address) into a
- * high-quality initial PRNG state.  The three-step multiply-xorshift cascade
- * is the standard splitmix64 constants; it passes SmallCrush and PractRand
- * and has no known short cycles.
- *
- * This function does not allocate memory and does not touch any global state,
- * making it safe to call anywhere in the module including before the PRNG is
- * seeded or inside the reentrancy guard.
- *
- * @param value  Input value to mix.
- * @return       Finalised 64-bit value with good avalanche properties.
+ * @details Pure function; no global state.
  */
 static inline uint64_t chaos_memory_prng_mix(uint64_t value)
 {
@@ -417,26 +342,12 @@ static inline uint64_t chaos_memory_prng_mix(uint64_t value)
 }
 
 /**
- * @brief Seed the per-thread PRNG if it has not been seeded yet.
+ * @brief Seeds this thread's PRNG on its first draw.
  *
- * @details
- * Called lazily by chaos_memory_prng_next_u32() before producing the first
- * random value for a thread.  The seed is derived entirely from values
- * available without any I/O or heap allocation:
- *  - g_chaos_memory_process_seed  (from /dev/urandom at init, or fallback)
- *  - The kernel TID                (process-wide unique per thread)
- *  - The address of a local variable (ASLR-derived stack offset)
- *
- * The XOR combination is passed through chaos_memory_prng_mix() to break
- * linear correlations between threads that share the same process seed.
- *
- * Zero is the uninitialised sentinel for g_chaos_memory_tls_prng_state.  If
- * the mix produces zero (probability 2^-64), the state is replaced with a
- * fixed non-zero constant to keep the PRNG alive.
- *
- * @note No /dev/urandom access occurs here.  The per-thread seed is derived
- *       purely from in-process state, so this function cannot trigger a
- *       recursive mmap call through glibc's open() path.
+ * @details The seed is mix(process seed ^ kernel tid ^ address of a local), forced
+ * odd so it is never 0, the one state xorshift64* cannot leave and also the
+ * "not seeded" marker. No I/O and no allocation: safe inside a wrapper, under the
+ * reentrancy guard and in a signal handler.
  */
 static inline void chaos_memory_prng_ensure_seeded(void)
 {
@@ -455,17 +366,12 @@ static inline void chaos_memory_prng_ensure_seeded(void)
 }
 
 /**
- * @brief Unconditionally seed the per-thread PRNG with a given value.
+ * @brief Seeds this thread's PRNG with mix(@p seed); a seed of 0 is replaced by 1.
  *
- * @details
- * Intended for testing and for the initial seeding in chaos_memory_init()
- * where the process-seed has just been read and must be applied immediately
- * to the main thread's PRNG state.
+ * @details Used by the constructor for the main thread and by unit tests for
+ * reproducible sequences.
  *
- * If @p seed is zero (invalid PRNG state sentinel), the value 1 is used
- * before mixing so the PRNG is never left in the all-zero absorbing state.
- *
- * @param seed  Raw seed value.  Zero is treated as 1 before mixing.
+ * @param seed  Raw seed.
  */
 static inline void chaos_memory_prng_seed_thread(uint64_t seed)
 {
@@ -473,24 +379,12 @@ static inline void chaos_memory_prng_seed_thread(uint64_t seed)
 }
 
 /**
- * @brief Produce the next 32-bit pseudo-random value from the per-thread stream.
+ * @brief Next 32-bit value of this thread's xorshift64* stream.
  *
- * @details
- * Implements xorshift64* — a three-step xorshift on the 64-bit state followed
- * by multiplication with a Weyl constant to extract the upper 32 bits.  The
- * algorithm has a period of 2^64 - 1, passes BigCrush, and requires no memory
- * allocation or synchronisation.
+ * @details Shifts 12/25/27 on the 64-bit state, then the upper 32 bits of the
+ * product with 0x2545f4914f6cdd1d. Period 2^64 - 1. Seeds the thread lazily.
  *
- * chaos_memory_prng_ensure_seeded() is called first so that the PRNG is
- * transparently initialised on first use even for threads that did not call
- * chaos_memory_prng_seed_thread() explicitly.
- *
- * The returned value is uniformly distributed in [0, 2^32).  Probability
- * thresholding in chaos_memory_probability_hit_sample() compares it against a
- * scaled threshold without bias for probability values representable as
- * fractions of 2^32.
- *
- * @return 32-bit pseudo-random value.
+ * @return A value uniform in [0, 2^32).
  */
 static inline uint32_t chaos_memory_prng_next_u32(void)
 {
@@ -506,32 +400,18 @@ static inline uint32_t chaos_memory_prng_next_u32(void)
 }
 
 /**
- * @brief Classify an mmap flags word as anonymous or file-backed.
+ * @brief Whether an mmap() flags word requests an anonymous mapping
+ *        (selector `mmap/anon`) rather than a file or device one (`mmap/file`).
  *
- * @details
- * Tests whether MAP_ANONYMOUS (0x20 on Linux) is set in @p flags.
+ * @details In LD_PRELOAD mode a `mmap/anon` ERRNO:ENOMEM rule reaches only callers of
+ * the exported mmap symbol: preloaded allocators (jemalloc, tcmalloc), language
+ * runtimes and JITs, thread-stack setup in programs that map stacks themselves, and
+ * application code. The C library's own malloc (glibc and musl) maps memory through
+ * its internal `__mmap`, which never passes through the dynamic symbol table, so
+ * malloc() and free() are not faulted by these rules.
  *
- * @par Why this distinction matters for allocator pressure testing
- * glibc's malloc uses mmap(MAP_ANONYMOUS | MAP_PRIVATE) for allocations that
- * exceed MMAP_THRESHOLD (default 128 KiB, tunable via mallopt(M_MMAP_THRESHOLD,
- * ...)).  Allocations below the threshold use the brk/sbrk heap.  Injecting
- * ERRNO:ENOMEM on the `mmap/anon` selector therefore simulates allocator
- * pressure for large objects under glibc, but small allocations are unaffected
- * (they never reach the mmap hook).
- *
- * musl libc's malloc always uses mmap(MAP_ANONYMOUS | MAP_PRIVATE) for every
- * allocation — there is no brk path.  Under musl, ERRNO:ENOMEM on `mmap/anon`
- * causes malloc() to return NULL for all allocation sizes immediately, giving
- * complete allocator failure coverage with a single rule.
- *
- * @par Platform note
- * MAP_ANONYMOUS == 0x20 on all supported Linux architectures (x86, x86-64,
- * arm64, riscv64).  This library targets Linux only; MAP_ANON is normalised
- * to MAP_ANONYMOUS at the top of this header for completeness.
- *
- * @param flags  The @p flags argument passed to mmap(2).
- * @return       Non-zero if MAP_ANONYMOUS is set (anonymous mapping),
- *               zero if clear (file-backed or device mapping).
+ * @param flags  The flags argument of mmap(2).
+ * @return Non-zero when MAP_ANONYMOUS is set.
  */
 static inline int chaos_memory_mmap_is_anonymous(int flags)
 {
@@ -539,11 +419,13 @@ static inline int chaos_memory_mmap_is_anonymous(int flags)
 }
 
 /**
- * @brief Resolves every downstream symbol once, whichever caller comes first.
+ * @brief Resolves every real function once, whichever caller comes first.
  *
  * @details The constructor alone is not enough: ELF initialisers run in dependency
- * order, so another object's constructor can reach an interposed wrapper before
- * this library's constructor has run. Every exported wrapper calls this first.
+ * order, so another object's constructor can reach a wrapper before this
+ * library's constructor has run. Every wrapper calls this first. Thread-safe
+ * (chaos_once()); a concurrent caller waits until the lookup has finished, except
+ * a nested call from inside the lookup on the same thread.
  */
 void chaos_memory_ensure_symbols(void);
 

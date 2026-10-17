@@ -1,45 +1,27 @@
 /**
  * @file chaos_process_internal.h
- * @brief Internal ABI contracts, global state, and inline utilities for the
- *        libchaos-process LD_PRELOAD fault-injection subsystem.
+ * @brief Definitions shared by every translation unit of libchaos-process; not part of
+ *        the ABI.
  *
  * @details
- * This header is the private spine of the process chaos library.  It is
- * included by every translation unit in the subsystem and must never be
- * exposed to consumers of the library.
+ * libchaos-process wraps thread and process creation, exec and child reaping. Seven
+ * operations carry rules (selectors): pthread_create, fork, posix_spawn, posix_spawnp,
+ * execve, execveat, waitpid. Further wrappers follow the rules of the operation they
+ * are a form of (see chaos_process_hooks.c): the exec family, system(), popen() and the
+ * wait family. vfork is not wrapped.
  *
- * ## Subsystem overview
+ * Contents:
+ *  - Paths of the rule file, status file and hits file, and the parser limits.
+ *  - The change-stamp sentinels that double as the reload state machine.
+ *  - Typedefs and globals for the real functions, resolved with `dlsym(RTLD_NEXT)`.
+ *  - The per-operation FAIL_AFTER counters.
+ *  - The per-thread reentrancy guard: while set, every wrapper calls the real function
+ *    and injects nothing, so the library never faults its own work.
+ *  - The per-thread xorshift64* PRNG behind the probability gate: no locks, independent
+ *    streams per thread and per forked child.
  *
- * libchaos-process interposes the following libc/POSIX symbols at the dynamic
- * linker level via LD_PRELOAD:
- *
- *   - `pthread_create(3)` — NPTL thread creation
- *   - `fork(2)` / `vfork(2)` — process forking
- *   - `posix_spawn(3)` / `posix_spawnp(3)` — spawn-with-exec
- *   - `execve(2)` / `execveat(2)` — process image replacement
- *   - `waitpid(2)` — child process reaping
- *
- * Each wrapper may inject ERRNO failures, artificial LATENCY, or
- * FAIL_AFTER-counted failures as described by a rules file loaded at runtime.
- *
- * ## Re-entrancy guard
- *
- * Because many interposed functions are also called internally (e.g. `stat`
- * invoked during config reload calls through libc which may in turn call our
- * interposed symbols), the library maintains a per-thread TLS re-entrancy
- * guard (`g_chaos_process_tls_guard`).  Any code path that must reach real
- * libc without passing through chaos logic must bracket itself with
- * `chaos_process_enter_internal()` / `chaos_process_leave_internal()`.
- *
- * ## PRNG
- *
- * Each thread has its own xorshift64* PRNG state seeded from the process-wide
- * seed XOR-ed with the thread ID and a stack address.  This ensures
- * independent per-thread probability decisions without locks.
- *
- * ## Stability
- * Private — not part of the public API.  Definitions may change between
- * library versions without notice.
+ * Everything inline here is async-signal-safe (TLS, `__sync` builtins, one gettid
+ * system call) and leaves errno alone.
  */
 
 #ifndef CHAOS_PROCESS_INTERNAL_H
@@ -66,56 +48,60 @@
  *  @{
  */
 
-/** Filesystem path from which the live rules file is read. */
+/** Rule file; looked at no more than once per CHAOS_CHECK_INTERVAL_NS (1 ms) per process. */
 #define CHAOS_PROCESS_CONFIG_PATH "/tmp/.chaos-process.conf"
 
-/** Status file reporting the outcome of the last load (see chaos_status.h). */
+/** Status file: outcome of the last load (see chaos_status.h). */
 #define CHAOS_PROCESS_STATUS_PATH "/tmp/.chaos-process.status"
 
-/** Hits file of a process, without the `.<pid>` suffix (see chaos_hits.h). */
+/** Hits file prefix; each image appends `.<n>` (see chaos_hits.h). */
 #define CHAOS_PROCESS_HITS_PREFIX "/tmp/.chaos-process.hits"
 
-/** Maximum number of rules that can be loaded from a single config file. */
+/** Rules per snapshot; one more rejects the whole file (CHAOS_STATUS_REASON_TOO_MANY). */
 #define CHAOS_PROCESS_MAX_RULES 256U
 
-/** Maximum byte length of a single config line (including NUL). */
+/** Nominal bytes per line; only used to size CHAOS_PROCESS_MAX_CONFIG_BYTES. */
 #define CHAOS_PROCESS_MAX_LINE_LENGTH 1024U
 
 /**
- * Maximum total bytes of config file that will be read in a single reload.
- * If the file is exactly this size the read is treated as a truncation error
- * and the reload fails (the previous valid config is retained).
+ * Rule-file size limit: 256 * 1024 bytes = 256 KiB.
+ *
+ * A file of this size or larger is rejected as a whole (CHAOS_STATUS_REASON_TOO_LARGE):
+ * no rule applies and the status file reports the error until the file changes.
  */
 #define CHAOS_PROCESS_MAX_CONFIG_BYTES (CHAOS_PROCESS_MAX_RULES * CHAOS_PROCESS_MAX_LINE_LENGTH)
 
-/** Maximum byte length of a single field value token within a config line. */
+/** Capacity of the value field (before `@probability`) including the NUL. */
 #define CHAOS_PROCESS_MAX_VALUE 256U
 
 /**
- * Symbol visibility attribute applied to every interposed public symbol.
- * Required so the dynamic linker can resolve these names ahead of libc.
+ * Default ELF visibility for the wrappers.
+ *
+ * The library is built with -fvisibility=hidden; only symbols marked with this macro enter
+ * the dynamic symbol table, where LD_PRELOAD places them ahead of libc's definitions.
  */
 #define CHAOS_PROCESS_EXPORT __attribute__((visibility("default")))
 
 /**
- * Sentinel stored in `g_chaos_process_cached_mtime` when the config file
- * does not exist on disk.  A missing file means "no active rules".
+ * stat() of the rule file failed (ENOENT or any other error).
+ *
+ * A load that observes it publishes an empty snapshot and removes the status file.
  */
 #define CHAOS_PROCESS_MTIME_MISSING UINT64_C(0)
 
 /**
- * Sentinel written into `g_chaos_process_cached_mtime` during a config
- * reload to act as an optimistic lock.  A CAS from the previously observed
- * mtime to this value serialises concurrent reloaders: only the thread that
- * wins the CAS performs the actual read+parse; all others fall through to the
- * currently active config state.
+ * A thread of this process owns the reload.
+ *
+ * Installed in g_chaos_process_cached_mtime by compare-and-swap before the file is read;
+ * every other caller serves the active snapshot without waiting. The atfork child
+ * handler turns an inherited value back into UNKNOWN.
  */
 #define CHAOS_PROCESS_MTIME_RELOADING UINT64_C(0xfffffffffffffffe)
 
 /**
- * Initial value of `g_chaos_process_cached_mtime` set during library init.
- * Forces the first call to `chaos_process_config_prepare()` to unconditionally
- * attempt a reload regardless of whether the config file is present.
+ * No load has completed yet (set by chaos_process_config_init()).
+ *
+ * The next call loads the file unconditionally, bypassing the 1 ms throttle.
  */
 #define CHAOS_PROCESS_MTIME_UNKNOWN UINT64_C(0xffffffffffffffff)
 
@@ -124,31 +110,23 @@
 /** @defgroup chaos_process_fptypes Function-pointer typedefs for real symbols
  *  @{
  *
- * These typedefs describe the ABI of each intercepted symbol exactly as it
- * appears in the system libc.  The corresponding `g_chaos_process_real_*`
- * globals are populated by `dlsym(RTLD_NEXT, ...)` during library
- * constructor execution.
+ * Signatures of the real functions as glibc and musl declare them. The matching
+ * `g_chaos_process_real_*` globals are filled by chaos_process_ensure_symbols().
  */
 
-/** Signature of the real `pthread_create(3)`. */
+/** pthread_create(3); returns an error number, does not set errno. */
 typedef int (*chaos_process_pthread_create_fn)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
 
-/** Signature of the real `fork(2)`. */
+/** fork(2). */
 typedef pid_t (*chaos_process_fork_fn)(void);
 
 /**
- * Signature of the real `posix_spawn(3)`.
+ * posix_spawn(3); returns an error number, does not set errno.
  *
- * @note On glibc, `posix_spawn` is implemented via `__spawnix` which uses
- *       `clone(CLONE_VFORK|CLONE_VM, ...)` internally — it does NOT call the
- *       libc `fork()` symbol.  Therefore a `fork:ERRNO:EAGAIN` rule does NOT
- *       affect `posix_spawn` on glibc.  Our wrapper intercepts at the
- *       `posix_spawn` ABI boundary directly, so it fires regardless of the
- *       underlying implementation path.
- *
- *       On musl, `posix_spawn` calls `fork()` then `exec()`, so a `fork`
- *       rule WOULD additionally affect it — but our direct wrapper fires
- *       first, before the musl path reaches the (also interposed) `fork`.
+ * @note glibc spawns through clone(CLONE_VM | CLONE_VFORK), not through the exported
+ *       fork symbol, so a `fork` rule never reaches posix_spawn. Rules for spawning
+ *       must name `posix_spawn` / `posix_spawnp`; this wrapper sits at that boundary
+ *       whatever the libc does underneath.
  */
 typedef int (*chaos_process_posix_spawn_fn)(
     pid_t *,
@@ -159,10 +137,7 @@ typedef int (*chaos_process_posix_spawn_fn)(
     char *const[]
 );
 
-/**
- * Signature of the real `posix_spawnp(3)`.
- * Same glibc/musl divergence as `posix_spawn` applies here; see above.
- */
+/** posix_spawnp(3); as posix_spawn, with a PATH search. */
 typedef int (*chaos_process_posix_spawnp_fn)(
     pid_t *,
     const char *,
@@ -172,35 +147,34 @@ typedef int (*chaos_process_posix_spawnp_fn)(
     char *const[]
 );
 
-/** Signature of the real `execve(2)`. */
+/** execve(2). */
 typedef int (*chaos_process_execve_fn)(const char *, char *const[], char *const[]);
 
 /**
- * Signature of the real `execveat(2)` (Linux only).
- * May be NULL on musl where `execveat` is not consistently exported as a
- * public libc symbol; callers must check for NULL before invoking.
+ * execveat(2), Linux only. The pointer may stay NULL (a libc without the symbol, or not
+ * resolved yet); the call helper then issues SYS_execveat directly.
  */
 typedef int (*chaos_process_execveat_fn)(int, const char *, char *const[], char *const[], int);
 
-/** Signature of the real `waitpid(2)`. */
+/** waitpid(2). */
 typedef pid_t (*chaos_process_waitpid_fn)(pid_t, int *, int);
 
-/** Signature of the real `execvpe(3)` (GNU; may be absent). */
+/** execvpe(3), a GNU extension; the pointer is NULL when libc lacks it. */
 typedef int (*chaos_process_execvpe_fn)(const char *, char *const[], char *const[]);
 
-/** Signature of the real `fexecve(3)` (may be absent). */
+/** fexecve(3); the pointer is NULL when libc lacks it. */
 typedef int (*chaos_process_fexecve_fn)(int, char *const[], char *const[]);
 
-/** Signature of the real `system(3)`. */
+/** system(3). */
 typedef int (*chaos_process_system_fn)(const char *);
 
-/** Signature of the real `popen(3)`. */
+/** popen(3). */
 typedef FILE *(*chaos_process_popen_fn)(const char *, const char *);
 
-/** Signature of the real `wait4(2)`. */
+/** wait4(2). */
 typedef pid_t (*chaos_process_wait4_fn)(pid_t, int *, int, struct rusage *);
 
-/** Signature of the real `waitid(2)`. */
+/** waitid(2). */
 typedef int (*chaos_process_waitid_fn)(idtype_t, id_t, siginfo_t *, int);
 
 /** @} */
@@ -208,129 +182,98 @@ typedef int (*chaos_process_waitid_fn)(idtype_t, id_t, siginfo_t *, int);
 /** @defgroup chaos_process_globals Global state variables
  *  @{
  *
- * All `g_chaos_process_real_*` pointers are written once during library
- * construction and are thereafter read-only.  They require no locking for
- * reads.
+ * chaos_process_ensure_symbols() fills each `g_chaos_process_real_*` pointer once; the
+ * constructor and every wrapper call it first. pthread_create is the exception: while it
+ * is unresolved (before glibc 2.34 it lives in libpthread) its wrapper retries the lookup
+ * on each call, so a libpthread loaded later with dlopen() is picked up. A pointer is
+ * NULL while resolution runs on this thread (dlsym -> preloaded allocator, or a signal
+ * handler) or when no later object defines the symbol; the call helpers in
+ * chaos_process_hooks.c then use a raw system call or fail with ENOSYS / EAGAIN.
  */
 
-/** Pointer to the real `pthread_create` resolved via RTLD_NEXT. */
+/** Real pthread_create; NULL until resolved (retried per call while NULL). */
 extern chaos_process_pthread_create_fn g_chaos_process_real_pthread_create;
 
-/** Pointer to the real `fork` resolved via RTLD_NEXT. */
+/** Real fork; NULL until resolved. */
 extern chaos_process_fork_fn g_chaos_process_real_fork;
 
-/** Pointer to the real `posix_spawn` resolved via RTLD_NEXT. */
+/** Real posix_spawn; NULL until resolved. */
 extern chaos_process_posix_spawn_fn g_chaos_process_real_posix_spawn;
 
-/** Pointer to the real `posix_spawnp` resolved via RTLD_NEXT. */
+/** Real posix_spawnp; NULL until resolved. */
 extern chaos_process_posix_spawnp_fn g_chaos_process_real_posix_spawnp;
 
-/** Pointer to the real `execve` resolved via RTLD_NEXT. */
+/** Real execve; NULL until resolved. */
 extern chaos_process_execve_fn g_chaos_process_real_execve;
 
-/**
- * Pointer to the real `execveat` resolved via RTLD_NEXT, or NULL if the
- * symbol is not available (e.g. musl without a public `execveat` export).
- * Linux-only; guarded by `#ifdef __linux__` at all call sites.
- */
+/** Real execveat (Linux only); NULL when absent from libc. */
 extern chaos_process_execveat_fn g_chaos_process_real_execveat;
 
-/** Pointer to the real `waitpid` resolved via RTLD_NEXT. */
+/** Real waitpid; NULL until resolved. */
 extern chaos_process_waitpid_fn g_chaos_process_real_waitpid;
 
-/** Pointer to the real `execvpe`, or NULL when libc lacks it. */
+/** Real execvpe; NULL when libc lacks it. */
 extern chaos_process_execvpe_fn g_chaos_process_real_execvpe;
 
-/** Pointer to the real `fexecve`, or NULL when libc lacks it. */
+/** Real fexecve; NULL when libc lacks it. */
 extern chaos_process_fexecve_fn g_chaos_process_real_fexecve;
 
-/** Pointer to the real `system` resolved via RTLD_NEXT. */
+/** Real system; NULL until resolved. */
 extern chaos_process_system_fn g_chaos_process_real_system;
 
-/** Pointer to the real `popen` resolved via RTLD_NEXT. */
+/** Real popen; NULL until resolved. */
 extern chaos_process_popen_fn g_chaos_process_real_popen;
 
-/** Pointer to the real `wait4` resolved via RTLD_NEXT. */
+/** Real wait4; NULL until resolved. */
 extern chaos_process_wait4_fn g_chaos_process_real_wait4;
 
-/** Pointer to the real `waitid` resolved via RTLD_NEXT. */
+/** Real waitid; NULL until resolved. */
 extern chaos_process_waitid_fn g_chaos_process_real_waitid;
 
 /**
- * Per-thread re-entrancy guard.
+ * Per-thread reentrancy guard: non-zero while this thread runs library code.
  *
- * Non-zero while the current thread is executing inside library-internal code
- * (config I/O, sleep primitives, symbol resolution).  The wrappers check this
- * before applying chaos logic; if set they call straight through to the real
- * function.  This prevents infinite recursion when, for example, the config
- * reload calls `stat()` and our `fork` wrapper is somehow reached via a
- * signal handler or atfork handler during that call.
- *
- * The guard is a counter (not a boolean) so that nested calls to
- * `chaos_process_enter_internal()` restore the correct previous depth.
+ * Set around the rule-file stat and read, the urandom read and every call of a real
+ * function. A wrapper entered while it is set calls the real function and injects
+ * nothing, so a call a real function makes back into an exported wrapper is not faulted
+ * a second time. A 0/1 flag, saved and restored (not a depth counter) by
+ * chaos_process_enter_internal() / chaos_process_leave_internal().
  */
 extern __thread int g_chaos_process_tls_guard;
 
 /**
- * Per-thread xorshift64* PRNG state.
+ * Per-thread xorshift64* state; 0 means "not seeded yet".
  *
- * Initialised lazily on first use by `chaos_process_prng_ensure_seeded()`.
- * A value of 0 means "not yet seeded".  The seeding mixes the process-wide
- * seed with the kernel thread ID (Linux) or PID (other) and a stack address
- * to produce a distinct seed per thread.  The state is never zero after
- * seeding because the algorithm would otherwise be stuck at 0.
+ * chaos_process_prng_ensure_seeded() replaces 0 with an odd value on the next draw. The
+ * atfork child handler resets the forking thread's state to 0, so each child draws its
+ * own stream instead of repeating the parent's decisions.
  */
 extern __thread uint64_t g_chaos_process_tls_prng_state;
 
 /**
- * Process-wide entropy seed used to differentiate per-thread PRNG streams.
+ * Process-wide seed: 8 bytes of /dev/urandom read by the constructor with raw system
+ * calls; 0x6a09e667f3bcc909 XOR pid if that read fails.
  *
- * Populated from `/dev/urandom` during library construction (via raw
- * `SYS_openat`/`SYS_read` syscalls to avoid recursion through our
- * interposed symbols).  Falls back to a mixing of a compile-time constant
- * XOR PID if the syscall path fails.  Written once; read-only thereafter.
+ * Before the constructor runs it holds a fixed constant; the thread id and a stack
+ * address still separate threads that draw that early.
  */
 extern uint64_t g_chaos_process_process_seed;
 
 /**
- * Per-operation FAIL_AFTER invocation counters.
+ * FAIL_AFTER counters, one per operation, indexed by chaos_process_operation_t.
  *
- * Array indexed by `chaos_process_operation_t` (0 through
- * `CHAOS_PROCESS_OP_COUNT - 1`):
+ * A counter advances (`__sync_fetch_and_add`, full barrier) on every call of its
+ * operation that reaches a matching FAIL_AFTER rule, i.e. one whose ERRNO rule did not
+ * fire first. The pre-increment value is compared with the rule's count N: calls 1..N
+ * pass, call N+1 onwards may fail. Wrappers that follow another operation's rules share
+ * its counter (wait family -> waitpid, exec family -> execve, system/popen ->
+ * posix_spawn, fexecve -> execveat).
  *
- *   [0] CHAOS_PROCESS_OP_PTHREAD_CREATE
- *   [1] CHAOS_PROCESS_OP_FORK
- *   [2] CHAOS_PROCESS_OP_POSIX_SPAWN
- *   [3] CHAOS_PROCESS_OP_POSIX_SPAWNP
- *   [4] CHAOS_PROCESS_OP_EXECVE
- *   [5] CHAOS_PROCESS_OP_EXECVEAT
- *   [6] CHAOS_PROCESS_OP_WAITPID
- *
- * Atomicity: each element is updated with `__sync_fetch_and_add` which
- * emits a full memory barrier (mfence / dmb ish) on all supported
- * architectures.  The counter is therefore safe to increment concurrently
- * from multiple threads without a lock.
- *
- * Semantics: the counter starts at 0.  The first call to the interposed
- * function increments it from 0 to 1 and receives the *pre-increment* value
- * 0 back from `__sync_fetch_and_add`.  A rule with `fail_after_count = N`
- * triggers when the observed pre-increment value is >= N, meaning the
- * (N+1)-th call and all subsequent calls fail.  With N=0, every call fails
- * starting from the very first.
- *
- * Overflow: the counter is uint64_t.  Wraparound at 2^64 is not guarded;
- * in practice it is unreachable (2^64 calls would take centuries at any
- * realistic call rate).  After overflow the counter restarts at 0, which
- * effectively re-arms the FAIL_AFTER trigger.
- *
- * Reset: all counters are zeroed atomically (non-atomically in a sequential
- * loop, but under the protection of the config-reload CAS) each time a new
- * config is published via `chaos_process_config_publish()`.
- *
- * Child inheritance: `fork()` duplicates the parent's process image.
- * Because the counter array lives in the data segment it is copied-on-write
- * into the child.  The child therefore starts with the same counter value
- * the parent had at the point of fork.  There is no post-fork reset.
+ * Shared by all threads of a process, which models a process-wide resource limit. Reset
+ * to 0 by chaos_process_config_publish() on every load that publishes a snapshot (not by
+ * a provisional re-read that finds the file unchanged) and by the atfork child handler,
+ * so each forked child counts from 0 like chaos-init does. Wraparound at 2^64 is not
+ * guarded.
  */
 extern volatile uint64_t g_chaos_process_fail_after_counters[];
 
@@ -338,16 +281,15 @@ extern volatile uint64_t g_chaos_process_fail_after_counters[];
 
 /** @defgroup chaos_process_guard Re-entrancy guard inline helpers
  *  @{
+ *
+ * Save/restore rather than set/clear: guarded regions nest (a real call made from inside
+ * a reload), and only the outermost leave may return the guard to 0.
  */
 
 /**
- * @brief Returns non-zero if the current thread is already executing inside
- *        library-internal code.
+ * @brief Non-zero while the calling thread runs library code.
  *
- * Callers should call this before performing any chaos logic and skip
- * straight to the real function if it returns non-zero.
- *
- * @return Non-zero if re-entrant, 0 if safe to apply chaos.
+ * Every wrapper tests this first and, when set, calls the real function unmodified.
  */
 static inline int chaos_process_in_internal(void)
 {
@@ -355,15 +297,10 @@ static inline int chaos_process_in_internal(void)
 }
 
 /**
- * @brief Marks the current thread as inside internal code and returns the
- *        previous guard value.
+ * @brief Raises the calling thread's guard.
  *
- * Must be paired with `chaos_process_leave_internal(previous)` on all
- * exit paths to restore the guard correctly.  Correctly handles nesting:
- * if the guard was already set it returns 1 (non-zero previous) and the
- * paired `leave` restores it back to 1.
- *
- * @return The guard value before the call (0 = was not internal, 1 = was).
+ * @return The previous value (0 or 1); pass it to the matching
+ *         chaos_process_leave_internal() on every exit path.
  */
 static inline int chaos_process_enter_internal(void)
 {
@@ -373,11 +310,9 @@ static inline int chaos_process_enter_internal(void)
 }
 
 /**
- * @brief Restores the re-entrancy guard to its state before the matching
- *        `chaos_process_enter_internal()` call.
+ * @brief Restores the guard to its value before the matching enter.
  *
- * @param previous The value returned by the corresponding
- *                 `chaos_process_enter_internal()`.
+ * @param previous Value returned by chaos_process_enter_internal() on the same thread.
  */
 static inline void chaos_process_leave_internal(int previous)
 {
@@ -389,20 +324,15 @@ static inline void chaos_process_leave_internal(int previous)
 /** @defgroup chaos_process_atomics Atomic primitive wrappers
  *  @{
  *
- * All three functions map directly to GCC/Clang built-in synchronisation
- * primitives that compile to full memory-barrier instructions on all
- * supported architectures (x86_64: `mfence`/`lock xadd`; AArch64:
- * `dmb ish` + `ldxr`/`stxr` sequences).
+ * `__sync` builtins (the library is C99, so no `<stdatomic.h>`); each is a full barrier.
+ * 64-bit loads and stores are single-copy atomic on amd64 and arm64.
  */
 
 /**
- * @brief Atomically loads a uint64_t with a full memory barrier.
+ * @brief Loads @p value after a full barrier.
  *
- * The explicit `__sync_synchronize()` before the load prevents the compiler
- * and CPU from hoisting the load above a preceding store by another thread.
- *
- * @param value Pointer to the value to load.
- * @return The current value of *value.
+ * @param value Variable to read.
+ * @return The value; later loads are not reordered before it.
  */
 static inline uint64_t chaos_process_atomic_load_u64(volatile uint64_t *value)
 {
@@ -411,20 +341,15 @@ static inline uint64_t chaos_process_atomic_load_u64(volatile uint64_t *value)
 }
 
 /**
- * @brief Atomically compare-and-swap a uint64_t.
+ * @brief Replaces @p expected with @p desired atomically; a full barrier either way.
  *
- * If `*value == expected`, replaces `*value` with `desired` atomically and
- * returns non-zero (success).  Otherwise leaves `*value` unchanged and
- * returns 0 (failure).  Emits a full barrier on success.
+ * The reload claim: exactly one thread swaps the cached stamp to
+ * CHAOS_PROCESS_MTIME_RELOADING and does the I/O.
  *
- * Used by the config reload path to serialise concurrent reload attempts:
- * exactly one thread wins the CAS from `observed_mtime` to
- * `CHAOS_PROCESS_MTIME_RELOADING` and performs the actual I/O.
- *
- * @param value    Pointer to the target.
- * @param expected Value that must be present for the swap to occur.
- * @param desired  Value to store on success.
- * @return Non-zero on success, 0 on failure.
+ * @param value    Variable to update.
+ * @param expected Value that must be stored for the swap to happen.
+ * @param desired  Value to store.
+ * @return Non-zero when the swap happened.
  */
 static inline int
 chaos_process_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint64_t desired)
@@ -433,15 +358,12 @@ chaos_process_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint64
 }
 
 /**
- * @brief Atomically add `delta` to `*value` and return the pre-add value.
+ * @brief Adds @p delta to @p value atomically (full barrier).
  *
- * Emits a full memory barrier.  The pre-add value is what drives FAIL_AFTER
- * semantics: the first call returns 0, the second returns 1, and so on.
- * A rule fires when the returned pre-add value >= `rule->fail_after_count`.
- *
- * @param value Pointer to the counter to increment.
- * @param delta Amount to add (always 1 in production use).
- * @return The value of `*value` before the addition.
+ * @param value Counter.
+ * @param delta Increment; the library always passes 1.
+ * @return The value before the addition: 0 for the first FAIL_AFTER call, 1 for the
+ *         second, and so on.
  */
 static inline uint64_t chaos_process_atomic_fetch_add_u64(volatile uint64_t *value, uint64_t delta)
 {
@@ -452,17 +374,21 @@ static inline uint64_t chaos_process_atomic_fetch_add_u64(volatile uint64_t *val
 
 /** @defgroup chaos_process_prng Per-thread xorshift64* PRNG
  *  @{
+ *
+ * Drives the probability gate only; not cryptographic. Seed material (process seed XOR
+ * thread id XOR a stack address) goes through the SplitMix64 finaliser; the generator
+ * is xorshift64* (shifts 12/25/27, period 2^64 - 1 over non-zero states, multiplier
+ * 0x2545f4914f6cdd1d, upper 32 bits returned). State is `__thread`: no lock, no shared
+ * cache line.
  */
 
 /**
- * @brief Returns an identifier for the current kernel thread.
+ * @brief Kernel thread id of the caller, as seed material only.
  *
- * On Linux uses `SYS_gettid` to obtain the kernel thread ID, which is
- * unique among all threads in the process and persists across `fork()`.
- * On other platforms falls back to `getpid()` (adequate for single-threaded
- * processes; all threads will share the same value on those platforms).
+ * Raw `SYS_gettid`: the gettid() wrapper exists only since glibc 2.30. Off Linux the pid
+ * stands in and the stack address separates the threads.
  *
- * @return A uint64_t thread identifier, unique within the running system.
+ * @return Thread id (pid off Linux).
  */
 static inline uint64_t chaos_process_current_tid(void)
 {
@@ -474,15 +400,11 @@ static inline uint64_t chaos_process_current_tid(void)
 }
 
 /**
- * @brief Finalisation mix (Murmur3 / SplitMix64 variant) for seeding.
+ * @brief SplitMix64 finaliser: a bijective 64-bit mix, so structured inputs (sequential
+ *        thread ids) give unrelated states.
  *
- * Applies the SplitMix64 finaliser to `value`.  This is an invertible
- * bijection that distributes entropy uniformly across all 64 bits,
- * making it suitable for deriving independent PRNG seeds from sequential
- * or structured inputs (e.g. incrementing PIDs or TIDs).
- *
- * @param value Raw seed material.
- * @return Well-mixed 64-bit output suitable for use as a PRNG state.
+ * @param value Seed material of any quality.
+ * @return Mixed value; may be 0, callers that need a non-zero state ensure it.
  */
 static inline uint64_t chaos_process_prng_mix(uint64_t value)
 {
@@ -493,21 +415,10 @@ static inline uint64_t chaos_process_prng_mix(uint64_t value)
 }
 
 /**
- * @brief Lazily seeds the per-thread PRNG state on first use.
+ * @brief Seeds the calling thread's PRNG unless it already has a state.
  *
- * Seeds are derived by XOR-ing three entropy sources:
- *  1. The process-wide seed (`g_chaos_process_process_seed`) drawn from
- *     `/dev/urandom` at startup.
- *  2. The kernel thread ID (`chaos_process_current_tid()`), ensuring that
- *     threads born from the same parent get different streams.
- *  3. The address of a local stack variable, adding ASLR entropy.
- *
- * The combined material is then passed through `chaos_process_prng_mix()`
- * to eliminate any structural correlation.  If the result is zero (a
- * degenerate state for xorshift), a compile-time non-zero constant is used
- * as a fallback.
- *
- * This function is a no-op if the thread is already seeded.
+ * Process seed XOR thread id XOR the address of a local, mixed and forced odd, so the
+ * state is never 0 (the one state xorshift64* never leaves).
  */
 static inline void chaos_process_prng_ensure_seeded(void)
 {
@@ -521,18 +432,18 @@ static inline void chaos_process_prng_ensure_seeded(void)
     seed = g_chaos_process_process_seed;
     seed ^= chaos_process_current_tid();
     seed ^= (uint64_t)(uintptr_t)&seed;
-    /* Odd: never 0, the one state xorshift64* cannot leave. */
+    /* Odd, hence never 0: the one state xorshift64* cannot leave. */
     g_chaos_process_tls_prng_state = chaos_process_prng_mix(seed) | 1U;
 }
 
 /**
- * @brief Explicitly seeds the per-thread PRNG state.
+ * @brief Seeds the calling thread's PRNG with mix(@p seed): the constructor seeds its
+ *        thread this way, and unit tests use it for reproducible streams.
  *
- * Used during library initialisation to seed the main thread immediately
- * after the process-wide seed has been established.  A seed of 0 is
- * mapped to 1 before mixing to avoid the xorshift degenerate state.
+ * Not forced odd; a mixed value of 0 only reads as "unseeded" and is replaced on the
+ * next draw.
  *
- * @param seed 64-bit seed material; 0 is treated as 1.
+ * @param seed Seed; 0 is replaced by 1 before mixing.
  */
 static inline void chaos_process_prng_seed_thread(uint64_t seed)
 {
@@ -540,18 +451,10 @@ static inline void chaos_process_prng_seed_thread(uint64_t seed)
 }
 
 /**
- * @brief Advances the per-thread xorshift64* PRNG and returns 32 bits of
- *        output.
+ * @brief Next 32-bit value of the calling thread's xorshift64* stream; seeds it on first
+ *        use.
  *
- * The PRNG is the xorshift64 generator with the multiplier from Vigna
- * (2016), producing 32 bits by taking the high word of the 64-bit
- * state-times-multiplier product.  Statistical quality is sufficient for
- * probability sampling; this is not a cryptographic PRNG.
- *
- * Lazy seeding via `chaos_process_prng_ensure_seeded()` is called on every
- * invocation; it is a no-op after the first call.
- *
- * @return A pseudo-random uint32_t uniformly distributed over [0, 2^32).
+ * @return Uniform value in [0, 2^32).
  */
 static inline uint32_t chaos_process_prng_next_u32(void)
 {
@@ -569,15 +472,18 @@ static inline uint32_t chaos_process_prng_next_u32(void)
 /** @} */
 
 /**
- * @brief Resolves every downstream symbol once, whichever caller comes first.
+ * @brief Resolves the real functions once, on whichever call comes first.
  *
  * @details The constructor alone is not enough: ELF initialisers run in dependency
- * order, so another object's constructor can reach an interposed wrapper before
- * this library's constructor has run. Every exported wrapper calls this first.
+ * order, so another object's constructor can reach a wrapper before this library's
+ * constructor has run. Every wrapper calls this first. Other threads wait (spinning on
+ * sched_yield()) until resolution completes; a call re-entering from the resolving
+ * thread (dlsym -> preloaded allocator, or a signal handler) returns at once and the
+ * helpers fall back (see chaos_once.h). After completion the cost is one acquire load.
  */
 void chaos_process_ensure_symbols(void);
 
-/** @brief Resolves `pthread_create` on demand; see chaos_process.c. */
+/** @brief Looks up `pthread_create` if still unresolved; no abort when absent. */
 void chaos_process_resolve_pthread_create(void);
 
 #endif
