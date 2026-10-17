@@ -1,26 +1,28 @@
 /**
  * @file bench_net.c
- * @brief Stage 3 microbenchmarks for libchaos-net.
+ * @brief Per-call overhead of the libchaos-net wrappers for socket I/O and lifecycle calls.
  *
  * @details
- * Three benchmarks against an `AF_UNIX` socketpair, which avoids any
- * kernel networking stack work and isolates the chaos library overhead.
- * The chaos-net library uses endpoint-based selectors (`unix://\*`,
- * `tcp4://...`) so the AF_UNIX path is the cleanest fixture for
- * measuring the per-call cost without the noise of TCP/UDP framing.
+ * All kernels use AF_UNIX sockets, so no IP stack, routing or NIC is involved and the
+ * kernel cost is a buffer copy between two sockets in one process. Every scenario uses
+ * the selector `unix://\*`, which matches any AF_UNIX socket.
  *
- *  1. `send_passthrough` — 64-byte `send` over the socketpair, no rule.
- *  2. `send_match_no_fire` — same, probability=0 rule loaded.
- *  3. `send_errno` — same, probability=1 ERRNO rule (synthetic EHOSTUNREACH).
+ * Each hooked call has `_passthrough`, `_match_no_fire` and `_errno` variants with one
+ * shared iteration body; `run-bench.sh` runs each without LD_PRELOAD (baseline) and with
+ * LD_PRELOAD=libchaos-net.so plus `benchmark/scenarios/net-<fn>-*.conf` copied to the
+ * rule file `/tmp/.chaos-net.conf` (treatment).
  *
- * Setup creates the socketpair, sets both ends non-blocking, and pre-
- * touches the receive end's buffer so subsequent receives are cheap.
- * Iter sends and immediately drains.  The drain is *outside* the
- * timed call sequence (the iter only times the send; the recv is
- * implicit in iter wraparound).  In practice we drain inside the iter
- * so the socket buffer never fills — the cost we record covers
- * `send + recv` together but the chaos rule selector targets `send`
- * only, isolating the metric we care about.
+ * The data-path kernels pair the hooked call with its counterpart (send with recv,
+ * recvfrom with send, and so on) inside one timed iteration, so the socket buffer never
+ * fills and the timed cost covers both calls. Only the hooked call has a rule, so the
+ * baseline/treatment delta is still one wrapper, plus the empty-rule pass through the
+ * counterpart's wrapper. Sockets are non-blocking, so a drained buffer returns EAGAIN
+ * instead of hanging the run (for example in the `_errno` arm, where nothing was sent).
+ *
+ * Scenario status at this revision (checked against src/net/chaos_net_config.c):
+ * send, recv, socket_close and shutdown are effective; sendto, recvfrom, sendmsg and
+ * recvmsg use operation tokens libchaos-net does not accept, so their `_match_no_fire`
+ * and `_errno` arms measure the passthrough path.
  */
 
 #include "chaos_bench.h"
@@ -57,8 +59,8 @@ static void bench_net_setup(void *user_state)
         perror("bench_net: socketpair");
         abort();
     }
-    /* Non-blocking on both ends so a stuck recv never deadlocks the
-     * benchmark (e.g. if a chaos LATENCY rule causes a stall). */
+    /* Non-blocking on both ends: when a send is suppressed (`_errno` arm) the paired
+     * recv must return EAGAIN instead of blocking the single-threaded run forever. */
     for (int i = 0; i < 2; ++i)
     {
         flags = fcntl(s->sv[i], F_GETFL, 0);
@@ -96,9 +98,9 @@ CHAOS_BENCH("net", send_errno,         bench_net_state_t,
             bench_net_setup, bench_net_iter_send, bench_net_teardown)
 
 /* ------------------------------------------------------------------ recv ---
- * `recv` on a non-blocking AF_UNIX socket with no pending data: returns
- * -1/EAGAIN immediately.  Times the chaos hook + libc + kernel fast-path,
- * without depending on data movement.
+ * `recv` on an empty non-blocking AF_UNIX datagram socket: every baseline call returns
+ * -1/EAGAIN at once, so the iteration measures the wrapper and the syscall entry
+ * without data movement. The `_errno` scenario injects the same EAGAIN.
  */
 typedef struct bench_net_drain_state
 {
@@ -143,9 +145,9 @@ CHAOS_BENCH("net", recv_errno,          bench_net_drain_state_t,
             bench_net_drain_setup, bench_net_iter_recv, bench_net_drain_teardown)
 
 /* --------------------------------------------------- sendto / recvfrom ---
- * `sendto` to a self-bound UDP loopback socket; `recvfrom` reads back.
- * Pair of non-blocking socketpair-style setups, but using SOCK_DGRAM so
- * sendto/recvfrom are the natural API.
+ * Same connected AF_UNIX stream socketpair as the send kernel. sendto passes a NULL
+ * address (valid on a connected socket) and recvfrom a NULL address buffer, so only
+ * the entry point differs from send/recv.
  */
 static void bench_net_iter_sendto(void *user_state)
 {
@@ -180,6 +182,8 @@ CHAOS_BENCH("net", recvfrom_errno,         bench_net_state_t,
             bench_net_setup, bench_net_iter_recvfrom, bench_net_teardown)
 
 /* --------------------------------------------------- sendmsg / recvmsg ---
+ * One-iovec msghdr over an AF_UNIX stream socketpair, prepared once in setup so the
+ * iteration does not rebuild it. No control messages.
  */
 typedef struct bench_net_msg_state
 {
@@ -254,8 +258,10 @@ CHAOS_BENCH("net", recvmsg_errno,         bench_net_msg_state_t,
             bench_net_msg_setup, bench_net_iter_recvmsg, bench_net_msg_teardown)
 
 /* ------------------------------------------------------- socket / shutdown ---
- * Per-iter `socket(AF_UNIX)` + `close`.  Pairs the cheapest socket-creation
- * call with close.  `shutdown` adds a single extra hooked syscall per iter.
+ * `socket(AF_UNIX, SOCK_DGRAM)` followed by `close`; the shutdown kernel inserts
+ * `shutdown(SHUT_RDWR)` on the unconnected socket between them. All three calls are
+ * wrapped. Both kernels are capped at 20000 iterations. In the socket `_errno` arm
+ * socket fails with EMFILE and close is skipped.
  */
 typedef struct bench_net_sock_state
 {

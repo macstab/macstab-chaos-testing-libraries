@@ -1,3 +1,10 @@
+# Builds and tests the four release variants (glibc|musl x amd64|arm64) on every branch push.
+#
+# Each variant builds on a runner of its own architecture (ubuntu-24.04 / ubuntu-24.04-arm), so
+# no emulation and no cross-toolchain is involved; musl variants use musl-gcc from musl-tools.
+# The per-libc runtime suites then load the fresh dist/ objects in glibc or Alpine containers
+# of the same architecture. The objects are uploaded for 14 days for manual inspection; release
+# binaries are rebuilt by release.yml.
 name: matrix
 
 on:
@@ -7,13 +14,17 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same ref supersedes the running matrix.
 concurrency:
   group: matrix-${{ github.ref }}
   cancel-in-progress: true
 
+# FORCE_JAVASCRIPT_ACTIONS_TO_NODE24 runs JavaScript actions on Node 24 ahead of GitHub's
+# default switch.
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  # A runtime suite that cannot run (no docker, another architecture) fails.
+  # Runtime suites exit with CHAOS_SKIP_EXIT when they cannot run (no docker, foreign
+  # architecture); 1 turns such a skip into a failure instead of a silent pass.
   CHAOS_SKIP_EXIT: "1"
 
 jobs:
@@ -45,7 +56,8 @@ jobs:
 
       - name: Cross-build ${{ matrix.target.libc }}-${{ matrix.target.arch }}
         run: |
-          # On native arm64 runners musl-tools ships musl-gcc (not aarch64-linux-musl-gcc)
+          # The Makefile defaults to the cross-compiler name aarch64-linux-musl-gcc; on a native
+          # arm64 runner musl-tools installs the compiler as musl-gcc.
           EXTRA_ARGS=""
           if [ "${{ matrix.target.libc }}" = "musl" ] && \
              [ "${{ matrix.target.arch }}" = "arm64" ]; then

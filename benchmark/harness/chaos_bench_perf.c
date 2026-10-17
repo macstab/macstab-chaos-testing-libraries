@@ -1,38 +1,32 @@
 /**
  * @file chaos_bench_perf.c
- * @brief Linux `perf_event_open(2)` wrapper; stub on non-Linux.
+ * @brief `perf_event_open(2)` implementation of chaos_bench_perf.h; stubs on non-Linux.
  *
  * @details
- * See chaos_bench_perf.h for the contract.  This file's job is to (a)
- * open the counter panel, (b) start / stop / read counters around the
- * measurement window, and (c) emit a coherent failure reason when the
- * kernel refuses.  The most common refusal mode in containers is
- * `EACCES` from `perf_event_paranoid >= 3`; we surface this verbatim so
- * the operator can fix it (or accept the absence of PMU data).
+ * Opens the counter panel, brackets the measurement loop with reset/enable and
+ * disable/read, and records a readable reason when the kernel refuses. Inside containers
+ * the usual refusal is `EACCES`/`EPERM` from `perf_event_paranoid` or the seccomp profile;
+ * the reason string carries `strerror` verbatim so the operator can grant access or accept
+ * the missing counters.
  *
- * **Group-leader pattern.**
- * Hardware counters are opened against the `cycles` leader (group_fd =
- * leader's fd, read_format inherited).  This guarantees they are
- * scheduled atomically by the kernel — every counter in the group reads
- * the same interval.  Without grouping, the kernel may multiplex on a
- * CPU that has fewer counters than we requested, scaling the values; we
- * lose precision.  Grouping caps us at the number of counters the CPU's
- * PMU supports simultaneously (typically 4–8), which is enough for our
- * panel of 7 hardware counters.
+ * **Group leader.**
+ * Hardware events are opened with `group_fd` set to the `cycles` fd. The kernel schedules a
+ * group onto the PMU all-or-nothing, so every member counts the same interval and none is
+ * multiplexed and scaled. The price: the group must fit the PMU's simultaneous counters
+ * (typically 4-8 general-purpose counters plus fixed ones). If it does not fit, the members
+ * that overflow may fail to open (and report 0) or the group may not be scheduled at all;
+ * no `read_format` time fields are requested, so the latter is not detectable from the
+ * counts.
  *
- * Software counters (`context_switches`, `cpu_migrations`,
- * `page_faults`) are not grouped: the kernel does not allow mixing
- * hardware and software events under one leader on every
- * microarchitecture.  They are opened independently and read individually.
+ * Software events are opened standalone: hardware and software events cannot be grouped
+ * under one leader on every PMU, and software events never compete for PMU counters.
  *
- * **What this file does NOT do.**
- *  - It does not retry on transient ENOSPC (PMU exhaustion).  A failure
- *    here is reported once and the counter remains unused.
- *  - It does not support per-CPU sampling — we use `pid=0` (calling
- *    process) and `cpu=-1` (any CPU), which gives task-scoped counts.
- *    Per-CPU sampling is a Stage 4 capability for cache-line studies.
- *  - It does not enable kernel-mode counting (`exclude_kernel = 1`).
- *    Pure user-space counts are what we want for chaos library overhead.
+ * **Scope.**
+ *  - No retry on transient errors such as ENOSPC; a failed event stays unused.
+ *  - `pid = 0`, `cpu = -1`: the calling thread on any CPU. Threads the benchmark creates are
+ *    not counted (`inherit` is 0).
+ *  - `exclude_kernel = 1`, `exclude_hv = 1`: user-space work of the wrapper and the
+ *    benchmark only; syscall time inside the kernel is not counted.
  */
 
 #include "chaos_bench_perf.h"
@@ -63,7 +57,8 @@ const char *const chaos_bench_pmu_counter_names[CHAOS_BENCH_PMU_COUNTER_COUNT] =
 #include <fcntl.h>
 
 /**
- * @brief Per-counter configuration table.
+ * @brief Event description: perf type, config word, and whether it is a software event
+ *        (opened outside the hardware group).
  */
 typedef struct chaos_bench_pmu_event
 {
@@ -75,8 +70,8 @@ typedef struct chaos_bench_pmu_event
 /**
  * @brief Encodes a CACHE event triple as the perf 64-bit config word.
  *
- * @details See `linux/perf_event.h`: the CACHE event type packs the
- * (cache id, op id, result id) tuple into a single 64-bit config field.
+ * @details `PERF_TYPE_HW_CACHE` config layout from `linux/perf_event.h`: cache id in bits
+ * 0-7, operation in bits 8-15, result in bits 16-23.
  */
 #define CHAOS_BENCH_CACHE_CFG(cache, op, res) \
     (((uint64_t)(cache)) | ((uint64_t)(op) << 8) | ((uint64_t)(res) << 16))
@@ -98,7 +93,10 @@ static const chaos_bench_pmu_event_t chaos_bench_pmu_events[CHAOS_BENCH_PMU_COUN
 };
 
 /**
- * @brief Wrapper around `perf_event_open(2)` syscall.
+ * @brief Invokes `perf_event_open(2)` through `syscall(2)`; neither glibc nor musl provides a
+ *        wrapper.
+ *
+ * @return New fd, or -1 with errno set.
  */
 static long chaos_bench_perf_event_open(
     struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd, unsigned long flags
@@ -134,7 +132,8 @@ int chaos_bench_pmu_init(chaos_bench_pmu_t *pmu)
         attr.exclude_kernel = 1;
         attr.exclude_hv     = 1;
 
-        /* Software counters are opened standalone (no group leader). */
+        /* Software events never join the hardware group; group_fd is -1 for them and, if
+         * cycles failed to open, for the hardware events too. */
         leader_fd = chaos_bench_pmu_events[i].is_software ? -1 : group_fd;
 
         fd = (int)chaos_bench_perf_event_open(&attr, /*pid=*/0, /*cpu=*/-1,
@@ -179,8 +178,8 @@ void chaos_bench_pmu_start(chaos_bench_pmu_t *pmu)
         if (pmu->fds[i] < 0) continue;
         (void)ioctl(pmu->fds[i], PERF_EVENT_IOC_RESET, 0);
     }
-    /* Enable the hardware-event leader (i=0); software events are armed
-     * implicitly when their disabled bit defaults to 0. */
+    /* Enabling the leader with PERF_IOC_FLAG_GROUP starts the whole hardware group.
+     * Software events were created enabled (disabled = 0) and need no ioctl. */
     if (pmu->fds[0] >= 0)
     {
         (void)ioctl(pmu->fds[0], PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);

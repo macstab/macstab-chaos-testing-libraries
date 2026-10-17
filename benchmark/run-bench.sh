@@ -1,24 +1,32 @@
 #!/bin/sh
 # =============================================================================
-# benchmark/run-bench.sh
+# benchmark/run-bench.sh - baseline vs LD_PRELOAD benchmark sweep in Docker.
 #
-# Stage 2/3 wrapper: drives the chaos-bench harness inside the Tier 1
-# Docker images (glibc/debian or musl/alpine), builds the .so libraries
-# and the harness, runs each benchmark with the right scenario / LD_PRELOAD
-# combination, collects JSON envelopes into benchmark/reports/<git-sha>/,
-# and (optionally) runs the A/B comparison driver.
+# Builds a Tier 1 image (glibc or musl), then inside it builds the six
+# libchaos libraries and the harness and runs every benchmark twice: without
+# LD_PRELOAD (baseline) and with the library plus a scenario copied to its
+# rule file (passthrough, match-no-fire, errno). Each run writes one JSON
+# envelope, <report-dir>/<benchmark>.<arm>.<run>.json, tagged ADVISORY.
 #
-# Usage:
-#   ./benchmark/run-bench.sh [--smoke|--full]      # default: full
-#   ./benchmark/run-bench.sh --libc=alpine         # musl image instead of glibc
-#   ./benchmark/run-bench.sh --runs=N              # repeat each cell N times
-#   ./benchmark/run-bench.sh --compare             # run driver after sweep
-#   ./benchmark/run-bench.sh --in-container        # inner mode (set by Docker)
-#
-# Environment overrides:
-#   BENCH_WARMUP       warmup iterations (default: 10000)
-#   BENCH_ITERS        measurement iterations (default: 200000)
-#   BENCH_REPORT_DIR   output directory (default: benchmark/reports/<sha>)
+# Usage: ./benchmark/run-bench.sh [options]     (run from anywhere)
+#   --full            every library and benchmark (default)
+#   --smoke           libchaos-time clock_gettime baseline/passthrough only
+#   --libc=glibc      Debian 12 image (default)
+#   --libc=alpine     Alpine 3.19 musl image (alias: --libc=musl)
+#   --runs=N          repeat the whole sweep N times (default 1); the driver
+#                     needs >= 5 runs per arm to flag a regression at p < 0.01
+#   --compare         after the sweep, write <report-dir>/comparison.md with
+#                     benchmark/driver/chaos_bench_driver.py (needs python3)
+#   --in-container    internal: the inner half, run by the outer half
+#   -h, --help        print this text
+# Environment:
+#   BENCH_WARMUP      warmup iterations per run (default 10000)
+#   BENCH_ITERS       measured iterations per run (default 200000; slow
+#                     kernels use fixed lower caps)
+#   BENCH_REPORT_DIR  host report dir (default benchmark/reports/<short-sha>);
+#                     the container always writes to the default path
+# Exit: 2 unknown option, 3 no docker, 1 regression flagged by --compare,
+# otherwise the status of the first failing command.
 # =============================================================================
 
 set -eu
@@ -70,10 +78,16 @@ if [ "$in_container" -eq 0 ]; then
     mkdir -p "$BENCH_REPORT_DIR"
     echo ">>> running $mode sweep ($libc, $runs run(s)); reports → $BENCH_REPORT_DIR"
 
-    # --cap-add SYS_ADMIN gives the container CAP_PERFMON-equivalent on
-    # most distros so perf_event_open works.  --security-opt is needed
-    # on hardened daemons.  Without these the harness still runs, but
-    # the JSON envelope will say `pmu.available: false`.
+    # --cpuset-cpus=0,1 keeps the run on two fixed CPUs so the scheduler cannot
+    # migrate it across the whole machine between runs; --memory=2g bounds it.
+    # PMU access: --cap-add=SYS_ADMIN satisfies perf_event_open's capability check
+    # on every kernel (CAP_PERFMON exists only from Linux 5.8), and
+    # seccomp=unconfined lifts Docker's default seccomp profile, which blocks
+    # perf_event_open on some Docker versions. Without them the harness still runs
+    # and the envelope reports the PMU as unavailable.
+    # The container always writes to /work/benchmark/reports/<sha>: a host-side
+    # BENCH_REPORT_DIR override is not passed through, so --compare would then read
+    # a directory the sweep never wrote.
     docker run --rm \
         --cpuset-cpus="0,1" \
         --memory=2g \
@@ -115,7 +129,8 @@ make -f benchmark/Makefile.bench bench-build >/dev/null
 
 mkdir -p "$BENCH_REPORT_DIR"
 
-# Map (subsystem, scenario_tag) → (LD_PRELOAD path, target path).
+# Scenario files live in the bind-mounted repository; the harness copies the
+# chosen one to the library's rule file (--scenario-target) before setup.
 SCEN_DIR=/work/benchmark/scenarios
 
 run_one() {
@@ -137,12 +152,10 @@ run_one() {
                   --warmup="$BENCH_WARMUP" --iters="$BENCH_ITERS" \
                   --output="$out"
     fi
-    # Sanity check: the bench harness always writes a JSON envelope on
-    # successful completion.  Empty/missing file means the binary
-    # crashed before reaching the runner output stage — usually a chaos
-    # rule self-DOS'd a libc call at startup, a scenario syntax error,
-    # or an unknown --benchmark name.  Set -e will already have aborted
-    # on non-zero exit; this guards the "exit 0, no output" case.
+    # A zero exit with no envelope means the run never reached the JSON writer
+    # (for example a rule that broke one of the harness's own libc calls). A
+    # non-zero exit has already stopped the script under set -e, except inside
+    # the `run_trio ... || true` lines below, where set -e is suspended.
     if [ ! -s "$out" ]; then
         echo "run-bench.sh: ERROR: $bench_name ($tag) produced no envelope" >&2
         echo "  output:    $out" >&2
@@ -153,10 +166,13 @@ run_one() {
     fi
 }
 
-# Run a baseline + 3-scenario trio for one hooked function with optional
-# per-call iter throttling.  Heavy hooks like fork/execve/getaddrinfo
-# pass an "iters" override; cheap hooks pass "" to keep BENCH_ITERS.
-# Args: bench_prefix, iters_override, binary, lib, empty_conf, conf_stem, target
+# run_trio PREFIX ITERS BINARY LIB EMPTY_CONF STEM RULE_FILE
+# Runs PREFIX_passthrough, PREFIX_match_no_fire and PREFIX_errno, each once
+# without LD_PRELOAD (tag "baseline") and once with LIB and its scenario
+# (EMPTY_CONF, STEM-match-no-fire.conf, STEM-errno.conf). Every benchmark gets its
+# own baseline so the driver compares like with like. ITERS, when non-empty,
+# replaces BENCH_ITERS for this trio: slow calls (fork, execve, getaddrinfo,
+# open/close) would otherwise run for minutes.
 run_trio() {
     pfx="$1"; iters="$2"; bin="$3"; lib="$4"; empty="$5"; stem="$6"; tgt="$7"
     saved="$BENCH_ITERS"
@@ -208,8 +224,9 @@ while [ "$run_idx" -lt "$runs" ]; do
     run_trio fsync        20000   "$BIN" "$LIB" io-empty.conf io-fsync        "$TGT"
     run_trio fdatasync    20000   "$BIN" "$LIB" io-empty.conf io-fdatasync    "$TGT"
     run_trio ftruncate    ""      "$BIN" "$LIB" io-empty.conf io-ftruncate    "$TGT"
-    # Linux-only kernels (compiled out on Darwin); the binary returns
-    # "unknown benchmark" silently if absent — `|| true` gates that.
+    # fallocate and sendfile exist only in Linux builds of bench_io. If one is
+    # missing the binary prints "benchmark '...' not registered" and exits 3;
+    # `|| true` keeps the sweep going (and suspends set -e inside run_trio).
     run_trio fallocate    20000   "$BIN" "$LIB" io-empty.conf io-fallocate    "$TGT" || true
     run_trio sendfile     ""      "$BIN" "$LIB" io-empty.conf io-sendfile     "$TGT" || true
 

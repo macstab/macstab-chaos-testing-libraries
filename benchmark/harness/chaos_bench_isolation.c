@@ -1,48 +1,41 @@
 /**
  * @file chaos_bench_isolation.c
- * @brief Computes the harness's `OFFICIAL` vs `ADVISORY` execution mode.
+ * @brief Decides the `OFFICIAL` vs `ADVISORY` execution mode from the captured environment.
  *
  * @details
- * The harness publishes its execution mode in every JSON envelope.
- * `OFFICIAL` means every isolation precondition passed and the numbers
- * are suitable for publication or release-gate comparison.  `ADVISORY`
- * means at least one precondition failed; results are still valid for
- * change-detection on the same machine but must not be cited as
- * authoritative numbers.
+ * Every JSON envelope carries `execution.mode`. `OFFICIAL` means every isolation check below
+ * passed and the numbers may be published or used as a release gate. `ADVISORY` means at
+ * least one check failed; the numbers remain valid for change detection on the same host
+ * but must not be cited as absolute costs.
  *
- * **Precondition matrix (Stage 1).**
+ * **Checks.** Each failed check adds one warning with this `check` identifier.
  *
- * | Check                | Pass condition                                   | Why it matters                           |
- * |----------------------|--------------------------------------------------|------------------------------------------|
- * | governor             | `cpu0` governor is `performance`                 | freq scaling injects 5–30% variance      |
- * | constant_tsc         | x86_64 has CPUID flag                            | rdtscp ↔ ns conversion stability         |
- * | nonstop_tsc          | x86_64 has CPUID flag                            | TSC continues across C-states            |
- * | isolated             | `/sys/.../isolated` non-empty                    | scheduler can't preempt our core         |
- * | container            | `/.dockerenv` absent                             | container ⇒ host scheduler/governor rule |
- * | smt_off              | sibling list has no comma/dash                   | SMT sibling steals execution units       |
+ * | check          | Passes when                                  | Why it matters                |
+ * |----------------|----------------------------------------------|-------------------------------|
+ * | `governor`     | cpu0 governor reads `performance`            | DVFS adds 5-30 % noise        |
+ * | `isolcpus`     | `/sys/devices/system/cpu/isolated` non-empty | other tasks share the core    |
+ * | `container`    | `/.dockerenv` absent                         | host owns scheduler and IRQs  |
+ * | `smt`          | cpu0 sibling list has no `,` or `-`          | sibling shares exec units     |
+ * | `constant_tsc` | flag present (x86 only)                      | TSC rate fixed in P-states    |
+ * | `nonstop_tsc`  | flag present (x86 only)                      | TSC runs in deep C-states     |
  *
- * On aarch64 we skip the two TSC checks (the architected timer is
- * always invariant); everything else applies identically.
+ * The TSC checks are compiled only for x86; other architectures skip them (the aarch64
+ * generic timer is invariant by definition).
  *
- * **What we do NOT check, and why.**
- *  - `nohz_full`, `rcu_nocbs`: not exposed via a single canonical path;
- *    the same effect is captured indirectly by the variance of the
- *    measurements themselves (Stage 2 will add this as a derived check).
- *  - IRQ affinity: requires reading every `/proc/irq/\*\/smp_affinity`,
- *    which is privileged on hardened hosts.  We rely on the bench host
- *    being configured correctly at provisioning time.
- *  - Thermal throttling: cannot be checked statically; appears as
- *    bimodality in the sample distribution (Stage 2).
- *  - Microcode version: captured in env metadata but does not affect
- *    OFFICIAL/ADVISORY status.  A microcode change that regresses
- *    benchmarks is itself a finding.
+ * The isolcpus check only requires the list to be non-empty; it does not verify that the
+ * process runs on an isolated CPU. Pinning to one is the caller's responsibility.
  *
- * **Bias.**
- * The check is intentionally pessimistic: any single failed precondition
- * downgrades to ADVISORY.  This produces false negatives (a benchmark
- * that would have been fine in advisory mode is downgraded too) but
- * never false positives — a JSON envelope tagged OFFICIAL has met every
- * documented condition.
+ * **Not checked.**
+ *  - `nohz_full`, `rcu_nocbs`: no single canonical sysfs file; their absence shows up as
+ *    sample variance.
+ *  - IRQ affinity: needs every `/proc/irq/\*\/smp_affinity`, which hardened hosts restrict;
+ *    it is a host provisioning duty.
+ *  - Thermal throttling: not detectable statically; it shows up as bimodal samples.
+ *  - Microcode revision: not captured.
+ *
+ * **Bias.** Conservative by design: any single failure downgrades to `ADVISORY`. A host that
+ * would have measured cleanly can be marked `ADVISORY` (false alarm), but an `OFFICIAL` tag
+ * always means every listed check passed.
  */
 
 #include "chaos_bench_internal.h"
@@ -51,11 +44,12 @@
 #include <string.h>
 
 /**
- * @brief Appends one warning to @p warnings if it has space.
+ * @brief Appends a warning with identifier @p check and detail `fmt % value`.
  *
- * @details Out-of-band: silently drops the warning past the cap so the
- * caller has a constant-time append regardless of how many checks fail.
- * The runner reports total drops via a synthetic "...truncated" entry.
+ * @details Drops the warning silently once @ref CHAOS_BENCH_MAX_WARNINGS (32) are stored; no
+ * truncation marker is emitted. With six checks the cap is unreachable today. @p check must
+ * have static storage duration (it is stored by pointer); @p value NULL formats as "". The
+ * detail is truncated to 255 bytes.
  */
 static void chaos_bench_warn(
     chaos_bench_warning_t *warnings,
@@ -84,7 +78,7 @@ chaos_bench_exec_mode_t chaos_bench_isolation_check(
 {
     *count = 0U;
 
-    /* Governor must be `performance` to bound frequency drift. */
+    /* Any governor but performance lets the core clock drift during the run. */
     if (strcmp(env->governor, "performance") != 0)
     {
         chaos_bench_warn(warnings, count,
@@ -93,7 +87,7 @@ chaos_bench_exec_mode_t chaos_bench_isolation_check(
                          env->governor[0] != '\0' ? env->governor : "<absent>");
     }
 
-    /* CPU isolation list must be non-empty. */
+    /* Non-empty list only; whether this process runs on an isolated CPU is not checked. */
     if (env->isolated_cpus[0] == '\0')
     {
         chaos_bench_warn(warnings, count,
@@ -102,7 +96,7 @@ chaos_bench_exec_mode_t chaos_bench_isolation_check(
                          NULL);
     }
 
-    /* Container ⇒ host owns scheduler / governor / IRQs. */
+    /* Inside Docker the host, not the container, owns scheduler, governor and IRQs. */
     if (env->container_marker)
     {
         chaos_bench_warn(warnings, count,
@@ -111,7 +105,7 @@ chaos_bench_exec_mode_t chaos_bench_isolation_check(
                          NULL);
     }
 
-    /* SMT sibling co-tenancy steals execution units. */
+    /* A busy SMT sibling competes for the same execution units and caches. */
     if (env->smt_active)
     {
         chaos_bench_warn(warnings, count,

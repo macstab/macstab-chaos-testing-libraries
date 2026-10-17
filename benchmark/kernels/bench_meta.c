@@ -1,24 +1,26 @@
 /**
  * @file bench_meta.c
- * @brief Harness self-validation benchmarks.
+ * @brief Harness self-validation kernels: they measure the harness, not a libchaos library.
  *
  * @details
- * Two kernels that validate the benchmark harness itself rather than a
- * chaos library:
+ * `make -f benchmark/Makefile.bench bench-validate` runs both kernels (1000 warmup,
+ * 10000 measured iterations) and prints the expected range before each result. The
+ * check is by eye: nothing asserts on the numbers. Neither kernel is part of the
+ * `run-bench.sh` sweep and neither is run under LD_PRELOAD.
  *
- *  1. `nop_loop_1k` — accumulates 1000 integer additions with no memory
- *     traffic beyond the single state slot.  Expected cost: ~300–3000 ns/iter
- *     (loop body + branch prediction), depending on the host.  If the harness
- *     reports a value far outside this range, the timer calibration is suspect.
+ * | Kernel           | Iteration body                                 | Expected     |
+ * |------------------|------------------------------------------------|--------------|
+ * | `nop_loop_1k`    | 1000 dependent 64-bit additions on a register  | 300–3000 ns  |
+ * | `clock_overhead` | one `clock_gettime(CLOCK_MONOTONIC_RAW)`       | 5–30 ns      |
  *
- *  2. `clock_overhead` — one `clock_gettime(CLOCK_MONOTONIC_RAW)` call per
- *     iteration, measuring the vDSO overhead in isolation.  Expected: 5–30
- *     ns/iter on a modern Linux/vDSO host.  If the harness overhead_ns field
- *     is comparable to or larger than this number, the harness's own timer
- *     reads are too expensive for the workloads being measured.
- *
- * These kernels are used by `make bench-validate` to assert that the harness
- * is producing plausible numbers on the current host.
+ * Reading the results:
+ *  - `nop_loop_1k` far outside its range points at timer calibration (cycle-to-ns
+ *    conversion). The loop has a closed form (`seed + 499500`); if the compiler applies
+ *    final-value replacement the body collapses to one add and the result drops to a
+ *    few ns. A result far below 300 ns therefore indicates folding, not a fast host.
+ *  - `clock_overhead` is the cost of one vDSO clock read. If the envelope's
+ *    `timer.overhead_ns` is of the same order, the harness's own timer reads dominate any
+ *    kernel that costs only a few tens of ns, and `--batch` is required for it.
  */
 
 #include "chaos_bench.h"
@@ -30,8 +32,8 @@
 
 typedef struct bench_meta_loop_state
 {
-    uint64_t seed; /**< Prevents the compiler from constant-folding the loop. */
-    uint64_t sink; /**< Receives the loop result; kept live by DO_NOT_OPTIMIZE. */
+    uint64_t seed; /**< Runtime start value, so the final sum is not a compile-time constant. */
+    uint64_t sink; /**< Loop result; CHAOS_BENCH_DO_NOT_OPTIMIZE keeps the loop alive. */
 } bench_meta_loop_state_t;
 
 static void bench_meta_loop_setup(void *user_state)

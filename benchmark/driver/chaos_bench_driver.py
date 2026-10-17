@@ -81,9 +81,9 @@ def _wilcoxon_rank_sum_z(a: list[float], b: list[float]) -> tuple[float, float, 
     if n1 == 0 or n2 == 0:
         return float("nan"), float("nan"), float("nan")
 
-    # Build joint sample with rank-tagging.
+    # Pool both groups, tagging each value with its group (0 = a, 1 = b), and rank them.
     joined = sorted([(v, 0) for v in a] + [(v, 1) for v in b], key=lambda x: x[0])
-    # Average ranks for ties.
+    # Tied values share the mean of the ranks they span (midranks).
     ranks: list[float] = [0.0] * (n1 + n2)
     i = 0
     while i < len(joined):
@@ -100,12 +100,15 @@ def _wilcoxon_rank_sum_z(a: list[float], b: list[float]) -> tuple[float, float, 
     u2 = n1 * n2 - u1
     u_stat = min(u1, u2)
 
+    # No tie correction in sigma: with ties the variance is overstated, so |z| is
+    # slightly understated and the p-value errs on the conservative side.
     mu = n1 * n2 / 2.0
     sigma = math.sqrt(n1 * n2 * (n1 + n2 + 1) / 12.0)
     if sigma == 0.0:
         return u_stat, 0.0, 1.0
     z = (u_stat - mu) / sigma
-    # Two-sided p-value via the standard-normal survival function.
+    # Two-sided p-value. u_stat is min(U1, U2), so z <= 0 and abs(z) is the distance
+    # from the null mean.
     p = 2.0 * (1.0 - _phi(abs(z)))
     return u_stat, z, max(0.0, min(1.0, p))
 
@@ -144,6 +147,7 @@ def _bootstrap_median_delta_ci(
     """
     if not a or not b:
         return (float("nan"), float("nan"))
+    # Fixed seed: the same inputs always give the same interval, so reports diff cleanly.
     rng = random.Random(0)
     deltas: list[float] = []
     for _ in range(iterations):
@@ -156,14 +160,13 @@ def _bootstrap_median_delta_ci(
     return (lo, hi)
 
 
-# --------------------------------------------------------------- group ---
-
 # -------------------------------------------------- reference CPU table ---
 
-# Current fastest consumer/server CPUs per architecture (2026).
-# Used to convert measured cycle deltas to reference wall-clock ns.
-# These are NOT measurements — they are labeled reference calculations:
+# Reference clocks for turning PMU cycle deltas into a nanosecond figure that does not
+# depend on the (unknown, frequency-scaled) clock of the runner. The output labels the
+# column as a calculation, not a measurement:
 #   ref_ns = cycles / (ghz * 1e9) * 1e9  =  cycles / ghz
+# The architecture comes from _detect_arch(); unknown architectures use 5.0 GHz.
 _REFERENCE_CPUS: dict[str, tuple[str, float]] = {
     "x86_64": ("AMD Ryzen 9 9950X (Zen 5, 5.7 GHz boost)", 5.7),
     "aarch64": ("Apple M4 Max (4.4 GHz performance cores)", 4.4),
@@ -204,7 +207,7 @@ class BenchSample:
     ld_preload: str
     git_sha: str
     exec_mode: str
-    # full per-envelope stats (used for rich breakdown table)
+    # Remaining per-envelope stats; unused by the comparison, kept for report detail.
     mean_ns: float = 0.0
     stdev_ns: float = 0.0
     min_ns: float = 0.0
@@ -214,7 +217,7 @@ class BenchSample:
     p95_ns: float = 0.0
     p99_ns: float = 0.0
     p999_ns: float = 0.0
-    # PMU cycle counts
+    # PMU counters over the measurement loop; 0 when the envelope carries none (no PMU).
     cycles: int = 0
     instructions: int = 0
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
@@ -287,10 +290,13 @@ def _compare(name: str, base: list[BenchSample], treat: list[BenchSample],
     delta = treat_median - base_median if base_medians and treat_medians else float("nan")
     delta_pct = (delta / base_median * 100.0) if base_median > 0 else float("nan")
 
-    # Use raw per-iteration medians as the test inputs.  Each envelope
-    # contributes one sample (its median), so the test compares the
-    # distribution of medians across runs.  For a meaningful test we
-    # need ≥3 runs per arm; fewer = note it and skip the test.
+    # The unit of observation is one run: each envelope contributes its median, and
+    # the test compares run medians, not per-iteration samples (those are serially
+    # correlated within a run and would overstate significance).
+    # Fewer than 3 runs per arm skips the test. Note that with the normal approximation
+    # the smallest reachable two-sided p is 0.0495 at 3+3 runs, 0.021 at 4+4 and
+    # 0.0090 at 5+5, so the default --regression-p 0.01 needs at least 5 runs per arm
+    # before any regression can be flagged.
     note = ""
     if len(base) < 3 or len(treat) < 3:
         note = f"insufficient runs ({len(base)} baseline, {len(treat)} treatment)"
@@ -531,7 +537,8 @@ def main() -> int:
                 "(first release? skipping gate)",
                 file=sys.stderr,
             )
-            # Write an explicit "skipped" report so the workflow has something to attach.
+            # First release (no previous envelopes): exit 0 and write an explicit
+            # "skipped" report so the release workflow always has a file to attach.
             skipped = (
                 "# Release-over-release benchmark gate — skipped\n\n"
                 "_No envelopes found from a previous release; nothing to compare against._\n"

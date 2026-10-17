@@ -1,16 +1,26 @@
 # =============================================================================
-# benchmark/Makefile.bench  —  Stage 2/3 build rules for the chaos-bench harness.
+# benchmark/Makefile.bench  —  build rules for the chaos-bench harness and kernels.
 #
-# Designed to be `-include`d from the root Makefile (or invoked directly
-# via `make -f benchmark/Makefile.bench`).  Self-contained: depends only
-# on a hosted POSIX toolchain plus the host CC.
+# Run from the repository root: make -f benchmark/Makefile.bench <target>
+# Needs a C99 compiler and make. git is optional: it stamps the commit id into
+# every envelope, which reads "unknown" without it.
+# The libchaos libraries are built by the root Makefile, not here; the kernels
+# do not link against them and are interposed at run time via LD_PRELOAD.
 #
 # Targets:
-#   bench-build      Build all kernel binaries (bench_time, bench_io, ...)
-#   bench-clean      Remove all generated artifacts
-#   bench-list       List registered benchmarks per binary
-#   bench-smoke      Quick sanity run of bench_time
-#   bench-help       Show this help
+#   bench-build      Build every kernel binary into benchmark/build/
+#                    (bench_time, bench_io, bench_net, bench_dns, bench_memory,
+#                    bench_process, bench_meta)
+#   bench-list       Build, then print the benchmarks each binary registers
+#   bench-smoke      Build, then run clock_gettime_baseline (1000 warmup,
+#                    10000 measured iterations, JSON to stdout)
+#   bench-validate   Run the harness self-checks in bench_meta and print the
+#                    expected ns/iter range before each result
+#   bench-clean      Remove benchmark/build/
+#   bench-help       Print this text
+#
+# Overridable: BENCH_DIR (benchmark), BENCH_BUILD_DIR, BENCH_REPORT_DIR, CC.
+# Full sweeps with LD_PRELOAD and scenarios: benchmark/run-bench.sh.
 # =============================================================================
 
 BENCH_DIR        ?= benchmark
@@ -39,10 +49,10 @@ BENCH_CPPFLAGS  := -D_GNU_SOURCE \
                    -DCHAOS_BENCH_GIT_SHA=\"$(BENCH_GIT_SHA)\" \
                    -DCHAOS_BENCH_CFLAGS="\"$(BENCH_CFLAGS_RAW)\""
 
-# Harness ≠ kernel CFLAGS by design: kernels are NOT built with LTO so
-# the optimizer cannot inline iter callbacks across the kernel/harness
-# boundary, which would defeat the noinline assumption inside the
-# measurement loop.
+## Kernels get -fno-lto so a toolchain that enables LTO by default cannot inline the
+## iteration callback into the harness measurement loop: the loop calls it through a
+## function pointer and must time exactly one call per iteration.
+## ('##' comments are internal; bench-help prints only '# ' lines.)
 BENCH_HARNESS_CFLAGS := $(BENCH_CFLAGS_RAW)
 BENCH_KERNEL_CFLAGS  := $(BENCH_CFLAGS_RAW) -fno-lto
 
@@ -53,7 +63,8 @@ else
 BENCH_LDFLAGS_BASE := -lm -lpthread
 endif
 
-# bench_process needs -lpthread which is already in BASE.
+## -lrt: clock_gettime lives in librt on glibc < 2.17; harmless (empty) on newer
+## glibc and musl. -lpthread: bench_process creates threads.
 
 BENCH_BIN_TIME    := $(BENCH_BUILD_DIR)/bench_time
 BENCH_BIN_IO      := $(BENCH_BUILD_DIR)/bench_io
@@ -73,8 +84,8 @@ BENCH_BINS := \
 
 bench-build: $(BENCH_BINS)
 
-# Pattern rule for any kernel source -> binary.  Each kernel binary
-# links the entire harness archive plus its own kernel .c.
+## One binary per kernel source: the kernel .c plus every harness object. The harness
+## main() finds the kernel's benchmarks through constructor-time registration.
 $(BENCH_BUILD_DIR)/bench_%: $(BENCH_KERNELS_DIR)/bench_%.c $(BENCH_HARNESS_OBJ) | $(BENCH_BUILD_DIR)
 	$(CC) $(BENCH_CPPFLAGS) $(BENCH_KERNEL_CFLAGS) -o $@ \
 	    $< $(BENCH_HARNESS_OBJ) $(BENCH_LDFLAGS_BASE)

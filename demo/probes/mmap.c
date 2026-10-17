@@ -1,5 +1,6 @@
-/* memory use-case 1 — an anonymous mmap. With mmap/anon:ERRNO:ENOMEM it returns
- * MAP_FAILED, the off-heap OOM a JVM -Xmx can never trigger. */
+/* Demo mem1: one 4 MiB anonymous mmap. Under libchaos-memory with
+ * `mmap/anon:ERRNO:ENOMEM` it returns MAP_FAILED with errno ENOMEM: an off-heap allocation
+ * failure that a JVM -Xmx limit cannot provoke. File-backed mappings are not selected. */
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>

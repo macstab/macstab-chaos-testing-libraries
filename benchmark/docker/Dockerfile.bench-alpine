@@ -1,16 +1,18 @@
 # =============================================================================
-# Dockerfile.bench-alpine  —  Tier 1 benchmark image (musl / alpine).
+# Dockerfile.bench-alpine  —  Tier 1 benchmark image (musl, Alpine 3.19).
 #
-# Sibling of Dockerfile.bench-glibc.  Same caveats apply (host scheduler
-# / governor / IRQs are out of our control); the harness flags ADVISORY
-# mode automatically.  Differences from glibc:
-#  - Compiler: musl-gcc via gcc-default; pthread/clock_gettime live in
-#    libc.musl-*.so.1 and need no separate -lrt.
-#  - musl's posix_spawn calls fork(); the chaos-process bench therefore
-#    sees a different cascade than on glibc.  This is intentional.
-#  - musl's getaddrinfo path is simpler (no NSS); chaos-dns numbers run
-#    faster than glibc.  This is also intentional and documented in
-#    BENCHMARKS.md.
+# musl counterpart of Dockerfile.bench-glibc, used by
+# `benchmark/run-bench.sh --libc=alpine` (or --libc=musl). Same model: toolchain
+# only, repository bind-mounted at /work, every run tagged ADVISORY.
+#
+# Differences from the glibc image:
+#  - gcc here is a native musl compiler. Thread and clock functions live in
+#    libc.musl itself; the harness's -lrt and -lpthread resolve to musl's
+#    empty stub archives.
+#  - musl's resolver has no NSS layer, so getaddrinfo/getnameinfo baselines
+#    differ from glibc's.
+#  - linux-headers supplies <linux/perf_event.h> for the harness PMU code;
+#    build-base does not include it.
 # =============================================================================
 
 FROM alpine:3.19

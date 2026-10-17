@@ -1,26 +1,27 @@
 /**
  * @file bench_io.c
- * @brief Stage 3 microbenchmarks for libchaos-io.
+ * @brief Per-call overhead of the libchaos-io wrappers for file I/O and sync calls.
  *
  * @details
- * Three benchmarks exercise the libchaos-io hot paths:
+ * Each hooked call has three registered benchmarks sharing one iteration body:
+ * `<fn>_passthrough`, `<fn>_match_no_fire` and `<fn>_errno`. `run-bench.sh` runs each
+ * once without LD_PRELOAD (baseline) and once with LD_PRELOAD=libchaos-io.so and the
+ * matching `benchmark/scenarios/io-*.conf` copied to the rule file
+ * `/tmp/.chaos-io.conf` (treatment); the driver reports the median difference.
  *
- *  1. `pread_passthrough` — `pread(fd, buf, 64, 0)` against an open
- *     tmpfile, with no rule installed.  Without LD_PRELOAD this is
- *     pure libc / kernel cost; with LD_PRELOAD this measures the chaos
- *     library's TLS guard + snapshot pointer load + rule scan + early
- *     return overhead.
- *  2. `pread_match_no_fire` — same call, with a probability=0 rule
- *     loaded so the selector match runs but the dice never trigger.
- *  3. `pread_errno` — same call, probability=1 ERRNO rule, exercising
- *     the full effect-dispatch path.
+ * Targets are chosen so the kernel side is cheap and stable and the wrapper dominates:
+ * `/dev/zero` and `/dev/null` (no filesystem, no blocking), or a 4 KiB unlinked temp
+ * file in `/tmp` whose single page stays in the page cache.
  *
- * Setup creates an anonymous tmpfile via `mkstemp`, fills the first 4 KiB
- * with deterministic bytes, and unlinks the path so the file disappears
- * on teardown.  Iter does one `pread` of 64 bytes from offset 0; the
- * choice of offset 0 means each call hits the page-cached first block,
- * so we measure the path-resolution + chaos overhead, not the
- * device.
+ * Scenario status at this revision (checked against src/config/chaos_io_config.c):
+ *  - Effective: pread, read, write, open_close.
+ *  - Never fire, so `_match_no_fire` and `_errno` equal `_passthrough`: openat_close,
+ *    readv, writev, ftruncate, fallocate, sendfile (operation token not accepted) and
+ *    fsync, fdatasync (path selector `/tmp/chaos-bench-io.*` is a literal prefix, not
+ *    a glob). Each scenario file states its defect.
+ *
+ * The `_errno` arm skips the real call, so its delta is wrapper cost minus the skipped
+ * kernel work.
  */
 
 #include "chaos_bench.h"
@@ -43,11 +44,10 @@
 #define BENCH_IO_FILE_BYTES    4096
 
 /**
- * @brief Per-benchmark state: open tmpfile + result buffer.
+ * @brief State of the temp-file kernels (pread, fsync, fdatasync, ftruncate, fallocate).
  *
- * @details The buffer is 64 bytes — enough to be representative but
- * small enough to fit in one cache line plus a bit, so the iter cost
- * is dominated by the syscall+chaos path, not the memcpy.
+ * @details `buffer` is 64 bytes, one cache line on amd64 and most arm64 cores, so the
+ * copy-out is negligible next to the syscall and wrapper.
  */
 typedef struct bench_io_state
 {
@@ -69,7 +69,8 @@ static void bench_io_setup(void *user_state)
         perror("bench_io: mkstemp");
         abort();
     }
-    /* Unlink immediately; the fd keeps the file alive. */
+    /* Unlink at once: the open fd keeps the inode alive and the file vanishes with the
+     * process even if teardown never runs. */
     (void)unlink(path);
 
     memset(fill, 0xA5, sizeof(fill));
@@ -106,8 +107,8 @@ CHAOS_BENCH("io", pread_errno,          bench_io_state_t,
             bench_io_setup, bench_io_iter_pread, bench_io_teardown)
 
 /* ------------------------------------------------------------------ read ---
- * `read(/dev/zero)` — never blocks, never advances a meaningful position,
- * isolates the chaos hook from any filesystem variability.
+ * `read(/dev/zero, 64)` and `write(/dev/null, 64)`: character devices with no file
+ * position, no page cache and no blocking, so the kernel cost is the bare syscall.
  */
 typedef struct bench_io_dev_state
 {
@@ -167,6 +168,8 @@ CHAOS_BENCH("io", write_errno,          bench_io_dev_state_t,
             bench_io_devnull_setup, bench_io_iter_write, bench_io_dev_teardown)
 
 /* ----------------------------------------------------------- readv/writev ---
+ * Two 32-byte iovecs against /dev/zero and /dev/null: same total payload as read and
+ * write, so the difference isolates the vectored wrapper path.
  */
 typedef struct bench_io_iov_state
 {
@@ -234,9 +237,10 @@ CHAOS_BENCH("io", writev_errno,          bench_io_iov_state_t,
             bench_io_writev_setup, bench_io_iter_writev, bench_io_iov_teardown)
 
 /* -------------------------------------------------------------- open_close ---
- * Per-iter `open(/dev/null)` + immediate `close`.  Pairs the two hooks so
- * the bench measures both, since they're often called as a duo in real
- * code (e.g. probing for file existence via stat→open).
+ * `open("/dev/null")` followed by `close`: both calls are wrapped, so the baseline
+ * delta covers two wrappers. The pair keeps the fd table from growing. In the `_errno`
+ * arm open fails with ENOENT and close is skipped. `run-bench.sh` caps it at 20000
+ * iterations.
  */
 typedef struct bench_io_oc_state
 {
@@ -259,8 +263,8 @@ CHAOS_BENCH("io", open_close_errno,          bench_io_oc_state_t,
             NULL, bench_io_iter_open_close, NULL)
 
 /* ----------------------------------------------------------- openat_close ---
- * Per-iter `openat(AT_FDCWD, "/dev/null", ...)` + close.  Tests the
- * `openat` hook specifically (different libc entry from `open` on glibc).
+ * `openat(AT_FDCWD, "/dev/null")` followed by `close`: openat is a separate libc entry
+ * point with its own wrapper. Capped at 20000 iterations.
  */
 static void bench_io_iter_openat_close(void *user_state)
 {
@@ -278,8 +282,11 @@ CHAOS_BENCH("io", openat_close_errno,          bench_io_oc_state_t,
             NULL, bench_io_iter_openat_close, NULL)
 
 /* ------------------------------------------------------------------ fsync ---
- * `fsync` on a tmpfile that has zero dirty pages → kernel fast path.
- * Measures the chaos-hook overhead, not actual disk sync.
+ * `fsync` / `fdatasync` on the temp file. Setup dirties one page; the first call (in
+ * warmup) writes it back, after which every call finds nothing dirty and returns
+ * without device I/O. The cost still depends on the filesystem backing /tmp (the
+ * container root, overlayfs under Docker's default storage driver). Capped at 20000
+ * iterations.
  */
 static void bench_io_iter_fsync(void *user_state)
 {
@@ -310,8 +317,9 @@ CHAOS_BENCH("io", fdatasync_errno,          bench_io_state_t,
             bench_io_setup, bench_io_iter_fdatasync, bench_io_teardown)
 
 /* -------------------------------------------------------------- ftruncate ---
- * Truncate the same tmpfile to the same size each iter — kernel mostly
- * no-ops, leaving wrapper overhead as the dominant cost.
+ * `ftruncate` to the current size (4096 bytes): the size does not change, so no
+ * blocks are freed or allocated, but the kernel still takes the inode lock and updates
+ * timestamps.
  */
 static void bench_io_iter_ftruncate(void *user_state)
 {
@@ -328,8 +336,8 @@ CHAOS_BENCH("io", ftruncate_errno,          bench_io_state_t,
             bench_io_setup, bench_io_iter_ftruncate, bench_io_teardown)
 
 /* -------------------------------------------------------------- fallocate ---
- * Linux-only.  Allocate 1 page at offset 0 each iter (idempotent on a
- * file that already covers that range — exercises the hook, not extents).
+ * Linux only. `fallocate(mode 0)` over [0, 4096), a range setup already wrote, so no
+ * extent changes after the first call. Capped at 20000 iterations.
  */
 #ifdef __linux__
 static void bench_io_iter_fallocate(void *user_state)
@@ -348,7 +356,10 @@ CHAOS_BENCH("io", fallocate_errno,          bench_io_state_t,
 #endif
 
 /* --------------------------------------------------------------- sendfile ---
- * Linux-only.  Two tmpfiles, sendfile from in→out at offset 0 each iter.
+ * Linux only. `sendfile` of 64 bytes from offset 0 of one unlinked temp file to
+ * another. The input offset is reset each iteration; the output file position is not,
+ * so the output file grows by 64 bytes per successful call (12.8 MB at the default
+ * 200000 iterations). Regular-file output needs Linux >= 2.6.33.
  */
 #ifdef __linux__
 typedef struct bench_io_sendfile_state

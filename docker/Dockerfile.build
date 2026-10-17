@@ -1,5 +1,18 @@
 # syntax=docker/dockerfile:1.7
 
+# Release build image: compiles one variant inside a container of the target libc and
+# architecture and exports only dist/ (stage `export`, FROM scratch), for
+# `docker buildx build --output type=local,dest=...`.
+#
+# Inputs (build args):
+#   BASE_IMAGE   toolchain image; selects the libc (gcc:* = glibc, alpine:* = musl). The build's
+#                glibc version sets the minimum glibc the libraries require, which is why
+#                docker-build-all pins gcc:10 instead of this default.
+#   MAKE_TARGET  cross-glibc-<arch> | cross-musl-<arch> | cross-init-<arch>
+# The architecture comes from --platform. Each target is built with the container's own gcc
+# (the *_CC override), so no cross-compiler is involved; arm64 runs under QEMU on amd64 hosts.
+# Only src/ and the Makefile enter the build context, so tests and docs cannot affect the build.
+
 ARG BASE_IMAGE=gcc:bookworm
 FROM --platform=$TARGETPLATFORM ${BASE_IMAGE} AS build
 
@@ -9,6 +22,9 @@ WORKDIR /src
 COPY src ./src
 COPY Makefile ./Makefile
 
+# Installs gcc and make only when the base image lacks them (alpine has neither; gcc:* has
+# both). linux-headers provides the kernel UAPI headers on Alpine. An unknown MAKE_TARGET
+# matches no case arm, builds nothing and fails at `cp dist/*`.
 RUN if ! command -v gcc >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1; then \
         if command -v apt-get >/dev/null 2>&1; then \
             apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev make && rm -rf /var/lib/apt/lists/*; \

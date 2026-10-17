@@ -1,24 +1,23 @@
 /**
  * @file bench_memory.c
- * @brief Stage 3 microbenchmarks for libchaos-memory.
+ * @brief Per-call overhead of the libchaos-memory wrappers for madvise, mprotect and munmap.
  *
  * @details
- * Three benchmarks against `madvise(addr, 4096, MADV_DONTNEED)` on a
- * pre-allocated 1 MiB private mapping.  We use `madvise` instead of
- * `mmap`/`munmap` for the iter call because:
- *  - mmap/munmap exercise the allocator's mmap-threshold path on
- *    glibc; on musl every malloc above ~28 KiB is already an mmap.
- *    Either way the *cost* is dominated by VMA list manipulation,
- *    which is measurable but variable.
- *  - madvise is a fixed-cost VMA hint; it lets the chaos overhead
- *    show through clearly.
+ * Each hooked call has `_passthrough`, `_match_no_fire` and `_errno` variants sharing
+ * one iteration body. `run-bench.sh` runs each without LD_PRELOAD (baseline) and with
+ * LD_PRELOAD=libchaos-memory.so plus `benchmark/scenarios/memory-<fn>-*.conf` copied to
+ * the rule file `/tmp/.chaos-memory.conf` (treatment).
  *
- * For mmap-path coverage, see Stage 4 (when we add the malloc-allocator
- * size sweep).
+ * The madvise and mprotect kernels work on one page of a 1 MiB private anonymous
+ * mapping created and pre-faulted in setup, so the iteration never pays for creating
+ * a VMA. mmap itself is not timed in isolation: its cost depends on the address-space
+ * layout and, for small sizes, on the allocator's mmap threshold, which differs between
+ * glibc and musl.
  *
- *  1. `madvise_passthrough`    — no rule loaded.
- *  2. `madvise_match_no_fire`  — probability=0 rule on `madvise`.
- *  3. `madvise_errno`          — probability=1 EINVAL injection.
+ * Scenario status at this revision: every memory scenario writes the probability as
+ * `ERRNO:<name>,<p>`, but libchaos-memory expects `ERRNO:<name>@<p>`. The rule is
+ * rejected, so `_match_no_fire` and `_errno` measure the passthrough path (the 1.0.1
+ * matrix shows all three arms within noise of each other). See the scenario files.
  */
 
 #include "chaos_bench.h"
@@ -56,22 +55,22 @@ static void bench_memory_setup(void *user_state)
         perror("bench_memory: mmap");
         abort();
     }
-    /* Pre-touch every page so subsequent madvise calls do not race a
-     * fault-in path.  The chaos library's overhead is the same either
-     * way, but baseline-vs-treatment must compare equal pre-conditions. */
+    /* Fault in every page now, so the first measured iterations do not pay for page
+     * faults the later ones skip; both arms then start from the same resident state. */
     memset(s->mapping, 0x5A, s->mapping_size);
 }
 
 static void bench_memory_iter_madvise(void *user_state)
 {
     bench_memory_state_t *s = (bench_memory_state_t *)user_state;
-    /* Hint a single page near the start; do not dontneed the whole
-     * region (would force a fault-in chain that dominates the next
-     * iteration). */
+    /* One page only: the cost of MADV_DONTNEED grows with the number of resident pages
+     * it drops, and dropping the whole 1 MiB would swamp the wrapper. */
     s->rc = madvise(s->mapping, BENCH_MEMORY_HINT_BYTES, MADV_DONTNEED);
     CHAOS_BENCH_DO_NOT_OPTIMIZE(s->rc);
-    /* Touch the page so the dontneed actually frees the backing on
-     * subsequent calls. */
+    /* Refault the page so the next MADV_DONTNEED has a resident page to drop. The
+     * touch (one write fault that allocates a zeroed page) is part of every timed
+     * iteration. If an ERRNO rule fired, the page would stay resident and this write
+     * would not fault. */
     *((volatile char *)s->mapping) = 0x5A;
 }
 
@@ -92,9 +91,10 @@ CHAOS_BENCH("memory", madvise_errno,          bench_memory_state_t,
             bench_memory_setup, bench_memory_iter_madvise, bench_memory_teardown)
 
 /* --------------------------------------------------------------- mprotect ---
- * Toggle PROT_READ on/off on a single page each iter.  Two calls per iter
- * to leave the page in the original state (PROT_READ|PROT_WRITE), so
- * iters don't drift.
+ * Two mprotect calls per iteration on the first page: read-only, then back to
+ * read-write, so every iteration starts from the same protection. Both calls are
+ * wrapped, so the delta covers two wrappers. Changing the protection of one page in
+ * a larger VMA splits and remerges the VMA, which is part of the baseline cost.
  */
 static void bench_memory_iter_mprotect(void *user_state)
 {
@@ -113,8 +113,11 @@ CHAOS_BENCH("memory", mprotect_errno,          bench_memory_state_t,
             bench_memory_setup, bench_memory_iter_mprotect, bench_memory_teardown)
 
 /* ----------------------------------------------------------------- munmap ---
- * Per-iter `mmap` 1 page anonymous + immediate `munmap`.  Pairs the two
- * but only `munmap` is hooked by libchaos-memory; the mmap is overhead.
+ * Map one anonymous page and unmap it again. libchaos-memory wraps both calls; the
+ * scenario has a munmap rule only, so mmap contributes a no-match pass through its
+ * wrapper to every arm. If a munmap ERRNO rule fired, every iteration would leak one
+ * page of address space (200000 iterations: about 780 MiB of virtual memory, never
+ * touched).
  */
 typedef struct bench_memory_munmap_state
 {

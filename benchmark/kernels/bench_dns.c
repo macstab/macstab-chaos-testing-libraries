@@ -1,21 +1,29 @@
 /**
  * @file bench_dns.c
- * @brief Stage 3 microbenchmarks for libchaos-dns.
+ * @brief Per-call overhead of the libchaos-dns wrappers for getaddrinfo and getnameinfo.
  *
  * @details
- * Three benchmarks exercising `getaddrinfo("localhost", NULL, ...)`,
- * which on glibc and musl resolves entirely from `/etc/hosts` and
- * `/etc/resolv.conf` without any DNS round-trip.  This isolates the
- * chaos-dns library's interception cost from network latency.
+ * Both lookups target the loopback host, so in the benchmark images they are answered
+ * from `/etc/hosts` and send no DNS packet. That removes network latency from both
+ * arms; what remains is resolver CPU cost plus, under LD_PRELOAD, the wrapper.
  *
- *  1. `getaddrinfo_passthrough`   — no rule loaded.
- *  2. `getaddrinfo_match_no_fire` — probability=0 rule on `dns://\*`.
- *  3. `getaddrinfo_errno`         — probability=1 EAI_AGAIN injection.
+ * | Benchmark suffix | Scenario (`dns-<fn>-*.conf`)                  | Path measured          |
+ * |------------------|-----------------------------------------------|------------------------|
+ * | `_passthrough`   | `dns-empty.conf` (no rules)                   | wrapper, empty rules   |
+ * | `_match_no_fire` | EAI_AGAIN, probability 0.0                    | rule match + draw      |
+ * | `_errno`         | EAI_AGAIN, probability 1.0                    | effect dispatch only   |
  *
- * Iter unconditionally calls `freeaddrinfo` after each `getaddrinfo`
- * (when the call succeeded), keeping the addrinfo allocator state
- * stable across iterations.  Failure modes (the ERRNO benchmark)
- * naturally have no list to free.
+ * getaddrinfo rules use the selector `dns://localhost`. The `_errno` arm returns
+ * EAI_AGAIN without calling the real resolver, so its delta is wrapper cost minus the
+ * skipped resolver work; in the 1.0.1 matrix it is negative on every variant.
+ * `run-bench.sh` caps both lookups at 20000 iterations.
+ *
+ * Scenario status at this revision: the getnameinfo scenarios use `dns://\*`, but
+ * getnameinfo consults rdns:// rules, so its `_match_no_fire` and `_errno` arms measure
+ * the passthrough path.
+ *
+ * The getaddrinfo kernel frees every result list it receives, so allocator state does
+ * not grow across iterations; a failed lookup returns no list.
  */
 
 #include "chaos_bench.h"
@@ -62,9 +70,10 @@ CHAOS_BENCH("dns", getaddrinfo_errno,         bench_dns_state_t,
             NULL, bench_dns_iter_getaddrinfo, NULL)
 
 /* ------------------------------------------------------------ getnameinfo ---
- * Reverse lookup of `127.0.0.1` to a hostname.  Hits the glibc/musl
- * resolver fast-path against `/etc/hosts`.  Numeric flag forces the
- * fast-path on systems where the resolver might otherwise probe.
+ * Reverse lookup of 127.0.0.1, port 0. NI_NUMERICSERV formats the port as "0" and
+ * skips the services database; the host part is still a real reverse lookup, answered
+ * by the 127.0.0.1 entry in `/etc/hosts`. Without that entry glibc moves on to the next
+ * nsswitch source (normally a DNS PTR query) and the baseline measures the network.
  */
 typedef struct bench_dns_gni_state
 {

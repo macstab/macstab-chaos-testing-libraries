@@ -1,5 +1,6 @@
-/* Minimal loopback TCP server for the net send:ECONNRESET demo. Runs WITHOUT
- * the chaos lib preloaded, so only the client's send() is faulted. */
+/* Loopback TCP sink for demo net3: accepts connections on 127.0.0.1:<port> (default 9092)
+ * and reads until EOF, one client at a time, forever. It runs without LD_PRELOAD, so the
+ * only faulted call in the demo is the client's send(). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>

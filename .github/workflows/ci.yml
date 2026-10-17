@@ -1,3 +1,10 @@
+# Correctness gate for every push to a long-lived or topic branch.
+#
+# Job graph: fmt runs first (cheap, catches the most common failure), then unit, integration,
+# sanitizers and static-analysis run in parallel. Every job uses the stock ubuntu-24.04 image
+# plus apt packages, which docker/Dockerfile.ci mirrors for `make ci-local`.
+# Only push events trigger it; a pull request from a fork is not gated by this workflow.
+# The four release variants are built and tested by matrix.yml, not here.
 name: ci
 
 on:
@@ -7,14 +14,17 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same ref supersedes the running gate.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Runs JavaScript actions on Node 24 ahead of GitHub's default switch.
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  # clang-format conformance of src/ and test/ (make fmt-check). Gate for all other jobs.
   fmt:
     name: clang-format check
     runs-on: ubuntu-24.04
@@ -28,6 +38,8 @@ jobs:
       - name: Check formatting
         run: make fmt-check
 
+  # Native libraries, unit tests, the per-file line-coverage gate and the verified doc examples.
+  # The coverage report is uploaded even on failure, so a missed line can be located.
   unit:
     name: unit tests + coverage
     runs-on: ubuntu-24.04
@@ -56,6 +68,9 @@ jobs:
       - name: Verify doc examples
         run: make verify-docs
 
+  # Every runtime suite against the native glibc amd64 build. The Alpine suites run in
+  # containers, so docker on the runner is required. Keep this list in step with
+  # HOST_RUNTIME_TESTS in the Makefile.
   integration:
     name: native integration tests
     runs-on: ubuntu-24.04
@@ -70,8 +85,8 @@ jobs:
       - name: Build native libraries
         run: make native
       - name: Run integration tests
-        # A suite that cannot run here (no docker, another architecture) fails
-        # the job instead of passing as skipped.
+        # Suites exit with CHAOS_SKIP_EXIT when they cannot run (no docker, foreign
+        # architecture); 1 fails the job instead of letting it pass as skipped.
         env:
           CHAOS_SKIP_EXIT: "1"
         run: |
@@ -110,6 +125,8 @@ jobs:
             echo "::endgroup::"
           done
 
+  # Unit tests under ASan (with leak detection) and under UBSan, each in its own BUILD_DIR.
+  # Both *_OPTIONS make the first report abort, so findings fail the job instead of scrolling by.
   sanitizers:
     name: ${{ matrix.sanitizer }} sanitizer
     runs-on: ubuntu-24.04
@@ -135,6 +152,8 @@ jobs:
             CFLAGS="-std=c99 -Wall -Wextra -Werror -pedantic -O1 -g -fno-omit-frame-pointer -fsanitize=${{ matrix.sanitizer }}" \
             LDFLAGS="-fsanitize=${{ matrix.sanitizer }}"
 
+  # Clang static analyzer over the native library build; --status-bugs fails on any finding.
+  # The HTML report is uploaded only when the job fails.
   static-analysis:
     name: clang static analyzer
     runs-on: ubuntu-24.04
