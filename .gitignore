@@ -1,7 +1,11 @@
+# Build outputs: build/ (native), build-*/ (coverage, sanitizer, ci-local, fuzz), dist/ (release).
 build/
 build-*/
 dist/
+# gcov reports written by test/runtime/check_coverage.sh.
 *.gcov
+# Editor and tool state.
 .idea/
 .claude/
+# Bytecode cache of benchmark/driver.
 __pycache__/

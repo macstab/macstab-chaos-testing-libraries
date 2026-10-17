@@ -1,38 +1,35 @@
 /**
  * @file test_net_runtime.c
- * @brief Unit tests for the NET-domain constructor: symbol resolution, seed material,
- *   and function-pointer table wiring.
+ * @brief Unit tests for the libchaos-net constructor: real-function resolution, seeding, the
+ *   start-up rule load, and `chaos_once()` re-entry.
  *
- * Subsystem under test: `src/net/chaos_net.c` (the `chaos_net_init()` constructor).
+ * @details
+ * Unit under test: `src/net/chaos_net.c` and `src/common/chaos_once.h`. The suite proves:
+ * - `chaos_net_resolve_symbol()` stores the `dlsym(RTLD_NEXT)` result after clearing a stale
+ *   `dlerror()` once, and aborts when dlsym returns NULL with a pending dlerror (no real
+ *   function means no way to delegate);
+ * - seeding on Linux reads 8 bytes from `/dev/urandom` through raw `SYS_openat`/`SYS_read`/
+ *   `SYS_close`, closes the fd on a short read, and falls back to
+ *   `0x6a09e667f3bcc909 ^ getpid()` when the open fails or the read is short; on other
+ *   platforms only a non-zero seed is asserted;
+ * - the constructor wires every real-function pointer it resolves (20 portable socket calls,
+ *   plus accept4, sendmmsg, recvmmsg, epoll_wait and epoll_pwait on Linux), seeds the process
+ *   and main-thread PRNG, initialises the config module once and loads the rule file once, so
+ *   a bad rule file is reported at start-up;
+ * - `chaos_once()` called again from inside its own initialiser, on the same thread, returns 0
+ *   at once instead of deadlocking, and the initialiser runs exactly once.
  *
- * Coverage approach:
- * - All 20 portable socket operation symbols plus 5 Linux-only symbols are mapped to
- *   local stub functions via a test-controlled `dlsym` stub.
- * - `dlerror`, `abort`, and (on Linux) `syscall` are overridden via `#define` before
- *   `chaos_net.c` is included, giving access to the constructor without LD_PRELOAD.
- * - On Linux, a raw-syscall stub intercepts SYS_openat, SYS_read, and SYS_close to
- *   deliver a deterministic 8-byte seed value (0x1122334455667788) so tests can assert
- *   the exact stored seed.
- * - The abort path is intercepted via `setjmp`/`longjmp` to verify that `chaos_net_init`
- *   terminates when a required symbol cannot be resolved.
+ * Seams: the source is compiled into this file with `dlsym`, `dlerror`, `abort` and (Linux)
+ * `syscall` macro-redirected to local stubs. The dlsym stub returns a do-nothing stub for each
+ * of the 25 socket symbols and NULL otherwise; the six fd calls libchaos-net also resolves
+ * (setsockopt, read, write, readv, writev, close) are pre-set by
+ * `chaos_net_test_reset_runtime()` to raw-syscall implementations, which resolution never
+ * overwrites. The abort stub `longjmp()`s back when an abort is expected; the syscall stub
+ * returns fd 9 and the seed `0x1122334455667788`, with flags for the two fallback paths.
+ * `chaos_net_config_init()` and `chaos_net_config_prepare()` are replaced by counters.
  *
- * Properties under test:
- * - `chaos_net_resolve_symbol()`: successful resolution calls `dlerror()` once; the
- *   resulting pointer equals the stub function.
- * - `chaos_net_read_seed_material()` (Linux): returns 0x1122334455667788; raw syscalls
- *   issued in order (openat → read → close).
- * - `chaos_net_read_seed_material()` (non-Linux): returns a non-zero value.
- * - Abort path: when `dlsym` returns NULL and `dlerror` returns a non-NULL message,
- *   `chaos_net_resolve_symbol` calls `abort()`.
- * - Linux seed fallback: open failure → PID-based fallback seed; short read → same fallback.
- * - `chaos_net_init()`: all 20 (or 25 on Linux) real-function-pointer globals wired
- *   to their stub counterparts; config_init called once; process_seed and tls_prng_state
- *   are non-zero after construction.
- *
- * What is NOT tested here:
- * - The wrapper interception behaviour (tested in test_chaos_net.c).
- * - Config file loading or rule matching.
- * - Thread-safety of the constructor under concurrent library opens.
+ * Out of scope: the wrappers (`test_chaos_net.c`), rule loading (`test_net_config.c`) and
+ * concurrent library loads.
  */
 
 #include "../support/test_net_support.h"
@@ -42,44 +39,41 @@
 #include <setjmp.h>
 #include <stdarg.h>
 
-/** @brief Number of times `chaos_net_config_init()` stub was called. */
+/** @brief Calls of the `chaos_net_config_init()` stub. */
 static int g_config_init_calls = 0;
-/** @brief Number of times the `dlerror` stub was called. */
+
+/** @brief Calls of the `chaos_net_config_prepare()` stub (start-up rule loads). */
+static int g_config_prepare_calls = 0;
+/** @brief Calls of the dlerror stub. */
 static int g_dlerror_calls = 0;
-/** @brief Error string to return from the `dlerror` stub; NULL means no error. */
+/** @brief Returned by the dlerror stub; non-NULL turns a NULL dlsym result into an abort. */
 static const char *g_dlerror_text = NULL;
-/** @brief `setjmp` buffer used by the `abort` stub to return to the test. */
+/** @brief Where the abort stub returns to when an abort is expected. */
 static jmp_buf g_abort_env;
-/** @brief Non-zero when the test expects `abort()` to be called. */
+/** @brief Non-zero while a test expects abort(); otherwise abort() fails the test. */
 static int g_expect_abort = 0;
 #ifdef __linux__
-/** @brief Number of times SYS_openat was dispatched through the syscall stub. */
+/** @brief `SYS_openat` calls seen by the syscall stub. */
 static int g_syscall_open_calls = 0;
-/** @brief Number of times SYS_read was dispatched through the syscall stub. */
+/** @brief `SYS_read` calls seen by the syscall stub. */
 static int g_syscall_read_calls = 0;
-/** @brief Number of times SYS_close was dispatched through the syscall stub. */
+/** @brief `SYS_close` calls seen by the syscall stub. */
 static int g_syscall_close_calls = 0;
-/** @brief When non-zero, causes SYS_openat to return -1 (simulates /dev/urandom open failure). */
+/** @brief Non-zero makes `SYS_openat` fail (no `/dev/urandom`). */
 static int g_force_open_fail = 0;
-/**
- * @brief When non-zero, causes SYS_read to return sizeof(seed)-1 (simulates short read).
- *
- * A short read of the seed material should trigger the PID-based fallback rather than
- * storing a partial seed value.
- */
+/** @brief Non-zero makes `SYS_read` return 7 of 8 bytes; a partial seed must not be used. */
 static int g_force_short_read = 0;
 #endif
 
 /**
- * @brief Reset all runtime globals to their initial state before each test.
- *
- * Resets the NET runtime globals via `chaos_net_test_reset_runtime()` and also
- * zeroes all local stubs counters and flags.
+ * @brief Restores the runtime globals (real functions, PRNG, guard) and clears every counter
+ *   and fault flag.
  */
 static void reset_test_state(void)
 {
     chaos_net_test_reset_runtime();
     g_config_init_calls = 0;
+    g_config_prepare_calls = 0;
     g_dlerror_calls = 0;
     g_dlerror_text = NULL;
     g_expect_abort = 0;
@@ -93,10 +87,10 @@ static void reset_test_state(void)
 }
 
 /* -------------------------------------------------------------------------
- * Stub socket operation implementations
+ * Real-function stand-ins: never called; only their addresses are compared.
  * --------------------------------------------------------------------- */
 
-/** @brief Stub for `bind(2)`. Returns 0 without touching the OS. */
+/** @brief Stand-in for the real bind(). */
 static int stub_bind(int fd, const struct sockaddr *address, socklen_t length)
 {
     (void)fd;
@@ -105,7 +99,7 @@ static int stub_bind(int fd, const struct sockaddr *address, socklen_t length)
     return 0;
 }
 
-/** @brief Stub for `listen(2)`. Returns 0. */
+/** @brief Stand-in for the real listen(). */
 static int stub_listen(int fd, int backlog)
 {
     (void)fd;
@@ -113,7 +107,7 @@ static int stub_listen(int fd, int backlog)
     return 0;
 }
 
-/** @brief Stub for `connect(2)`. Returns 0. */
+/** @brief Stand-in for the real connect(). */
 static int stub_connect(int fd, const struct sockaddr *address, socklen_t length)
 {
     (void)fd;
@@ -122,7 +116,7 @@ static int stub_connect(int fd, const struct sockaddr *address, socklen_t length
     return 0;
 }
 
-/** @brief Stub for `accept(2)`. Returns 0. */
+/** @brief Stand-in for the real accept(). */
 static int stub_accept(int fd, struct sockaddr *address, socklen_t *length)
 {
     (void)fd;
@@ -131,7 +125,7 @@ static int stub_accept(int fd, struct sockaddr *address, socklen_t *length)
     return 0;
 }
 
-/** @brief Stub for `socket(2)`. Returns 0. */
+/** @brief Stand-in for the real socket(). */
 static int stub_socket(int domain, int type, int protocol)
 {
     (void)domain;
@@ -140,7 +134,7 @@ static int stub_socket(int domain, int type, int protocol)
     return 0;
 }
 
-/** @brief Stub for `socketpair(2)`. Returns 0. */
+/** @brief Stand-in for the real socketpair(). */
 static int stub_socketpair(int domain, int type, int protocol, int fds[2])
 {
     (void)domain;
@@ -150,7 +144,7 @@ static int stub_socketpair(int domain, int type, int protocol, int fds[2])
     return 0;
 }
 
-/** @brief Stub for `shutdown(2)`. Returns 0. */
+/** @brief Stand-in for the real shutdown(). */
 static int stub_shutdown(int fd, int how)
 {
     (void)fd;
@@ -158,7 +152,7 @@ static int stub_shutdown(int fd, int how)
     return 0;
 }
 
-/** @brief Stub for `send(2)`. Returns 0. */
+/** @brief Stand-in for the real send(). */
 static ssize_t stub_send(int fd, const void *buffer, size_t size, int flags)
 {
     (void)fd;
@@ -168,7 +162,7 @@ static ssize_t stub_send(int fd, const void *buffer, size_t size, int flags)
     return 0;
 }
 
-/** @brief Stub for `sendto(2)`. Returns 0. */
+/** @brief Stand-in for the real sendto(). */
 static ssize_t stub_sendto(
     int fd,
     const void *buffer,
@@ -187,7 +181,7 @@ static ssize_t stub_sendto(
     return 0;
 }
 
-/** @brief Stub for `sendmsg(2)`. Returns 0. */
+/** @brief Stand-in for the real sendmsg(). */
 static ssize_t stub_sendmsg(int fd, const struct msghdr *message, int flags)
 {
     (void)fd;
@@ -196,7 +190,7 @@ static ssize_t stub_sendmsg(int fd, const struct msghdr *message, int flags)
     return 0;
 }
 
-/** @brief Stub for `recv(2)`. Returns 0. */
+/** @brief Stand-in for the real recv(). */
 static ssize_t stub_recv(int fd, void *buffer, size_t size, int flags)
 {
     (void)fd;
@@ -206,7 +200,7 @@ static ssize_t stub_recv(int fd, void *buffer, size_t size, int flags)
     return 0;
 }
 
-/** @brief Stub for `recvfrom(2)`. Returns 0. */
+/** @brief Stand-in for the real recvfrom(). */
 static ssize_t stub_recvfrom(
     int fd, void *buffer, size_t size, int flags, struct sockaddr *address, socklen_t *length
 )
@@ -220,7 +214,7 @@ static ssize_t stub_recvfrom(
     return 0;
 }
 
-/** @brief Stub for `recvmsg(2)`. Returns 0. */
+/** @brief Stand-in for the real recvmsg(). */
 static ssize_t stub_recvmsg(int fd, struct msghdr *message, int flags)
 {
     (void)fd;
@@ -229,7 +223,7 @@ static ssize_t stub_recvmsg(int fd, struct msghdr *message, int flags)
     return 0;
 }
 
-/** @brief Stub for `poll(2)`. Returns 0. */
+/** @brief Stand-in for the real poll(). */
 static int stub_poll(struct pollfd *fds, nfds_t nfds, int timeout)
 {
     (void)fds;
@@ -238,7 +232,7 @@ static int stub_poll(struct pollfd *fds, nfds_t nfds, int timeout)
     return 0;
 }
 
-/** @brief Stub for `ppoll(2)`. Returns 0. */
+/** @brief Stand-in for the real ppoll(). */
 static int
 stub_ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout, const sigset_t *sigmask)
 {
@@ -249,7 +243,7 @@ stub_ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout, cons
     return 0;
 }
 
-/** @brief Stub for `select(2)`. Returns 0. */
+/** @brief Stand-in for the real select(). */
 static int
 stub_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout)
 {
@@ -261,7 +255,7 @@ stub_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, stru
     return 0;
 }
 
-/** @brief Stub for `pselect(2)`. Returns 0. */
+/** @brief Stand-in for the real pselect(). */
 static int stub_pselect(
     int nfds,
     fd_set *readfds,
@@ -280,7 +274,7 @@ static int stub_pselect(
     return 0;
 }
 
-/** @brief Stub for `getsockname(2)`. Returns 0. */
+/** @brief Stand-in for the real getsockname(). */
 static int stub_getsockname(int fd, struct sockaddr *address, socklen_t *length)
 {
     (void)fd;
@@ -289,7 +283,7 @@ static int stub_getsockname(int fd, struct sockaddr *address, socklen_t *length)
     return 0;
 }
 
-/** @brief Stub for `getpeername(2)`. Returns 0. */
+/** @brief Stand-in for the real getpeername(). */
 static int stub_getpeername(int fd, struct sockaddr *address, socklen_t *length)
 {
     (void)fd;
@@ -298,7 +292,7 @@ static int stub_getpeername(int fd, struct sockaddr *address, socklen_t *length)
     return 0;
 }
 
-/** @brief Stub for `getsockopt(2)`. Returns 0. */
+/** @brief Stand-in for the real getsockopt(). */
 static int stub_getsockopt(int fd, int level, int optname, void *value, socklen_t *length)
 {
     (void)fd;
@@ -310,7 +304,7 @@ static int stub_getsockopt(int fd, int level, int optname, void *value, socklen_
 }
 
 #ifdef __linux__
-/** @brief Stub for Linux `accept4(2)`. Returns 0. */
+/** @brief Stand-in for the real accept4() (Linux). */
 static int stub_accept4(int fd, struct sockaddr *address, socklen_t *length, int flags)
 {
     (void)fd;
@@ -320,7 +314,7 @@ static int stub_accept4(int fd, struct sockaddr *address, socklen_t *length, int
     return 0;
 }
 
-/** @brief Stub for Linux `sendmmsg(2)`. Returns 0. */
+/** @brief Stand-in for the real sendmmsg() (Linux). */
 static int
 stub_sendmmsg(int fd, struct mmsghdr *msgvec, unsigned int vlen, CHAOS_NET_MMSG_FLAGS_TYPE flags)
 {
@@ -331,7 +325,7 @@ stub_sendmmsg(int fd, struct mmsghdr *msgvec, unsigned int vlen, CHAOS_NET_MMSG_
     return 0;
 }
 
-/** @brief Stub for Linux `recvmmsg(2)`. Returns 0. */
+/** @brief Stand-in for the real recvmmsg() (Linux). */
 static int stub_recvmmsg(
     int fd,
     struct mmsghdr *msgvec,
@@ -348,7 +342,7 @@ static int stub_recvmmsg(
     return 0;
 }
 
-/** @brief Stub for Linux `epoll_wait(2)`. Returns 0. */
+/** @brief Stand-in for the real epoll_wait() (Linux). */
 static int stub_epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout)
 {
     (void)epfd;
@@ -358,7 +352,7 @@ static int stub_epoll_wait(int epfd, struct epoll_event *events, int maxevents, 
     return 0;
 }
 
-/** @brief Stub for Linux `epoll_pwait(2)`. Returns 0. */
+/** @brief Stand-in for the real epoll_pwait() (Linux). */
 static int stub_epoll_pwait(
     int epfd, struct epoll_event *events, int maxevents, int timeout, const sigset_t *sigmask
 )
@@ -372,22 +366,24 @@ static int stub_epoll_pwait(
 }
 #endif
 
-/**
- * @brief Stub for `chaos_net_config_init()`.
- *
- * Increments the call counter so tests can verify `chaos_net_init()` invokes it
- * exactly once.
- */
+/** @brief Replaces the config module's initialiser; counts calls. */
 void chaos_net_config_init(void)
 {
     ++g_config_init_calls;
 }
 
+/** @brief Replaces the start-up rule load; counts calls and reports success. */
+int chaos_net_config_prepare(void)
+{
+    ++g_config_prepare_calls;
+    return 0;
+}
+
 /**
- * @brief Stub for `dlerror()`.
+ * @brief dlerror() replacement: counts calls and returns `g_dlerror_text`.
  *
- * Returns `g_dlerror_text` and increments the call counter. Used to verify that
- * `chaos_net_resolve_symbol()` calls `dlerror()` exactly once per successful resolution.
+ * The resolver calls dlerror() once before dlsym to clear stale state and a second time only
+ * when dlsym returned NULL, so a successful resolution counts exactly 1 call.
  */
 static char *chaos_net_test_dlerror(void)
 {
@@ -396,11 +392,11 @@ static char *chaos_net_test_dlerror(void)
 }
 
 /**
- * @brief Stub for `dlsym(RTLD_NEXT, symbol)`.
+ * @brief dlsym() replacement: the stand-in for each of the 20 portable and 5 Linux-only socket
+ *   symbols, NULL for any other name.
  *
- * Maps each of the 20 (or 25 on Linux) expected symbol names to the corresponding
- * stub function via `CHAOS_NET_TEST_DLSYM_RESULT`. Returns NULL for unrecognised
- * symbol names; the production constructor will then call `dlerror()` and `abort()`.
+ * `CHAOS_NET_TEST_DLSYM_RESULT` converts through memcpy, as ISO C has no function-to-object
+ * pointer cast. A NULL result aborts only when `g_dlerror_text` is set.
  */
 static void *chaos_net_test_dlsym(void *handle, const char *symbol)
 {
@@ -463,12 +459,11 @@ static void *chaos_net_test_dlsym(void *handle, const char *symbol)
 
 #ifdef __linux__
 /**
- * @brief Stub for `syscall(2)` used by the production constructor to read seed material.
+ * @brief syscall() replacement modelling `/dev/urandom` for the seed reader.
  *
- * Intercepts SYS_openat, SYS_read, and SYS_close. For SYS_read, copies the constant
- * seed `0x1122334455667788` into the caller's buffer when `g_force_short_read == 0`,
- * or returns `sizeof(seed)-1` bytes when `g_force_short_read != 0`. For SYS_openat,
- * returns -1 when `g_force_open_fail != 0`.
+ * `SYS_openat` returns fd 9, or -1 under `g_force_open_fail`. `SYS_read` asserts it reads
+ * exactly 8 bytes from fd 9, writes `0x1122334455667788`, and reports 7 bytes under
+ * `g_force_short_read`. `SYS_close` succeeds. Each is counted; any other number returns -1.
  */
 static long chaos_net_test_syscall(long number, ...)
 {
@@ -515,11 +510,8 @@ static long chaos_net_test_syscall(long number, ...)
 #endif
 
 /**
- * @brief Stub for `abort()`.
- *
- * When `g_expect_abort != 0`, transfers control back to the enclosing `setjmp`
- * frame via `longjmp(g_abort_env, 1)`. When the abort is unexpected, asserts
- * false to produce a diagnostic failure rather than hanging.
+ * @brief abort() replacement: `longjmp()`s to `g_abort_env` when expected, fails the test
+ *   otherwise, so the abort path is observable without killing the test process.
  */
 static void chaos_net_test_abort(void)
 {
@@ -531,7 +523,7 @@ static void chaos_net_test_abort(void)
 }
 
 /* -------------------------------------------------------------------------
- * Symbol overrides and production source inclusion
+ * Compile the constructor against the stubs above
  * --------------------------------------------------------------------- */
 
 #define dlsym chaos_net_test_dlsym
@@ -553,16 +545,22 @@ static void chaos_net_test_abort(void)
  * --------------------------------------------------------------------- */
 
 /**
- * @brief Invariant: `chaos_net_resolve_symbol()` wires a single symbol and calls dlerror once.
+ * @brief Re-arms the run-once guard of symbol resolution.
  *
- * Triggering condition: `chaos_net_resolve_symbol(&bind_fn, "bind")` with a clean state.
+ * @details The real constructor already ran when this binary loaded, so the guard is done
+ * and chaos_net_init() would otherwise resolve nothing.
+ */
+static void reset_symbols_once(void)
+{
+    g_chaos_net_symbols_once = CHAOS_ONCE_INIT;
+}
+
+/**
+ * @brief Proves one symbol resolves with exactly one dlerror() call, and the seed comes from
+ *   `/dev/urandom`.
  *
- * Expected observable behaviour:
- * - `bind_fn` is set to `stub_bind` after the call.
- * - `g_dlerror_calls == 1` (dlerror is called once to clear any pending error string).
- * - On Linux: `chaos_net_read_seed_material()` returns 0x1122334455667788 and issues
- *   exactly one openat, one read, and one close raw syscall.
- * - On non-Linux: `chaos_net_read_seed_material()` returns a non-zero value.
+ * @details On Linux the seed equals the 8 bytes read, through exactly one open, read and
+ * close; elsewhere it is only non-zero.
  */
 static void test_resolve_symbol_and_seed_helpers(void)
 {
@@ -584,14 +582,11 @@ static void test_resolve_symbol_and_seed_helpers(void)
 }
 
 /**
- * @brief Invariant: `chaos_net_resolve_symbol()` calls `abort()` when the symbol is missing.
+ * @brief Proves a failed lookup (dlsym NULL with a pending dlerror) aborts the process.
  *
- * Triggering condition: `g_dlerror_text = "missing"` causes the `dlerror` stub to return
- *   a non-NULL string. The `dlsym` stub returns NULL for "missing-symbol". Together these
- *   conditions trigger the fatal-error path in `chaos_net_resolve_symbol`.
- *
- * Expected observable behaviour: `longjmp` transfers control out of the setjmp block;
- *   the "expected abort path" assert is never reached.
+ * @details libchaos-net fails closed here: without the real function no wrapper could
+ * delegate. The abort stub `longjmp()`s back past the call, so reaching the assertion after
+ * it means abort() was not called.
  */
 static void test_resolve_symbol_abort_path(void)
 {
@@ -610,17 +605,11 @@ static void test_resolve_symbol_abort_path(void)
 
 #ifdef __linux__
 /**
- * @brief Invariant: `chaos_net_read_seed_material()` falls back to a PID-based seed when
- *   `/dev/urandom` cannot be opened or yields a short read.
+ * @brief Proves the seed falls back to `0x6a09e667f3bcc909 ^ getpid()` when `/dev/urandom`
+ *   cannot be opened or returns a short read (Linux only).
  *
- * Triggering conditions:
- * - `g_force_open_fail = 1`: SYS_openat returns -1; no read or close is attempted.
- * - `g_force_short_read = 1`: SYS_read returns `sizeof(seed)-1`; a short read is treated
- *   as a failure and the PID-based fallback is used.
- *
- * Expected observable behaviour: both paths return `0x6a09e667f3bcc909 XOR getpid()`.
- * The fallback constant is the SHA-256 initial hash value for H0, chosen as a non-zero,
- * non-trivial mixing constant.
+ * @details A failed open performs no read and no close. A short read still closes the fd,
+ * so a process without full entropy does not leak a descriptor per seeding.
  */
 static void test_seed_fallback_paths(void)
 {
@@ -643,23 +632,18 @@ static void test_seed_fallback_paths(void)
 #endif
 
 /**
- * @brief Invariant: `chaos_net_init()` wires all function pointers and seeds the PRNG.
- *
- * Triggering condition: `chaos_net_init()` called after `reset_test_state()`.
- *
- * Expected observable behaviour:
- * - All 20 portable `g_chaos_net_real_*` globals equal their corresponding stub functions.
- * - On Linux: the 5 additional Linux-only globals are also wired.
- * - `g_config_init_calls` increments by exactly 1 (config subsystem initialised once).
- * - `g_chaos_net_process_seed != 0` (seed was populated from `chaos_net_read_seed_material()`).
- * - `g_chaos_net_tls_prng_state != 0` (TLS PRNG state was seeded from process seed).
+ * @brief Proves the constructor wires every socket real function, seeds both PRNG states, and
+ *   initialises and loads the configuration exactly once each.
  */
 static void test_constructor_init(void)
 {
     int config_calls_before;
+    int prepare_calls_before;
 
     reset_test_state();
+    reset_symbols_once();
     config_calls_before = g_config_init_calls;
+    prepare_calls_before = g_config_prepare_calls;
     chaos_net_init();
     assert(g_chaos_net_real_bind == stub_bind);
     assert(g_chaos_net_real_listen == stub_listen);
@@ -689,12 +673,45 @@ static void test_constructor_init(void)
     assert(g_chaos_net_real_epoll_pwait == stub_epoll_pwait);
 #endif
     assert(g_config_init_calls == config_calls_before + 1);
+    assert(g_config_prepare_calls == prepare_calls_before + 1);
     assert(g_chaos_net_process_seed != 0U);
     assert(g_chaos_net_tls_prng_state != 0U);
 }
 
+/** @brief Run-once guard driven by the re-entrant initialiser below. */
+static volatile chaos_once_t g_test_once = CHAOS_ONCE_INIT;
+/** @brief Result of the nested chaos_once() call (-1 until it runs). */
+static int g_test_nested = -1;
+/** @brief Times the initialiser ran. */
+static int g_test_runs = 0;
+
+/**
+ * @brief Initialiser that calls chaos_once() on its own guard, as symbol resolution can when
+ *   dlsym() itself calls an interposed function.
+ */
+static void reentrant_initialiser(void)
+{
+    ++g_test_runs;
+    g_test_nested = chaos_once(&g_test_once, reentrant_initialiser);
+}
+
+/**
+ * @brief Proves a nested chaos_once() on the initialising thread returns 0 at once instead of
+ *   waiting for itself, the outer call returns 1, the guard ends DONE, and a later call does
+ *   not run the initialiser again.
+ */
+static void test_once_reentry_does_not_wait(void)
+{
+    assert(chaos_once(&g_test_once, reentrant_initialiser) == 1);
+    assert(g_test_nested == 0 && g_test_runs == 1);
+    assert(g_test_once == CHAOS_ONCE_DONE);
+    assert(chaos_once(&g_test_once, reentrant_initialiser) == 1);
+    assert(g_test_runs == 1);
+}
+
 int main(void)
 {
+    test_once_reentry_does_not_wait();
     test_resolve_symbol_and_seed_helpers();
     test_resolve_symbol_abort_path();
 #ifdef __linux__

@@ -1,104 +1,44 @@
 /**
  * @file test_net_actions.c
- * @brief Unit tests for NET-domain probabilistic, corruption, latency, and errno helpers.
+ * @brief Unit tests for the libchaos-net effect helpers: probability, rule firing, CORRUPT,
+ *   LATENCY and ERRNO.
  *
- * Subsystem under test: `src/net/chaos_net_actions.c`
+ * @details
+ * Unit under test: `src/net/chaos_net_actions.c`. The suite proves:
+ * - probability: 0.0 and negative values never hit, 1.0 always hits, 0.5 splits the 32-bit
+ *   sample space at 2^31; a draw is reproducible from a seed, and seed 0 behaves like seed 1
+ *   (xorshift must never start from the all-zero state, which it cannot leave);
+ * - CORRUPT flips exactly one bit, at byte `index_sample % size` and bit `bit_sample & 7`,
+ *   and ignores a NULL or empty buffer;
+ * - firing: the `@from`/`@until` window and `@size` gate apply first; LATENCY rules carry no
+ *   probability and fire on every permitted call; other effects then draw against their
+ *   probability; `@first=N` caps the firings; a hit is counted only when the effect fires;
+ * - LATENCY sleeps once for the whole delay (2500 ms is one 2 s + 500 ms request);
+ * - ERRNO sets errno only when an ERRNO rule fires; otherwise errno is untouched.
  *
- * Coverage approach:
- * - Includes production source directly via `#include "../../src/net/chaos_net_actions.c"`
- *   after defining `usleep` to a test-controlled stub. This gives access to all static
- *   helper functions without LD_PRELOAD.
- * - The `usleep` macro override redirects sleep calls into a local array so tests can
- *   assert on the exact useconds values generated for a given latency_ms setting.
+ * Seams: the source is compiled into this file. `test_sleep_support.h` replaces the sleep
+ * syscall used by `chaos_sleep_ms()` with a recorder, so LATENCY is observed without waiting.
+ * `CHAOS_NET_DEFINE_TEST_GLOBALS()` provides the real-function pointers and PRNG state.
  *
- * Properties under test:
- * - Probability sampling: boundary values (0.0, 1.0) and mid-range determinism.
- * - `chaos_net_probability_hit()` reproduces a seeded sample reproducibly.
- * - Buffer corruption: single-bit flip at a deterministic index+bit position.
- * - `chaos_net_corrupt_buffer()` and `chaos_net_corrupt_buffer_sample()` equivalence.
- * - Latency decomposition: 2500 ms becomes exactly three usleep calls of 1s, 1s, 0.5s.
- * - `chaos_net_rule_should_trigger()` unconditional for LATENCY effect, probability-gated
- *   for ERRNO effect.
- * - Errno application: ECONNREFUSED injected at probability 1.0; skipped at 0.0.
- *
- * What is NOT tested here:
- * - Config file parsing and rule selection.
- * - Actual socket wrapper call paths (tested in test_chaos_net.c).
- * - Thread-safety of `chaos_net_prng_seed_thread()`.
+ * Out of scope: rule parsing (`test_net_config.c`), the socket wrappers (`test_chaos_net.c`)
+ * and PRNG seeding across threads.
  */
 
 #include "../support/test_net_support.h"
 
-/**
- * @brief Captured usleep durations from the test-local sleep stub.
- *
- * Populated in call order. The array size (8) is deliberately small relative to
- * the maximum possible chunk count to catch excessive sleep decompositions via
- * the assert inside the stub.
- */
-static useconds_t g_sleep_chunks[8];
-
-/**
- * @brief Number of usleep calls recorded since the last reset.
- *
- * Used by tests to assert the exact number of sleep intervals generated.
- */
-static size_t g_sleep_count = 0U;
-
-/**
- * @brief Test-local usleep stub that records durations instead of sleeping.
- *
- * Asserts that the call array has not overflowed. Returns 0 (success) always.
- *
- * @param usec  Sleep duration in microseconds, recorded at `g_sleep_chunks[g_sleep_count]`.
- * @return 0 (success, never fails).
- */
-static int chaos_net_test_usleep(useconds_t usec)
-{
-    assert(g_sleep_count < sizeof(g_sleep_chunks) / sizeof(g_sleep_chunks[0]));
-    g_sleep_chunks[g_sleep_count++] = usec;
-    return 0;
-}
-
 CHAOS_NET_DEFINE_TEST_GLOBALS();
 
-/* Override usleep before including the production implementation. */
-#define usleep chaos_net_test_usleep
+#include "../support/test_sleep_support.h"
+
 #include "../../src/net/chaos_net_actions.c"
-#undef usleep
 
 /**
- * @brief Reset sleep-tracking state between test functions.
+ * @brief Proves the probability boundaries, reproducible draws from a seed, and that seed 0
+ *   is replaced by 1.
  *
- * Zeroes `g_sleep_count` and clears all recorded chunk values. Called at the
- * start of any test that exercises the latency code path.
- */
-static void chaos_net_test_reset_sleep_state(void)
-{
-    size_t index;
-
-    g_sleep_count = 0U;
-    for (index = 0U; index < sizeof(g_sleep_chunks) / sizeof(g_sleep_chunks[0]); ++index)
-    {
-        g_sleep_chunks[index] = 0U;
-    }
-}
-
-/**
- * @brief Invariant: probability sampling produces correct 0/1 decisions at boundary and midpoint.
- *
- * Triggering condition: `chaos_net_probability_hit_sample(p, sample)` called with
- *   boundary probabilities and hand-picked sample values.
- *
- * Expected observable behaviour:
- * - p=0.0 always returns 0 regardless of sample.
- * - p=-1.0 (out-of-range) always returns 0.
- * - p=1.0 always returns 1 regardless of sample.
- * - p=0.5 with sample=0 returns 1 (sample < threshold).
- * - p=0.5 with sample=0xffffffff returns 0 (sample >= threshold).
- * - `chaos_net_probability_hit(p)` with a seeded PRNG reproduces the result that
- *   would be obtained by manually drawing the next sample and calling
- *   `chaos_net_probability_hit_sample(p, sample)`.
+ * @details Out-of-range probabilities are clamped, never sampled: -1.0 never hits and 1.0
+ * hits even for sample UINT32_MAX. Re-seeding with the same value and calling
+ * `chaos_net_probability_hit()` matches drawing the sample by hand.
  */
 static void test_probability_helpers(void)
 {
@@ -116,20 +56,23 @@ static void test_probability_helpers(void)
         chaos_net_prng_seed_thread(123456U);
         assert(chaos_net_probability_hit(0.25) == expected_hit);
     }
+
+    chaos_net_prng_seed_thread(1U);
+    {
+        const uint32_t from_one = chaos_net_prng_next_u32();
+
+        chaos_net_prng_seed_thread(0U);
+        assert(g_chaos_net_tls_prng_state != 0U);
+        assert(chaos_net_prng_next_u32() == from_one);
+    }
 }
 
 /**
- * @brief Invariant: buffer corruption flips exactly one bit at the expected byte position.
+ * @brief Proves CORRUPT flips one bit at the position the two samples select, and that the
+ *   PRNG-driven form draws the index sample first and the bit sample second.
  *
- * Triggering condition: `chaos_net_corrupt_buffer_sample(buffer, size, index_sample, bit_sample)`.
- *
- * Expected observable behaviour:
- * - NULL or zero-size buffer calls are silently ignored (no crash, no modification).
- * - Buffer `{0, 0, 0}` with index_sample=1 and bit_sample=5 produces `{0, 0x20, 0}`.
- *   (bit 5 of byte 1: 1 << 5 = 0x20).
- * - `chaos_net_corrupt_buffer()` produces the same result as calling
- *   `chaos_net_corrupt_buffer_sample()` with the two next PRNG values after a
- *   common seed.
+ * @details Index sample 1, bit sample 5 on three zero bytes yields `{0, 0x20, 0}`. A NULL or
+ * zero-length buffer is left alone (a recv() of 0 bytes has nothing to corrupt).
  */
 static void test_corrupt_helpers(void)
 {
@@ -160,21 +103,54 @@ static void test_corrupt_helpers(void)
 }
 
 /**
- * @brief Invariant: latency of 2500ms decomposes into three usleep intervals and trigger
- *   logic respects effect type vs probability.
+ * @brief Proves LATENCY applies the qualifiers and counts each delay as a hit.
  *
- * Triggering condition:
- * - `chaos_net_rule_apply_latency(&rule)` with latency_ms=2500 and effect=LATENCY.
- * - `chaos_net_rule_should_trigger()` with various effect/probability combinations.
+ * @details `@first=1` delays once and then never. A `@from` in 2096 does not delay. `@size>100`
+ * skips a 10-byte call and delays a 101-byte one. Two delays, two hits.
+ */
+static void test_latency_honours_qualifiers(void)
+{
+    chaos_net_rule_t rule;
+    chaos_hit_slot_t slot;
+
+    (void)memset(&rule, 0, sizeof(rule));
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.effect = CHAOS_NET_EFFECT_LATENCY;
+    rule.latency_ms = 5U;
+    rule.hit = &slot;
+    rule.policy.first = 1U;
+
+    chaos_test_sleep_reset();
+    chaos_net_rule_apply_latency(&rule);
+    chaos_net_rule_apply_latency(&rule);
+    assert(g_test_sleep_calls == 1U);
+    assert(slot.count == 1U);
+
+    (void)memset(&rule.policy, 0, sizeof(rule.policy));
+    rule.policy.from_ms = INT64_C(4000000000000);
+    chaos_net_rule_apply_latency(&rule);
+    assert(g_test_sleep_calls == 1U);
+
+    (void)memset(&rule.policy, 0, sizeof(rule.policy));
+    rule.policy.has_size_above = 1U;
+    rule.policy.size_above = 100U;
+    rule.call_size = 10U;
+    chaos_net_rule_apply_latency(&rule);
+    assert(g_test_sleep_calls == 1U);
+    rule.call_size = 101U;
+    chaos_net_rule_apply_latency(&rule);
+    assert(g_test_sleep_calls == 2U);
+    assert(slot.count == 2U);
+}
+
+/**
+ * @brief Proves LATENCY sleeps once for the whole delay, and that LATENCY rules fire without a
+ *   probability while ERRNO rules draw against theirs.
  *
- * Expected observable behaviour:
- * - NULL rule pointer to `apply_latency`: no crash, no sleep calls.
- * - Zero-initialised rule to `apply_latency`: no crash, no sleep calls (no effect set).
- * - 2500 ms generates exactly 3 usleep calls: 1 000 000 + 1 000 000 + 500 000 µs.
- * - `chaos_net_rule_should_trigger(NULL)` returns 0.
- * - LATENCY effect triggers unconditionally (returns 1 regardless of probability).
- * - ERRNO effect with probability=0.0 does not trigger (returns 0).
- * - ERRNO effect with probability=1.0 triggers (returns 1).
+ * @details A NULL rule and a rule of no effect do not sleep. 2500 ms is a single sleep request
+ * of 2 s + 500000000 ns, not a sequence of shorter sleeps. A LATENCY rule with probability 0
+ * still fires: its value field is the delay, not a probability. ERRNO at 0.0 never fires and
+ * at 1.0 always does.
  */
 static void test_latency_and_trigger_helpers(void)
 {
@@ -182,18 +158,17 @@ static void test_latency_and_trigger_helpers(void)
 
     (void)memset(&rule, 0, sizeof(rule));
 
-    chaos_net_test_reset_sleep_state();
+    chaos_test_sleep_reset();
     chaos_net_rule_apply_latency(NULL);
     chaos_net_rule_apply_latency(&rule);
-    assert(g_sleep_count == 0U);
+    assert(g_test_sleep_calls == 0U);
 
     rule.effect = CHAOS_NET_EFFECT_LATENCY;
     rule.latency_ms = 2500U;
     chaos_net_rule_apply_latency(&rule);
-    assert(g_sleep_count == 3U);
-    assert(g_sleep_chunks[0] == 1000000U);
-    assert(g_sleep_chunks[1] == 1000000U);
-    assert(g_sleep_chunks[2] == 500000U);
+    assert(g_test_sleep_calls == 1U);
+    assert(g_test_sleep_requests[0].tv_sec == 2);
+    assert(g_test_sleep_requests[0].tv_nsec == 500000000L);
 
     assert(chaos_net_rule_should_trigger(NULL) == 0);
     assert(chaos_net_rule_should_trigger(&rule) == 1);
@@ -207,20 +182,11 @@ static void test_latency_and_trigger_helpers(void)
 }
 
 /**
- * @brief Invariant: errno injection sets the target error code and is gated by probability.
+ * @brief Proves ERRNO writes the rule's errno only when an ERRNO rule fires.
  *
- * Triggering condition:
- * - `chaos_net_rule_apply_errno(&rule)` with effect=ERRNO, errnum=ECONNREFUSED,
- *   and various probability values.
- *
- * Expected observable behaviour:
- * - NULL rule returns 0; errno is unchanged.
- * - Zero-initialised rule (no effect set) returns 0; errno is unchanged.
- * - probability=0.0: returns 0; errno is left at its current value (123).
- * - probability=1.0: returns 1; errno is set to ECONNREFUSED.
- *
- * ECONNREFUSED is chosen as a representative network errno to verify that the
- * specific error code requested by the rule is what actually gets injected.
+ * @details A NULL rule, a rule of no effect, a rule at probability 0.0 and a firing LATENCY
+ * rule all return 0 and leave errno as it was (123): the wrapper relies on errno being
+ * untouched when it goes on to make the real call. At 1.0 errno becomes ECONNREFUSED.
  */
 static void test_errno_application(void)
 {
@@ -242,13 +208,97 @@ static void test_errno_application(void)
     errno = 0;
     assert(chaos_net_rule_apply_errno(&rule) == 1);
     assert(errno == ECONNREFUSED);
+
+    rule.effect = CHAOS_NET_EFFECT_LATENCY;
+    errno = 123;
+    assert(chaos_net_rule_apply_errno(&rule) == 0);
+    assert(errno == 123);
+}
+
+/**
+ * @brief Proves a hit is counted only when the effect fires.
+ *
+ * @details The hits file must report firings, not evaluations: probability 1.0 fires and
+ * counts 1, probability 0.0 neither fires nor counts. A rule with no hit slot (a copy made
+ * outside a rule snapshot) still fires.
+ */
+static void test_should_trigger_counts_hits(void)
+{
+    chaos_net_rule_t rule;
+    chaos_hit_slot_t slot;
+
+    memset(&rule, 0, sizeof(rule));
+    memset(&slot, 0, sizeof(slot));
+    rule.effect = CHAOS_NET_EFFECT_ERRNO;
+    rule.hit = &slot;
+    rule.probability = 1.0;
+    assert(chaos_net_rule_should_trigger(&rule) == 1);
+    assert(slot.count == 1U);
+    rule.probability = 0.0;
+    assert(chaos_net_rule_should_trigger(&rule) == 0);
+    assert(slot.count == 1U);
+    rule.hit = NULL;
+    rule.probability = 1.0;
+    assert(chaos_net_rule_should_trigger(&rule) == 1);
+}
+
+/**
+ * @brief Proves `chaos_net_rule_should_trigger()` applies `@first`, `@from`/`@until` and
+ *   `@size`.
+ *
+ * @details `@first=2` fires twice, then stops, and the hit count stays 2. The window is
+ * compared with the wall clock in Unix ms: `@until=1` has passed, `@from=4000000000000`
+ * (year 2096) has not started, and `@from=1` is open. `@size>100` rejects a call without a
+ * byte count (`CHAOS_POLICY_NO_SIZE`) and a call of exactly 100 bytes (strict bound), passes
+ * 101, and `@size<101` added on top rejects 101 again.
+ */
+static void test_should_trigger_honours_qualifiers(void)
+{
+    chaos_net_rule_t rule;
+    chaos_hit_slot_t slot;
+
+    memset(&rule, 0, sizeof(rule));
+    memset(&slot, 0, sizeof(slot));
+    rule.effect = CHAOS_NET_EFFECT_ERRNO;
+    rule.hit = &slot;
+    rule.probability = 1.0;
+    rule.policy.first = 2U;
+    assert(chaos_net_rule_should_trigger(&rule) == 1);
+    assert(chaos_net_rule_should_trigger(&rule) == 1);
+    assert(chaos_net_rule_should_trigger(&rule) == 0);
+    assert(slot.count == 2U);
+
+    memset(&rule.policy, 0, sizeof(rule.policy));
+    rule.policy.until_ms = 1;
+    assert(chaos_net_rule_should_trigger(&rule) == 0);
+    rule.policy.until_ms = 0;
+    rule.policy.from_ms = INT64_C(4000000000000);
+    assert(chaos_net_rule_should_trigger(&rule) == 0);
+    rule.policy.from_ms = 1;
+    assert(chaos_net_rule_should_trigger(&rule) == 1);
+
+    memset(&rule.policy, 0, sizeof(rule.policy));
+    rule.policy.has_size_above = 1U;
+    rule.policy.size_above = 100U;
+    rule.call_size = CHAOS_POLICY_NO_SIZE;
+    assert(chaos_net_rule_should_trigger(&rule) == 0);
+    rule.call_size = 100U;
+    assert(chaos_net_rule_should_trigger(&rule) == 0);
+    rule.call_size = 101U;
+    assert(chaos_net_rule_should_trigger(&rule) == 1);
+    rule.policy.has_size_below = 1U;
+    rule.policy.size_below = 101U;
+    assert(chaos_net_rule_should_trigger(&rule) == 0);
 }
 
 int main(void)
 {
+    test_should_trigger_honours_qualifiers();
+    test_should_trigger_counts_hits();
     test_probability_helpers();
     test_corrupt_helpers();
     test_latency_and_trigger_helpers();
+    test_latency_honours_qualifiers();
     test_errno_application();
     return 0;
 }

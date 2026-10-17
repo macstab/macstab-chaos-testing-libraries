@@ -1,14 +1,17 @@
 #!/bin/sh
 #
-# check_format.sh — clang-format style gate for all C sources.
+# check_format.sh: clang-format gate and formatter for every C source under src/ and test/.
 #
-# Scans every .c and .h file under src/ and test/ for clang-format compliance.
-# In --check mode (default) exits non-zero if any file would be reformatted.
-# In --fix mode rewrites files in place.
+# --check (default, `make fmt-check`) proves that every .c and .h file is byte-identical to
+# clang-format's output under the repository's .clang-format; it stops at the first deviating
+# file and prints its unified diff. --write (`make fmt`) reformats all files in place.
 #
-# Usage:   check_format.sh [--check|--fix]
-# Env:     CLANG_FORMAT  path override for the clang-format binary
-# Prereqs: clang-format (searched in PATH, then via xcrun on macOS)
+# Usage:   check_format.sh [--check|--write]
+# Env:     CLANG_FORMAT  clang-format binary to use instead of the one found in PATH
+# Prereqs: clang-format (CLANG_FORMAT, then PATH, then `xcrun --find` on macOS); output can
+#          differ between clang-format major versions.
+# Exit:    0 all files conform (or were rewritten); 1 a file deviates or no clang-format was
+#          found; 2 unknown mode. Never skips.
 
 set -eu
 

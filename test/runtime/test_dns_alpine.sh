@@ -1,19 +1,30 @@
 #!/bin/sh
 #
-# test_dns_alpine.sh — libchaos-dns runtime validation on musl/Alpine (Docker).
+# test_dns_alpine.sh: libchaos-dns end-to-end in LD_PRELOAD mode on musl (Alpine 3.20).
 #
-# Builds libchaos-dns.so for the target platform using Docker buildx with a
-# musl (alpine) base, then runs the pre-compiled dns_probe binary under
-# LD_PRELOAD in an Alpine container. Validates getaddrinfo and getnameinfo
-# fault injection on musl libc for amd64 and arm64.
+# Proves, for one architecture per run, that dns:// and rdns:// rules reach getaddrinfo, getnameinfo
+# and the gethostbyname*/gethostbyaddr* family with the GAI, LATENCY, REWRITE, SERVICE, OVERRIDE,
+# FILTER_FAMILY, SHUFFLE and LIMIT effects, without network access; dns_probe.c lists every check.
+#
+# Method: docker buildx builds libchaos-dns-musl-<arch>.so (make cross-musl-<arch>) from
+# docker/Dockerfile.build on alpine:3.20. Then a fresh alpine:3.20 container (build-base installed
+# at run time) compiles test/runtime/dns_probe.c from the read-only repository mount and runs it
+# with LD_PRELOAD=/tmp/libchaos-dns.so. The probe is compiled in the target image so it uses the
+# same libc the library was built against.
 #
 # Note: on musl, getaddrinfo calls do not go through NSS modules; the
 # reentrancy path from getnameinfo→getaddrinfo (glibc aarch64 only) is
 # not triggered. Both paths are independently exercised by dns_probe.
 #
-# Usage:   test_dns_alpine.sh [linux/amd64|linux/arm64]
-# Env:     CHAOS_DNS_DOCKER_PLATFORM  platform override
-# Prereqs: docker with buildx and multi-arch support
+# Usage:   test_dns_alpine.sh [linux/amd64|linux/arm64]   (default: the host architecture)
+# Env:     CHAOS_DNS_DOCKER_PLATFORM  platform when no argument is given
+#          CHAOS_SKIP_EXIT  exit status of a skip (default 0; CI sets 1)
+# Prereqs: docker with buildx; QEMU binfmt for a foreign platform. Run by `make test` and,
+#          once per platform, by `make test-matrix`.
+# Exit:    the probe's exit code (0 = every check passed; dns_probe.c lists the others);
+#          non-zero when the build fails or yields no library; 2 on bad usage;
+#          CHAOS_SKIP_EXIT when the host or platform is not amd64/arm64, docker is missing
+#          or its daemon is unreachable.
 
 set -eu
 
@@ -36,7 +47,7 @@ if [ -z "$DOCKER_PLATFORM" ]; then
             ;;
         *)
             echo "dns alpine test skipped: unsupported host architecture $(uname -m)" >&2
-            exit 0
+            exit "${CHAOS_SKIP_EXIT:-0}"
             ;;
     esac
 fi
@@ -52,7 +63,7 @@ case "$DOCKER_PLATFORM" in
         ;;
     *)
         echo "dns alpine test skipped: unsupported docker platform $DOCKER_PLATFORM" >&2
-        exit 0
+        exit "${CHAOS_SKIP_EXIT:-0}"
         ;;
 esac
 
@@ -64,12 +75,12 @@ trap cleanup EXIT INT TERM
 
 if ! command -v docker >/dev/null 2>&1; then
     echo "dns alpine test skipped: docker not available" >&2
-    exit 0
+    exit "${CHAOS_SKIP_EXIT:-0}"
 fi
 
 if ! docker version >/dev/null 2>&1; then
     echo "dns alpine test skipped: docker daemon not accessible" >&2
-    exit 0
+    exit "${CHAOS_SKIP_EXIT:-0}"
 fi
 
 docker buildx build \

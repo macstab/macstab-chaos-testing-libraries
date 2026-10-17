@@ -1,59 +1,42 @@
 /**
  * @file chaos_dns_actions.c
- * @brief Implementation of pre-call effects and post-call result-set transforms.
+ * @brief Effect primitives of libchaos-dns (contracts in chaos_dns_actions.h).
  *
  * @details
- * This translation unit implements all functions declared in
- * chaos_dns_actions.h.  It is the only place in the library that:
- *   - Issues blocking sleeps (LATENCY).
- *   - Calls g_chaos_dns_real_freeaddrinfo on individual addrinfo nodes (FILTER_FAMILY, LIMIT).
- *   - Heap-allocates a temporary pointer array (SHUFFLE).
+ * The only place in the library that sleeps (LATENCY), releases single addrinfo nodes
+ * (FILTER_FAMILY, LIMIT) and allocates a temporary array (SHUFFLE).
  *
- * ### addrinfo ownership model
- *
- * The transform functions (chaos_dns_filter_result_list,
- * chaos_dns_limit_result_list, chaos_dns_shuffle_result_list) operate on
- * addrinfo lists whose nodes were allocated by the real getaddrinfo — either
- * directly by the real resolver call, or by the OVERRIDE path which calls the
- * real getaddrinfo with AI_NUMERICHOST for each IP literal.
- *
- * Nodes that are removed from the list (by FILTER_FAMILY or LIMIT) are freed
- * immediately via chaos_dns_call_real_freeaddrinfo().  This is correct
- * because:
- *   1. The nodes were allocated by the real getaddrinfo; only the matching
- *      real freeaddrinfo knows their internal memory layout.
- *   2. Calling the interposed freeaddrinfo entry point instead would re-enter
- *      the library (setting the reentrancy guard) and might apply additional
- *      unexpected logic.
- *   3. Calling the system malloc/free directly would be incorrect because
- *      getaddrinfo may use a custom allocator internally.
- *
- * Nodes that are *kept* in the list remain owned by the caller (the
- * getaddrinfo interposer in chaos_dns_lookup.c).  When the application
- * eventually calls freeaddrinfo on the result, the interposed freeaddrinfo
- * entry point delegates to the real freeaddrinfo for the surviving nodes.
+ * ### Releasing nodes
+ * A node removed from a list is released by chaos_dns_call_real_freeaddrinfo():
+ *   1. A node of a real result goes to the real freeaddrinfo, which alone knows how the
+ *      C library allocated it (glibc: per node; musl: one reference-counted block per
+ *      result). Either way it walks ai_next, so a single node is isolated first.
+ *   2. A node of a list OVERRIDE built (chaos_dns_owned.h) is left alone: it lives in
+ *      one block that the freeaddrinfo wrapper frees with the list.
+ *   3. Never through the freeaddrinfo wrapper, and never with free().
+ * Kept nodes stay with the caller and reach the application, which frees the list
+ * through the freeaddrinfo wrapper.
  *
  * ### SHUFFLE allocation
- *
- * chaos_dns_shuffle_result_list() heap-allocates a temporary `struct
- * addrinfo *[]` array solely to hold pointers during the Fisher–Yates shuffle.
- * This array is freed before the function returns.  No addrinfo nodes are
- * allocated or freed; only the ai_next chain is re-wired.  If calloc fails,
- * the function is a no-op and the list is returned in its original order.
+ * chaos_dns_shuffle_result_list() calloc()s an array of N node pointers for the
+ * Fisher-Yates pass and frees it before returning; no node is allocated or freed. If
+ * calloc fails the list keeps its order.
  *
  * @module  libchaos-dns actions
  * @stability  Private
  */
 
 #include "chaos_dns_actions.h"
+#include "chaos_sleep.h"
+
+#include "chaos_dns_owned.h"
 
 #include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
 
 /**
- * @brief Test whether a probabilistic rule fires given a pre-supplied sample.
- *        See chaos_dns_actions.h for the full contract.
+ * @brief Fire/no-fire decision for a pre-drawn sample (contract in the header).
  */
 int chaos_dns_probability_hit_sample(double probability, uint32_t sample)
 {
@@ -68,17 +51,14 @@ int chaos_dns_probability_hit_sample(double probability, uint32_t sample)
         return 1;
     }
 
-    /* Map probability [0,1] onto the uint32 range [0, 2^32).
-     * A sample value strictly less than the threshold triggers the rule.
-     * At probability == 1.0 the threshold equals 4294967296.0 which is larger
-     * than any uint32, so the fast path above handles that case. */
+    /* Map [0, 1) onto [0, 2^32): a sample strictly below the threshold fires.
+     * Converting a uint32_t to double is exact; probability 1.0 took the early return. */
     threshold = probability * 4294967296.0;
     return (double)sample < threshold;
 }
 
 /**
- * @brief Test whether a probabilistic rule fires, drawing from the PRNG.
- *        See chaos_dns_actions.h for the full contract.
+ * @brief Fire/no-fire decision with one PRNG draw (contract in the header).
  */
 int chaos_dns_probability_hit(double probability)
 {
@@ -86,52 +66,44 @@ int chaos_dns_probability_hit(double probability)
 }
 
 /**
- * @brief Sleep for the duration specified in a LATENCY rule.
- *        See chaos_dns_actions.h for the full contract.
+ * @brief Sleeps for a LATENCY rule (contract in the header).
  *
- * @details usleep(3) accepts at most 999999 µs on POSIX systems.  The loop
- * divides the total into chunks of at most 1,000,000 µs to avoid exceeding
- * this limit, and continues until the full latency has been injected.
- * A SIGALRM or other signal interrupting usleep will cause an early return
- * from that chunk; the remaining microseconds are re-attempted in the next
- * iteration, so the effective latency is at least the requested value minus
- * signal handling overhead.
+ * @details No decision here: the wrappers call chaos_dns_rule_should_trigger() first.
+ * chaos_sleep_ms() is a raw system call, so no other preloaded library (libchaos-time in
+ * particular) can shorten or stretch the delay; errno is preserved.
  */
 void chaos_dns_rule_apply_latency(const chaos_dns_rule_t *rule)
 {
-    uint64_t remaining_us;
-
     if (rule == NULL || rule->effect != CHAOS_DNS_EFFECT_LATENCY)
     {
         return;
     }
-
-    remaining_us = (uint64_t)rule->latency_ms * 1000ULL;
-    while (remaining_us > 0ULL)
-    {
-        /* usleep takes useconds_t; cap each sleep at 1,000,000 µs (= 1 s). */
-        useconds_t chunk = remaining_us > 1000000ULL ? 1000000U : (useconds_t)remaining_us;
-        (void)usleep(chunk);
-        remaining_us -= (uint64_t)chunk;
-    }
+    chaos_sleep_ms((uint64_t)rule->latency_ms);
 }
 
 /**
- * @brief Decide whether this rule fires on the current call.
- *        See chaos_dns_actions.h for the full contract.
+ * @brief Firing decision for a rule copy (contract in the header).
+ *
+ * @details Cheap gates first (window, size), then the PRNG draw, then the hit slot: a
+ * call the window or the size gate rejects neither consumes a random number nor claims
+ * an `@first` slot.
  */
 int chaos_dns_rule_should_trigger(const chaos_dns_rule_t *rule)
 {
-    if (rule == NULL)
+    if (rule == NULL || !chaos_policy_window_open(&rule->policy) ||
+        !chaos_policy_size_ok(&rule->policy, rule->call_size))
     {
         return 0;
     }
-    return chaos_dns_probability_hit(rule->probability);
+    if (!chaos_dns_probability_hit(rule->probability))
+    {
+        return 0;
+    }
+    return chaos_policy_fire(&rule->policy, rule->hit, rule->hit_generation);
 }
 
 /**
- * @brief Apply a GAI effect rule if it fires.
- *        See chaos_dns_actions.h for the full contract.
+ * @brief Applies a GAI rule (contract in the header).
  */
 int chaos_dns_rule_apply_gai(const chaos_dns_rule_t *rule, int *gai_error)
 {
@@ -149,26 +121,22 @@ int chaos_dns_rule_apply_gai(const chaos_dns_rule_t *rule, int *gai_error)
 }
 
 /**
- * @brief Call the real freeaddrinfo under the reentrancy guard.
+ * @brief Releases a node or sub-list of a real result with the real freeaddrinfo.
  *
- * @details Sets the TLS reentrancy guard before invoking
- * g_chaos_dns_real_freeaddrinfo so that the call cannot be intercepted by the
- * library's own interposed freeaddrinfo entry point.  This is the correct
- * way to free nodes that were allocated by the real getaddrinfo.
+ * @details No-op for NULL, before the real function is resolved (leaking is the only
+ * safe choice), and for a node of a list OVERRIDE built: such a node stays in its block
+ * until the whole list is freed (chaos_dns_owned.h). The guard is saved and restored
+ * around the call, so this works inside an existing section too.
  *
- * The guard is saved and restored (not simply set to 1) so that this function
- * can be called from within an already-internal context without incorrectly
- * resetting the guard to 0 on return.
- *
- * @param result  Head of the addrinfo sub-list to free; no-op if NULL.
- *                Also no-op if g_chaos_dns_real_freeaddrinfo is NULL (not yet
- *                initialised), though this should never happen at call sites.
+ * @param result  Head of the nodes to release.
  */
 static void chaos_dns_call_real_freeaddrinfo(struct addrinfo *result)
 {
     int previous;
 
-    if (result == NULL || g_chaos_dns_real_freeaddrinfo == NULL)
+    /* A node of a list we built (OVERRIDE) stays in its block until the list itself is
+     * freed; only real results are released node by node. */
+    if (result == NULL || g_chaos_dns_real_freeaddrinfo == NULL || chaos_dns_owned_contains(result))
     {
         return;
     }
@@ -179,7 +147,7 @@ static void chaos_dns_call_real_freeaddrinfo(struct addrinfo *result)
 }
 
 /**
- * @brief Count nodes in an addrinfo list.  See chaos_dns_actions.h.
+ * @brief Node count of an addrinfo list (contract in the header).
  */
 size_t chaos_dns_result_count(const struct addrinfo *result)
 {
@@ -195,21 +163,12 @@ size_t chaos_dns_result_count(const struct addrinfo *result)
 }
 
 /**
- * @brief Remove addrinfo nodes that do not match the target address family.
- *        See chaos_dns_actions.h for the full contract and ownership model.
+ * @brief Removes nodes of the other family (contract in the header).
  *
- * @details Traversal is done with explicit `current` and `previous` pointers.
- * When a node is removed:
- *   1. `current->ai_next` is saved in `next`.
- *   2. The node is unlinked (previous->ai_next or *result is updated to `next`).
- *   3. `current->ai_next` is set to NULL so freeaddrinfo receives a
- *      single-node list, not the rest of the chain.
- *   4. chaos_dns_call_real_freeaddrinfo(current) releases the node.
- *
- * Setting ai_next to NULL before freeing is critical: if the node's internal
- * allocator stores adjacent nodes contiguously, passing a non-NULL ai_next
- * could cause the real freeaddrinfo to walk and double-free the rest of the
- * list.
+ * @details One pass with `previous` and `current`. A dropped node is unlinked, then
+ * isolated (ai_next = NULL) before it is released, because freeaddrinfo walks ai_next
+ * and would otherwise release the rest of the chain too. The canonical name is handed to
+ * the next node first, so it survives on the new head.
  */
 int chaos_dns_filter_result_list(struct addrinfo **result, chaos_dns_family_filter_t family)
 {
@@ -230,7 +189,15 @@ int chaos_dns_filter_result_list(struct addrinfo **result, chaos_dns_family_filt
 
         if (current->ai_family != wanted_family)
         {
-            /* Unlink this node from the list. */
+            /* The canonical name lives on the first node: hand it on rather than free it
+             * with the node, so the new head keeps it. A last node keeps it, and frees
+             * it, when nothing is left. */
+            if (current->ai_canonname != NULL && next != NULL && next->ai_canonname == NULL)
+            {
+                next->ai_canonname = current->ai_canonname;
+                current->ai_canonname = NULL;
+            }
+            /* Unlink. */
             if (previous == NULL)
             {
                 *result = next;
@@ -239,8 +206,8 @@ int chaos_dns_filter_result_list(struct addrinfo **result, chaos_dns_family_filt
             {
                 previous->ai_next = next;
             }
-            /* Isolate the node before freeing to prevent the real freeaddrinfo
-             * from walking ai_next and freeing nodes we still need. */
+            /* Isolate before releasing: freeaddrinfo walks ai_next and would release
+             * nodes that are still in the list. */
             current->ai_next = NULL;
             chaos_dns_call_real_freeaddrinfo(current);
         }
@@ -251,19 +218,16 @@ int chaos_dns_filter_result_list(struct addrinfo **result, chaos_dns_family_filt
         current = next;
     }
 
+    /* The name only moves from a dropped node to the next, so it ends on the first
+     * survivor, the new head (or with the last node, if none is left). */
     return *result != NULL;
 }
 
 /**
- * @brief Truncate an addrinfo list to at most @p limit nodes.
- *        See chaos_dns_actions.h for the full contract and ownership model.
+ * @brief Cuts a list after @p limit nodes (contract in the header).
  *
- * @details When the N-th node (where N == limit) is reached, the tail
- * (current->ai_next onwards) is detached in a single pointer assignment and
- * freed via chaos_dns_call_real_freeaddrinfo().  Unlike filter, where nodes
- * must be freed one by one (to avoid contaminating the remainder of the list),
- * here the entire tail can be freed in one call because none of the tail nodes
- * are kept.
+ * @details The tail is detached by terminating node @p limit and released in one call:
+ * every tail node goes, so the real freeaddrinfo may walk the whole sub-list.
  */
 void chaos_dns_limit_result_list(struct addrinfo **result, unsigned int limit)
 {
@@ -274,7 +238,7 @@ void chaos_dns_limit_result_list(struct addrinfo **result, unsigned int limit)
     {
         if (result != NULL && *result != NULL && limit == 0U)
         {
-            /* Limit of zero: free the entire list. */
+            /* Limit 0 (never produced by the parser): release the whole list. */
             chaos_dns_call_real_freeaddrinfo(*result);
             *result = NULL;
         }
@@ -287,7 +251,7 @@ void chaos_dns_limit_result_list(struct addrinfo **result, unsigned int limit)
         ++count;
         if (count == limit)
         {
-            /* Detach the tail and free it as a sub-list in a single call. */
+            /* Detach the tail and release it as one sub-list. */
             struct addrinfo *tail = current->ai_next;
 
             current->ai_next = NULL; /* terminate the kept prefix */
@@ -299,30 +263,17 @@ void chaos_dns_limit_result_list(struct addrinfo **result, unsigned int limit)
 }
 
 /**
- * @brief Randomly permute addrinfo list nodes using Fisher–Yates.
- *        See chaos_dns_actions.h for the full contract and allocation notes.
+ * @brief Fisher-Yates shuffle of a list (contract in the header).
  *
- * @details The algorithm:
- *   1. Count nodes N.  Return immediately if N < 2.
- *   2. calloc an array of N `struct addrinfo *` pointers.  calloc (not malloc)
- *      is used so that a partial failure leaves the array zero-initialised
- *      rather than containing garbage — defensively, though the loop always
- *      fills all slots.
- *   3. Fill the array with node pointers in list order.
- *   4. Fisher–Yates descending sweep: for i in [N-1, 1], swap nodes[i] with
- *      nodes[j] where j = prng_next_u32() % (i+1).
- *   5. Relink: for each index i in [0, N-2], nodes[i]->ai_next = nodes[i+1].
- *      Set nodes[N-1]->ai_next = NULL.
- *   6. Set *result = nodes[0].
- *   7. free the temporary array.
- *
- * No addrinfo nodes are allocated or freed.  The temporary array is always
- * freed before return, including on the early-return path (count < 2).
+ * @details Array of node pointers in list order; descending sweep swapping node i with
+ * node `prng % (i + 1)`; canonical name swapped from the old head to the new one (the C
+ * libraries set it only on the head); relink; free the array.
  */
 void chaos_dns_shuffle_result_list(struct addrinfo **result)
 {
     struct addrinfo **nodes;
     struct addrinfo *current;
+    char *canonname;
     size_t count;
     size_t index;
 
@@ -337,15 +288,14 @@ void chaos_dns_shuffle_result_list(struct addrinfo **result)
         return;
     }
 
-    /* Heap-allocate a pointer array for the shuffle.  On failure, leave the
-     * list unchanged (fail-open: caller still has a valid list). */
+    /* Fail-open: without the array the list keeps its order. */
     nodes = (struct addrinfo **)calloc(count, sizeof(*nodes));
     if (nodes == NULL)
     {
         return;
     }
 
-    /* Step 1: fill the pointer array in current list order. */
+    /* Node pointers in list order. */
     current = *result;
     for (index = 0U; index < count; ++index)
     {
@@ -353,9 +303,8 @@ void chaos_dns_shuffle_result_list(struct addrinfo **result)
         current = current->ai_next;
     }
 
-    /* Step 2: Fisher–Yates descending sweep.
-     * j is drawn from [0, i] inclusive via prng_next_u32() % (i+1).
-     * Modulo bias is negligible for i+1 ≤ 256. */
+    /* Descending Fisher-Yates sweep; j uniform in [0, i] up to a modulo bias below
+     * (i + 1) / 2^32. */
     for (index = count - 1U; index > 0U; --index)
     {
         size_t swap_index = (size_t)(chaos_dns_prng_next_u32() % (uint32_t)(index + 1U));
@@ -365,7 +314,11 @@ void chaos_dns_shuffle_result_list(struct addrinfo **result)
         nodes[swap_index] = tmp;
     }
 
-    /* Step 3: relink the shuffled pointers into a singly-linked list. */
+    /* Relink. The canonical name belongs to the head (callers read it there): swap it
+     * with the new head's (NULL in what the C libraries return), so none is lost. */
+    canonname = (*result)->ai_canonname;
+    (*result)->ai_canonname = nodes[0]->ai_canonname;
+    nodes[0]->ai_canonname = canonname;
     for (index = 0U; index + 1U < count; ++index)
     {
         nodes[index]->ai_next = nodes[index + 1U];
@@ -373,6 +326,6 @@ void chaos_dns_shuffle_result_list(struct addrinfo **result)
     nodes[count - 1U]->ai_next = NULL;
     *result = nodes[0];
 
-    /* Step 4: free the temporary pointer array (not the addrinfo nodes). */
+    /* The pointer array only; the nodes now form the list. */
     free(nodes);
 }

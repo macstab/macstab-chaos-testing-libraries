@@ -1,5 +1,6 @@
-/* memory use-case 2 — time an mmap. With mmap:LATENCY:150 it gains ~150 ms, modelling
- * an allocation-path / page-reclaim stall. Timing is real: only the memory lib is loaded. */
+/* Demo mem2: times one 1 MiB anonymous mmap with CLOCK_MONOTONIC. Under libchaos-memory
+ * with `mmap:LATENCY:150` the call takes ~150 ms longer, modelling an allocation stall under
+ * memory pressure. Only libchaos-memory is preloaded, so the clock read is not altered. */
 #include <stdio.h>
 #include <time.h>
 #include <sys/mman.h>

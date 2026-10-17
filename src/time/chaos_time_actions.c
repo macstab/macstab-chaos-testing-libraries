@@ -1,69 +1,26 @@
 /**
  * @file chaos_time_actions.c
- * @brief Implementation of chaos effect actions: probability gating,
- *        LATENCY sleep, ERRNO injection, and OFFSET arithmetic.
+ * @brief Effect execution for libchaos-time: firing decision, LATENCY sleep, ERRNO,
+ *        OFFSET and REGRESS arithmetic, deadline correction.
  *
- * This translation unit is the only place where probability thresholds are
- * evaluated, sleep calls are issued to real sleep functions, errno is set
- * unconditionally, and struct timespec values are arithmetically modified.
+ * @details
+ * ### LATENCY
  *
- * ### LATENCY implementation and reentrancy
+ * The delay goes through the real usleep (or the real nanosleep) pointer, never the
+ * exported symbol, with the guard raised for each chunk. The guard is saved and
+ * restored, not set and cleared, because a wrapper may already hold it (see
+ * @ref chaos_time_guard). Unlike the other libraries, which sleep with a raw
+ * clock_nanosleep system call (chaos_sleep.h), libchaos-time sleeps through these
+ * real-function pointers.
  *
- * The LATENCY action must sleep for a caller-specified duration without
- * triggering further chaos injection.  chaos_time_sleep_chunk() achieves this
- * by:
+ * ### Time arithmetic
  *
- *  1. Calling chaos_time_enter_internal(), which saves the current guard value
- *     and sets it to 1.
- *  2. Calling g_chaos_time_real_usleep or g_chaos_time_real_nanosleep directly
- *     through the resolved function pointers — never through the symbol names
- *     `usleep` or `nanosleep`, which would resolve to the wrappers.
- *  3. Calling chaos_time_leave_internal(previous), which restores the guard to
- *     whatever value it had before step 1.
- *
- * **Why save/restore matters here:**
- *
- * Consider a LATENCY rule on `nanosleep` and a separate LATENCY rule on
- * `clock_gettime`.  Hypothetically, if the C runtime's nanosleep uses
- * clock_gettime internally and the guard were set-to-1 / set-to-0 rather than
- * save/restore, the sequence would be:
- *
- * @code
- *   [outer] nanosleep wrapper:       enter → previous=0, guard=1
- *   [outer] apply_latency:           sleep_chunk → enter → previous=1, guard=1
- *                                    real_nanosleep ...
- *                                    [inner] clock_gettime via runtime:
- *                                        guard==1, bypass → real call
- *                                    leave(1) → guard=1  ← correct with save/restore
- *                                               guard=0  ← BUG with set-to-0
- *   [outer] apply_latency returns
- *   [outer] nanosleep wrapper:       real nanosleep, leave(0) → guard=0
- * @endcode
- *
- * With set-to-0, the outer wrapper's guard is prematurely cleared after the
- * sleep chunk returns.  Any subsequent code in the outer wrapper that calls an
- * intercepted symbol (e.g. config stat via clock_gettime) would see guard==0
- * and re-enter chaos injection logic, which is incorrect.
- *
- * The save/restore pattern ensures the outer enter/leave pair is the sole
- * authority over when the guard transitions to 0 for the outermost frame.
- *
- * ### OFFSET arithmetic
- *
- * chaos_time_add_offset_ms() operates on int64_t intermediates to avoid
- * overflow and to handle signed nanosecond carry correctly.  The algorithm:
- *
- *  1. Decompose offset_ms into whole seconds (offset_ms / 1000) and a
- *     sub-second residual in nanoseconds ((offset_ms % 1000) * 1,000,000).
- *  2. Add each part to the corresponding field.
- *  3. Normalise tv_nsec into [0, 999,999,999] by iteratively borrowing from
- *     or lending to tv_sec.  The loop handles the case where the residual
- *     exceeds ±999,999,999 ns, which can happen when both the original
- *     tv_nsec and the residual are large in the same direction (maximum
- *     |residual| = 999 * 1,000,000 = 999,000,000 ns < 1 s, so at most one
- *     iteration of each while loop is ever needed in practice).
- *  4. Clamp negative tv_sec to {0, 0} rather than returning a negative
- *     timespec, which would violate the POSIX struct timespec invariant.
+ * chaos_time_add_offset_ms() works in int64_t: offset_ms is split into seconds and a
+ * nanosecond residual of at most 999000000 in magnitude, so one carry or borrow
+ * normalises tv_nsec into [0, 999999999]; the loops are a guard, not a hot path. With
+ * shifts bounded to 100 years at parse time (3155760000 s) the sum cannot overflow. A
+ * result before the epoch is clamped to {0, 0} rather than returned as a negative
+ * timespec.
  *
  * @module chaos-time
  * @stability Internal.
@@ -71,17 +28,13 @@
 
 #include "chaos_time_actions.h"
 
+#include <errno.h>
 #include <stdint.h>
 
 /**
  * @copydoc chaos_time_probability_hit_sample
  *
- * The threshold is computed as `probability * 4294967296.0` (i.e. probability
- * * 2^32).  The sample is a uniformly distributed uint32_t in [0, 2^32), so
- * the comparison `(double)sample < threshold` fires with frequency
- * approximately equal to @p probability.  The double comparison avoids integer
- * overflow and handles the boundary cases (probability == 0.0 and == 1.0)
- * naturally via the fast-path guards.
+ * Compared in double, which represents every uint32_t exactly and cannot overflow.
  */
 int chaos_time_probability_hit_sample(double probability, uint32_t sample)
 {
@@ -109,24 +62,18 @@ int chaos_time_probability_hit(double probability)
 }
 
 /**
- * Sleeps for at most @p usec microseconds using the real sleep implementation.
+ * Sleeps @p usec through the real usleep, else the real nanosleep, under the guard.
  *
- * Wraps the sleep call inside chaos_time_enter_internal() /
- * chaos_time_leave_internal() to prevent the sleep itself from being
- * intercepted.  See the file-level documentation for the full reentrancy
- * analysis.
+ * usleep is not restarted when a signal interrupts it, so the chunk may be shorter;
+ * the nanosleep fallback resumes with the remaining time on EINTR. With neither
+ * pointer resolved nothing sleeps. errno is preserved.
  *
- * Preference order:
- *  1. g_chaos_time_real_usleep — lower overhead on platforms that map usleep
- *     to a single syscall.
- *  2. g_chaos_time_real_nanosleep — used if usleep is unavailable; the
- *     microsecond value is converted to a struct timespec and the call is
- *     retried on EINTR to avoid partial sleeps.
- *
- * @param usec  Duration to sleep in microseconds.  Must be ≤ 1,000,000.
+ * @param usec  Microseconds, <= 1000000.
  */
 static void chaos_time_sleep_chunk(useconds_t usec)
 {
+    /* An interrupted sleep sets EINTR; the delay is the library's, the errno the caller's. */
+    const int saved_errno = errno;
     int previous;
 
     previous = chaos_time_enter_internal();
@@ -145,22 +92,17 @@ static void chaos_time_sleep_chunk(useconds_t usec)
         }
     }
     chaos_time_leave_internal(previous);
+    errno = saved_errno;
 }
 
 /**
- * Applies a signed millisecond offset to a struct timespec in-place.
+ * Adds @p offset_ms to @p value, normalised; a result before the epoch becomes {0, 0}.
  *
- * Decomposes the offset into whole seconds and a sub-second nanosecond
- * component, adds each part to the corresponding field of @p value, then
- * normalises the nanosecond field into [0, 999,999,999] by propagating carry
- * to or borrow from the second field.  Negative results are clamped to
- * {0, 0}.
+ * Expects tv_nsec in [0, 999999999] on entry, as every clock returns it.
  *
- * Operates on int64_t intermediates throughout to avoid signed overflow with
- * large tv_sec values or large negative offsets.
- *
- * @param value      struct timespec to update.  Ignored if NULL.
- * @param offset_ms  Signed millisecond delta.  A value of 0 is a no-op.
+ * @param value      Time to shift in place; NULL does nothing.
+ * @param offset_ms  Signed shift in ms, |offset_ms| <= CHAOS_TIME_MAX_OFFSET_MS; 0 does
+ *                   nothing.
  */
 static void chaos_time_add_offset_ms(struct timespec *value, int64_t offset_ms)
 {
@@ -202,28 +144,23 @@ static void chaos_time_add_offset_ms(struct timespec *value, int64_t offset_ms)
  */
 int chaos_time_rule_should_trigger(const chaos_time_rule_t *rule)
 {
-    if (rule == NULL)
+    if (rule == NULL || !chaos_policy_window_open(&rule->policy) ||
+        !chaos_policy_size_ok(&rule->policy, rule->call_size))
     {
         return 0;
     }
 
-    return chaos_time_probability_hit(rule->probability);
+    if (!chaos_time_probability_hit(rule->probability))
+    {
+        return 0;
+    }
+    return chaos_policy_fire(&rule->policy, rule->hit, rule->hit_generation);
 }
 
 /**
  * @copydoc chaos_time_rule_apply_latency
  *
- * Implementation notes:
- *
- *  - The millisecond duration is converted to microseconds and broken into
- *    chunks of at most 1,000,000 µs (1 s) because useconds_t is only
- *    guaranteed to represent values up to 1,000,000 on POSIX-conforming
- *    systems.
- *  - Probability is sampled once at the start; if the gate does not fire, no
- *    sleep occurs.
- *  - The reentrancy guard is raised inside chaos_time_sleep_chunk() around
- *    each real sleep call.  See the file-level documentation for why
- *    save/restore semantics are required rather than simple set/clear.
+ * One firing decision per call, before the first chunk.
  */
 void chaos_time_rule_apply_latency(const chaos_time_rule_t *rule)
 {
@@ -262,15 +199,6 @@ int chaos_time_rule_apply_errno(const chaos_time_rule_t *rule)
 
 /**
  * @copydoc chaos_time_rule_apply_offset
- *
- * Implementation notes:
- *
- *  - Delegates arithmetic to chaos_time_add_offset_ms().
- *  - Probability is sampled for each call independently; two threads
- *    calling clock_gettime simultaneously may each independently fire or
- *    not fire the probability gate, so they may receive different absolute
- *    timestamps even if the kernel returned identical values.  There is no
- *    synchronisation between threads.
  */
 void chaos_time_rule_apply_offset(const chaos_time_rule_t *rule, struct timespec *value)
 {
@@ -281,4 +209,83 @@ void chaos_time_rule_apply_offset(const chaos_time_rule_t *rule, struct timespec
     }
 
     chaos_time_add_offset_ms(value, rule->offset_ms);
+}
+
+/**
+ * @copydoc chaos_time_rule_apply_regress
+ *
+ * slot->state: 0 fresh -> 1 armed on the first read (left real); 1 -> 3 by CAS while
+ * one thread decides; 3 -> 2 when the rule fires (the jump, one hit) or 3 -> 1 when it
+ * does not; in 2 every read is shifted. A read that meets state 3 on another thread is
+ * not shifted. The atfork child handler turns an inherited 3 back into 1.
+ */
+void chaos_time_rule_apply_regress(const chaos_time_rule_t *rule, struct timespec *value)
+{
+    chaos_hit_slot_t *slot;
+
+    if (rule == NULL || value == NULL || rule->effect != CHAOS_TIME_EFFECT_REGRESS ||
+        rule->hit == NULL || !chaos_hit_slot_current(rule->hit, rule->hit_generation))
+    {
+        return;
+    }
+    /* Outside its @from/@until window the rule shifts nothing, before or after the jump. */
+    if (!chaos_policy_window_open(&rule->policy))
+    {
+        return;
+    }
+    slot = rule->hit;
+    if (slot->state == 0U)
+    {
+        (void)__sync_bool_compare_and_swap(&slot->state, 0U, 1U);
+        return;
+    }
+    if (slot->state != 2U)
+    {
+        /* Exactly one thread decides the jump (state 3 while it does), so the jump
+         * is counted once; a concurrent read is not shifted yet. */
+        if (!__sync_bool_compare_and_swap(&slot->state, 1U, 3U))
+        {
+            return;
+        }
+        if (!chaos_time_rule_should_trigger(rule))
+        {
+            slot->state = 1U;
+            return;
+        }
+        slot->state = 2U;
+    }
+    chaos_time_add_offset_ms(value, -rule->offset_ms);
+}
+
+/**
+ * @copydoc chaos_time_rule_unshift_deadline
+ *
+ * The program read now + O under OFFSET and now - R after a REGRESS jump, so its
+ * deadline is O ahead of and R behind the real one: subtract O, add R.
+ */
+int chaos_time_rule_unshift_deadline(
+    const chaos_time_rule_t *offset_rule,
+    const chaos_time_rule_t *regress_rule,
+    struct timespec *deadline
+)
+{
+    int changed = 0;
+
+    if (offset_rule != NULL && offset_rule->effect == CHAOS_TIME_EFFECT_OFFSET &&
+        offset_rule->probability >= 1.0 && offset_rule->policy.first == 0U &&
+        !offset_rule->policy.has_size_above && !offset_rule->policy.has_size_below &&
+        chaos_policy_window_open(&offset_rule->policy))
+    {
+        chaos_time_add_offset_ms(deadline, -offset_rule->offset_ms);
+        changed = 1;
+    }
+    if (regress_rule != NULL && regress_rule->effect == CHAOS_TIME_EFFECT_REGRESS &&
+        regress_rule->hit != NULL &&
+        chaos_hit_slot_current(regress_rule->hit, regress_rule->hit_generation) &&
+        regress_rule->hit->state == 2U && chaos_policy_window_open(&regress_rule->policy))
+    {
+        chaos_time_add_offset_ms(deadline, regress_rule->offset_ms);
+        changed = 1;
+    }
+    return changed;
 }

@@ -1,56 +1,56 @@
 /**
  * @file chaos_bench_perf.h
- * @brief Linux PMU sampling via `perf_event_open(2)`.
+ * @brief Optional hardware and software performance counters around the measurement loop,
+ *        via `perf_event_open(2)`.
  *
  * @details
- * Optional Stage 2 capability: when the kernel exposes the perf
- * subsystem and the calling process has the necessary capability
- * (`CAP_PERFMON` on Linux ≥ 5.8 with `kernel.perf_event_paranoid <= 2`,
- * or `CAP_SYS_ADMIN` on older kernels), the harness samples a fixed
- * panel of hardware and software counters across the measurement
- * window and emits the deltas in the JSON envelope.
+ * When the kernel permits, the runner counts a fixed panel of events for the calling thread
+ * over exactly the measurement loop (not warmup, statistics or output) and emits the totals
+ * in the envelope's `pmu.counters`. Counts are whole-loop totals, not per call; divide by
+ * `measurement_iters * batch_size` for per-call values.
  *
- * **Counter panel.**
- *  - `cycles`              — `PERF_COUNT_HW_CPU_CYCLES`
- *  - `instructions`        — `PERF_COUNT_HW_INSTRUCTIONS`
- *  - `branches`            — `PERF_COUNT_HW_BRANCH_INSTRUCTIONS`
- *  - `branch_misses`       — `PERF_COUNT_HW_BRANCH_MISSES`
- *  - `cache_references`    — `PERF_COUNT_HW_CACHE_REFERENCES`
- *  - `cache_misses`        — `PERF_COUNT_HW_CACHE_MISSES`
- *  - `dtlb_load_misses`    — `PERF_COUNT_HW_CACHE_DTLB|READ|MISS`
- *  - `context_switches`    — `PERF_COUNT_SW_CONTEXT_SWITCHES`
- *  - `cpu_migrations`      — `PERF_COUNT_SW_CPU_MIGRATIONS`
- *  - `page_faults`         — `PERF_COUNT_SW_PAGE_FAULTS`
+ * **Counter panel** (index order = JSON order).
  *
- * The hardware events are opened with `disabled=1` and grouped under a
- * single leader so they sample atomically (read across the same
- * interval).  The software events are opened individually because the
- * kernel does not group hardware and software events into one
- * leader-set on every microarchitecture.
+ * | name               | perf event                                               |
+ * |--------------------|----------------------------------------------------------|
+ * | `cycles`           | `PERF_COUNT_HW_CPU_CYCLES` (group leader)                |
+ * | `instructions`     | `PERF_COUNT_HW_INSTRUCTIONS`                             |
+ * | `branches`         | `PERF_COUNT_HW_BRANCH_INSTRUCTIONS`                      |
+ * | `branch_misses`    | `PERF_COUNT_HW_BRANCH_MISSES`                            |
+ * | `cache_references` | `PERF_COUNT_HW_CACHE_REFERENCES`                         |
+ * | `cache_misses`     | `PERF_COUNT_HW_CACHE_MISSES`                             |
+ * | `dtlb_load_misses` | `PERF_TYPE_HW_CACHE` DTLB / OP_READ / RESULT_MISS         |
+ * | `context_switches` | `PERF_COUNT_SW_CONTEXT_SWITCHES`                         |
+ * | `cpu_migrations`   | `PERF_COUNT_SW_CPU_MIGRATIONS`                           |
+ * | `page_faults`      | `PERF_COUNT_SW_PAGE_FAULTS`                              |
  *
- * **Failure modes.**
- *  - `ENOSYS`     — kernel built without CONFIG_PERF_EVENTS.
- *  - `EACCES`     — `perf_event_paranoid` too restrictive, or running
- *                   without `CAP_PERFMON`.
- *  - `EOPNOTSUPP` — counter not implemented on this microarchitecture
- *                   (e.g. some virtual CPUs lack hardware events).
- *  - `ENODEV`     — no PMU on this CPU.
+ * The seven hardware events form one group led by `cycles`, so the kernel schedules them
+ * together and all cover the same interval. The three software events are opened standalone.
+ * All events exclude kernel and hypervisor mode, which counts the wrapper's user-space work
+ * only.
  *
- * Any of these results in `chaos_bench_pmu_init` returning -1 with the
- * reason captured in the struct.  The runner emits a `pmu` section in
- * JSON with `available: false` and the reason; downstream consumers
- * treat absent counter data as missing-but-explained, not as a bug.
+ * **Permissions.** User-space-only counting of the own task is allowed for unprivileged
+ * processes while `kernel.perf_event_paranoid` is 2 or lower. At higher values (3 on some
+ * distribution kernels) it needs `CAP_PERFMON` (Linux 5.8+) or `CAP_SYS_ADMIN`. A container's
+ * seccomp profile can block the syscall independently of both.
  *
- * **Non-Linux platforms.**
- * On macOS, FreeBSD, etc. this module compiles to a stub: every entry
- * point returns "unavailable: not_linux".  Benchmark binaries built
- * for those platforms still link cleanly; the JSON envelope just lacks
- * counter values.  The harness is itself portable to non-Linux for
- * development convenience even though the production target is Linux.
+ * **Failure behaviour.** Fail-open: each event that fails to open is skipped. If none opens,
+ * `chaos_bench_pmu_init` returns -1, `available` is 0 and `reason` holds
+ * `"perf_event_open failed: <strerror of the first error>"`; the envelope then reports
+ * `"available": false` with that reason. Typical errors:
+ *  - `ENOSYS`: kernel without `CONFIG_PERF_EVENTS`, or the syscall filtered.
+ *  - `EACCES`/`EPERM`: paranoid level or capabilities, or a seccomp filter.
+ *  - `ENOENT`/`EOPNOTSUPP`: event not supported by this CPU or virtual CPU.
+ *  - `ENODEV`: no PMU.
+ * An event that failed while others opened reports 0 in the envelope, indistinguishable from
+ * a true zero.
  *
- * **Thread-safety.** Same as the harness: not thread-safe.  PMU init is
- * called once before the measurement loop, read once inside it, closed
- * once after.  Concurrent benchmarks are out of scope (Stage 1+).
+ * **Non-Linux.** The module compiles to stubs: `chaos_bench_pmu_init` returns -1 with reason
+ * `"perf_event_open: not Linux"` and the other entry points do nothing. This keeps the harness
+ * buildable on macOS for development.
+ *
+ * **Thread-safety.** None. The runner initialises, starts, stops and closes the PMU once,
+ * from the main thread; events count that thread only (`pid = 0`, `cpu = -1`, no inherit).
  */
 
 #ifndef CHAOS_BENCH_PERF_H
@@ -64,21 +64,21 @@ extern "C" {
 #endif
 
 /**
- * @brief Counter panel size.  Keep in sync with `chaos_bench_perf.c`.
+ * @brief Number of events in the panel; `chaos_bench_pmu_counter_names` and the event table
+ *        in chaos_bench_perf.c must have exactly this many entries in the same order.
  */
 #define CHAOS_BENCH_PMU_COUNTER_COUNT 10U
 
 /**
- * @brief Per-counter identifiers, used as JSON field names.
+ * @brief Event names in panel order, used as keys of `pmu.counters`; part of the JSON schema.
  */
 extern const char *const chaos_bench_pmu_counter_names[CHAOS_BENCH_PMU_COUNTER_COUNT];
 
 /**
- * @brief Opaque PMU handle.  Allocated by the caller on the stack.
+ * @brief PMU state for one run; caller-allocated (the runner uses the stack).
  *
- * @details The struct exposes one bool — `available` — that the runner
- * checks before reading or emitting counter values.  Internal fields
- * are private to the implementation.
+ * @details Callers read only `available`, `reason` and `total`; `fds` and `baseline` belong
+ * to the implementation. `baseline` is currently unused.
  */
 typedef struct chaos_bench_pmu
 {
@@ -90,43 +90,45 @@ typedef struct chaos_bench_pmu
 } chaos_bench_pmu_t;
 
 /**
- * @brief Initialises @p pmu by opening the counter panel.
+ * @brief Zeroes @p pmu and opens every event in the panel.
  *
- * @details Best-effort: a counter that fails to open is recorded as
- * unavailable but does not abort the others.  If at least one hardware
- * counter opens successfully, @c available is set to 1 and counters are
- * armed (DISABLE on; reset).  Otherwise @c available is 0 and @c reason
- * carries the diagnostic.
+ * @details An event that fails to open keeps `fds[i] == -1`; the others are unaffected. The
+ * hardware group is created disabled and starts counting at @ref chaos_bench_pmu_start. The
+ * software events are created enabled and count from here on, but are reset at start.
+ * If `cycles` fails to open there is no group leader: the remaining hardware events open
+ * standalone and enabled, are reset at start, and are not disabled at stop (their reads
+ * follow immediately, so the error is a few hundred instructions).
  *
- * Caller must invoke `chaos_bench_pmu_close` on the same struct
- * regardless of return value.
+ * Call @ref chaos_bench_pmu_close on @p pmu whatever the return value.
  *
- * @param[out] pmu  Caller-owned target.  Must not be NULL.
+ * @param[out] pmu  Caller-owned. Must not be NULL.
  *
- * @return 0 if at least one counter opened; -1 if all opens failed.
+ * @return 0 and `available = 1` if at least one event (hardware or software) opened;
+ *         -1 and `available = 0` with `reason` set otherwise.
  */
 int chaos_bench_pmu_init(chaos_bench_pmu_t *pmu);
 
 /**
- * @brief Begins counting on every armed counter.
+ * @brief Resets every open event and enables the hardware group.
  *
- * @details Equivalent to `ioctl(fd, PERF_EVENT_IOC_RESET, 0)` followed
- * by `PERF_EVENT_IOC_ENABLE` on each open fd.  Failure on individual
- * fds is silently tolerated; the corresponding counter will read 0.
+ * @details Issues `PERF_EVENT_IOC_RESET` on each open fd, then `PERF_EVENT_IOC_ENABLE` with
+ * `PERF_IOC_FLAG_GROUP` on the leader. ioctl errors are ignored. No-op unless `available`.
  */
 void chaos_bench_pmu_start(chaos_bench_pmu_t *pmu);
 
 /**
- * @brief Stops counting and reads accumulated values into @c total.
+ * @brief Disables the hardware group and reads every open event into `total`.
  *
- * @details Calls `PERF_EVENT_IOC_DISABLE` then `read(2)` on each open
- * fd.  Sums are stored in @c pmu->total in counter-name order matching
- * @c chaos_bench_pmu_counter_names.
+ * @details Issues `PERF_EVENT_IOC_DISABLE` with `PERF_IOC_FLAG_GROUP` on the leader, then
+ * one 8-byte `read(2)` per open fd (default `read_format`: the raw count). `total[i]` stays
+ * 0 for unopened events and for failed or short reads. Software events are read while still
+ * running. No-op unless `available`.
  */
 void chaos_bench_pmu_stop(chaos_bench_pmu_t *pmu);
 
 /**
- * @brief Closes all open perf fds.  Idempotent.
+ * @brief Closes every open perf fd and marks it -1; idempotent and safe after a failed
+ *        @ref chaos_bench_pmu_init.
  */
 void chaos_bench_pmu_close(chaos_bench_pmu_t *pmu);
 

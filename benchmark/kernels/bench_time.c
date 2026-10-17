@@ -1,52 +1,42 @@
 /**
  * @file bench_time.c
- * @brief Stage 1 microbenchmarks for libchaos-time.
+ * @brief Per-call overhead of the libchaos-time wrappers for clock_gettime, nanosleep, usleep.
  *
  * @details
- * This binary registers three benchmarks for the libchaos-time hot path:
+ * Every hooked function gets three registered benchmarks that share one iteration body.
+ * `run-bench.sh` runs each name twice: once without LD_PRELOAD (baseline: the libc
+ * call alone) and once with LD_PRELOAD=libchaos-time.so plus a scenario written to the
+ * rule file `/tmp/.chaos-time.conf` (treatment). The driver attributes the median
+ * difference to the wrapper. Keeping the C code identical in both arms is what makes
+ * the difference attributable; the arms differ only in the process environment.
  *
- *  1. `clock_gettime_baseline` — calls `clock_gettime(CLOCK_MONOTONIC)`
- *     in a tight loop with no chaos rule installed.  When run *without*
- *     LD_PRELOAD, this is the absolute reference: pure libc / vDSO cost.
- *     When run *with* LD_PRELOAD and an empty chaos config, this measures
- *     the *passthrough* overhead — the cost added by the TLS guard, the
- *     snapshot pointer load, and the early-return path.
+ * | Suffix           | Scenario (`benchmark/scenarios/`)     | Wrapper path measured        |
+ * |------------------|---------------------------------------|------------------------------|
+ * | `_passthrough`   | `empty.conf` (no rules)               | wrapper with empty rule set  |
+ * | `_match_no_fire` | `<stem>-match-no-fire.conf`, prob 0.0 | rule scan + probability draw |
+ * | `_errno`         | `<stem>-errno.conf`, ERRNO, prob 1.0  | full effect dispatch         |
  *
- *  2. `clock_gettime_match_no_fire` — same call, but a probability=0
- *     rule is installed so the rule scan executes but never fires.
- *     Measures the cost of selector-match + dice-roll vs passthrough.
+ * `clock_gettime_baseline` plays the `_passthrough` role for clock_gettime; its name
+ * predates the suffix convention and the sweep keeps it.
  *
- *  3. `clock_gettime_errno` — same call, but a probability=1 ERRNO rule
- *     is installed so every call returns -1 with `errno=EINVAL`.  Measures
- *     the full effect-dispatch path including the synthetic error setup.
+ * Measured:
+ *  - One call through the real function. With LD_PRELOAD the wrapper forwards to the
+ *    libc clock_gettime resolved with `dlsym(RTLD_NEXT)`, which still uses the vDSO, so
+ *    both arms include the vDSO read and the delta is the wrapper alone. Before the
+ *    real function is resolved the wrapper issues `syscall(SYS_clock_gettime)`; warmup
+ *    runs past that window.
+ *  - The `_errno` arm skips the real function, so its delta is wrapper cost minus the
+ *    skipped libc/kernel work and can be negative for the sleep calls.
  *
- * The wrapper script (`run-bench.sh`) decides whether to launch the
- * binary with or without LD_PRELOAD; the C code is identical in both.
- * That keeps "baseline vs treatment" a single concept rather than a
- * branching maintenance burden.
+ * Not measured:
+ *  - Cold-call cost (first PLT resolution, first TLS access, first rule-file load):
+ *    warmup absorbs it. `--mode=SINGLE_SHOT` times a single call of any benchmark;
+ *    `run-bench.sh` does not use it.
+ *  - Reload cost: no kernel rewrites the rule file during measurement.
  *
- * **What the benchmarks DO measure.**
- *  - User-space cost of one clock_gettime call (vDSO under glibc, libc
- *    syscall wrapper under LD_PRELOAD interposition).
- *  - The chaos library's per-call overhead in each path (passthrough,
- *    rule-scan, effect dispatch).
- *
- * **What the benchmarks DO NOT measure.**
- *  - Cold-call cost: warmup absorbs first-PLT / first-TLS / first-config
- *    overhead.  Use `--mode=SINGLE_SHOT` benchmarks for that (Stage 2).
- *  - Reload-cycle cost: that's a separate `bench_reload.c` binary
- *    (Stage 2).
- *  - vDSO bypass cost: libchaos-time interposes the libc PLT entry,
- *    which on glibc is itself the vDSO dispatcher — the interposition
- *    captures the call before vDSO routing happens, so we measure the
- *    full libc path on the treatment side regardless of how the
- *    baseline routes.  This is documented behavior, not a regression.
- *
- * **Anti-DCE protocol.**
- * Every iteration writes to `state->result` (so the call has an
- * observable effect) and immediately marks the result live with
- * `CHAOS_BENCH_DO_NOT_OPTIMIZE`.  The compiler is forbidden from
- * eliminating either the call or the store.
+ * Anti-DCE: each iteration stores the return value (and, for clock_gettime, the
+ * timespec) in the state and passes it through CHAOS_BENCH_DO_NOT_OPTIMIZE, so the
+ * compiler can remove neither the call nor the store.
  */
 
 #include "chaos_bench.h"
@@ -56,11 +46,10 @@
 #include <unistd.h>
 
 /**
- * @brief Per-benchmark state: a single timespec result slot.
+ * @brief Per-benchmark state for the clock_gettime kernels: output timespec and return code.
  *
- * @details The slot is reused across iterations.  Because the harness
- * marks `result` as live after each call, the compiler cannot fold the
- * store away or hoist the call out of the loop.
+ * @details Reused across iterations. The kernel marks both fields live after every
+ * call, so the store cannot be dropped and the call cannot be hoisted out of the loop.
  */
 typedef struct bench_time_state
 {
@@ -69,12 +58,11 @@ typedef struct bench_time_state
 } bench_time_state_t;
 
 /**
- * @brief Iter callback for all three benchmarks: one clock_gettime call.
+ * @brief Iteration body of all three clock_gettime benchmarks: one
+ *        `clock_gettime(CLOCK_MONOTONIC)` call.
  *
- * @details The body is identical regardless of whether LD_PRELOAD
- * intercepts the symbol — the harness measures the call in both
- * configurations and the wrapper attributes the delta to the chaos
- * library's overhead.
+ * @details In the `_errno` arm the call returns -1 with errno EINVAL and leaves
+ * `result` unwritten; the kernel does not check either, because only the timing matters.
  */
 static void bench_time_iter_clock_gettime(void *user_state)
 {
@@ -97,9 +85,9 @@ CHAOS_BENCH("time", clock_gettime_errno,
             NULL, bench_time_iter_clock_gettime, NULL)
 
 /* ---------------------------------------------------------- nanosleep_zero ---
- * `nanosleep` with a {0,0} timespec.  Linux returns immediately without
- * scheduling away.  Tests the chaos hook on the cheapest possible
- * `nanosleep` invocation.
+ * `nanosleep({0, 0})`: the cheapest call that still enters the nanosleep wrapper and,
+ * in the baseline and the first two arms, a real syscall. The `_errno` arm returns
+ * -1/EINTR without the syscall.
  */
 typedef struct bench_time_sleep_state
 {
@@ -125,10 +113,9 @@ CHAOS_BENCH("time", nanosleep_zero_errno,          bench_time_sleep_state_t,
             NULL, bench_time_iter_nanosleep_zero, NULL)
 
 /* ------------------------------------------------------------- usleep_zero ---
- * `usleep(0)` — POSIX micro-sleep with zero microseconds.  Maps onto
- * nanosleep on Linux but goes through the libc usleep wrapper, exercising
- * the libchaos-time `usleep` hook specifically (separate dispatch from
- * `nanosleep`).
+ * `usleep(0)`: exercises the separate usleep wrapper and its rule selector. The real
+ * usleep runs with the wrapper's reentrancy guard raised, so a libc usleep built on
+ * nanosleep does not pass through the nanosleep wrapper a second time.
  */
 typedef struct bench_time_usleep_state
 {

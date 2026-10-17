@@ -1,30 +1,24 @@
 /**
  * @file chaos_bench_register.c
- * @brief Global descriptor registry — populated by per-benchmark
- *        constructors, walked once by the runner.
+ * @brief Global descriptor registry: filled by per-benchmark ELF constructors, queried by
+ *        the runner.
  *
  * @details
- * The registry is a singly-linked list of `chaos_bench_descriptor_t *`,
- * with insertion at the head.  Each `CHAOS_BENCH(...)` macro emits a
- * `__attribute__((constructor))` function that calls
- * @ref chaos_bench_register; constructors execute in unspecified order
- * but always before `main`, so by the time the runner queries the list
- * every benchmark in the binary is registered.
+ * A singly-linked list of descriptors with head insertion. Every @ref CHAOS_BENCH expansion
+ * emits an `__attribute__((constructor))` function that calls @ref chaos_bench_register.
+ * Constructors run in unspecified order but all complete before `main`, so the list is
+ * complete when the runner queries it.
  *
- * **Why a linked list and not a `__attribute__((section))` set?**
- *  - Section-based registration (the GCC `__start_<sec> / __stop_<sec>`
- *    idiom) is slightly more elegant but depends on the host linker
- *    producing the section-bound symbols.  The Make/Ld combo we ship
- *    with covers GNU ld and lld, but the linker on a Mac dev box
- *    produces results that diverge under `--gc-sections`.  A linked
- *    list is portable across every linker we'll ever care about and
- *    incurs one constructor call per benchmark — negligible.
- *  - The registry is consulted exactly once per process (in `main`),
- *    so list-vs-array scan cost is irrelevant.
+ * **Why a linked list, not a linker section.**
+ *  - The `__attribute__((section))` + `__start_<sec>`/`__stop_<sec>` idiom needs the linker
+ *    to synthesise the bound symbols and to keep the section under `--gc-sections`; GNU ld
+ *    and lld do, but behaviour differs across linkers (the macOS linker in particular). The
+ *    list depends only on constructors, which every supported toolchain implements.
+ *  - The cost is one constructor call per benchmark at load time and one linear scan per
+ *    process, both outside any timed region.
  *
- * **Thread-safety.** Not thread-safe.  Constructors run before any
- * thread other than the implicit main thread exists, and the registry
- * is read-only after `main` begins.  No locking is needed.
+ * **Thread-safety.** No locking. Constructors run on the main thread before any other thread
+ * can exist, and the list is only read after `main` starts.
  */
 
 #include "chaos_bench_internal.h"
@@ -34,13 +28,12 @@
 #include <string.h>
 
 /**
- * @brief Registry head pointer; modified only by `chaos_bench_register`.
+ * @brief Most recently registered descriptor; written only by `chaos_bench_register`.
  */
 static chaos_bench_descriptor_t *g_chaos_bench_registry_head = NULL;
 
 /**
- * @brief Registered descriptor count; bounded by
- *        @ref CHAOS_BENCH_MAX_REGISTERED.
+ * @brief Number of registered descriptors; never exceeds @ref CHAOS_BENCH_MAX_REGISTERED.
  */
 static size_t g_chaos_bench_registry_count = 0U;
 
@@ -48,8 +41,8 @@ void chaos_bench_register(chaos_bench_descriptor_t *desc)
 {
     if (desc == NULL)
     {
-        /* Defensive: a benchmark binary that registers a NULL descriptor
-         * is a build-system bug; abort loudly so it surfaces immediately. */
+        /* A NULL descriptor, a NULL iter or an overflow is a build defect; abort before
+         * main so a binary that would silently skip or crash in a benchmark never runs. */
         fprintf(stderr, "chaos_bench: NULL descriptor registration\n");
         abort();
     }
@@ -93,8 +86,10 @@ chaos_bench_descriptor_t *chaos_bench_registry_find(const char *name)
 }
 
 /**
- * @brief Internal: prints all registered names, one per line.  Used by
- *        the runner's `--list` flag.
+ * @brief Prints one `<category>\t<name>` line per registered benchmark to @p out.
+ *
+ * @details Backs `--list`. Order is reverse registration order, which is unspecified; "?"
+ * stands in for a NULL category or name.
  */
 void chaos_bench_registry_list(FILE *out)
 {

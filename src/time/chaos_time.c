@@ -1,126 +1,112 @@
 /**
  * @file chaos_time.c
- * @brief Library initialisation: symbol resolution, entropy collection, and
- *        process-wide bootstrapping for the libchaos-time subsystem.
+ * @brief libchaos-time bootstrap: real-function resolution, seeding and the first load.
  *
- * This translation unit contains the ELF constructor that runs before any
- * application code executes.  Its responsibilities are:
+ * @details
+ * The ELF constructor chaos_time_init() runs, in order:
  *
- *  1. **Symbol resolution** — locate the real implementations of
- *     clock_gettime(2), nanosleep(2), and usleep(3) via RTLD_NEXT and store
- *     them in the global function-pointer variables.  All other translation
- *     units call through these pointers to avoid recursing into the wrappers.
+ *  1. **Resolution:** chaos_time_ensure_symbols() fills the eight real-function pointers
+ *     through `dlsym(RTLD_NEXT)`. Wrappers call it too, because another object's
+ *     constructor can reach a wrapper before this one runs.
+ *  2. **Seeding:** 8 bytes from /dev/urandom become the process seed, read with raw
+ *     openat/read/close system calls so that no other preloaded library interposing
+ *     open or read (libchaos-io) sees or faults the read. errno is preserved.
+ *  3. **PRNG:** the constructing thread is seeded from the process seed; other threads
+ *     seed themselves on their first draw.
+ *  4. **Rules:** chaos_time_config_init() resets both snapshots and marks the change stamp
+ *     unknown, then chaos_time_config_prepare() loads the rule file, so a bad file is
+ *     reported in the status file at start-up rather than at the first clock read.
  *
- *  2. **Entropy collection** — read 8 bytes from /dev/urandom using raw
- *     syscalls rather than the libc wrappers.  Raw syscalls are used because
- *     at constructor time libc may not have initialised its own file-descriptor
- *     layer, and because calling open(2) through the libc wrapper would trigger
- *     the chaos_time interceptors if they were already active.  The reentrancy
- *     guard is set for the duration of the syscall sequence to be safe.
- *
- *  3. **PRNG initialisation** — seed the main thread's per-thread PRNG state
- *     from the collected entropy so that the first probability decision is
- *     drawn from a high-quality random stream.
- *
- *  4. **Config initialisation** — call chaos_time_config_init() to zero the
- *     two config state snapshots and set the cached mtime to
- *     CHAOS_TIME_MTIME_UNKNOWN, which ensures the first intercepted call
- *     triggers a config reload.
- *
- * @invariant  After chaos_time_init() returns, g_chaos_time_real_clock_gettime,
- *             g_chaos_time_real_nanosleep, and g_chaos_time_real_usleep are all
- *             non-NULL.  If any RTLD_NEXT lookup fails, abort(3) is called
- *             immediately so the process cannot proceed with null function
- *             pointers.
+ * @par Failure behaviour
+ * A lookup that dlerror() reports as failed calls abort(3): running with a wrong symbol
+ * table would be worse than not running. A pointer can still be NULL (a symbol absent
+ * from the chain, or a call that arrives while resolution runs); the call helpers in
+ * chaos_time_hooks.c then make the system call directly. A failed urandom read falls
+ * back to a pid-derived seed; probabilities still work, only less unpredictably.
  *
  * @module chaos-time
  * @stability Internal.
  */
 
+#include "chaos_once.h"
 #include "chaos_time_config.h"
 #include "chaos_time_internal.h"
 
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 
-/**
- * Resolved pointer to the real clock_gettime(2).
- *
- * NULL until chaos_time_init() completes.  Set exactly once; thereafter
- * treated as read-only by all threads.
- */
+/** Real clock_gettime(2); NULL until first resolution. */
 chaos_time_clock_gettime_fn g_chaos_time_real_clock_gettime = NULL;
 
-/**
- * Resolved pointer to the real nanosleep(2).
- *
- * NULL until chaos_time_init() completes.  Set exactly once; thereafter
- * treated as read-only by all threads.
- */
+/** Real nanosleep(2); NULL until first resolution. */
 chaos_time_nanosleep_fn g_chaos_time_real_nanosleep = NULL;
 
-/**
- * Resolved pointer to the real usleep(3).
- *
- * NULL until chaos_time_init() completes.  Set exactly once; thereafter
- * treated as read-only by all threads.
- */
+/** Real usleep(3); NULL until first resolution. */
 chaos_time_usleep_fn g_chaos_time_real_usleep = NULL;
 
-/**
- * Per-thread reentrancy guard; 0 = not inside the library, 1 = inside.
- *
- * Initial value of 0 is correct: the main thread is not inside the library
- * until chaos_time_init() is called, and by the time that constructor returns
- * the guard has been restored to 0.
- */
+/** Real gettimeofday(2); NULL until first resolution. */
+chaos_time_gettimeofday_fn g_chaos_time_real_gettimeofday = NULL;
+
+/** Real time(2); NULL until first resolution. */
+chaos_time_time_fn g_chaos_time_real_time = NULL;
+
+/** Real sleep(3); NULL until first resolution. */
+chaos_time_sleep_fn g_chaos_time_real_sleep = NULL;
+
+/** Real timespec_get(3); NULL until first resolution. */
+chaos_time_timespec_get_fn g_chaos_time_real_timespec_get = NULL;
+
+/** Real clock_nanosleep(2); NULL until first resolution. */
+chaos_time_clock_nanosleep_fn g_chaos_time_real_clock_nanosleep = NULL;
+
+/** Reentrancy guard; 0 outside library code. Every new thread starts at 0. */
 __thread int g_chaos_time_tls_guard = 0;
 
-/**
- * Per-thread xorshift64* PRNG state.
- *
- * Initial value of 0 signals "not yet seeded"; chaos_time_prng_ensure_seeded()
- * initialises it on first use.
- */
+/** xorshift64* state; 0 means unseeded, so every new thread seeds itself on first draw. */
 __thread uint64_t g_chaos_time_tls_prng_state = 0U;
 
 /**
- * Process-wide base seed written once from /dev/urandom during
- * chaos_time_init().
+ * Process seed; overwritten with /dev/urandom bytes by chaos_time_init().
  *
- * The default value 0x2545f4914f6cdd1d (the xorshift64* output multiplier)
- * is a reasonable non-zero constant used if entropy collection fails before
- * init, e.g. during very early static-initialiser callbacks.
+ * The initial constant serves only threads that draw before the constructor has run
+ * (another object's constructor calling a wrapper); their thread id and stack address
+ * still separate them.
  */
 uint64_t g_chaos_time_process_seed = UINT64_C(0x2545f4914f6cdd1d);
 
 #ifndef CHAOS_TIME_CONSTRUCTOR
-/** Attribute that causes chaos_time_init() to run as an ELF constructor. */
+/** Makes chaos_time_init() an ELF constructor; overridable at compile time (test seam). */
 #define CHAOS_TIME_CONSTRUCTOR __attribute__((constructor))
 #endif
 
 /**
- * Resolves one libc symbol via RTLD_NEXT and stores the resulting pointer.
+ * Stores `dlsym(RTLD_NEXT, symbol)` into the function pointer at @p target, if unset.
  *
- * Uses memcpy to move the void* into the typed function-pointer target,
- * which avoids undefined behaviour from a direct cast through incompatible
- * pointer types (ISO C forbids converting between function-pointer and
- * object-pointer types via assignment).
+ * The pointer is copied with memcpy because ISO C does not define converting an object
+ * pointer (`void *`) to a function pointer. A pointer that is already set (by an earlier
+ * call, or by a test harness) is left alone.
  *
- * Calls abort(3) if dlsym() returns NULL and dlerror() confirms a lookup
- * failure.  A NULL result without an error string is accepted; this can happen
- * when the symbol genuinely does not exist in the chain (e.g. usleep on a
- * platform that maps it to nanosleep at the linker level).
+ * @par Failure behaviour
+ * abort(3) when dlsym() returns NULL and dlerror() reports an error. A NULL result
+ * without an error leaves the pointer NULL; the call helpers then use raw system calls.
  *
- * @param target  Pointer to the function-pointer variable to populate.
- *                Must point to storage of exactly sizeof(void*) bytes.
- * @param symbol  NUL-terminated name of the symbol to resolve.
+ * @param target  Function-pointer variable of sizeof(void *) bytes.
+ * @param symbol  Symbol name.
  */
 static void chaos_time_resolve_symbol(void *target, const char *symbol)
 {
     void *resolved;
+    void *current;
+
+    /* A pointer already wired (by an earlier call, or by a test harness) stays. */
+    (void)memcpy(&current, target, sizeof(current));
+    if (current != NULL)
+    {
+        return;
+    }
 
     (void)dlerror();
     resolved = dlsym(RTLD_NEXT, symbol);
@@ -133,27 +119,16 @@ static void chaos_time_resolve_symbol(void *target, const char *symbol)
 }
 
 /**
- * Reads 8 bytes of entropy from /dev/urandom using raw Linux syscalls.
+ * Reads 8 bytes from /dev/urandom with raw openat/read/close system calls.
  *
- * Raw syscalls are used for two reasons:
+ * Raw system calls keep the read invisible to any other preloaded library that
+ * interposes open or read (libchaos-io would otherwise see, and could fault, it). The
+ * guard is held anyway, so nothing the read might call reaches this library's wrappers.
  *
- *  1. At constructor time the libc file-descriptor layer may not yet be
- *     initialised, making open(3)/read(3)/close(3) unsafe.
- *  2. Using the wrapped open() would potentially trigger the chaos interceptors
- *     (if somehow invoked recursively), even though the reentrancy guard is set
- *     before the call.
- *
- * The reentrancy guard is raised around the syscall sequence with
- * chaos_time_enter_internal() / chaos_time_leave_internal() to prevent any
- * re-entrant chaos decisions from being made while reading entropy.
- *
- * Falls back to a deterministic value derived from getpid() on non-Linux
- * platforms or if the read fails.
- *
- * @return  8 bytes of entropy as a uint64_t, or a pid-derived constant on
- *          failure.  Never returns zero on the non-Linux fallback path.
+ * @return The 8 bytes; on any failure, or off Linux, 0x6a09e667f3bcc909 XOR pid, which
+ *         is never 0. errno may be changed (see chaos_time_read_seed_material()).
  */
-static uint64_t chaos_time_read_seed_material(void)
+static uint64_t chaos_time_read_urandom_seed(void)
 {
 #ifdef __linux__
     uint64_t seed = 0U;
@@ -182,28 +157,66 @@ static uint64_t chaos_time_read_seed_material(void)
 }
 
 /**
- * ELF constructor: initialises the entire libchaos-time subsystem.
+ * @brief chaos_time_read_urandom_seed() with errno preserved.
  *
- * Execution order:
- *
- *  1. Resolve the three real function pointers via RTLD_NEXT.
- *  2. Collect entropy from /dev/urandom and write it to g_chaos_time_process_seed.
- *  3. Seed the main thread's PRNG state from the process seed.
- *  4. Initialise the config subsystem (zeros both snapshots, sets cached mtime
- *     to CHAOS_TIME_MTIME_UNKNOWN).
- *
- * Runs before main() and before any static C++ constructors that might call
- * clock_gettime or nanosleep.  If symbol resolution fails, abort(3) is called
- * so the application never runs with null function pointers.
+ * @details Only the constructor calls it; preloading the library must not change the
+ * errno a program observes, so a failed openat or read leaves no trace.
  */
-CHAOS_TIME_CONSTRUCTOR
-static void chaos_time_init(void)
+static uint64_t chaos_time_read_seed_material(void)
+{
+    const int saved_errno = errno;
+    const uint64_t seed = chaos_time_read_urandom_seed();
+
+    errno = saved_errno;
+    return seed;
+}
+
+/**
+ * @brief Run-once state of symbol resolution.
+ *
+ * @details `chaos_once()`, not `pthread_once()`: before glibc 2.34 the latter lives
+ * in libpthread, which programs such as `cat` and `sh` do not load.
+ */
+static volatile chaos_once_t g_chaos_time_symbols_once = CHAOS_ONCE_INIT;
+
+/**
+ * @brief Resolves all eight real functions; runs once, through chaos_time_ensure_symbols().
+ *
+ * @details Calls no wrapper of this library. `dlsym(RTLD_NEXT, ...)` walks the
+ * loaded link map without file I/O; if it allocates and the allocator calls back into a
+ * wrapper, chaos_once() returns 0 to that nested call and the helper uses a system call.
+ */
+static void chaos_time_resolve_all_symbols(void)
 {
     chaos_time_resolve_symbol(&g_chaos_time_real_clock_gettime, "clock_gettime");
     chaos_time_resolve_symbol(&g_chaos_time_real_nanosleep, "nanosleep");
     chaos_time_resolve_symbol(&g_chaos_time_real_usleep, "usleep");
+    chaos_time_resolve_symbol(&g_chaos_time_real_gettimeofday, "gettimeofday");
+    chaos_time_resolve_symbol(&g_chaos_time_real_time, "time");
+    chaos_time_resolve_symbol(&g_chaos_time_real_clock_nanosleep, "clock_nanosleep");
+    chaos_time_resolve_symbol(&g_chaos_time_real_sleep, "sleep");
+    chaos_time_resolve_symbol(&g_chaos_time_real_timespec_get, "timespec_get");
+}
 
+void chaos_time_ensure_symbols(void)
+{
+    (void)chaos_once(&g_chaos_time_symbols_once, chaos_time_resolve_all_symbols);
+}
+
+/**
+ * ELF constructor: resolves, seeds, initialises the rule state and loads the rule file.
+ *
+ * Runs before main(), but not necessarily before every other object's constructor:
+ * those may call a wrapper first, which is why each wrapper resolves symbols itself and
+ * a rule load also happens lazily. See the file header for the steps and their order.
+ */
+CHAOS_TIME_CONSTRUCTOR
+static void chaos_time_init(void)
+{
+    chaos_time_ensure_symbols();
     g_chaos_time_process_seed = chaos_time_read_seed_material();
     chaos_time_prng_seed_thread(g_chaos_time_process_seed);
     chaos_time_config_init();
+    /* Load now, so a bad rule file shows in the status file at start-up. */
+    (void)chaos_time_config_prepare();
 }

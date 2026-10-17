@@ -1,39 +1,33 @@
 /**
  * @file chaos_memory_actions.h
- * @brief Public interface for probabilistic fault-injection actions in
- *        libchaos-memory.
+ * @brief Turns a matched libchaos-memory rule into its effect: the firing
+ *        decision, LATENCY and ERRNO.
  *
  * @details
- * This header declares the functions that translate a matched
- * chaos_memory_rule_t into an observable effect (errno injection or latency).
- * It sits between the config matching layer (chaos_memory_config.h) and the
- * hook wrappers (chaos_memory_hooks.c).
- *
- * The four functions form a deliberate two-step pattern used by every hook:
+ * Sits between rule matching (chaos_memory_config.h) and the wrappers
+ * (chaos_memory_hooks.c). Every wrapper runs two independent passes, LATENCY
+ * first, so one call can be both delayed and failed:
  *
  * @code
  *   chaos_memory_rule_t rule;
  *   if (chaos_memory_config_match(CHAOS_MEMORY_EFFECT_LATENCY, op, flags, &rule)) {
- *       chaos_memory_rule_apply_latency(&rule);   // may or may not sleep
+ *       chaos_memory_rule_apply_latency(&rule);
  *   }
  *   if (chaos_memory_config_match(CHAOS_MEMORY_EFFECT_ERRNO, op, flags, &rule) &&
  *       chaos_memory_rule_apply_errno(&rule)) {
- *       return MAP_FAILED;  // or -1
+ *       return MAP_FAILED;  // -1 for munmap/mprotect/madvise
  *   }
- *   return real_syscall(...);
+ *   return real_function(...);
  * @endcode
  *
- * chaos_memory_rule_should_trigger() encapsulates the probability check so
- * that both apply functions share the same probabilistic gate.  It is also
- * exposed here for unit testing.
+ * (The wrappers also store the call's length in rule.call_size for `@size`.)
  *
- * @par Thread safety
- * All functions are thread-safe.  Probability sampling reads the per-thread
- * TLS PRNG state (no synchronisation needed).  Sleep uses the reentrancy guard
- * to avoid recursive hook invocations through usleep/nanosleep.
+ * @par Thread and signal safety
+ * Lock-free and allocation-free; the PRNG is thread-local; the sleep is a raw
+ * system call that enters no wrapper.
  *
  * @par Stability
- * Internal — do not include from outside the memory chaos module.
+ * Internal.
  */
 #ifndef CHAOS_MEMORY_ACTIONS_H
 #define CHAOS_MEMORY_ACTIONS_H
@@ -41,103 +35,61 @@
 #include "chaos_memory_config.h"
 
 /**
- * @brief Test whether a probability value fires for a given 32-bit PRNG sample.
+ * @brief Bernoulli trial of @p probability with a caller-supplied sample; the
+ *        deterministic core of chaos_memory_probability_hit(), exposed for tests.
  *
- * @details
- * Maps the floating-point @p probability into the integer range [0, 2^32) by
- * multiplying by 4294967296.0 (== 2^32) and comparing @p sample against the
- * resulting threshold.  This gives an unbiased Bernoulli trial for any
- * probability representable as a fraction of 2^32, with no division and no
- * branch misprediction beyond the fast-path boundary checks.
+ * @details Fires when @p sample < @p probability * 2^32. Exact for probabilities
+ * that are multiples of 2^-32; otherwise off by at most one sample value
+ * (2^-32) from rounding.
  *
- * Edge cases:
- *  - probability <= 0.0: always returns 0 (never fires).
- *  - probability >= 1.0: always returns 1 (always fires).
- *  - Intermediate values produce exact results for multiples of 2^-32 and
- *    approximate results (IEEE 754 rounding) for arbitrary fractions.
- *
- * @param probability  Target probability in [0.0, 1.0].  Values outside this
- *                     range are clamped by the <= 0.0 and >= 1.0 guards.
- * @param sample       A uniformly distributed 32-bit value (typically from
- *                     chaos_memory_prng_next_u32()).
- * @return             1 if @p sample falls below the probability threshold,
- *                     0 otherwise.
+ * @param probability  Probability; <= 0.0 never fires, >= 1.0 always fires.
+ * @param sample       Value uniform in [0, 2^32), normally chaos_memory_prng_next_u32().
+ * @return 1 if the trial fires, 0 otherwise.
  */
 int chaos_memory_probability_hit_sample(double probability, uint32_t sample);
 
 /**
- * @brief Test whether a probability value fires, drawing a sample from the
- *        per-thread PRNG.
+ * @brief Bernoulli trial of @p probability with the next value of this thread's PRNG.
  *
- * @details
- * Calls chaos_memory_prng_next_u32() to obtain a fresh sample and passes it
- * to chaos_memory_probability_hit_sample().  This is the normal call path
- * used by chaos_memory_rule_should_trigger().  The sample-based variant is
- * exposed separately to allow deterministic unit testing.
- *
- * @param probability  Target probability in [0.0, 1.0].
- * @return             1 if the PRNG sample falls below the threshold, 0 otherwise.
+ * @param probability  Probability in [0.0, 1.0].
+ * @return 1 if the trial fires, 0 otherwise.
  */
 int chaos_memory_probability_hit(double probability);
 
 /**
- * @brief Determine whether a matched rule should fire on this specific call.
+ * @brief Decides whether @p rule fires on this call; counts the hit when it does.
  *
- * @details
- * Evaluates rule->probability against a fresh PRNG draw.  Returns 0
- * immediately if @p rule is NULL.
+ * @details In order: `@from`/`@until` window open, `@size` gate passed for
+ * rule->call_size, PRNG draw below rule->probability, then chaos_policy_fire()
+ * grants an `@first` slot and increments the rule's hit counter. A rule that has
+ * left the active snapshot (stale hit_generation) does not fire.
  *
- * Used internally by chaos_memory_rule_apply_latency() and
- * chaos_memory_rule_apply_errno() to apply the probabilistic gate before
- * taking any observable action.
- *
- * @param rule  The matched rule.  May be NULL (returns 0).
- * @return      1 if the rule should fire this time, 0 otherwise.
+ * @param rule  Matched rule copy; NULL returns 0.
+ * @return 1 if the rule fires, 0 otherwise.
  */
 int chaos_memory_rule_should_trigger(const chaos_memory_rule_t *rule);
 
 /**
- * @brief Apply a LATENCY rule: sleep for rule->latency_ms milliseconds if
- *        the rule fires.
+ * @brief Sleeps rule->latency_ms milliseconds if @p rule is a LATENCY rule that fires.
  *
- * @details
- * The sleep is performed as a series of up to 1-second chunks using the real
- * usleep(3) (preferred) or nanosleep(2) (fallback), always under the TLS
- * reentrancy guard.  Chunking prevents a single call from consuming more than
- * 1 second of PRNG-decided sleep per chunk without the guard, and handles
- * the EINTR restart requirement for nanosleep transparently.
+ * @details The sleep is chaos_sleep_ms() (src/common/chaos_sleep.h): a raw
+ * clock_nanosleep on CLOCK_MONOTONIC, restarted on EINTR, so the full delay
+ * elapses, errno is preserved, and libchaos-time cannot shorten or lengthen it.
+ * The real function is always called afterwards.
  *
- * Does nothing if:
- *  - @p rule is NULL.
- *  - rule->effect != CHAOS_MEMORY_EFFECT_LATENCY.
- *  - The probability check (chaos_memory_rule_should_trigger) does not fire.
- *
- * The real syscall is always issued after this function returns — LATENCY does
- * not suppress the underlying operation.
- *
- * @param rule  The matched LATENCY rule.  No-op if NULL or wrong effect.
+ * @param rule  Matched rule copy; no-op if NULL, not LATENCY, or not firing.
  */
 void chaos_memory_rule_apply_latency(const chaos_memory_rule_t *rule);
 
 /**
- * @brief Apply an ERRNO rule: set errno and signal that the call should be
- *        short-circuited.
+ * @brief Sets errno to rule->errnum if @p rule is an ERRNO rule that fires.
  *
- * @details
- * If the rule fires (chaos_memory_rule_should_trigger returns non-zero), sets
- * the calling thread's errno to rule->errnum and returns 1.  The caller is
- * responsible for returning the appropriate error sentinel:
- *  - mmap(2): MAP_FAILED ((void*)-1)
- *  - munmap(2), mprotect(2), madvise(2): -1
+ * @details The caller returns its failure value without calling the real function:
+ * MAP_FAILED for mmap(); -1 for munmap(), mprotect() and madvise();
+ * posix_madvise() returns the error number and restores errno.
  *
- * Returns 0 (no-op) if:
- *  - @p rule is NULL.
- *  - rule->effect != CHAOS_MEMORY_EFFECT_ERRNO.
- *  - The probability check does not fire.
- *
- * @param rule  The matched ERRNO rule.  No-op if NULL or wrong effect.
- * @return      1 if errno was set and the call should be short-circuited,
- *              0 if the rule did not fire.
+ * @param rule  Matched rule copy; no-op if NULL, not ERRNO, or not firing.
+ * @return 1 if errno was set and the call must fail, 0 otherwise (errno untouched).
  */
 int chaos_memory_rule_apply_errno(const chaos_memory_rule_t *rule);
 

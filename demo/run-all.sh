@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
-# Run all 15 chaos demo profiles from source and print a green tally.
-#   bash demo/run-all.sh          # from the repo root; needs only Docker
+# Runs all 15 profiles of demo/docker-compose.yml and prints one pass/fail line per profile.
+#   bash demo/run-all.sh          # from any directory; needs Docker with the compose plugin
 #
-# Each profile builds the six .so from source into a shared volume (once) and
-# runs a probe under LD_PRELOAD. Exit code is non-zero if any profile fails.
+# The `build` service compiles the six libraries from this checkout into a shared volume once;
+# each profile then runs a probe or stock tool under LD_PRELOAD with one rule file.
+# A profile passes when its combined stdout+stderr matches the expected pattern
+# (case-insensitive extended regex), i.e. the injected fault became visible to the application.
+# Exit status: the number of failed profiles (0 = all passed). Volumes are removed at the end.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 C="docker compose -f demo/docker-compose.yml"
 G=$'\033[32m'; R=$'\033[31m'; D=$'\033[2m'; B=$'\033[1m'; Z=$'\033[0m'
 
+# Build output is discarded. A failed build is not reported here: the libraries are then
+# missing and the profiles fail instead.
 echo "${D}building six .so from source ...${Z}"
 $C run --rm -T build >/dev/null 2>&1
 
-# profile | description | pass-pattern (extended regex)
+# profile | description | pass pattern (extended regex). The row is split on the first two '|';
+# the rest is the pattern, so a further '|' is regex alternation (see proc1).
 ROWS=(
   "io1|read → EIO|input/output error"
   "io2|read → CORRUPT (bit-flip)|checksum mismatch"
@@ -32,6 +38,7 @@ ROWS=(
 )
 
 pass=0; fail=0
+# --no-deps: the build already ran above, so profiles do not re-run it.
 for row in "${ROWS[@]}"; do
   IFS='|' read -r name desc pat <<<"$row"
   out=$($C run --rm --no-deps -T "$name" 2>&1)   # app errno messages (e.g. io1) land on stderr

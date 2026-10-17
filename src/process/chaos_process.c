@@ -1,65 +1,38 @@
 /**
  * @file chaos_process.c
- * @brief Library initialisation: symbol resolution, entropy seeding, and
- *        constructor bootstrapping for the libchaos-process subsystem.
+ * @brief libchaos-process bootstrap: shared globals, real-function resolution, seeding
+ *        and the first load.
  *
  * @details
- * This translation unit owns the definitions of all shared global state
- * declared as `extern` in `chaos_process_internal.h`, and contains the
- * `__attribute__((constructor))` function `chaos_process_init()` that the
- * dynamic linker runs before any application code executes.
+ * Defines the globals declared in chaos_process_internal.h. The ELF constructor
+ * chaos_process_init() runs, in order:
  *
- * ## Responsibilities
+ *  1. **Resolution:** chaos_process_ensure_symbols() fills the real-function pointers
+ *     through `dlsym(RTLD_NEXT)`. Wrappers call it too, because another object's
+ *     constructor can reach a wrapper before this one runs.
+ *  2. **Seeding:** 8 bytes from /dev/urandom become the process seed, read with raw
+ *     openat/read/close system calls so that no other preloaded library interposing
+ *     open or read (libchaos-io) sees or faults the read. errno is preserved.
+ *  3. **PRNG:** the constructing thread is seeded from the process seed; other threads
+ *     seed themselves on their first draw.
+ *  4. **Rules:** chaos_process_config_init() resets the rule state, then
+ *     chaos_process_config_prepare() loads the rule file, so a bad file is reported in
+ *     the status file at start-up rather than at the first wrapped call.
  *
- *  1. **Symbol resolution** — locate the real libc implementations of every
- *     interposed function via `dlsym(RTLD_NEXT, ...)` and store them in the
- *     corresponding `g_chaos_process_real_*` function pointers.  A failure to
- *     resolve a mandatory symbol calls `abort()` to prevent silent
- *     passthrough with a NULL function pointer.
- *
- *  2. **Entropy seeding** — read 8 bytes from `/dev/urandom` using raw
- *     syscalls (bypassing our own interposed symbols) and store the result in
- *     `g_chaos_process_process_seed`.  Falls back to a XOR of a compile-time
- *     constant and the PID if the syscall fails.
- *
- *  3. **PRNG bootstrap** — immediately seed the main thread's per-thread
- *     PRNG state so that the first call to any wrapper after construction has
- *     a valid random stream.
- *
- *  4. **Config bootstrap** — call `chaos_process_config_init()` to zero all
- *     config state and set the cached mtime sentinel to `UNKNOWN` so the
- *     first hook invocation triggers a file read.
- *
- * ## Thread safety of initialisation
- *
- * The constructor runs exactly once in a single-threaded context (before
- * `main()` and before any application threads are created).  The
- * `g_chaos_process_real_*` pointers are written here and are thereafter
- * read-only; they need no locking from the hook wrappers.
- *
- * ## Re-entrancy during construction
- *
- * `chaos_process_read_seed_material()` opens `/dev/urandom` via
- * `SYS_openat`/`SYS_read`/`SYS_close` raw syscalls rather than through
- * `open()`/`read()`/`close()`.  This is necessary because at constructor
- * time the `g_chaos_process_real_*` pointers have already been populated and
- * the TLS guard protects internal calls, but using the libc wrappers would
- * invoke our own interposed symbols (which are already live in the PLT) and
- * could, depending on load order, recurse before all pointers are ready.
- * Using the syscall layer avoids this entirely.
- *
- * The `chaos_process_enter_internal()` / `chaos_process_leave_internal()`
- * bracket inside `chaos_process_read_seed_material()` is a belt-and-
- * suspenders guard for any case where the TLS guard matters during seeding.
- *
- * ## Stability
- * Private implementation — not part of the public API.
+ * @par Failure behaviour
+ * A required symbol whose lookup dlerror() reports as failed calls abort(3). Optional
+ * symbols (pthread_create before glibc 2.34, execveat, execvpe, fexecve) may stay NULL.
+ * A pointer can also be NULL while resolution runs; the call helpers in
+ * chaos_process_hooks.c then use a raw system call or report ENOSYS / EAGAIN. A failed
+ * urandom read falls back to a pid-derived seed.
  */
 
+#include "chaos_once.h"
 #include "chaos_process_config.h"
 #include "chaos_process_internal.h"
 
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -77,9 +50,12 @@ chaos_process_posix_spawnp_fn g_chaos_process_real_posix_spawnp = NULL;
 chaos_process_execve_fn g_chaos_process_real_execve = NULL;
 chaos_process_execveat_fn g_chaos_process_real_execveat = NULL;
 chaos_process_waitpid_fn g_chaos_process_real_waitpid = NULL;
-chaos_process_nanosleep_fn g_chaos_process_real_nanosleep = NULL;
-chaos_process_usleep_fn g_chaos_process_real_usleep = NULL;
-
+chaos_process_wait4_fn g_chaos_process_real_wait4 = NULL;
+chaos_process_execvpe_fn g_chaos_process_real_execvpe = NULL;
+chaos_process_fexecve_fn g_chaos_process_real_fexecve = NULL;
+chaos_process_system_fn g_chaos_process_real_system = NULL;
+chaos_process_popen_fn g_chaos_process_real_popen = NULL;
+chaos_process_waitid_fn g_chaos_process_real_waitid = NULL;
 __thread int g_chaos_process_tls_guard = 0;
 __thread uint64_t g_chaos_process_tls_prng_state = 0U;
 uint64_t g_chaos_process_process_seed = UINT64_C(0x2545f4914f6cdd1d);
@@ -92,7 +68,7 @@ volatile uint64_t g_chaos_process_fail_after_counters[CHAOS_PROCESS_OP_COUNT] = 
  * ---------------------------------------------------------------------- */
 
 #ifndef CHAOS_PROCESS_CONSTRUCTOR
-/** GCC/Clang constructor attribute — runs before main(). */
+/** Makes chaos_process_init() an ELF constructor; overridable at compile time (test seam). */
 #define CHAOS_PROCESS_CONSTRUCTOR __attribute__((constructor))
 #endif
 
@@ -101,28 +77,32 @@ volatile uint64_t g_chaos_process_fail_after_counters[CHAOS_PROCESS_OP_COUNT] = 
  * ---------------------------------------------------------------------- */
 
 /**
- * @brief Resolves a libc symbol via RTLD_NEXT and stores the result.
+ * @brief Stores `dlsym(RTLD_NEXT, symbol)` into the function pointer at @p target, if
+ *        unset.
  *
- * Uses `dlsym(RTLD_NEXT, symbol)` to find the next definition of `symbol`
- * in the dynamic linker's search order (i.e. the real libc implementation
- * that lies behind this LD_PRELOAD library).
+ * The pointer is copied with memcpy because ISO C does not define converting an object
+ * pointer (`void *`) to a function pointer. A pointer already set (by an earlier call,
+ * or by a test harness) is left alone.
  *
- * The resolved pointer is written into `target` via `memcpy` to avoid
- * aliasing issues with casting between `void *` and function pointer types
- * (which is technically undefined behaviour in C99 though universally
- * supported by all relevant toolchains).
+ * @par Failure behaviour
+ * abort(3) when dlsym() returns NULL and dlerror() reports an error: running a required
+ * wrapper without its real function would be worse than not running. A NULL result
+ * without an error leaves the pointer NULL.
  *
- * @param target  Pointer to a function-pointer variable to populate.
- * @param symbol  Null-terminated symbol name to resolve.
- *
- * @note Calls `abort()` if the symbol cannot be resolved.  The library
- *       cannot operate without the real implementations; aborting early
- *       is safer than proceeding with a NULL function pointer that would
- *       cause a SIGSEGV in the wrapper at an arbitrary later time.
+ * @param target  Function-pointer variable of sizeof(void *) bytes.
+ * @param symbol  Symbol name.
  */
 static void chaos_process_resolve_symbol(void *target, const char *symbol)
 {
     void *resolved;
+    void *current;
+
+    /* A pointer already wired (by an earlier call, or by a test harness) stays. */
+    (void)memcpy(&current, target, sizeof(current));
+    if (current != NULL)
+    {
+        return;
+    }
 
     (void)dlerror();
     resolved = dlsym(RTLD_NEXT, symbol);
@@ -134,21 +114,26 @@ static void chaos_process_resolve_symbol(void *target, const char *symbol)
     (void)memcpy(target, &resolved, sizeof(resolved));
 }
 
-#ifdef __linux__
 /**
- * @brief Like `chaos_process_resolve_symbol()` but does not abort on failure.
+ * @brief chaos_process_resolve_symbol() for optional symbols: absence leaves the pointer
+ *        NULL and clears the dlerror() state instead of aborting.
  *
- * Used for symbols that may legitimately be absent on some libc
- * implementations.  Specifically, `execveat` is not consistently exported
- * as a public symbol by musl libc.  If the symbol is absent, `target` is
- * set to NULL and callers must guard against this.
+ * Used for pthread_create, execveat, execvpe and fexecve, which a given libc version
+ * may not export.
  *
- * @param target  Pointer to a function-pointer variable to populate or NULL.
- * @param symbol  Null-terminated symbol name to attempt to resolve.
+ * @param target  Function-pointer variable; left unchanged when already set.
+ * @param symbol  Symbol name.
  */
 static void chaos_process_try_resolve_symbol(void *target, const char *symbol)
 {
     void *resolved;
+    void *current;
+
+    (void)memcpy(&current, target, sizeof(current));
+    if (current != NULL)
+    {
+        return;
+    }
 
     (void)dlerror();
     resolved = dlsym(RTLD_NEXT, symbol);
@@ -159,24 +144,19 @@ static void chaos_process_try_resolve_symbol(void *target, const char *symbol)
 
     (void)memcpy(target, &resolved, sizeof(resolved));
 }
-#endif
 
 /**
- * @brief Reads 8 bytes of entropy from `/dev/urandom` using raw syscalls.
+ * @brief Reads 8 bytes from /dev/urandom with raw openat/read/close system calls.
  *
- * Uses `SYS_openat`, `SYS_read`, and `SYS_close` directly rather than the
- * libc wrappers to avoid recursing through our own interposed symbols during
- * library construction.  The TLS re-entrancy guard is set for the duration
- * of the syscall sequence as an additional safeguard.
+ * Raw system calls keep the read invisible to any other preloaded library that
+ * interposes open or read. The guard is held anyway, so nothing the read might call
+ * reaches this library's wrappers.
  *
- * Falls back to a compile-time constant XOR PID if:
- *  - The platform is not Linux (raw syscall layer not used there).
- *  - `SYS_openat` fails (e.g. sandboxed environment with no `/dev/urandom`).
- *  - `SYS_read` returns a short read.
- *
- * @return 64 bits of entropy for use as `g_chaos_process_process_seed`.
+ * @return The 8 bytes; 0x6a09e667f3bcc909 XOR pid off Linux, when openat fails (no
+ *         /dev/urandom in a sandbox) or on a short read. errno may change (see
+ *         chaos_process_read_seed_material()).
  */
-static uint64_t chaos_process_read_seed_material(void)
+static uint64_t chaos_process_read_urandom_seed(void)
 {
 #ifdef __linux__
     uint64_t seed = 0U;
@@ -205,39 +185,88 @@ static uint64_t chaos_process_read_seed_material(void)
 }
 
 /**
- * @brief Library constructor: resolves symbols, seeds entropy, and
- *        bootstraps the config subsystem.
+ * @brief chaos_process_read_urandom_seed() with errno preserved.
  *
- * Executed by the dynamic linker before `main()` via the
- * `__attribute__((constructor))` annotation.  Execution order relative to
- * other constructors in the same library is unspecified, but all libc
- * initialisations (and therefore all libc symbols accessible via
- * `RTLD_NEXT`) are complete before any constructor runs.
- *
- * Steps performed in order:
- *  1. Resolve all mandatory real-symbol pointers (abort on failure).
- *  2. Conditionally resolve `execveat` (Linux only; NULL is acceptable).
- *  3. Read 8 bytes from `/dev/urandom` to populate the process seed.
- *  4. Seed the main thread's per-thread PRNG from the process seed.
- *  5. Initialise the config subsystem (zeroes rules, sets mtime sentinel).
+ * @details Only the constructor calls it; preloading the library must not change the
+ * errno a program observes, so a failed openat or read leaves no trace.
  */
-CHAOS_PROCESS_CONSTRUCTOR
-static void chaos_process_init(void)
+static uint64_t chaos_process_read_seed_material(void)
 {
-    chaos_process_resolve_symbol(&g_chaos_process_real_pthread_create, "pthread_create");
+    const int saved_errno = errno;
+    const uint64_t seed = chaos_process_read_urandom_seed();
+
+    errno = saved_errno;
+    return seed;
+}
+
+/**
+ * @brief Resolves `pthread_create`, which may be absent until libpthread is loaded.
+ *
+ * @details Before glibc 2.34 `pthread_create` lives in libpthread. A program that
+ * does not link it never calls it, but resolving it eagerly aborted that program
+ * at start-up. Unresolved, the pointer stays NULL and the wrapper retries here: a
+ * library loaded later with `dlopen()` can bring libpthread in.
+ */
+void chaos_process_resolve_pthread_create(void)
+{
+    chaos_process_try_resolve_symbol(&g_chaos_process_real_pthread_create, "pthread_create");
+}
+
+/**
+ * @brief Run-once state of symbol resolution.
+ *
+ * @details `chaos_once()`, not `pthread_once()`: before glibc 2.34 the latter lives
+ * in libpthread, which programs such as `cat` and `sh` do not load.
+ */
+static volatile chaos_once_t g_chaos_process_symbols_once = CHAOS_ONCE_INIT;
+
+/**
+ * @brief Resolves all real functions; runs once, through chaos_process_ensure_symbols().
+ *
+ * @details Calls no wrapper of this library. `dlsym(RTLD_NEXT, ...)` walks the loaded
+ * link map without file I/O; if it allocates and the allocator calls back into a
+ * wrapper, chaos_once() returns 0 to that nested call and its helper falls back.
+ */
+static void chaos_process_resolve_all_symbols(void)
+{
+    chaos_process_resolve_pthread_create();
     chaos_process_resolve_symbol(&g_chaos_process_real_fork, "fork");
     chaos_process_resolve_symbol(&g_chaos_process_real_posix_spawn, "posix_spawn");
     chaos_process_resolve_symbol(&g_chaos_process_real_posix_spawnp, "posix_spawnp");
     chaos_process_resolve_symbol(&g_chaos_process_real_execve, "execve");
 #ifdef __linux__
-    /* musl does not consistently expose execveat as a public libc symbol. */
+    /* Optional: not every libc version exports execveat (glibc added it in 2.34). */
     chaos_process_try_resolve_symbol(&g_chaos_process_real_execveat, "execveat");
 #endif
     chaos_process_resolve_symbol(&g_chaos_process_real_waitpid, "waitpid");
-    chaos_process_resolve_symbol(&g_chaos_process_real_nanosleep, "nanosleep");
-    chaos_process_resolve_symbol(&g_chaos_process_real_usleep, "usleep");
+    chaos_process_resolve_symbol(&g_chaos_process_real_wait4, "wait4");
+    chaos_process_resolve_symbol(&g_chaos_process_real_waitid, "waitid");
+    chaos_process_resolve_symbol(&g_chaos_process_real_system, "system");
+    chaos_process_resolve_symbol(&g_chaos_process_real_popen, "popen");
+    chaos_process_try_resolve_symbol(&g_chaos_process_real_execvpe, "execvpe");
+    chaos_process_try_resolve_symbol(&g_chaos_process_real_fexecve, "fexecve");
+}
 
+void chaos_process_ensure_symbols(void)
+{
+    (void)chaos_once(&g_chaos_process_symbols_once, chaos_process_resolve_all_symbols);
+}
+
+/**
+ * @brief ELF constructor: resolves, seeds, initialises the rule state and loads the rule
+ *        file (see the file header for the order).
+ *
+ * Runs before main(), but not necessarily before every other object's constructor:
+ * those may call a wrapper first, which is why each wrapper resolves symbols itself and
+ * a rule load also happens lazily.
+ */
+CHAOS_PROCESS_CONSTRUCTOR
+static void chaos_process_init(void)
+{
+    chaos_process_ensure_symbols();
     g_chaos_process_process_seed = chaos_process_read_seed_material();
     chaos_process_prng_seed_thread(g_chaos_process_process_seed);
     chaos_process_config_init();
+    /* Load now, so a bad rule file shows in the status file at start-up. */
+    (void)chaos_process_config_prepare();
 }

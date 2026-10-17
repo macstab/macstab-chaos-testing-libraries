@@ -1,17 +1,17 @@
 /**
  * @file chaos_bench_internal.h
- * @brief Private types and helpers shared across harness translation units.
+ * @brief Types and functions shared between harness translation units only.
  *
  * @details
- * This header is included only by `harness/\*.c` files; it is not part of
- * the public API and benchmark kernels must not include it.  Anything
- * declared here may change without notice.
+ * Included by `harness/\*.c` only. Benchmark kernels include `chaos_bench.h` and must not
+ * include this header; everything here may change without notice.
  *
- * The split exists because the harness's runtime configuration
- * (parsed argv, calibrated timer, captured environment) crosses
- * several translation units (`chaos_bench_runner.c`, `chaos_bench_stats.c`,
- * `chaos_bench_json.c`) but should not leak through the kernel-facing
- * `chaos_bench.h`.
+ * The split keeps the runner's state (parsed options, calibrated timer, captured environment,
+ * statistics) out of the kernel-facing API while letting `chaos_bench_runner.c`,
+ * `chaos_bench_env.c`, `chaos_bench_isolation.c`, `chaos_bench_timer.c`,
+ * `chaos_bench_stats.c` and `chaos_bench_json.c` share it.
+ *
+ * **Thread-safety.** None of these functions lock; the runner calls them from the main thread.
  */
 
 #ifndef CHAOS_BENCH_INTERNAL_H
@@ -24,41 +24,44 @@
 #include <stdio.h>
 
 /**
- * @brief Hard upper bound on benchmarks per binary; abort registration
- *        beyond this to keep the runner's static buffers tractable.
+ * @brief Maximum descriptors per binary; `chaos_bench_register` aborts beyond it.
  *
- * @details A benchmark binary that exceeds this should be split per
- * subsystem.  Stage 1 binaries register on the order of 5-10 benchmarks.
+ * @details The cap turns a runaway registration (e.g. a macro expanded in a loop-generated
+ * header) into an immediate abort instead of an unbounded list. The largest kernel file
+ * registers 36 benchmarks.
  */
 #define CHAOS_BENCH_MAX_REGISTERED 256U
 
 /**
- * @brief Hard upper bound on samples per measurement run.
+ * @brief Maximum `--iters` value, i.e. samples per run.
  *
- * @details At 8 bytes/sample, this caps the sample buffer at 8 MiB —
- * comfortably below typical container memory limits and small enough
- * that quicksort over the array stays in L2.
+ * @details One `double` per sample caps the sample buffer at 8 MiB, which fits typical
+ * container memory limits. `--iters` outside [1, 1048576] is rejected with exit code 2.
  */
 #define CHAOS_BENCH_MAX_SAMPLES 1048576U
 
 /**
- * @brief Maximum length of an environment-capture string field.
+ * @brief Capacity, in bytes including the NUL, of the large environment string fields.
  *
- * @details Bounds buffers used to read `/proc/cpuinfo`, `/proc/version`,
- * and similar paths.  Truncation past this limit is logged in the JSON
- * envelope as `truncated: true`.
+ * @details Sizes the buffers for `/proc/sys/kernel/osrelease`, `/proc/version`, the cpuinfo
+ * model and flags lines, the build CFLAGS and LD_PRELOAD. `/proc/cpuinfo` itself is read into
+ * a 4x larger (16 KiB) stack buffer. Longer values are truncated; the `*_truncated` flags in
+ * @ref chaos_bench_env_t record it, but the JSON envelope does not emit those flags.
  */
 #define CHAOS_BENCH_ENV_FIELD_MAX 4096U
 
 /**
  * @brief Maximum number of CPU flags collected from `/proc/cpuinfo`.
+ *
+ * @details Currently unused: the flags line is stored as one string in
+ * `chaos_bench_env_t::cpu_flags_blob`.
  */
 #define CHAOS_BENCH_MAX_CPU_FLAGS 256U
 
 /**
- * @brief Computed isolation status, attached to JSON envelope.
+ * @brief Result of the host isolation check, emitted as `execution.mode`.
  *
- * @details See `chaos_bench_isolation.c` for the precondition matrix.
+ * @details The checks are listed in chaos_bench_isolation.c.
  */
 typedef enum chaos_bench_exec_mode
 {
@@ -67,11 +70,11 @@ typedef enum chaos_bench_exec_mode
 } chaos_bench_exec_mode_t;
 
 /**
- * @brief One precondition warning collected during isolation check.
+ * @brief One failed isolation check, emitted in `execution.warnings`.
  *
- * @details Empty when isolation is `OFFICIAL`.  In `ADVISORY` mode each
- * failed check records its identifier and a human-readable detail
- * (e.g. `"governor=schedutil"`).
+ * @details `check` points to a string literal with a stable identifier (`governor`,
+ * `isolcpus`, `container`, `smt`, `constant_tsc`, `nonstop_tsc`) that consumers can match
+ * on; `detail` is free text such as `"governor=schedutil (need performance)"`.
  */
 typedef struct chaos_bench_warning
 {
@@ -80,31 +83,33 @@ typedef struct chaos_bench_warning
 } chaos_bench_warning_t;
 
 /**
- * @brief Maximum advisory warnings recorded; surplus is dropped with a
- *        single `"...truncated"` sentinel.
+ * @brief Capacity of the warning array; further warnings are dropped silently.
+ *
+ * @details The isolation check can raise at most 6 warnings, so the cap is never reached
+ * today. No truncation marker is emitted.
  */
 #define CHAOS_BENCH_MAX_WARNINGS 32U
 
 /**
- * @brief Captured host/build environment, populated once at startup.
+ * @brief Host and build provenance, captured once at startup.
  *
- * @details All fields are owned by this struct and are NUL-terminated.
- * Strings that did not fit into their buffer are truncated and the
- * relevant `*_truncated` flag is set.  The struct is value-copied into
- * the JSON writer; no pointer escapes.
+ * @details Every string is NUL-terminated and owned by the struct; a missing source leaves
+ * an empty string. A value longer than its buffer is truncated and, for the kernel release,
+ * the cpuinfo read and LD_PRELOAD, the matching `*_truncated` flag is set. The JSON writer
+ * reads the struct through a const pointer and emits every field except `*_truncated`.
  */
 typedef struct chaos_bench_env
 {
     char     kernel_release[CHAOS_BENCH_ENV_FIELD_MAX];      /**< /proc/sys/kernel/osrelease. */
     char     kernel_version[CHAOS_BENCH_ENV_FIELD_MAX];      /**< /proc/version. */
-    char     cpu_model[CHAOS_BENCH_ENV_FIELD_MAX];           /**< model name from /proc/cpuinfo. */
+    char     cpu_model[CHAOS_BENCH_ENV_FIELD_MAX];           /**< cpuinfo model. */
     char     cpu_flags_blob[CHAOS_BENCH_ENV_FIELD_MAX];      /**< raw flags line. */
     char     governor[64];                                   /**< cpu0 cpufreq governor. */
     char     isolated_cpus[256];                             /**< /sys/.../isolated. */
     char     thp_enabled[64];                                /**< THP setting. */
-    char     libc_id[128];                                   /**< glibc/musl identifier if detectable. */
-    char     git_sha[64];                                    /**< CHAOS_BENCH_GIT_SHA build define. */
-    char     build_cflags[CHAOS_BENCH_ENV_FIELD_MAX];        /**< CHAOS_BENCH_CFLAGS build define. */
+    char     libc_id[128];                                   /**< glibc/musl/unknown. */
+    char     git_sha[64];                                    /**< CHAOS_BENCH_GIT_SHA. */
+    char     build_cflags[CHAOS_BENCH_ENV_FIELD_MAX];        /**< CHAOS_BENCH_CFLAGS. */
     char     ld_preload[CHAOS_BENCH_ENV_FIELD_MAX];          /**< current LD_PRELOAD env var. */
     int      smt_active;                                     /**< 1 if HT/SMT is on. */
     int      container_marker;                               /**< 1 if /.dockerenv exists. */
@@ -116,24 +121,25 @@ typedef struct chaos_bench_env
 } chaos_bench_env_t;
 
 /**
- * @brief Populates @p out_env with a best-effort snapshot of the host
- *        environment.  Never fails; missing fields remain empty strings.
+ * @brief Fills @p out_env from `/proc`, `/sys`, the process environment and build defines.
  *
- * @param[out] out_env  Caller-owned target.  Must not be NULL.
+ * @details Never fails and never aborts: an unreadable source leaves its field empty (or 0).
+ * Reads files with stdio, so it must run before the timed loop.
+ *
+ * @param[out] out_env  Caller-owned; zeroed, then filled. Must not be NULL.
  */
 void chaos_bench_env_capture(chaos_bench_env_t *out_env);
 
 /**
- * @brief Inspects the host and computes the execution mode.
+ * @brief Evaluates the isolation checks against @p env.
  *
- * @param[in]  env       Captured environment (used for several checks).
- * @param[out] warnings  Receives one entry per failed precondition.
- *                       Pass an array of length @ref CHAOS_BENCH_MAX_WARNINGS.
- * @param[out] count     Number of warnings actually written.  Set to 0 if
- *                       no preconditions failed.
+ * @param[in]  env       Captured environment; all checks read from it, none touch the host.
+ * @param[out] warnings  Array of at least @ref CHAOS_BENCH_MAX_WARNINGS entries; receives one
+ *                       entry per failed check.
+ * @param[out] count     Number of entries written; 0 when every check passed.
  *
- * @return CHAOS_BENCH_EXEC_OFFICIAL when @p count is 0; otherwise
- *         CHAOS_BENCH_EXEC_ADVISORY.
+ * @return `CHAOS_BENCH_EXEC_OFFICIAL` when @p count is 0, otherwise
+ *         `CHAOS_BENCH_EXEC_ADVISORY`.
  */
 chaos_bench_exec_mode_t chaos_bench_isolation_check(
     const chaos_bench_env_t *env,
@@ -142,12 +148,12 @@ chaos_bench_exec_mode_t chaos_bench_isolation_check(
 );
 
 /**
- * @brief Aggregated statistics over a sample array.
+ * @brief Summary statistics of one run, all time values in nanoseconds per call.
  *
- * @details All time-valued fields are nanoseconds.  `samples_after_trim`
- * counts the values used to compute statistics after outlier trimming
- * (Stage 1: no trimming; this field equals `samples`).  Percentiles use
- * the type-7 (R-7) interpolation method to match NumPy's default.
+ * @details No outlier trimming is done, so `samples_after_trim` always equals `samples`; the
+ * field exists so the envelope schema does not change if trimming is added. `median_ns` and
+ * `p50_ns` hold the same value. Percentiles use type-7 (R-7) linear interpolation, NumPy's
+ * default, so they match `numpy.percentile` on the same samples.
  */
 typedef struct chaos_bench_stats
 {
@@ -167,32 +173,35 @@ typedef struct chaos_bench_stats
 } chaos_bench_stats_t;
 
 /**
- * @brief Computes percentile statistics over an array of nanosecond samples.
+ * @brief Computes @ref chaos_bench_stats_t over @p samples.
  *
- * @details Sorts the array in place (so @p samples must be caller-owned
- * and writable) and computes the fields of @p out.  No allocation; uses
- * `qsort(3)` from libc.
+ * @details Sorts @p samples in place with `qsort(3)`; allocates nothing. @p out is zeroed
+ * first, so `sample_count == 0` yields an all-zero result instead of a crash.
  *
- * @param[in,out] samples       Array of nanosecond timings; sorted on return.
- * @param[in]     sample_count  Length of @p samples; must be > 0.
- * @param[out]    out           Caller-owned target.  Must not be NULL.
+ * @param[in,out] samples       Per-call nanosecond values; ascending on return.
+ * @param[in]     sample_count  Number of elements in @p samples.
+ * @param[out]    out           Caller-owned result. Must not be NULL.
  */
 void chaos_bench_stats_compute(
     double *samples, size_t sample_count, chaos_bench_stats_t *out
 );
 
 /**
- * @brief Identifies the timer source used by the harness.
+ * @brief Counter that @ref chaos_bench_timer_read samples, emitted as `timer.source`.
  */
 typedef enum chaos_bench_timer_source
 {
     CHAOS_BENCH_TIMER_RDTSCP = 0,    /**< x86_64 with constant_tsc + nonstop_tsc. */
     CHAOS_BENCH_TIMER_CNTVCT,        /**< aarch64 generic timer. */
-    CHAOS_BENCH_TIMER_CLOCK_MONOTONIC /**< Fallback: vDSO clock_gettime. */
+    CHAOS_BENCH_TIMER_CLOCK_MONOTONIC /**< Fallback: clock_gettime(CLOCK_MONOTONIC_RAW). */
 } chaos_bench_timer_source_t;
 
 /**
- * @brief Calibrated timer state, populated once per process at startup.
+ * @brief Selected and calibrated timer, set up once per process.
+ *
+ * @details For the `CLOCK_MONOTONIC_RAW` fallback a "cycle" is one nanosecond (`hz` = 1e9,
+ * `ns_per_cycle` = 1.0) and no calibration runs, although `calibration_window_ns` still
+ * reports the nominal 100 ms.
  */
 typedef struct chaos_bench_timer
 {
@@ -204,28 +213,32 @@ typedef struct chaos_bench_timer
 } chaos_bench_timer_t;
 
 /**
- * @brief Initialises @p timer by selecting and calibrating the best
- *        available source on the current CPU.
+ * @brief Selects the timer source for this CPU and calibrates it.
  *
- * @param[in]  env    Captured environment (used to gate rdtscp on the
- *                    `constant_tsc`/`nonstop_tsc` flags).
- * @param[out] timer  Caller-owned target; populated on return.
+ * @details Blocks for about 110 ms on rdtscp/cntvct (100 ms calibration plus a 10 ms
+ * cross-check) and aborts if the two calibrations disagree by more than 1 %. Aborts if
+ * `CLOCK_MONOTONIC_RAW` is unavailable. See chaos_bench_timer.c.
+ *
+ * @param[in]  env    Captured environment; on x86, rdtscp is chosen only if both
+ *                    `constant_tsc` and `nonstop_tsc` are set.
+ * @param[out] timer  Caller-owned; fully populated on return.
  */
 void chaos_bench_timer_init(
     const chaos_bench_env_t *env, chaos_bench_timer_t *timer
 );
 
 /**
- * @brief Reads the calibrated timer's current value, in cycles.
+ * @brief Reads the selected counter, in timer cycles (ns for the fallback).
  *
- * @details The function performs a *serializing* read so the compiler
- * and the CPU pipeline cannot reorder it past adjacent code.  Inlined
- * via the header definition to avoid call overhead in the timed loop.
+ * @details The read is serializing in hardware (`rdtscp`+`lfence`, `isb`-bracketed `mrs`) and
+ * carries a compiler memory clobber, so neither the CPU nor the compiler moves work across
+ * it. It is an out-of-line function in chaos_bench_timer.c that switches on
+ * `timer->source`; the call and branch are part of the measured `overhead_ns`.
  */
 uint64_t chaos_bench_timer_read(const chaos_bench_timer_t *timer);
 
 /**
- * @brief Converts a cycle delta to nanoseconds using the calibrated rate.
+ * @brief Converts a cycle delta to nanoseconds with the calibrated factor.
  */
 static inline double chaos_bench_timer_cycles_to_ns(
     const chaos_bench_timer_t *timer, uint64_t cycles
@@ -235,19 +248,19 @@ static inline double chaos_bench_timer_cycles_to_ns(
 }
 
 /**
- * @brief Internal: walks the registered descriptor list looking for @p name.
+ * @brief Looks up a registered descriptor by exact, case-sensitive name.
  *
- * @return The descriptor or NULL.
+ * @return The descriptor, or NULL if @p name is NULL or not registered.
  */
 chaos_bench_descriptor_t *chaos_bench_registry_find(const char *name);
 
 /**
- * @brief Internal: emits a JSON-encoded result envelope to @p out.
+ * @brief Writes the complete result envelope for one run to @p out as one JSON object.
  *
- * @details Self-contained: writes the full envelope as a single object
- * with provenance, environment, mode, scenario, statistics, and timer
- * metadata.  No allocation in the timed path; the caller's buffers are
- * expected to be already populated.
+ * @details Sections: `schema_version`, `benchmark`, `config`, `execution`, `timer`,
+ * `scenario`, `stats`, `pmu`, `environment` (schema in chaos_bench_json.c). Uses stdio and
+ * runs after the timed loop. Flushes @p out but does not close it. Write errors are not
+ * detected.
  */
 void chaos_bench_json_write_envelope(
     FILE                          *out,

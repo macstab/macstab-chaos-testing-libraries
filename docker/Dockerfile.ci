@@ -1,22 +1,21 @@
 # =============================================================================
 # docker/Dockerfile.ci — local CI gate image.
 #
-# Mirrors the toolchain used by .github/workflows/ci.yml (ubuntu-24.04) so
-# developers on macOS / Windows can run the full CI gate locally before
-# pushing.  Drives `make ci-local` and `make ci-local-shell`.
+# Same base (ubuntu:24.04) and toolchain as the jobs of .github/workflows/ci.yml, so that a
+# macOS or Windows host can run the CI correctness gate locally before pushing. Used by the
+# ci-local* targets of the Makefile, which bind-mount the repository at /work.
 #
-# This image is for the *correctness* gate only (fmt, unit, coverage,
-# sanitizers, scan-build, native integration test).  Benchmark numbers
-# from this container on a non-Linux host are NOT reliable: Apple Silicon
-# / Windows hosts run Linux through HVF/qemu, which exposes a virtual TSC
-# at ~24 MHz instead of the 1+ GHz invariant TSC of real x86_64.  Use the
-# bench.yml workflow on a real Linux runner for trustworthy numbers.
+# Covers fmt-check, unit, coverage, ASan, UBSan and scan-build. It does not run the runtime
+# suites. Not for benchmarks: on Apple Silicon or Windows hosts this container runs in a VM
+# (HVF/qemu) whose virtual counter ticks at ~24 MHz instead of a GHz-class invariant TSC, so
+# cycle-based timings are meaningless. Use the bench.yml workflow on a Linux runner.
 # =============================================================================
 
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# clang-format: fmt-check. clang-tools: scan-build. gcc: unit, coverage and sanitizer builds.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         gcc \

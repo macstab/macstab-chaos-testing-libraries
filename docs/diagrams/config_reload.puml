@@ -5,12 +5,14 @@
 '                Macstab GmbH · Hamburg, Germany
 '                https://macstab.com
 '
-' Two-snapshot CAS config reload protocol.
-' Shows the mtime state machine, CAS winner/loser paths,
-' and the spin-wait on MTIME_RELOADING.
+' Two-snapshot CAS reload of the rule file.
+' Shows the 1 ms throttle, the change-stamp state machine, the
+' CAS winner path and the loser path (no waiting: losers serve the
+' active snapshot).
 '
-' Reference: docs/MEMORY.md §16
-'            src/*/chaos_*_config.c  (all libraries use the same pattern)
+' Reference: docs/ARCHITECTURE.md "Config Reloading", docs/PLATFORM.md §12
+'            src/config/chaos_io_config.c and src/*/chaos_*_config.c
+'            (every library uses the same protocol)
 '
 title Two-Snapshot CAS Config Reload — Winner and Loser Threads
 
@@ -30,79 +32,84 @@ skinparam sequence {
 hide footbox
 
 participant "Thread A\n(reload winner)" as A
-participant "mtime_slot\n(volatile uint64)" as Slot
-participant "Config Store\n(two snapshots)" as Store
+participant "cached_mtime\n(volatile uint64)" as Slot
+participant "Snapshots\n(2 static buffers\n+ active index)" as Store
 participant "Thread B\n(concurrent caller)" as B
 
 note over Slot
   State encoding:
-  MISSING    = 0x0000…0000  (file absent)
-  UNKNOWN    = 0xffff…ffff  (initial sentinel)
-  RELOADING  = 0xffff…fffe  (reload in progress)
-  <timestamp>               (loaded + cached)
+  MISSING    = 0x0000…0000  (no file at the last look)
+  UNKNOWN    = 0xffff…ffff  (before the first load)
+  RELOADING  = 0xffff…fffe  (reload claimed)
+  <stamp>    = hash(mtime s+ns, size, inode, dev);
+               a hash equal to a sentinel is XORed
+               with 0x9e3779b97f4a7c15
 end note
 
-== Thread A: Reload Trigger ==
+== Every intercepted call: prepare() ==
 
-A -> Slot : __sync_synchronize(); load(mtime_slot)
-Slot --> A : old_mtime (e.g., UNKNOWN or stale timestamp)
-A -> A : stat(config_path) → new_mtime
+A -> Slot : atomic load
 note right of A
-  If new_mtime == old_mtime: done, no reload needed.
+  Throttle: skip the look if the last look was
+  < 1 ms ago (vDSO CLOCK_MONOTONIC, chaos_clock.h).
+  Never skipped while UNKNOWN or RELOADING;
+  always looks when no vDSO clock exists.
+  When not skipped, due hits are flushed first.
 end note
-
-A -> Slot : CAS(old_mtime, MTIME_RELOADING)
+A -> A : stat(rule file) → observed\n(under the guard; errno restored by prepare())
+A -> Slot : atomic load → cached
+note right of A
+  observed == cached, load not provisional
+  (and, io only, no link re-check due):
+  nothing to do, serve the active snapshot.
+end note
+A -> Slot : CAS(cached, RELOADING)
 note right of Slot
-  __sync_bool_compare_and_swap(
-    &mtime_slot, old_mtime, MTIME_RELOADING)
-  Returns true for exactly one winner thread.
+  __sync_bool_compare_and_swap:
+  exactly one thread wins. A loser
+  serves the active snapshot.
 end note
 
-== Concurrent Thread B encounters MTIME_RELOADING ==
+== Thread B meets the claim ==
 
-B -> Slot : load(mtime_slot) → MTIME_RELOADING
+B -> Slot : atomic load → RELOADING
+B -> Store : __sync_synchronize(); load active index
 note right of B
-  Spin: keep re-loading mtime_slot until
-  it is no longer MTIME_RELOADING.
-  (Reload window is < 15 µs for typical configs.)
+  No wait, no spin: B serves this call from
+  the snapshot that is still active. The
+  winner publishes shortly; B's next call
+  sees the new rules.
+end note
+B -> Store : copy rule; seqlock check of the copy
+note right of B
+  sequence read before and after the copy;
+  odd or changed → copy discarded,
+  the call passes through once
 end note
 
-loop while mtime_slot == MTIME_RELOADING
-  B -> Slot : load(mtime_slot)
-  Slot --> B : MTIME_RELOADING
+== Thread A: winner reloads ==
+
+A -> Store : inactive.sequence odd (write_begin), clear inactive
+A -> Store : open + read rule file into the static 256 KiB buffer\n(raw syscalls; libchaos-io: real open/read under the guard)
+A -> Store : fstat(fd): stamp still == observed?
+alt transient failure (open/read error other than EACCES/EPERM/EISDIR,\nfile changed during the read), or provisional re-read with identical content
+  A -> Slot : __sync_synchronize(); store previous stamp
+  note right of Slot
+    Active snapshot kept (with hit counts
+    and @first claims); claim released;
+    the next look retries.
+  end note
+else read complete (or file missing, or rejected as a whole)
+  A -> Store : parse into inactive (all or nothing),\nattach hit slots, write status file, release slots of rules that left
+  A -> Store : sequence even (write_end)
+  A -> Store : __sync_synchronize(); active index = inactive;\n__sync_synchronize()
+  A -> Slot : store observed stamp (claim released)
+  note right of Slot
+    Index before stamp: a thread that sees the
+    new stamp also sees the new index.
+    Nothing is allocated or freed: the old
+    snapshot becomes the next reload's target.
+  end note
 end
-
-Slot --> B : new_mtime (reload complete)
-B -> Store : read active_snapshot_index
-Store --> B : active_snapshot
-note right of B
-  Thread B now uses the freshly loaded config.
-end note
-
-== Thread A: Winner completes reload ==
-
-A -> Store : open+read config_path into INACTIVE snapshot
-A -> Store : parse rules into inactive snapshot buffer
-note right of Store
-  Inactive snapshot is written without a lock.
-  Thread B is spinning; it does not read inactive.
-  The active_snapshot_index still points to old snapshot.
-end note
-
-A -> Store : __sync_synchronize() (write barrier)
-A -> Store : swap active_snapshot_index
-A -> Store : __sync_synchronize() (read barrier for others)
-
-note right of Store
-  After the index swap, new callers see the new snapshot.
-  Old snapshot (now inactive) is not freed; it leaks
-  one struct per reload. Acceptable: reloads are rare,
-  process lifetime is bounded.
-end note
-
-A -> Slot : CAS(MTIME_RELOADING, new_mtime)
-note right of Slot
-  Releases the reload lock. Spinning threads unblock.
-end note
 
 @enduml

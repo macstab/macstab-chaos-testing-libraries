@@ -1,3 +1,13 @@
+# Full benchmark sweep on a GitHub-hosted Linux x86_64 runner: on demand (workflow_dispatch, with
+# run count and libc variant as inputs) and on every v* tag.
+#
+# Results are ADVISORY: hosted runners are shared VMs with CPU steal and no PMU isolation, so the
+# numbers support A/B comparison within one run (baseline vs preloaded, same machine) but not
+# absolute claims. Outputs, all under benchmark/reports/<short-sha>/: one JSON envelope per
+# benchmark cell and run, plus comparison.md from the A/B driver. They are uploaded for 90 days
+# and summarised on the run page.
+# Release tags without a leading v (the release.yml trigger) do not start this workflow;
+# release.yml runs its own four-variant sweep.
 name: bench
 
 on:
@@ -32,11 +42,15 @@ jobs:
         with:
           fetch-depth: 0
 
+      # perf_event_paranoid=1 lets the unprivileged harness open per-process hardware counters
+      # (cycles, instructions). At paranoid >= 3 perf_event_open fails with EACCES and the
+      # envelopes carry the refusal reason instead of PMU data.
       - name: Lower perf_event_paranoid for PMU access
         run: |
           echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid
           echo "perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid)"
 
+      # CPU model, flags and kernel in the log, so advisory numbers can be attributed later.
       - name: Capture host environment
         run: |
           echo "::group::lscpu"
@@ -49,6 +63,9 @@ jobs:
           uname -a
           echo "::endgroup::"
 
+      # run-bench.sh builds the kernels in a container of the chosen libc, runs every cell
+      # BENCH_RUNS times without and with LD_PRELOAD, then runs the A/B driver (--compare).
+      # A driver-reported regression exits 1 and fails this step; later steps still run.
       - name: Run full benchmark sweep
         env:
           BENCH_LIBC: ${{ inputs.libc || 'glibc' }}
@@ -96,6 +113,7 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Pinned hyperfine release, used only by the cross-validation step below.
       - name: Install hyperfine
         run: |
           HYPERFINE_VER=1.18.0
@@ -117,7 +135,8 @@ jobs:
           ITERS=100000
           CALIB_NS=100000000  # ~100ms calibration window
 
-          # Run 5 trials; hyperfine measures total wall time per invocation.
+          # Independent check of the harness timer: hyperfine measures whole-process wall time
+          # with its own clock, 5 runs after 2 warmups.
           hyperfine --runs 5 --warmup 2 \
             --export-json /tmp/hyperfine.json \
             "$BIN --benchmark=$BENCH --warmup=1000 --iters=$ITERS"
@@ -125,9 +144,10 @@ jobs:
           HF_MEAN_S=$(jq '.results[0].mean' /tmp/hyperfine.json)
           echo "Hyperfine mean wall time per invocation: ${HF_MEAN_S}s"
 
-          # Subtract calibration overhead and divide by iteration count to
-          # get an approximate per-operation time.  This is a broad sanity
-          # check — the calibration constant is ~100ms but may vary.
+          # Per-op estimate = (wall time - CALIB_NS) / ITERS. CALIB_NS approximates the harness
+          # start-up cost, dominated by its 100 ms timer calibration window (plus a 10 ms
+          # cross-check pass, process start and warmup, which this ignores). The result is only
+          # an order-of-magnitude check, hence the 10x tolerance below.
           HF_PER_OP_NS=$(awk "BEGIN {
             bench_ns = ($HF_MEAN_S * 1e9) - $CALIB_NS
             if (bench_ns < 1) bench_ns = 1
@@ -135,7 +155,9 @@ jobs:
           }")
           echo "Hyperfine estimated per-op: ${HF_PER_OP_NS} ns"
 
-          # Find the harness JSON for this benchmark.
+          # Harness envelopes are named <bench>.<mode>.<run>.json (for example
+          # clock_gettime_baseline.baseline.1.json), so this exact-name search finds nothing and
+          # the step ends in the warning branch: the ratio gate below does not run as written.
           GIT_SHA=$(git rev-parse --short HEAD)
           HARNESS_JSON=$(find benchmark/reports/$GIT_SHA -name "${BENCH}.json" 2>/dev/null | head -1)
 
@@ -143,7 +165,8 @@ jobs:
             HARNESS_MEDIAN=$(jq '.stats.median_ns' "$HARNESS_JSON")
             echo "Harness median: ${HARNESS_MEDIAN} ns/op"
 
-            # Ratio check: allow up to 10× difference given calibration noise.
+            # Fail when the two estimates differ by more than 10x in either direction: that
+            # indicates a mis-calibrated cycle counter rather than noise.
             RATIO=$(awk "BEGIN {
               r = $HF_PER_OP_NS / $HARNESS_MEDIAN
               if (r < 1) r = 1/r

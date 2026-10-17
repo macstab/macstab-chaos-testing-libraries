@@ -1,54 +1,39 @@
 /**
  * @file test_chaos_io_harness.h
- * @brief Full IO-domain wrapper harness: stubs, global state, and production source inclusion.
+ * @brief Wrapper-layer harness for libchaos-io: recording stubs for every dependency, symbol
+ *        overrides, and the production wrapper sources compiled in.
  *
- * Subsystem under test: chaos-io wrapper layer (chaos_io.c, chaos_io_open.c,
- *   chaos_io_rw.c, chaos_io_fsops.c, chaos_io_sync.c).
+ * @details Lets test_chaos_io.c drive each libchaos-io wrapper in-process and assert exactly
+ * what it did: which config/fd-cache/effect helpers it consulted, which real function it
+ * called with which arguments, and that the reentrancy guard was held (== 1) during that call.
  *
- * This header is intentionally structured as a combined header+implementation unit. It
- * must be included exactly once per test binary (inside `test_chaos_io.c`). Including it
- * a second time in the same link unit causes multiple-definition errors on the many static
- * globals declared here.
+ * This is a header in name only: it defines functions and static state, so include it exactly
+ * once per test binary (test_chaos_io.c); a second inclusion is a multiple-definition error.
  *
- * Architecture overview:
+ * Structure:
+ *   1. Recording state: a call counter, a configurable return value and captured arguments
+ *      for every stubbed dependency; the guard value seen inside each real-function stub.
+ *   2. Non-static stubs for the config, fd-cache and effect (actions) modules, satisfying the
+ *      wrappers' `extern` references so no production rule matching or PRNG runs.
+ *   3. Static stubs for the real functions (`chaos_test_real_*_impl`), reached through the
+ *      `g_chaos_io_real_*` pointers.
+ *   4. `#define` overrides of dlsym, dlerror, abort, syscall and CHAOS_IO_PROCESS_VM_READV,
+ *      then `#include` of chaos_io.c and the open, rw, fsops, sync and stdio wrapper sources
+ *      with CHAOS_IO_CONSTRUCTOR defined empty, so chaos_io_init() runs only when a test calls
+ *      it.
+ *   5. chaos_test_reset_state(): defaults for all recording state, run-once symbol state
+ *      reset, most real functions NULL; every test calls it first.
+ *   6. chaos_test_bind_real_functions(): points the real functions at the stubs.
+ *   7. chaos_test_bind_libc_functions_for_exit(): points them back at the C library before
+ *      main() returns, because the C runtime's exit path writes and closes through the
+ *      wrappers compiled into this binary.
  *
- *   1. Static global variables (roughly 100+) track every call into every stubbed
- *      dependency. Each intercepted function has at minimum a call counter and a
- *      configurable return value. Functions that receive pointer arguments also capture
- *      those arguments for post-call assertions.
+ * The stdio real functions always resolve to the C library (chaos_test_bind_real_stdio()),
+ * because the test binary's own printf/fputs/fflush go through the stdio wrappers.
  *
- *   2. Stub implementations of config, fdcache, and actions functions replace the
- *      production implementations. All stubs are non-static so they satisfy the `extern`
- *      declarations used by the production wrappers that are linked in below.
- *
- *   3. Symbol overrides (`#define dlsym`, `dlerror`, `abort`, `syscall`) intercept the
- *      dynamic resolution calls made by the production `chaos_io_init()` constructor.
- *      After the overrides, the five production source files are included directly.
- *
- *   4. `chaos_test_reset_state()` resets all ~100 globals to known-good defaults
- *      (call counters to 0, return values to their safe defaults, captured arguments
- *      cleared). Every test function must call this first to prevent cross-test
- *      contamination.
- *
- *   5. `chaos_test_bind_real_functions()` wires the `g_chaos_io_real_*` table to the
- *      stub implementations for tests that need the full wrapper call path.
- *
- *   6. `chaos_test_bind_libc_functions_for_exit()` replaces the stubs with real libc
- *      symbols via `dlsym(RTLD_NEXT, ...)` before process exit. This is necessary because
- *      the C runtime calls `write`, `close`, and other IO functions during shutdown and
- *      must not go through stubs that return zero.
- *
- * Coverage approach:
- * - Production source files are compiled directly into the test binary. This gives
- *   access to all `static` helpers without LD_PRELOAD.
- * - The LD_PRELOAD interposition path (dynamic linker symbol resolution) is NOT tested
- *   here. Its correctness is verified by the integration test suite that loads the real
- *   `.so` files into a target process.
- *
- * What is NOT tested by this harness:
- * - Concurrent access to the TLS guard from multiple threads.
- * - OS-level read/write semantics (partial transfers, signals, EINTR retry loops).
- * - Config hot-reload under real filesystem mtime changes.
+ * Not covered: dynamic-linker interposition (the runtime suites load the real .so), the
+ * reentrancy guard under concurrency, real partial transfers and EINTR, and reload on real
+ * rule-file changes.
  */
 
 #ifndef CHAOS_IO_TEST_HARNESS_H
@@ -60,19 +45,20 @@
 #include "../../src/config/chaos_io_config.h"
 #include "../../src/config/chaos_io_fdcache.h"
 
+#include <dirent.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <sys/syscall.h>
 
-/** @brief Maximum number of iovec lengths captured in a single stubbed vectored call. */
+/** @brief iovec lengths captured per stubbed vectored call; later segments are not recorded. */
 #define CHAOS_TEST_IOV_SNAPSHOT_COUNT 4
 
 /* -------------------------------------------------------------------------
  * Config subsystem stubs
  * --------------------------------------------------------------------- */
 
-/** @brief Number of times the config subsystem initializer was called. */
+/** @brief Calls of chaos_io_config_init(); the constructor makes exactly one. */
 static int g_config_init_calls = 0;
 /** @brief Number of times `chaos_io_config_prepare()` was called. */
 static int g_config_prepare_calls = 0;
@@ -88,8 +74,7 @@ static int g_config_match_loaded_result = 0;
 static int g_config_match_path_result = 0;
 /** @brief Rule written into the caller's output on a successful config match. */
 static chaos_io_rule_t g_config_rule;
-/** @brief Operation argument captured from the most recent `chaos_io_config_match_loaded()` call.
- */
+/** @brief Operation passed to the most recent chaos_io_config_match_loaded() call. */
 static chaos_io_operation_t g_last_match_loaded_operation = CHAOS_IO_OP_INVALID;
 /** @brief Operation argument captured from the most recent `chaos_io_config_match_path()` call. */
 static chaos_io_operation_t g_last_match_path_operation = CHAOS_IO_OP_INVALID;
@@ -129,6 +114,8 @@ static char g_last_store_path[CHAOS_IO_MAX_PATH];
 
 /** @brief Number of times `chaos_io_rule_apply_latency()` was called. */
 static int g_latency_calls = 0;
+/** @brief `call_size` of the rule copy the latency stub was last given. */
+static uint64_t g_last_call_size = 0U;
 /** @brief Number of times `chaos_io_rule_apply_errno()` was called. */
 static int g_rule_apply_errno_calls = 0;
 /** @brief Number of times `chaos_io_rule_should_trigger()` was called. */
@@ -147,13 +134,11 @@ static int g_corrupt_calls = 0;
 static size_t g_last_corrupt_size = 0U;
 /** @brief Number of times `chaos_io_corrupt_buffer_sample()` was called. */
 static int g_corrupt_sample_calls = 0;
-/** @brief `size` argument captured from the most recent `chaos_io_corrupt_buffer_sample()` call. */
+/** @brief `size` passed to the most recent chaos_io_corrupt_buffer_sample() call. */
 static size_t g_last_corrupt_sample_size = 0U;
-/** @brief `index_sample` argument captured from the most recent `chaos_io_corrupt_buffer_sample()`
- * call. */
+/** @brief `index_sample` passed to the most recent chaos_io_corrupt_buffer_sample() call. */
 static uint32_t g_last_corrupt_index_sample = 0U;
-/** @brief `bit_sample` argument captured from the most recent `chaos_io_corrupt_buffer_sample()`
- * call. */
+/** @brief `bit_sample` passed to the most recent chaos_io_corrupt_buffer_sample() call. */
 static uint32_t g_last_corrupt_bit_sample = 0U;
 
 /* -------------------------------------------------------------------------
@@ -169,12 +154,10 @@ static int g_real_open_flags = 0;
 /** @brief Non-zero if the `O_CREAT` path was taken and `mode` was extracted. */
 static int g_real_open_has_mode = 0;
 /**
- * @brief TLS guard value observed inside the stub open function.
+ * @brief Reentrancy guard value seen inside the open stub.
  *
- * The production wrapper sets `g_chaos_io_tls_guard = 1` before dispatching to the
- * real function and restores it to 0 on return. This field captures the guard value
- * as seen by the stub, which must equal 1 to prove the guard is held during the
- * real-function call.
+ * Wrappers set `g_chaos_io_tls_guard` to 1 around the real-function call so that any I/O the
+ * real function performs internally passes straight through. Tests assert this equals 1.
  */
 static int g_real_open_guard = 0;
 /** @brief `mode` argument captured from an `O_CREAT` open call. */
@@ -214,11 +197,11 @@ static int g_real_read_fd = -1;
 /** @brief `count` argument captured from the most recent stub read call. */
 static size_t g_real_read_count = 0U;
 /**
- * @brief Pattern written into the caller's buffer by the stub read function.
+ * @brief Bytes the read and readv stubs deliver into the caller's buffer.
  *
- * When `g_real_read_return > 0`, this array is `memcpy`'d into the buffer
- * supplied by the caller, allowing tests to verify that corrupt/torn effects are
- * applied to data that was actually "read".
+ * When the configured return is > 0, that many bytes are copied in, so CORRUPT and TORN
+ * effects applied afterwards operate on known data. Capacity 64 bytes: a larger configured
+ * read return over-reads this array.
  */
 static char g_real_read_fill[64];
 /** @brief Number of times the stub readv function was called. */
@@ -311,7 +294,7 @@ static unsigned int g_real_copy_file_range_flags = 0U;
 #endif
 
 /* -------------------------------------------------------------------------
- * Real-function stubs: close / fsync / fdatasync / ftruncate / unlinkat / renameat
+ * Real-function stubs: close / fsync / fdatasync / ftruncate / truncate / unlinkat / renameat
  * --------------------------------------------------------------------- */
 
 /** @brief Number of times the stub close function was called. */
@@ -322,6 +305,10 @@ static int g_real_close_return = 0;
 static int g_real_close_guard = 0;
 /** @brief `fd` argument captured from the most recent stub close call. */
 static int g_real_close_fd = -1;
+/** @brief Number of times the stub dup2 / dup3 / close_range functions were called. */
+static int g_real_dup_calls = 0;
+/** @brief Return value for the stub dup2 / dup3 / close_range functions. */
+static int g_real_dup_return = 0;
 
 /** @brief Number of times the stub fsync function was called. */
 static int g_real_fsync_calls = 0;
@@ -351,6 +338,32 @@ static int g_real_ftruncate_guard = 0;
 static int g_real_ftruncate_fd = -1;
 /** @brief `length` argument captured from the most recent stub ftruncate call. */
 static off_t g_real_ftruncate_length = 0;
+
+/** @brief Number of times the stub renameat2 function was called. */
+static int g_real_renameat2_calls = 0;
+/** @brief `flags` argument captured from the most recent stub renameat2 call. */
+static unsigned int g_real_renameat2_flags = 0U;
+/** @brief Number of times the stub posix_fallocate function was called. */
+static int g_real_posix_fallocate_calls = 0;
+/** @brief Return value (an error number) for the stub posix_fallocate function. */
+static int g_real_posix_fallocate_return = 0;
+
+/** @brief Number of times the stub truncate function was called. */
+static int g_real_truncate_calls = 0;
+/** @brief Return value for the stub truncate function. */
+static int g_real_truncate_return = 0;
+/** @brief TLS guard value observed inside the stub truncate function. */
+static int g_real_truncate_guard = 0;
+/** @brief `length` argument captured from the most recent stub truncate call. */
+static off_t g_real_truncate_length = 0;
+/** @brief Number of times the stub fopen function was called. */
+static int g_real_fopen_calls = 0;
+/** @brief Number of times the stub freopen function was called. */
+static int g_real_freopen_calls = 0;
+/** @brief Stream returned by the stub fopen and freopen functions. */
+static FILE *g_real_fopen_return = NULL;
+/** @brief Path passed to the most recent stub fopen or freopen call. */
+static const char *g_real_fopen_path = NULL;
 
 /** @brief Number of times the stub unlinkat function was called. */
 static int g_real_unlinkat_calls = 0;
@@ -453,44 +466,41 @@ static int g_sys_close_calls = 0;
 /** @brief Return value to emit for SYS_openat; -1 simulates a failed open. */
 static long g_sys_open_result = -1;
 /**
- * @brief Return value for SYS_read; also controls how many bytes are copied.
+ * @brief Return value of the SYS_read stub; when positive, also the number of seed bytes
+ *        copied out (capped at the caller's size).
  *
- * When positive, the stub copies exactly `g_sys_read_result` bytes from
- * `g_sys_seed_value` into the caller's buffer. Set to sizeof(uint64_t) to
- * simulate a successful seed read.
+ * sizeof(uint64_t) simulates a complete seed read.
  */
 static long g_sys_read_result = -1;
 /** @brief Return value for SYS_close; 0 is the normal success value. */
 static long g_sys_close_result = 0;
 /**
- * @brief Seed material value returned by the SYS_read stub.
+ * @brief Seed bytes the SYS_read stub delivers.
  *
- * The production `chaos_io_init()` reads 8 bytes from `/dev/urandom` via a raw
- * SYS_read syscall to seed the per-process PRNG. This field provides the seed
- * bytes that the stub delivers, allowing tests to assert on the exact seed value
- * stored by `chaos_io_init()`.
+ * chaos_io_init() reads 8 bytes from /dev/urandom with raw openat/read/close system calls
+ * (raw so no wrapper of this library runs during its own constructor). Tests set this value
+ * and assert that `g_chaos_io_process_seed` ends up derived from it.
  */
 static uint64_t g_sys_seed_value = 0U;
 
 /**
- * @brief Symbol name for which the `dlsym` stub returns NULL to exercise failure paths.
+ * @brief Symbol for which the dlsym stub fails (returns NULL, sets a dlerror message).
  *
- * Set to the name of a symbol that the production constructor will try to resolve.
- * The `dlsym` stub returns NULL and sets `g_dlerror_pending` for that symbol, triggering
- * the `abort()` path that the test catches via `setjmp`.
+ * Drives the constructor's unresolved-symbol path into abort(), which the abort stub turns
+ * into a longjmp back to the test.
  */
 static const char *g_dlsym_fail_symbol = NULL;
 /** @brief Pending error string to return from the `dlerror` stub; NULL means no error. */
 static const char *g_dlerror_pending = NULL;
 /**
- * @brief Non-zero when the test expects `abort()` to be called.
+ * @brief Non-zero when the test expects abort().
  *
- * When set, the `chaos_test_abort()` stub invokes `longjmp(g_abort_env, 1)`
- * instead of calling `exit(111)`. Tests that exercise fatal-error paths must
- * set this flag and protect the call site with `setjmp`.
+ * Set: the abort stub longjmp()s to `g_abort_env`, so the test must have called setjmp().
+ * Clear: the abort stub calls exit(111), a status distinct from a failed assert() (SIGABRT,
+ * shell status 134).
  */
 static int g_abort_expected = 0;
-/** @brief Set to 1 by the `abort` stub when it is triggered and `g_abort_expected == 1`. */
+/** @brief Set to 1 by the abort stub when it fires with `g_abort_expected` non-zero. */
 static int g_abort_called = 0;
 /** @brief Jump buffer used by the `abort` stub to transfer control back to the test. */
 static jmp_buf g_abort_env;
@@ -499,22 +509,18 @@ static jmp_buf g_abort_env;
  * Config subsystem stub implementations
  * --------------------------------------------------------------------- */
 
-/**
- * @brief Stub for `chaos_io_config_init()`.
- *
- * Increments the call counter so tests can assert the constructor called this
- * exactly once.
- */
+/** @brief Stub for chaos_io_config_init(): counts calls only. */
 void chaos_io_config_init(void)
 {
     ++g_config_init_calls;
 }
 
 /**
- * @brief Stub for `chaos_io_config_prepare()`.
+ * @brief Stub for chaos_io_config_prepare(): counts calls and returns
+ *        `g_config_prepare_result`.
  *
- * Returns `g_config_prepare_result`. Tests set this to 1 to simulate a
- * successful config load and to 0 to simulate a missing or unparseable file.
+ * Production returns non-zero when the active snapshot holds at least one rule; 0 models a
+ * missing, empty or rejected rule file, which makes every wrapper pass straight through.
  */
 int chaos_io_config_prepare(void)
 {
@@ -523,11 +529,9 @@ int chaos_io_config_prepare(void)
 }
 
 /**
- * @brief Stub for `chaos_io_config_match_loaded()`.
- *
- * Captures @p operation and @p path for post-call assertions. When
- * `g_config_match_loaded_result != 0`, copies `g_config_rule` into @p rule and
- * returns 1. Returns 0 otherwise.
+ * @brief Stub for chaos_io_config_match_loaded(): records @p operation and @p path, then
+ *        copies `g_config_rule` to @p rule and returns 1 when `g_config_match_loaded_result`
+ *        is non-zero and @p rule is not NULL; returns 0 otherwise.
  */
 int chaos_io_config_match_loaded(
     chaos_io_operation_t operation, const char *path, chaos_io_rule_t *rule
@@ -554,10 +558,9 @@ int chaos_io_config_match_loaded(
 }
 
 /**
- * @brief Stub for `chaos_io_config_match_path()`.
- *
- * Captures @p operation and @p path. When `g_config_match_path_result != 0`,
- * copies `g_config_rule` into @p rule and returns 1.
+ * @brief Stub for chaos_io_config_match_path(): records @p operation and @p path, then copies
+ *        `g_config_rule` to @p rule and returns 1 when `g_config_match_path_result` is
+ *        non-zero and @p rule is not NULL; returns 0 otherwise.
  */
 int chaos_io_config_match_path(
     chaos_io_operation_t operation, const char *path, chaos_io_rule_t *rule
@@ -588,10 +591,8 @@ int chaos_io_config_match_path(
  * --------------------------------------------------------------------- */
 
 /**
- * @brief Stub for `chaos_io_fdcache_reset()`.
- *
- * Increments the call counter. The production constructor calls this once to
- * invalidate any stale cache entries from a previous `dlopen` invocation.
+ * @brief Stub for chaos_io_fdcache_reset(): counts calls. The constructor calls it once to
+ *        drop fd-cache entries left by an earlier constructor run.
  */
 void chaos_io_fdcache_reset(void)
 {
@@ -599,11 +600,9 @@ void chaos_io_fdcache_reset(void)
 }
 
 /**
- * @brief Stub for `chaos_io_fdcache_resolve()`.
- *
- * Captures @p fd. When `g_fdcache_resolve_result != 0`, copies `g_resolved_path`
- * into @p path and returns 1. Returns 0 if `g_fdcache_resolve_result == 0` or
- * if @p path is NULL.
+ * @brief Stub for chaos_io_fdcache_resolve(): records @p fd; when `g_fdcache_resolve_result`
+ *        is non-zero and @p path is usable, copies `g_resolved_path` (which must fit,
+ *        asserted) and returns 1; returns 0 otherwise, modelling an fd with no known path.
  */
 int chaos_io_fdcache_resolve(int fd, char *path, size_t path_size)
 {
@@ -621,10 +620,9 @@ int chaos_io_fdcache_resolve(int fd, char *path, size_t path_size)
 }
 
 /**
- * @brief Stub for `chaos_io_fdcache_store()`.
- *
- * Captures @p fd and @p path for post-call assertions. The production wrappers
- * call this after a successful `open` or `openat` to populate the path cache.
+ * @brief Stub for chaos_io_fdcache_store(): records @p fd and @p path. Wrappers store the path
+ *        of a descriptor after a successful open/openat so later fd-based calls can match
+ *        path selectors.
  */
 void chaos_io_fdcache_store(int fd, const char *path)
 {
@@ -641,10 +639,9 @@ void chaos_io_fdcache_store(int fd, const char *path)
 }
 
 /**
- * @brief Stub for `chaos_io_fdcache_invalidate()`.
- *
- * Captures @p fd. The production wrappers call this after a successful `close`
- * or filesystem-mutation operation to remove stale cache entries.
+ * @brief Stub for chaos_io_fdcache_invalidate(): records @p fd. Wrappers invalidate a
+ *        descriptor's entry when it is closed or replaced, so a reused fd number cannot
+ *        inherit a stale path.
  */
 void chaos_io_fdcache_invalidate(int fd)
 {
@@ -657,23 +654,19 @@ void chaos_io_fdcache_invalidate(int fd)
  * --------------------------------------------------------------------- */
 
 /**
- * @brief Stub for `chaos_io_rule_apply_latency()`.
- *
- * Increments the call counter. The production wrappers call this when the
- * matched rule has effect LATENCY; this stub avoids actual sleeps in tests.
+ * @brief Stub for chaos_io_rule_apply_latency(): counts calls and records the rule's
+ *        `call_size` (the byte count the @size qualifier is matched against); never sleeps.
  */
 void chaos_io_rule_apply_latency(const chaos_io_rule_t *rule)
 {
     assert(rule != NULL);
     ++g_latency_calls;
+    g_last_call_size = rule != NULL ? rule->call_size : 0U;
 }
 
 /**
- * @brief Stub for `chaos_io_rule_should_trigger()`.
- *
- * Returns `g_rule_should_trigger_result`. Set to 1 in tests that want to
- * exercise the triggered path (errno/latency applied) and leave it 0 to
- * exercise the passthrough path.
+ * @brief Stub for chaos_io_rule_should_trigger(): counts calls and returns
+ *        `g_rule_should_trigger_result` (1 = the probability draw hits, 0 = pass through).
  */
 int chaos_io_rule_should_trigger(const chaos_io_rule_t *rule)
 {
@@ -683,10 +676,8 @@ int chaos_io_rule_should_trigger(const chaos_io_rule_t *rule)
 }
 
 /**
- * @brief Stub for `chaos_io_rule_apply_errno()`.
- *
- * When `g_rule_apply_errno_result != 0`, sets `errno` to `rule->errnum` and
- * returns 1, simulating a successful errno injection. Returns 0 otherwise.
+ * @brief Stub for chaos_io_rule_apply_errno(): when `g_rule_apply_errno_result` is non-zero,
+ *        sets errno to `rule->errnum`; returns `g_rule_apply_errno_result` either way.
  */
 int chaos_io_rule_apply_errno(const chaos_io_rule_t *rule)
 {
@@ -700,11 +691,9 @@ int chaos_io_rule_apply_errno(const chaos_io_rule_t *rule)
 }
 
 /**
- * @brief Stub for `chaos_io_torn_count()`.
- *
- * Captures @p requested and returns `g_torn_count_result`. A torn-count of 0
- * simulates the passthrough path; a non-zero value triggers the torn-read/write
- * logic in the wrappers.
+ * @brief Stub for chaos_io_torn_count(): records @p requested and returns
+ *        `g_torn_count_result`, the shortened transfer size a TORN rule passes to the real
+ *        function.
  */
 size_t chaos_io_torn_count(size_t requested)
 {
@@ -713,10 +702,8 @@ size_t chaos_io_torn_count(size_t requested)
 }
 
 /**
- * @brief Stub for `chaos_io_corrupt_buffer()`.
- *
- * Increments the call counter, captures @p size, and flips the low bit of the
- * first byte to produce a deterministic one-bit corruption observable in tests.
+ * @brief Stub for chaos_io_corrupt_buffer(): records @p size and flips bit 0 of byte 0, a
+ *        deterministic corruption tests can assert without the PRNG.
  */
 void chaos_io_corrupt_buffer(void *buffer, size_t size)
 {
@@ -731,11 +718,9 @@ void chaos_io_corrupt_buffer(void *buffer, size_t size)
 }
 
 /**
- * @brief Stub for `chaos_io_corrupt_buffer_sample()`.
- *
- * Captures all four arguments and performs the same index+bit-flip calculation
- * as the production implementation, so tests can verify that the production
- * wrapper passes the right samples to the corruption function.
+ * @brief Stub for chaos_io_corrupt_buffer_sample(): records all arguments and flips the same
+ *        bit production does (byte `index_sample % size`, bit `bit_sample & 7`), so tests see
+ *        both the samples the wrapper drew and their effect on the buffer.
  */
 void chaos_io_corrupt_buffer_sample(
     void *buffer, size_t size, uint32_t index_sample, uint32_t bit_sample
@@ -762,16 +747,15 @@ void chaos_io_corrupt_buffer_sample(
  * --------------------------------------------------------------------- */
 
 /**
- * @brief Capture iov lengths from up to CHAOS_TEST_IOV_SNAPSHOT_COUNT segments.
+ * @brief Records @p iovcnt and the lengths of the first CHAOS_TEST_IOV_SNAPSHOT_COUNT
+ *        segments; unused slots are zeroed.
  *
- * Used by stub readv/writev/preadv/pwritev to record the iov layout so tests
- * can assert that the wrapper correctly builds or trims the iovec array.
+ * Lets tests assert how a wrapper rebuilt or trimmed the iovec array (TORN on readv/writev).
  *
- * @param iov              Source iovec array (may be NULL).
- * @param iovcnt           Number of elements in @p iov.
- * @param captured_iovcnt  Output: receives the value of @p iovcnt.
- * @param captured_lengths Output: receives the first CHAOS_TEST_IOV_SNAPSHOT_COUNT
- *                         element lengths; extras are zeroed.
+ * @param iov               Source array; NULL or @p iovcnt <= 0 records no lengths.
+ * @param iovcnt            Element count as passed to the real function.
+ * @param captured_iovcnt   Receives @p iovcnt; must not be NULL.
+ * @param captured_lengths  Array of CHAOS_TEST_IOV_SNAPSHOT_COUNT entries; must not be NULL.
  */
 static void chaos_test_capture_iov_lengths(
     const struct iovec *iov, int iovcnt, int *captured_iovcnt, size_t *captured_lengths
@@ -798,15 +782,13 @@ static void chaos_test_capture_iov_lengths(
 }
 
 /**
- * @brief Fill iovec buffers from a pattern array, stopping at `fill_size` bytes.
+ * @brief Scatters the first @p fill_size bytes of @p fill across the iovec buffers in order,
+ *        as a vectored read would.
  *
- * Used by stub readv/preadv to simulate data delivery so that corrupt/torn
- * effects applied afterwards have actual bytes to operate on.
- *
- * @param iov       Iovec array whose buffers are to be filled.
- * @param iovcnt    Number of elements.
- * @param fill      Source pattern.
- * @param fill_size How many bytes from @p fill to distribute across the iovecs.
+ * @param iov        Destination segments; NULL is a no-op.
+ * @param iovcnt     Segment count; <= 0 is a no-op.
+ * @param fill       Source bytes; must hold at least @p fill_size bytes.
+ * @param fill_size  Bytes to deliver; stops early when the segments are full.
  */
 static void
 chaos_test_fill_iovecs(const struct iovec *iov, int iovcnt, const char *fill, size_t fill_size)
@@ -840,10 +822,8 @@ chaos_test_fill_iovecs(const struct iovec *iov, int iovcnt, const char *fill, si
  * --------------------------------------------------------------------- */
 
 /**
- * @brief Stub for the real `open` syscall wrapper.
- *
- * Records the call, captures path/flags/mode, and captures the TLS guard value.
- * Returns `g_real_open_return`.
+ * @brief Real-function stub for open: records path, flags, the mode (read only with O_CREAT,
+ *        as open(2) does) and the reentrancy guard; returns `g_real_open_return`.
  */
 static int chaos_test_real_open_impl(const char *path, int flags, ...)
 {
@@ -878,10 +858,9 @@ static int chaos_test_real_open_impl(const char *path, int flags, ...)
 }
 
 /**
- * @brief Stub for the real `openat` syscall wrapper.
- *
- * Records the call, captures dirfd/path/flags/mode, and captures the TLS guard.
- * Returns `g_real_openat_return`.
+ * @brief Real-function stub for openat: records dirfd, path, flags, the mode (read with
+ *        O_CREAT or O_TMPFILE, the two flags that carry one) and the reentrancy guard;
+ *        returns `g_real_openat_return`.
  */
 static int chaos_test_real_openat_impl(int dirfd, const char *path, int flags, ...)
 {
@@ -921,10 +900,8 @@ static int chaos_test_real_openat_impl(int dirfd, const char *path, int flags, .
 }
 
 /**
- * @brief Stub for the real `read` syscall wrapper.
- *
- * Fills the caller's buffer from `g_real_read_fill` when `g_real_read_return > 0`,
- * simulating data delivery for subsequent corruption/torn checks.
+ * @brief Real-function stub for read: records fd, count and guard; when the configured return
+ *        is > 0, copies that many bytes of `g_real_read_fill` into @p buffer.
  */
 static ssize_t chaos_test_real_read_impl(int fd, void *buffer, size_t count)
 {
@@ -942,9 +919,8 @@ static ssize_t chaos_test_real_read_impl(int fd, void *buffer, size_t count)
 }
 
 /**
- * @brief Stub for the real `readv` syscall wrapper.
- *
- * Fills the iov buffers from `g_real_read_fill` when `g_real_readv_return > 0`.
+ * @brief Real-function stub for readv: records fd, guard and iovec layout; when the configured
+ *        return is > 0, scatters that many bytes of `g_real_read_fill` into the segments.
  */
 static ssize_t chaos_test_real_readv_impl(int fd, const struct iovec *iov, int iovcnt)
 {
@@ -961,7 +937,7 @@ static ssize_t chaos_test_real_readv_impl(int fd, const struct iovec *iov, int i
     return g_real_readv_return;
 }
 
-/** @brief Stub for the real `write` syscall wrapper. Captures fd and count. */
+/** @brief Real-function stub for write: records fd, count and guard; data is discarded. */
 static ssize_t chaos_test_real_write_impl(int fd, const void *buffer, size_t count)
 {
     (void)buffer;
@@ -972,7 +948,7 @@ static ssize_t chaos_test_real_write_impl(int fd, const void *buffer, size_t cou
     return g_real_write_return;
 }
 
-/** @brief Stub for the real `writev` syscall wrapper. Captures fd and iov layout. */
+/** @brief Real-function stub for writev: records fd, guard and iovec layout. */
 static ssize_t chaos_test_real_writev_impl(int fd, const struct iovec *iov, int iovcnt)
 {
     ++g_real_writev_calls;
@@ -983,7 +959,7 @@ static ssize_t chaos_test_real_writev_impl(int fd, const struct iovec *iov, int 
 }
 
 #ifdef __linux__
-/** @brief Stub for the real `fallocate` syscall wrapper. Captures fd, mode, offset, length. */
+/** @brief Real-function stub for fallocate: records all arguments and the guard. */
 static int chaos_test_real_fallocate_impl(int fd, int mode, off_t offset, off_t length)
 {
     ++g_real_fallocate_calls;
@@ -995,7 +971,7 @@ static int chaos_test_real_fallocate_impl(int fd, int mode, off_t offset, off_t 
     return g_real_fallocate_return;
 }
 
-/** @brief Stub for the real `sendfile` syscall wrapper. Captures out_fd, in_fd, offset, count. */
+/** @brief Real-function stub for sendfile: records all arguments and the guard. */
 static ssize_t chaos_test_real_sendfile_impl(int out_fd, int in_fd, off_t *offset, size_t count)
 {
     ++g_real_sendfile_calls;
@@ -1007,7 +983,7 @@ static ssize_t chaos_test_real_sendfile_impl(int out_fd, int in_fd, off_t *offse
     return g_real_sendfile_return;
 }
 
-/** @brief Stub for the real `copy_file_range` syscall wrapper. Captures all arguments. */
+/** @brief Real-function stub for copy_file_range: records all arguments and the guard. */
 static ssize_t chaos_test_real_copy_file_range_impl(
     int in_fd, off_t *in_offset, int out_fd, off_t *out_offset, size_t count, unsigned int flags
 )
@@ -1024,7 +1000,7 @@ static ssize_t chaos_test_real_copy_file_range_impl(
 }
 #endif
 
-/** @brief Stub for the real `close` syscall wrapper. Captures fd and TLS guard. */
+/** @brief Real-function stub for close: records fd and guard. */
 static int chaos_test_real_close_impl(int fd)
 {
     ++g_real_close_calls;
@@ -1033,7 +1009,79 @@ static int chaos_test_real_close_impl(int fd)
     return g_real_close_return;
 }
 
-/** @brief Stub for the real `fsync` syscall wrapper. Captures fd and TLS guard. */
+/** @brief Real-function stub for dup2: counts into `g_real_dup_calls`, returns
+ * `g_real_dup_return`. */
+static int chaos_test_real_dup2_impl(int oldfd, int newfd)
+{
+    (void)oldfd;
+    (void)newfd;
+    ++g_real_dup_calls;
+    return g_real_dup_return;
+}
+
+/** @brief Calls of the closedir stub. */
+static int g_real_closedir_calls = 0;
+/** @brief Calls of the pclose stub. */
+static int g_real_pclose_calls = 0;
+/** @brief Calls of the closefrom stub. */
+static int g_real_closefrom_calls = 0;
+/** @brief `lowfd` the stub closefrom was last given. */
+static int g_real_closefrom_lowfd = -1;
+/** @brief Raw renameat2 system calls made through the syscall stub. */
+static int g_sys_renameat2_calls = 0;
+/** @brief Result the syscall stub returns for close_range (SYS_close_range, or 436 when the
+ * headers lack the constant). */
+static long g_sys_close_range_result = -1;
+
+/** @brief Real-function stub for closedir: counts calls, returns 0. */
+static int chaos_test_real_closedir_impl(DIR *directory)
+{
+    (void)directory;
+    ++g_real_closedir_calls;
+    return 0;
+}
+
+/** @brief Real-function stub for pclose: counts calls and returns 7, a distinctive exit status
+ * tests check is passed through. */
+static int chaos_test_real_pclose_impl(FILE *stream)
+{
+    (void)stream;
+    ++g_real_pclose_calls;
+    return 7;
+}
+
+/** @brief Real-function stub for closefrom: counts calls and records @p lowfd. */
+static void chaos_test_real_closefrom_impl(int lowfd)
+{
+    ++g_real_closefrom_calls;
+    g_real_closefrom_lowfd = lowfd;
+}
+
+/** @brief Real-function stub for close_range: counts into `g_real_dup_calls`, returns
+ * `g_real_dup_return`. */
+static int chaos_test_real_close_range_impl(unsigned int first, unsigned int last, int flags)
+{
+    (void)first;
+    (void)last;
+    (void)flags;
+    ++g_real_dup_calls;
+    return g_real_dup_return;
+}
+
+#ifdef __linux__
+/** @brief Real-function stub for dup3 (Linux): counts into `g_real_dup_calls`, returns
+ * `g_real_dup_return`. */
+static int chaos_test_real_dup3_impl(int oldfd, int newfd, int flags)
+{
+    (void)oldfd;
+    (void)newfd;
+    (void)flags;
+    ++g_real_dup_calls;
+    return g_real_dup_return;
+}
+#endif
+
+/** @brief Real-function stub for fsync: records fd and guard. */
 static int chaos_test_real_fsync_impl(int fd)
 {
     ++g_real_fsync_calls;
@@ -1042,7 +1090,7 @@ static int chaos_test_real_fsync_impl(int fd)
     return g_real_fsync_return;
 }
 
-/** @brief Stub for the real `fdatasync` syscall wrapper. Captures fd and TLS guard. */
+/** @brief Real-function stub for fdatasync: records fd and guard. */
 static int chaos_test_real_fdatasync_impl(int fd)
 {
     ++g_real_fdatasync_calls;
@@ -1051,7 +1099,7 @@ static int chaos_test_real_fdatasync_impl(int fd)
     return g_real_fdatasync_return;
 }
 
-/** @brief Stub for the real `ftruncate` syscall wrapper. Captures fd, length, TLS guard. */
+/** @brief Real-function stub for ftruncate: records fd, length and guard. */
 static int chaos_test_real_ftruncate_impl(int fd, off_t length)
 {
     ++g_real_ftruncate_calls;
@@ -1061,7 +1109,62 @@ static int chaos_test_real_ftruncate_impl(int fd, off_t length)
     return g_real_ftruncate_return;
 }
 
-/** @brief Stub for the real `unlinkat` syscall wrapper. Captures dirfd, path, flags. */
+/** @brief Real-function stub for renameat2: records flags, returns 0. */
+static int chaos_test_real_renameat2_impl(
+    int olddirfd, const char *oldpath, int newdirfd, const char *newpath, unsigned int flags
+)
+{
+    (void)olddirfd;
+    (void)oldpath;
+    (void)newdirfd;
+    (void)newpath;
+    ++g_real_renameat2_calls;
+    g_real_renameat2_flags = flags;
+    return 0;
+}
+
+/** @brief Real-function stub for fopen: records the path pointer, returns `g_real_fopen_return`. */
+static FILE *chaos_test_real_fopen_impl(const char *path, const char *mode)
+{
+    (void)mode;
+    ++g_real_fopen_calls;
+    g_real_fopen_path = path;
+    return g_real_fopen_return;
+}
+
+/** @brief Real-function stub for freopen: records the path pointer, returns
+ * `g_real_fopen_return`. */
+static FILE *chaos_test_real_freopen_impl(const char *path, const char *mode, FILE *stream)
+{
+    (void)mode;
+    (void)stream;
+    ++g_real_freopen_calls;
+    g_real_fopen_path = path;
+    return g_real_fopen_return;
+}
+
+/** @brief Real-function stub for posix_fallocate: returns `g_real_posix_fallocate_return`, an
+ * error number (posix_fallocate reports errors by return value, not errno). */
+static int chaos_test_real_posix_fallocate_impl(int fd, off_t offset, off_t length)
+{
+    (void)fd;
+    (void)offset;
+    (void)length;
+    ++g_real_posix_fallocate_calls;
+    return g_real_posix_fallocate_return;
+}
+
+/** @brief Real-function stub for truncate: records length and guard. */
+static int chaos_test_real_truncate_impl(const char *path, off_t length)
+{
+    (void)path;
+    ++g_real_truncate_calls;
+    g_real_truncate_length = length;
+    g_real_truncate_guard = g_chaos_io_tls_guard;
+    return g_real_truncate_return;
+}
+
+/** @brief Real-function stub for unlinkat: records dirfd, path, flags and guard. */
 static int chaos_test_real_unlinkat_impl(int dirfd, const char *path, int flags)
 {
     ++g_real_unlinkat_calls;
@@ -1079,7 +1182,7 @@ static int chaos_test_real_unlinkat_impl(int dirfd, const char *path, int flags)
     return g_real_unlinkat_return;
 }
 
-/** @brief Stub for the real `renameat` syscall wrapper. Captures all four path/dirfd arguments. */
+/** @brief Real-function stub for renameat: records both dirfds, both paths and the guard. */
 static int
 chaos_test_real_renameat_impl(int olddirfd, const char *oldpath, int newdirfd, const char *newpath)
 {
@@ -1107,9 +1210,8 @@ chaos_test_real_renameat_impl(int olddirfd, const char *oldpath, int newdirfd, c
 }
 
 /**
- * @brief Stub for the real `pread` syscall wrapper.
- *
- * Fills the caller's buffer from `g_real_pread_fill` when `g_real_pread_return > 0`.
+ * @brief Real-function stub for pread: records fd, count, offset and guard; when the
+ *        configured return is > 0, copies that many bytes of `g_real_pread_fill` (64 bytes).
  */
 static ssize_t chaos_test_real_pread_impl(int fd, void *buffer, size_t count, off_t offset)
 {
@@ -1127,8 +1229,8 @@ static ssize_t chaos_test_real_pread_impl(int fd, void *buffer, size_t count, of
     return g_real_pread_return;
 }
 
-/** @brief Stub for the real `preadv` syscall wrapper. Fills iov buffers from `g_real_pread_fill`.
- */
+/** @brief Real-function stub for preadv: records fd, offset, guard and iovec layout; scatters
+ * `g_real_pread_fill` when the configured return is > 0. */
 static ssize_t
 chaos_test_real_preadv_impl(int fd, const struct iovec *iov, int iovcnt, off_t offset)
 {
@@ -1146,7 +1248,7 @@ chaos_test_real_preadv_impl(int fd, const struct iovec *iov, int iovcnt, off_t o
     return g_real_preadv_return;
 }
 
-/** @brief Stub for the real `pwrite` syscall wrapper. Captures fd, count, and offset. */
+/** @brief Real-function stub for pwrite: records fd, count, offset and guard. */
 static ssize_t chaos_test_real_pwrite_impl(int fd, const void *buffer, size_t count, off_t offset)
 {
     (void)buffer;
@@ -1158,7 +1260,7 @@ static ssize_t chaos_test_real_pwrite_impl(int fd, const void *buffer, size_t co
     return g_real_pwrite_return;
 }
 
-/** @brief Stub for the real `pwritev` syscall wrapper. Captures fd, iov layout, and offset. */
+/** @brief Real-function stub for pwritev: records fd, offset, guard and iovec layout. */
 static ssize_t
 chaos_test_real_pwritev_impl(int fd, const struct iovec *iov, int iovcnt, off_t offset)
 {
@@ -1175,16 +1277,14 @@ chaos_test_real_pwritev_impl(int fd, const struct iovec *iov, int iovcnt, off_t 
  * --------------------------------------------------------------------- */
 
 /**
- * @brief Type-safe helper to convert a typed function pointer to `void *`.
+ * @brief Copies a function pointer's bytes into a `void *`.
  *
- * The production `dlsym` returns `void *` which callers then cast to a typed
- * function pointer. Direct casting between data and function pointers is
- * undefined behaviour in C99. This helper uses `memcpy` through a compound
- * literal to perform the conversion without violating strict aliasing.
+ * ISO C leaves function-pointer to object-pointer casts undefined; POSIX guarantees the
+ * representations match, so a byte copy is the portable way to build a dlsym() result.
  *
- * @param function_bytes  Address of a function-pointer-typed compound literal.
- * @param function_size   `sizeof` the function pointer type.
- * @return `void *` carrying the same bit pattern as the function pointer.
+ * @param function_bytes  Address of a function-pointer object; must not be NULL (asserted).
+ * @param function_size   Size of that object; must be <= sizeof(void *) (asserted).
+ * @return A `void *` with the same bit pattern as the function pointer.
  */
 static void *chaos_test_dlsym_pointer(const void *function_bytes, size_t function_size)
 {
@@ -1197,28 +1297,60 @@ static void *chaos_test_dlsym_pointer(const void *function_bytes, size_t functio
 }
 
 /**
- * @brief Macro to produce the `void *` result expected by the `dlsym` stub for a given stub
- * function.
+ * @brief Yields the `void *` the dlsym stub returns for @p function, e.g.
+ *        `CHAOS_TEST_DLSYM_RESULT(chaos_io_read_fn, chaos_test_real_read_impl)`.
  *
- * Usage: `CHAOS_TEST_DLSYM_RESULT(chaos_io_read_fn, chaos_test_real_read_impl)`
- * returns a `void *` that the production constructor will store in `g_chaos_io_real_read`.
- *
- * The compound literal `(type){function}` is valid C99 and has automatic storage
- * duration; the `memcpy` in `chaos_test_dlsym_pointer` copies the bits before the
- * literal goes out of scope.
+ * The compound literal `(type){function}` lives until the end of the enclosing block, which
+ * outlasts the memcpy() inside chaos_test_dlsym_pointer(). A @p function whose type does not
+ * match @p type draws a compiler diagnostic.
  */
 #define CHAOS_TEST_DLSYM_RESULT(type, function)                                                    \
     chaos_test_dlsym_pointer(&(type){function}, sizeof(type))
 
+/** @brief Returns 1 when @p symbol is one of the 15 stdio functions libchaos-io wraps. */
+static int chaos_test_is_stdio_symbol(const char *symbol)
+{
+    static const char *const names[] = {
+        "fread",
+        "fwrite",
+        "fgets",
+        "fputs",
+        "fgetc",
+        "getc",
+        "fputc",
+        "putc",
+
+        "getdelim",
+        "vfprintf",
+        "fflush",
+        "__vfprintf_chk",
+        "__fread_chk",
+        "__fgets_chk",
+        "fclose"
+    };
+    size_t index;
+
+    for (index = 0U; index < sizeof(names) / sizeof(names[0]); ++index)
+    {
+        if (strcmp(symbol, names[index]) == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /**
- * @brief Stub for `dlsym(RTLD_NEXT, symbol)` called by the production constructor.
+ * @brief Replacement for dlsym(RTLD_NEXT, symbol) inside the production sources.
  *
- * Maps each expected symbol name to the corresponding stub function using the
- * CHAOS_TEST_DLSYM_RESULT macro. If `g_dlsym_fail_symbol` equals @p symbol,
- * returns NULL and sets `g_dlerror_pending` to trigger the abort path.
+ * Returns the matching `chaos_test_real_*_impl` stub for each descriptor/path symbol and the
+ * genuine C library function for the stdio symbols. Returns NULL with a pending dlerror()
+ * message for `g_dlsym_fail_symbol` and for any unknown name, so a symbol added to
+ * production without a stub here fails loudly instead of resolving to garbage.
  *
- * An unexpected symbol also returns NULL with `g_dlerror_pending` set; this acts
- * as a test-authoring guard against typos in symbol names.
+ * @param handle  Ignored.
+ * @param symbol  Symbol name; must not be NULL.
+ * @return The stub, the real stdio function, or NULL.
  */
 static void *chaos_test_dlsym(void *handle, const char *symbol)
 {
@@ -1274,6 +1406,32 @@ static void *chaos_test_dlsym(void *handle, const char *symbol)
     {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_close_fn, chaos_test_real_close_impl);
     }
+    if (strcmp(symbol, "dup2") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_dup2_fn, chaos_test_real_dup2_impl);
+    }
+    if (strcmp(symbol, "closedir") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_closedir_fn, chaos_test_real_closedir_impl);
+    }
+    if (strcmp(symbol, "pclose") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_pclose_fn, chaos_test_real_pclose_impl);
+    }
+    if (strcmp(symbol, "closefrom") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_closefrom_fn, chaos_test_real_closefrom_impl);
+    }
+    if (strcmp(symbol, "close_range") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_close_range_fn, chaos_test_real_close_range_impl);
+    }
+#ifdef __linux__
+    if (strcmp(symbol, "dup3") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_dup3_fn, chaos_test_real_dup3_impl);
+    }
+#endif
     if (strcmp(symbol, "fsync") == 0)
     {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_sync_fn, chaos_test_real_fsync_impl);
@@ -1285,6 +1443,24 @@ static void *chaos_test_dlsym(void *handle, const char *symbol)
     if (strcmp(symbol, "ftruncate") == 0)
     {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_ftruncate_fn, chaos_test_real_ftruncate_impl);
+    }
+    if (strcmp(symbol, "posix_fallocate") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(
+            chaos_io_posix_fallocate_fn, chaos_test_real_posix_fallocate_impl
+        );
+    }
+    if (strcmp(symbol, "truncate") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_truncate_fn, chaos_test_real_truncate_impl);
+    }
+    if (strcmp(symbol, "fopen") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_fopen_fn, chaos_test_real_fopen_impl);
+    }
+    if (strcmp(symbol, "freopen") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_freopen_fn, chaos_test_real_freopen_impl);
     }
     if (strcmp(symbol, "unlinkat") == 0)
     {
@@ -1311,16 +1487,20 @@ static void *chaos_test_dlsym(void *handle, const char *symbol)
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_pwritev_fn, chaos_test_real_pwritev_impl);
     }
 
+    /* The test binary's own printf/fputs output runs through the stdio wrappers compiled
+     * in above, so stdio must resolve to the real C library, never to a stub. */
+    if (chaos_test_is_stdio_symbol(symbol))
+    {
+        return dlsym(RTLD_NEXT, symbol);
+    }
+
     g_dlerror_pending = "unexpected symbol";
     return NULL;
 }
 
 /**
- * @brief Stub for `dlerror()` called by the production constructor error path.
- *
- * Returns `g_dlerror_pending` and clears it (POSIX semantics: a second call
- * without an intervening error returns NULL). Used by the constructor to format
- * the abort message after a failed `dlsym` call.
+ * @brief Replacement for dlerror(): returns the pending message and clears it, so a second
+ *        call returns NULL, matching POSIX.
  */
 static char *chaos_test_dlerror(void)
 {
@@ -1330,15 +1510,11 @@ static char *chaos_test_dlerror(void)
 }
 
 /**
- * @brief Stub for `abort()` called when the production constructor cannot resolve a symbol.
+ * @brief Replacement for abort() inside the production sources.
  *
- * When `g_abort_expected != 0`, transfers control back to the nearest enclosing
- * `setjmp` frame via `longjmp(g_abort_env, 1)` after recording the call. This
- * allows the test to verify that the fatal-error path is reached without
- * actually terminating the process.
- *
- * When `g_abort_expected == 0` (an unexpected abort), calls `exit(111)` with a
- * distinctive status code to distinguish it from an assertion failure (exit code 134).
+ * With `g_abort_expected` set, records the call and longjmp()s to `g_abort_env`, so a test
+ * can prove the fatal path is reached and keep running. Otherwise exits with status 111,
+ * distinguishable from a failed assert() (SIGABRT, shell status 134). Never returns.
  */
 static void chaos_test_abort(void)
 {
@@ -1351,12 +1527,14 @@ static void chaos_test_abort(void)
 }
 
 /**
- * @brief Stub for `syscall()` called by the production constructor to read seed material.
+ * @brief Replacement for syscall() inside the production sources.
  *
- * Intercepts SYS_openat, SYS_read, and SYS_close. For SYS_read, copies
- * `g_sys_seed_value` bytes into the caller's buffer when `g_sys_read_result > 0`,
- * simulating a successful `/dev/urandom` read. This lets tests assert the exact
- * seed value stored by `chaos_io_init()`.
+ * - SYS_openat, SYS_read, SYS_close: the constructor's raw /dev/urandom seed read. Counted;
+ *   SYS_read copies up to `g_sys_read_result` bytes of `g_sys_seed_value` when positive.
+ * - SYS_renameat2: counted, returns 0.
+ * - SYS_close_range (436 where the headers lack the constant): returns
+ *   `g_sys_close_range_result`.
+ * - Anything else: returns -1 without setting errno.
  */
 static long chaos_test_syscall(long number, ...)
 {
@@ -1398,6 +1576,24 @@ static long chaos_test_syscall(long number, ...)
         ++g_sys_close_calls;
         result = g_sys_close_result;
     }
+#ifdef SYS_renameat2
+    else if (number == SYS_renameat2)
+    {
+        ++g_sys_renameat2_calls;
+        result = 0;
+    }
+#endif
+#ifdef SYS_close_range
+    else if (number == SYS_close_range)
+    {
+        result = g_sys_close_range_result;
+    }
+#else
+    else if (number == 436)
+    {
+        result = g_sys_close_range_result;
+    }
+#endif
     va_end(args);
 
     return result;
@@ -1406,12 +1602,37 @@ static long chaos_test_syscall(long number, ...)
 /* -------------------------------------------------------------------------
  * Production source inclusion
  *
- * Symbol overrides must be in scope before the source files are parsed.
- * CHAOS_IO_CONSTRUCTOR is defined to suppress the constructor attribute so
- * the init function can be called explicitly from tests instead of
- * automatically at library load time.
+ * Every override below must be in scope before the production sources are parsed.
+ * CHAOS_IO_CONSTRUCTOR is defined empty to drop the constructor attribute, so chaos_io_init()
+ * runs only when a test calls it.
  * --------------------------------------------------------------------- */
 
+/** @brief Calls of the checked iovec-array copy (process_vm_readv) by the vectored wrappers. */
+static int g_vm_readv_calls = 0;
+/** @brief errno the iovec-array copy fails with; 0 makes it succeed. */
+static int g_vm_readv_errno = 0;
+
+/**
+ * @brief Replacement for CHAOS_IO_PROCESS_VM_READV, the vectored wrappers' fault-safe copy of
+ *        the caller's iovec array.
+ *
+ * Copies @p remote into @p local and returns its length, or fails with -1 and errno
+ * `g_vm_readv_errno`: EFAULT models an unreadable array, ENOSYS/EPERM a kernel or seccomp
+ * policy without process_vm_readv.
+ */
+static long chaos_test_process_vm_readv(const struct iovec *local, const struct iovec *remote)
+{
+    ++g_vm_readv_calls;
+    if (g_vm_readv_errno != 0)
+    {
+        errno = g_vm_readv_errno;
+        return -1;
+    }
+    (void)memcpy(local->iov_base, remote->iov_base, remote->iov_len);
+    return (long)remote->iov_len;
+}
+
+#define CHAOS_IO_PROCESS_VM_READV(local, remote) chaos_test_process_vm_readv((local), (remote))
 #define dlsym chaos_test_dlsym
 #define dlerror chaos_test_dlerror
 #define abort chaos_test_abort
@@ -1422,6 +1643,7 @@ static long chaos_test_syscall(long number, ...)
 #include "../../src/wrappers/chaos_io_rw.c"
 #include "../../src/wrappers/chaos_io_fsops.c"
 #include "../../src/wrappers/chaos_io_sync.c"
+#include "../../src/wrappers/chaos_io_stdio.c"
 #undef CHAOS_IO_CONSTRUCTOR
 #undef syscall
 #undef abort
@@ -1433,19 +1655,116 @@ static long chaos_test_syscall(long number, ...)
  * --------------------------------------------------------------------- */
 
 /**
- * @brief Reset all harness globals to their default test-safe state.
+ * @brief Points the 15 stdio real functions at the C library via dlsym(RTLD_NEXT).
  *
- * Must be called at the start of every test function to prevent state leakage.
- * Resets all call counters to 0, all return values to safe defaults (fd
- * returns default to 10 so tests that need a valid fd do not need to configure
- * them explicitly), all captured arguments to their null/zero values, and all
- * `g_chaos_io_real_*` function pointers to NULL.
+ * @details The stdio wrappers are compiled into the test binary and therefore replace its own
+ * printf, fputs, fflush and friends; their real functions must always reach libc or test
+ * output recurses or vanishes. Stdio tests that swap in counting stubs call this afterwards.
+ */
+static void chaos_test_bind_real_stdio(void)
+{
+    {
+        void *resolved = dlsym(RTLD_NEXT, "fclose");
+
+        (void)memcpy(&g_chaos_io_real_fclose, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "fread");
+
+        (void)memcpy(&g_chaos_io_real_fread, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "fwrite");
+
+        (void)memcpy(&g_chaos_io_real_fwrite, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "fgets");
+
+        (void)memcpy(&g_chaos_io_real_fgets, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "fputs");
+
+        (void)memcpy(&g_chaos_io_real_fputs, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "fgetc");
+
+        (void)memcpy(&g_chaos_io_real_fgetc, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "getc");
+
+        (void)memcpy(&g_chaos_io_real_getc, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "fputc");
+
+        (void)memcpy(&g_chaos_io_real_fputc, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "putc");
+
+        (void)memcpy(&g_chaos_io_real_putc, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "getdelim");
+
+        (void)memcpy(&g_chaos_io_real_getdelim, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "vfprintf");
+
+        (void)memcpy(&g_chaos_io_real_vfprintf, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "fflush");
+
+        (void)memcpy(&g_chaos_io_real_fflush, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "__vfprintf_chk");
+
+        (void)memcpy(&g_chaos_io_real_vfprintf_chk, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "__fread_chk");
+
+        (void)memcpy(&g_chaos_io_real_fread_chk, &resolved, sizeof(resolved));
+    }
+    {
+        void *resolved = dlsym(RTLD_NEXT, "__fgets_chk");
+
+        (void)memcpy(&g_chaos_io_real_fgets_chk, &resolved, sizeof(resolved));
+    }
+}
+
+/**
+ * @brief Returns all harness state and the libchaos-io globals to test defaults.
  *
- * The `g_sys_seed_value` default is `0x0123456789abcdef` so tests that exercise
- * the seed read path get a deterministic non-zero seed without extra setup.
+ * Call first in every test. Effects:
+ * - Call counters 0; captured fds -1; captured paths and fill buffers empty.
+ * - Stub returns 0, except open/openat (10, a plausible descriptor) and SYS_read/SYS_openat/
+ *   close_range (-1, failing).
+ * - `g_sys_seed_value` = 0x0123456789abcdef, a known non-zero seed.
+ * - `g_chaos_io_symbols_once` back to CHAOS_ONCE_INIT, so chaos_io_ensure_symbols() resolves
+ *   again and its lazy path is testable.
+ * - The descriptor/path real functions NULL (dup2, dup3, close_range, closedir, pclose and
+ *   closefrom are not reset); the stdio ones bound to libc via chaos_test_bind_real_stdio().
+ * - Reentrancy guard and PRNG state 0; `g_chaos_io_process_seed` 0 (unseeded, unlike
+ *   chaos_test_reset_runtime(), which sets 1).
  */
 static void chaos_test_reset_state(void)
 {
+    g_real_closedir_calls = 0;
+    g_real_pclose_calls = 0;
+    g_real_closefrom_calls = 0;
+    g_real_closefrom_lowfd = -1;
+    g_sys_close_range_result = -1;
+    g_sys_renameat2_calls = 0;
+    g_vm_readv_calls = 0;
+    g_vm_readv_errno = 0;
     (void)memset(&g_config_rule, 0, sizeof(g_config_rule));
     g_config_init_calls = 0;
     g_config_prepare_calls = 0;
@@ -1554,6 +1873,8 @@ static void chaos_test_reset_state(void)
     g_real_close_calls = 0;
     g_real_close_return = 0;
     g_real_close_guard = 0;
+    g_real_dup_calls = 0;
+    g_real_dup_return = 0;
     g_real_close_fd = -1;
 
     g_real_fsync_calls = 0;
@@ -1571,6 +1892,20 @@ static void chaos_test_reset_state(void)
     g_real_ftruncate_guard = 0;
     g_real_ftruncate_fd = -1;
     g_real_ftruncate_length = 0;
+
+    g_real_renameat2_calls = 0;
+    g_real_renameat2_flags = 0U;
+    g_real_posix_fallocate_calls = 0;
+    g_real_posix_fallocate_return = 0;
+
+    g_real_truncate_calls = 0;
+    g_real_truncate_return = 0;
+    g_real_truncate_guard = 0;
+    g_real_truncate_length = 0;
+    g_real_fopen_calls = 0;
+    g_real_freopen_calls = 0;
+    g_real_fopen_return = NULL;
+    g_real_fopen_path = NULL;
 
     g_real_unlinkat_calls = 0;
     g_real_unlinkat_return = 0;
@@ -1632,8 +1967,7 @@ static void chaos_test_reset_state(void)
      * pre-constructor state.  Without this a test cannot exercise the lazy
      * resolution path in chaos_io_ensure_symbols(). */
     {
-        pthread_once_t fresh_once = PTHREAD_ONCE_INIT;
-        g_chaos_io_symbols_once = fresh_once;
+        g_chaos_io_symbols_once = CHAOS_ONCE_INIT;
     }
     g_chaos_io_real_read = NULL;
     g_chaos_io_real_write = NULL;
@@ -1650,6 +1984,11 @@ static void chaos_test_reset_state(void)
     g_chaos_io_real_pwritev = NULL;
     g_chaos_io_real_ftruncate = NULL;
     g_chaos_io_real_unlinkat = NULL;
+    g_chaos_io_real_truncate = NULL;
+    g_chaos_io_real_fopen = NULL;
+    g_chaos_io_real_freopen = NULL;
+    g_chaos_io_real_renameat2 = NULL;
+    g_chaos_io_real_posix_fallocate = NULL;
     g_chaos_io_real_renameat = NULL;
 #ifdef __linux__
     g_chaos_io_real_fallocate = NULL;
@@ -1659,16 +1998,14 @@ static void chaos_test_reset_state(void)
     g_chaos_io_tls_guard = 0;
     g_chaos_io_tls_prng_state = 0U;
     g_chaos_io_process_seed = 0U;
+    chaos_test_bind_real_stdio();
 }
 
 /**
- * @brief Wire the `g_chaos_io_real_*` table to the stub implementations.
+ * @brief Points every real function at its `chaos_test_real_*_impl` stub (stdio stays libc).
  *
- * After calling this function, invoking a production wrapper (e.g. `read()`)
- * calls through the chaos interception layer and eventually reaches the
- * corresponding `chaos_test_real_*_impl` stub. Use this in tests that need
- * to verify the full wrapper call path including guard state and argument
- * capture, without performing actual system calls.
+ * A wrapper called afterwards runs its full path, guard handling included, and ends in a stub
+ * that records the call instead of entering the kernel.
  */
 static void chaos_test_bind_real_functions(void)
 {
@@ -1679,6 +2016,14 @@ static void chaos_test_bind_real_functions(void)
     g_chaos_io_real_open = chaos_test_real_open_impl;
     g_chaos_io_real_openat = chaos_test_real_openat_impl;
     g_chaos_io_real_close = chaos_test_real_close_impl;
+    g_chaos_io_real_dup2 = chaos_test_real_dup2_impl;
+    g_chaos_io_real_close_range = chaos_test_real_close_range_impl;
+    g_chaos_io_real_closedir = chaos_test_real_closedir_impl;
+    g_chaos_io_real_pclose = chaos_test_real_pclose_impl;
+    g_chaos_io_real_closefrom = chaos_test_real_closefrom_impl;
+#ifdef __linux__
+    g_chaos_io_real_dup3 = chaos_test_real_dup3_impl;
+#endif
     g_chaos_io_real_fsync = chaos_test_real_fsync_impl;
     g_chaos_io_real_fdatasync = chaos_test_real_fdatasync_impl;
     g_chaos_io_real_pread = chaos_test_real_pread_impl;
@@ -1687,27 +2032,28 @@ static void chaos_test_bind_real_functions(void)
     g_chaos_io_real_pwritev = chaos_test_real_pwritev_impl;
     g_chaos_io_real_ftruncate = chaos_test_real_ftruncate_impl;
     g_chaos_io_real_unlinkat = chaos_test_real_unlinkat_impl;
+    g_chaos_io_real_truncate = chaos_test_real_truncate_impl;
+    g_chaos_io_real_fopen = chaos_test_real_fopen_impl;
+    g_chaos_io_real_freopen = chaos_test_real_freopen_impl;
+    g_chaos_io_real_renameat2 = chaos_test_real_renameat2_impl;
+    g_chaos_io_real_posix_fallocate = chaos_test_real_posix_fallocate_impl;
     g_chaos_io_real_renameat = chaos_test_real_renameat_impl;
 #ifdef __linux__
     g_chaos_io_real_fallocate = chaos_test_real_fallocate_impl;
     g_chaos_io_real_sendfile = chaos_test_real_sendfile_impl;
     g_chaos_io_real_copy_file_range = chaos_test_real_copy_file_range_impl;
 #endif
+    chaos_test_bind_real_stdio();
 }
 
 /**
- * @brief Replace all stub function pointers with real libc symbols for safe process exit.
+ * @brief Points the real functions back at the C library before the test binary exits.
  *
- * The C runtime calls `write`, `close`, and other IO functions during `exit()`.
- * If `g_chaos_io_real_*` still points to the stubs at exit time, those calls
- * will return 0 (or whatever the stub return value is), potentially causing
- * stdout/stderr flush failures and corrupted output.
- *
- * This function resolves the real libc symbols via `dlsym(RTLD_NEXT, ...)` and
- * stores them in the function-pointer globals. It also resets the config/fdcache
- * match results to 0 so no chaos effects are applied to shutdown IO.
- *
- * Call this as the last statement in `main()` before returning.
+ * exit() flushes and closes streams through write/close, which in this binary are libchaos-io
+ * wrappers; left on the stubs, buffered output would be discarded. Resolves each real
+ * function with dlsym(RTLD_NEXT) (asserting it exists; renameat2 may be NULL on libcs without
+ * it) and zeroes the config, fd-cache and effect stub results so no rule applies to shutdown
+ * I/O. test_chaos_io.c calls it at the end of main().
  */
 static void chaos_test_bind_libc_functions_for_exit(void)
 {
@@ -1753,6 +2099,25 @@ static void chaos_test_bind_libc_functions_for_exit(void)
     assert(resolved != NULL);
     (void)memcpy(&g_chaos_io_real_ftruncate, &resolved, sizeof(resolved));
 
+    resolved = dlsym(RTLD_NEXT, "posix_fallocate");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_posix_fallocate, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "renameat2");
+    (void)memcpy(&g_chaos_io_real_renameat2, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "truncate");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_truncate, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "fopen");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_fopen, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "freopen");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_freopen, &resolved, sizeof(resolved));
+
     resolved = dlsym(RTLD_NEXT, "unlinkat");
     assert(resolved != NULL);
     (void)memcpy(&g_chaos_io_real_unlinkat, &resolved, sizeof(resolved));
@@ -1760,6 +2125,10 @@ static void chaos_test_bind_libc_functions_for_exit(void)
     resolved = dlsym(RTLD_NEXT, "renameat");
     assert(resolved != NULL);
     (void)memcpy(&g_chaos_io_real_renameat, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "dup2");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_dup2, &resolved, sizeof(resolved));
 
     resolved = dlsym(RTLD_NEXT, "pread");
     assert(resolved != NULL);
@@ -1796,6 +2165,7 @@ static void chaos_test_bind_libc_functions_for_exit(void)
     g_fdcache_resolve_result = 0;
     g_rule_apply_errno_result = 0;
     g_rule_should_trigger_result = 0;
+    chaos_test_bind_real_stdio();
 }
 
 #endif

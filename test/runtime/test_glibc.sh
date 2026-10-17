@@ -1,17 +1,36 @@
 #!/bin/sh
 #
-# test_glibc.sh — libchaos-io runtime validation on glibc (Docker).
+# test_glibc.sh: libchaos-io end-to-end in LD_PRELOAD mode on glibc (Debian bookworm), one
+# architecture per run (Docker).
 #
-# Builds libchaos-io.so for the target platform using Docker buildx with a
-# glibc (debian:bookworm) base, compiles an inline C probe that exercises
-# every interposed IO symbol with ERRNO, TORN, CORRUPT, and LATENCY effects,
-# then runs the probe in a minimal glibc container with LD_PRELOAD set.
-# Validates that all fault effects fire correctly on glibc amd64 and arm64.
+# Proves, with the cross-built glibc library, that the descriptor and path wrappers fault real files
+# with the ERRNO, CORRUPT, TORN and LATENCY effects:
 #
-# Usage:   test_glibc.sh [linux/amd64|linux/arm64]
-#          Defaults to the host architecture when no argument is given.
-# Env:     CHAOS_IO_DOCKER_PLATFORM  platform override (e.g. linux/arm64)
-# Prereqs: docker with buildx and multi-arch support (linux/amd64, linux/arm64)
+# - write:EIO fails write; open:EIO fails openat; write:EIO fails writev, sendfile and
+#   copy_file_range on the target; pwrite:EIO fails pwritev; truncate, allocate, unlink and
+#   rename_from:EIO fail ftruncate, fallocate, unlinkat and renameat; each with errno EIO;
+# - read:CORRUPT and pread:CORRUPT alter what readv and preadv return, which are intact
+#   without the rule;
+# - write:TORN and pwrite:TORN shorten write, writev, pwritev, sendfile and copy_file_range
+#   to 1..n-1 bytes;
+# - LATENCY:200 delays fsync, ftruncate, fallocate, unlinkat and renameat (rename_to) by
+#   >= 150 ms.
+#
+# Method: docker buildx builds libchaos-io-glibc-<arch>.so (make cross-glibc-<arch>) on
+# gcc:bookworm. An inline C probe is compiled in a gcc:bookworm stage and copied with the library
+# into a debian:bookworm-slim image (built with --load, removed on exit), where it runs under
+# LD_PRELOAD. Each rule is written with an explicit future mtime (now + n s) so every rewrite
+# changes the reload change stamp.
+#
+# Usage:   test_glibc.sh [linux/amd64|linux/arm64]   (default: the host architecture)
+# Env:     CHAOS_IO_DOCKER_PLATFORM  platform when no argument is given
+#          CHAOS_SKIP_EXIT  exit status of a skip (default 0; CI sets 1)
+# Prereqs: docker with buildx; QEMU binfmt for a foreign platform. Run by `make test` and,
+#          once per platform, by `make test-matrix`.
+# Exit:    0 when every check passes; the probe's step number (1-61, in main() order) at
+#          the first failing check; non-zero when the build fails or yields no library;
+#          2 on bad usage; CHAOS_SKIP_EXIT when the host or platform is not amd64/arm64,
+#          docker is missing or its daemon is unreachable.
 
 set -eu
 
@@ -24,7 +43,8 @@ if [ "$#" -gt 1 ]; then
     exit 2
 fi
 
-# Allow an explicit Docker target so glibc checks do not silently track the host arch.
+# An explicit platform (argument or CHAOS_IO_DOCKER_PLATFORM) lets one host test both
+# architectures; without one the host architecture is used.
 DOCKER_PLATFORM=${1:-${CHAOS_IO_DOCKER_PLATFORM:-}}
 if [ -z "$DOCKER_PLATFORM" ]; then
     case "$(uname -m)" in
@@ -36,7 +56,7 @@ if [ -z "$DOCKER_PLATFORM" ]; then
             ;;
         *)
             echo "glibc test skipped: unsupported host architecture $(uname -m)" >&2
-            exit 0
+            exit "${CHAOS_SKIP_EXIT:-0}"
             ;;
     esac
 fi
@@ -54,7 +74,7 @@ case "$DOCKER_PLATFORM" in
         ;;
     *)
         echo "glibc test skipped: unsupported docker platform $DOCKER_PLATFORM" >&2
-        exit 0
+        exit "${CHAOS_SKIP_EXIT:-0}"
         ;;
 esac
 
@@ -67,12 +87,12 @@ trap cleanup EXIT INT TERM
 
 if ! command -v docker >/dev/null 2>&1; then
     echo "glibc test skipped: docker not available" >&2
-    exit 0
+    exit "${CHAOS_SKIP_EXIT:-0}"
 fi
 
 if ! docker version >/dev/null 2>&1; then
     echo "glibc test skipped: docker daemon not accessible" >&2
-    exit 0
+    exit "${CHAOS_SKIP_EXIT:-0}"
 fi
 
 docker buildx build \
@@ -135,6 +155,8 @@ static int write_config(const char *line, time_t stamp)
         return 34;
     }
 
+    /* The library looks at the rule file at most every millisecond. */
+    usleep(2000);
     return 0;
 }
 

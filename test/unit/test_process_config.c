@@ -1,42 +1,47 @@
 /**
  * @file test_process_config.c
- * @brief Unit tests for PROCESS-domain config parsing, rule selection, and reload state machine.
+ * @brief Proves the libchaos-process rule file pipeline: parse, select, reload, report.
  *
- * Subsystem under test: `src/process/chaos_process_config.c`
+ * @details
+ * Unit under test: `src/process/chaos_process_config.c`. The suite proves:
+ * - the rule grammar `selector:effect:value[@probability] [qualifiers] [# comment]` for the
+ *   ERRNO, LATENCY and FAIL_AFTER effects, including every numeric limit and each rejection
+ *   reason recorded for the status file;
+ * - rule selection: a named operation beats `*`, then the longer selector wins, regardless of
+ *   rule order;
+ * - the reload protocol: the change stamp (mtime, size, inode, device), the single reload
+ *   claim, the two-snapshot publish, keeping the active rules on a failed read, rejecting a
+ *   file that changed while it was read, re-reading a racily-clean (just written) file, and
+ *   the 1 ms check throttle;
+ * - the status file and hits file contents, and the fork() child reset;
+ * - errno preservation across a reload.
  *
- * Coverage approach:
- * - Production source is included directly after replacing `open`, `read`, `close`, and
- *   `chaos_process_atomic_cas_u64` with test-controlled stubs. This exercises the full
- *   config pipeline (file I/O, parse, CAS-protected mtime tracking) without LD_PRELOAD.
- * - A local `write_config_text()` helper uses `futimens` to set deterministic mtime stamps,
- *   ensuring each successive config write triggers a reload.
- * - The existing config file at `CHAOS_PROCESS_CONFIG_PATH` is backed up and restored so
- *   tests do not leave side effects on the host filesystem.
+ * Isolation:
+ * - `CHAOS_CONFIG_FILE_OPEN/READ/CLOSE` are predefined to libc `open`/`read`/`close`, which are
+ *   then renamed by macro to stubs, so open and read failures (EINTR, EACCES, EPERM, EMFILE,
+ *   EIO) are injected without touching the file system. `stat`/`fstat` stay real.
+ * - `chaos_process_atomic_cas_u64` is renamed to a stub that can lose every CAS.
+ * - Everything else is real: the tests write the real rule file
+ *   (`/tmp/.chaos-process.conf`) and read the real status and hits files. Tests that write it
+ *   back up and restore any existing rule file.
+ * - `write_config_text()` sets the mtime to a fixed second near the epoch: each write gets a
+ *   distinct stamp even within one clock tick, and the stamp is far outside the racily-clean
+ *   window, so the load is final unless a test wants otherwise.
+ * - `main()` sets the check interval to 0 so every `prepare()` looks at the file; only the
+ *   throttle test restores a non-zero interval.
  *
- * Properties under test:
- * - Primitive helpers: `is_blank_char`, `config_reset_state`, `trim`, `strip_comment`,
- *   `parse_errno_name` (symbolic, numeric "42", NULL, "bad"), `parse_probability`,
- *   `parse_latency`, `parse_fail_after_count`, `copy_text_value`,
- *   `parse_payload_probability` (bare / `value@p` / missing payload / out-of-range p),
- *   `parse_fail_after_value` (ERRNO,count format, missing comma, bad errno),
- *   `selector_parse` (7 operation names + "*", NULL, "", "bogus"),
- *   `split_rule_fields` (valid / NULL / missing-effect / one-colon),
- *   `selector_matches` (* matches any, name matches exact, non-matching name),
- *   mtime hash sentinels (`MTIME_MISSING`, `MTIME_UNKNOWN`, `MTIME_RELOADING`).
- * - Line and buffer parsing: ERRNO / LATENCY / FAIL_AFTER effects; 10 invalid-line categories;
- *   buffer with blank+comment lines; no-newline EOF; NULL guards.
- * - Rule selection: operation-specific rule beats ANY wildcard; `selector_len` tie-break;
- *   FAIL_AFTER and LATENCY effects resolved by operation.
- * - Prepare-and-match state machine: no-file → prepare fails; valid file loads; same mtime
- *   → prepare returns true without reload; new mtime → reloads; bad rule → prepare fails;
- *   oversized file → read_file fails; open/read/CAS failures all return false.
- * - Buffer limit: `CHAOS_PROCESS_MAX_RULES + 1` rules → parse_buffer returns negative.
- *
- * What is NOT tested here:
- * - Action helpers (probability, latency, errno, fail_after): tested in test_process_actions.c.
- * - Wrapper call paths: tested in test_chaos_process.c.
+ * The tests share the library's static state; each one that depends on it starts with
+ * `chaos_process_config_init()`.
  */
+/* Production reads the rule file with raw system calls; routing it through libc names lets the
+ * macros below swap in the fault-injecting stubs. */
+#define CHAOS_CONFIG_FILE_OPEN(path) open((path), O_RDONLY)
+#define CHAOS_CONFIG_FILE_READ(fd, buffer, size) read((fd), (buffer), (size))
+#define CHAOS_CONFIG_FILE_CLOSE(fd) (void)close(fd)
 
+/* Widens the racily-clean window from 20 ms to 5 s: test_racy_rewrite_is_seen() restores the
+ * mtime of a write made earlier and needs it still "recent" on a slow or loaded machine. */
+#define CHAOS_RACY_WINDOW_MS 5000
 #include "../support/test_process_support.h"
 
 #include <errno.h>
@@ -47,38 +52,48 @@
 
 CHAOS_PROCESS_DEFINE_TEST_GLOBALS();
 
-/** @brief When non-zero, the open stub returns ENOENT rather than delegating to the real open. */
+/** @brief Non-zero makes every open fail with ENOENT (file gone since the stat). */
 static int g_test_config_force_open_fail = 0;
-/**
- * @brief When non-zero, the open stub returns `g_test_config_fake_fd` for every call;
- *   subsequent reads on that fd return EIO.
- */
+/** @brief Non-zero makes open return `g_test_config_fake_fd`, whose reads fail with EIO. */
 static int g_test_config_force_read_fail = 0;
-/** @brief When non-zero, the CAS stub always returns 0 (failure), blocking config reload. */
+
+/** @brief Upcoming reads that fail with EINTR, as an interrupting signal would make them. */
+static int g_test_config_read_eintr = 0;
+
+/** @brief Upcoming opens that fail with EINTR, as an interrupting signal would make them. */
+static int g_test_config_open_eintr = 0;
+
+/** @brief Non-zero makes every open fail with this errno (EACCES, EPERM, EMFILE). */
+static int g_test_config_open_errno = 0;
+/** @brief Non-zero makes every CAS fail, as if another thread claimed the reload first. */
 static int g_test_config_force_cas_fail = 0;
 /**
- * @brief Sentinel file descriptor returned by the open stub when `g_test_config_force_read_fail`
- *   is set. Its value is deliberately outside normal fd ranges to avoid aliasing.
+ * @brief Fake descriptor for the read-failure path; high enough not to alias a real open fd.
  */
 static const int g_test_config_fake_fd = 9312;
 
 /**
- * @brief Stub for `open(2)` / `open(2)` with O_CREAT.
+ * @brief Replaces `open(2)` for the production source; injects failures, else calls real open.
  *
- * Behaviour depends on fault-injection flags:
- * - `g_test_config_force_open_fail`: returns -1 with errno=ENOENT.
- * - `g_test_config_force_read_fail`: returns `g_test_config_fake_fd` for any flags
- *   (the subsequent read stub will inject EIO on that fd).
- * - O_CREAT: extracts mode from va_args and delegates to the real `open`.
- * - Otherwise: delegates to the real `open` without mode.
+ * Checks in order: pending EINTR, `g_test_config_open_errno`, forced ENOENT, then the fake fd
+ * for the read-failure path. The variadic mode is forwarded for O_CREAT so the stub keeps
+ * open's full signature.
  *
- * @param path   Filesystem path.
- * @param flags  Open flags.
- * @param ...    Optional mode_t argument when flags include O_CREAT.
- * @return Opened file descriptor, `g_test_config_fake_fd`, or -1 on injected failure.
+ * @return A real fd, `g_test_config_fake_fd`, or -1 with errno set.
  */
 static int chaos_process_test_config_open(const char *path, int flags, ...)
 {
+    if (g_test_config_open_eintr > 0)
+    {
+        --g_test_config_open_eintr;
+        errno = EINTR;
+        return -1;
+    }
+    if (g_test_config_open_errno != 0)
+    {
+        errno = g_test_config_open_errno;
+        return -1;
+    }
     if (g_test_config_force_open_fail != 0)
     {
         errno = ENOENT;
@@ -104,18 +119,16 @@ static int chaos_process_test_config_open(const char *path, int flags, ...)
 }
 
 /**
- * @brief Stub for `read(2)`.
- *
- * When `g_test_config_force_read_fail` is set and @p fd equals `g_test_config_fake_fd`,
- * returns -1 with errno=EIO without consuming any bytes. Otherwise delegates to the real read.
- *
- * @param fd      File descriptor.
- * @param buffer  Destination buffer.
- * @param count   Maximum bytes to read.
- * @return Bytes read, or -1 with errno=EIO on injected failure.
+ * @brief Replaces `read(2)`: pending EINTR first, EIO on the fake fd, else the real read.
  */
 static ssize_t chaos_process_test_config_read(int fd, void *buffer, size_t count)
 {
+    if (g_test_config_read_eintr > 0)
+    {
+        --g_test_config_read_eintr;
+        errno = EINTR;
+        return -1;
+    }
     if (g_test_config_force_read_fail != 0 && fd == g_test_config_fake_fd)
     {
         (void)buffer;
@@ -127,14 +140,7 @@ static ssize_t chaos_process_test_config_read(int fd, void *buffer, size_t count
 }
 
 /**
- * @brief Stub for `close(2)`.
- *
- * When `g_test_config_force_read_fail` is set and @p fd equals `g_test_config_fake_fd`,
- * returns 0 without calling the real close (the fake fd is not a real kernel fd).
- * Otherwise delegates to the real close.
- *
- * @param fd  File descriptor to close.
- * @return 0 on success (always, for the fake fd).
+ * @brief Replaces `close(2)`: the fake fd is not a kernel fd, so it is not passed to close.
  */
 static int chaos_process_test_config_close(int fd)
 {
@@ -146,18 +152,10 @@ static int chaos_process_test_config_close(int fd)
 }
 
 /**
- * @brief Stub for `chaos_process_atomic_cas_u64`.
+ * @brief Replaces the reload-claim CAS; under `g_test_config_force_cas_fail` it always loses.
  *
- * When `g_test_config_force_cas_fail` is non-zero, returns 0 (CAS failure) without touching
- * @p value. This exercises the code path where a concurrent reload wins the race, causing the
- * current prepare call to skip the update and return false.
- *
- * Otherwise delegates to the real `__sync_bool_compare_and_swap`.
- *
- * @param value     Pointer to the target 64-bit word.
- * @param expected  Value required for the swap to succeed.
- * @param desired   Value to write on success.
- * @return 1 if the swap succeeded, 0 if injected or if the current value differs from expected.
+ * A lost CAS means another thread claimed the reload, so the caller must use the active
+ * snapshot unchanged. Otherwise it performs the real `__sync_bool_compare_and_swap`.
  */
 static int
 chaos_process_test_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint64_t desired)
@@ -180,30 +178,26 @@ chaos_process_test_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, u
 #undef open
 
 /**
- * @brief Heap snapshot of a config file for safe backup and restore.
+ * @brief Copy of a rule file taken before a test overwrites it, restored afterwards.
  *
- * Used by `test_prepare_and_match` to preserve and restore the caller's config file so the
- * test does not corrupt the host filesystem state.
+ * The rule file path is fixed and shared with any libchaos-process run on the host, so tests
+ * that write it put back what was there.
  */
 typedef struct chaos_process_test_file_backup
 {
-    /** @brief Non-zero if the file existed at backup time. */
+    /** @brief Non-zero if the file existed; zero makes the restore delete it. */
     int existed;
-    /** @brief Heap-allocated copy of the file contents; NULL when `existed == 0`. */
+    /** @brief Heap copy of the contents; NULL when the file did not exist or was empty. */
     char *data;
-    /** @brief Number of bytes in `data`. */
+    /** @brief Bytes in `data`. */
     size_t size;
 } chaos_process_test_file_backup_t;
 
 /**
- * @brief Read @p path into a heap snapshot stored in @p backup.
+ * @brief Copies @p path into @p backup, or records that it does not exist.
  *
- * If the file does not exist, sets `backup->existed = 0` and returns. Uses
- * `fread` in 256-byte chunks with `realloc` growth so it handles files of any size
- * without needing an `fstat` first.
- *
- * @param path    Path to back up.
- * @param backup  Output struct to populate; must be zero-initialised by caller.
+ * Reads in 256-byte chunks, so files of any size are copied without an `fstat` first.
+ * @p backup is fully overwritten; it need not be initialised.
  */
 static void backup_file(const char *path, chaos_process_test_file_backup_t *backup)
 {
@@ -240,15 +234,7 @@ static void backup_file(const char *path, chaos_process_test_file_backup_t *back
     fclose(file);
 }
 
-/**
- * @brief Restore a file from a heap snapshot previously created by `backup_file`.
- *
- * If `backup->existed == 0`, the file at @p path is removed. Otherwise it is
- * rewritten verbatim from `backup->data`.
- *
- * @param path    Filesystem path to restore.
- * @param backup  Snapshot to write (must come from `backup_file`).
- */
+/** @brief Rewrites @p path from @p backup verbatim, or deletes it if it did not exist. */
 static void restore_file(const char *path, const chaos_process_test_file_backup_t *backup)
 {
     FILE *file;
@@ -265,13 +251,7 @@ static void restore_file(const char *path, const chaos_process_test_file_backup_
     assert(fclose(file) == 0);
 }
 
-/**
- * @brief Free heap memory held by a backup snapshot.
- *
- * Sets all fields back to zero/NULL so the struct is safe to discard.
- *
- * @param backup  Snapshot to release.
- */
+/** @brief Frees the copy held by @p backup and zeroes it. */
 static void free_backup(chaos_process_test_file_backup_t *backup)
 {
     free(backup->data);
@@ -281,14 +261,11 @@ static void free_backup(chaos_process_test_file_backup_t *backup)
 }
 
 /**
- * @brief Write @p text to `CHAOS_PROCESS_CONFIG_PATH` with a deterministic mtime.
+ * @brief Writes @p text as the rule file and sets its atime and mtime to @p stamp seconds.
  *
- * Uses `futimens` on the open file descriptor before closing so that successive calls
- * with distinct @p stamp values produce distinct mtime hashes, reliably triggering a
- * reload regardless of the wall-clock resolution on the test host.
- *
- * @param text   NUL-terminated config text to write.
- * @param stamp  Seconds value used for both atime and mtime.
+ * Distinct stamps give distinct change stamps even when two writes fall into one file system
+ * clock tick and keep the same size. Small stamps (1970) lie outside the racily-clean window,
+ * so the next load is final, not provisional.
  */
 static void write_config_text(const char *text, time_t stamp)
 {
@@ -307,33 +284,16 @@ static void write_config_text(const char *text, time_t stamp)
 }
 
 /**
- * @brief Invariant: all primitive config helpers accept valid input and reject invalid input.
+ * @brief Proves each leaf parser accepts its valid forms and rejects NULL, empty and bad input.
  *
- * Triggering conditions: direct calls to every leaf parsing helper with valid, boundary,
- *   and invalid arguments.
+ * Covers trimming (blanks include CR/LF), `#` comment stripping, all 14 errno names plus a
+ * decimal errno, probability in [0, 1], latency and FAIL_AFTER count digits, bounded value
+ * copies, `value[@p]` splitting (bare value leaves the probability as is), `ERRNO,count`,
+ * the 7 selector names plus `*`, three-field splitting, and selector matching.
  *
- * Expected observable behaviour:
- * - `is_blank_char(' '/'\\t')` → true; `is_blank_char('x')` → false.
- * - `config_reset_state(NULL, 1)` does not crash; `reset_state(&state, 0)` zeroes
- *   `rule_count` and `parse_ok` even when the struct was memset to 0xff.
- * - `trim` strips leading and trailing whitespace including \\r\\n; NULL input → NULL.
- * - `strip_comment` truncates at '#'; NULL input is a no-op.
- * - `parse_errno_name`: all 14 symbolic names return correct values; numeric "42" → 42;
- *   NULL → -1; "bad" → -1.
- * - `parse_probability`/`parse_latency`/`parse_fail_after_count`: NULL pointer args → error;
- *   valid strings → 0 return and correct output; out-of-range value → error.
- * - `copy_text_value`: NULL/empty/zero-size → error; valid → 0 and copy.
- * - `parse_payload_probability`: NULL → error; bare value → copies as-is with probability
- *   unchanged; "value@p" → extracts each part; empty payload → error; p > 1.0 → error.
- * - `parse_fail_after_value("EAGAIN,5", ...)` → errnum=EAGAIN, count=5; NULL/no-comma/
- *   empty-errno/bad-errno → error.
- * - `selector_parse`: 7 operation names, "*", and "" / NULL / "bogus" → correct true/false.
- * - `split_rule_fields`: valid three-field text → fills all three pointers; NULL line /
- *   one-colon / missing second colon → false.
- * - `selector_matches`: NULL → false; "*" matches any operation; named selector matches
- *   exact operation and rejects others.
- * - `config_hash_mtime(NULL)` → MTIME_MISSING; sentinel normalization never returns
- *   MTIME_UNKNOWN or MTIME_RELOADING; `hash_mtime(&zero_stat)` → non-zero.
+ * The change-stamp checks matter for reload: a missing file hashes to MTIME_MISSING, and the
+ * normaliser moves a hash off the MTIME_UNKNOWN and MTIME_RELOADING sentinels, so a real file
+ * can never be mistaken for "not loaded yet" or "reload in progress".
  */
 static void test_helper_functions(void)
 {
@@ -504,25 +464,17 @@ static void test_helper_functions(void)
 }
 
 /**
- * @brief Invariant: line and buffer parsers accept valid rules and reject invalid forms.
+ * @brief Proves the line parser fills a rule per effect and the buffer parser is all-or-nothing.
  *
- * Triggering condition: `chaos_process_config_parse_line()` and
- *   `chaos_process_config_parse_buffer()` with representative valid and invalid inputs.
+ * Valid lines for each effect set selector, effect, payload and probability; a comment line
+ * yields no rule (0). Ten malformed lines (structure, selector, effect, errno, latency,
+ * missing count, probability > 1 for each effect) are rejected. A FAIL_AFTER count must be
+ * plain digits that fit 64 bits: `-1` and `+1` are rejected because strtoull would turn -1
+ * into UINT64_MAX (a rule that never fires), and 2^64 because it would wrap; UINT64_MAX itself
+ * is accepted. Rejection must not change errno.
  *
- * Expected observable behaviour:
- * - Comment line → returns 0 (skipped, no rule output).
- * - `*:ERRNO:EAGAIN@0.5` → selector_kind=ANY, effect=ERRNO, errnum=EAGAIN, probability=0.5.
- * - `fork:LATENCY:25` → operation=FORK, effect=LATENCY, latency_ms=25.
- * - `pthread_create:FAIL_AFTER:EAGAIN,2@0.5` → operation=PTHREAD_CREATE, effect=FAIL_AFTER,
- *   errnum=EAGAIN, fail_after_count=2, probability=0.5.
- * - 10 invalid-line forms all return negative: bad selector, empty selector, unknown selector,
- *   unknown effect, bad errno, out-of-range probability (ERRNO and LATENCY and FAIL_AFTER),
- *   bad latency, FAIL_AFTER without comma.
- * - 4-rule buffer with newline → rule_count=4.
- * - No-newline EOF: single rule parsed correctly.
- * - Buffer with blank line and comment: blank+comment skipped, one rule emitted.
- * - Buffer with a bad line: returns negative.
- * - NULL guards for both line and buffer parsers all return negative.
+ * Buffers: 4 rules parse; a last line without newline counts; blank and comment lines are
+ * skipped; one bad line fails the whole buffer, so a half-applied rule file cannot happen.
  */
 static void test_parse_line_and_buffer(void)
 {
@@ -601,6 +553,28 @@ static void test_parse_line_and_buffer(void)
         char invalid_line[] = "fork:FAIL_AFTER:EAGAIN,1@2.0";
         assert(chaos_process_config_parse_line(invalid_line, &rule) < 0);
     }
+    {
+        static const char *const counts[] = {
+            "fork:FAIL_AFTER:EAGAIN,-1",
+            "fork:FAIL_AFTER:EAGAIN,+1",
+            "fork:FAIL_AFTER:EAGAIN,x",
+            "fork:FAIL_AFTER:EAGAIN,18446744073709551616",
+        };
+        char largest[] = "fork:FAIL_AFTER:EAGAIN, 18446744073709551615";
+        size_t index;
+
+        for (index = 0U; index < sizeof(counts) / sizeof(counts[0]); ++index)
+        {
+            char line[64];
+
+            (void)strcpy(line, counts[index]);
+            errno = 1234;
+            assert(chaos_process_config_parse_line(line, &rule) < 0);
+            assert(errno == 1234);
+        }
+        assert(chaos_process_config_parse_line(largest, &rule) == 1);
+        assert(rule.fail_after_count == UINT64_MAX);
+    }
 
     assert(chaos_process_config_parse_buffer(buffer, rules, &rule_count) == 0);
     assert(rule_count == 4U);
@@ -630,20 +604,13 @@ static void test_parse_line_and_buffer(void)
 }
 
 /**
- * @brief Invariant: rule selection prefers operation-specific rules over wildcard ANY,
- *   and resolves ties by `selector_len`.
+ * @brief Proves rule selection picks the most specific matching rule, independent of order.
  *
- * Triggering condition: `chaos_process_config_select_rule()` against a 5-rule set
- *   containing one ANY rule and four operation-specific rules.
- *
- * Expected observable behaviour:
- * - `pthread_create` with ERRNO effect → returns ENOMEM (operation-specific wins over ANY EAGAIN).
- * - `posix_spawn` with ERRNO effect → falls back to ANY rule, returns EAGAIN.
- * - `fork` with LATENCY effect → returns latency_ms=10 (direct match).
- * - `execve` with FAIL_AFTER effect → returns fail_after_count=2.
- * - NULL rules pointer or NULL output rule → returns false.
- * - Tie-break: two rules for `waitpid` with selector_len 7 and 8 → the rule with
- *   selector_len=8 wins, returning ECHILD.
+ * Selection is per (effect, operation). A named operation (pthread_create → ENOMEM) beats `*`
+ * (EAGAIN); an operation with no named rule falls back to `*` (posix_spawn → EAGAIN). Among
+ * equal ranks the longer `selector_len` wins whether listed first or second, and a later `*`
+ * does not displace an earlier named rule. Order independence lets users append rules without
+ * re-sorting the file.
  */
 static void test_rule_selection(void)
 {
@@ -656,6 +623,7 @@ static void test_rule_selection(void)
     char fork_line[] = "fork:LATENCY:10";
     char exec_line[] = "execve:FAIL_AFTER:EACCES,2";
     char wait_line[] = "waitpid:ERRNO:EINTR";
+    char late_any_line[] = "*:ERRNO:EAGAIN";
 
     assert(chaos_process_config_parse_line(any_line, &rules[0]) == 1);
     assert(chaos_process_config_parse_line(thread_line, &rules[1]) == 1);
@@ -701,28 +669,34 @@ static void test_rule_selection(void)
         tie_rules, 2U, CHAOS_PROCESS_EFFECT_ERRNO, CHAOS_PROCESS_OP_WAITPID, &rule
     ));
     assert(rule.errnum == ECHILD);
+
+    tie_rules[1] = tie_rules[0];
+    tie_rules[0].selector.selector_len = 8U;
+    tie_rules[0].errnum = ECHILD;
+    tie_rules[1].selector.selector_len = 7U;
+    tie_rules[1].errnum = EINTR;
+    assert(chaos_process_config_select_rule(
+        tie_rules, 2U, CHAOS_PROCESS_EFFECT_ERRNO, CHAOS_PROCESS_OP_WAITPID, &rule
+    ));
+    assert(rule.errnum == ECHILD);
+
+    assert(chaos_process_config_parse_line(late_any_line, &tie_rules[1]) == 1);
+    assert(chaos_process_config_select_rule(
+        tie_rules, 2U, CHAOS_PROCESS_EFFECT_ERRNO, CHAOS_PROCESS_OP_WAITPID, &rule
+    ));
+    assert(rule.errnum == ECHILD);
 }
 
 /**
- * @brief Invariant: the prepare/match pipeline handles all file-system and state-machine paths.
+ * @brief Proves the load/match lifecycle from no file through valid, changed and broken files.
  *
- * Triggering condition: `chaos_process_config_prepare()` and `chaos_process_config_match()`
- *   called under various file conditions with fault flags set and cleared between calls.
- *
- * Expected observable behaviour:
- * - No config file → `prepare` returns false; `match` returns false.
- * - `match(..., NULL)` → false (NULL output guard).
- * - Valid ERRNO rule for `fork:ERRNO:EAGAIN` → `prepare` true; `match` true; errnum=EAGAIN.
- * - `match_loaded` (bypass prepare) returns same result.
- * - Second `prepare` with same mtime → returns true without reload.
- * - New mtime with FAIL_AFTER rule → `match` updates and returns fail_after_count=1.
- * - Bad rule → `prepare` returns false; `match_loaded` returns false.
- * - File exceeding `CHAOS_PROCESS_MAX_CONFIG_BYTES` → `read_file` returns negative.
- * - `read_file(NULL)` → returns negative.
- * - Open failure → `prepare` returns false.
- * - Read failure (EIO) → `prepare` returns false.
- * - CAS failure → `prepare` returns false (concurrent-reload simulation).
- * - Config file is restored to its original contents at test end.
+ * - No rule file: prepare and match report no rules.
+ * - A valid file loads; match and match_loaded find the rule; an unchanged file keeps it.
+ * - A new stamp is picked up by match itself (it calls prepare), with the new rule.
+ * - A bad rule replaces the rule set with an empty one (fail closed to "no faults").
+ * - A file of CHAOS_PROCESS_MAX_CONFIG_BYTES or more is refused by read_file.
+ * - Open failure, EIO on read and a lost reload CAS each leave the active rule set in place;
+ *   that set is the empty one from the bad rule, hence false.
  */
 static void test_prepare_and_match(void)
 {
@@ -768,9 +742,9 @@ static void test_prepare_and_match(void)
         (void)memset(large_config, 'a', sizeof(large_config) - 1U);
         large_config[sizeof(large_config) - 1U] = '\0';
         write_config_text(large_config, 14);
-        assert(chaos_process_config_read_file(&size) < 0);
+        assert(chaos_process_config_read_file(&size, chaos_process_config_observed_mtime()) < 0);
     }
-    assert(chaos_process_config_read_file(NULL) < 0);
+    assert(chaos_process_config_read_file(NULL, chaos_process_config_observed_mtime()) < 0);
 
     write_config_text("waitpid:ERRNO:EINTR\n", 15);
     g_test_config_force_open_fail = 1;
@@ -792,13 +766,10 @@ static void test_prepare_and_match(void)
 }
 
 /**
- * @brief Invariant: rule buffer parser rejects input that exceeds `CHAOS_PROCESS_MAX_RULES`.
+ * @brief Proves CHAOS_PROCESS_MAX_RULES + 1 (257) valid rules fail the buffer, not overflow.
  *
- * Triggering condition: a dynamically allocated buffer containing exactly
- *   `CHAOS_PROCESS_MAX_RULES + 1` valid rule lines.
- *
- * Expected observable behaviour: `chaos_process_config_parse_buffer()` returns a negative
- *   value before the rules array would overflow.
+ * The output array has room for one extra rule, so an off-by-one in the limit check would
+ * write it instead of failing.
  */
 static void test_parse_buffer_limit(void)
 {
@@ -819,12 +790,764 @@ static void test_parse_buffer_limit(void)
     free(buffer);
 }
 
+/**
+ * @brief Proves a caller that finds a reload in progress uses the active snapshot.
+ *
+ * The cached stamp is set to RELOADING, as while another thread owns the reload. A CAS from
+ * RELOADING to RELOADING would succeed, so without an explicit check this caller would reload
+ * into the same inactive snapshot through the same shared read buffer as the owner. The
+ * claim and the active index must be untouched afterwards.
+ */
+static void test_reload_in_progress_is_not_joined(void)
+{
+    unsigned int active_index;
+
+    chaos_process_config_init();
+    active_index = g_chaos_process_active_config_index;
+    g_chaos_process_cached_mtime = CHAOS_PROCESS_MTIME_RELOADING;
+    assert(chaos_process_config_observed_mtime() != CHAOS_PROCESS_MTIME_RELOADING);
+
+    (void)chaos_process_config_prepare();
+
+    assert(g_chaos_process_cached_mtime == CHAOS_PROCESS_MTIME_RELOADING);
+    assert(g_chaos_process_active_config_index == active_index);
+
+    g_chaos_process_cached_mtime = CHAOS_PROCESS_MTIME_UNKNOWN;
+}
+
+/**
+ * @brief Proves a failed read keeps the active rules and is retried on the next call.
+ *
+ * A read error (EIO here) says nothing about the rules, so dropping them would silently stop
+ * fault injection until the file changed again. The claim is released with the old stamp
+ * (not RELOADING, not the new one), so the next call reloads and finds both rules.
+ */
+static void test_read_failure_keeps_rules_and_retries(void)
+{
+    chaos_process_test_file_backup_t backup;
+
+    backup_file(CHAOS_PROCESS_CONFIG_PATH, &backup);
+    chaos_process_config_init();
+
+    write_config_text("fork:ERRNO:EAGAIN\n", 40);
+    assert(chaos_process_config_prepare());
+    assert(chaos_process_config_active_state()->rule_count == 1U);
+
+    write_config_text("fork:ERRNO:EAGAIN\npthread_create:FAIL_AFTER:EAGAIN,1\n", 41);
+    g_test_config_force_read_fail = 1;
+    assert(chaos_process_config_prepare());
+    assert(chaos_process_config_active_state()->rule_count == 1U);
+    assert(g_chaos_process_cached_mtime != chaos_process_config_observed_mtime());
+    assert(g_chaos_process_cached_mtime != CHAOS_PROCESS_MTIME_RELOADING);
+    g_test_config_force_read_fail = 0;
+
+    assert(chaos_process_config_prepare());
+    assert(chaos_process_config_active_state()->rule_count == 2U);
+
+    restore_file(CHAOS_PROCESS_CONFIG_PATH, &backup);
+    free_backup(&backup);
+}
+
+/**
+ * @brief Proves the change stamp sees writes that leave the mtime unchanged.
+ *
+ * File systems stamp mtime from a coarse clock, so two writes in one tick keep it. The size
+ * catches an append; the inode catches a rewrite via temporary file and rename(2) (`sed -i`).
+ */
+static void test_change_stamp_beyond_mtime(void)
+{
+    struct stat base;
+    struct stat other;
+
+    memset(&base, 0, sizeof(base));
+    base.st_mtim.tv_sec = 50;
+    base.st_size = 10;
+    base.st_ino = 100;
+    other = base;
+    assert(chaos_process_config_hash_mtime(&base) == chaos_process_config_hash_mtime(&other));
+
+    other.st_size = 20;
+    assert(chaos_process_config_hash_mtime(&base) != chaos_process_config_hash_mtime(&other));
+
+    other = base;
+    other.st_ino = 101;
+    assert(chaos_process_config_hash_mtime(&base) != chaos_process_config_hash_mtime(&other));
+}
+
+/**
+ * @brief Proves prepare never takes over a reload claim; only the fork() child handler drops it.
+ *
+ * A vfork child shares the parent's memory while the parent's reloading thread still runs, so
+ * prepare must leave any RELOADING claim alone. A fork() child's atfork handler releases the
+ * inherited claim (to UNKNOWN) and starts the child afresh: PRNG state 0 (reseeded on next
+ * draw, so pre-forked workers do not decide alike), FAIL_AFTER counters 0, hits owned by the
+ * child's pid. The next prepare then loads. The handler leaves a published stamp alone.
+ */
+static void test_fork_takes_over_orphaned_reload(void)
+{
+    chaos_process_test_file_backup_t backup;
+
+    backup_file(CHAOS_PROCESS_CONFIG_PATH, &backup);
+    chaos_process_config_init();
+    write_config_text("fork:ERRNO:EAGAIN\n", 60);
+
+    g_chaos_process_cached_mtime = CHAOS_PROCESS_MTIME_RELOADING;
+    (void)chaos_process_config_prepare();
+    assert(g_chaos_process_cached_mtime == CHAOS_PROCESS_MTIME_RELOADING);
+    g_chaos_process_tls_prng_state = UINT64_C(42);
+    g_chaos_process_fail_after_counters[CHAOS_PROCESS_OP_FORK] = 7U;
+    chaos_process_config_after_fork();
+    assert(g_chaos_process_tls_prng_state == 0U);
+    assert(g_chaos_process_fail_after_counters[CHAOS_PROCESS_OP_FORK] == 0U);
+    assert(g_chaos_process_cached_mtime == CHAOS_PROCESS_MTIME_UNKNOWN);
+    assert(g_chaos_process_hits_pid == (uint64_t)getpid());
+    assert(chaos_process_config_prepare());
+    assert(g_chaos_process_cached_mtime == chaos_process_config_observed_mtime());
+    chaos_process_config_after_fork();
+    assert(g_chaos_process_cached_mtime == chaos_process_config_observed_mtime());
+
+    /* With rules loaded, a caller that finds a claim keeps the current snapshot (true); the
+     * claim check returns before the forced CAS failure is reached. */
+    g_chaos_process_cached_mtime = CHAOS_PROCESS_MTIME_RELOADING;
+    g_test_config_force_cas_fail = 1;
+    assert(chaos_process_config_prepare());
+    g_test_config_force_cas_fail = 0;
+
+    /* Same claim seen again: still untouched. */
+    g_chaos_process_cached_mtime = CHAOS_PROCESS_MTIME_RELOADING;
+    (void)chaos_process_config_prepare();
+    assert(g_chaos_process_cached_mtime == CHAOS_PROCESS_MTIME_RELOADING);
+    g_chaos_process_cached_mtime = CHAOS_PROCESS_MTIME_UNKNOWN;
+
+    restore_file(CHAOS_PROCESS_CONFIG_PATH, &backup);
+    free_backup(&backup);
+}
+
+/**
+ * @brief Proves prepare preserves the caller's errno, with and without a rule file.
+ *
+ * Wrappers call prepare before the real function; a stat ENOENT leaking out would make a
+ * successful call appear to fail with ENOENT. EBADF is a value prepare never sets itself.
+ */
+static void test_prepare_preserves_errno(void)
+{
+    chaos_process_test_file_backup_t backup;
+
+    backup_file(CHAOS_PROCESS_CONFIG_PATH, &backup);
+    chaos_process_config_init();
+    (void)unlink(CHAOS_PROCESS_CONFIG_PATH);
+    errno = EBADF;
+    (void)chaos_process_config_prepare();
+    assert(errno == EBADF);
+
+    write_config_text("fork:ERRNO:EAGAIN\n", 70);
+    errno = EBADF;
+    assert(chaos_process_config_prepare());
+    assert(errno == EBADF);
+
+    restore_file(CHAOS_PROCESS_CONFIG_PATH, &backup);
+    free_backup(&backup);
+}
+
+/**
+ * @brief Proves a read interrupted by a signal (EINTR) is retried, not treated as failure.
+ */
+static void test_interrupted_read_is_retried(void)
+{
+    chaos_process_test_file_backup_t backup;
+
+    backup_file(CHAOS_PROCESS_CONFIG_PATH, &backup);
+    chaos_process_config_init();
+    write_config_text("fork:ERRNO:EAGAIN\n", 80);
+    g_test_config_read_eintr = 1;
+    assert(chaos_process_config_prepare());
+    assert(g_test_config_read_eintr == 0);
+    assert(chaos_process_config_active_state()->rule_count == 1U);
+
+    restore_file(CHAOS_PROCESS_CONFIG_PATH, &backup);
+    free_backup(&backup);
+}
+
+/**
+ * @brief Proves read_file rejects a file whose stamp differs from the one that started reload.
+ *
+ * A writer that rewrote or appended during the read leaves a different stamp and possibly a
+ * half-old, half-new copy. read_file compares the fstat stamp with the expected one: a
+ * mismatch returns -1 (retryable), the matching stamp returns the full content.
+ */
+static void test_read_file_rejects_changed_file(void)
+{
+    size_t size = 0U;
+    uint64_t stamp;
+
+    write_config_text("# stable\n", 41);
+    stamp = chaos_process_config_observed_mtime();
+    assert(chaos_process_config_read_file(&size, stamp ^ UINT64_C(1)) == -1);
+    assert(chaos_process_config_read_file(&size, stamp) == 0);
+    assert(size == strlen("# stable\n"));
+    (void)unlink(CHAOS_PROCESS_CONFIG_PATH);
+}
+
+/** @brief Reads the status file into @p buffer (NUL-terminated); 0 when it does not exist. */
+static int read_status_file(char *buffer, size_t size)
+{
+    FILE *file = fopen(CHAOS_PROCESS_STATUS_PATH, "r");
+    size_t length;
+
+    if (file == NULL)
+    {
+        return 0;
+    }
+    length = fread(buffer, 1U, size - 1U, file);
+    buffer[length] = '\0';
+    assert(fclose(file) == 0);
+    return 1;
+}
+
+/**
+ * @brief Proves a rejected buffer records line number, reason and the line as written.
+ *
+ * The status file shows these to the user, so the text keeps the comment the parser strips
+ * and the line number counts blank and comment lines. Exactly CHAOS_PROCESS_MAX_RULES rules
+ * plus a trailing comment is accepted and clears the error; one rule more reports line 257
+ * as "too many rules" and leaves rule_count 0.
+ */
+static void test_parse_buffer_reports_rejected_line(void)
+{
+    static chaos_process_rule_t rules[CHAOS_PROCESS_MAX_RULES];
+    char buffer[] = "# header\n\nfork:ERRNO:EAGAIN\nbogus-rule # typo\n";
+    const chaos_status_error_t *error = chaos_process_config_last_error();
+    const size_t line_length = strlen("fork:ERRNO:EAGAIN\n");
+    size_t rule_count = 7U;
+    size_t index;
+    char *many;
+
+    assert(chaos_process_config_parse_buffer(buffer, rules, &rule_count) == -1);
+    assert(error->line == 4U);
+    assert(strcmp(error->reason, CHAOS_STATUS_REASON_INVALID) == 0);
+    assert(strcmp(error->text, "bogus-rule # typo") == 0);
+
+    many = (char *)malloc((CHAOS_PROCESS_MAX_RULES + 1U) * line_length + 32U);
+    assert(many != NULL);
+    many[0] = '\0';
+    for (index = 0U; index < CHAOS_PROCESS_MAX_RULES; ++index)
+    {
+        (void)strcat(many, "fork:ERRNO:EAGAIN\n");
+    }
+    (void)strcat(many, "# trailing comment\n");
+    assert(chaos_process_config_parse_buffer(many, rules, &rule_count) == 0);
+    assert(rule_count == CHAOS_PROCESS_MAX_RULES);
+    assert(error->reason == NULL);
+
+    many[0] = '\0';
+    for (index = 0U; index <= CHAOS_PROCESS_MAX_RULES; ++index)
+    {
+        (void)strcat(many, "fork:ERRNO:EAGAIN\n");
+    }
+    assert(chaos_process_config_parse_buffer(many, rules, &rule_count) == -1);
+    assert(rule_count == 0U);
+    assert(error->line == CHAOS_PROCESS_MAX_RULES + 1U);
+    assert(strcmp(error->reason, CHAOS_STATUS_REASON_TOO_MANY) == 0);
+    assert(strcmp(error->text, "fork:ERRNO:EAGAIN") == 0);
+    free(many);
+}
+
+/**
+ * @brief Proves every load writes its outcome to the status file, byte for byte.
+ *
+ * Outcomes: an invalid line (state=error, line 2, text as written); a valid file (state=ok,
+ * rules=1); a file of CHAOS_PROCESS_MAX_CONFIG_BYTES ("file too large"); a NUL byte ("file
+ * contains a NUL byte"); a directory (EISDIR) and, when not root, a mode-0 file (EACCES), both
+ * "file unreadable"; no rule file removes the status file. Every report carries this pid.
+ */
+static void test_prepare_reports_status(void)
+{
+    char status[CHAOS_STATUS_BUFFER_SIZE];
+    char expected[CHAOS_STATUS_BUFFER_SIZE];
+
+    chaos_process_config_init();
+    write_config_text("# header\nbogus-rule # typo\n", 51);
+    assert(chaos_process_config_prepare() == 0);
+    assert(read_status_file(status, sizeof(status)));
+    (void)snprintf(
+        expected,
+        sizeof(expected),
+        "state=error\nrules=0\nline=2\nreason=invalid rule\ntext=bogus-rule # typo\npid=%ld\n",
+        (long)getpid()
+    );
+    assert(strcmp(status, expected) == 0);
+
+    write_config_text("fork:ERRNO:EAGAIN\n", 52);
+    assert(chaos_process_config_prepare() == 1);
+    assert(read_status_file(status, sizeof(status)));
+    (void)snprintf(expected, sizeof(expected), "state=ok\nrules=1\npid=%ld\n", (long)getpid());
+    assert(strcmp(status, expected) == 0);
+
+    /* A file at the size limit is reported and not re-read until it changes. */
+    {
+        FILE *large = fopen(CHAOS_PROCESS_CONFIG_PATH, "w");
+        size_t index;
+
+        assert(large != NULL);
+        for (index = 0U; index < CHAOS_PROCESS_MAX_CONFIG_BYTES; ++index)
+        {
+            assert(fputc('#', large) != EOF);
+        }
+        assert(fclose(large) == 0);
+    }
+    assert(chaos_process_config_prepare() == 0);
+    assert(read_status_file(status, sizeof(status)));
+    (void)snprintf(
+        expected,
+        sizeof(expected),
+        "state=error\nrules=0\nline=0\nreason=file too large\ntext=\npid=%ld\n",
+        (long)getpid()
+    );
+    assert(strcmp(status, expected) == 0);
+
+    (void)unlink(CHAOS_PROCESS_CONFIG_PATH);
+
+    /* A NUL byte rejects the file: the parser would stop there and drop every later rule while
+     * reporting state=ok. */
+    {
+        static const char text[] = "# rules\n\0\n";
+        FILE *nul = fopen(CHAOS_PROCESS_CONFIG_PATH, "w");
+
+        assert(nul != NULL);
+        assert(fwrite(text, 1U, sizeof(text) - 1U, nul) == sizeof(text) - 1U);
+        assert(fclose(nul) == 0);
+    }
+    assert(chaos_process_config_prepare() == 0);
+    assert(read_status_file(status, sizeof(status)));
+    (void)snprintf(
+        expected,
+        sizeof(expected),
+        "state=error\nrules=0\nline=0\nreason=file contains a NUL byte\ntext=\npid=%ld\n",
+        (long)getpid()
+    );
+    assert(strcmp(status, expected) == 0);
+    (void)unlink(CHAOS_PROCESS_CONFIG_PATH);
+
+    /* Root bypasses file permissions, so the EACCES case runs only for other users. */
+    assert(mkdir(CHAOS_PROCESS_CONFIG_PATH, 0700) == 0);
+    assert(chaos_process_config_prepare() == 0);
+    assert(read_status_file(status, sizeof(status)));
+    (void)snprintf(
+        expected,
+        sizeof(expected),
+        "state=error\nrules=0\nline=0\nreason=file unreadable\ntext=\npid=%ld\n",
+        (long)getpid()
+    );
+    assert(strcmp(status, expected) == 0);
+    assert(rmdir(CHAOS_PROCESS_CONFIG_PATH) == 0);
+    if (geteuid() != 0)
+    {
+        FILE *locked = fopen(CHAOS_PROCESS_CONFIG_PATH, "w");
+
+        assert(locked != NULL);
+        assert(fclose(locked) == 0);
+        assert(chmod(CHAOS_PROCESS_CONFIG_PATH, 0) == 0);
+        assert(chaos_process_config_prepare() == 0);
+        assert(read_status_file(status, sizeof(status)));
+        assert(strcmp(status, expected) == 0);
+        (void)unlink(CHAOS_PROCESS_CONFIG_PATH);
+    }
+    assert(chaos_process_config_prepare() == 0);
+    assert(!read_status_file(status, sizeof(status)));
+}
+
+/** @brief Reads this process's hits file into @p buffer; 0 when it does not exist. */
+static int read_hits_file(char *buffer, size_t size)
+{
+    char path[64];
+    FILE *file;
+    size_t length;
+
+    (void
+    )snprintf(path, sizeof(path), "%s.%ld", CHAOS_PROCESS_HITS_PREFIX, g_chaos_process_hits_file);
+    file = fopen(path, "r");
+    if (file == NULL)
+    {
+        return 0;
+    }
+    length = fread(buffer, 1U, size - 1U, file);
+    buffer[length] = '\0';
+    assert(fclose(file) == 0);
+    return 1;
+}
+
+/**
+ * @brief Proves hit counting, the hits file format and its write schedule.
+ *
+ * - Each line is `count<TAB>rule text as written`; a reload keeps the count of a rule whose
+ *   text is unchanged (`# a` stays 2 when `# b` is added).
+ * - A hit that finds the writer busy stays pending and is not lost.
+ * - The first CHAOS_HITS_EAGER (64) hits are written at once; after that a hit inside the
+ *   100 ms interval only counts, a hit after it writes; the exit report flushes the rest.
+ * - The fork() child handler releases the writer flag, resets a once-only decision still in
+ *   progress (state 3 to 1) but keeps one that fired (2), and restarts counts at 0.
+ * - Only the process that owns the counts writes them; a vfork child, which shares memory but
+ *   has another pid, writes nothing.
+ */
+static void test_hits_are_counted_and_reported(void)
+{
+    char hits[1024];
+    char path[64];
+    chaos_process_config_state_t *state;
+
+    chaos_process_config_init();
+    write_config_text("fork:ERRNO:EAGAIN # a\n", 61);
+    assert(chaos_process_config_prepare() == 1);
+    state = (chaos_process_config_state_t *)chaos_process_config_active_state();
+    assert(state->rule_count == 1U);
+    assert(state->rules[0].hit == state->hits[0]);
+    assert(strcmp(state->text[0], "fork:ERRNO:EAGAIN # a") == 0);
+    chaos_hit_record(state->rules[0].hit);
+    chaos_hit_record(state->rules[0].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(strcmp(hits, "2\tfork:ERRNO:EAGAIN # a\n") == 0);
+
+    write_config_text("fork:ERRNO:EAGAIN # a\nfork:ERRNO:EAGAIN # b\n", 62);
+    assert(chaos_process_config_prepare() == 1);
+    state = (chaos_process_config_state_t *)chaos_process_config_active_state();
+    assert(state->rule_count == 2U);
+    assert(state->hits[0]->count == 2U);
+    chaos_hit_record(state->rules[1].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(strcmp(hits, "2\tfork:ERRNO:EAGAIN # a\n1\tfork:ERRNO:EAGAIN # b\n") == 0);
+
+    g_chaos_process_hits_writing = 1;
+    chaos_hit_record(state->rules[1].hit);
+    g_chaos_process_hits_writing = 0;
+    assert(g_chaos_process_hits_pending == 1);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(strcmp(hits, "2\tfork:ERRNO:EAGAIN # a\n1\tfork:ERRNO:EAGAIN # b\n") == 0);
+
+    g_chaos_process_hits_total = CHAOS_HITS_EAGER;
+    g_chaos_process_hits_last_ms = chaos_hits_now_ms();
+    chaos_hit_record(state->rules[1].hit);
+    assert(state->hits[1]->count == 3U);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(strcmp(hits, "2\tfork:ERRNO:EAGAIN # a\n1\tfork:ERRNO:EAGAIN # b\n") == 0);
+
+    chaos_process_config_report_hits(NULL);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(strcmp(hits, "2\tfork:ERRNO:EAGAIN # a\n3\tfork:ERRNO:EAGAIN # b\n") == 0);
+    assert(g_chaos_process_hits_pending == 0);
+    chaos_process_config_report_hits(NULL);
+
+    g_chaos_process_hits_last_ms = chaos_hits_now_ms() - CHAOS_HITS_INTERVAL_MS;
+    chaos_hit_record(state->rules[1].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(strcmp(hits, "2\tfork:ERRNO:EAGAIN # a\n4\tfork:ERRNO:EAGAIN # b\n") == 0);
+    assert(g_chaos_process_hits_pending == 0);
+    g_chaos_process_hits_total = 0U;
+
+    g_chaos_process_hits_writing = 1;
+    state->rules[0].hit->state = 3U; /* a once-only effect deciding in the parent */
+    state->rules[1].hit->state = 2U; /* one that already fired */
+    chaos_process_config_after_fork();
+    assert(g_chaos_process_hits_writing == 0);
+    assert(state->rules[0].hit->state == 1U);
+    assert(state->rules[1].hit->state == 2U);
+    state->rules[0].hit->state = 0U;
+    state->rules[1].hit->state = 0U;
+    chaos_hit_record(state->rules[0].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(strcmp(hits, "1\tfork:ERRNO:EAGAIN # a\n0\tfork:ERRNO:EAGAIN # b\n") == 0);
+    g_chaos_process_hits_total = 0U;
+
+    g_chaos_process_hits_pending = 1;
+    g_chaos_process_hits_pid = (uint64_t)getpid() + 1U;
+    chaos_process_config_report_hits(NULL);
+    assert(g_chaos_process_hits_pending == 1);
+    g_chaos_process_hits_pending = 0;
+    g_chaos_process_hits_pid = (uint64_t)getpid();
+
+    (void
+    )snprintf(path, sizeof(path), "%s.%ld", CHAOS_PROCESS_HITS_PREFIX, g_chaos_process_hits_file);
+    (void)unlink(path);
+    (void)unlink(CHAOS_PROCESS_CONFIG_PATH);
+}
+
+/**
+ * @brief Proves the rule file is stat()ed at most once per check interval once rules load.
+ *
+ * The stat is the largest part of a wrapper's cost. The interval is widened to 10 s so the
+ * test cannot race the clock: right after a look, deleting the file goes unseen; with the
+ * last look one interval back, the deletion is seen and the rules are gone.
+ */
+static void test_rule_file_check_is_throttled(void)
+{
+    chaos_process_config_init();
+    write_config_text("fork:ERRNO:EAGAIN\n", 81);
+    assert(chaos_process_config_prepare() == 1);
+
+    assert(chaos_clock_now_ns() != 0U);
+    g_chaos_process_check_interval_ns = UINT64_C(10000000000);
+    g_chaos_process_last_check_ns = chaos_clock_now_ns();
+    (void)unlink(CHAOS_PROCESS_CONFIG_PATH);
+    assert(chaos_process_config_prepare() == 1);
+
+    g_chaos_process_last_check_ns = chaos_clock_now_ns() - g_chaos_process_check_interval_ns;
+    assert(chaos_process_config_prepare() == 0);
+    g_chaos_process_check_interval_ns = 0U;
+}
+
+/**
+ * @brief Proves qualifiers parse into the rule's policy and bad ones reject the line.
+ *
+ * `@first`, `@from`, `@until` and both `@size` bounds land in the policy; libchaos-process
+ * calls carry no byte count, so `call_size` is CHAOS_POLICY_NO_SIZE. Rejected: an unknown
+ * qualifier, a qualifier line with no rule (line 2), `@until` before `@from`, and
+ * `@first=0`.
+ */
+static void test_rule_qualifiers(void)
+{
+    static chaos_process_rule_t rules[CHAOS_PROCESS_MAX_RULES];
+    char qualified[] =
+        "fork:ERRNO:EAGAIN @first=3 @from=1000 @until=2000 @size>10 @size<99 # owner\n";
+    char unknown[] = "fork:ERRNO:EAGAIN @bogus=1\n";
+    char lonely[] = "# header\n  @first=3\n";
+    char backwards[] = "fork:ERRNO:EAGAIN @from=2000 @until=1000\n";
+    char empty_first[] = "fork:ERRNO:EAGAIN @first=0\n";
+    size_t count = 0U;
+
+    assert(chaos_process_config_parse_buffer(qualified, rules, &count) == 0);
+    assert(count == 1U);
+    assert(rules[0].policy.first == 3U);
+    assert(rules[0].policy.from_ms == 1000);
+    assert(rules[0].policy.until_ms == 2000);
+    assert(rules[0].policy.has_size_above && rules[0].policy.size_above == 10U);
+    assert(rules[0].policy.has_size_below && rules[0].policy.size_below == 99U);
+    assert(rules[0].call_size == CHAOS_POLICY_NO_SIZE);
+
+    assert(chaos_process_config_parse_buffer(unknown, rules, &count) == -1);
+    assert(strcmp(chaos_process_config_last_error()->text, "fork:ERRNO:EAGAIN @bogus=1") == 0);
+    assert(chaos_process_config_parse_buffer(lonely, rules, &count) == -1);
+    assert(chaos_process_config_last_error()->line == 2U);
+    assert(chaos_process_config_parse_buffer(backwards, rules, &count) == -1);
+    assert(chaos_process_config_parse_buffer(empty_first, rules, &count) == -1);
+}
+
+/**
+ * @brief Proves a same-size in-place rewrite within one mtime tick is still loaded.
+ *
+ * Such a rewrite leaves mtime, size, inode and device unchanged, so the change stamp cannot
+ * see it. A load of a file written within the racily-clean window is therefore provisional
+ * and re-read on each check: an unchanged re-read (same content hash) keeps the snapshot and
+ * its FAIL_AFTER counters; the rewrite (rule commented out) loads 0 rules; an mtime outside
+ * the window makes the load final.
+ */
+static void test_racy_rewrite_is_seen(void)
+{
+    static const char rule[] = "fork:ERRNO:EAGAIN\n";
+    char rewritten[sizeof(rule)];
+    char status[512];
+    struct timespec times[2];
+    struct stat first;
+    FILE *file;
+    const uint64_t interval = g_chaos_process_check_interval_ns;
+
+    g_chaos_process_check_interval_ns = 0U;
+    (void)unlink(CHAOS_PROCESS_CONFIG_PATH);
+    chaos_process_config_init();
+    file = fopen(CHAOS_PROCESS_CONFIG_PATH, "w");
+    assert(file != NULL && fputs(rule, file) >= 0 && fclose(file) == 0);
+    assert(stat(CHAOS_PROCESS_CONFIG_PATH, &first) == 0);
+    assert(chaos_process_config_prepare());
+    assert(g_chaos_process_config_provisional == 1);
+    assert(read_status_file(status, sizeof(status)) && strstr(status, "rules=1\n") != NULL);
+    g_chaos_process_fail_after_counters[CHAOS_PROCESS_OP_FORK] = 3U;
+
+    assert(chaos_process_config_prepare());
+    assert(g_chaos_process_config_content == chaos_config_content_hash(rule, sizeof(rule) - 1U));
+    assert(g_chaos_process_fail_after_counters[CHAOS_PROCESS_OP_FORK] == 3U);
+
+    (void)memcpy(rewritten, rule, sizeof(rule));
+    rewritten[0] = '#';
+    file = fopen(CHAOS_PROCESS_CONFIG_PATH, "r+");
+    assert(file != NULL && fputs(rewritten, file) >= 0 && fflush(file) == 0);
+    times[0] = first.st_atim;
+    times[1] = first.st_mtim;
+    assert(futimens(fileno(file), times) == 0 && fclose(file) == 0);
+    assert(chaos_process_config_prepare() == 0);
+    assert(read_status_file(status, sizeof(status)) && strstr(status, "rules=0\n") != NULL);
+
+    times[1].tv_sec = 60;
+    times[1].tv_nsec = 0L;
+    assert(utimensat(AT_FDCWD, CHAOS_PROCESS_CONFIG_PATH, times, 0) == 0);
+    assert(chaos_process_config_prepare() == 0);
+    assert(g_chaos_process_config_provisional == 0);
+
+    (void)unlink(CHAOS_PROCESS_CONFIG_PATH);
+    g_chaos_process_check_interval_ns = interval;
+}
+
+/**
+ * @brief Proves the next rule-file check writes hits pending for a whole interval (100 ms).
+ *
+ * Without this a long-running process that stopped hitting would report its last counts only
+ * at exit. Inside the interval the hits stay pending.
+ */
+static void test_pending_hits_written_after_interval(void)
+{
+    const uint64_t interval = g_chaos_process_check_interval_ns;
+
+    g_chaos_process_check_interval_ns = 0U;
+    g_chaos_process_hits_pid = (uint64_t)getpid();
+    g_chaos_process_hits_pending = 1;
+    g_chaos_process_hits_last_ms = chaos_hits_now_ms();
+    (void)chaos_process_config_prepare();
+    assert(g_chaos_process_hits_pending == 1);
+    g_chaos_process_hits_last_ms = chaos_hits_now_ms() - CHAOS_HITS_INTERVAL_MS;
+    (void)chaos_process_config_prepare();
+    assert(g_chaos_process_hits_pending == 0);
+    g_chaos_process_check_interval_ns = interval;
+}
+
+/**
+ * @brief Proves each value parser accepts its exact limit and rejects the next value.
+ *
+ * - errno: 2147483647 (INT_MAX) accepted; 0, -5, 2147483648 and "12x" rejected.
+ * - latency (ms): 4294967295 accepted; 4294967296 and "12x" rejected, output untouched.
+ * - FAIL_AFTER: "12x", ",5", "EAGAIN," and NULL outputs rejected, count untouched.
+ * - A value that fills its buffer with no room for the NUL is rejected, one byte shorter is
+ *   accepted; likewise the payload before `@`.
+ * - An empty effect or value field, a bad latency or a bad count rejects the line.
+ * - Selector matching gives the same answer with a NULL rank output.
+ */
+static void test_parse_boundaries(void)
+{
+    char payload[4];
+    /* Writable arrays: the parsers trim the text after the number in place. */
+    char errno_garbage[] = "12x";
+    char latency_garbage[] = "12x";
+    char count_garbage[] = "12x";
+    char empty_errno[] = ",5";
+    char empty_count[] = "EAGAIN,";
+    char empty_effect_line[] = "fork::EAGAIN";
+    char empty_value_line[] = "fork:ERRNO: ";
+    char bad_latency_line[] = "fork:LATENCY:soon";
+    char bad_count_line[] = "fork:FAIL_AFTER:EAGAIN,many";
+    char split_line[] = "fork:ERRNO:EAGAIN";
+    char *selector_text = NULL;
+    char *effect_text = NULL;
+    unsigned int latency = 0U;
+    uint64_t count = 0U;
+    int errnum = 0;
+    double probability = 0.0;
+    chaos_process_selector_t selector;
+    chaos_process_rule_t rule;
+
+    assert(chaos_process_parse_errno_name("2147483647") == 2147483647);
+    assert(chaos_process_parse_errno_name("0") == -1);
+    assert(chaos_process_parse_errno_name("-5") == -1);
+    assert(chaos_process_parse_errno_name("2147483648") == -1);
+    assert(chaos_process_parse_errno_name(errno_garbage) == -1);
+
+    assert(chaos_process_parse_latency("4294967295", &latency) == 0);
+    assert(latency == 4294967295U);
+    assert(chaos_process_parse_latency("4294967296", &latency) != 0);
+    assert(chaos_process_parse_latency(latency_garbage, &latency) != 0);
+    assert(latency == 4294967295U);
+
+    assert(chaos_process_parse_fail_after_count(count_garbage, &count) != 0);
+    assert(chaos_process_parse_fail_after_value(empty_errno, &errnum, &count) != 0);
+    assert(chaos_process_parse_fail_after_value(empty_count, &errnum, &count) != 0);
+    assert(chaos_process_parse_fail_after_value(split_line, NULL, &count) != 0);
+    assert(chaos_process_parse_fail_after_value(split_line, &errnum, NULL) != 0);
+    assert(count == 0U);
+
+    assert(chaos_process_copy_text_value("abcd", payload, sizeof(payload)) != 0);
+    assert(chaos_process_copy_text_value("abc", payload, sizeof(payload)) == 0);
+    assert(strcmp(payload, "abc") == 0);
+    assert(
+        chaos_process_parse_payload_probability(
+            "abcd@0.5", payload, sizeof(payload), &probability
+        ) != 0
+    );
+    assert(
+        chaos_process_parse_payload_probability(
+            "abc@0.5", payload, sizeof(payload), &probability
+        ) == 0
+    );
+    assert(strcmp(payload, "abc") == 0);
+    assert(probability == 0.5);
+    assert(
+        chaos_process_parse_payload_probability("abc", NULL, sizeof(payload), &probability) != 0
+    );
+    assert(chaos_process_parse_payload_probability("abc", payload, sizeof(payload), NULL) != 0);
+
+    assert(chaos_process_config_parse_line(empty_effect_line, &rule) < 0);
+    assert(chaos_process_config_parse_line(empty_value_line, &rule) < 0);
+    assert(chaos_process_config_parse_line(bad_latency_line, &rule) < 0);
+    assert(chaos_process_config_parse_line(bad_count_line, &rule) < 0);
+    assert(!chaos_process_split_rule_fields(split_line, &selector_text, &effect_text, NULL));
+    assert(!chaos_process_split_rule_fields(split_line, &selector_text, NULL, NULL));
+    assert(!chaos_process_selector_parse("*", NULL));
+
+    assert(chaos_process_selector_parse("*", &selector));
+    assert(chaos_process_selector_matches(&selector, CHAOS_PROCESS_OP_WAITPID, NULL));
+    assert(chaos_process_selector_parse("fork", &selector));
+    assert(chaos_process_selector_matches(&selector, CHAOS_PROCESS_OP_FORK, NULL));
+    assert(!chaos_process_selector_matches(&selector, CHAOS_PROCESS_OP_EXECVE, NULL));
+}
+
+/**
+ * @brief Proves open errors are classified: EINTR retried, EACCES/EPERM lasting, rest retryable.
+ *
+ * -3 (lasting) makes the reload reject the file until it changes, so an unreadable file is
+ * reported once instead of re-opened on every check; -1 (EMFILE, out of descriptors) is
+ * retried on the next check because it says nothing about the file.
+ */
+static void test_open_errors(void)
+{
+    size_t size = 0U;
+    uint64_t stamp;
+
+    write_config_text("# open errors\n", 43);
+    stamp = chaos_process_config_observed_mtime();
+    g_test_config_open_eintr = 1;
+    assert(chaos_process_config_read_file(&size, stamp) == 0);
+    assert(g_test_config_open_eintr == 0);
+    assert(size == strlen("# open errors\n"));
+
+    g_test_config_open_errno = EACCES;
+    assert(chaos_process_config_read_file(&size, stamp) == -3);
+    g_test_config_open_errno = EPERM;
+    assert(chaos_process_config_read_file(&size, stamp) == -3);
+    g_test_config_open_errno = EMFILE;
+    assert(chaos_process_config_read_file(&size, stamp) == -1);
+    g_test_config_open_errno = 0;
+    (void)unlink(CHAOS_PROCESS_CONFIG_PATH);
+}
+
 int main(void)
 {
+    /* Interval 0 makes every prepare stat the file, so tests see each write at once; the
+     * throttle has its own test. */
+    g_chaos_process_check_interval_ns = 0U;
+    test_parse_buffer_reports_rejected_line();
+    test_prepare_reports_status();
+    test_hits_are_counted_and_reported();
+    test_rule_file_check_is_throttled();
+    test_rule_qualifiers();
+    test_read_file_rejects_changed_file();
     test_helper_functions();
     test_parse_line_and_buffer();
     test_rule_selection();
     test_prepare_and_match();
     test_parse_buffer_limit();
+    test_reload_in_progress_is_not_joined();
+    test_read_failure_keeps_rules_and_retries();
+    test_change_stamp_beyond_mtime();
+    test_fork_takes_over_orphaned_reload();
+    test_prepare_preserves_errno();
+    test_interrupted_read_is_retried();
+    test_racy_rewrite_is_seen();
+    test_pending_hits_written_after_interval();
+    test_parse_boundaries();
+    test_open_errors();
     return 0;
 }

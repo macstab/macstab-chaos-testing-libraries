@@ -1,5 +1,7 @@
-/* net use-case 1 — connect() to a peer, report the errno. With
- * tcp4://<ip>:<port>:connect:ECONNREFUSED:p the call is refused before the syscall. */
+/* Demo net1/net2: five connect() attempts to <ip> <port> (default 127.0.0.1 6379), each on
+ * a new socket, printing the result. Under libchaos-net with
+ * `tcp4://127.0.0.1:6379:connect:ECONNREFUSED:1.0` (net1) or `...:ETIMEDOUT:1.0` (net2) the
+ * wrapper returns the error without the real connect, so no server is needed. */
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>

@@ -1,38 +1,29 @@
 /**
  * @file test_memory_support.h
- * @brief Memory-domain test globals, reset helper, and dlsym cast utility.
+ * @brief Unit-test scaffolding for libchaos-memory: runtime globals, reset helper, dlsym cast.
  *
- * Subsystem under test: chaos-memory (LD_PRELOAD memory fault injection via
- *   mmap / munmap / mprotect / madvise interception).
+ * @details Unit tests compile the libchaos-memory sources directly into the test binary
+ * instead of loading the shared object, so the globals libchaos-memory defines in its own
+ * translation units must be supplied by the test. This header provides:
  *
- * This header is included by every unit test that exercises the memory domain.
- * It provides:
+ *   1. CHAOS_MEMORY_DEFINE_TEST_GLOBALS(): defines every runtime global declared `extern` in
+ *      chaos_memory_internal.h, plus an empty chaos_memory_ensure_symbols() so no wrapper
+ *      calls dlsym(RTLD_NEXT). Expand exactly once per test binary, at file scope.
+ *   2. chaos_memory_test_reset_runtime(): returns those globals to their initial state; call
+ *      at the start of every test that touches runtime state.
+ *   3. CHAOS_MEMORY_TEST_DLSYM_RESULT(type, function): converts a typed function pointer to
+ *      the `void *` a stub dlsym() returns, via memcpy (ISO C forbids the direct cast).
  *
- *   1. `CHAOS_MEMORY_DEFINE_TEST_GLOBALS()` -- a macro that instantiates all
- *      translation-unit-scoped globals declared `extern` in the production
- *      memory internal header. Must be expanded exactly once per test binary.
+ * libchaos-memory holds five real functions: mmap, munmap, mprotect, madvise and
+ * posix_madvise. Its LATENCY effect sleeps through chaos_sleep_ms(); include
+ * test_sleep_support.h first to record those sleeps instead of performing them.
  *
- *   2. `chaos_memory_test_reset_runtime()` -- resets all memory runtime globals
- *      to their initial (NULL/zero) state. Call at the start of every test
- *      function that modifies runtime state.
+ * Runtime tests (test_memory_runtime.c) additionally `#define` dlsym, dlerror, abort and, on
+ * Linux, syscall before including the production sources, which lets them drive the
+ * constructor and the config path without LD_PRELOAD.
  *
- *   3. `CHAOS_MEMORY_TEST_DLSYM_RESULT(type, function)` -- type-safe conversion
- *      of a typed function pointer to `void *` via `memcpy`, used in dlsym
- *      stubs to map symbol names to test stub functions.
- *
- * The memory domain intercepts six functions: mmap, munmap, mprotect, madvise,
- * nanosleep, and usleep. The last two are intercepted so the latency injection
- * path can be tested without real sleeps.
- *
- * Coverage approach:
- * - Tests directly `#include` production `.c` files after `#define`-overriding
- *   `dlsym`, `dlerror`, `abort`, and (on Linux) `syscall`. The constructor and
- *   config paths are tested without LD_PRELOAD.
- *
- * What is NOT tested via this header:
- * - Actual mmap/mprotect/madvise system call semantics.
- * - Thread-safety of the TLS guard under concurrent mmap calls.
- * - OS-level memory fault behaviour triggered by mprotect.
+ * Not covered by tests built on this header: real mmap/mprotect/madvise semantics, faults
+ * raised by a real mprotect, and the reentrancy guard under concurrent calls.
  */
 
 #ifndef CHAOS_MEMORY_TEST_SUPPORT_H
@@ -49,33 +40,33 @@
 #include <unistd.h>
 
 /**
- * @brief Instantiate all memory-domain runtime globals for one test translation unit.
+ * @brief Defines the libchaos-memory runtime globals for one test binary.
  *
- * Must be expanded exactly once at file scope. Defines:
- * - `g_chaos_memory_real_mmap`, `g_chaos_memory_real_munmap`,
- *   `g_chaos_memory_real_mprotect`, `g_chaos_memory_real_madvise`,
- *   `g_chaos_memory_real_nanosleep`, `g_chaos_memory_real_usleep` -- all NULL.
- * - `__thread int g_chaos_memory_tls_guard` -- per-thread re-entrancy guard.
- * - `__thread uint64_t g_chaos_memory_tls_prng_state` -- per-thread PRNG state.
- * - `uint64_t g_chaos_memory_process_seed` -- process-wide PRNG seed (1).
+ * Expand exactly once at file scope (a second expansion is a duplicate definition). Defines:
+ * - chaos_memory_ensure_symbols() as a no-op, so real functions stay what the test assigns.
+ * - The five `g_chaos_memory_real_*` real-function pointers, all NULL.
+ * - `__thread int g_chaos_memory_tls_guard` (reentrancy guard) = 0.
+ * - `__thread uint64_t g_chaos_memory_tls_prng_state` = 0, which makes the per-thread PRNG
+ *   seed itself on first use.
+ * - `uint64_t g_chaos_memory_process_seed` = 1 in place of the /dev/urandom seed.
  */
 #define CHAOS_MEMORY_DEFINE_TEST_GLOBALS()                                                         \
+    void chaos_memory_ensure_symbols(void) {}                                                      \
     chaos_memory_mmap_fn g_chaos_memory_real_mmap = NULL;                                          \
     chaos_memory_munmap_fn g_chaos_memory_real_munmap = NULL;                                      \
     chaos_memory_mprotect_fn g_chaos_memory_real_mprotect = NULL;                                  \
     chaos_memory_madvise_fn g_chaos_memory_real_madvise = NULL;                                    \
-    chaos_memory_nanosleep_fn g_chaos_memory_real_nanosleep = NULL;                                \
-    chaos_memory_usleep_fn g_chaos_memory_real_usleep = NULL;                                      \
+    chaos_memory_posix_madvise_fn g_chaos_memory_real_posix_madvise = NULL;                        \
     __thread int g_chaos_memory_tls_guard = 0;                                                     \
     __thread uint64_t g_chaos_memory_tls_prng_state = 0U;                                          \
     uint64_t g_chaos_memory_process_seed = 1U
 
 /**
- * @brief Reset all memory-domain runtime globals to their initial state.
+ * @brief Restores every global defined by CHAOS_MEMORY_DEFINE_TEST_GLOBALS() to its initial
+ *        value.
  *
- * Sets all six real-function-pointer globals to NULL, zeroes the TLS guard, TLS
- * PRNG state, and resets the process seed to 1. Call at the start of each test
- * function to prevent cross-test contamination.
+ * Sets the five real-function pointers to NULL, zeroes the calling thread's reentrancy guard
+ * and PRNG state, and resets the process seed to 1. Only the calling thread's TLS is reset.
  */
 static inline void chaos_memory_test_reset_runtime(void)
 {
@@ -83,22 +74,21 @@ static inline void chaos_memory_test_reset_runtime(void)
     g_chaos_memory_real_munmap = NULL;
     g_chaos_memory_real_mprotect = NULL;
     g_chaos_memory_real_madvise = NULL;
-    g_chaos_memory_real_nanosleep = NULL;
-    g_chaos_memory_real_usleep = NULL;
+    g_chaos_memory_real_posix_madvise = NULL;
     g_chaos_memory_tls_guard = 0;
     g_chaos_memory_tls_prng_state = 0U;
     g_chaos_memory_process_seed = 1U;
 }
 
 /**
- * @brief Convert a typed function pointer to `void *` using `memcpy`.
+ * @brief Copies a function pointer's bytes into a `void *`.
  *
- * Direct casts between function pointers and `void *` are undefined behaviour
- * in C99. This helper copies the pointer bits through a `void *` local.
+ * ISO C leaves function-pointer to object-pointer casts undefined; POSIX guarantees the
+ * representations match, so a byte copy is the portable way to build a dlsym() result.
  *
- * @param function_bytes  Address of a function-pointer-typed value.
- * @param function_size   `sizeof` the function pointer type; must be <= sizeof(void *).
- * @return `void *` carrying the same bit pattern as the function pointer.
+ * @param function_bytes  Address of a function-pointer object; must not be NULL (asserted).
+ * @param function_size   Size of that object; must be <= sizeof(void *) (asserted).
+ * @return A `void *` with the same bit pattern as the function pointer.
  */
 static inline void *
 chaos_memory_test_dlsym_pointer(const void *function_bytes, size_t function_size)
@@ -112,10 +102,11 @@ chaos_memory_test_dlsym_pointer(const void *function_bytes, size_t function_size
 }
 
 /**
- * @brief Produce the `void *` return value for a `dlsym` stub entry.
+ * @brief Yields the `void *` a stub dlsym() returns for @p function.
  *
- * @param type      Function pointer typedef (e.g. `chaos_memory_mmap_fn`).
- * @param function  Stub function to map to this symbol.
+ * @param type      Function-pointer typedef, e.g. `chaos_memory_mmap_fn`; a mismatch
+ *                  with @p function draws a compiler diagnostic via the compound literal.
+ * @param function  Stub to hand back for the requested symbol name.
  *
  * Usage:
  * @code

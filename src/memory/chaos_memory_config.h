@@ -1,51 +1,59 @@
 /**
  * @file chaos_memory_config.h
- * @brief Configuration data model and public interface for the chaos-memory
- *        rule engine.
+ * @brief Rule model of libchaos-memory: selectors, effects, the rule struct, and
+ *        the load/match API over the rule file.
  *
  * @details
- * This header defines the complete type system used to represent, parse, and
- * match fault-injection rules for the memory chaos module.  It is included by
- * both the config implementation (chaos_memory_config.c) and the hook
- * implementations (chaos_memory_hooks.c, chaos_memory_actions.c).
- *
- * The config file lives at CHAOS_MEMORY_CONFIG_PATH (/tmp/.chaos-memory.conf).
- * It is a line-oriented text file; each non-comment, non-blank line has the
- * form:
+ * Rule file: CHAOS_MEMORY_CONFIG_PATH (`/tmp/.chaos-memory.conf`). One rule per
+ * line; blank lines and `#` comments are ignored; blanks around fields are trimmed:
  *
  * @code
- *   <selector> : <effect> : <value>[@<probability>]
+ *   <selector>:<effect>:<value>[@<probability>] [qualifiers] [# comment]
  * @endcode
  *
- * Examples:
+ * | Field       | Values                                                         |
+ * |-------------|----------------------------------------------------------------|
+ * | selector    | `*`, `mmap`, `mmap/anon`, `mmap/file`, `munmap`, `mprotect`, `madvise` |
+ * | effect      | `ERRNO` (value: errno name or positive decimal), `LATENCY` (ms) |
+ * | probability | `0`, `1`, `0.<digits>`, `1.<zeros>`; default 1                  |
+ * | qualifiers  | `@first=N`, `@from=T`, `@until=T`, `@size>N`, `@size<N`         |
+ *
  * @code
  *   mmap/anon : ERRNO : ENOMEM@0.05   # fail 5% of anonymous mmaps
- *   mmap/file : LATENCY : 20          # add 20ms latency to file-backed mmaps
+ *   mmap/file : LATENCY : 20          # add 20 ms to file-backed mmaps
  *   mprotect  : ERRNO : EPERM         # always fail mprotect
- *   *         : LATENCY : 5@0.1       # 10% chance of 5ms latency on anything
+ *   *         : LATENCY : 5@0.1       # 10% chance of 5 ms on any call
+ *   mmap/anon:ERRNO:ENOMEM @size>1048576 @first=3
  * @endcode
  *
- * @par Rule selection
- * When multiple rules match a given call, the most-specific match wins.
- * Specificity rank (ascending priority): ANY (`*`) < OPERATION (`mmap`,
- * `munmap`, etc.) < MMAP_KIND (`mmap/anon`, `mmap/file`).  Within equal rank,
- * the rule with the longer selector text is preferred.  LATENCY and ERRNO
- * rules are matched independently — both can fire on a single call.
+ * Any invalid line rejects the whole file: the process then runs with no rules
+ * and the status file names the line (fail-open, but visible).
  *
- * @par Config reload protocol
- * The config is checked for modification on every intercepted call via a
- * stat(2) mtime hash.  If the hash has changed, the inactive slot in a
- * two-snapshot buffer is updated atomically.  A CAS on the cached mtime
- * ensures exactly one thread performs the reload; concurrent callers observe
- * the RELOADING sentinel and fall back to the current active snapshot.
+ * @par Rule selection
+ * Per call, the LATENCY rules and the ERRNO rules are matched separately, so one
+ * call can be both delayed and failed. Among the matching rules of one effect the
+ * most specific selector wins: `*` (rank 1) < operation (rank 2) < `mmap/anon` /
+ * `mmap/file` (rank 3); equal rank goes to the longer selector text, then to the
+ * earlier line.
+ *
+ * @par Reload
+ * After the first load, each process looks at the rule file (one stat(2)) at most
+ * once per CHAOS_CHECK_INTERVAL_NS (1 ms, vDSO CLOCK_MONOTONIC); without a vDSO
+ * clock it looks on every call. A changed change stamp (mtime, size, inode,
+ * device) makes one thread, chosen by CAS on the cached stamp, parse the file
+ * into the inactive of two snapshots and publish it; other threads keep serving
+ * the active snapshot meanwhile. Details in chaos_memory_config.c.
  *
  * @par Stability
- * Internal — do not include from outside the memory chaos module.
+ * Internal.
  */
 #ifndef CHAOS_MEMORY_CONFIG_H
 #define CHAOS_MEMORY_CONFIG_H
 
 #include "chaos_memory_internal.h"
+#include "chaos_hits.h"
+#include "chaos_policy.h"
+#include "chaos_status.h"
 
 /* =========================================================================
  * Enumerations
@@ -53,120 +61,88 @@
  */
 
 /**
- * @brief Identifies which memory syscall a rule targets.
+ * @brief Intercepted function a selector names.
  *
- * @details
- * Assigned at parse time from the selector text and stored in
- * chaos_memory_selector_t::operation.  The value CHAOS_MEMORY_OP_INVALID is
- * used by the SELECTOR_ANY kind where the operation field is irrelevant.
+ * @details posix_madvise() is matched as CHAOS_MEMORY_OP_MADVISE; mmap64() as
+ * CHAOS_MEMORY_OP_MMAP.
  */
 typedef enum chaos_memory_operation
 {
-    /** Sentinel: operation field is not meaningful for this selector kind. */
+    /** No operation: used by the `*` selector, which ignores the field. */
     CHAOS_MEMORY_OP_INVALID = -1,
-    /** Matches calls to mmap(2), potentially further refined by mmap_kind. */
+    /** mmap(2), mmap64; `mmap/anon` and `mmap/file` refine it. */
     CHAOS_MEMORY_OP_MMAP,
-    /** Matches calls to mprotect(2). */
+    /** mprotect(2). */
     CHAOS_MEMORY_OP_MPROTECT,
-    /** Matches calls to madvise(2). */
+    /** madvise(2) and posix_madvise(3). */
     CHAOS_MEMORY_OP_MADVISE,
-    /** Matches calls to munmap(2). */
+    /** munmap(2). */
     CHAOS_MEMORY_OP_MUNMAP
 } chaos_memory_operation_t;
 
 /**
- * @brief Discriminator for the three selector granularities.
+ * @brief Granularity of a selector; determines its rank in rule selection.
  *
  * @details
- * Controls how chaos_memory_selector_matches() interprets the rest of the
- * chaos_memory_selector_t fields and determines the specificity rank returned
- * via rank_out:
- *
- *  - ANY (rank 1): matches every intercepted call regardless of operation or
- *    mmap flags.  Corresponds to the `*` selector token.
- *  - OPERATION (rank 2): matches all calls to a specific syscall.  Corresponds
- *    to `mmap`, `munmap`, `mprotect`, `madvise`.
- *  - MMAP_KIND (rank 3): matches mmap calls further filtered by the
- *    MAP_ANONYMOUS flag.  Corresponds to `mmap/anon` and `mmap/file`.
+ * | Kind      | Selector text                                 | Rank |
+ * |-----------|-----------------------------------------------|------|
+ * | ANY       | `*`                                           | 1    |
+ * | OPERATION | `mmap`, `munmap`, `mprotect`, `madvise`       | 2    |
+ * | MMAP_KIND | `mmap/anon`, `mmap/file`                      | 3    |
  */
 typedef enum chaos_memory_selector_kind
 {
-    /** Sentinel: invalid or uninitialised selector. */
+    /** Not a parsed selector. */
     CHAOS_MEMORY_SELECTOR_INVALID = -1,
-    /** Matches all intercepted operations (wildcard selector `*`). */
+    /** `*`: every intercepted call. */
     CHAOS_MEMORY_SELECTOR_ANY,
-    /** Matches a specific operation (e.g., `mmap`, `munmap`). */
+    /** One operation, e.g. `mmap`. */
     CHAOS_MEMORY_SELECTOR_OPERATION,
-    /**
-     * Matches a specific mmap mapping kind (`mmap/anon` or `mmap/file`).
-     * Only valid when operation == CHAOS_MEMORY_OP_MMAP.
-     */
+    /** `mmap/anon` or `mmap/file`; operation is always CHAOS_MEMORY_OP_MMAP. */
     CHAOS_MEMORY_SELECTOR_MMAP_KIND
 } chaos_memory_selector_kind_t;
 
 /**
- * @brief Discriminates between anonymous and file-backed mmap mappings.
+ * @brief Anonymous versus file-backed mapping, decided by MAP_ANONYMOUS
+ *        (chaos_memory_mmap_is_anonymous()).
  *
  * @details
- * Used only when selector kind is CHAOS_MEMORY_SELECTOR_MMAP_KIND.  The
- * classification is driven by chaos_memory_mmap_is_anonymous(flags):
- *
- *  - ANON: MAP_ANONYMOUS is set.  This is the path used by:
- *    - glibc's malloc for allocations > MMAP_THRESHOLD (default 128 KiB).
- *      Injecting ERRNO:ENOMEM on `mmap/anon` fails large glibc allocations;
- *      small allocations via brk() are unaffected.
- *    - musl's malloc for all allocations (no brk path).  ERRNO:ENOMEM on
- *      `mmap/anon` fails every malloc() call under musl immediately.
- *    - Stack growth, JIT code buffers, shared-memory IPC.
- *
- *  - FILE: MAP_ANONYMOUS is clear.  This is the path used for memory-mapped
- *    files (mmap of an open fd), device mappings, and POSIX shared memory
- *    objects.  Injecting ERRNO:EACCES here tests file-mapping error paths
- *    without disturbing the allocator.
+ *  - ANON (`mmap/anon`): memory of preloaded allocators and runtimes, JIT code
+ *    buffers, MAP_SHARED|MAP_ANONYMOUS memory shared with children. Not libc
+ *    malloc, which calls its internal `__mmap` (see chaos_memory_mmap_is_anonymous()).
+ *  - FILE (`mmap/file`): mappings of a descriptor: files, devices, POSIX shared
+ *    memory objects. A rule here tests file-mapping error paths without touching
+ *    a preloaded allocator.
  */
 typedef enum chaos_memory_mmap_kind
 {
-    /** Sentinel: not applicable or uninitialised. */
+    /** Not a `mmap/...` selector. */
     CHAOS_MEMORY_MMAP_KIND_INVALID = -1,
-    /** MAP_ANONYMOUS is set — anonymous private or shared mapping. */
+    /** MAP_ANONYMOUS set. */
     CHAOS_MEMORY_MMAP_KIND_ANON = 0,
-    /** MAP_ANONYMOUS is clear — file-backed or device mapping. */
+    /** MAP_ANONYMOUS clear. */
     CHAOS_MEMORY_MMAP_KIND_FILE
 } chaos_memory_mmap_kind_t;
 
 /**
- * @brief Enumerates the injectable effects.
+ * @brief Effect of a rule. Both act before the real function is called.
  *
  * @details
- * A rule carries exactly one effect.  Two independent matching passes are
- * performed per intercepted call — one for LATENCY, one for ERRNO — so both
- * can fire on the same call if two matching rules exist.
+ *  - ERRNO: set errno to errnum and return the failure value (MAP_FAILED; -1;
+ *    posix_madvise(): the error number) without calling the real function.
+ *  - LATENCY: sleep latency_ms, then call the real function.
  *
- *  - ERRNO (pre-call): sets errno to rule->errnum and returns the
- *    syscall-specific error sentinel without invoking the real function.
- *    For mmap(2) the sentinel is MAP_FAILED ((void*)-1); for munmap(2),
- *    mprotect(2), and madvise(2) it is -1.
- *
- *  - LATENCY (pre-call): sleeps for rule->latency_ms milliseconds before
- *    passing the call through to the real function.  Does not suppress the
- *    call.
- *
- * @note CORRUPT and OFFSET effects are intentionally absent for mmap.  The
- *       result of mmap(2) is a raw pointer to newly-mapped memory.  Corrupting
- *       that pointer after a successful mapping would mean either (a) writing
- *       into the mapping itself — undefined behaviour for file-backed mappings
- *       and data corruption for anonymous ones — or (b) returning a pointer
- *       that does not correspond to any mapping, causing an immediate SIGSEGV
- *       on first access.  Neither is a useful fault mode; pre-call ERRNO is
- *       the correct abstraction for testing allocator error paths.
+ * @note There is deliberately no CORRUPT or OFFSET effect: the only output of
+ *       mmap() is an address, and altering it yields SIGSEGV or corrupted data
+ *       rather than an error path (see chaos_memory_actions.c).
  */
 typedef enum chaos_memory_effect
 {
-    /** Sentinel: invalid or uninitialised effect. */
+    /** Not a parsed effect. */
     CHAOS_MEMORY_EFFECT_INVALID = -1,
-    /** Pre-call error injection: set errno and return MAP_FAILED / -1. */
+    /** `ERRNO`: fail the call with errnum. */
     CHAOS_MEMORY_EFFECT_ERRNO = 0,
-    /** Pre-call latency injection: sleep for latency_ms before the call. */
+    /** `LATENCY`: delay the call by latency_ms. */
     CHAOS_MEMORY_EFFECT_LATENCY
 } chaos_memory_effect_t;
 
@@ -176,156 +152,114 @@ typedef enum chaos_memory_effect
  */
 
 /**
- * @brief Parsed selector — identifies which calls a rule applies to.
+ * @brief Parsed selector (chaos_memory_selector_parse()).
  *
- * @details
- * Populated by chaos_memory_selector_parse().  The active fields depend on
- * @c kind:
- *
- *  - kind == ANY:        @c operation and @c mmap_kind are ignored.
- *  - kind == OPERATION:  @c operation identifies the syscall; @c mmap_kind is
- *                        ignored.
- *  - kind == MMAP_KIND:  both @c operation (always MMAP) and @c mmap_kind are
- *                        meaningful.
- *
- * @note Ownership: embedded by value in chaos_memory_rule_t.  No heap
- *       allocation; lifetime is that of the enclosing rule.
+ * @details Embedded by value in a rule; no heap memory.
  */
 typedef struct chaos_memory_selector
 {
-    /**
-     * @brief Discriminator that controls interpretation of the other fields.
-     * Never CHAOS_MEMORY_SELECTOR_INVALID in a successfully parsed selector.
-     */
+    /** Granularity; never CHAOS_MEMORY_SELECTOR_INVALID after a successful parse. */
     chaos_memory_selector_kind_t kind;
 
-    /**
-     * @brief The target syscall.
-     * Meaningful when kind is OPERATION or MMAP_KIND; set to
-     * CHAOS_MEMORY_OP_INVALID when kind is ANY.
-     */
+    /** Target operation; CHAOS_MEMORY_OP_INVALID for `*`. */
     chaos_memory_operation_t operation;
 
-    /**
-     * @brief Anonymous vs file-backed mapping discriminator.
-     * Meaningful only when kind is MMAP_KIND; set to
-     * CHAOS_MEMORY_MMAP_KIND_INVALID otherwise.
-     */
+    /** Mapping kind for MMAP_KIND; CHAOS_MEMORY_MMAP_KIND_INVALID otherwise. */
     chaos_memory_mmap_kind_t mmap_kind;
 
     /**
-     * @brief Byte length of the original selector text (e.g., 9 for "mmap/anon").
-     * Used as a tiebreaker within equal-rank selectors: longer text wins.
-     * This ensures `mmap/anon` beats `mmap` when both match an anonymous call.
+     * Length of the selector text (9 for "mmap/anon"): tie-breaker between matching
+     * rules of equal rank, longer wins. Two selectors of equal rank that match the
+     * same call have the same text, so rank alone decides today (`mmap/anon` beats
+     * `mmap` by rank 3 > 2, not by length).
      */
     size_t selector_len;
 } chaos_memory_selector_t;
 
 /**
- * @brief A single parsed fault-injection rule.
+ * @brief One parsed rule.
  *
- * @details
- * Produced by chaos_memory_config_parse_line() and stored in the active
- * config snapshot.  Fields not relevant to a given effect are zero-initialised
- * but must not be read by code that has not checked @c effect first.
- *
- * @note Ownership: stored by value in chaos_memory_config_state_t::rules[].
- *       Copied by value into the caller's stack when matched by
- *       chaos_memory_config_select_rule(), so callers own their copy.
+ * @details Stored by value in a snapshot; chaos_memory_config_select_rule() copies
+ * the winner to the caller, which owns the copy. Fields of the other effect are 0.
  */
 typedef struct chaos_memory_rule
 {
-    /** @brief Selector describing which calls this rule matches. */
+    /** Which calls the rule matches. */
     chaos_memory_selector_t selector;
 
-    /**
-     * @brief The effect to apply when this rule fires.
-     * Never CHAOS_MEMORY_EFFECT_INVALID in a successfully parsed rule.
-     */
+    /** ERRNO or LATENCY; never CHAOS_MEMORY_EFFECT_INVALID after a successful parse. */
     chaos_memory_effect_t effect;
 
     /**
-     * @brief The errno value to inject when effect == ERRNO.
-     * One of: ENOMEM, EINVAL, EACCES, EPERM, EBADF, ENODEV, EAGAIN,
-     * EFAULT, ENOSYS, ENFILE, EMFILE, or a positive integer literal.
-     * Zero when effect != ERRNO.
+     * errno to inject (ERRNO): ENOMEM, EINVAL, EACCES, EPERM, EBADF, ENODEV, EAGAIN,
+     * EFAULT, ENOSYS, ENFILE, EMFILE, or a decimal number in 1..2147483647.
      */
     int errnum;
 
-    /**
-     * @brief Probability that this rule fires on any given matching call.
-     * Range: [0.0, 1.0].  0.0 means never fire; 1.0 means always fire.
-     * Evaluated by chaos_memory_probability_hit() against the per-thread PRNG.
-     * Parsed from the optional `@<p>` suffix in the config value field;
-     * defaults to 1.0 if no suffix is present.
-     */
+    /** Firing probability in [0.0, 1.0], from the `@<p>` suffix of the value; default 1.0. */
     double probability;
 
-    /**
-     * @brief Delay in milliseconds when effect == LATENCY.
-     * Applied as a pre-call sleep; the real syscall is still issued afterwards.
-     * Zero when effect != LATENCY.
-     */
+    /** Delay in milliseconds (LATENCY), 0..4294967295; 0 is accepted and sleeps nothing. */
     unsigned int latency_ms;
+    /** Qualifiers written after the rule (`@first`, `@from`, `@until`, `@size`). */
+    chaos_rule_policy_t policy;
+    /**
+     * Length in bytes of the call this copy is being decided for, set by the
+     * wrappers; CHAOS_POLICY_NO_SIZE in a snapshot, which fails every `@size` gate.
+     */
+    uint64_t call_size;
+    /** Hit counter of this rule (see chaos_hits.h); NULL for a rule outside a snapshot. */
+    chaos_hit_slot_t *hit;
+    /** Generation of @c hit when the rule was published; a later one means the rule left. */
+    uint64_t hit_generation;
 } chaos_memory_rule_t;
 
 /* =========================================================================
- * Public API
+ * API
  * =========================================================================
  */
 
 /**
- * @brief Initialise the config subsystem to a clean, zero-rule state.
+ * @brief Resets the rule state: both snapshots empty, active index 0, cached stamp
+ *        CHAOS_MEMORY_MTIME_UNKNOWN (so the next look reloads unthrottled).
  *
- * @details
- * Called once from chaos_memory_init() at constructor time.  Zeroes both
- * config snapshots, sets the active index to 0, and resets the cached mtime
- * to CHAOS_MEMORY_MTIME_UNKNOWN so that the first call to
- * chaos_memory_config_prepare() triggers an unconditional reload.
- *
- * Not thread-safe — must only be called from the module constructor before
- * any intercepted syscall can be made.
+ * @details Also resets the hit pool and the hits-file identity, registers the fork
+ * child handler (once per process), and finds the vDSO clock outside any wrapper.
+ * Not thread-safe: called by the constructor (and unit tests) before any other
+ * thread uses the library.
  */
 void chaos_memory_config_init(void);
 
 /**
- * @brief Check for config file changes and reload if necessary.
+ * @brief Reloads the rule file if it changed; returns whether rules are active.
  *
- * @details
- * Called at the top of chaos_memory_config_match() on every intercepted call.
- * The implementation stats the config file, hashes the mtime, and compares it
- * to the cached hash.  If they differ it attempts a CAS on the cached mtime to
- * claim the reload slot; exactly one thread wins and updates the inactive
- * snapshot, then publishes it atomically.  All other threads fall back to the
- * currently active snapshot.
+ * @details Called by chaos_memory_config_match() on every intercepted call (once
+ * per pass). The look at the file is throttled to once per CHAOS_CHECK_INTERVAL_NS
+ * (1 ms) after the first load; on a changed stamp exactly one thread reloads (CAS
+ * on the cached stamp) while the others serve the active snapshot. errno is
+ * preserved.
  *
- * Fail-open: if the config file is absent, unreadable, or syntactically
- * invalid, the active snapshot is set to zero rules and all calls pass
- * through without fault injection.
+ * Failure behaviour: an absent, unopenable (EACCES/EPERM), oversized, NUL-containing
+ * or invalid file publishes an empty snapshot (no injection); a transient read
+ * failure or a read that raced a writer keeps the previous snapshot and retries
+ * on the next look.
  *
- * @return Non-zero if the active config has at least one valid rule after the
- *         prepare step, zero otherwise.
+ * @return Non-zero if the active snapshot holds at least one rule.
  */
 int chaos_memory_config_prepare(void);
 
 /**
- * @brief Match a rule from the already-loaded active config snapshot.
+ * @brief Selects the best rule of the active snapshot without looking at the file.
  *
- * @details
- * Does not stat or reload the config file.  Used when the caller has already
- * called chaos_memory_config_prepare() and wants to avoid a second reload
- * check.  Selects the best-matching rule (highest rank, then longest selector)
- * for the given effect/operation/flags combination.
+ * @details For callers that already ran chaos_memory_config_prepare(). Reads the
+ * snapshot without a lock and validates it with its sequence counter: a result
+ * from a snapshot that a reload rewrote meanwhile is discarded (returns 0).
  *
- * @param effect      The effect to match (ERRNO or LATENCY).
- * @param operation   The intercepted syscall being matched.
- * @param mmap_flags  The @p flags argument from the mmap(2) call.  Ignored
- *                    (passed as 0) for non-mmap operations; used by
- *                    chaos_memory_mmap_is_anonymous() for mmap/anon vs
- *                    mmap/file discrimination.
- * @param[out] rule   Populated with a copy of the matched rule on success.
- *                    Undefined on failure.
- * @return            Non-zero if a matching rule was found, zero otherwise.
+ * @param effect      ERRNO or LATENCY.
+ * @param operation   Intercepted operation.
+ * @param mmap_flags  mmap() flags (for `mmap/anon` / `mmap/file`); 0 for other calls.
+ * @param[out] rule   Copy of the winning rule; unspecified when 0 is returned.
+ * @return Non-zero if a rule matched.
  */
 int chaos_memory_config_match_loaded(
     chaos_memory_effect_t effect,
@@ -335,21 +269,16 @@ int chaos_memory_config_match_loaded(
 );
 
 /**
- * @brief Prepare the config (reload if stale) then match a rule.
+ * @brief chaos_memory_config_prepare() then chaos_memory_config_match_loaded(): the
+ *        entry point of the wrappers, once per effect pass.
  *
- * @details
- * Combines chaos_memory_config_prepare() and chaos_memory_config_match_loaded()
- * in one call.  This is the entry point used by the hook wrappers in
- * chaos_memory_hooks.c for each effect pass.
+ * @details Returns 0 without scanning when @p rule is NULL or no rule is active.
  *
- * Returns zero immediately if @p rule is NULL or if config_prepare reports
- * no rules are active (fast path with no matching work).
- *
- * @param effect      The effect to match (ERRNO or LATENCY).
- * @param operation   The intercepted syscall being matched.
- * @param mmap_flags  The @p flags argument from mmap(2), or 0 for other ops.
- * @param[out] rule   Populated with a copy of the matched rule on success.
- * @return            Non-zero if a matching rule was found, zero otherwise.
+ * @param effect      ERRNO or LATENCY.
+ * @param operation   Intercepted operation.
+ * @param mmap_flags  mmap() flags, or 0.
+ * @param[out] rule   Copy of the winning rule.
+ * @return Non-zero if a rule matched.
  */
 int chaos_memory_config_match(
     chaos_memory_effect_t effect,
@@ -359,64 +288,56 @@ int chaos_memory_config_match(
 );
 
 /**
- * @brief Parse a single line from the config file into a rule.
+ * @brief Parses one rule line (qualifiers already removed by chaos_policy_extract()).
  *
- * @details
- * Strips trailing comments (`#` through end-of-line), trims whitespace, and
- * splits the line into selector, effect, and value fields on `:` delimiters.
- * The @p probability suffix is parsed from the value field if an `@` character
- * is present.
+ * @details Cuts the line at the first `#`, trims it, splits it at the first two
+ * `:` into selector, effect and value, and splits the value at its last `@` into
+ * payload and probability.
  *
- * @param[in,out] line  Null-terminated line buffer.  Modified in place
- *                      (comment stripping, token splitting).
- * @param[out]    rule  Populated on success (return value 1).
- *                      Zeroed but otherwise undefined on failure (return -1).
- *                      Not written on blank/comment lines (return 0).
- * @return   1  if a valid rule was parsed into @p rule.
- * @return   0  if the line is blank or a comment (not an error).
- * @return  -1  if the line is syntactically invalid.
+ * @param[in,out] line  NUL-terminated line; modified in place.
+ * @param[out]    rule  Filled on 1; not written on 0; unspecified on -1.
+ * @return 1 for a rule, 0 for a blank or comment line, -1 for an invalid line.
  */
 int chaos_memory_config_parse_line(char *line, chaos_memory_rule_t *rule);
 
 /**
- * @brief Parse a complete null-terminated config buffer into a rule array.
+ * @brief Parses a whole rule file buffer, all or nothing.
  *
- * @details
- * Splits @p buffer on newlines and calls chaos_memory_config_parse_line() for
- * each line.  Accumulates valid rules into @p rules up to
- * CHAOS_MEMORY_MAX_RULES.  Returns -1 if any line is syntactically invalid or
- * if the rule count exceeds the limit; in that case @p rules and
- * @p rule_count are in an indeterminate state and the caller should discard
- * the entire buffer.
+ * @details Splits at '\n', extracts each line's qualifiers, then parses it. The first
+ * invalid line, qualifiers on a line without a rule, or a 257th rule rejects the
+ * buffer: *rule_count is set to 0 and chaos_memory_config_last_error() names the line
+ * and the reason. On success each rule's text is kept for the status and hits files
+ * and call_size is CHAOS_POLICY_NO_SIZE.
  *
- * @param[in,out] buffer      Null-terminated config text.  Modified in place
- *                            (newline splitting).
- * @param[out]    rules       Array of at least CHAOS_MEMORY_MAX_RULES entries.
- * @param[out]    rule_count  Number of valid rules written to @p rules.
- * @return   0 on success, -1 on any parse error or rule count overflow.
+ * @param[in,out] buffer      NUL-terminated text; modified in place.
+ * @param[out]    rules       Array of CHAOS_MEMORY_MAX_RULES entries.
+ * @param[out]    rule_count  Number of rules, 0 on failure.
+ * @return 0 on success, -1 on rejection.
  */
 int chaos_memory_config_parse_buffer(char *buffer, chaos_memory_rule_t *rules, size_t *rule_count);
 
 /**
- * @brief Select the best-matching rule from an array for a given call context.
+ * @brief The line the last chaos_memory_config_parse_buffer() call rejected.
  *
- * @details
- * Iterates @p rules, skipping entries whose effect does not match or whose
- * selector does not match the operation/flags combination.  Among matching
- * rules, chooses the one with the highest specificity rank; ties are broken by
- * the longer selector text (selector_len).
+ * @return The rejected line (`reason != NULL`), or a cleared record when the last
+ *         parse succeeded. Valid until the next parse.
+ */
+const chaos_status_error_t *chaos_memory_config_last_error(void);
+
+/**
+ * @brief Selects the most specific rule of @p effect that matches a call.
  *
- * This function is the core of the rule-matching algorithm and is separated
- * from the config state management so it can be unit-tested with arbitrary
- * rule arrays.
+ * @details Highest rank wins; equal rank goes to the longer selector text, then to
+ * the earlier rule. O(rule_count), no allocation. Separate from the snapshot code
+ * so tests can feed arbitrary rule arrays.
  *
- * @param rules       Array of parsed rules.  May be NULL (returns 0).
+ * @param rules       Rules; NULL returns 0.
  * @param rule_count  Number of entries in @p rules.
- * @param effect      Effect to filter on.
- * @param operation   Syscall to match against each selector.
- * @param mmap_flags  mmap(2) flags word; unused (should be 0) for non-mmap ops.
- * @param[out] rule   Populated with a copy of the winning rule on success.
- * @return            Non-zero if at least one rule matched, zero otherwise.
+ * @param effect      Effect to select.
+ * @param operation   Intercepted operation.
+ * @param mmap_flags  mmap() flags; 0 for other operations.
+ * @param[out] rule   Copy of the winner; NULL returns 0.
+ * @return Non-zero if a rule matched.
  */
 int chaos_memory_config_select_rule(
     const chaos_memory_rule_t *rules,

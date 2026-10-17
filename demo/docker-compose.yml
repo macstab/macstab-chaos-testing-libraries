@@ -1,16 +1,25 @@
 # Macstab Chaos Stack 00-1 — runnable demos, one docker compose PROFILE per fault.
 #
-#   export CHAOS_REPO=/path/to/chaos-testing-libraries      # source checkout (defaults below)
+#   export CHAOS_REPO=/path/to/chaos-testing-libraries   # optional; default: parent of demo/
 #   docker compose -f demo/docker-compose.yml run --rm mem1
 #   docker compose -f demo/docker-compose.yml run --rm io1
-#   ... etc. Profiles: io1 io2 io3 net1 net2 net3 dns1 dns2 dns3 time1 time2 mem1 mem2 proc1 proc2
-#   (io3 / net3 / dns3 are the exact faults written up in the blog: torn WAL, mid-stream reset, OVERRIDE.)
+#   Profiles: io1 io2 io3 net1 net2 net3 dns1 dns2 dns3 time1 time2 mem1 mem2 proc1 proc2
+#   (io3 / net3 / dns3 are the faults written up in the blog: torn WAL, mid-stream reset,
+#   OVERRIDE.) demo/run-all.sh runs all 15 and checks each output.
 #
-# The `build` service (no profile) always runs: it compiles all six .so from source into a
-# shared volume — guaranteed to work on any host with Docker, no published release required.
-# Every target image is Debian-bookworm (glibc), matching the built objects.
+# The `build` service has no profile. Every demo depends on its successful completion, so it
+# runs first on each `run`: `make native` against the checkout, then the six
+# libchaos-<lib>.so are copied into the `chaoslibs` volume, which demos mount read-only at /libs.
+# No published release is needed. Builder and demos share the gcc:bookworm image (glibc), so the
+# objects always match the demo libc.
+#
+# Each demo writes its rule file (/tmp/.chaos-<lib>.conf) inside its own container, compiles its
+# probe from demo/probes/ where a stock tool (cat, getent) cannot show the fault, and runs it
+# under LD_PRELOAD; the rule file always exists before the preloaded program starts.
+# `$$` in commands is compose's escape for a literal `$`.
 name: chaos-00-1-demo
 
+# Shared demo service template: image, build dependency, read-only libraries and probes.
 x-probe: &probe
   image: gcc:bookworm
   depends_on:

@@ -13,17 +13,32 @@
 
 ---
 
-`libchaos-memory` is the dedicated memory-mapping preload library in this
-repository. Repository-wide ownership and composition rules live in
-[`docs/SYSTEM.md`](SYSTEM.md). Platform-layer internals (ELF link-map ordering,
-PLT/GOT cold/hot paths, vDSO, AT_SECURE) are in [`docs/PLATFORM.md`](PLATFORM.md).
+`libchaos-memory` fails or delays memory-mapping calls of a dynamically linked
+process: an ERRNO rule makes `mmap` return `MAP_FAILED` (or `munmap`, `mprotect`,
+`madvise` return `-1`) with the configured errno, without the real call; a LATENCY
+rule delays the call. Rules live in `/tmp/.chaos-memory.conf`. This document
+describes the implementation in `src/memory/`; repository-wide composition rules are
+in [SYSTEM.md](SYSTEM.md), loader and symbol-resolution internals in
+[PLATFORM.md](PLATFORM.md).
 
-Current implementation status:
+| | |
+|---|---|
+| Interposed | `mmap`, `munmap`, `mprotect`, `madvise`, `posix_madvise` (uses the `madvise` rules, returns the error number), and on 64-bit glibc `mmap64` (alias of the `mmap` wrapper; the JVM, Redis, nginx and MySQL bind to it) |
+| Rule file | `/tmp/.chaos-memory.conf` |
+| Status file | `/tmp/.chaos-memory.status` |
+| Hits file | `/tmp/.chaos-memory.hits.<n>` |
+| Effects | ERRNO, LATENCY (both with a probability) |
+| Test gates | 100.00 % line coverage on `chaos_memory.c`, `chaos_memory_config.c`, `chaos_memory_actions.c`, `chaos_memory_hooks.c`; runtime probes on glibc and musl, amd64 and arm64 |
 
-- exact interposed symbols today: `mmap()`, `munmap()`, `mprotect()`, `madvise()`
-- config path: `/tmp/.chaos-memory.conf`
-- unit-tested; strict `100.00%` line coverage gate on `src/memory/*.c`
-- runtime probe implemented for glibc/musl and amd64/arm64 validation
+**Reach in LD_PRELOAD mode.** The wrappers see calls made through the exported
+symbols. The C library's own mappings do not go through them: glibc and musl
+`malloc`, thread-stack allocation in `pthread_create` and the dynamic loader call
+C-library-internal entry points that bind inside libc or `ld.so`. A memory rule
+therefore reaches mappings made by the application and by libraries that call the
+exported `mmap` (the JVM's heap reservation, jemalloc and other allocators linked
+into the program), not `malloc()` of the C library. SECCOMP mode (`chaos-init`)
+filters the system calls themselves and sees every mapping, the loader's and
+`malloc`'s included ([SECCOMP.md §5](SECCOMP.md#5-how-calls-map-to-the-libraries-operations)).
 
 ---
 
@@ -52,58 +67,26 @@ Current implementation status:
 
 ## 1. Virtual-Memory Taxonomy
 
-Linux user-space memory is divided into four archetypal VMA classes. Understanding
-which ones this library can and cannot reach is prerequisite to reasoning about
-injection scope.
+The `mmap` selectors classify a call by one bit of its `flags` argument:
+`mmap/anon` when `MAP_ANONYMOUS` is set, `mmap/file` otherwise (§5). The table maps
+the four classic mapping classes onto that split.
 
-### 1.1 Anonymous Private (`MAP_PRIVATE | MAP_ANONYMOUS`)
+| Class | flags | Selector | Typical callers that reach the wrapper |
+|---|---|---|---|
+| Anonymous private | `MAP_PRIVATE \| MAP_ANONYMOUS` | `mmap/anon` | Runtime heaps (JVM heap and code cache reservation), allocators outside libc, guard regions (`PROT_NONE`) |
+| Anonymous shared | `MAP_SHARED \| MAP_ANONYMOUS` | `mmap/anon` | Memory shared with children after `fork()` |
+| File-backed private | `MAP_PRIVATE`, a file descriptor | `mmap/file` | Programs mapping files read-only or copy-on-write |
+| File-backed shared | `MAP_SHARED`, a file descriptor | `mmap/file` | Memory-mapped files, POSIX shared memory (`shm_open` + `mmap`), device mappings |
 
-Backed by zero pages from the kernel's page allocator (ZONE_NORMAL / ZONE_HIGHMEM
-depending on arch and size). Pages are demand-paged from the zero-page until first
-write, at which point CoW (copy-on-write) creates a private physical page. The
-allocators (`malloc`, operator `new`) use anonymous VMAs for large allocations
-(glibc: `>= MMAP_THRESHOLD`, default 128 KB; mallocng: arena threshold per
-`malloc_options.h`).
+The sharing flag and the descriptor are not inspected: `MAP_ANONYMOUS` alone
+decides.
 
-Selector `mmap/anon` fires for any call where `flags & MAP_ANONYMOUS` is non-zero.
-`MAP_ANONYMOUS | MAP_PRIVATE` is the dominant class. `MAP_ANONYMOUS | MAP_SHARED`
-(SysV IPC emulation) also matches.
-
-### 1.2 File-Backed Private (`MAP_PRIVATE`, fd ≥ 0)
-
-Used by the dynamic linker to map ELF segments (text, rodata, data+bss CoW),
-by `dlopen()` for shared libraries, and by application code for memory-mapped I/O.
-Writeable pages get CoW copies on first write; the underlying file is never
-modified. Selector `mmap/file` fires.
-
-Because the dynamic linker calls `mmap()` during `dl_open` before `dlsym`
-returns control to `__libc_start_main`, injection here can make library loading
-fail — which is a valid test (ENOMEM from a plugin loader) but requires care with
-probability guards.
-
-### 1.3 File-Backed Shared (`MAP_SHARED`, fd ≥ 0)
-
-Direct page-cache sharing; writes are visible to other processes mapping the same
-file and propagate to the backing file on writeback. Used for IPC via `mmap()` of
-a shared file, for `shm_open`/`posix_shm`, and for POSIX shared memory objects.
-Selector `mmap/file` fires.
-
-### 1.4 Anonymous Shared (`MAP_SHARED | MAP_ANONYMOUS`)
-
-Zero-initialised pages shared between parent and children after `fork()`. Pages
-live in tmpfs internally (Linux ≥ 2.4). Selector `mmap/anon` fires because the
-`MAP_ANONYMOUS` bit is set regardless of the sharing flag.
-
-### 1.5 Guard Pages and Special VMAs
-
-`PROT_NONE` guard pages are typically created by `mmap(NULL, size, PROT_NONE,
-MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)`. They match `mmap/anon`. Thread stack guards,
-`pthread_create`-internal guard pages, and `valgrind`/`asan` shadow maps all
-arrive through the same `mmap()` call path. Injecting `ENOMEM` with a non-zero
-probability here will trigger thread-creation failures — a valid chaos scenario,
-but the correct configuration should use the `mmap/anon` selector with a small
-probability guard (e.g., `mmap/anon:ERRNO:ENOMEM@0.001`) rather than a hard
-100% rate.
+Mappings the wrapper does not see in LD_PRELOAD mode: ELF segments mapped by the
+dynamic loader at start-up and on `dlopen()`, glibc and musl `malloc` (§2), thread
+stacks and guard pages created by `pthread_create`, stack growth and other
+kernel-internal mappings. Under SECCOMP mode the loader's and `malloc`'s mappings are
+ordinary `mmap` system calls: an `mmap/file:ERRNO:ENOMEM` rule there stops a dynamic
+program from loading (exit 127); narrow it with `@size`, `@first` or `@from`.
 
 ---
 
@@ -111,58 +94,45 @@ probability guard (e.g., `mmap/anon:ERRNO:ENOMEM@0.001`) rather than a hard
 
 ### 2.1 glibc ptmalloc2
 
-ptmalloc2 (Wolfram Gloger's malloc, derived from Doug Lea's dlmalloc, standard in
-glibc since 2.3) manages a main arena and per-thread arenas. Small allocations
-(below `MMAP_THRESHOLD`, default 128 KiB) are served from arena bins using the
-`brk()`/`sbrk()` heap segment. Allocations at or above the threshold use
-`mmap(MAP_PRIVATE|MAP_ANONYMOUS)` directly and are freed with `munmap()`.
+ptmalloc2 serves requests below `M_MMAP_THRESHOLD` (128 KiB by default, adjusted
+dynamically by glibc unless set with `mallopt` or `MALLOC_MMAP_THRESHOLD_`) from
+arenas grown with `brk`/`sbrk` (main arena) or arena mappings (other threads), and
+requests at or above it with a dedicated anonymous mapping released by `munmap`.
 
-Consequence for injection:
-
-- `malloc(N)` for N ≥ 128 KiB → `mmap/anon:ERRNO:ENOMEM` can make it fail
-- `malloc(N)` for N < 128 KiB → served from the arena, **not through `mmap()`**;
-  `mmap/anon:ERRNO:ENOMEM` does NOT affect it
-- `free()` of a large allocation → `munmap()`; `munmap:ERRNO:EINVAL` can leave
-  the mapping alive (intentional semantics, see §4.3)
-
-The threshold is tunable via `mallopt(M_MMAP_THRESHOLD, ...)` or
-`MALLOC_MMAP_THRESHOLD_` environment variable. At runtime the threshold adapts
-upward dynamically (up to `DEFAULT_MMAP_MAX = 65536` mmaps) unless disabled by
-`mallopt(M_TRIM_THRESHOLD, -1)`.
-
-Reference: glibc `malloc/malloc.c`, symbols `__libc_malloc`, `_int_malloc`,
-`sysmalloc`; POSIX.1-2017 §11.2 (no dynamic threshold is standardised).
+All of these calls go through glibc's internal `__mmap`/`__munmap`/`__madvise`
+aliases, which are bound inside libc and never through the exported symbols. In
+LD_PRELOAD mode `mmap/anon:ERRNO:ENOMEM` therefore does **not** make `malloc()` fail,
+for any size. To fail large glibc allocations, use SECCOMP mode, where the same rule
+with `@size>131071` hits the dedicated mappings above the default threshold.
 
 ### 2.2 musl mallocng
 
-musl's `mallocng` (introduced in musl 1.2.x, replacing the previous "old malloc")
-does not use `brk()` at all. All arenas are `mmap(MAP_PRIVATE|MAP_ANONYMOUS)`.
-Meta-data pages (group headers, `struct meta_area`) are allocated by an internal
-`alloc_meta()` path that also uses anonymous `mmap()`.
+musl's mallocng (musl 1.2.1 and later) maps its groups with its internal `__mmap`
+and grows its metadata area with the `brk` system call, both invisible to the
+exported symbols. As with glibc, memory rules in LD_PRELOAD mode do not reach musl's
+`malloc()`; SECCOMP mode does, and since mallocng maps memory for small size classes
+as well, an unrestricted `mmap/anon:ERRNO:ENOMEM` under SECCOMP mode fails a musl
+program almost immediately. Use a low probability or `@size`.
 
-Consequence: on musl, even small allocations eventually require `mmap()`. The
-selector `mmap/anon` has broader coverage against mallocng than against ptmalloc2.
+### 2.3 Allocators that do reach the wrapper
 
-Reference: musl `src/malloc/mallocng/malloc.c`, `alloc_meta()`, `nontrivial_free()`.
+An allocator linked into the program (jemalloc, tcmalloc, mimalloc) or a runtime
+managing its own heap (the JVM) calls the exported `mmap`/`munmap`/`madvise`, so the
+wrappers see those calls. This also happens during symbol resolution:
+`dlsym` → `calloc` → jemalloc → `mmap` → libchaos-memory, which is why the wrapper
+falls back to a raw system call while its own symbols are unresolved (§14).
 
-### 2.3 Why brk/sbrk Is Not Interposed
+### 2.4 Why brk/sbrk Is Not Interposed
 
-`brk(2)` and `sbrk(3)` are the historical heap-extension primitives. glibc's
-ptmalloc2 calls `__sbrk()` internally to extend the main arena's heap region.
-However:
+- The C libraries' allocators never call the exported `brk`/`sbrk`: glibc uses its
+  internal `__brk`/`__sbrk`, musl issues the system call directly. An interposed
+  `brk` would see almost nothing.
+- Failing a heap extension behind an allocator's back is not a clean fault: the
+  allocator handles `brk` failure by falling back to `mmap`, so the observable effect
+  is a different mapping pattern, not an allocation failure.
 
-1. `brk()` is a raw syscall on Linux (NR 12 on x86_64, NR 214 on aarch64); glibc's
-   `sbrk()` wrapper calls it directly via `__brk()` which uses the `brk` syscall
-   number. LD_PRELOAD interposition of a libc symbol `brk` or `sbrk` would work
-   only if the allocator called it through the public libc symbol table — which
-   glibc's own malloc does not (it calls `__brk` directly, bypassing the PLT).
-2. musl mallocng does not use `brk()` at all; the hook would be dead on musl.
-3. The behaviour of breaking the main arena heap in a controlled way is extremely
-   difficult to make idempotent; a failed `brk()` corrupts the arena's bookkeeping
-   in ways that are not recoverable without forking the allocator.
-
-For heap exhaustion scenarios, the correct injection point is `mmap/anon:ERRNO:ENOMEM`
-for large allocations (ptmalloc2 mmap path) and for all allocations on musl.
+For heap exhaustion scenarios, use `mmap/anon` rules on the allocators that call the
+exported `mmap` (§2.3), or SECCOMP mode for the C library's `malloc`.
 
 ---
 
@@ -171,146 +141,149 @@ for large allocations (ptmalloc2 mmap path) and for all allocations on musl.
 ### 3.1 Full ABNF (RFC 5234)
 
 ```abnf
-rule-line   = selector ":" effect ":" value [ "@" probability ] CRLF / LF
-selector    = "*"
-            / "mmap"
-            / "mmap/anon"
-            / "mmap/file"
-            / "munmap"
-            / "mprotect"
-            / "madvise"
+line        = [ rule *( 1*WSP qualifier ) ] *WSP [ comment ] LF
+rule        = *WSP selector *WSP ":" *WSP effect *WSP ":" *WSP value
+selector    = "*" / "mmap" / "mmap/anon" / "mmap/file"
+            / "munmap" / "mprotect" / "madvise"
 effect      = "ERRNO" / "LATENCY"
-value       = errno-name / latency-ms
-errno-name  = 1*ALPHA *( ALPHA / DIGIT / "_" )
-latency-ms  = 1*DIGIT
-probability = "0." 1*DIGIT / "1.0" / "1"
+value       = payload [ "@" probability ]     ; split at the last "@"; no blanks around "@"
+payload     = errno-value / latency-ms        ; at most 255 bytes
+errno-value = "ENOMEM" / "EINVAL" / "EACCES" / "EPERM" / "EBADF" / "ENODEV"
+            / "EAGAIN" / "EFAULT" / "ENOSYS" / "ENFILE" / "EMFILE"
+            / 1*DIGIT                          ; decimal, 1 .. 2147483647
+latency-ms  = 1*DIGIT                          ; decimal, 0 .. 4294967295
+probability = ( "0" [ "." 1*DIGIT ] ) / ( "1" [ "." 1*"0" ] )
+qualifier   = "@first=" 1*18DIGIT / "@from=" 1*18DIGIT / "@until=" 1*18DIGIT
+            / "@size>" 1*18DIGIT / "@size<" 1*18DIGIT
+                                               ; @first > 0; @until > @from when both set
+comment     = "#" *( VCHAR / WSP )
 ```
 
-`*` is the wildcard selector matching any interposed call regardless of symbol
-name. More specific selectors (`mmap/anon`, `mmap/file`) take precedence; see
-§3.2 for rule ordering.
+- The selector ends at the first `:`, the effect at the second; everything after it
+  is the value.
+- A blank before `@` turns the probability into a word starting with `@`, which is
+  parsed as a qualifier and rejects the line: write `ENOMEM@0.05`, not
+  `ENOMEM @0.05`.
+- The probability is parsed without `strtod`, independent of `LC_NUMERIC`.
+- Omitted probability: 1.0. Probability 0 parses and never fires.
+- Limits: 256 rules (`CHAOS_MEMORY_MAX_RULES`), a file smaller than 262 144 bytes, no
+  NUL byte. Any violation rejects the whole file (§16).
 
-### 3.2 Rule Precedence and First-Match Semantics
+Examples:
 
-The config engine scans rules top-to-bottom. For a given call:
+```text
+mmap/anon:ERRNO:ENOMEM@0.05          # 5 % of anonymous mappings fail
+mmap/file:LATENCY:20                 # 20 ms on every file mapping
+mprotect:ERRNO:EPERM                 # every mprotect fails
+*:LATENCY:5@0.1                      # 10 % of all calls take 5 ms longer
+mmap/anon:ERRNO:ENOMEM @size>1048575 # only mappings of 1 MiB and more
+madvise:ERRNO:5                      # EIO by number (not in the name list)
+```
 
-1. The most specific matching selector wins per effect type.
-2. If two rules with the same effect and equal specificity exist, the one appearing
-   first in the file is applied.
-3. A single call evaluates `LATENCY` first (pre-call delay), then `ERRNO`
-   (pre-call failure gate). The real call fires only if `ERRNO` did not trigger.
-4. `mmap/anon` and `mmap/file` are more specific than `mmap`, which is more
-   specific than `*`. Within the specificity tier, first-match wins.
+### 3.2 Rule Precedence
+
+For every call the wrapper selects **one LATENCY rule and one ERRNO rule
+independently**:
+
+1. Only rules of that effect whose selector matches the call are candidates.
+2. Highest rank wins: `mmap/anon` and `mmap/file` (3) > `mmap`, `munmap`,
+   `mprotect`, `madvise` (2) > `*` (1).
+3. Equal rank: the longer selector text wins; equal text: the first rule in the file.
+4. LATENCY is applied first, then ERRNO. Both can fire on the same call: the call
+   is delayed and then fails.
+
+Each selected rule fires when its `@from`/`@until` window is open, its `@size` gate
+passes (the byte count is the `length` argument of all five functions), its
+probability draw succeeds and its `@first` budget is not used up. A rule that fires
+records a hit.
 
 ### 3.3 Effect Semantics per Symbol
 
-| Symbol     | LATENCY | ERRNO | Notes                                      |
-|------------|---------|-------|--------------------------------------------|
-| `mmap`     | yes     | yes   | LATENCY fires before the real call         |
-| `mmap/anon`| yes     | yes   | Sub-selector of mmap; MAP_ANONYMOUS test   |
-| `mmap/file`| yes     | yes   | Sub-selector of mmap; !MAP_ANONYMOUS test  |
-| `munmap`   | yes     | yes   | Synthetic failure leaves mapping alive     |
-| `mprotect` | yes     | yes   | No post-call mutation path                 |
-| `madvise`  | yes     | yes   | No hint-rewrite path                       |
+| Selector | Calls | LATENCY | ERRNO result |
+|---|---|---|---|
+| `mmap` | `mmap`, `mmap64` | before the call | `MAP_FAILED`, `errno` set, nothing mapped |
+| `mmap/anon` | `mmap` with `MAP_ANONYMOUS` | before the call | as `mmap` |
+| `mmap/file` | `mmap` without `MAP_ANONYMOUS` | before the call | as `mmap` |
+| `munmap` | `munmap` | before the call | `-1`, `errno` set; the mapping stays (§4.3) |
+| `mprotect` | `mprotect` | before the call | `-1`, `errno` set; protection unchanged |
+| `madvise` | `madvise` | before the call | `-1`, `errno` set; advice not given |
+| `madvise` | `posix_madvise` | before the call | the error number returned, `errno` unchanged |
+| `*` | all of the above | | |
+
+No effect mutates arguments or results. A corrupted `mmap` result would be either an
+address with no mapping (SIGSEGV on first access, not an error path) or a write into
+live memory (undefined behaviour), so CORRUPT and OFFSET do not exist here.
 
 ### 3.4 Valid `errno` Values per Call
 
-These are the values the POSIX.1-2017 and Linux man-pages document as meaningful;
-the library does not validate the configured value against this list but callers
-should use documented errors to avoid surprising application behaviour.
+The parser accepts the 11 names in §3.1 and any positive decimal number; it does not
+check whether the value is one the function can return. Use the values the Linux
+man pages document, so the application's error handling is the one that runs in
+production:
 
-`mmap()`: `EACCES`, `EAGAIN`, `EBADF`, `EINVAL`, `ENFILE`, `ENODEV`, `ENOMEM`,
-`EOVERFLOW`, `EPERM` (Linux 4.9+, MAP_FIXED_NOREPLACE seal), `ETXTBSY`.
-
-`munmap()`: `EINVAL`.
-
-`mprotect()`: `EACCES`, `EINVAL`, `ENOMEM`.
-
-`madvise()`: `EACCES`, `EAGAIN`, `EBADF`, `EINVAL`, `EIO`, `ENOMEM`, `EPERM`.
+| Call | Documented errors | Not in the name list (write as number; Linux asm-generic numbering on amd64 and arm64) |
+|---|---|---|
+| `mmap` | `EACCES`, `EAGAIN`, `EBADF`, `EEXIST` (`MAP_FIXED_NOREPLACE`), `EINVAL`, `ENFILE`, `ENODEV`, `ENOMEM`, `EOVERFLOW`, `EPERM`, `ETXTBSY` | `EEXIST` 17, `EOVERFLOW` 75, `ETXTBSY` 26 |
+| `munmap` | `EINVAL` | — |
+| `mprotect` | `EACCES`, `EINVAL`, `ENOMEM` | — |
+| `madvise` | `EACCES`, `EAGAIN`, `EBADF`, `EINVAL`, `EIO`, `ENOMEM`, `EPERM` | `EIO` 5 |
 
 ---
 
 ## 4. Per-Hook Call Flows
 
-### 4.1 `mmap()` Call Flow
+All five wrappers share one shape (`src/memory/chaos_memory_hooks.c`):
 
-```
+```text
 wrapper entry
-  ├─ chaos_memory_enter_internal()  → TLS guard: re-entrancy check
-  │    (guard non-zero → bypass all injection, call real mmap, return)
-  ├─ chaos_memory_check_config()    → stat(config_path), CAS-based reload if mtime changed
-  ├─ LATENCY rule match
-  │    if matched → nanosleep(ms * 1e6 ns) via real_nanosleep
-  ├─ ERRNO rule match
-  │    if matched and PRNG()/UINT32_MAX ≤ probability → errno=value, return MAP_FAILED
-  ├─ mmap_is_anonymous(flags) → set sub-selector for /anon or /file
-  ├─ real_mmap(addr, length, prot, flags, fd, offset)
-  └─ chaos_memory_leave_internal()
+  ├─ chaos_memory_ensure_symbols()          resolve real functions once (chaos_once)
+  ├─ guard set?  → real call, return        (the library's own work, §14)
+  ├─ LATENCY: chaos_memory_config_match()   refresh snapshot (≤ 1 stat per ms), select
+  │    rule found → apply_latency()         window, @size, probability, @first, then
+  │                                         chaos_sleep_ms(): raw clock_nanosleep
+  ├─ ERRNO: chaos_memory_config_match()
+  │    rule found and fires → errno = errnum, return error value (no real call)
+  └─ real call under the guard; while the real pointer is still NULL: raw syscall
 ```
 
-The reentrancy guard prevents the LATENCY nanosleep from recursing back through
-the memory wrapper (because `nanosleep` is in `libchaos-memory`'s own hook table).
-See §14 for the full TLS guard mechanics.
+The real call runs with the guard set, so any interposed call it makes internally
+passes through untouched. While symbol resolution is still running on this thread
+(re-entry from `dlsym`'s allocator, §2.3) the real pointer is NULL and the wrapper
+issues `SYS_mmap`, `SYS_munmap`, `SYS_mprotect` or `SYS_madvise` directly.
 
-### 4.2 `mprotect()` Call Flow
+### 4.1 `mmap()`
 
-```
-wrapper entry
-  ├─ chaos_memory_enter_internal()
-  ├─ chaos_memory_check_config()
-  ├─ LATENCY rule match
-  ├─ ERRNO rule match
-  │    if fired → errno=value, return -1
-  ├─ real_mprotect(addr, len, prot)
-  └─ chaos_memory_leave_internal()
-```
+The `flags` word is passed to both matches, so `mmap/anon` and `mmap/file` are
+decided per call (§5). ERRNO returns `MAP_FAILED` before any kernel work: no address
+range is reserved.
 
-No post-call mutation. The library does not rewrite `prot` values before or after
-the real call. Rewriting protection flags non-atomically would create TOCTOU
-windows unrelated to the failure mode being tested.
+### 4.2 `mprotect()`
 
-### 4.3 `munmap()` Call Flow
+The library never rewrites `prot`. Changing protection non-atomically would add a
+window unrelated to the fault being tested.
 
-```
-wrapper entry
-  ├─ chaos_memory_enter_internal()
-  ├─ chaos_memory_check_config()
-  ├─ LATENCY rule match
-  ├─ ERRNO rule match
-  │    if fired → errno=EINVAL (or configured), return -1
-  │    mapping remains alive in process address space
-  ├─ real_munmap(addr, len)
-  └─ chaos_memory_leave_internal()
-```
+### 4.3 `munmap()`
 
-The synthetic `munmap()` failure is semantically correct: when `munmap(2)` returns
-`EINVAL` from the kernel the mapping stays; this library's synthetic failure
-models exactly that observable. The library does not track that the mapping has
-been "leaked" — it is the caller's responsibility to retry or fail-fast, which is
-the behaviour the test is probing for.
+A synthetic failure returns `-1` and leaves the mapping in place, which is exactly
+what the caller observes when the kernel rejects `munmap` (`EINVAL`). The library
+does not track the leaked range; whether the application retries, aborts or leaks is
+what the test observes.
 
-### 4.4 `madvise()` Call Flow
+### 4.4 `madvise()` and `posix_madvise()`
 
-```
-wrapper entry
-  ├─ chaos_memory_enter_internal()
-  ├─ chaos_memory_check_config()
-  ├─ LATENCY rule match
-  ├─ ERRNO rule match
-  │    if fired → errno=value, return -1
-  ├─ real_madvise(addr, len, advice)
-  └─ chaos_memory_leave_internal()
-```
-
-`madvise()` is advisory by POSIX.1-2017 definition. A kernel is permitted to
-ignore any advice; `EINVAL` is the canonical error for bad advice values. The
-library does not mutate the `advice` argument.
+`madvise` is advisory: the kernel may ignore advice, and the library never changes
+`advice`. `posix_madvise` matches the `madvise` rules (glibc and musl implement it
+with the `madvise` system call, never through `madvise()`), returns an injected
+error as its result and leaves `errno` unchanged. While its real pointer is NULL it
+issues the system call itself and returns 0 for `POSIX_MADV_DONTNEED` without a call:
+that value equals `MADV_DONTNEED`, which would discard pages, while POSIX only asks
+for advice; glibc and musl ignore it the same way.
 
 ---
 
 ## 5. mmap/anon vs mmap/file Dispatch
 
-The split is derived from the `flags` argument of the incoming `mmap()` call:
+The split is one bit test on the `flags` argument:
 
 ```c
 static inline int chaos_memory_mmap_is_anonymous(int flags)
@@ -319,14 +292,14 @@ static inline int chaos_memory_mmap_is_anonymous(int flags)
 }
 ```
 
-This single bit test is the sole dispatch criterion. The library does not inspect:
-- the `fd` argument (which may be -1 or a valid fd even for `MAP_ANONYMOUS`)
-- the `offset` argument
-- the VMA type (private vs shared within each class)
+The library does not inspect:
 
-On Linux, `MAP_ANONYMOUS` (0x20 on x86_64/aarch64) and its historical alias
-`MAP_ANON` (defined identically on platforms that use the alias) are normalised
-at the top of `chaos_memory_internal.h`:
+- `fd` (callers pass `-1` with `MAP_ANONYMOUS`, but Linux ignores it either way);
+- `offset`;
+- private vs shared.
+
+`MAP_ANONYMOUS` is `0x20` on amd64 and arm64. Platforms that spell it `MAP_ANON` are
+normalised at the top of `chaos_memory_internal.h`:
 
 ```c
 #if !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
@@ -334,217 +307,153 @@ at the top of `chaos_memory_internal.h`:
 #endif
 ```
 
-This ensures portability across BSDs and older POSIX platforms. The library is
-not expected to run on those platforms, but the guard eliminates a compile-time
-portability trap.
+The library targets Linux; the shim only keeps the header compiling elsewhere.
 
 ---
 
 ## 6. Non-Coverage: brk/sbrk
 
-Covered in detail in §2.3. Short form: `brk()` bypasses the PLT in glibc's own
-malloc; musl does not call it at all; interposing it is not idempotent. Out of
-scope by design.
+Not interposed. The C libraries' allocators never call the exported symbols, and a
+failed heap extension makes allocators fall back to `mmap` rather than fail (§2.4).
 
 ---
 
 ## 7. Non-Coverage: mremap
 
-`mremap(2)` (Linux-specific, not in POSIX.1-2017) extends or shrinks an existing
-VMA or moves it to a new address. glibc does not use it internally for normal
-allocation, but some allocators (jemalloc, mimalloc) do use it as an efficient
-realloc path (`MREMAP_MAYMOVE`).
+`mremap(2)` (Linux only) grows, shrinks or moves an existing mapping. It is not
+interposed:
 
-Why not interposed:
+- A synthetic `mremap` failure is ambiguous with `MREMAP_MAYMOVE`/`MREMAP_FIXED`:
+  whether the caller expects the old range to survive depends on flags the library
+  would have to model.
+- The scenario it serves, a mapping that cannot grow, is reachable by failing the
+  `mmap` that would replace it.
 
-1. `mremap()` is Linux-only (`_GNU_SOURCE` required); shipping a hook for a
-   non-portable symbol adds platform gating that is not yet worth the complexity.
-2. The primary failure scenarios (ENOMEM, EFAULT) are already reachable via
-   `mmap/anon:ERRNO:ENOMEM` for the allocator's initial allocation, which is
-   usually more useful for resilience testing.
-3. `mremap(MREMAP_FIXED)` semantics overlap with `munmap+mmap`, making a synthetic
-   failure of `mremap` alone ambiguous without tracking source VMA.
-
-Candidate for future expansion. Reference: `mremap(2)` Linux man-pages, jemalloc
-`src/pages.c` `pages_huge_aligned()`, mimalloc `src/segment.c` `_mi_segment_map_aligned()`.
+Candidate for a future wrapper. Reference: `mremap(2)`.
 
 ---
 
 ## 8. Non-Coverage: mlock and mlock2
 
-`mlock(2)`, `mlock2(2)` (Linux 4.4+), and `munlock(2)` pin pages into RAM,
-preventing reclaim. Used by: HSMs, memory-safe key storage, real-time audio
-daemons (JACK, PulseAudio), latency-critical network paths.
-
-Why not interposed:
-
-1. The primary chaos target for memory residency is the allocator path, not the
-   lock/unlock protocol.
-2. `mlock()` failure (`EAGAIN`, `ENOMEM`, `EPERM` when `RLIMIT_MEMLOCK` is
-   exhausted) is already reachable in integration tests by reducing
-   `RLIMIT_MEMLOCK` to 0 via `ulimit -l 0` before test execution — without
-   requiring a preload hook.
-3. `mlock2(MLOCK_ONFAULT)` semantics interact with page-fault handling in ways
-   that are genuinely kernel-internal and not observable at the libc wrapper level.
-
-`mlockall(MCL_FUTURE)` is the extreme variant; this is also not interposed for
-the same reasons. Reference: `mlock(2)`, `mlock2(2)` Linux man-pages.
+`mlock(2)`, `mlock2(2)` (Linux 4.4), `munlock(2)` and `mlockall(2)` are not
+interposed. Their failure modes (`EAGAIN`, `ENOMEM`, `EPERM` once `RLIMIT_MEMLOCK` is
+exhausted) are reproducible without a preload by lowering the limit (`ulimit -l 0`)
+before the test.
 
 ---
 
 ## 9. madvise Hint Catalogue and Injection Surface
 
-`madvise(2)` carries a rich set of advice values. The library does not restrict
-which `advice` value the real call receives, but understanding the catalogue
-clarifies what a synthetic `madvise` failure means for the target application.
+### 9.1 Advice values
 
-### 9.1 Advisory Hints (POSIX.1-2017 and Linux Extensions)
+The library passes `advice` through unchanged. The catalogue clarifies what a
+synthetic failure means to the caller.
 
-| Advice constant         | Source      | Semantics                                               |
-|-------------------------|-------------|---------------------------------------------------------|
-| `MADV_NORMAL`           | POSIX       | No special treatment, reset any prior advice            |
-| `MADV_SEQUENTIAL`       | POSIX       | Prefetch forward; kernel read-ahead aggressively        |
-| `MADV_RANDOM`           | POSIX       | Disable read-ahead; random access expected              |
-| `MADV_WILLNEED`         | POSIX       | Prefetch the range now; `read-ahead` into page cache    |
-| `MADV_DONTNEED`         | POSIX       | Kernel may reclaim pages; accesses re-fault from zero   |
-| `MADV_FREE`             | Linux 4.5   | Pages may be reclaimed, but remain if not under pressure|
-| `MADV_HUGEPAGE`         | Linux 2.6.38| Promote range to THPs if `CONFIG_TRANSPARENT_HUGEPAGE` |
-| `MADV_NOHUGEPAGE`       | Linux 2.6.38| Inhibit THP promotion for the range                    |
-| `MADV_DONTFORK`         | Linux 2.6.16| Range not copied on `fork()`, child gets zero pages    |
-| `MADV_DOFORK`           | Linux 2.6.16| Undo `MADV_DONTFORK`                                    |
-| `MADV_DONTDUMP`         | Linux 3.4   | Exclude range from core dumps                           |
-| `MADV_DODUMP`           | Linux 3.4   | Undo `MADV_DONTDUMP`                                    |
-| `MADV_MERGEABLE`        | Linux 2.6.32| KSM candidate (Kernel Samepage Merging)                 |
-| `MADV_UNMERGEABLE`      | Linux 2.6.32| Undo KSM eligibility                                    |
-| `MADV_HWPOISON`         | Linux 2.6.32| Simulate hardware memory error on the range (CAP_SYS_ADMIN required) |
-| `MADV_SOFT_OFFLINE`     | Linux 2.6.33| Offline page without data loss (CAP_SYS_ADMIN required) |
-| `MADV_REMOVE`           | Linux 2.6.16| Release range from shared file mapping (hole punch)     |
-| `MADV_COLD`             | Linux 5.4   | Deactivate pages; reclaim under pressure before others  |
-| `MADV_PAGEOUT`          | Linux 5.4   | Reclaim pages immediately; useful for cold-tier flushing|
-| `MADV_POPULATE_READ`    | Linux 5.14  | Eagerly populate (read) range                           |
-| `MADV_POPULATE_WRITE`   | Linux 5.14  | Eagerly populate (write) range                          |
+| Advice | Since | Semantics |
+|---|---|---|
+| `MADV_NORMAL`, `MADV_SEQUENTIAL`, `MADV_RANDOM`, `MADV_WILLNEED` | — (POSIX equivalents `POSIX_MADV_*`) | Read-ahead hints and prefetch |
+| `MADV_DONTNEED` | — | Drop the pages now; private anonymous memory refaults zero-filled. `POSIX_MADV_DONTNEED` has the same number but is pure advice and ignored by glibc and musl |
+| `MADV_REMOVE` | 2.6.16 | Free the range and its backing store (hole punch) |
+| `MADV_DONTFORK`, `MADV_DOFORK` | 2.6.16 | Exclude from / include in a `fork()` child |
+| `MADV_MERGEABLE`, `MADV_UNMERGEABLE` | 2.6.32 | Kernel samepage merging candidates |
+| `MADV_HWPOISON` | 2.6.32 | Poison the pages as on a hardware error (`CAP_SYS_ADMIN`) |
+| `MADV_SOFT_OFFLINE` | 2.6.33 | Migrate and offline the pages (`CAP_SYS_ADMIN`) |
+| `MADV_HUGEPAGE`, `MADV_NOHUGEPAGE` | 2.6.38 | Allow / forbid transparent huge pages |
+| `MADV_DONTDUMP`, `MADV_DODUMP` | 3.4 | Exclude from / include in core dumps |
+| `MADV_FREE` | 4.5 | Pages may be reclaimed lazily under pressure |
+| `MADV_COLD`, `MADV_PAGEOUT` | 5.4 | Deactivate / reclaim now |
+| `MADV_POPULATE_READ`, `MADV_POPULATE_WRITE` | 5.14 | Prefault the range |
 
-### 9.2 Injection Surface
+### 9.2 Injection surface
 
-The library's `madvise:ERRNO:EINVAL` or `madvise:ERRNO:ENOMEM` injects a
-pre-call failure. The application sees the failure but the kernel does not see the
-advice. Useful for:
+`madvise:ERRNO:EINVAL` (or `ENOMEM`, `EAGAIN`, ...) fails the call before the kernel
+sees the advice. Useful for:
 
-- testing that applications handle `MADV_WILLNEED` failure gracefully (prefetch
-  degrades to demand-paging, not a crash)
-- testing that `MADV_FREE` / `MADV_DONTNEED` failure at `free()` time does not
-  corrupt the allocator
-- testing that `MADV_DONTDUMP` failure does not expose secrets in core dumps
-  (the injection simulates the syscall not running, so secrets remain dumpable)
+- prefetch hints (`MADV_WILLNEED`, `MADV_POPULATE_*`) whose failure must degrade to
+  demand paging, not to an error;
+- `MADV_DONTDUMP` failures in code that protects secrets (the advice was not applied,
+  so the range stays in core dumps);
+- `MADV_HUGEPAGE` refusals in code tuned for transparent huge pages;
+- an application's or allocator's own `MADV_DONTNEED`/`MADV_FREE` calls on release
+  (glibc's and musl's `free()` advise through internal calls the wrapper does not
+  see, §2).
 
-### 9.3 What madvise Injection Cannot Reach
+### 9.3 What madvise injection cannot reach
 
-The library cannot inject a partial-range error (`ENOMEM` for part of the range
-only), cannot simulate `MADV_HWPOISON` machine-check events, and cannot
-synthesise the delayed reclaim of `MADV_FREE`-marked pages under memory pressure.
+No partial-range failure (the whole call fails), no machine-check event for
+`MADV_HWPOISON`, no simulation of delayed reclaim of `MADV_FREE` pages.
 
 ---
 
 ## 10. NUMA, mbind, and move_pages — Out of Scope
 
-`mbind(2)`, `set_mempolicy(2)`, `get_mempolicy(2)`, and `move_pages(2)` operate
-on NUMA memory policies. They are not interposed.
-
-Rationale:
-
-1. NUMA policy failures (`EINVAL`, `EPERM`, `EIO` from `move_pages`) are
-   typically infrastructure failures (misconfigured NUMA topology, missing
-   `CAP_SYS_NICE`), not application code-path failures worth testing via preload.
-2. NUMA-aware testing requires a multi-NUMA-node machine; single-node VMs
-   (CI standard) return `ENOTSUP` from `mbind()` unconditionally — the real error
-   surface is already available without injection.
-3. `mbind()` and `set_mempolicy()` affect the NUMA policy on already-mapped VMAs;
-   their failure modes do not propagate backward to the `mmap()` that created
-   the VMA. They are orthogonal to the allocation-failure scenarios this library
-   targets.
+`mbind(2)`, `set_mempolicy(2)`, `get_mempolicy(2)` and `move_pages(2)` are not
+interposed. Their failures (`EINVAL`, `EPERM` without `CAP_SYS_NICE`, `EIO` from
+`move_pages`) describe NUMA topology and privileges rather than application error
+paths, and a policy change on an existing mapping does not feed back into the `mmap`
+that created it.
 
 ---
 
 ## 11. MAP_HUGETLB and Transparent Hugepages
 
-### 11.1 Explicit Hugepages (MAP_HUGETLB)
+### 11.1 Explicit huge pages (MAP_HUGETLB)
 
-`MAP_HUGETLB` (Linux 2.6.32) requests pages from the HugeTLB pool. Sizes are
-specified with `MAP_HUGE_2MB` or `MAP_HUGE_1GB` shift flags (Linux 3.8). The pool
-must be pre-allocated (`/proc/sys/vm/nr_hugepages`).
+`MAP_HUGETLB` (Linux 2.6.32) takes pages from the preallocated HugeTLB pool
+(`/proc/sys/vm/nr_hugepages`); `MAP_HUGE_2MB`/`MAP_HUGE_1GB` (Linux 3.8) select the
+size. An anonymous huge-page mapping sets `MAP_ANONYMOUS | MAP_HUGETLB` and matches
+`mmap/anon`; a mapping of a file on hugetlbfs matches `mmap/file`. No separate
+selector exists; `@size` separates large requests.
 
-`mmap/anon:ERRNO:ENOMEM` covers MAP_HUGETLB allocations because they set
-`MAP_ANONYMOUS | MAP_HUGETLB`. No special selector is needed.
+### 11.2 Transparent huge pages
 
-### 11.2 Transparent Hugepages (THP)
-
-THP promotion is controlled by `madvise(MADV_HUGEPAGE)` per-range and by the
-system-wide `/sys/kernel/mm/transparent_hugepage/enabled` policy. The library
-can inject `madvise:ERRNO:EINVAL` to simulate the promotion hint being rejected
-(useful for testing that THP-optimised code handles MADV fallback without data
-corruption). The actual promotion decision, demotion, and compaction are
-kernel-internal and beyond the preload boundary.
+THP use is steered per range with `madvise(MADV_HUGEPAGE)` and system-wide by
+`/sys/kernel/mm/transparent_hugepage/enabled`. `madvise:ERRNO:EINVAL` simulates a
+rejected hint. Promotion, demotion and compaction are kernel-internal and beyond the
+preload boundary.
 
 ---
 
 ## 12. KASLR Interaction
 
-Kernel Address Space Layout Randomisation (KASLR, CONFIG_RANDOMIZE_BASE) shifts
-the kernel's own virtual address layout. It does not affect user-space mmap
-placement directly. What does affect user-space mapping addresses is ASLR
-(`/proc/sys/kernel/randomize_va_space`, `mmap_min_addr`).
-
-This library does not interact with KASLR. It notes KASLR only because the
-mechanism is sometimes confused with user-space ASLR in system docs.
-
-ASLR context: when the library injects a synthetic `mmap` failure, the kernel
-never runs the mmap path, so no ASLR slot is consumed. If the test relies on
-a deterministic address layout (e.g., `MAP_FIXED_NOREPLACE`), failures and
-retries will not desynchronise the slot allocator.
+KASLR (`CONFIG_RANDOMIZE_BASE`) randomises the kernel's own layout and has no effect
+on user mappings. User-space placement is governed by ASLR
+(`/proc/sys/kernel/randomize_va_space`) and `vm.mmap_min_addr`. A synthetic `mmap`
+failure never reaches the kernel, so no address range is consumed and a retry sees
+the same address space as the failed call would have.
 
 ---
 
 ## 13. PT_GNU_STACK and the Executable-Stack Guard
 
-`PT_GNU_STACK` is a load-segment type in ELF PHDR that signals the desired
-stack permission to the kernel's `load_elf_binary()`. If absent or set
-`PF_X`, the loader maps the initial thread stack as `PROT_READ|PROT_WRITE|PROT_EXEC`.
-If set `PF_R|PF_W` (non-executable), the stack mapping is `PROT_READ|PROT_WRITE`.
-
-This is relevant here because:
-
-1. `libchaos-memory.so` itself is built with `-z noexecstack` (standard hardening
-   flag); its `PT_GNU_STACK` segment has `PF_R|PF_W`. That does not override the
-   target executable's own `PT_GNU_STACK` setting.
-2. If the target executable lacks `PT_GNU_STACK`, `load_elf_binary()` falls back
-   to `READ_IMPLIES_EXEC` personality, which makes all mappings implicitly
-   executable. In that scenario `mprotect(PROT_READ|PROT_WRITE)` effectively
-   leaves the executable bit set because the personality flag overrides the
-   protection. Injecting `mprotect:ERRNO:EACCES` in that environment will appear
-   to have the correct observable (the application gets `EACCES`), but the
-   background permission state is anomalous.
-3. Build check: `readelf -l <target> | grep GNU_STACK` should show
-   `RW` (non-executable). `libchaos-memory.so` does not enforce or check this on
-   the target; it is a pre-deployment hygiene concern.
+`PT_GNU_STACK` in an executable's program headers tells the kernel whether the
+initial stack must be executable. The library neither inspects nor changes it, and
+the `mprotect` wrapper never alters `prot`. Where the kernel adds `PROT_EXEC` on its
+own (the `READ_IMPLIES_EXEC` personality of binaries without `PT_GNU_STACK`), an
+injected `mprotect` error is still exactly the configured errno; only the protection
+the real call would have produced differs. Check a target with
+`readelf -lW <binary> | grep GNU_STACK`.
 
 ---
 
 ## 14. Reentrancy Guard and TLS State
 
-### 14.1 The Problem
+This section describes the mechanism every `libchaos-<lib>` library uses; only the
+names differ.
 
-`libchaos-memory` interposes `mmap`, `munmap`, `mprotect`, and `madvise`. The
-LATENCY path calls `nanosleep()` (via the cached `real_nanosleep` pointer), not
-the interposed `nanosleep` in `libchaos-time`. But the config reload path calls
-`open()`, `read()`, `fstat()` — all potentially interposed by `libchaos-io`. More
-subtly, the reentrancy guard itself uses TLS (`__thread`), and TLS access on some
-implementations calls `mmap` internally during thread-local storage setup.
+### 14.1 The problem
+
+The library's own work calls functions that are interposed, by this library or by
+others preloaded with it: `stat()`, `open()` and `read()` of the rule file (all
+interposed by libchaos-io), the real `mmap` (which another preloaded library may
+wrap again), and symbol resolution (`dlsym` may allocate, and an allocator may call
+`mmap`). Without a guard those calls would be faulted or would recurse.
 
 ### 14.2 Implementation
 
-The guard is a `__thread int g_chaos_memory_tls_guard` per-thread flag:
-
 ```c
+extern __thread int g_chaos_memory_tls_guard;
+
 static inline int chaos_memory_enter_internal(void)
 {
     int previous = g_chaos_memory_tls_guard;
@@ -558,61 +467,62 @@ static inline void chaos_memory_leave_internal(int previous)
 }
 ```
 
-Every interposed function calls `chaos_memory_enter_internal()` at entry and
-`chaos_memory_leave_internal(previous)` at exit, including all early-exit paths.
-If the guard is already set on entry, the wrapper skips all injection logic and
-calls the real function immediately.
+- Every wrapper tests the guard after `chaos_memory_ensure_symbols()`; when set it
+  forwards to the real function with no rule lookup.
+- The guard is set around each real call (the `chaos_memory_call_real_*`
+  trampolines), around `stat()` of the rule file, around its `open`/`read`/`fstat`
+  loop, and around the raw seed read in the constructor.
+- Save and restore, not increment and clear: a nested section restores the state it
+  found, so leaving an inner section never clears an outer one.
+- The LATENCY sleep is a raw `clock_nanosleep` system call
+  (`src/common/chaos_sleep.h`) and needs no guard: no interposed symbol is entered,
+  and libchaos-time cannot shorten or lengthen the delay.
 
-The guard restores `previous` rather than unconditionally writing 0, which means
-nesting depth is tracked correctly: if `mmap` (wrapper) calls something that also
-triggers the `mmap` wrapper (e.g., during TLS initialisation), the inner call
-exits the guard at the same depth it found, not below it.
+### 14.3 TLS placement
 
-### 14.3 TLS Initialisation Race
+The library is loaded at process start by `LD_PRELOAD`, so its TLS is part of the
+static TLS block the C library allocates with every thread; reading or writing the
+guard never maps memory. TLS is deliberately tiny (the guard, an `int`, and the PRNG state, a
+`uint64_t`): static TLS is reserved in every thread and counts against its minimum stack
+size, and large objects there made runtimes with small explicit thread stacks (the
+Erlang VM) fail `pthread_create` with `EINVAL`. The 256 KiB rule-file buffer is
+therefore a process-wide static, used only by the thread that owns a reload.
 
-On glibc, `__thread` variables that are not in the executable's TLS block may
-require a call to `__tls_get_addr()` on first access per thread. For the initial
-thread and for threads created before the library is loaded (rare in LD_PRELOAD
-context), TLS is already set up. For threads created after preload, the first
-access to `g_chaos_memory_tls_guard` triggers `__tls_get_addr()` in glibc (or
-`__tls_get_addr` in musl), which does not call `mmap()` because the TLS segment
-was already mapped when the DSO was loaded. This is safe.
+### 14.4 Symbol resolution re-entry
 
-On musl, `__tls_get_addr` is also safe in this respect; the dynamic TLS is
-allocated via `__mmap` (musl's internal mmap alias, `SYS_mmap` syscall directly),
-which bypasses the interposed `mmap` symbol.
+`chaos_memory_ensure_symbols()` runs `chaos_memory_resolve_all_symbols()` once
+through `chaos_once()` (release/acquire, no libpthread dependency). A call that
+re-enters on the resolving thread (`dlsym` → allocator → `mmap`) returns from
+`chaos_once()` at once instead of deadlocking; the real pointer is still NULL and the
+trampoline issues the raw system call. A missing symbol (`dlsym` NULL with `dlerror()`
+set) calls `abort()`.
 
 ---
 
 ## 15. PRNG Model
 
-Probability-gated rules (`@probability`) use a per-thread xorshift64* PRNG
-seeded from three independent sources:
+Shared by all libraries. Each thread owns an xorshift64* generator; probability
+draws need no synchronisation and threads never share a sequence.
+
+**Process seed.** The constructor reads 8 bytes from `/dev/urandom` with raw
+`SYS_openat`/`SYS_read`/`SYS_close` (no interposed call during construction),
+`errno` preserved. Fallback when that fails: `0x6a09e667f3bcc909 ^ getpid()`. The
+main thread is seeded directly from the process seed.
+
+**Lazy per-thread seed** on a thread's first draw:
 
 ```c
-seed = g_chaos_memory_process_seed;   // set once at library load from /dev/urandom or time(NULL)
-seed ^= chaos_memory_current_tid();   // SYS_gettid on Linux, getpid() on others
-seed ^= (uint64_t)(uintptr_t)&seed;  // stack address (ASLR contribution)
-g_chaos_memory_tls_prng_state = chaos_memory_prng_mix(seed);
+seed  = g_chaos_memory_process_seed;
+seed ^= chaos_memory_current_tid();      /* SYS_gettid on Linux */
+seed ^= (uint64_t)(uintptr_t)&seed;      /* stack address */
+g_chaos_memory_tls_prng_state = chaos_memory_prng_mix(seed) | 1U;  /* never 0 */
 ```
 
-The mix function is Murmur3 finaliser / SplitMix64 round:
+`chaos_memory_prng_mix()` is the SplitMix64 finaliser (Steele, Lea, Flood, OOPSLA
+2014): consecutive thread ids yield uncorrelated states. Forcing the low bit keeps
+the state out of 0, the one state xorshift cannot leave.
 
-```c
-static inline uint64_t chaos_memory_prng_mix(uint64_t value)
-{
-    value += UINT64_C(0x9e3779b97f4a7c15);
-    value  = (value ^ (value >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
-    value  = (value ^ (value >> 27)) * UINT64_C(0x94d049bb133111eb);
-    return   value ^ (value >> 31);
-}
-```
-
-Constants are from SplitMix64 (Steele & Vigna, "Fast Splittable Pseudorandom
-Number Generators", OOPSLA 2014). The mixing property ensures that linearly
-correlated seeds (e.g., TIDs differing by 1) produce uncorrelated states.
-
-The per-step update is xorshift64 (Marsaglia 2003):
+**Step and output:**
 
 ```c
 state ^= state >> 12;
@@ -621,100 +531,135 @@ state ^= state >> 27;
 return (uint32_t)((state * UINT64_C(0x2545f4914f6cdd1d)) >> 32);
 ```
 
-The output multiplicative finaliser (`0x2545f4914f6cdd1d` is a GoldenRatio-based
-multiplier) improves the lower-bit quality of the raw xorshift output. Period is
-2^64 − 1 per thread; zero-state is avoided by the post-init check.
+xorshift64 (Marsaglia, 2003) with the multiplicative output scrambler of xorshift64*
+(Vigna, 2016); period 2^64 − 1. Every probability check consumes one draw and fires
+when `sample < p × 2^32`; `p <= 0` never fires, `p >= 1` always fires.
+
+**fork.** The atfork child handler zeroes the forking thread's state, so the child
+reseeds from its own thread id on its next draw; pre-fork workers would otherwise
+make identical decisions.
 
 ---
 
 ## 16. Config Reload Protocol — Two-Snapshot CAS
 
-The config is reloaded on-demand, without a background thread, and without locks.
-The protocol is a two-snapshot compare-and-swap on the file's mtime encoded as a
-`uint64_t`.
+Shared by all libraries (libchaos-io adds link re-resolution, see
+[IO.md §4](IO.md#4-end-to-end-behavior)). No thread, no lock, no allocation.
 
-### 16.1 State Machine
+### 16.1 State
 
+- Two statically allocated snapshots of 256 rules each, with the rule texts and hit
+  slot pointers; an active index (0 or 1).
+- A cached change stamp that doubles as the reload lock:
+
+```text
+MTIME_MISSING   (0x0000000000000000)  no rule file: no rules
+MTIME_UNKNOWN   (0xffffffffffffffff)  initial: the first look always loads
+MTIME_RELOADING (0xfffffffffffffffe)  a thread owns the reload
+<stamp>                               FNV-1a over mtime s, mtime ns, size, inode, device
 ```
-MTIME_MISSING  (0x0000...0000) — config file absent; use empty ruleset
-MTIME_UNKNOWN  (0xffff...ffff) — initial sentinel; force first stat()
-MTIME_RELOADING(0xffff...fffe) — reload CAS winner is active
-<timestamp>                    — loaded and cached
-```
 
-### 16.2 Protocol Steps
+A real stamp equal to `UNKNOWN` or `RELOADING` is decremented by one.
 
-1. `atomic_load(mtime_slot)` — read current state with `__sync_synchronize()`.
-2. If current == `MTIME_RELOADING`, spin (another thread is loading); this
-   is the only busy-wait point. In practice, config files are small (< 256 KB)
-   and the parse is O(N lines) with N ≤ 256, so the spin is very short.
-3. `stat(config_path, &st)` — get the file's mtime.
-4. If mtime unchanged: done.
-5. CAS(`mtime_slot`, old_value, `MTIME_RELOADING`):
-   - Success → this thread is the reload winner; read+parse+swap.
-   - Failure → another thread won; continue with existing config.
-6. Read config, parse rules, build new `chaos_memory_config_t` snapshot.
-7. Atomic store new snapshot pointer (two-pointer swap: the old pointer is
-   overwritten; there is no epoch-based reclaim because the config is read
-   only under the guard context and writes are infrequent).
-8. CAS(`mtime_slot`, `MTIME_RELOADING`, new_mtime) — release the reload lock.
+### 16.2 Protocol
 
-This is an RCU-flavored design without a formal RCU read-side critical section
-or grace-period mechanism. It is safe because:
-- Readers hold the TLS guard while accessing the config, preventing reentrancy
-  during the check-and-call sequence.
-- The config pointer swap is sequentially consistent (both sides issue
-  `__sync_synchronize()` full barriers).
-- The old config allocation is not freed (it leaks one struct per reload cycle).
-  This is intentional and acceptable for a test-infrastructure library where config
-  reloads are rare and process lifetime is bounded.
+1. **Throttle.** Once rules are loaded, the file is looked at no more than every
+   1 ms (`CHAOS_CHECK_INTERVAL_NS`, vDSO `CLOCK_MONOTONIC`). The first load, and
+   every call while no rules are loaded, always looks. Without a vDSO clock every
+   call looks.
+2. `stat()` the file (guard set) and compute the stamp. Mtime alone misses two writes
+   within one filesystem clock tick; size catches an append, inode a rename-over
+   (`sed -i`).
+3. Stamp unchanged and the last load not provisional: use the active snapshot.
+4. Cached stamp is `RELOADING`: another thread is loading; use the active snapshot.
+   Nobody waits or spins.
+5. CAS cached stamp → `RELOADING`. Losers use the active snapshot.
+6. The winner rewrites the inactive snapshot (its sequence counter is odd meanwhile),
+   reads the file into the process-wide buffer, verifies with `fstat()` that the file
+   still has the stamp that triggered the load (a writer that changed it mid-read
+   makes the copy unusable: the claim is released with the previous stamp and the
+   next look retries), parses, attaches hit slots (a rule whose text is unchanged
+   keeps its slot, so its count and `@first` claims survive the reload), and writes
+   the status file.
+7. Publish: sequence even, full barrier, active index, full barrier, cached stamp.
+8. A file whose mtime is within 20 ms of now (`CHAOS_RACY_WINDOW_MS`) is loaded
+   provisionally and read again on the next look until it is older, because a
+   same-size rewrite within one tick leaves every stat field unchanged. A re-read
+   with identical content keeps the snapshot and its counters.
 
-Reference: Paul McKenney, "Is Parallel Programming Hard?" §9 (RCU mechanics);
-GCC `__sync_*` builtins documentation.
+**Readers** copy the selected rule out of the active snapshot and check its sequence
+before and after (a seqlock). Two reloads later the same snapshot is rewritten; a
+reader preempted in the middle of its copy sees the sequence change and discards the
+copy (the call passes through) instead of using half of one rule and half of
+another. Nothing is ever freed, so there is nothing to reclaim.
+
+All atomics are GCC `__sync_*` builtins with full barriers.
+
+### 16.3 Failure behaviour
+
+| Condition | Result | Status file |
+|---|---|---|
+| No rule file | no rules | removed |
+| Invalid line, malformed qualifier, qualifier without a rule | no rules (previous rules dropped) | `state=error`, `reason=invalid rule`, `line`, `text` |
+| More than 256 rules | no rules | `reason=too many rules` |
+| 262 144 bytes or more | no rules | `reason=file too large`, `line=0` |
+| `open` fails with `EACCES`/`EPERM`, `read` with `EISDIR` | no rules until the file changes | `reason=file unreadable`, `line=0` |
+| NUL byte | no rules | `reason=file contains a NUL byte` |
+| Other read error, file changed mid-read | active snapshot kept, retried | unchanged |
+
+The constructor loads the file immediately, so a bad file is reported at start-up.
+Every refresh saves and restores `errno`.
+
+### 16.4 fork and vfork
+
+The `pthread_atfork` child handler releases a reload claim held by a parent thread
+that does not exist in the child, clears the hits writer state, resets hit counts and
+`@first` claims, and gives the child its own hits file. `vfork` children and
+`posix_spawn` run no handler: they share the parent's memory, see its claim as busy
+and never write a hits file.
+
+Reference: GCC `__sync` builtins documentation; Linux `Documentation/RCU/whatisRCU.rst`
+for the publish-then-switch pattern.
 
 ---
 
 ## 17. glibc vs musl Divergence
 
-| Aspect                    | glibc (ptmalloc2)                          | musl (mallocng)                            |
-|---------------------------|--------------------------------------------|--------------------------------------------|
-| Small alloc path          | brk/sbrk arena (below MMAP_THRESHOLD)     | mmap/anon (all allocations via alloc_meta) |
-| mmap threshold            | Adaptive; default 128 KiB; max 65536 mmaps| No threshold; always mmap                  |
-| mmap/anon coverage        | Large allocs only                          | All allocs                                 |
-| mremap usage              | Never in normal malloc                     | Never in mallocng                           |
-| brk() usage               | Yes (via __brk syscall direct)             | No                                          |
-| MAP_ANONYMOUS alias       | MAP_ANONYMOUS (0x20 on x86_64)             | Same                                        |
-| execveat in libc          | Yes, glibc 2.34+ (syscall wrapper)         | Not always exported as public symbol        |
-| madvise(MADV_FREE)        | glibc 2.30+ uses MADV_FREE in free()       | musl does not use MADV_FREE (MADV_DONTNEED) |
-| mprotect on stack guard   | Called by pthread_create via libpthread    | Called by musl thread creation              |
+| Aspect | glibc | musl |
+|---|---|---|
+| `mmap64` | separate exported symbol on 64-bit; wrapped as an alias | does not exist |
+| `malloc` mappings | internal `__mmap`/`__munmap`/`__madvise`: not seen in LD_PRELOAD mode | internal `__mmap` and the `brk` system call: not seen in LD_PRELOAD mode |
+| Small allocations | `brk` heap below `M_MMAP_THRESHOLD` (128 KiB default) | mallocng groups, mapped for small size classes too |
+| `posix_madvise` | implemented with the `madvise` system call; `POSIX_MADV_DONTNEED` ignored | same |
+| `MAP_ANONYMOUS` | `0x20` | `0x20` |
 
-**Key difference for injection:** On musl, `mmap/anon:ERRNO:ENOMEM` with even a
-moderate probability will cause `malloc()` for any allocation size to fail, because
-mallocng's meta-area allocation path calls `mmap()` for all size classes. On glibc,
-the same rule only affects allocations ≥ 128 KiB (or whatever the current
-`MMAP_THRESHOLD` is). Calibrate your probabilities accordingly.
+Consequence for SECCOMP mode, where `malloc`'s mappings are visible: an
+`mmap/anon:ERRNO:ENOMEM` rule fails musl programs on small allocations too, glibc
+programs mainly on allocations at or above the threshold. Calibrate
+probability and `@size` per libc.
 
 ---
 
 ## 18. Execution Boundary Summary
 
-`libchaos-memory` operates at the libc contract boundary. It can reach any call
-to `mmap()`, `munmap()`, `mprotect()`, or `madvise()` that travels through the
-PLT of the target binary.
+`libchaos-memory` operates at the exported-symbol boundary of the C library. It
+reaches every call to `mmap`, `mmap64` (glibc), `munmap`, `mprotect`, `madvise` and
+`posix_madvise` that binds to the exported symbol.
 
-It does not reach:
+It does not reach, in LD_PRELOAD mode:
 
-- `brk()` / `sbrk()` heap operations inside glibc's ptmalloc2
-- `mremap()` (not interposed)
-- `mlock()` / `mlock2()` (not interposed)
-- anonymous mmap calls made by the kernel itself (page fault handlers, stack
-  growth)
-- mmap calls issued via raw syscall number (`syscall(SYS_mmap, ...)`) — bypass
-  surface identical to other preload libraries; see `docs/PLATFORM.md` §5
-- mmap calls inside statically linked binaries
+- the C library's own mappings: `malloc`/`free`, thread stacks, the dynamic loader;
+- `brk`/`sbrk`, `mremap`, `mlock*`, NUMA policy calls (not interposed);
+- raw `syscall(SYS_mmap, ...)`, statically linked binaries, kernel-internal mappings
+  (page faults, stack growth).
 
-The library is process-local. Unrelated processes are not affected. Kernel VM
-subsystem policy (page reclaim, compaction, OOM killer) is not affected.
+SECCOMP mode (`chaos-init`) applies the same rule file to the `mmap`, `munmap`,
+`mprotect` and `madvise` system calls of every process it supervises, with ERRNO and
+LATENCY on every selector, and therefore reaches the loader and `malloc` as well
+([SECCOMP.md](SECCOMP.md)).
+
+The library is process-local: other processes and kernel memory policy (reclaim,
+compaction, the OOM killer) are unaffected.
 
 ---
 

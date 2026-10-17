@@ -1,54 +1,36 @@
 /**
  * @file test_chaos_process.c
- * @brief Unit tests for the PROCESS-domain wrapper hooks: real-function dispatch helpers,
- *   pthread_create, fork, posix_spawn, posix_spawnp, execve, execveat (Linux), and waitpid.
+ * @brief Proves the libchaos-process wrappers: effect order, error convention, fallbacks.
  *
- * Subsystem under test: `src/process/chaos_process_hooks.c`.
+ * @details
+ * Unit under test: `src/process/chaos_process_hooks.c`, the wrappers for pthread_create, fork,
+ * posix_spawn(p), the exec family, system, popen and the wait family. For every wrapper the
+ * suite proves:
+ * - the re-entrancy guard bypasses all rules and calls the real function;
+ * - a LATENCY rule delays and then still calls the real function;
+ * - a firing ERRNO or FAIL_AFTER rule fails the call without calling the real function, using
+ *   the function's own error convention: the error as return value for pthread_create and
+ *   posix_spawn(p) (errno untouched), -1 + errno for fork/exec/wait, NULL + errno for popen;
+ * - a real-function error passes through unchanged;
+ * - with no real function resolved, a wrapper backed by one system call makes that call, and
+ *   one with no single system call fails with ENOSYS (EAGAIN for pthread_create).
  *
- * Coverage approach:
- * - `chaos_process_hooks.c` is included directly after replacing the six (seven on Linux)
- *   intercepted function names with test-local wrapper names via `#define`:
- *     - `pthread_create` → `chaos_process_test_pthread_create_wrapper`
- *     - `fork`           → `chaos_process_test_fork_wrapper`
- *     - `posix_spawn`    → `chaos_process_test_posix_spawn_wrapper`
- *     - `posix_spawnp`   → `chaos_process_test_posix_spawnp_wrapper`
- *     - `execve`         → `chaos_process_test_execve_wrapper`
- *     - `execveat`       → `chaos_process_test_execveat_wrapper` (Linux-only)
- *     - `waitpid`        → `chaos_process_test_waitpid_wrapper`
- *   This lets tests call the wrappers directly without LD_PRELOAD.
- * - `CHAOS_PROCESS_DEFINE_TEST_GLOBALS()` instantiates the real-function-pointer table.
- * - `g_stub_rules[3][CHAOS_PROCESS_OP_COUNT]` and `g_stub_match[3][CHAOS_PROCESS_OP_COUNT]`
- *   are indexed by `[effect_index][operation_index]`. Setting `g_stub_match[e][op] = 1`
- *   causes `chaos_process_config_match(e, op, rule)` to return 1 and copy the corresponding
- *   rule, activating that effect for the next wrapper call.
- * - `reset_wrapper_state()` must be called before each test function (and sometimes between
- *   scenarios within a test) to prevent cross-test contamination.
- * - Each wrapper is tested with four effect scenarios: guard bypass, LATENCY, ERRNO, FAIL_AFTER,
- *   plus a real-function-error passthrough where applicable.
+ * Isolation:
+ * - The 20 interposed names are renamed by macro to `chaos_process_test_*_wrapper` before the
+ *   production source is included, so the wrappers are callable without LD_PRELOAD and do not
+ *   collide with libc. The tests themselves still use libc's real `fork` and `waitpid`.
+ * - Rule matching and the effect helpers are replaced by stubs: `g_stub_match` /
+ *   `g_stub_rules` decide which (effect, operation) matches, and `g_errno_trigger` /
+ *   `g_fail_after_trigger` decide whether a matched rule fires. Probability, qualifiers and
+ *   counters are therefore out of scope here (see test_process_actions.c).
+ * - The real-function pointers are set per scenario to counting stubs with distinct return
+ *   values (fork 123, posix_spawn pid 234, posix_spawnp pid 345, waitpid 321).
+ * - `CHAOS_PROCESS_DEFINE_TEST_GLOBALS()` makes `chaos_process_ensure_symbols()` a no-op so a
+ *   wrapper never overwrites the pointers a test set.
  *
- * Properties under test:
- * - `chaos_process_call_real_pthread_create()`: dispatches to stub; call count == 1.
- * - `chaos_process_call_real_fork()`: returns `g_real_fork_result` (123); call count == 1.
- * - `chaos_process_call_real_posix_spawn()`: pid set to 234; call count == 1.
- * - `chaos_process_call_real_posix_spawnp()`: pid set to 345; call count == 1.
- * - `chaos_process_call_real_execve()`: returns 0; call count == 1.
- * - `chaos_process_call_real_execveat()` (Linux): returns 0; call count == 1.
- * - `chaos_process_call_real_waitpid()`: returns 321; pid and options forwarded.
- * - All wrappers: guard bypass (`g_chaos_process_tls_guard = 1`) → real call, no effect.
- * - All wrappers: LATENCY effect → `g_latency_calls == 1`; real call still made.
- * - All wrappers: ERRNO effect with `g_errno_trigger = 1` → returns error code; real call
- *   skipped; pthread/posix_spawn return the error directly (not via errno); fork/execve/waitpid
- *   set errno.
- * - All wrappers: FAIL_AFTER effect with `g_fail_after_trigger = 1` → returns error; real call
- *   skipped.
- * - All wrappers: real function error passthrough → returns error from real stub; errno set.
- *
- * What is NOT tested here:
- * - Constructor and symbol resolution (`chaos_process_init()`).
- * - Config file parsing and rule matching.
- * - FAIL_AFTER countdown logic (per-operation decrement below threshold).
+ * Every scenario starts from `reset_wrapper_state()`, because a pointer, match flag or trigger
+ * left set by one scenario would change the next one's outcome.
  */
-
 #include "../support/test_process_support.h"
 
 #include "../../src/process/chaos_process_config.h"
@@ -57,84 +39,61 @@
 
 CHAOS_PROCESS_DEFINE_TEST_GLOBALS();
 
-/**
- * @brief Per-effect, per-operation rule table for the config-match stub.
- *
- * Index as `g_stub_rules[effect_index][operation_index]`. Tests fill the
- * desired cell and set the corresponding `g_stub_match` entry to 1.
- */
+/** @brief Rule returned by the match stub, indexed `[effect][operation]`. */
 static chaos_process_rule_t g_stub_rules[3][CHAOS_PROCESS_OP_COUNT];
-/**
- * @brief Per-effect, per-operation match-enable flags for the config-match stub.
- *
- * Non-zero means `chaos_process_config_match(effect, op, rule)` returns 1 and
- * copies the rule from `g_stub_rules[effect][op]` into the caller's output.
- */
+/** @brief Non-zero makes `chaos_process_config_match(effect, op)` match, `[effect][op]`. */
 static int g_stub_match[3][CHAOS_PROCESS_OP_COUNT];
-/** @brief Number of times `chaos_process_rule_apply_latency` was called. */
+/** @brief LATENCY applications; the stub never sleeps. */
 static int g_latency_calls = 0;
-/**
- * @brief When non-zero, causes `chaos_process_rule_error_number` to inject the
- *   rule's `errnum` and return 1, simulating a triggered ERRNO fault.
- */
+/** @brief Non-zero makes a matched ERRNO rule fire; zero models a probability miss. */
 static int g_errno_trigger = 0;
-/**
- * @brief When non-zero, causes `chaos_process_rule_fail_after_error` to inject
- *   the rule's `errnum` and return 1, simulating a triggered FAIL_AFTER fault.
- */
+/** @brief Non-zero makes a matched FAIL_AFTER rule fire; zero models "not yet". */
 static int g_fail_after_trigger = 0;
-/** @brief Number of times the `stub_pthread_create` function was called. */
+/** @brief Calls that reached the real `pthread_create` stub. */
 static int g_real_pthread_create_calls = 0;
-/** @brief Number of times the `stub_fork` function was called. */
+/** @brief Calls that reached the real `fork` stub. */
 static int g_real_fork_calls = 0;
-/** @brief Number of times the `stub_posix_spawn` function was called. */
+/** @brief Calls that reached the real `posix_spawn` stub. */
 static int g_real_posix_spawn_calls = 0;
-/** @brief Number of times the `stub_posix_spawnp` function was called. */
+/** @brief Calls that reached the real `posix_spawnp` stub. */
 static int g_real_posix_spawnp_calls = 0;
-/** @brief Number of times the `stub_execve` function was called. */
+/** @brief Calls that reached the real `execve` stub. */
 static int g_real_execve_calls = 0;
-/** @brief Number of times the `stub_execveat` function was called (Linux-only). */
+/** @brief Calls that reached the real `execveat` stub (Linux only). */
 static int g_real_execveat_calls = 0;
-/** @brief Number of times the `stub_waitpid` function was called. */
+/** @brief Calls that reached the real `waitpid` stub. */
 static int g_real_waitpid_calls = 0;
-/** @brief Return value for `stub_pthread_create`; 0 == success, EAGAIN == resource limit. */
+/** @brief Return value of the real `pthread_create` stub (0 or an error number). */
 static int g_real_pthread_create_result = 0;
-/** @brief Return value for `stub_fork`; 123 simulates a successful parent-side pid. */
+/** @brief Return value of the real `fork` stub; 123 is a parent-side child pid. */
 static pid_t g_real_fork_result = 123;
-/** @brief Return value for `stub_posix_spawn`; 0 == success. */
+/** @brief Return value of the real `posix_spawn` stub. */
 static int g_real_posix_spawn_result = 0;
-/** @brief Return value for `stub_posix_spawnp`; 0 == success. */
+/** @brief Return value of the real `posix_spawnp` stub. */
 static int g_real_posix_spawnp_result = 0;
-/** @brief Return value for `stub_execve`; 0 == success, -1 == failure. */
+/** @brief Return value of the real `execve` stub; -1 also sets `g_real_execve_errno`. */
 static int g_real_execve_result = 0;
-/** @brief Return value for `stub_execveat`; 0 == success, -1 == failure (Linux-only). */
+/** @brief Return value of the real `execveat` stub; -1 also sets its errno (Linux only). */
 static int g_real_execveat_result = 0;
-/** @brief Return value for `stub_waitpid`; 321 simulates a normal child exit. */
+/** @brief Return value of the real `waitpid`/`wait4` stubs; 321 is a reaped child pid. */
 static pid_t g_real_waitpid_result = 321;
-/**
- * @brief errno value to set when `stub_execve` returns -1.
- *
- * E2BIG is used as a representative exec-failure errno (argument list too long).
- */
+/** @brief errno the real `execve` stub sets when it returns -1. */
 static int g_real_execve_errno = 0;
-/**
- * @brief errno value to set when `stub_execveat` returns -1 (Linux-only).
- *
- * E2BIG is used for the same reason as `g_real_execve_errno`.
- */
+/** @brief errno the real `execveat` stub sets when it returns -1 (Linux only). */
 static int g_real_execveat_errno = 0;
-/** @brief errno value to set when `stub_waitpid` returns -1. */
+/** @brief errno the real `waitpid` stub sets when it returns -1. */
 static int g_real_waitpid_errno = 0;
-/** @brief `pid` argument captured from the most recent `stub_waitpid` call. */
+/** @brief `pid` seen by the last real `waitpid`/`wait4` stub call. */
 static pid_t g_last_waitpid_pid = 0;
-/** @brief `options` argument captured from the most recent `stub_waitpid` call. */
+/** @brief `options` seen by the last real `waitpid`/`wait4` stub call. */
 static int g_last_waitpid_options = 0;
 
 /**
- * @brief Reset all wrapper-layer test state between test functions.
+ * @brief Clears real-function pointers, match tables, triggers, counters and stub results.
  *
- * Calls `chaos_process_test_reset_runtime()` to clear the runtime function-pointer
- * table, then zeroes all local stub tables and counters.
+ * Also zeroes the guard, so a scenario that set it cannot leak a bypass into the next one.
+ * Counters declared after this function (wait4, waitid, exec family) are reset by the tests
+ * that use them.
  */
 static void reset_wrapper_state(void)
 {
@@ -180,10 +139,10 @@ static void reset_wrapper_state(void)
 }
 
 /**
- * @brief Stub for `chaos_process_config_match()`.
+ * @brief Replaces rule matching: matches when `g_stub_match[effect][operation]` is set.
  *
- * Returns 1 and copies `g_stub_rules[effect][operation]` into @p rule when
- * `g_stub_match[effect][operation] != 0` and all indices are in range.
+ * Copies the configured rule out, as the real matcher does, and rejects out-of-range indices so
+ * a wrapper passing a wrong operation fails to match instead of reading past the tables.
  */
 int chaos_process_config_match(
     chaos_process_effect_t effect, chaos_process_operation_t operation, chaos_process_rule_t *rule
@@ -199,11 +158,7 @@ int chaos_process_config_match(
     return 1;
 }
 
-/**
- * @brief Stub for `chaos_process_rule_apply_latency()`.
- *
- * Increments the latency call counter without performing any sleep.
- */
+/** @brief Replaces LATENCY: counts the call instead of sleeping. */
 void chaos_process_rule_apply_latency(const chaos_process_rule_t *rule)
 {
     assert(rule != NULL);
@@ -211,13 +166,9 @@ void chaos_process_rule_apply_latency(const chaos_process_rule_t *rule)
 }
 
 /**
- * @brief Stub for `chaos_process_rule_error_number()`.
+ * @brief Replaces the ERRNO decision: fires when `g_errno_trigger` is set and the rule is ERRNO.
  *
- * When `g_errno_trigger != 0` and the rule has ERRNO effect with a valid error
- * pointer, sets `*errnum` to `rule->errnum` and returns 1. Returns 0 otherwise.
- *
- * EAGAIN is the canonical ERRNO used in tests (resource temporarily unavailable),
- * chosen because it is a realistic threading failure code for `pthread_create` and `fork`.
+ * Keeps the real helper's contract: writes `*errnum` only when it returns 1.
  */
 int chaos_process_rule_error_number(const chaos_process_rule_t *rule, int *errnum)
 {
@@ -232,13 +183,10 @@ int chaos_process_rule_error_number(const chaos_process_rule_t *rule, int *errnu
 }
 
 /**
- * @brief Stub for `chaos_process_rule_fail_after_error()`.
+ * @brief Replaces the FAIL_AFTER decision: fires when `g_fail_after_trigger` is set.
  *
- * When `g_fail_after_trigger != 0` and the rule has FAIL_AFTER effect with valid
- * parameters, sets `*errnum` to `rule->errnum` and returns 1. Returns 0 otherwise.
- *
- * ENOMEM is used in tests to distinguish FAIL_AFTER from ERRNO (EAGAIN) without
- * ambiguity, reflecting realistic allocation-failure semantics.
+ * Tests give FAIL_AFTER a different errno than ERRNO in the same suite (ENOMEM vs EAGAIN,
+ * ENOENT vs EACCES, ECHILD vs EINTR), so the observed errno identifies which effect fired.
  */
 int chaos_process_rule_fail_after_error(
     const chaos_process_rule_t *rule, chaos_process_operation_t operation, int *errnum
@@ -254,14 +202,13 @@ int chaos_process_rule_fail_after_error(
     return 1;
 }
 
-/** @brief Minimal thread start function used as a non-NULL argument to pthread_create tests. */
+/** @brief Non-NULL start routine for pthread_create calls; never run by the stubs. */
 static void *stub_start_routine(void *argument)
 {
     return argument;
 }
 
-/** @brief Stub for the real `pthread_create`. Increments counter; returns
- * `g_real_pthread_create_result`. */
+/** @brief Real `pthread_create` stand-in: counts, returns `g_real_pthread_create_result`. */
 static int stub_pthread_create(
     pthread_t *thread,
     const pthread_attr_t *attributes,
@@ -277,7 +224,7 @@ static int stub_pthread_create(
     return g_real_pthread_create_result;
 }
 
-/** @brief Stub for the real `fork`. Increments counter; returns `g_real_fork_result` (123). */
+/** @brief Real `fork` stand-in: counts, returns `g_real_fork_result`; never forks. */
 static pid_t stub_fork(void)
 {
     ++g_real_fork_calls;
@@ -285,10 +232,10 @@ static pid_t stub_fork(void)
 }
 
 /**
- * @brief Stub for the real `posix_spawn`. Increments counter; sets `*pid = 234`.
+ * @brief Real `posix_spawn` stand-in: counts, stores pid 234, returns its configured result.
  *
- * Returns `g_real_posix_spawn_result`. The fixed pid value 234 is chosen to be
- * distinct from the fork stub (123) and posix_spawnp stub (345).
+ * 234 differs from the fork (123) and posix_spawnp (345) values, so a pid proves which real
+ * function the wrapper reached.
  */
 static int stub_posix_spawn(
     pid_t *pid,
@@ -313,12 +260,7 @@ static int stub_posix_spawn(
     return g_real_posix_spawn_result;
 }
 
-/**
- * @brief Stub for the real `posix_spawnp`. Increments counter; sets `*pid = 345`.
- *
- * Returns `g_real_posix_spawnp_result`. The fixed pid value 345 allows tests to
- * distinguish posix_spawnp from posix_spawn output.
- */
+/** @brief Real `posix_spawnp` stand-in: counts, stores pid 345, returns its result. */
 static int stub_posix_spawnp(
     pid_t *pid,
     const char *file,
@@ -343,16 +285,42 @@ static int stub_posix_spawnp(
 }
 
 /**
- * @brief Stub for the real `execve`. Increments counter.
+ * @brief Arguments of the last exec stub call, copied while the caller's array is alive.
  *
- * When `g_real_execve_result == -1`, sets `errno = g_real_execve_errno` to simulate
- * a failed exec (e.g. E2BIG for argument-list overflow, EACCES for permission denied).
+ * The execl forms build argv as a VLA on their own stack, which is gone once they return, so
+ * the strings are copied rather than the pointer kept. An empty string after the last argument
+ * marks the terminating NULL.
  */
+static char g_last_exec_args[4][16];
+/** @brief `argv` passed to the last real `execve` stub call; proves pass-through. */
+static char *const *g_last_execve_argv = NULL;
+/** @brief `envp` passed to the last real `execve` stub call; proves `environ` use. */
+static char *const *g_last_execve_envp = NULL;
+
+/**
+ * @brief Copies up to three arguments into `g_last_exec_args`.
+ *
+ * Asserts a NULL follows them, proving the wrapper terminated the argv it assembled.
+ */
+static void record_exec_args(char *const argv[])
+{
+    size_t index;
+
+    (void)memset(g_last_exec_args, 0, sizeof(g_last_exec_args));
+    for (index = 0U; index < 3U && argv[index] != NULL; ++index)
+    {
+        (void)snprintf(g_last_exec_args[index], sizeof(g_last_exec_args[index]), "%s", argv[index]);
+    }
+    assert(argv[index] == NULL);
+}
+
+/** @brief Real `execve` stand-in: records argv/envp, counts, returns its configured result. */
 static int stub_execve(const char *path, char *const argv[], char *const envp[])
 {
     (void)path;
-    (void)argv;
-    (void)envp;
+    g_last_execve_argv = argv;
+    g_last_execve_envp = envp;
+    record_exec_args(argv);
 
     ++g_real_execve_calls;
     if (g_real_execve_result == -1)
@@ -363,12 +331,7 @@ static int stub_execve(const char *path, char *const argv[], char *const envp[])
 }
 
 #ifdef __linux__
-/**
- * @brief Stub for the real `execveat` (Linux-only). Increments counter.
- *
- * When `g_real_execveat_result == -1`, sets `errno = g_real_execveat_errno`.
- * E2BIG is the representative error used in tests, same rationale as execve.
- */
+/** @brief Real `execveat` stand-in: counts and returns its configured result and errno. */
 static int
 stub_execveat(int directory_fd, const char *path, char *const argv[], char *const envp[], int flags)
 {
@@ -387,13 +350,36 @@ stub_execveat(int directory_fd, const char *path, char *const argv[], char *cons
 }
 #endif
 
-/**
- * @brief Stub for the real `waitpid`. Captures `pid` and `options`.
- *
- * Returns `g_real_waitpid_result` (321 by default). When `g_real_waitpid_result == -1`,
- * sets `errno = g_real_waitpid_errno`. ECHILD (no child process) and EINTR (interrupted
- * by signal) are the representative errors used in tests.
- */
+/** @brief Calls that reached the real `wait4` stub. */
+static int g_real_wait4_calls = 0;
+/** @brief `usage` seen by the last real `wait4` stub call; proves wait3 passes it on. */
+static struct rusage *g_last_wait4_usage = NULL;
+/** @brief Calls that reached the real `waitid` stub. */
+static int g_real_waitid_calls = 0;
+
+/** @brief Real `wait4` stand-in: records pid/options/usage, returns `g_real_waitpid_result`. */
+static pid_t stub_wait4(pid_t pid, int *status, int options, struct rusage *usage)
+{
+    (void)status;
+    ++g_real_wait4_calls;
+    g_last_waitpid_pid = pid;
+    g_last_waitpid_options = options;
+    g_last_wait4_usage = usage;
+    return g_real_waitpid_result;
+}
+
+/** @brief Real `waitid` stand-in: counts and returns 0. */
+static int stub_waitid(idtype_t type, id_t id, siginfo_t *info, int options)
+{
+    (void)type;
+    (void)id;
+    (void)info;
+    (void)options;
+    ++g_real_waitid_calls;
+    return 0;
+}
+
+/** @brief Real `waitpid` stand-in: records pid/options, returns its configured result. */
 static pid_t stub_waitpid(pid_t pid, int *status, int options)
 {
     (void)status;
@@ -407,7 +393,56 @@ static pid_t stub_waitpid(pid_t pid, int *status, int options)
     return g_real_waitpid_result;
 }
 
-/* Rename all intercepted function names to test-local wrappers before including the source. */
+/** @brief Calls that reached the real execvpe, fexecve, system or popen stubs. */
+static int g_real_exec_family_calls = 0;
+/** @brief `argv` passed to the last real `execvpe` stub call. */
+static char *const *g_last_execvpe_argv = NULL;
+/** @brief `envp` passed to the last real `execvpe` stub call. */
+static char *const *g_last_execvpe_envp = NULL;
+
+/** @brief Real `execvpe` stand-in: records argv/envp, fails with -1/ENOENT. */
+static int stub_execvpe(const char *file, char *const argv[], char *const envp[])
+{
+    (void)file;
+    ++g_real_exec_family_calls;
+    g_last_execvpe_argv = argv;
+    g_last_execvpe_envp = envp;
+    record_exec_args(argv);
+    errno = ENOENT;
+    return -1;
+}
+
+/** @brief Real `fexecve` stand-in: fails with -1/ENOENT. */
+static int stub_fexecve(int fd, char *const argv[], char *const envp[])
+{
+    (void)fd;
+    (void)argv;
+    (void)envp;
+    ++g_real_exec_family_calls;
+    errno = ENOENT;
+    return -1;
+}
+
+/** @brief Real `system` stand-in: returns 7, a value no injected failure produces. */
+static int stub_system(const char *command)
+{
+    (void)command;
+    ++g_real_exec_family_calls;
+    return 7;
+}
+
+/** @brief Real `popen` stand-in: returns `stdin` as a recognisable non-NULL stream. */
+static FILE *stub_popen(const char *command, const char *mode)
+{
+    (void)command;
+    (void)mode;
+    ++g_real_exec_family_calls;
+    return stdin;
+}
+
+/* Renaming the 20 interposed names keeps the wrappers from replacing libc's symbols in this test
+ * binary and makes them callable by a distinct name. The #undefs restore libc's real fork and
+ * waitpid for the child-process helpers below. */
 #define pthread_create chaos_process_test_pthread_create_wrapper
 #define fork chaos_process_test_fork_wrapper
 #define posix_spawn chaos_process_test_posix_spawn_wrapper
@@ -417,7 +452,33 @@ static pid_t stub_waitpid(pid_t pid, int *status, int options)
 #define execveat chaos_process_test_execveat_wrapper
 #endif
 #define waitpid chaos_process_test_waitpid_wrapper
+#define wait chaos_process_test_wait_wrapper
+#define wait3 chaos_process_test_wait3_wrapper
+#define wait4 chaos_process_test_wait4_wrapper
+#define waitid chaos_process_test_waitid_wrapper
+#define execv chaos_process_test_execv_wrapper
+#define execvp chaos_process_test_execvp_wrapper
+#define execvpe chaos_process_test_execvpe_wrapper
+#define execl chaos_process_test_execl_wrapper
+#define execlp chaos_process_test_execlp_wrapper
+#define execle chaos_process_test_execle_wrapper
+#define fexecve chaos_process_test_fexecve_wrapper
+#define system chaos_process_test_system_wrapper
+#define popen chaos_process_test_popen_wrapper
 #include "../../src/process/chaos_process_hooks.c"
+#undef popen
+#undef system
+#undef fexecve
+#undef execle
+#undef execlp
+#undef execl
+#undef execvpe
+#undef execvp
+#undef execv
+#undef waitid
+#undef wait4
+#undef wait3
+#undef wait
 #undef waitpid
 #ifdef __linux__
 #undef execveat
@@ -429,21 +490,13 @@ static pid_t stub_waitpid(pid_t pid, int *status, int options)
 #undef pthread_create
 
 /**
- * @brief Invariant: `chaos_process_call_real_*` helpers dispatch to the real stubs
- *   and return their values.
+ * @brief Proves each real-function helper forwards its arguments and result unchanged.
  *
- * Triggering condition: each `chaos_process_call_real_*` function called once with
- *   clean state after wiring all real-function-pointer globals to their stubs.
- *
- * Expected observable behaviour:
- * - `call_real_pthread_create`: returns 0; `g_real_pthread_create_calls == 1`.
- * - `call_real_fork`: returns 123; `g_real_fork_calls == 1`.
- * - `call_real_posix_spawn`: returns 0; pid == 234; call count == 1.
- * - `call_real_posix_spawnp`: returns 0; pid == 345; call count == 1.
- * - `call_real_execve`: returns 0; call count == 1.
- * - `call_real_execveat` (Linux): returns 0; call count == 1.
- * - `call_real_waitpid(777, NULL, WNOHANG)`: returns 321; `g_last_waitpid_pid == 777`;
- *   `g_last_waitpid_options == WNOHANG`.
+ * Also covers the two late-binding cases. pthread_create still unresolved is resolved on first
+ * use (libpthread loaded by `dlopen()` after start-up); if it stays unresolved the call returns
+ * EAGAIN, the error pthread_create documents, because no single system call creates a thread.
+ * execveat unresolved (musl) falls back to the raw system call, proven by the kernel's ENOENT
+ * for a missing program while the stub's counter stays put.
  */
 static void test_call_real_helpers(void)
 {
@@ -466,6 +519,19 @@ static void test_call_real_helpers(void)
     assert(chaos_process_call_real_pthread_create(&thread, NULL, stub_start_routine, NULL) == 0);
     assert(g_real_pthread_create_calls == 1);
 
+    g_chaos_process_real_pthread_create = NULL;
+    g_test_late_pthread_create = stub_pthread_create;
+    assert(chaos_process_call_real_pthread_create(&thread, NULL, stub_start_routine, NULL) == 0);
+    assert(g_real_pthread_create_calls == 2);
+
+    g_chaos_process_real_pthread_create = NULL;
+    g_test_late_pthread_create = NULL;
+    assert(
+        chaos_process_call_real_pthread_create(&thread, NULL, stub_start_routine, NULL) == EAGAIN
+    );
+    assert(g_real_pthread_create_calls == 2);
+    g_chaos_process_real_pthread_create = stub_pthread_create;
+
     assert(chaos_process_call_real_fork() == 123);
     assert(g_real_fork_calls == 1);
 
@@ -484,12 +550,12 @@ static void test_call_real_helpers(void)
     assert(chaos_process_call_real_execveat(AT_FDCWD, "/bin/echo", argv, envp, 0) == 0);
     assert(g_real_execveat_calls == 1);
 
-    /* Cover the "execveat unavailable on musl" fallback: ENOSYS without
-     * incrementing the stub call count. */
     g_chaos_process_real_execveat = NULL;
     errno = 0;
-    assert(chaos_process_call_real_execveat(AT_FDCWD, "/bin/echo", argv, envp, 0) == -1);
-    assert(errno == ENOSYS);
+    assert(
+        chaos_process_call_real_execveat(AT_FDCWD, "/nonexistent/chaos-tool", argv, envp, 0) == -1
+    );
+    assert(errno == ENOENT);
     assert(g_real_execveat_calls == 1);
     g_chaos_process_real_execveat = stub_execveat;
 #endif
@@ -501,22 +567,12 @@ static void test_call_real_helpers(void)
 }
 
 /**
- * @brief Invariant: the `pthread_create` wrapper applies guard bypass, latency, ERRNO, and
- *   FAIL_AFTER effects; the ERRNO return code is the error value, not via errno.
+ * @brief Proves the pthread_create wrapper returns injected errors as the result, not in errno.
  *
- * Triggering conditions:
- * - Wrapper call with `g_chaos_process_tls_guard = 1` (re-entrant bypass).
- * - Wrapper call with LATENCY rule for OP_PTHREAD_CREATE.
- * - Wrapper call with ERRNO rule (EAGAIN) and `g_errno_trigger = 1`.
- * - Wrapper call with FAIL_AFTER rule (ENOMEM) and `g_fail_after_trigger = 1`.
- * - Wrapper call with `g_real_pthread_create_result = EAGAIN` (real-function error passthrough).
- *
- * Expected observable behaviour:
- * - Guard bypass: real stub called; `g_latency_calls == 0`.
- * - LATENCY: `g_latency_calls == 1`; real stub called; returns 0.
- * - ERRNO (EAGAIN): returns EAGAIN directly; `errno` unchanged (0); real stub not called.
- * - FAIL_AFTER (ENOMEM): returns ENOMEM; real stub not called.
- * - Real-function error: returns EAGAIN from stub; call count incremented.
+ * pthread_create reports failure by return value and leaves errno unspecified; a wrapper that
+ * set errno instead would make a failing call look successful. Scenarios: guard bypass,
+ * LATENCY then real call, ERRNO (EAGAIN) and FAIL_AFTER (ENOMEM) without the real call and with
+ * errno still 0, and a real EAGAIN passed through.
  */
 static void test_pthread_create_paths(void)
 {
@@ -572,20 +628,10 @@ static void test_pthread_create_paths(void)
 }
 
 /**
- * @brief Invariant: the `fork` wrapper applies guard bypass, latency, ERRNO, and FAIL_AFTER
- *   effects; ERRNO and FAIL_AFTER set errno and return -1.
+ * @brief Proves the fork wrapper fails with -1 + errno and never forks when a rule fires.
  *
- * Triggering conditions:
- * - Wrapper call with `g_chaos_process_tls_guard = 1` (re-entrant bypass).
- * - Wrapper call with LATENCY rule for OP_FORK.
- * - Wrapper call with ERRNO rule (EAGAIN) and `g_errno_trigger = 1`.
- * - Wrapper call with FAIL_AFTER rule (ENOMEM) and `g_fail_after_trigger = 1`.
- *
- * Expected observable behaviour:
- * - Guard bypass: returns 123 (stub value); real stub called.
- * - LATENCY: `g_latency_calls == 1`; real stub called; returns 123.
- * - ERRNO (EAGAIN): returns -1; `errno == EAGAIN`; real stub not called.
- * - FAIL_AFTER (ENOMEM): returns -1; `errno == ENOMEM`; real stub not called.
+ * Scenarios: guard bypass and LATENCY both reach the real fork (pid 123); ERRNO (EAGAIN) and
+ * FAIL_AFTER (ENOMEM) return -1 with that errno and leave the real fork uncalled.
  */
 static void test_fork_paths(void)
 {
@@ -630,20 +676,11 @@ static void test_fork_paths(void)
 }
 
 /**
- * @brief Invariant: the `posix_spawn` wrapper applies guard bypass, latency, ERRNO, and
- *   FAIL_AFTER effects; the ERRNO return code is the error value, not via errno.
+ * @brief Proves the posix_spawn wrapper returns injected errors as the result, errno untouched.
  *
- * Triggering conditions:
- * - Wrapper call with `g_chaos_process_tls_guard = 1`.
- * - Wrapper call with LATENCY rule for OP_POSIX_SPAWN.
- * - Wrapper call with ERRNO rule (EAGAIN) and `g_errno_trigger = 1`.
- * - Wrapper call with FAIL_AFTER rule (ENOMEM) and `g_fail_after_trigger = 1`.
- *
- * Expected observable behaviour:
- * - Guard bypass: returns 0; pid == 234; real stub called.
- * - LATENCY: `g_latency_calls == 1`; real stub called; returns 0.
- * - ERRNO (EAGAIN): returns EAGAIN; `errno` unchanged (0); real stub not called.
- * - FAIL_AFTER (ENOMEM): returns ENOMEM; real stub not called.
+ * posix_spawn, like pthread_create, reports failure by return value. Scenarios: guard bypass
+ * (pid 234 written by the real function), LATENCY then real call, ERRNO (EAGAIN) and FAIL_AFTER
+ * (ENOMEM) without the real call.
  */
 static void test_posix_spawn_paths(void)
 {
@@ -695,20 +732,10 @@ static void test_posix_spawn_paths(void)
 }
 
 /**
- * @brief Invariant: the `posix_spawnp` wrapper applies guard bypass, latency, ERRNO, and
- *   FAIL_AFTER effects; behaviour mirrors `posix_spawn` with different pid sentinel (345).
+ * @brief Proves posix_spawnp has its own operation and the posix_spawn error convention.
  *
- * Triggering conditions:
- * - Wrapper call with `g_chaos_process_tls_guard = 1`.
- * - Wrapper call with LATENCY rule for OP_POSIX_SPAWNP.
- * - Wrapper call with ERRNO rule (EAGAIN) and `g_errno_trigger = 1`.
- * - Wrapper call with FAIL_AFTER rule (ENOMEM) and `g_fail_after_trigger = 1`.
- *
- * Expected observable behaviour:
- * - Guard bypass: returns 0; pid == 345.
- * - LATENCY: `g_latency_calls == 1`; real stub called; returns 0.
- * - ERRNO (EAGAIN): returns EAGAIN; `errno` unchanged; real stub not called.
- * - FAIL_AFTER (ENOMEM): returns ENOMEM; real stub not called.
+ * Rules are keyed on OP_POSIX_SPAWNP, not OP_POSIX_SPAWN; pid 345 proves the wrapper reached
+ * the real posix_spawnp. Scenarios match test_posix_spawn_paths().
  */
 static void test_posix_spawnp_paths(void)
 {
@@ -756,22 +783,11 @@ static void test_posix_spawnp_paths(void)
 }
 
 /**
- * @brief Invariant: the `execve` wrapper applies guard bypass, latency, ERRNO (sets errno),
- *   FAIL_AFTER (sets errno), and real-function error passthrough.
+ * @brief Proves the execve wrapper fails with -1 + errno and does not exec when a rule fires.
  *
- * Triggering conditions:
- * - Wrapper call with `g_chaos_process_tls_guard = 1`.
- * - Wrapper call with LATENCY rule for OP_EXECVE.
- * - Wrapper call with ERRNO rule (EACCES) and `g_errno_trigger = 1`.
- * - Wrapper call with FAIL_AFTER rule (ENOENT) and `g_fail_after_trigger = 1`.
- * - Wrapper call with `g_real_execve_result = -1`, `g_real_execve_errno = E2BIG`.
- *
- * Expected observable behaviour:
- * - Guard bypass: returns 0; real stub called.
- * - LATENCY: `g_latency_calls == 1`; real stub called; returns 0.
- * - ERRNO (EACCES): returns -1; `errno == EACCES`; real stub not called.
- * - FAIL_AFTER (ENOENT): returns -1; `errno == ENOENT`; real stub not called.
- * - Real-function error (E2BIG): returns -1; `errno == E2BIG`.
+ * Scenarios: guard bypass and LATENCY reach the real execve; ERRNO (EACCES) and FAIL_AFTER
+ * (ENOENT) return -1 with that errno and skip it; a real E2BIG failure keeps its errno, proving
+ * the wrapper does not clobber errno after the real call.
  */
 static void test_execve_paths(void)
 {
@@ -828,17 +844,9 @@ static void test_execve_paths(void)
 
 #ifdef __linux__
 /**
- * @brief Invariant: the `execveat` wrapper (Linux-only) behaves identically to the `execve`
- *   wrapper with the addition of a dirfd and flags argument.
+ * @brief Proves execveat (Linux only) has its own operation and the execve error convention.
  *
- * Triggering conditions:
- * - Wrapper call with `g_chaos_process_tls_guard = 1`.
- * - Wrapper call with LATENCY rule for OP_EXECVEAT.
- * - Wrapper call with ERRNO rule (EACCES) and `g_errno_trigger = 1`.
- * - Wrapper call with FAIL_AFTER rule (ENOENT) and `g_fail_after_trigger = 1`.
- * - Wrapper call with `g_real_execveat_result = -1`, `g_real_execveat_errno = E2BIG`.
- *
- * Expected observable behaviour: same as `test_execve_paths` with `execveat` call counts.
+ * Rules are keyed on OP_EXECVEAT. Scenarios and errnos match test_execve_paths().
  */
 static void test_execveat_paths(void)
 {
@@ -895,22 +903,11 @@ static void test_execveat_paths(void)
 #endif
 
 /**
- * @brief Invariant: the `waitpid` wrapper applies guard bypass, latency, ERRNO, FAIL_AFTER,
- *   and real-function error passthrough; pid and options are forwarded correctly.
+ * @brief Proves the waitpid wrapper forwards pid/options and fails with -1 + errno on a rule.
  *
- * Triggering conditions:
- * - Wrapper call `waitpid(456, NULL, WNOHANG)` with `g_chaos_process_tls_guard = 1`.
- * - Wrapper call with LATENCY rule for OP_WAITPID.
- * - Wrapper call with ERRNO rule (EINTR) and `g_errno_trigger = 1`.
- * - Wrapper call with FAIL_AFTER rule (ECHILD) and `g_fail_after_trigger = 1`.
- * - Wrapper call with `g_real_waitpid_result = -1`, `g_real_waitpid_errno = ECHILD`.
- *
- * Expected observable behaviour:
- * - Guard bypass: returns 321; `g_last_waitpid_pid == 456`; real stub called.
- * - LATENCY: `g_latency_calls == 1`; real stub called; returns 321.
- * - ERRNO (EINTR): returns -1; `errno == EINTR`; real stub not called.
- * - FAIL_AFTER (ECHILD): returns -1; `errno == ECHILD`; real stub not called.
- * - Real-function error (ECHILD): returns -1; `errno == ECHILD`.
+ * Scenarios: guard bypass (pid 456 forwarded, 321 returned), LATENCY then real call, ERRNO
+ * (EINTR) and FAIL_AFTER (ECHILD) without reaping anything, and a real ECHILD passed through.
+ * Not reaping matters: an injected failure must leave the child for a later retry.
  */
 static void test_waitpid_paths(void)
 {
@@ -963,6 +960,381 @@ static void test_waitpid_paths(void)
     assert(errno == ECHILD);
 }
 
+/**
+ * @brief Proves wait, wait3, wait4 and waitid share the `waitpid` selector.
+ *
+ * One `waitpid` rule covers every way to reap a child, so a rule cannot be dodged by a program
+ * that calls wait4 or waitid. wait(s) becomes waitpid(-1, s, 0); wait3 becomes wait4(-1, ...)
+ * with `usage` passed through. wait4 and waitid reach the real call with no rule and under the
+ * guard, and fail with -1 + errno under a firing ERRNO or FAIL_AFTER rule on OP_WAITPID.
+ */
+static void test_wait_family_paths(void)
+{
+    struct rusage usage;
+    siginfo_t info;
+
+    reset_wrapper_state();
+    g_chaos_process_real_waitpid = stub_waitpid;
+    assert(chaos_process_test_wait_wrapper(NULL) == 321);
+    assert(g_last_waitpid_pid == -1);
+    assert(g_last_waitpid_options == 0);
+
+    reset_wrapper_state();
+    g_chaos_process_real_wait4 = stub_wait4;
+    g_real_wait4_calls = 0;
+    assert(chaos_process_test_wait3_wrapper(NULL, WNOHANG, &usage) == 321);
+    assert(g_real_wait4_calls == 1);
+    assert(g_last_waitpid_pid == -1);
+    assert(g_last_waitpid_options == WNOHANG);
+    assert(g_last_wait4_usage == &usage);
+
+    g_chaos_process_tls_guard = 1;
+    assert(chaos_process_test_wait4_wrapper(7, NULL, 0, NULL) == 321);
+    assert(g_real_wait4_calls == 2);
+    g_chaos_process_tls_guard = 0;
+
+    reset_wrapper_state();
+    g_chaos_process_real_waitid = stub_waitid;
+    g_real_waitid_calls = 0;
+    assert(chaos_process_test_waitid_wrapper(P_ALL, 0, &info, WEXITED) == 0);
+    g_chaos_process_tls_guard = 1;
+    assert(chaos_process_test_waitid_wrapper(P_ALL, 0, &info, WEXITED) == 0);
+    g_chaos_process_tls_guard = 0;
+    assert(g_real_waitid_calls == 2);
+
+    reset_wrapper_state();
+    g_chaos_process_real_wait4 = stub_wait4;
+    g_chaos_process_real_waitid = stub_waitid;
+    g_real_wait4_calls = 0;
+    g_real_waitid_calls = 0;
+    g_stub_match[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_WAITPID] = 1;
+    g_stub_rules[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_WAITPID].effect =
+        CHAOS_PROCESS_EFFECT_ERRNO;
+    g_stub_rules[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_WAITPID].errnum = EINTR;
+    g_errno_trigger = 1;
+    errno = 0;
+    assert(chaos_process_test_wait4_wrapper(7, NULL, 0, NULL) == -1);
+    assert(errno == EINTR);
+    errno = 0;
+    assert(chaos_process_test_waitid_wrapper(P_ALL, 0, &info, WEXITED) == -1);
+    assert(errno == EINTR);
+    assert(g_real_wait4_calls == 0);
+    assert(g_real_waitid_calls == 0);
+
+    reset_wrapper_state();
+    g_chaos_process_real_waitid = stub_waitid;
+    g_real_waitid_calls = 0;
+    g_stub_match[CHAOS_PROCESS_EFFECT_FAIL_AFTER][CHAOS_PROCESS_OP_WAITPID] = 1;
+    g_stub_rules[CHAOS_PROCESS_EFFECT_FAIL_AFTER][CHAOS_PROCESS_OP_WAITPID].effect =
+        CHAOS_PROCESS_EFFECT_FAIL_AFTER;
+    g_stub_rules[CHAOS_PROCESS_EFFECT_FAIL_AFTER][CHAOS_PROCESS_OP_WAITPID].errnum = ECHILD;
+    g_fail_after_trigger = 1;
+    errno = 0;
+    assert(chaos_process_test_waitid_wrapper(P_ALL, 0, &info, WEXITED) == -1);
+    assert(errno == ECHILD);
+    assert(g_real_waitid_calls == 0);
+}
+
+/**
+ * @brief Proves the exec family maps onto existing selectors and builds argv correctly.
+ *
+ * Mapping: execv/execl/execle/execvp/execlp/execvpe use `execve`, fexecve uses `execveat`
+ * (Linux only), system and popen use `posix_spawn`.
+ * - execv/execl/execle reach the real execve with the given or assembled argv (NULL-terminated,
+ *   checked through `g_last_exec_args`) and `environ`, or execle's trailing envp.
+ * - execvp/execlp reach the real execvpe with `environ`.
+ * - A firing ERRNO rule fails execvpe, fexecve, system (-1) and popen (NULL) with its errno and
+ *   no real call.
+ * - An unresolved real execvpe or fexecve fails with ENOSYS.
+ * - system(NULL) bypasses rules: it only asks whether a shell exists and must not be failed.
+ */
+static void test_exec_family_paths(void)
+{
+    char *const argv[] = {(char *)"tool", (char *)"-x", NULL};
+    char *const envp[] = {(char *)"A=1", NULL};
+
+    reset_wrapper_state();
+    g_chaos_process_real_execve = stub_execve;
+    g_real_execve_result = -1;
+    g_real_execve_errno = ENOENT;
+    assert(chaos_process_test_execv_wrapper("/bin/tool", argv) == -1);
+    assert(g_last_execve_argv == argv);
+    assert(g_last_execve_envp == environ);
+
+    assert(chaos_process_test_execl_wrapper("/bin/tool", "tool", "-x", "-y", (char *)NULL) == -1);
+    assert(strcmp(g_last_exec_args[0], "tool") == 0);
+    assert(strcmp(g_last_exec_args[2], "-y") == 0);
+    assert(g_last_execve_envp == environ);
+
+    assert(chaos_process_test_execle_wrapper("/bin/tool", "tool", (char *)NULL, envp) == -1);
+    assert(strcmp(g_last_exec_args[0], "tool") == 0);
+    assert(g_last_exec_args[1][0] == '\0');
+    assert(g_last_execve_envp == envp);
+    assert(chaos_process_test_execle_wrapper("/bin/tool", "tool", "-v", (char *)NULL, envp) == -1);
+    assert(strcmp(g_last_exec_args[1], "-v") == 0);
+    assert(g_last_execve_envp == envp);
+
+    reset_wrapper_state();
+    g_real_exec_family_calls = 0;
+    g_chaos_process_real_execvpe = stub_execvpe;
+    assert(chaos_process_test_execvp_wrapper("tool", argv) == -1);
+    assert(g_last_execvpe_argv == argv);
+    assert(g_last_execvpe_envp == environ);
+    assert(chaos_process_test_execlp_wrapper("tool", "tool", "-z", (char *)NULL) == -1);
+    assert(strcmp(g_last_exec_args[1], "-z") == 0);
+    assert(g_last_exec_args[2][0] == '\0');
+    g_chaos_process_tls_guard = 1;
+    assert(chaos_process_test_execvpe_wrapper("tool", argv, envp) == -1);
+    g_chaos_process_tls_guard = 0;
+    assert(g_real_exec_family_calls == 3);
+
+    g_stub_match[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_EXECVE] = 1;
+    g_stub_rules[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_EXECVE].effect =
+        CHAOS_PROCESS_EFFECT_ERRNO;
+    g_stub_rules[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_EXECVE].errnum = EACCES;
+    g_errno_trigger = 1;
+    errno = 0;
+    assert(chaos_process_test_execvpe_wrapper("tool", argv, envp) == -1);
+    assert(errno == EACCES);
+    assert(g_real_exec_family_calls == 3);
+
+    reset_wrapper_state();
+    g_chaos_process_real_execvpe = NULL;
+    g_chaos_process_real_fexecve = NULL;
+    errno = 0;
+    assert(chaos_process_test_execvpe_wrapper("tool", argv, envp) == -1);
+    assert(errno == ENOSYS);
+    errno = 0;
+    assert(chaos_process_test_fexecve_wrapper(3, argv, envp) == -1);
+    assert(errno == ENOSYS);
+
+    reset_wrapper_state();
+    g_real_exec_family_calls = 0;
+    g_chaos_process_real_fexecve = stub_fexecve;
+    assert(chaos_process_test_fexecve_wrapper(3, argv, envp) == -1);
+    assert(errno == ENOENT);
+    assert(g_real_exec_family_calls == 1);
+#ifdef __linux__
+    g_stub_match[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_EXECVEAT] = 1;
+    g_stub_rules[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_EXECVEAT].effect =
+        CHAOS_PROCESS_EFFECT_ERRNO;
+    g_stub_rules[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_EXECVEAT].errnum = EACCES;
+    g_errno_trigger = 1;
+    errno = 0;
+    assert(chaos_process_test_fexecve_wrapper(3, argv, envp) == -1);
+    assert(errno == EACCES);
+    assert(g_real_exec_family_calls == 1);
+#endif
+
+    reset_wrapper_state();
+    g_real_exec_family_calls = 0;
+    g_chaos_process_real_system = stub_system;
+    g_chaos_process_real_popen = stub_popen;
+    assert(chaos_process_test_system_wrapper("true") == 7);
+    assert(chaos_process_test_popen_wrapper("true", "r") == stdin);
+    g_chaos_process_tls_guard = 1;
+    assert(chaos_process_test_popen_wrapper("true", "r") == stdin);
+    g_chaos_process_tls_guard = 0;
+    assert(g_real_exec_family_calls == 3);
+
+    g_stub_match[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_POSIX_SPAWN] = 1;
+    g_stub_rules[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_POSIX_SPAWN].effect =
+        CHAOS_PROCESS_EFFECT_ERRNO;
+    g_stub_rules[CHAOS_PROCESS_EFFECT_ERRNO][CHAOS_PROCESS_OP_POSIX_SPAWN].errnum = EAGAIN;
+    g_errno_trigger = 1;
+    errno = 0;
+    assert(chaos_process_test_system_wrapper("true") == -1);
+    assert(errno == EAGAIN);
+    errno = 0;
+    assert(chaos_process_test_popen_wrapper("true", "r") == NULL);
+    assert(errno == EAGAIN);
+    assert(chaos_process_test_system_wrapper(NULL) == 7);
+    g_chaos_process_tls_guard = 1;
+    assert(chaos_process_test_system_wrapper("true") == 7);
+    g_chaos_process_tls_guard = 0;
+    assert(g_real_exec_family_calls == 5);
+}
+
+/**
+ * @brief Proves a matched rule that does not fire leaves every wrapper to the real call.
+ *
+ * An ERRNO and a FAIL_AFTER rule match every operation while both triggers are off, modelling
+ * a probability miss or a FAIL_AFTER count not yet reached. Each wrapper must then return the
+ * real result exactly once. Finally fexecve under the guard reaches the real fexecve (ENOENT)
+ * although its ERRNO rule would fire (EACCES), proving the guard check precedes rule matching.
+ */
+static void test_rules_that_do_not_fire(void)
+{
+    pthread_t thread = (pthread_t)0;
+    pid_t pid = 0;
+    char *argv[] = {(char *)"echo", NULL};
+    char *envp[] = {NULL};
+    int operation;
+
+    reset_wrapper_state();
+    g_real_exec_family_calls = 0;
+    g_chaos_process_real_pthread_create = stub_pthread_create;
+    g_chaos_process_real_fork = stub_fork;
+    g_chaos_process_real_posix_spawn = stub_posix_spawn;
+    g_chaos_process_real_posix_spawnp = stub_posix_spawnp;
+    g_chaos_process_real_execve = stub_execve;
+#ifdef __linux__
+    g_chaos_process_real_execveat = stub_execveat;
+#endif
+    g_chaos_process_real_waitpid = stub_waitpid;
+    g_chaos_process_real_execvpe = stub_execvpe;
+    g_chaos_process_real_fexecve = stub_fexecve;
+    for (operation = 0; operation < (int)CHAOS_PROCESS_OP_COUNT; ++operation)
+    {
+        g_stub_match[CHAOS_PROCESS_EFFECT_ERRNO][operation] = 1;
+        g_stub_rules[CHAOS_PROCESS_EFFECT_ERRNO][operation].effect = CHAOS_PROCESS_EFFECT_ERRNO;
+        g_stub_rules[CHAOS_PROCESS_EFFECT_ERRNO][operation].errnum = EACCES;
+        g_stub_match[CHAOS_PROCESS_EFFECT_FAIL_AFTER][operation] = 1;
+        g_stub_rules[CHAOS_PROCESS_EFFECT_FAIL_AFTER][operation].effect =
+            CHAOS_PROCESS_EFFECT_FAIL_AFTER;
+        g_stub_rules[CHAOS_PROCESS_EFFECT_FAIL_AFTER][operation].errnum = ENOMEM;
+    }
+
+    assert(chaos_process_test_pthread_create_wrapper(&thread, NULL, stub_start_routine, NULL) == 0);
+    assert(chaos_process_test_fork_wrapper() == 123);
+    assert(chaos_process_test_posix_spawn_wrapper(&pid, "/bin/echo", NULL, NULL, argv, envp) == 0);
+    assert(chaos_process_test_posix_spawnp_wrapper(&pid, "echo", NULL, NULL, argv, envp) == 0);
+    assert(chaos_process_test_execve_wrapper("/bin/echo", argv, envp) == 0);
+#ifdef __linux__
+    assert(chaos_process_test_execveat_wrapper(AT_FDCWD, "/bin/echo", argv, envp, 0) == 0);
+    assert(g_real_execveat_calls == 1);
+#endif
+    assert(chaos_process_test_waitpid_wrapper(456, NULL, WNOHANG) == 321);
+    errno = 0;
+    assert(chaos_process_test_execvpe_wrapper("echo", argv, envp) == -1);
+    assert(errno == ENOENT);
+    assert(g_real_pthread_create_calls == 1);
+    assert(g_real_fork_calls == 1);
+    assert(g_real_posix_spawn_calls == 1);
+    assert(g_real_posix_spawnp_calls == 1);
+    assert(g_real_execve_calls == 1);
+    assert(g_real_waitpid_calls == 1);
+    assert(g_real_exec_family_calls == 1);
+
+    g_errno_trigger = 1;
+    g_chaos_process_tls_guard = 1;
+    errno = 0;
+    assert(chaos_process_test_fexecve_wrapper(3, argv, envp) == -1);
+    assert(errno == ENOENT);
+    g_chaos_process_tls_guard = 0;
+    assert(g_real_exec_family_calls == 2);
+}
+
+/** @brief Forks (libc's real fork) a child that `_exit`s with @p code; returns its pid. */
+static pid_t spawn_exiting_child(int code)
+{
+    pid_t child = fork();
+
+    assert(child >= 0);
+    if (child == 0)
+    {
+        _exit(code);
+    }
+    return child;
+}
+
+/**
+ * @brief Execs `/bin/sh -c "exit 7"` through a wrapper with no real exec resolved, in a child.
+ *
+ * Runs in a child because a successful exec replaces the calling process.
+ *
+ * @param use_execveat  Non-zero uses the execveat wrapper (Linux only), else execve.
+ * @return The child's exit status: 7 when the raw system call ran the shell, 99 when the exec
+ *   returned.
+ */
+static int exit_status_of_exec_child(int use_execveat)
+{
+    char *argv[] = {(char *)"sh", (char *)"-c", (char *)"exit 7", NULL};
+    char *envp[] = {NULL};
+    int status = 0;
+    pid_t child = fork();
+
+    assert(child >= 0);
+    if (child == 0)
+    {
+        g_chaos_process_real_execve = NULL;
+#ifdef __linux__
+        g_chaos_process_real_execveat = NULL;
+        if (use_execveat)
+        {
+            (void)chaos_process_test_execveat_wrapper(AT_FDCWD, "/bin/sh", argv, envp, 0);
+            _exit(99);
+        }
+#endif
+        (void)chaos_process_test_execve_wrapper("/bin/sh", argv, envp);
+        _exit(99);
+    }
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFEXITED(status));
+    return WEXITSTATUS(status);
+}
+
+/**
+ * @brief Proves a wrapper whose real function is unresolved never calls through NULL.
+ *
+ * All real-function pointers are NULL, as while the symbol lookup itself runs. Wrappers backed
+ * by one system call make it: execve and execveat run a real program (exit status 7) or get
+ * the kernel's ENOENT, and waitpid/wait4/waitid reap real children with the right status.
+ * fork, posix_spawn(p), system and popen have no single system call and fail with ENOSYS in
+ * their own convention: -1 + errno, ENOSYS as the result (pid untouched), -1 + errno, NULL +
+ * errno.
+ */
+static void test_unresolved_fallbacks(void)
+{
+    char *argv[] = {(char *)"tool", NULL};
+    char *envp[] = {NULL};
+    struct rusage usage;
+    siginfo_t info;
+    pid_t pid = 42;
+    pid_t child;
+    int status = 0;
+
+    reset_wrapper_state();
+
+    errno = 0;
+    assert(chaos_process_test_fork_wrapper() == -1);
+    assert(errno == ENOSYS);
+    assert(
+        chaos_process_test_posix_spawn_wrapper(&pid, "/bin/true", NULL, NULL, argv, envp) == ENOSYS
+    );
+    assert(chaos_process_test_posix_spawnp_wrapper(&pid, "true", NULL, NULL, argv, envp) == ENOSYS);
+    assert(pid == 42);
+    errno = 0;
+    assert(chaos_process_test_system_wrapper("true") == -1);
+    assert(errno == ENOSYS);
+    errno = 0;
+    assert(chaos_process_test_popen_wrapper("true", "r") == NULL);
+    assert(errno == ENOSYS);
+
+    errno = 0;
+    assert(chaos_process_test_execve_wrapper("/nonexistent/chaos-tool", argv, envp) == -1);
+    assert(errno == ENOENT);
+    assert(exit_status_of_exec_child(0) == 7);
+#ifdef __linux__
+    assert(exit_status_of_exec_child(1) == 7);
+#endif
+
+    child = spawn_exiting_child(5);
+    assert(chaos_process_test_waitpid_wrapper(child, &status, 0) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 5);
+
+    child = spawn_exiting_child(6);
+    (void)memset(&usage, 0, sizeof(usage));
+    assert(chaos_process_test_wait4_wrapper(child, &status, 0, &usage) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 6);
+
+    child = spawn_exiting_child(9);
+    (void)memset(&info, 0, sizeof(info));
+    assert(chaos_process_test_waitid_wrapper(P_PID, (id_t)child, &info, WEXITED) == 0);
+    assert(info.si_pid == child);
+    assert(info.si_status == 9);
+}
+
 int main(void)
 {
     test_call_real_helpers();
@@ -975,5 +1347,9 @@ int main(void)
     test_execveat_paths();
 #endif
     test_waitpid_paths();
+    test_wait_family_paths();
+    test_exec_family_paths();
+    test_rules_that_do_not_fire();
+    test_unresolved_fallbacks();
     return 0;
 }

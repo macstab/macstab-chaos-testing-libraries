@@ -1,41 +1,34 @@
 /**
  * @file chaos_io_internal.h
- * @brief Shared runtime definitions for the libchaos-io preload library.
+ * @brief libchaos-io primitives shared by every translation unit: limits, control-file
+ *        paths, real-function types and pointers, re-entrancy guard, PRNG, path filters.
  *
  * @details
- * This header is the single source of truth for every primitive that crosses
- * compilation-unit boundaries inside the preload library: capacity limits,
- * sentinel values, libc symbol types, the TLS reentrancy guard, the PRNG, and
- * the path exclusion filter.
+ * Included by the wrappers, the rule cache, the fd cache, the effects and by chaos-init
+ * (which reuses the path helpers). Everything defined inline here is allocation-free and
+ * lock-free.
  *
- * All wrapper translation units, the config subsystem, the fd-cache, and the
- * effect helpers include this file directly.  The implementation deliberately
- * avoids dynamic allocation anywhere in this header so that every inline
- * function is safe to call from signal handlers and constructors.
- *
- * **Module ownership:** core/
- * **Stability:** internal – not part of any public ABI
- * **Thread-safety:** all non-`static` symbols exposed here are either
- * thread-local (`__thread`) or truly read-only after `chaos_io_init()`;
- * the atomic helpers provide the necessary ordering for shared fields.
+ * @par Thread safety
+ * - Real-function pointers are written once, during symbol resolution under chaos_once(),
+ *   and only read afterwards.
+ * - g_chaos_io_process_seed is written once in the constructor.
+ * - The re-entrancy guard and the PRNG state are thread-local (`__thread`): each thread
+ *   has its own, so they need no synchronisation. Together they are 12 bytes of TLS;
+ *   larger objects are kept out of TLS on purpose (see g_chaos_io_config_buffer in
+ *   chaos_io_config.c).
+ * - The atomic helpers order the shared rule-cache fields.
  */
 
 #ifndef CHAOS_IO_INTERNAL_H
 #define CHAOS_IO_INTERNAL_H
 
-/*
- * Shared internal runtime definitions used across the preload library.
- *
- * This header is the common contract between the wrapper layer, config loader,
- * fault helpers, and fd cache. It keeps the low-level guard, PRNG, path filter,
- * and libc symbol state in one place so the codebase behaves consistently while
- * still keeping the final shared object small.
- */
-
+#include <dirent.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -51,67 +44,80 @@
 #endif
 
 /**
+ * @brief System-call entry used by a wrapper whose real function is not resolved yet.
+ *
+ * @details A wrapper can run while the real-function table is still being filled: a
+ * signal handler during the constructor's dlsym, or an allocator whose first allocation
+ * inside dlsym does file I/O. Its `g_chaos_io_real_*` pointer is NULL then, and the
+ * wrapper issues the system call itself. Test seam: unit tests stub `syscall` and point
+ * this macro at the real one.
+ */
+#ifndef CHAOS_IO_SYSCALL
+#define CHAOS_IO_SYSCALL syscall
+#endif
+
+/**
  * @defgroup chaos_io_limits Capacity and path limits
  * @{
  */
 
 /**
- * @brief Absolute path of the fault-injection configuration file.
+ * @brief Rule file of libchaos-io.
  *
- * @details The library reads this file on demand when its mtime changes.
- * The path is also used as the primary exclusion key: any operation whose
- * resolved path equals this string is passed through without injection,
- * preventing the library from injecting faults into its own control plane.
+ * @details Re-read when its change stamp changes (chaos_io_config_prepare()). Excluded
+ * from matching, together with every other `/tmp/.chaos-*` control file
+ * (chaos_io_is_control_path()), so no rule can fault the control plane.
  */
 #define CHAOS_IO_CONFIG_PATH "/tmp/.chaos-io.conf"
 
+/** @brief Status file: outcome of the last reload (chaos_status.h). */
+#define CHAOS_IO_STATUS_PATH "/tmp/.chaos-io.status"
+
+/** @brief Hits-file name without the `.<n>` suffix (chaos_hits.h). */
+#define CHAOS_IO_HITS_PREFIX "/tmp/.chaos-io.hits"
+
 /**
- * @brief Maximum number of rules that one config snapshot may hold.
+ * @brief Most rules one rule file may hold; rule 257 rejects the file ("too many rules").
  *
- * @details Bounds the two statically allocated `chaos_io_config_state_t`
- * arrays.  Increasing this value increases BSS usage by
- * `2 * CHAOS_IO_MAX_RULES * sizeof(chaos_io_rule_t)`.
+ * @details Sizes the two static snapshots, the hit-slot pool (twice this) and the
+ * hits-file buffer; BSS grows linearly with it.
  */
 #define CHAOS_IO_MAX_RULES 256U
 
 /**
- * @brief Maximum byte length of a resolved filesystem path, including NUL.
- *
- * @details Set to `PATH_MAX` so on-stack path buffers never need to be
- * larger than the kernel's own limit.
+ * @brief Size of a path buffer, NUL included: `PATH_MAX` (4096 on Linux), the kernel's
+ *        own limit for a path argument. Wrappers keep one or two on the stack.
  */
 #define CHAOS_IO_MAX_PATH ((size_t)PATH_MAX)
 
 /**
- * @brief Maximum byte length of a rule path prefix stored in a parsed rule.
+ * @brief Size of a rule's path-prefix buffer, NUL included; a prefix of 1024 bytes or more
+ *        rejects the line.
  *
- * @details Kept smaller than `CHAOS_IO_MAX_PATH` because rule prefixes are
- * specified by the operator and do not need to cover every possible
- * kernel-resolved path.  Paths longer than this at parse time are rejected.
+ * @details Smaller than CHAOS_IO_MAX_PATH because it is stored three times per rule slot
+ * (prefix, resolved form, both snapshots), and operator-written prefixes are short.
  */
 #define CHAOS_IO_MAX_RULE_PATH 1024U
 
 /**
- * @brief Maximum byte length of one line in the config file.
+ * @brief Line length used only to size CHAOS_IO_MAX_CONFIG_BYTES; no per-line limit is
+ *        enforced beyond the rule-prefix limit.
  */
 #define CHAOS_IO_MAX_LINE_LENGTH 1024U
 
 /**
- * @brief Maximum total byte size of the config file that the library will read.
- *
- * @details The config reader rejects files that hit this boundary to prevent
- * a partial rule set from silently truncating intended configuration.
- * The value is `CHAOS_IO_MAX_RULES * CHAOS_IO_MAX_LINE_LENGTH`.
+ * @brief Rule-file size limit: 256 * 1024 = 262144 bytes (256 KiB). A file of this size
+ *        or larger is rejected ("file too large") instead of being parsed truncated.
  */
 #define CHAOS_IO_MAX_CONFIG_BYTES (CHAOS_IO_MAX_RULES * CHAOS_IO_MAX_LINE_LENGTH)
 
 /**
- * @brief Number of direct-mapped slots in the per-thread fd-to-path cache.
+ * @brief Slots of the process-wide direct-mapped fd-to-path cache.
  *
- * @details The cache is indexed by `fd % CHAOS_IO_FD_CACHE_SLOTS`, so any
- * two descriptors whose values differ by this modulus share a slot and the
- * later one evicts the earlier one.  32 slots covers the typical fd range of
- * a single-threaded I/O loop without bloating per-thread storage.
+ * @details Indexed by `fd % CHAOS_IO_FD_CACHE_SLOTS`: descriptors that differ by a
+ * multiple of 32 share a slot, and the later store evicts the earlier entry. The table
+ * is mapped once per process on first store, 32 * (4096 + 12) bytes, about 128 KiB; no
+ * thread carries any of it.
  */
 #define CHAOS_IO_FD_CACHE_SLOTS 32U
 
@@ -123,71 +129,61 @@
  */
 
 /**
- * @brief Marks a symbol as part of the public preload ABI.
+ * @brief Exports a wrapper into the dynamic symbol table.
  *
- * @details Applied exclusively to the interposed libc symbols (e.g. `open`,
- * `read`, `write`).  Every other symbol in the library is compiled with
- * `-fvisibility=hidden` so it is invisible to the dynamic linker and cannot
- * conflict with symbols in the target process.
+ * @details Only the interposed functions carry it; the shared object is built with
+ * `-fvisibility=hidden`, so no internal helper can interpose on, or collide with, a
+ * symbol of the host process.
  *
- * @note `-fno-stack-protector` is also required at compile time because
- * `__stack_chk_fail` calls `write`, which would recurse back into this
- * library before `g_chaos_io_real_write` is resolved.
+ * @note The shared object is also built with `-fno-stack-protector`, so it imports no
+ * `__stack_chk_fail`: that handler writes a message through libc, which would re-enter
+ * these wrappers on a corrupted stack.
  */
 #define CHAOS_IO_EXPORT __attribute__((visibility("default")))
 
 /** @} */
 
 /**
- * @defgroup chaos_io_mtime Config mtime sentinel values
+ * @defgroup chaos_io_mtime Change-stamp sentinels
  * @{
  *
- * @details The library stores the mtime of the config file as a hashed
- * 64-bit value in a shared `volatile uint64_t` that doubles as a lock-free
- * CAS token.  Three special sentinel values have meaning beyond a normal
- * hash result.  `chaos_io_config_normalize_mtime_hash()` maps genuine hash
- * collisions with these sentinels to a nearby distinct value.
+ * @details The rule cache keeps the rule file's change stamp (a 64-bit hash of mtime,
+ * size, inode and device) in one shared word that is also the reload claim's CAS target.
+ * Three values are reserved; chaos_io_config_normalize_mtime_hash() moves a real stamp
+ * that hashes to one of them off it.
  */
 
 /**
- * @brief Sentinel: config file does not exist or could not be stat'd.
- *
- * @details When the cached mtime equals this value, the active config state
- * has zero rules and all operations pass through without injection.
+ * @brief Sentinel: the rule file does not exist or stat() failed; the active snapshot
+ *        then holds no rules.
  */
 #define CHAOS_IO_MTIME_MISSING UINT64_C(0)
 
 /**
- * @brief Sentinel: another thread has won the CAS race and is reloading.
+ * @brief Sentinel: the reload claim; one thread of this process is reloading.
  *
- * @details A thread that observes this value as the cached mtime yields the
- * reload responsibility and falls back to the current active snapshot.
- * This prevents two threads from reading the config file simultaneously.
+ * @details Other threads keep using the active snapshot instead of waiting, so at most
+ * one thread reads and parses the rule file at a time.
  */
 #define CHAOS_IO_MTIME_RELOADING UINT64_C(0xfffffffffffffffe)
 
 /**
- * @brief Sentinel: initial state before the first stat check.
- *
- * @details Set by `chaos_io_config_init()`.  Any observed mtime differs from
- * this on the first call to `chaos_io_config_prepare()`, guaranteeing that
- * the config file is read at least once before any wrapper fires a rule.
+ * @brief Sentinel: no load yet (set by chaos_io_config_init(), and by the atfork handler
+ *        when it releases a claim). Every observed stamp differs from it, so the next
+ *        check reloads, and the throttle is bypassed while it is set.
  */
 #define CHAOS_IO_MTIME_UNKNOWN UINT64_C(0xffffffffffffffff)
 
 /** @} */
 
 /**
- * @defgroup chaos_io_fn_types Resolved libc function pointer types
+ * @defgroup chaos_io_fn_types Real-function pointer types
  * @{
  *
- * @details Each typedef mirrors the exact POSIX signature of the
- * corresponding libc symbol.  Using typed function pointers rather than
- * `void (*)(void)` casts lets the compiler check argument types at call
- * sites and avoids undefined behavior from incompatible pointer-to-pointer
- * conversions.  The actual pointers are populated by `dlsym(RTLD_NEXT, …)`
- * during the library constructor and must be non-NULL before any wrapper
- * reaches a `g_chaos_io_real_*` call.
+ * @details Each typedef mirrors the libc prototype exactly, so calls through the
+ * pointers are type-checked and well defined. The pointers are filled by
+ * `dlsym(RTLD_NEXT, ...)` (chaos_io_ensure_symbols()); wrappers handle a NULL pointer
+ * themselves (raw system call or ENOSYS).
  */
 
 /** @brief Type of the real `read(2)` libc symbol. */
@@ -210,6 +206,18 @@ typedef int (*chaos_io_openat_fn)(int, const char *, int, ...);
 
 /** @brief Type of the real `close(2)` libc symbol. */
 typedef int (*chaos_io_close_fn)(int);
+
+/** @brief Type of the real `dup2(2)` libc symbol. */
+typedef int (*chaos_io_dup2_fn)(int, int);
+
+/** @brief Type of the real `close_range(2)` libc symbol (glibc 2.34+; may be absent). */
+typedef int (*chaos_io_close_range_fn)(unsigned int, unsigned int, int);
+/** @brief Signature of `closedir`. */
+typedef int (*chaos_io_closedir_fn)(DIR *);
+/** @brief Signature of `pclose`. */
+typedef int (*chaos_io_pclose_fn)(FILE *);
+/** @brief Signature of `closefrom` (glibc 2.34; absent from musl). */
+typedef void (*chaos_io_closefrom_fn)(int);
 
 /**
  * @brief Type shared by the real `fsync(2)` and `fdatasync(2)` libc symbols.
@@ -234,6 +242,60 @@ typedef ssize_t (*chaos_io_pwritev_fn)(int, const struct iovec *, int, off_t);
 /** @brief Type of the real `ftruncate(2)` libc symbol. */
 typedef int (*chaos_io_ftruncate_fn)(int, off_t);
 
+/** @brief Type of the real `truncate(2)` libc symbol. */
+typedef int (*chaos_io_truncate_fn)(const char *, off_t);
+
+/** @brief Type of the real `fread` libc symbol. */
+typedef size_t (*chaos_io_fread_fn)(void *, size_t, size_t, FILE *);
+
+/** @brief Type of the real `fwrite` libc symbol. */
+typedef size_t (*chaos_io_fwrite_fn)(const void *, size_t, size_t, FILE *);
+
+/** @brief Type of the real `fgets` libc symbol. */
+typedef char *(*chaos_io_fgets_fn)(char *, int, FILE *);
+
+/** @brief Type of the real `fputs` libc symbol. */
+typedef int (*chaos_io_fputs_fn)(const char *, FILE *);
+
+/** @brief Type of the real `fgetc` libc symbol. */
+typedef int (*chaos_io_fgetc_fn)(FILE *);
+
+/** @brief Type of the real `fputc` libc symbol. */
+typedef int (*chaos_io_fputc_fn)(int, FILE *);
+
+/** @brief Type of the real `getdelim` libc symbol. */
+typedef ssize_t (*chaos_io_getdelim_fn)(char **, size_t *, int, FILE *);
+
+/** @brief Type of the real `vfprintf` libc symbol. */
+typedef int (*chaos_io_vfprintf_fn)(FILE *, const char *, va_list);
+
+/** @brief Type of the real `fflush` libc symbol. */
+typedef int (*chaos_io_fflush_fn)(FILE *);
+
+/** @brief Type of the real `__vfprintf_chk` libc symbol. */
+typedef int (*chaos_io_vfprintf_chk_fn)(FILE *, int, const char *, va_list);
+
+/** @brief Type of the real `__fread_chk` libc symbol. */
+typedef size_t (*chaos_io_fread_chk_fn)(void *, size_t, size_t, size_t, FILE *);
+
+/** @brief Type of the real `__fgets_chk` libc symbol. */
+typedef char *(*chaos_io_fgets_chk_fn)(char *, size_t, int, FILE *);
+
+/** @brief Type of the real `fclose` libc symbol. */
+typedef int (*chaos_io_fclose_fn)(FILE *);
+
+/** @brief Type of the real `fopen(3)` libc symbol. */
+typedef FILE *(*chaos_io_fopen_fn)(const char *, const char *);
+
+/** @brief Type of the real `freopen(3)` libc symbol. */
+typedef FILE *(*chaos_io_freopen_fn)(const char *, const char *, FILE *);
+
+/** @brief Type of the real `renameat2(2)` libc symbol (glibc 2.28+; absent on musl). */
+typedef int (*chaos_io_renameat2_fn)(int, const char *, int, const char *, unsigned int);
+
+/** @brief Type of the real `posix_fallocate(3)` libc symbol. */
+typedef int (*chaos_io_posix_fallocate_fn)(int, off_t, off_t);
+
 /** @brief Type of the real `unlinkat(2)` libc symbol. */
 typedef int (*chaos_io_unlinkat_fn)(int, const char *, int);
 
@@ -247,6 +309,9 @@ typedef int (*chaos_io_fallocate_fn)(int, int, off_t, off_t);
 /** @brief Type of the real Linux `sendfile(2)` libc symbol. */
 typedef ssize_t (*chaos_io_sendfile_fn)(int, int, off_t *, size_t);
 
+/** @brief Type of the real Linux `dup3(2)` libc symbol. */
+typedef int (*chaos_io_dup3_fn)(int, int, int);
+
 /** @brief Type of the real Linux `copy_file_range(2)` libc symbol. */
 typedef ssize_t (*chaos_io_copy_file_range_fn)(int, off_t *, int, off_t *, size_t, unsigned int);
 #endif
@@ -254,27 +319,34 @@ typedef ssize_t (*chaos_io_copy_file_range_fn)(int, off_t *, int, off_t *, size_
 /** @} */
 
 /**
- * @defgroup chaos_io_real_symbols Resolved downstream libc symbols
+ * @defgroup chaos_io_real_symbols Real functions
  * @{
  *
- * @details These globals are populated by `chaos_io_ensure_symbols()` using
- * `dlsym(RTLD_NEXT, name)`.  Once populated they are effectively read-only:
- * nothing writes to them again, so no synchronization is needed for reads.
+ * @details The next definition of each symbol after libchaos-io, found with
+ * `dlsym(RTLD_NEXT, name)`: libc, or another preloaded library later in `LD_PRELOAD`.
+ * Written once by chaos_io_ensure_symbols() and read without synchronisation afterwards;
+ * chaos_once()'s release/acquire pairing makes the complete table visible.
  *
- * All pointers default to `NULL` in BSS.  The library constructor alone is
- * not a sufficient guarantee that they are set: ELF initialisers run in
- * dependency order, so another object's constructor can reach an interposed
- * wrapper before `chaos_io_init()` has run.  Every wrapper therefore calls
- * `chaos_io_ensure_symbols()` before dereferencing one of these pointers.
+ * All start NULL. The constructor alone does not guarantee they are set: ELF initialisers
+ * run in dependency order, so another object's constructor can reach a wrapper before
+ * chaos_io_init(). Every wrapper therefore calls chaos_io_ensure_symbols() first, and
+ * still copes with NULL (re-entry during resolution, or an optional symbol libc lacks).
  */
 
-extern chaos_io_read_fn g_chaos_io_real_read;           /**< Downstream `read`. */
-extern chaos_io_write_fn g_chaos_io_real_write;         /**< Downstream `write`. */
-extern chaos_io_readv_fn g_chaos_io_real_readv;         /**< Downstream `readv`. */
-extern chaos_io_writev_fn g_chaos_io_real_writev;       /**< Downstream `writev`. */
-extern chaos_io_open_fn g_chaos_io_real_open;           /**< Downstream `open`. */
-extern chaos_io_openat_fn g_chaos_io_real_openat;       /**< Downstream `openat`. */
-extern chaos_io_close_fn g_chaos_io_real_close;         /**< Downstream `close`. */
+extern chaos_io_read_fn g_chaos_io_real_read;     /**< Downstream `read`. */
+extern chaos_io_write_fn g_chaos_io_real_write;   /**< Downstream `write`. */
+extern chaos_io_readv_fn g_chaos_io_real_readv;   /**< Downstream `readv`. */
+extern chaos_io_writev_fn g_chaos_io_real_writev; /**< Downstream `writev`. */
+extern chaos_io_open_fn g_chaos_io_real_open;     /**< Downstream `open`. */
+extern chaos_io_openat_fn g_chaos_io_real_openat; /**< Downstream `openat`. */
+extern chaos_io_close_fn g_chaos_io_real_close;   /**< Downstream `close`. */
+extern chaos_io_dup2_fn g_chaos_io_real_dup2;     /**< Downstream `dup2`. */
+extern chaos_io_close_range_fn
+    g_chaos_io_real_close_range; /**< Downstream `close_range`; NULL when libc lacks it. */
+extern chaos_io_closedir_fn g_chaos_io_real_closedir; /**< Downstream `closedir`. */
+extern chaos_io_pclose_fn g_chaos_io_real_pclose;     /**< Downstream `pclose`. */
+extern chaos_io_closefrom_fn
+    g_chaos_io_real_closefrom; /**< Downstream `closefrom`; NULL when libc lacks it. */
 extern chaos_io_sync_fn g_chaos_io_real_fsync;          /**< Downstream `fsync`. */
 extern chaos_io_sync_fn g_chaos_io_real_fdatasync;      /**< Downstream `fdatasync`. */
 extern chaos_io_pread_fn g_chaos_io_real_pread;         /**< Downstream `pread`. */
@@ -283,25 +355,47 @@ extern chaos_io_preadv_fn g_chaos_io_real_preadv;       /**< Downstream `preadv`
 extern chaos_io_pwritev_fn g_chaos_io_real_pwritev;     /**< Downstream `pwritev`. */
 extern chaos_io_ftruncate_fn g_chaos_io_real_ftruncate; /**< Downstream `ftruncate`. */
 extern chaos_io_unlinkat_fn g_chaos_io_real_unlinkat;   /**< Downstream `unlinkat`. */
-extern chaos_io_renameat_fn g_chaos_io_real_renameat;   /**< Downstream `renameat`. */
+extern chaos_io_truncate_fn g_chaos_io_real_truncate;   /**< Downstream `truncate`. */
+extern chaos_io_fopen_fn g_chaos_io_real_fopen;         /**< Downstream `fopen`. */
+extern chaos_io_fclose_fn g_chaos_io_real_fclose;       /**< Downstream `fclose`. */
+extern chaos_io_fread_fn g_chaos_io_real_fread;         /**< Downstream `fread`. */
+extern chaos_io_fwrite_fn g_chaos_io_real_fwrite;       /**< Downstream `fwrite`. */
+extern chaos_io_fgets_fn g_chaos_io_real_fgets;         /**< Downstream `fgets`. */
+extern chaos_io_fputs_fn g_chaos_io_real_fputs;         /**< Downstream `fputs`. */
+extern chaos_io_fgetc_fn g_chaos_io_real_fgetc;         /**< Downstream `fgetc`. */
+extern chaos_io_fgetc_fn g_chaos_io_real_getc;          /**< Downstream `getc`. */
+extern chaos_io_fputc_fn g_chaos_io_real_fputc;         /**< Downstream `fputc`. */
+extern chaos_io_fputc_fn g_chaos_io_real_putc;          /**< Downstream `putc`. */
+extern chaos_io_getdelim_fn g_chaos_io_real_getdelim;   /**< Downstream `getdelim`. */
+extern chaos_io_vfprintf_fn g_chaos_io_real_vfprintf;   /**< Downstream `vfprintf`. */
+extern chaos_io_fflush_fn g_chaos_io_real_fflush;       /**< Downstream `fflush`. */
+extern chaos_io_vfprintf_chk_fn
+    g_chaos_io_real_vfprintf_chk; /**< Downstream `__vfprintf_chk` (optional). */
+extern chaos_io_fread_chk_fn g_chaos_io_real_fread_chk; /**< Downstream `__fread_chk` (optional). */
+extern chaos_io_fgets_chk_fn g_chaos_io_real_fgets_chk; /**< Downstream `__fgets_chk` (optional). */
+extern chaos_io_freopen_fn g_chaos_io_real_freopen;     /**< Downstream `freopen`. */
+extern chaos_io_renameat2_fn
+    g_chaos_io_real_renameat2; /**< Downstream `renameat2`; NULL when libc lacks it. */
+extern chaos_io_posix_fallocate_fn
+    g_chaos_io_real_posix_fallocate;                  /**< Downstream `posix_fallocate`. */
+extern chaos_io_renameat_fn g_chaos_io_real_renameat; /**< Downstream `renameat`. */
 #ifdef __linux__
 extern chaos_io_fallocate_fn g_chaos_io_real_fallocate; /**< Downstream `fallocate` (Linux). */
 extern chaos_io_sendfile_fn g_chaos_io_real_sendfile;   /**< Downstream `sendfile` (Linux). */
+extern chaos_io_dup3_fn g_chaos_io_real_dup3;           /**< Downstream `dup3` (Linux). */
 extern chaos_io_copy_file_range_fn
     g_chaos_io_real_copy_file_range; /**< Downstream `copy_file_range` (Linux). */
 
 /**
- * @brief Ensures every downstream libc symbol is resolved.  Idempotent.
+ * @brief Resolves every real function on first use; idempotent and thread-safe.
  *
- * @details Must be the first statement of every interposed wrapper, before any
- * `g_chaos_io_real_*` pointer is dereferenced.  The library constructor is not
- * a sufficient guarantee on its own: ELF initialisers run in dependency order,
- * so another object's constructor can reach a wrapper before `chaos_io_init()`
- * has run.  `libcap-ng` does exactly this — its initialiser performs file I/O —
- * which made every `setpriv`, `su` and `runuser` invocation under this preload
- * jump through a NULL pointer and abort with SIGSEGV.
- *
- * After the first call this is a single load and a predictable branch.
+ * @details The first statement of every wrapper. The constructor is not enough on its
+ * own: ELF initialisers run in dependency order, so another object's constructor can
+ * reach a wrapper before chaos_io_init(). `libcap-ng` does exactly that (its initialiser
+ * performs file I/O), which made every `setpriv`, `su` and `runuser` under this preload
+ * jump through a NULL pointer and die with SIGSEGV. After the first call the cost is one
+ * acquire load and a predictable branch. A call re-entered from inside resolution on the
+ * same thread returns without waiting (chaos_once.h).
  */
 void chaos_io_ensure_symbols(void);
 #endif
@@ -314,41 +408,34 @@ void chaos_io_ensure_symbols(void);
  */
 
 /**
- * @brief Per-thread reentrancy guard.
+ * @brief Per-thread re-entrancy guard: non-zero while this thread runs library code that
+ *        may call an interposed function (rule-file read, `/proc/self/fd` readlink,
+ *        getcwd, a real-function call).
  *
- * @details Non-zero while the current thread is executing inside library
- * internals (config reads, fd-cache lookups, path resolution via
- * `/proc/self/fd`).  Every interposed wrapper checks this as its very first
- * action and falls through to the real libc call if it is set.
- *
- * The guard is a save/restore value, not a simple increment/decrement, so
- * that a nested internal entry always restores the *caller's* guard state
- * rather than blindly clearing it.  This matters because a wrapper may call
- * an internal helper that itself calls `chaos_io_enter_internal()`.
- *
- * @note TLS variables are zero-initialized per the C standard, so the guard
- * starts as "not inside internals" on every thread without explicit setup.
+ * @details A wrapper that finds it set calls straight through to the real function, so
+ * the library's own I/O, and libc's I/O made from inside a real call (fopen opening a
+ * file, fclose flushing), is never faulted or re-matched. Saved and restored, not
+ * counted, so nested sections restore the caller's state. Zero-initialised TLS, so every
+ * new thread starts outside.
  */
 extern __thread int g_chaos_io_tls_guard;
 
 /**
- * @brief Per-thread xorshift64* PRNG state.
+ * @brief Per-thread xorshift64* state; 0 means "not seeded yet".
  *
- * @details Zero is the invalid state for the xorshift family; the PRNG is
- * lazily seeded on first use by `chaos_io_prng_ensure_seeded()`.  Each
- * thread derives a distinct seed from `g_chaos_io_process_seed`, the
- * thread's kernel TID, and a stack address, ensuring that concurrent threads
- * do not share fault sequences.
+ * @details Seeded on first draw (chaos_io_prng_ensure_seeded()) from the process seed,
+ * the kernel tid and a stack address, so threads, and forked children (whose state the
+ * atfork handler zeroes), draw independent sequences.
  */
 extern __thread uint64_t g_chaos_io_tls_prng_state;
 
 /**
- * @brief Process-wide entropy base used to seed per-thread PRNGs.
+ * @brief Process-wide seed base for the per-thread PRNGs.
  *
- * @details Initialized once during `chaos_io_init()` from `/dev/urandom` if
- * available, or from a PID-derived fallback constant otherwise.  This value
- * is read-only after construction; threads read it without synchronization
- * because the constructor guarantees visibility before any wrapper fires.
+ * @details Set once in chaos_io_init() from `/dev/urandom`, or from a pid-derived value
+ * when that fails. A thread created later sees it through pthread_create()'s
+ * happens-before. A wrapper that runs before the constructor seeds from the built-in
+ * placeholder instead; that only affects which faults fire, not correctness.
  */
 extern uint64_t g_chaos_io_process_seed;
 
@@ -360,17 +447,10 @@ extern uint64_t g_chaos_io_process_seed;
  */
 
 /**
- * @brief Returns non-zero when the current thread is already inside library internals.
+ * @brief Non-zero when this thread is inside a library section (g_chaos_io_tls_guard).
  *
- * @details Wrappers use this as the first recursion check before touching config,
- * `/proc/self/fd`, or any other code path that can reach an interposed libc
- * symbol again.
- *
- * @return Non-zero if `g_chaos_io_tls_guard` is set; zero otherwise.
- *
- * @note Checking the guard before calling `chaos_io_enter_internal()` avoids
- * the save/restore overhead on the fast passthrough path.  Once this returns
- * non-zero, the wrapper must not touch any library state.
+ * @details A wrapper that sees non-zero must call straight through without touching rules
+ * or caches. Async-signal-safe: one TLS load.
  */
 static inline int chaos_io_in_internal(void)
 {
@@ -378,23 +458,13 @@ static inline int chaos_io_in_internal(void)
 }
 
 /**
- * @brief Marks the current thread as executing internal library code.
+ * @brief Enters a library section: sets the guard and returns its previous value.
  *
- * @details Every wrapper calls this before delegating to a real libc symbol or another
- * helper that must run in passthrough mode. The saved value lets nested callers
- * restore the original state correctly on the way out.
+ * @details Pass the result to chaos_io_leave_internal() on every exit path; restoring the
+ * previous value (instead of clearing) keeps an enclosing section intact. A signal handler
+ * that interrupts a section sees the guard set and passes its own I/O straight through.
  *
- * @return The previous value of `g_chaos_io_tls_guard`.  Must be passed back
- *         to `chaos_io_leave_internal()` on every exit path, including error
- *         paths.
- *
- * @post `g_chaos_io_tls_guard == 1`.
- *
- * @note The return-and-restore pattern rather than a paired increment/decrement
- * is necessary because a single interposed call may re-enter
- * `chaos_io_enter_internal()` from nested helpers.  Restoring the previous
- * value keeps the innermost call's guard state intact when the outer level
- * exits.
+ * @return The previous guard value.
  */
 static inline int chaos_io_enter_internal(void)
 {
@@ -404,15 +474,9 @@ static inline int chaos_io_enter_internal(void)
 }
 
 /**
- * @brief Restores the thread-local recursion guard after an internal section ends.
- *
- * @details This must pair with `chaos_io_enter_internal()` on every exit path so nested
- * calls do not leave the thread stuck in permanent passthrough mode.
- *
- * @param[in] previous  The value returned by the matching
- *                      `chaos_io_enter_internal()` call.
- *
- * @post `g_chaos_io_tls_guard == previous`.
+ * @brief Leaves a library section: restores the guard to @p previous, the value the
+ *        matching chaos_io_enter_internal() returned. A missed call leaves the thread in
+ *        permanent pass-through.
  */
 static inline void chaos_io_leave_internal(int previous)
 {
@@ -427,18 +491,14 @@ static inline void chaos_io_leave_internal(int previous)
  */
 
 /**
- * @brief Reads a volatile 64-bit shared value with a full memory barrier.
+ * @brief Full barrier, then a load of @p value.
  *
- * @details Config snapshot metadata is published lock-free, so readers use this helper
- * to observe the active snapshot and cached mtime in a consistent order.
+ * @details Used for the cached change stamp, which is published lock-free: the barrier
+ * keeps the load from being satisfied before earlier memory operations of this thread.
+ * A 64-bit aligned load is single-copy atomic on x86_64 and aarch64, the supported
+ * targets.
  *
- * @param[in] value  Pointer to the volatile shared variable.  Must not be NULL.
- * @return The value of `*value` observed after the barrier.
- *
- * @note The full `__sync_synchronize()` barrier before the load ensures that
- * the index read in `chaos_io_config_active_state()` and the subsequent
- * array dereference cannot be reordered ahead of a concurrent
- * `chaos_io_config_publish()` store sequence.
+ * @param[in] value  Shared word; must not be NULL.
  */
 static inline uint64_t chaos_io_atomic_load_u64(volatile uint64_t *value)
 {
@@ -447,21 +507,13 @@ static inline uint64_t chaos_io_atomic_load_u64(volatile uint64_t *value)
 }
 
 /**
- * @brief Performs a compare-and-swap on a shared 64-bit value.
+ * @brief Full-barrier compare-and-swap on a shared 64-bit word.
  *
- * @details Config reload ownership is decided without locks so only one thread performs
- * disk I/O while the others continue serving calls from the current snapshot.
+ * @details Decides the reload claim: the thread that swaps the cached stamp to
+ * CHAOS_IO_MTIME_RELOADING reloads; the others keep serving from the active snapshot
+ * instead of spinning.
  *
- * @param[in,out] value     Pointer to the shared variable.  Must not be NULL.
- * @param[in]     expected  The value that must currently be stored.
- * @param[in]     desired   The value to write if the CAS succeeds.
- * @return Non-zero if the swap happened (i.e. `*value == expected` at the
- *         moment of the swap); zero if another thread changed `*value` first.
- *
- * @note The winning thread writes `CHAOS_IO_MTIME_RELOADING` as `desired` to
- * act as an advisory "reload in progress" token.  Threads that lose the
- * race and observe `CHAOS_IO_MTIME_RELOADING` continue serving from the
- * current active snapshot rather than spinning.
+ * @return Non-zero when `*value` was @p expected and is now @p desired; 0 otherwise.
  */
 static inline int
 chaos_io_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint64_t desired)
@@ -477,17 +529,10 @@ chaos_io_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint64_t de
  */
 
 /**
- * @brief Returns an identifier for the current execution thread.
+ * @brief Kernel thread id (Linux), or the pid on other hosts; PRNG seed material.
  *
- * @details The PRNG uses this during lazy seeding so different threads do not inherit
- * the same fault sequence. Linux gets a true thread id; non-Linux test hosts
- * fall back to the process id.
- *
- * @return The kernel thread ID on Linux (`SYS_gettid`); `getpid()` elsewhere.
- *
- * @note `SYS_gettid` is used via `syscall()` rather than `gettid()` from
- * `<unistd.h>` because the latter was only added in glibc 2.30 and the
- * syscall form remains compatible with older toolchains.
+ * @details `syscall(SYS_gettid)` rather than gettid(): the libc wrapper exists only since
+ * glibc 2.30, and musl added it later still.
  */
 static inline uint64_t chaos_io_current_tid(void)
 {
@@ -499,15 +544,9 @@ static inline uint64_t chaos_io_current_tid(void)
 }
 
 /**
- * @brief Diffuses a 64-bit seed value into a well-scrambled result (SplitMix64 step).
- *
- * @details Raw inputs such as pid, tid, or stack addresses have obvious structure. This
- * mixing step removes that structure before the value becomes PRNG state.
- * The constants and shift distances are the SplitMix64 finalizer from
- * Steele et al., chosen for their avalanche properties.
- *
- * @param[in] value  Raw input to mix.
- * @return A 64-bit value with good bit diffusion from every input bit.
+ * @brief SplitMix64 step (Steele, Lea, Flood 2014): turns structured seed material (pid,
+ *        tid, addresses) into well-mixed PRNG state; every input bit affects every
+ *        output bit.
  */
 static inline uint64_t chaos_io_prng_mix(uint64_t value)
 {
@@ -518,21 +557,12 @@ static inline uint64_t chaos_io_prng_mix(uint64_t value)
 }
 
 /**
- * @brief Lazily initializes the current thread's PRNG state on first use.
+ * @brief Seeds this thread's PRNG on its first draw.
  *
- * @details Threads that never hit injected rules should not pay startup cost. When a
- * random sample is first needed, the helper derives a thread-specific seed from
- * the process seed, current thread id, and a stack address, then mixes it into
- * the thread-local state.
- *
- * @post `g_chaos_io_tls_prng_state != 0`.
- *
- * @note The stack address `&seed` is included in the XOR chain to
- * differentiate threads that happen to share a TID (e.g. after fork) and to
- * add an additional entropy dimension beyond the process/thread pair.
- * The fallback to `0x2545f4914f6cdd1d` guards against the astronomically
- * unlikely case where the mix produces zero, which would be a dead state for
- * xorshift.
+ * @details Lazy, so threads that never draw pay nothing. Seed = process seed XOR tid XOR
+ * a stack address (ASLR- and thread-dependent), mixed with SplitMix64 and forced odd, so
+ * the state is never 0, the one state xorshift64* cannot leave. One extra gettid system
+ * call per thread, once.
  */
 static inline void chaos_io_prng_ensure_seeded(void)
 {
@@ -546,24 +576,16 @@ static inline void chaos_io_prng_ensure_seeded(void)
     seed = g_chaos_io_process_seed;
     seed ^= chaos_io_current_tid();
     seed ^= (uint64_t)(uintptr_t)&seed;
-    g_chaos_io_tls_prng_state = chaos_io_prng_mix(seed);
-    if (g_chaos_io_tls_prng_state == 0U)
-    {
-        g_chaos_io_tls_prng_state = UINT64_C(0x2545f4914f6cdd1d);
-    }
+    /* Odd: never 0, the one state xorshift64* cannot leave. */
+    g_chaos_io_tls_prng_state = chaos_io_prng_mix(seed) | 1U;
 }
 
 /**
- * @brief Forces a deterministic seed into the current thread PRNG.
+ * @brief Seeds this thread's PRNG from @p seed (mixed with SplitMix64); the constructor
+ *        seeds its own thread with it, tests use it for reproducible draws.
  *
- * @details Tests use this to get reproducible behavior, and startup uses it to seed the
- * first thread from process entropy. Zero is normalized so the generator never
- * starts from an invalid all-zero state.
- *
- * @param[in] seed  Desired seed value.  If zero, `1` is substituted before
- *                  mixing to prevent the xorshift state from becoming stuck.
- *
- * @post `g_chaos_io_tls_prng_state != 0`.
+ * @param[in] seed  Seed; 0 is replaced by 1 before mixing. The mixed state is not forced
+ *                  odd here; a zero result would be reseeded lazily on the next draw.
  */
 static inline void chaos_io_prng_seed_thread(uint64_t seed)
 {
@@ -571,20 +593,15 @@ static inline void chaos_io_prng_seed_thread(uint64_t seed)
 }
 
 /**
- * @brief Produces the next 32-bit pseudo-random sample for the current thread.
+ * @brief Next 32-bit sample of this thread's xorshift64* generator (shifts 12, 25, 27;
+ *        output = high 32 bits of state * 0x2545f4914f6cdd1d).
  *
- * @details Fault helpers call this in hot paths, so it keeps the implementation cheap:
- * seed on first use, then advance a small xorshift-style state machine.
- * The generator is an xorshift64* variant: three shift-XOR steps advance the
- * 64-bit state, and the output is the upper 32 bits of
- * `state * 0x2545f4914f6cdd1d`, which provides significantly better
- * statistical properties than the raw state for the probability comparisons
- * made in `chaos_io_probability_hit_sample()`.
+ * @details A few cycles, no system call after seeding. The multiplied high half has far
+ * better low-order statistics than the raw state, which matters for the modulo in torn
+ * counts and corruption offsets. Not a cryptographic generator.
  *
- * @return A pseudo-random `uint32_t` uniformly distributed over [0, 2^32).
- *
- * @note This function is not re-entrant from a signal handler that fires
- * mid-computation; callers should not invoke it from signal contexts.
+ * Signal handlers: a handler that interrupts the update and draws itself may make both
+ * draws return related values; the state stays valid. Harmless for fault sampling.
  */
 static inline uint32_t chaos_io_prng_next_u32(void)
 {
@@ -606,32 +623,32 @@ static inline uint32_t chaos_io_prng_next_u32(void)
  * @{
  */
 
+/** @brief Name prefix of every libchaos library's control files (rule, status, hits, staging). */
+#define CHAOS_IO_CONTROL_PREFIX "/tmp/.chaos-"
+
 /**
- * @brief Returns non-zero when a path is exactly the active config file.
+ * @brief Non-zero when @p path is a control file of any libchaos library.
  *
- * @details The preload library must never inject faults into its own control plane, so
- * wrappers and cache code use this as an early exclusion check.
+ * @details The rule, status and hits files of every library (`/tmp/.chaos-<lib>.conf`,
+ * `.status`, `.hits.<n>`) are never faulted, including when a tool under the same preload
+ * writes them (a shell redirecting into a rule file). Also covers status staging files
+ * in /tmp, whose names start with `.chaos-staging-`.
  *
- * @param[in] path  Null-terminated path string.  May be NULL.
- * @return Non-zero when `path` equals `CHAOS_IO_CONFIG_PATH`.
+ * @param[in] path  Path; NULL returns 0.
  */
-static inline int chaos_io_is_config_path(const char *path)
+static inline int chaos_io_is_control_path(const char *path)
 {
-    return path != NULL && strcmp(path, CHAOS_IO_CONFIG_PATH) == 0;
+    return path != NULL &&
+           (strcmp(path, CHAOS_IO_CONFIG_PATH) == 0 ||
+            strncmp(path, CHAOS_IO_CONTROL_PREFIX, sizeof(CHAOS_IO_CONTROL_PREFIX) - 1U) == 0);
 }
 
 /**
- * @brief Returns non-zero when a path lives under a reserved top-level prefix.
+ * @brief Non-zero when @p path equals @p prefix or lies below it at a component boundary
+ *        (`/proc` covers `/proc/self/status`, not `/process`).
  *
- * @details The helper enforces path-boundary-aware matching so `/proc` matches
- * `/proc/self/status` but not `/process`.  The boundary check requires that
- * the character immediately after the prefix is either NUL (exact match) or
- * `/` (subdirectory), preventing overzealous exclusions on paths that merely
- * share a common string prefix.
- *
- * @param[in] path    Null-terminated path to test.  May be NULL.
- * @param[in] prefix  Null-terminated prefix to match against.  May be NULL.
- * @return Non-zero when `path` is equal to or is a child of `prefix`.
+ * @param[in] path    Path; NULL returns 0.
+ * @param[in] prefix  Prefix without a trailing `/`; NULL returns 0.
  */
 static inline int chaos_io_has_reserved_prefix(const char *path, const char *prefix)
 {
@@ -652,25 +669,20 @@ static inline int chaos_io_has_reserved_prefix(const char *path, const char *pre
 }
 
 /**
- * @brief Returns whether a path is permanently excluded from injection.
+ * @brief Non-zero when @p path is never faulted, whatever the rules say.
  *
- * @details Excluded paths cover the control file and kernel-facing trees that the
- * library itself depends on. The same filter is applied before matching rules
- * and before storing fd-cache entries.
+ * @details Applied before rule matching and before an fd-cache store:
+ * - NULL or empty (unresolved);
+ * - control files of every libchaos library (`/tmp/.chaos-*`);
+ * - `/proc`, `/sys`, `/dev` and everything below them.
  *
- * Excluded paths:
- * - NULL or empty string (unresolvable or unknown)
- * - The config file path exactly (`/tmp/.chaos-io.conf`)
- * - Anything under `/proc`, `/sys`, or `/dev`
+ * `/proc` and `/sys` are kernel interfaces the libraries and runtimes depend on
+ * (`/proc/self/fd`, `/proc/self/maps`, cgroup files); `/dev` holds devices, terminals and
+ * `/dev/urandom`, where a file fault would break terminals and entropy reads.
+ * Excluded descriptors are not cached, so they are re-resolved on every call.
  *
- * The `/proc` exclusion is essential: resolving fd paths via
- * `/proc/self/fd/<n>` happens inside the internal guard but the resulting
- * resolved path must not itself be stored in the cache or matched against
- * rules.  The `/sys` and `/dev` exclusions prevent accidental injection into
- * device I/O or kernel interface files.
- *
- * @param[in] path  Null-terminated path to test.  May be NULL.
- * @return Non-zero when the path should be silently passed through.
+ * @param[in] path  Path; NULL allowed.
+ * @return Non-zero to pass the call through.
  */
 static inline int chaos_io_is_excluded_path(const char *path)
 {
@@ -678,7 +690,7 @@ static inline int chaos_io_is_excluded_path(const char *path)
     {
         return 1;
     }
-    if (chaos_io_is_config_path(path))
+    if (chaos_io_is_control_path(path))
     {
         return 1;
     }
@@ -688,6 +700,147 @@ static inline int chaos_io_is_excluded_path(const char *path)
         return 1;
     }
     return 0;
+}
+
+/** @} */
+
+/** @name Path strings matched against rules (wrappers and chaos-init) */
+/** @{ */
+
+/**
+ * @brief Copies @p path into @p destination when it fits, NUL included.
+ *
+ * @param[out] destination       Buffer; NULL returns 0.
+ * @param[in]  destination_size  Capacity in bytes; 0 returns 0.
+ * @param[in]  path              Source; NULL returns 0.
+ * @return Non-zero on success; 0 when it does not fit (@p destination untouched).
+ */
+static inline int chaos_io_copy_path(char *destination, size_t destination_size, const char *path)
+{
+    size_t length;
+
+    if (destination == NULL || destination_size == 0U || path == NULL)
+    {
+        return 0;
+    }
+
+    length = strlen(path);
+    if (length + 1U > destination_size)
+    {
+        return 0;
+    }
+
+    (void)memcpy(destination, path, length + 1U);
+    return 1;
+}
+
+/**
+ * @brief Normalises an absolute path in place, lexically.
+ *
+ * @details Repeated slashes collapse, `.` components go, `..` removes the previous
+ * component (and stops at `/`), and a trailing slash goes; `/` stays `/`. So
+ * `/tmp/pd/./data//f` and `/tmp/pd/x/../data/f` both match a rule for `/tmp/pd/data`.
+ * Symbolic links are not followed: `..` after a link may differ from what the kernel
+ * resolves, but a descriptor's cached path comes from the kernel (`/proc/self/fd`)
+ * anyway. The result is never longer than the input; no allocation.
+ *
+ * @param[in,out] path  NUL-terminated path; NULL or a relative path is left unchanged.
+ */
+static inline void chaos_io_normalize_path(char *path)
+{
+    size_t read_at = 1U;
+    size_t write_at = 1U;
+
+    if (path == NULL || path[0] != '/')
+    {
+        return;
+    }
+    while (path[read_at] != '\0')
+    {
+        size_t start;
+        size_t length;
+
+        while (path[read_at] == '/')
+        {
+            ++read_at;
+        }
+        start = read_at;
+        while (path[read_at] != '\0' && path[read_at] != '/')
+        {
+            ++read_at;
+        }
+        length = read_at - start;
+        if (length == 0U || (length == 1U && path[start] == '.'))
+        {
+            continue;
+        }
+        if (length == 2U && path[start] == '.' && path[start + 1U] == '.')
+        {
+            while (write_at > 1U && path[write_at - 1U] != '/')
+            {
+                --write_at;
+            }
+            if (write_at > 1U)
+            {
+                --write_at;
+            }
+            continue;
+        }
+        if (write_at > 1U)
+        {
+            path[write_at++] = '/';
+        }
+        (void)memmove(path + write_at, path + start, length);
+        write_at += length;
+    }
+    path[write_at] = '\0';
+}
+
+/**
+ * @brief Writes `base + "/" + path` into @p destination (no separator when @p base already
+ *        ends with `/`).
+ *
+ * @details Purely lexical; callers normalise the result with chaos_io_normalize_path().
+ * Used for matching only, never for file-system access.
+ *
+ * @param[out] destination       Buffer; NULL returns 0.
+ * @param[in]  destination_size  Capacity in bytes; 0 returns 0.
+ * @param[in]  base              Directory path; NULL or empty returns 0.
+ * @param[in]  path              Relative path; NULL or empty returns 0.
+ * @return Non-zero on success; 0 when the result does not fit.
+ */
+static inline int
+chaos_io_join_paths(char *destination, size_t destination_size, const char *base, const char *path)
+{
+    size_t base_length;
+    size_t path_length;
+    size_t needs_separator;
+
+    if (destination == NULL || destination_size == 0U || base == NULL || path == NULL)
+    {
+        return 0;
+    }
+    if (*base == '\0' || *path == '\0')
+    {
+        return 0;
+    }
+
+    base_length = strlen(base);
+    path_length = strlen(path);
+    needs_separator = (base[base_length - 1U] == '/') ? 0U : 1U;
+    if (base_length + needs_separator + path_length + 1U > destination_size)
+    {
+        return 0;
+    }
+
+    (void)memcpy(destination, base, base_length);
+    if (needs_separator != 0U)
+    {
+        destination[base_length] = '/';
+        ++base_length;
+    }
+    (void)memcpy(destination + base_length, path, path_length + 1U);
+    return 1;
 }
 
 /** @} */

@@ -1,5 +1,7 @@
-/* io use-case (blog fault 1) — a torn write. With /data:write:TORN:p the
- * write() returns a SHORT count: some bytes never reached the page cache. */
+/* Demo io3: one 4096-byte write() to /data/torn. Under libchaos-io with
+ * `/data:write:TORN:1.0` the wrapper passes a shorter count to the real write, so only a
+ * prefix reaches the file and write() returns that short count. Code that ignores the return
+ * value of write() loses the tail silently. */
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>

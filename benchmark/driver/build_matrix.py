@@ -19,7 +19,8 @@ import math
 import os
 import sys
 
-# chaos_bench_driver lives in the same directory; reuse its loaders.
+# Reuse the driver's envelope loader and median so both tools classify baseline and
+# treatment runs identically (by environment.ld_preload being empty or not).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from chaos_bench_driver import _load_dir, _to_sample, _median  # noqa: E402
 
@@ -55,7 +56,8 @@ def _cell(slot: dict | None) -> str:
     delta_pct = (delta_ns / base) * 100.0
     sign_ns = "+" if delta_ns >= 0 else ""
     sign_pct = "+" if delta_pct >= 0 else ""
-    # Three lines per cell: native baseline, treated, absolute+relative delta.
+    # Three lines per cell (joined by <br>): baseline median, treatment median, and the
+    # delta in ns and percent. Each median is the median of the per-run medians.
     return (
         f"native: {base:,.1f} ns<br>"
         f"hooked: {treat:,.1f} ns<br>"
@@ -90,10 +92,10 @@ def main() -> int:
 
     table = _collect(variant_dirs)
 
-    # Sort rows ascending by smallest native median across variants.
-    # Fastest native call (e.g. clock_gettime) at top so the dramatic-but-meaningless
-    # rows are read with the explanation still in mind; the meaningful slow-native
-    # rows (pthread_create, getaddrinfo) appear at the bottom where readers settle.
+    # Rows are ordered by the smallest baseline median across variants, ascending;
+    # benchmarks with no baseline sort last. The cheapest native calls (clock_gettime),
+    # whose percentage deltas are largest, come first, directly below the text that
+    # explains why a large percentage on a ~60 ns call is expected.
     def _native_cost(bench: str) -> float:
         medians: list[float] = []
         for v in VARIANT_ORDER:
