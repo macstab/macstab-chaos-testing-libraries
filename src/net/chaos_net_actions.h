@@ -1,26 +1,23 @@
 /**
  * @file chaos_net_actions.h
- * @brief Fault-injection primitives: probability sampling, buffer corruption, latency, errno
- * injection.
+ * @brief Effect primitives: the firing decision, bit corruption, delay and errno injection.
  *
  * @details
- * This module provides the leaf-level operations that the interposition wrappers invoke
- * after a rule has been matched. Every function in this module is stateless with respect
- * to shared memory: probability samples draw from the per-thread PRNG, buffer corruption
- * operates on caller-supplied memory, and latency injection uses chaos_sleep_ms().
+ * The leaf operations a wrapper calls once it holds a matched rule copy. They keep no
+ * shared state of their own: probability draws use the calling thread's PRNG, corruption
+ * works on the caller's buffer, delays use chaos_sleep_ms(). The firing decision also
+ * goes through the rule's qualifiers and hit slot (chaos_policy_fire()), which is where
+ * hits are counted.
  *
- * The module deliberately exposes both "raw sample" variants (taking an explicit
- * uint32_t random value) and "live" variants (calling the PRNG internally). The raw
- * variants enable deterministic unit testing without mocking the PRNG.
+ * Each randomised primitive has a `_sample` variant that takes the random values as
+ * arguments, so unit tests can drive exact boundaries without controlling the PRNG.
  *
- * @par Design constraints:
- *   - No heap allocation.
- *   - No global mutable state beyond the per-thread PRNG (defined in chaos_net_internal.h).
- *   - All functions are safe to call from the hot interposition path.
- *   - chaos_net_corrupt_buffer / chaos_net_corrupt_buffer_sample: exactly one bit is flipped
- *     per call. The bit is chosen by (index_sample % size) for the byte and (bit_sample & 7)
- *     for the bit within the byte. This is intentionally minimal — flipping a single bit is
- *     enough to exercise error-detection code paths without destroying all data.
+ * @par Constraints:
+ *   - No heap allocation, no lock: callable on every wrapper's hot path and from signal
+ *     handlers that reach a wrapper.
+ *   - CORRUPT flips exactly one bit per firing: byte `index_sample % size`, bit
+ *     `bit_sample & 7`. One bit is the smallest change a checksum, length check or parser
+ *     must catch, and it leaves the rest of the payload intact for diagnosis.
  *
  * @par Module: chaos-net
  * @par Stability: private / internal
@@ -32,134 +29,105 @@
 #include "chaos_net_config.h"
 
 /**
- * @brief Tests whether a given probability value fires for a specific pre-drawn sample.
+ * @brief Whether @p probability fires for the pre-drawn 32-bit @p sample.
  *
- * @details Converts the probability to a fixed-point threshold over [0, 2^32) and
- * compares against @p sample. The mapping is:
+ * @details Fixed-point comparison over [0, 2^32):
  * @code
- *   threshold = probability * 4294967296.0   (= probability * 2^32)
- *   fires     = (double)sample < threshold
+ *   fires = (double)sample < probability * 4294967296.0
  * @endcode
- * This gives a uniform distribution: a sample drawn uniformly from [0, 2^32) falls
- * below the threshold with probability exactly equal to @p probability (to floating-
- * point precision). Edge cases: probability <= 0.0 always returns 0; probability >= 1.0
- * always returns 1 (short-circuits before the comparison).
- *
- * The separate-sample form exists for reproducible testing: the caller can supply
- * a deterministic value to verify boundary conditions without affecting the live PRNG.
+ * A uniform sample fires with probability @p probability, to a resolution of 2^-32.
+ * probability <= 0.0 never fires; probability >= 1.0 always fires, without comparing.
  *
  * @param probability  Probability in [0.0, 1.0].
- * @param sample       Pre-drawn uint32_t sample to test against the threshold.
- * @return Non-zero if the sample falls within the threshold (event fires); 0 otherwise.
- * @par Thread-safety: no shared state; safe.
+ * @param sample       Uniform 32-bit sample.
+ * @return Non-zero if the event fires; 0 otherwise.
+ * @par Thread-safety: pure function.
  */
 int chaos_net_probability_hit_sample(double probability, uint32_t sample);
 
 /**
- * @brief Tests whether a probability fires by drawing a fresh PRNG sample.
- *
- * @details Calls chaos_net_prng_next_u32() to obtain a sample from the calling
- * thread's PRNG stream, then delegates to chaos_net_probability_hit_sample().
- * Advances the thread's PRNG state by one step.
+ * @brief Whether @p probability fires, drawing one sample from the thread's PRNG.
  *
  * @param probability  Probability in [0.0, 1.0].
  * @return Non-zero if the event fires; 0 otherwise.
- * @par Thread-safety: reads/writes per-thread PRNG state; safe.
+ * @par Thread-safety: advances only the calling thread's PRNG by one step.
  */
 int chaos_net_probability_hit(double probability);
 
 /**
- * @brief Flips one bit in a buffer using pre-drawn samples.
+ * @brief Flips one bit of @p buffer chosen by pre-drawn samples.
  *
- * @details Computes the byte index as `index_sample % size` and the bit position
- * as `bit_sample & 7`. XORs the byte at that index with `(1 << bit_position)`.
- * This is a uniform selection over all bit positions in the buffer: given uniform
- * index_sample and bit_sample, each of the `size * 8` bits is equally likely to
- * be flipped.
+ * @details Byte `index_sample % size`, bit `bit_sample & 7`. With uniform samples every
+ * bit of the buffer is equally likely, up to the modulo bias of a 32-bit sample over
+ * @p size (negligible below a few MiB). Production code uses chaos_net_corrupt_buffer().
  *
- * The raw-sample form allows the caller to supply deterministic values for testing.
- * Production callers should use chaos_net_corrupt_buffer() instead.
- *
- * @param buffer        Buffer to corrupt in place. May be NULL (no-op).
- * @param size          Length of @p buffer in bytes. Must be > 0 for any effect.
- * @param index_sample  Pre-drawn sample for byte selection. Reduced modulo @p size.
- * @param bit_sample    Pre-drawn sample for bit selection. Only bits 2:0 are used.
- * @par Thread-safety: no shared state; safe.
+ * @param buffer        Buffer corrupted in place; NULL is a no-op.
+ * @param size          Bytes of @p buffer that may be touched; 0 is a no-op.
+ * @param index_sample  Sample for the byte, reduced modulo @p size.
+ * @param bit_sample    Sample for the bit; only bits 2..0 are used.
+ * @par Thread-safety: touches only @p buffer.
  */
 void chaos_net_corrupt_buffer_sample(
     void *buffer, size_t size, uint32_t index_sample, uint32_t bit_sample
 );
 
 /**
- * @brief Flips one bit in a buffer by drawing two fresh PRNG samples.
+ * @brief Flips one bit of @p buffer, drawing two samples from the thread's PRNG.
  *
- * @details Calls chaos_net_prng_next_u32() twice to obtain the byte-index sample
- * and bit-position sample, then delegates to chaos_net_corrupt_buffer_sample().
- * Advances the calling thread's PRNG state by two steps.
+ * @details Used by recv, recvfrom and read after the real call returned data and a
+ * CORRUPT rule fired; @p size is the byte count the call wrote, never the buffer size.
  *
- * Used by recv(), recvfrom(), and recvmsg() after a successful real recv call
- * when a CORRUPT rule fires.
- *
- * @param buffer  Buffer to corrupt in place. May be NULL (no-op).
- * @param size    Length of @p buffer in bytes. If 0, the call is a no-op.
- * @par Thread-safety: reads/writes per-thread PRNG state; safe.
+ * @param buffer  Buffer corrupted in place; NULL is a no-op.
+ * @param size    Bytes received; 0 is a no-op.
+ * @par Thread-safety: advances only the calling thread's PRNG by two steps.
  */
 void chaos_net_corrupt_buffer(void *buffer, size_t size);
 
 /**
- * @brief Introduces a blocking delay for the duration specified in a LATENCY rule.
+ * @brief Sleeps for a LATENCY rule's delay if the rule fires.
  *
- * @details Sleeps with chaos_sleep_ms() (`src/common/chaos_sleep.h`): a direct clock_nanosleep
- * system call on CLOCK_MONOTONIC, restarted on EINTR, so the full delay always
- * elapses, errno is preserved, and no other preloaded library (libchaos-time in
- * particular) can shorten or lengthen it.
+ * @details No-op unless @p rule is a LATENCY rule and chaos_net_rule_should_trigger()
+ * passes (window, `@size`, `@first`; there is no probability). The sleep is
+ * chaos_sleep_ms() (src/common/chaos_sleep.h): a raw clock_nanosleep on CLOCK_MONOTONIC,
+ * restarted on EINTR with the remaining time, so the full delay elapses, errno is
+ * preserved, and no other preloaded library (libchaos-time in particular) can shorten or
+ * stretch it.
  *
- * The function is a no-op if @p rule is NULL or rule->effect != CHAOS_NET_EFFECT_LATENCY.
- * Latency rules always fire (no probability check); the "should this fire" decision is
- * made by chaos_net_rule_should_trigger(), which returns 1 unconditionally for LATENCY.
- *
- * @param rule  Matched rule with effect == LATENCY. May be NULL (no-op).
- * @par Thread-safety: blocks only the calling thread; safe.
- * @par Blocking: blocks for approximately rule->latency_ms milliseconds when the rule fires.
+ * @param rule  Matched rule; NULL is a no-op.
+ * @par Thread-safety: blocks only the calling thread.
+ * @par Blocking: latency_ms milliseconds when the rule fires.
  */
 void chaos_net_rule_apply_latency(const chaos_net_rule_t *rule);
 
 /**
- * @brief Determines whether a matched rule should fire on this invocation.
+ * @brief Decides whether a matched rule fires on this call, and counts the hit if so.
  *
- * @details LATENCY rules always fire (they are deterministic delays, not random
- * failures). All other effect types (ERRNO, CORRUPT, TIMEOUT) sample their
- * probability field via chaos_net_probability_hit().
+ * @details Gates, in order: the `@from`/`@until` window, the `@size` gate against
+ * rule->call_size, the probability (every effect except LATENCY), then
+ * chaos_policy_fire(), which claims an `@first` slot, rejects a rule copy whose rule has
+ * left the file, and counts the hit. Call it at most once per decision: each firing is
+ * one hit.
  *
- * This function is used by both the latency path (to confirm the effect type
- * before sleeping) and by the CORRUPT/TIMEOUT paths to decide whether to apply
- * the post-call modification.
- *
- * @param rule  Matched rule to evaluate. May be NULL (returns 0).
- * @return Non-zero if the rule should fire on this call; 0 otherwise.
- * @par Thread-safety: see chaos_net_probability_hit(); safe.
+ * @param rule  Matched rule copy; NULL yields 0.
+ * @return Non-zero if the effect is to be applied now; 0 otherwise.
+ * @par Thread-safety: thread-local PRNG and atomic hit-slot updates.
  */
 int chaos_net_rule_should_trigger(const chaos_net_rule_t *rule);
 
 /**
- * @brief Applies an ERRNO rule: if the rule fires, sets errno and returns non-zero.
+ * @brief Applies an ERRNO rule: sets errno and returns 1 when it fires.
  *
- * @details Calls chaos_net_rule_should_trigger() to sample the probability. If it
- * fires, sets errno to rule->errnum and returns 1. If it does not fire or the rule
- * is not an ERRNO rule, returns 0 without modifying errno.
- *
- * The interposed wrappers use the return value to decide whether to return -1
- * immediately (skipping the real syscall) or to proceed. Example:
+ * @details Wrappers return -1 at once on 1 and skip the real call:
  * @code
  *   if (chaos_net_rule_apply_errno(&rule)) return -1;
  *   return g_chaos_net_real_connect(...);
  * @endcode
+ * A rule that is not ERRNO, or does not fire, leaves errno untouched.
  *
- * @param rule  Matched rule with effect == ERRNO. May be NULL (returns 0).
- * @return 1 if the error was injected (errno is set); 0 if not injected.
- * @post If returns 1: errno == rule->errnum.
- * @post If returns 0: errno is unchanged.
- * @par Thread-safety: errno is per-thread on POSIX; safe.
+ * @param rule  Matched rule copy; NULL yields 0.
+ * @return 1 if the error was injected; 0 otherwise.
+ * @post Returns 1: errno == rule->errnum. Returns 0: errno unchanged.
+ * @par Thread-safety: errno is thread-local.
  */
 int chaos_net_rule_apply_errno(const chaos_net_rule_t *rule);
 

@@ -1,50 +1,36 @@
 /**
  * @file chaos_net_extra.c
- * @brief LD_PRELOAD interposition wrappers for socket creation, shutdown, and batch I/O.
+ * @brief Wrappers for socket creation, shutdown and batched message I/O.
  *
  * @details
- * This file provides the exported interposition symbols for:
- *   - socket(2), socketpair(2): socket creation.
- *   - shutdown(2): socket teardown.
- *   - sendmmsg(2), recvmmsg(2): batch message I/O (Linux only).
+ * Exported wrappers: socket, socketpair, shutdown; sendmmsg and recvmmsg (Linux).
  *
- * @par socket() and socketpair() endpoint construction:
- * At socket-creation time there is no address available. The endpoint is constructed
- * from the (domain, type) arguments alone via chaos_net_endpoint_from_socket_spec(),
- * which produces a wildcard-host endpoint with port 0. Config selectors for socket
- * rules must therefore use wildcard forms:
- *   - `tcp4://\*:0 : socket : EMFILE : 0.1`   — match any TCP4 socket creation.
- *   - `"*" : socket : ENFILE : 0.05`          — match any socket creation at all.
- * Selectors with specific host addresses or non-zero ports are rejected at parse time
- * by chaos_net_selector_allowed() in chaos_net_config.c.
+ * @par socket() and socketpair():
+ *   No address exists at creation, so the endpoint comes from (domain, type) alone
+ *   (chaos_net_endpoint_from_socket_spec()): wildcard host and port 0 for IP, path `*`
+ *   for UNIX. SOCKET rules therefore accept only kind-describing selectors, enforced at
+ *   parse time by chaos_net_selector_allowed():
+ *   - `tcp4://\*:0 : socket : EMFILE : 0.1` -- any TCP/IPv4 socket.
+ *   - `* : socket : ENFILE : 0.05`          -- any supported socket.
+ *   socketpair() is matched as SOCKET for its (domain, type).
  *
- * @par shutdown() endpoint resolution:
- * shutdown() can be called on a socket that may be bound, connected, or both.
- * chaos_net_endpoint_from_activity_fd() is used, which tries getsockname first
- * and falls back to getpeername. This provides the most informative address
- * available without requiring the socket to be in a specific state.
+ * @par shutdown():
+ *   chaos_net_endpoint_from_activity_fd(): the local address, else the peer. @p how is
+ *   not part of the match.
  *
- * @par sendmmsg() multi-message endpoint resolution:
- * sendmmsg() takes an array of mmsghdr structs, each of which may have its own
- * destination address (msg_name) or rely on the socket's connected peer. The
- * wrapper scans the array sequentially and stops at the first message whose
- * endpoint resolves and matches a rule. When a match is found, the pre-call
- * effect is applied and the real sendmmsg is called (or -1 returned on errno
- * injection). The remaining messages in the array are not individually inspected;
- * the first matching message drives the decision.
+ * @par sendmmsg():
+ *   Scans the messages the kernel would send (at most 1024) and stops at the first
+ *   whose destination matches a SEND rule; messages without msg_name stand for the
+ *   connection, which is matched once (chaos_net_match_connected()). The effect then
+ *   applies to the whole batch: on an ERRNO firing nothing is sent.
  *
- * @par recvmmsg() CORRUPT application:
- * recvmmsg() receives multiple messages. If a CORRUPT rule fires post-call,
- * chaos_net_corrupt_mmsghdrs() selects one message from the returned batch at
- * random (via PRNG) and flips one bit in that message's iovec. Only one message
- * is corrupted per call to keep the corruption minimal and targeted.
+ * @par recvmmsg():
+ *   Matched like recv(). LATENCY and ERRNO apply before the call; a firing CORRUPT flips
+ *   one bit in one randomly chosen message of the returned batch. TRICKLE and DUP rules
+ *   match but have no effect here.
  *
- * @par chaos_net_apply_simple_pre_call_rule vs chaos_net_apply_pre_call_rule:
- * chaos_net_apply_simple_pre_call_rule() is identical in logic to
- * chaos_net_apply_pre_call_rule() from chaos_net_socket.c. It is duplicated here
- * rather than placed in a shared file to keep each .c file independently compilable
- * without introducing a new translation unit boundary that would require an
- * additional header. Both functions handle exactly LATENCY and ERRNO effects.
+ * chaos_net_apply_simple_pre_call_rule() duplicates chaos_net_apply_pre_call_rule() of
+ * chaos_net_socket.c, which is static there; seven lines do not justify a shared header.
  *
  * @par Module: chaos-net
  * @par Stability: private / internal
@@ -59,14 +45,12 @@
 #include <sys/syscall.h>
 
 /**
- * @brief Applies pre-call effects (LATENCY or ERRNO) for socket/shutdown/sendmmsg operations.
+ * @brief Applies the pre-call effects LATENCY and ERRNO; any other effect is ignored.
  *
- * @details Functionally equivalent to chaos_net_apply_pre_call_rule() in
- * chaos_net_socket.c. Duplicated here to keep this translation unit self-contained
- * and avoid a dependency on chaos_net_socket.c's static symbols.
+ * @details Same logic as chaos_net_apply_pre_call_rule() in chaos_net_socket.c.
  *
- * @param rule  Matched rule; may be NULL (returns 0 immediately).
- * @return 0 to proceed with the real call; -1 to return immediately (errno set).
+ * @param rule  Matched rule copy; NULL yields 0.
+ * @return 0 to make the real call (after any delay); -1 to return -1 at once, errno set.
  */
 static int chaos_net_apply_simple_pre_call_rule(const chaos_net_rule_t *rule)
 {
@@ -87,10 +71,10 @@ static int chaos_net_apply_simple_pre_call_rule(const chaos_net_rule_t *rule)
 }
 
 /*---------------------------------------------------------------------------
- * Real-symbol call wrappers (reentrancy-guard wrappers)
+ * Calls to the real functions: guard set; raw system call before resolution
  *---------------------------------------------------------------------------*/
 
-/** @brief Calls the real socket(2) with reentrancy guard set. */
+/** @brief Calls the real socket(2) with the guard set; SYS_socket before resolution. */
 static int chaos_net_call_real_socket(int domain, int type, int protocol)
 {
     int previous;
@@ -98,8 +82,8 @@ static int chaos_net_call_real_socket(int domain, int type, int protocol)
 
     if (g_chaos_net_real_socket == NULL)
     {
-        /* Not resolved yet: a call from inside the symbol lookup. The system
-         * call does what libc would. */
+        /* Not resolved yet: a call from inside the symbol lookup. The system call does
+         * what libc would. */
         return (int)syscall(SYS_socket, domain, type, protocol);
     }
     previous = chaos_net_enter_internal();
@@ -108,7 +92,7 @@ static int chaos_net_call_real_socket(int domain, int type, int protocol)
     return rc;
 }
 
-/** @brief Calls the real socketpair(2) with reentrancy guard set. */
+/** @brief Calls the real socketpair(2) with the guard set. */
 static int chaos_net_call_real_socketpair(int domain, int type, int protocol, int sv[2])
 {
     int previous;
@@ -124,7 +108,7 @@ static int chaos_net_call_real_socketpair(int domain, int type, int protocol, in
     return rc;
 }
 
-/** @brief Calls the real shutdown(2) with reentrancy guard set. */
+/** @brief Calls the real shutdown(2) with the guard set. */
 static int chaos_net_call_real_shutdown(int sockfd, int how)
 {
     int previous;
@@ -141,7 +125,7 @@ static int chaos_net_call_real_shutdown(int sockfd, int how)
 }
 
 #ifdef __linux__
-/** @brief Calls the real sendmmsg(2) with reentrancy guard set (Linux only). */
+/** @brief Calls the real sendmmsg(2) with the guard set (Linux). */
 static int chaos_net_call_real_sendmmsg(
     int sockfd, struct mmsghdr *msgvec, unsigned int vlen, CHAOS_NET_MMSG_FLAGS_TYPE flags
 )
@@ -159,7 +143,7 @@ static int chaos_net_call_real_sendmmsg(
     return rc;
 }
 
-/** @brief Calls the real recvmmsg(2) with reentrancy guard set (Linux only). */
+/** @brief Calls the real recvmmsg(2) with the guard set (Linux). */
 static int chaos_net_call_real_recvmmsg(
     int sockfd,
     struct mmsghdr *msgvec,
@@ -182,24 +166,17 @@ static int chaos_net_call_real_recvmmsg(
 }
 
 /**
- * @brief Corrupts one message in a recvmmsg result batch.
+ * @brief Flips one bit in one message of a recvmmsg batch.
  *
- * @details Selects one message from @p msgvec[0..count-1] using the PRNG. If the
- * selected message has msg_len > 0 and a non-NULL iovec, walks the iovec to find
- * a non-empty segment and calls chaos_net_corrupt_buffer_sample() on it.
+ * @details Picks one of the @p count returned messages with the PRNG, then flips one bit
+ * of the first non-empty segment of its scatter list, within the msg_len bytes received
+ * for it (chaos_net_corrupt_buffer_sample()). Messages with msg_len 0 or no vector are
+ * left alone, so a firing can flip nothing. One message per firing keeps the fault
+ * attributable: the application sees exactly one damaged message per hit.
  *
- * The multi-segment walk mirrors chaos_net_corrupt_iovecs() in chaos_net_socket.c
- * but operates on the mmsghdr::msg_len field (the actual bytes received for this
- * message) rather than a caller-provided size, ensuring corruption does not
- * overrun the receive buffer.
- *
- * Selecting exactly one message per call is intentional: flipping bits in multiple
- * messages simultaneously would be indistinguishable from hardware-level corruption
- * and harder for applications to handle. The per-call probability is already applied
- * by the caller via chaos_net_rule_should_trigger().
- *
- * @param msgvec  Array of received messages. Must not be NULL.
- * @param count   Number of messages returned by recvmmsg (> 0).
+ * @param msgvec  Returned batch; NULL is a no-op.
+ * @param count   Messages recvmmsg returned; 0 is a no-op.
+ * @par Thread-safety: advances the calling thread's PRNG by up to three steps.
  */
 static void chaos_net_corrupt_mmsghdrs(struct mmsghdr *msgvec, unsigned int count)
 {
@@ -210,7 +187,7 @@ static void chaos_net_corrupt_mmsghdrs(struct mmsghdr *msgvec, unsigned int coun
         return;
     }
 
-    /* Select a random message from the returned batch. */
+    /* One message of the batch, uniformly (up to modulo bias). */
     selected = chaos_net_prng_next_u32() % count;
     if (msgvec[selected].msg_len > 0U && msgvec[selected].msg_hdr.msg_iov != NULL &&
         msgvec[selected].msg_hdr.msg_iovlen > 0)
@@ -246,16 +223,14 @@ static void chaos_net_corrupt_mmsghdrs(struct mmsghdr *msgvec, unsigned int coun
 #endif
 
 /*---------------------------------------------------------------------------
- * Interposed symbols
+ * Wrappers
  *---------------------------------------------------------------------------*/
 
 /**
- * @brief Interposed socket(2).
+ * @brief socket(2) wrapper: SOCKET rules on (domain, type).
  *
- * @details Endpoint is constructed from (domain, type) via
- * chaos_net_endpoint_from_socket_spec(). If the domain or type is unsupported
- * (e.g., AF_PACKET, SOCK_RAW), the function returns 0 and the real socket() is
- * called without injection.
+ * @details A domain or type that does not map (AF_PACKET, AF_NETLINK, SOCK_RAW for IP,
+ * ...) is forwarded without matching. An ERRNO firing creates no descriptor.
  */
 CHAOS_NET_EXPORT int socket(int domain, int type, int protocol)
 {
@@ -278,12 +253,10 @@ CHAOS_NET_EXPORT int socket(int domain, int type, int protocol)
 }
 
 /**
- * @brief Interposed socketpair(2).
+ * @brief socketpair(2) wrapper: SOCKET rules on (domain, type), as socket().
  *
- * @details Same endpoint construction as socket(). socketpair() is mapped to
- * CHAOS_NET_OP_SOCKET because it creates sockets and has the same pre-address
- * constraint: no specific endpoint is available at creation time. Rules that match
- * socket() will also match socketpair() for the same domain/type combination.
+ * @details Rules that match socket() for a (domain, type) also match socketpair() for
+ * it. An ERRNO firing creates neither descriptor and leaves @p sv untouched.
  */
 CHAOS_NET_EXPORT int socketpair(int domain, int type, int protocol, int sv[2])
 {
@@ -306,11 +279,9 @@ CHAOS_NET_EXPORT int socketpair(int domain, int type, int protocol, int sv[2])
 }
 
 /**
- * @brief Interposed shutdown(2).
+ * @brief shutdown(2) wrapper: SHUTDOWN rules on the local address, else the peer.
  *
- * @details Endpoint is resolved via chaos_net_endpoint_from_activity_fd() (getsockname
- * then getpeername). The @p how argument (SHUT_RD, SHUT_WR, SHUT_RDWR) is not
- * considered for rule matching; all shutdown directions are matched by the same rule.
+ * @details @p how (SHUT_RD, SHUT_WR, SHUT_RDWR) is not part of the match.
  */
 CHAOS_NET_EXPORT int shutdown(int sockfd, int how)
 {
@@ -336,8 +307,8 @@ CHAOS_NET_EXPORT int shutdown(int sockfd, int how)
 #define CHAOS_NET_MMSG_MAX 1024U
 
 /**
- * @brief Bytes the first @p count messages of a batch describe, for `@size` gates;
- *        CHAOS_POLICY_NO_SIZE when one of them is unknown.
+ * @brief Bytes the first @p count messages describe, for `@size` gates;
+ *        CHAOS_POLICY_NO_SIZE when one is invalid or the sum would exceed 2^63.
  */
 static uint64_t chaos_net_mmsg_size(const struct mmsghdr *msgvec, unsigned int count)
 {
@@ -362,19 +333,15 @@ static uint64_t chaos_net_mmsg_size(const struct mmsghdr *msgvec, unsigned int c
 }
 
 /**
- * @brief Interposed sendmmsg(2) (Linux only).
+ * @brief sendmmsg(2) wrapper (Linux): first matching message decides for the batch.
  *
- * @details Scans the messages the kernel would send (at most CHAOS_NET_MMSG_MAX)
- * for the first whose destination matches a SEND rule, the connection standing for
- * every message without one. This is a "first-match-wins" strategy: if any message
- * targets a matched endpoint, the pre-call effect is applied and the entire batch
- * is affected (either all messages are sent or, on errno injection, none are).
- * `@size` compares the bytes of the whole batch.
+ * @details Scans at most CHAOS_NET_MMSG_MAX messages for the first whose msg_name
+ * matches a SEND rule; a message without msg_name stands for the connection, matched
+ * once with chaos_net_match_connected(). The effect applies to the whole batch: on an
+ * ERRNO firing nothing is sent. `@size` compares the bytes of the scanned messages.
  *
- * The reentrancy guard is checked once at entry rather than per-message to keep
- * the inner loop minimal. The guard is not needed for endpoint resolution inside
- * the loop because chaos_net_endpoint_from_sockaddr_fd / chaos_net_endpoint_from_peer_fd
- * each set the guard internally around their getsockopt/getpeername calls.
+ * The guard is checked once at entry. Endpoint resolution inside the loop sets it
+ * itself around each getsockopt/getsockname/getpeername.
  */
 CHAOS_NET_EXPORT int
 sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, CHAOS_NET_MMSG_FLAGS_TYPE flags)
@@ -393,8 +360,8 @@ sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, CHAOS_NET_MMSG_F
         return chaos_net_call_real_sendmmsg(sockfd, msgvec, vlen, flags);
     }
 
-    /* The kernel sends at most CHAOS_NET_MMSG_MAX messages of a batch. A message
-     * without a destination goes to the connection, which is looked up once. */
+    /* The kernel sends at most CHAOS_NET_MMSG_MAX messages of a batch. A message without
+     * a destination goes to the connection, which is matched once. */
     for (index = 0U; index < count && !matched; ++index)
     {
         struct msghdr *message = &msgvec[index].msg_hdr;
@@ -427,17 +394,12 @@ sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, CHAOS_NET_MMSG_F
 }
 
 /**
- * @brief Interposed recvmmsg(2) (Linux only).
+ * @brief recvmmsg(2) wrapper (Linux): RECV rules on either end of the connection.
  *
- * @details Endpoint is resolved from the local address (getsockname) consistent
- * with recv()/recvfrom()/recvmsg(). On CORRUPT rule firing post-call, exactly one
- * randomly selected message in the returned batch has one bit flipped via
- * chaos_net_corrupt_mmsghdrs(). Pre-call LATENCY and ERRNO effects work identically
- * to the single-message recv variants.
- *
- * The @p timeout parameter (recvmmsg-specific, a receive timeout rather than a
- * wait multiplexing timeout) is forwarded to the real call unchanged; it is not
- * related to CHAOS_NET_EFFECT_TIMEOUT (which is for poll-family operations).
+ * @details chaos_net_match_connected() as recv(), the local end winning ties. LATENCY and
+ * ERRNO apply before the call; a firing CORRUPT flips one bit in one randomly selected
+ * message of the returned batch (chaos_net_corrupt_mmsghdrs()). TRICKLE and DUP are not
+ * applied to batches. @p timeout is recvmmsg's own and unrelated to the TIMEOUT effect.
  */
 CHAOS_NET_EXPORT int recvmmsg(
     int sockfd,
@@ -465,7 +427,7 @@ CHAOS_NET_EXPORT int recvmmsg(
     }
 
     rc = chaos_net_call_real_recvmmsg(sockfd, msgvec, vlen, flags, timeout);
-    /* Apply corruption to one randomly selected message from the received batch. */
+    /* One bit in one randomly selected message of the batch. */
     if (rc > 0 && rule.effect == CHAOS_NET_EFFECT_CORRUPT && chaos_net_rule_should_trigger(&rule))
     {
         chaos_net_corrupt_mmsghdrs(msgvec, (unsigned int)rc);

@@ -1,55 +1,60 @@
 /**
  * @file chaos_dns_config.c
- * @brief Config file parsing, mtime-based reload, and rule-matching implementation.
+ * @brief Rule-file loading, parsing, lock-free two-snapshot reload and rule selection for
+ *        libchaos-dns.
  *
  * @details
- * This translation unit owns the full lifecycle of the chaos rule set:
- * reading the config file from disk, parsing it into @ref chaos_dns_rule_t
- * structures, selecting the best-matching rule for a given query, and
- * publishing an updated snapshot when the file changes.
+ * The same reload design as libchaos-net (chaos_net_config.c); the rule grammar is
+ * documented in chaos_dns_config.h.
  *
- * ### Two-snapshot CAS reload protocol
+ * ### Throttled change detection
+ * chaos_dns_config_prepare() looks at the rule file at most once per
+ * CHAOS_CHECK_INTERVAL_NS (1 ms) per process, timed with the vDSO CLOCK_MONOTONIC
+ * (chaos_clock.h); every call looks until the first load completes, and always when no
+ * vDSO clock exists. A look is one stat(2), hashed (FNV-style) over mtime s and ns,
+ * size, inode and device into a 64-bit stamp: an append changes the size and a
+ * rename-over rewrite (`sed -i`) the inode even inside one mtime tick. A same-size
+ * in-place rewrite inside one tick is caught by the provisional rule: a load whose mtime
+ * is under CHAOS_RACY_WINDOW_MS (20 ms) old is re-read on the next look and replaced only
+ * if its content hash changed.
  *
- * Two statically-allocated @ref chaos_dns_config_state_t snapshots are kept in
- * `g_chaos_dns_config_states[2]`.  At any moment one snapshot is *active* (its
- * index stored in `g_chaos_dns_active_config_index`) and one is *inactive* (the
- * reload target).  Readers always operate on the active snapshot without any
- * lock.
+ * ### Two-snapshot CAS reload
+ * Two static snapshots; wrappers read the active one without a lock. The thread that
+ * sees a new stamp CASes `g_chaos_dns_cached_mtime` to `CHAOS_DNS_MTIME_RELOADING`;
+ * losers, and threads that see RELOADING, use the active snapshot and never wait. The
+ * winner:
+ *   1. reads the file into the static buffer and parses it into the inactive snapshot;
+ *   2. writes the status file;
+ *   3. ends the snapshot's write sequence, stores the index, then the stamp, each behind
+ *      a full barrier; the stamp store releases the claim.
+ * A reader copying a rule out of a snapshot that a later reload rewrites detects it by
+ * the snapshot's seqlock sequence and treats the copy as no match.
  *
- * When a thread detects a mtime change it races to set `g_chaos_dns_cached_mtime`
- * to `CHAOS_DNS_MTIME_RELOADING` via CAS.  The single winner:
- *   1. Fills the inactive snapshot with freshly parsed rules.
- *   2. Issues a full memory fence, then stores the new active index.
- *   3. Issues another full fence, then stores the observed mtime to clear the
- *      RELOADING sentinel.
+ * ### Failure behaviour (fail-open)
+ *   - Missing file: an empty snapshot (parse_ok = 1), status file removed.
+ *   - Rejected file (invalid line, too many rules, NUL byte, >= 256 KiB, EACCES/EPERM,
+ *     EISDIR): a snapshot with parse_ok = 0 and no rules, status file state=error. Stale
+ *     rules are never kept; the file is not re-read until its stamp changes.
+ *   - Transient failure (other open/read errors, or the file changing during the read):
+ *     nothing is published, the claim is released with the old stamp, the next look
+ *     retries.
  *
- * Losing threads fall back to the still-active (old) snapshot for their
- * current lookup.  The protocol guarantees:
- *   - No reader ever sees a partially-written snapshot.
- *   - At most one reload is in progress at any time.
- *   - The library is fail-open: if parsing fails, the snapshot is reset to
- *     empty-but-valid so the intercepted call passes through with no effect.
+ * ### Fork and exec
+ * A pthread_atfork child handler releases a reload claim and the hits-writer flag held
+ * by parent threads, restarts hit counts for the child's pid and reseeds the PRNG.
+ * vfork() children run no handler; they share the parent's memory and the pid check
+ * keeps them from writing its hits file. exec() starts from scratch.
  *
- * ### Config file read buffer
- * The read buffer (`g_chaos_dns_config_buffer`) is a static array, avoiding a
- * heap allocation on the reload path.  Because at most one thread performs a
- * reload at a time (CAS serialisation, plus an early return for callers that
- * observe a reload in progress), only one thread ever writes this buffer, which
- * eliminates both locking and heap fragmentation.
+ * ### Invariants
+ * - `g_chaos_dns_active_config_index` is 0 or 1.
+ * - Only the claim holder writes the inactive snapshot, the read buffer, the error
+ *   record and the text table.
+ * - Rules keep file order; selection compares every rule by rank and selector length,
+ *   so order decides only full ties (the earlier rule wins).
  *
- * ### Platform portability
- * The mtime is read via `stat(2)`.  On Linux `st_mtim.tv_nsec` provides
- * sub-second resolution; on macOS the equivalent is `st_mtimespec.tv_nsec`.
- * The `CHAOS_DNS_STAT_SEC` / `CHAOS_DNS_STAT_NSEC` macros abstract this.
- *
- * ### Invariants maintained by this file
- * - `g_chaos_dns_active_config_index` is always 0 or 1.
- * - `g_chaos_dns_config_states[i].parse_ok` is 1 if the snapshot was parsed
- *   successfully (or is the zero-initialised empty state), and 0 if parsing
- *   failed for the snapshot at index i.
- * - Rules in a valid snapshot are ordered as they appeared in the file;
- *   rule selection iterates all rules and picks by rank/length rather than
- *   relying on order.
+ * ### Test seams
+ * CHAOS_CONFIG_FILE_OPEN/READ/CLOSE (chaos_status.h), g_chaos_dns_check_interval_ns (0
+ * disables the throttle), CHAOS_RACY_WINDOW_MS.
  *
  * @module  libchaos-dns configuration
  * @stability  Private
@@ -69,8 +74,7 @@
 #include <unistd.h>
 
 /* -------------------------------------------------------------------------
- * Platform portability for stat mtime fields.
- * POSIX.1-2008 uses st_mtim; macOS uses st_mtimespec.
+ * mtime of a struct stat: st_mtim on Linux (POSIX.1-2008), st_mtimespec on macOS/BSD.
  * ------------------------------------------------------------------------- */
 #if defined(__linux__)
 #define CHAOS_DNS_STAT_SEC(st) ((st)->st_mtim.tv_sec)
@@ -85,15 +89,14 @@
  * ------------------------------------------------------------------------- */
 
 /**
- * @brief One fully-parsed config snapshot.
+ * @brief One complete rule snapshot.
  *
- * @details Two instances of this struct exist as global statics
- * (`g_chaos_dns_config_states[2]`).  The two-snapshot protocol ensures only
- * one is ever being written at a time, while the other is read lock-free.
+ * @details Two static instances (`g_chaos_dns_config_states[2]`): the reload owner fills
+ * the inactive one while wrappers copy rules out of the active one.
  *
- * @invariant After chaos_dns_config_publish(), the newly-active snapshot's
- * `parse_ok` is 1; an empty (zero-rule) snapshot is valid and means
- * "no rules, pass all calls through unchanged".
+ * `parse_ok` is 1 for a usable snapshot (an empty one means "no rules, pass every call
+ * through") and 0 for a rejected file, which never matches. `sequence` is odd while a
+ * reload rewrites the snapshot.
  */
 typedef struct chaos_dns_config_state
 {
@@ -101,7 +104,7 @@ typedef struct chaos_dns_config_state
     volatile uint64_t sequence;
     chaos_dns_rule_t rules[CHAOS_DNS_MAX_RULES]; /**< Parsed rules in file order. */
     size_t rule_count;                           /**< Number of valid entries in rules[]. */
-    int parse_ok; /**< 1 if this snapshot is usable; 0 if parse failed. */
+    int parse_ok; /**< 1 usable (possibly empty); 0 rejected file, never matches. */
     /** Hit counters, one per rule (see chaos_hits.h). */
     chaos_hit_slot_t *hits[CHAOS_DNS_MAX_RULES];
     /** Each rule as written in the file, reported with its count. */
@@ -112,35 +115,35 @@ typedef struct chaos_dns_config_state
  * Module-level statics
  * ------------------------------------------------------------------------- */
 
-/** Both config snapshots; indexed by g_chaos_dns_active_config_index. */
+/** @brief Both snapshots; indexed by g_chaos_dns_active_config_index. */
 static chaos_dns_config_state_t g_chaos_dns_config_states[2];
 
 /** @brief Hit slots of the rules of both snapshots (see chaos_hits_assign()). */
 static chaos_hit_slot_t g_chaos_dns_hit_pool[2U * CHAOS_DNS_MAX_RULES];
 
 /**
- * @brief Index (0 or 1) of the currently active config snapshot.
+ * @brief Index (0 or 1) of the active snapshot.
  *
- * @details Written only inside chaos_dns_config_publish() under full memory
- * fences.  Read by chaos_dns_config_active_state() under a fence.
+ * @details Written by chaos_dns_config_publish() (behind full barriers) and
+ * chaos_dns_config_init(); read by chaos_dns_config_active_state() behind a barrier.
  */
 static volatile unsigned int g_chaos_dns_active_config_index = 0U;
 
 /**
- * @brief Cached mtime hash of the config file as of the last completed reload.
+ * @brief Change stamp of the loaded rule file, and the reload claim.
  *
- * @details Three sentinel values exist alongside valid hashes:
- *   - CHAOS_DNS_MTIME_UNKNOWN   — initial value; triggers a reload on first use.
- *   - CHAOS_DNS_MTIME_MISSING   — file did not exist on last stat.
- *   - CHAOS_DNS_MTIME_RELOADING — a CAS winner is currently performing a reload.
- *
- * The normalization function ensures no real mtime hash collides with these.
+ * @details Holds a chaos_dns_config_hash_mtime() stamp or a reserved value:
+ *   - CHAOS_DNS_MTIME_UNKNOWN   -- before the first load (and in a fork child whose
+ *     parent was mid-reload); forces a load.
+ *   - CHAOS_DNS_MTIME_MISSING   -- no rule file at the last load.
+ *   - CHAOS_DNS_MTIME_RELOADING -- a thread owns a reload.
+ * chaos_dns_config_normalize_mtime_hash() keeps computed stamps off these values.
  */
 static volatile uint64_t g_chaos_dns_cached_mtime = CHAOS_DNS_MTIME_UNKNOWN;
 
 /**
- * @brief The loaded file's mtime was too recent to trust its stamp
- *        (chaos_clock_stamp_is_recent): the next look reads it again.
+ * @brief The loaded file's mtime was within CHAOS_RACY_WINDOW_MS of the clock, so its
+ *        stamp cannot be trusted (chaos_clock_stamp_is_recent()): the next look re-reads.
  */
 static volatile int g_chaos_dns_config_provisional = 0;
 
@@ -148,33 +151,33 @@ static volatile int g_chaos_dns_config_provisional = 0;
 static uint64_t g_chaos_dns_config_content = 0U;
 
 /**
- * @brief Buffer the reload thread reads the config file into.
+ * @brief The reload owner's read buffer for the rule file.
  *
- * @details Sized CHAOS_DNS_MAX_CONFIG_BYTES + 1 for the NUL terminator appended by
- * chaos_dns_config_read_file().  Only the thread holding the reload marker
- * (CHAOS_DNS_MTIME_RELOADING) touches it, so one process-wide buffer suffices.
+ * @details CHAOS_DNS_MAX_CONFIG_BYTES + 1 for the NUL that chaos_dns_config_read_file()
+ * appends. Only the holder of the CHAOS_DNS_MTIME_RELOADING claim touches it, so one
+ * process-wide buffer suffices.
  *
- * Deliberately not `__thread`: a 256 KiB TLS object is static TLS, which glibc reserves
- * in every thread of the preloaded process and adds to each thread's minimum stack
- * size.  Runtimes that create threads with small explicit stacks -- the Erlang VM, for
- * one -- then fail pthread_create() with EINVAL and cannot start at all.
+ * Deliberately not `__thread`: a 256 KiB TLS object is static TLS, which glibc reserves in
+ * every thread of the preloaded process and adds to each thread's minimum stack size.
+ * Runtimes that create threads with small explicit stacks (the Erlang VM, for one) then
+ * fail pthread_create() with EINVAL and cannot start at all.
  */
 static char g_chaos_dns_config_buffer[CHAOS_DNS_MAX_CONFIG_BYTES + 1U];
 
 /**
- * @brief The first line the last parse rejected, reported in the status file.
+ * @brief The line the last parse rejected and why, for the status file.
  *
- * @details Written only by the thread that owns the reload claim.
+ * @details Written only by the reload owner (or a unit test calling the parser).
  */
 static chaos_status_error_t g_chaos_dns_config_error;
 
-/** @brief Text of each accepted rule of the last parse, copied into the snapshot. */
+/** @brief Text of each rule accepted by the last parse; copied into the next snapshot. */
 static char g_chaos_dns_config_texts[CHAOS_DNS_MAX_RULES][CHAOS_STATUS_TEXT_MAX + 1U];
 
-/** @brief Set while a thread writes the hits file. */
+/** @brief Hits-writer flag: set (by CAS) while one thread writes the hits file. */
 static volatile int g_chaos_dns_hits_writing = 0;
 
-/** @brief Set once the atfork handler is registered. */
+/** @brief Whether the pthread_atfork handler is registered (once per image). */
 static int g_chaos_dns_atfork_registered = 0;
 
 static void chaos_dns_config_after_fork(void);
@@ -182,21 +185,21 @@ static void chaos_dns_config_after_fork(void);
 /** @brief Set by every hit, cleared by the write that reports it. */
 static volatile int g_chaos_dns_hits_pending = 0;
 
-/** @brief Hits recorded by this process (reset in a forked child). */
+/** @brief Hits recorded by this process since start or fork; drives the eager phase. */
 static uint64_t g_chaos_dns_hits_total = 0U;
 
-/** @brief CLOCK_MONOTONIC time of the last write, in milliseconds. */
+/** @brief CLOCK_MONOTONIC time of the last hits-file write, in ms. */
 static uint64_t g_chaos_dns_hits_last_ms = 0U;
 
-/** @brief Process the counters belong to: set at start and in a forked child. */
+/** @brief Pid the counts belong to; set at init and in a fork() child. */
 static volatile uint64_t g_chaos_dns_hits_pid = 0U;
 
-/** @brief Number of this image's hits file (chaos_hits_file_number()). */
+/** @brief Number `<n>` of this image's hits file (chaos_hits_file_number()). */
 static long g_chaos_dns_hits_file = 0L;
 /** @brief Whether this image created that file (chaos_hits_write_for()). */
 static int g_chaos_dns_hits_owned = 0;
 
-/** @brief Scratch for the hits file; used only by the thread that writes it. */
+/** @brief Scratch for formatting the hits file; used only by the hits writer. */
 static char g_chaos_dns_hits_buffer[CHAOS_DNS_MAX_RULES * CHAOS_HITS_LINE_MAX + 1U];
 
 /* -------------------------------------------------------------------------
@@ -204,16 +207,15 @@ static char g_chaos_dns_hits_buffer[CHAOS_DNS_MAX_RULES * CHAOS_HITS_LINE_MAX + 
  * ------------------------------------------------------------------------- */
 
 /**
- * @brief Reset a config snapshot to an empty-but-valid or parse-failed state.
+ * @brief Empties a snapshot and sets its parse_ok, leaving its sequence odd.
  *
- * @details Uses memset to zero all fields, then sets `parse_ok`.  Called:
- *   - During init: sets both snapshots to empty-valid (parse_ok = 1).
- *   - Before a reload: resets the target snapshot to empty-valid.
- *   - After a parse failure: resets the target snapshot to parse-failed
- *     (parse_ok = 0) so that matchers return "no match" (fail-open).
+ * @details Starts the write sequence first (idempotent), so a reader still copying from
+ * this snapshot sees the change; chaos_dns_config_publish() or chaos_dns_config_init()
+ * ends it. Called for both snapshots by init, for the inactive one before a reload, and
+ * with parse_ok = 0 after a rejected parse.
  *
- * @param state     Snapshot to reset; no-op if NULL.
- * @param parse_ok  1 for empty-valid; 0 for parse-failed.
+ * @param state     Snapshot to reset; NULL is a no-op.
+ * @param parse_ok  1 usable (empty); 0 rejected.
  */
 static void chaos_dns_config_reset_state(chaos_dns_config_state_t *state, int parse_ok)
 {
@@ -224,7 +226,7 @@ static void chaos_dns_config_reset_state(chaos_dns_config_state_t *state, int pa
         return;
     }
 
-    /* A reader still holding this snapshot sees that it changed. */
+    /* Odd before the memset: a reader still holding this snapshot sees the rewrite. */
     chaos_snapshot_write_begin(&state->sequence);
     sequence = state->sequence;
     (void)memset(state, 0, sizeof(*state));
@@ -233,16 +235,15 @@ static void chaos_dns_config_reset_state(chaos_dns_config_state_t *state, int pa
 }
 
 /**
- * @brief Return a pointer to the currently active config snapshot.
+ * @brief The active snapshot.
  *
- * @details Issues a full memory fence before reading the index so that the
- * snapshot contents written by a concurrent reload are visible before the
- * index update is observed.  This is the reader side of the two-snapshot
- * protocol.
+ * @details Full barrier, then the index load: the reader side of
+ * chaos_dns_config_publish(). The snapshot can be rewritten two reloads later; readers
+ * that copy rules validate the copy with its sequence.
  *
- * @return  Pointer to the active snapshot; never NULL.
+ * @return  The active snapshot; never NULL.
  *
- * @threadsafety  Safe — index read is fenced; snapshot is read-only after publish.
+ * @threadsafety  Any thread.
  */
 static const chaos_dns_config_state_t *chaos_dns_config_active_state(void)
 {
@@ -254,20 +255,17 @@ static const chaos_dns_config_state_t *chaos_dns_config_active_state(void)
 }
 
 /**
- * @brief Publish a newly-loaded config snapshot as the active one.
+ * @brief Publishes the freshly loaded snapshot and releases the reload claim.
  *
- * @details This is the writer side of the two-snapshot protocol.  Two memory
- * fences are used:
- *   1. Before storing the new index — ensures all writes to the snapshot
- *      are visible to readers that subsequently load the new index.
- *   2. Before storing the observed mtime — ensures the index update is
- *      visible before the RELOADING sentinel is cleared, preventing a second
- *      thread from starting another reload while the first index store is
- *      still in flight.
+ * @details Writer side of the protocol:
+ *   1. End the snapshot's write sequence.
+ *   2. Full barrier, store the index: a reader that sees it sees the complete rules.
+ *   3. Full barrier, store the observed stamp in place of RELOADING: the claim is
+ *      released only after the index is visible, so the next reload cannot start
+ *      writing the snapshot that is still active.
  *
- * @param next_index     Index (0 or 1) of the snapshot to make active.
- * @param observed_mtime The mtime hash that triggered this reload, or
- *                       CHAOS_DNS_MTIME_MISSING if the file was absent.
+ * @param next_index     Index (0 or 1) of the snapshot to activate.
+ * @param observed_mtime Stamp that triggered this reload, or CHAOS_DNS_MTIME_MISSING.
  */
 static void chaos_dns_config_publish(unsigned int next_index, uint64_t observed_mtime)
 {
@@ -283,13 +281,10 @@ static void chaos_dns_config_publish(unsigned int next_index, uint64_t observed_
  * ------------------------------------------------------------------------- */
 
 /**
- * @brief Return non-zero if @p ch is an ASCII whitespace character.
- *
- * @details Recognises space, horizontal tab, carriage return, and newline.
- * Used by chaos_dns_trim() to strip leading and trailing whitespace.
+ * @brief Whether @p ch is a blank for trimming: space, tab, CR or LF.
  *
  * @param ch  Character to test.
- * @return  Non-zero if @p ch is a whitespace character; zero otherwise.
+ * @return  Non-zero for a blank; zero otherwise.
  */
 static int chaos_dns_is_blank_char(char ch)
 {
@@ -297,16 +292,13 @@ static int chaos_dns_is_blank_char(char ch)
 }
 
 /**
- * @brief Return a pointer to the first non-whitespace character of @p text,
- *        with trailing whitespace stripped in-place.
+ * @brief Trims blanks in place.
  *
- * @details Modifies @p text by overwriting the first trailing whitespace
- * character with a NUL terminator.  The returned pointer may point into the
- * middle of @p text.  The original buffer must remain valid for the lifetime
- * of the returned pointer.
+ * @details Writes a NUL over the first trailing blank and returns a pointer to the first
+ * non-blank, which may be inside @p text; the buffer must outlive the result.
  *
- * @param text  Mutable NUL-terminated string; may be NULL.
- * @return  Pointer to the trimmed start, or NULL if @p text was NULL.
+ * @param text  Writable NUL-terminated string; NULL returns NULL.
+ * @return  The trimmed start (the terminator for an all-blank string), or NULL.
  */
 static char *chaos_dns_trim(char *text)
 {
@@ -336,14 +328,11 @@ static char *chaos_dns_trim(char *text)
 }
 
 /**
- * @brief Truncate @p line at the first `#` character (inline comment removal).
+ * @brief Cuts @p line at its first `#`.
  *
- * @details Overwrites the `#` with NUL so that subsequent processing sees only
- * the portion of the line before any comment.  This is intentionally simple:
- * `#` inside quoted strings is not supported because the config format does
- * not use quoted strings.
+ * @details The format has no quoting or escape: a `#` anywhere starts a comment.
  *
- * @param line  Mutable NUL-terminated line buffer; no-op if NULL.
+ * @param line  Writable NUL-terminated line; NULL is a no-op.
  */
 static void chaos_dns_strip_comment(char *line)
 {
@@ -362,15 +351,15 @@ static void chaos_dns_strip_comment(char *line)
 }
 
 /**
- * @brief Case-insensitive ASCII string equality comparison.
+ * @brief ASCII case-insensitive string equality (DNS names are case-insensitive, RFC
+ *        4343).
  *
- * @details Used for hostname matching so that `Example.COM` and `example.com`
- * compare equal, matching DNS case-insensitivity semantics (RFC 4343).  Only
- * the 26 ASCII letters are case-folded; non-ASCII bytes are compared as-is.
+ * @details Uses tolower(), which folds only A-Z in the C locale; a program that set a
+ * single-byte locale may also fold bytes above 0x7f.
  *
- * @param left   First NUL-terminated string; NULL returns 0.
- * @param right  Second NUL-terminated string; NULL returns 0.
- * @return  Non-zero if both strings are equal length and equal content; zero otherwise.
+ * @param left   NUL-terminated string; NULL yields 0.
+ * @param right  NUL-terminated string; NULL yields 0.
+ * @return  Non-zero if both have the same length and equal characters; zero otherwise.
  */
 static int chaos_dns_ascii_case_equal(const char *left, const char *right)
 {
@@ -396,16 +385,14 @@ static int chaos_dns_ascii_case_equal(const char *left, const char *right)
 }
 
 /**
- * @brief Return non-zero if @p text ends with @p suffix (case-insensitive ASCII).
+ * @brief Whether @p text ends with @p suffix, ASCII case-insensitive.
  *
- * @details Used to implement SUFFIX selector matching.  A call to this
- * function is always preceded by a dot-separator check in
- * chaos_dns_selector_matches_domain() so that "fooexample.com" does not match
- * a selector for "*.example.com".
+ * @details For SUFFIX matching; chaos_dns_selector_matches_domain() also requires a `.`
+ * right before the suffix, so `fooexample.com` does not match `*.example.com`.
  *
- * @param text    NUL-terminated string to test; NULL returns 0.
- * @param suffix  NUL-terminated suffix to look for; NULL returns 0.
- * @return  Non-zero if @p text ends with @p suffix (ignoring case); zero otherwise.
+ * @param text    NUL-terminated string; NULL yields 0.
+ * @param suffix  NUL-terminated suffix; NULL yields 0.
+ * @return  Non-zero if @p text ends with @p suffix; zero otherwise.
  */
 static int chaos_dns_ascii_case_ends_with(const char *text, const char *suffix)
 {
@@ -428,27 +415,25 @@ static int chaos_dns_ascii_case_ends_with(const char *text, const char *suffix)
 }
 
 /* -------------------------------------------------------------------------
- * Internal helpers: selector parsing
+ * Selector parsing
  * ------------------------------------------------------------------------- */
 
 /**
- * @brief Parse the address body of an `rdns://` selector into @p selector.
+ * @brief Parses the part of an `rdns://` selector after the scheme.
  *
- * @details The body may be:
- *   - `"*"` — wildcard; sets kind=ANY, domain=REVERSE.
- *   - An IPv4 string (e.g., `"192.168.1.1"`) — parsed and re-serialised via
- *     inet_pton/inet_ntop to produce a canonical form.
- *   - A bracketed IPv6 string (e.g., `"[::1]"`) — brackets are stripped
- *     before the inet_pton call.
+ * @details Accepted:
+ *   - `*` -- any reverse lookup (ANY).
+ *   - An IPv4 literal (`192.168.1.1`).
+ *   - An IPv6 literal, bare (`::1`) or bracketed (`[::1]`).
+ * Literals are parsed with inet_pton and stored in inet_ntop form, so `[0:0::1]` and
+ * the query text for ::1 compare equal. inet_pton(AF_INET) accepts only dotted-quad
+ * decimal without leading zeros: glibc and musl reject `1.2.3.004` rather than
+ * canonicalise it.
  *
- * Re-serialising via inet_ntop ensures that selectors like `1.2.3.004` and
- * `1.2.3.4` end up with the same text, so comparisons with the normalised
- * query string from chaos_dns_reverse_query_from_sockaddr() are exact.
- *
- * @param body      The part of the selector after `rdns://`.
- * @param selector  Output; domain is set to REVERSE on success.
- * @return  Non-zero on success; zero if the body is empty, malformed, or
- *          an unsupported format (e.g., hostname instead of IP).
+ * @param body      Text after `rdns://`.
+ * @param selector  Output; domain REVERSE on success.
+ * @return  Non-zero on success; zero for an empty body, a host name, or a malformed
+ *          literal.
  */
 static int chaos_dns_parse_reverse_selector_body(const char *body, chaos_dns_selector_t *selector)
 {
@@ -472,7 +457,7 @@ static int chaos_dns_parse_reverse_selector_body(const char *body, chaos_dns_sel
     body_len = strlen(body);
     if (body[0] == '[')
     {
-        /* IPv6 addresses may be written as [::1]; strip the brackets. */
+        /* IPv6 may be written [::1]: strip the brackets. */
         if (body_len <= 2U || body[body_len - 1U] != ']')
         {
             return 0;
@@ -494,7 +479,7 @@ static int chaos_dns_parse_reverse_selector_body(const char *body, chaos_dns_sel
     {
         selector->domain = CHAOS_DNS_SELECTOR_DOMAIN_REVERSE;
         selector->kind = CHAOS_DNS_SELECTOR_EXACT;
-        /* Canonicalise: re-serialise so that 1.2.3.004 → 1.2.3.4, etc. */
+        /* Store the inet_ntop form, the form query keys are built in. */
         return inet_ntop(AF_INET, &ipv4, selector->text, sizeof(selector->text)) != NULL;
     }
     if (inet_pton(AF_INET6, source, &ipv6) == 1)
@@ -508,26 +493,22 @@ static int chaos_dns_parse_reverse_selector_body(const char *body, chaos_dns_sel
 }
 
 /**
- * @brief Parse a complete selector string into a @ref chaos_dns_selector_t.
+ * @brief Parses a selector into @p selector.
  *
- * @details Accepts the following forms:
- *   - `"*"`                — LOOKUP/ANY
- *   - `"dns://\*"`          — LOOKUP/ANY
- *   - `"dns://hostname"`   — LOOKUP/EXACT
- *   - `"dns://\*.suffix"`   — LOOKUP/SUFFIX (text = "suffix", leading `*.` stripped)
- *   - `"rdns://..."`       — delegates to chaos_dns_parse_reverse_selector_body()
+ * @details Forms:
+ *   - `*`               -- LOOKUP/ANY
+ *   - `dns://\*`        -- LOOKUP/ANY
+ *   - `dns://host`      -- LOOKUP/EXACT
+ *   - `dns://\*.suffix` -- LOOKUP/SUFFIX, text = "suffix"
+ *   - `rdns://...`      -- chaos_dns_parse_reverse_selector_body()
  *
- * The `selector_len` field is set to `strlen(text)` (the full original string
- * length) before any trimming.  This is used as a tiebreaker in rule selection:
- * longer selectors are considered more specific when rank is equal.
+ * selector_len is strlen(@p text), the selector as written: the tie-breaker between
+ * equal ranks. A `*` anywhere else in a dns:// body is rejected; there are no globs.
+ * Host and suffix text are limited to CHAOS_DNS_MAX_TEXT - 1 (255) bytes.
  *
- * A `*` anywhere inside the body (after any leading `*.`) is rejected to
- * prevent ambiguous glob-like patterns; only the specific forms above are
- * supported.
- *
- * @param text      NUL-terminated selector string from the config file.
- * @param selector  Output.
- * @return  Non-zero on success; zero if @p text is NULL, empty, or unrecognised.
+ * @param text      NUL-terminated selector.
+ * @param selector  Output; zeroed first.
+ * @return  Non-zero on success; zero if @p text is NULL, empty or not a selector.
  */
 static int chaos_dns_selector_parse(const char *text, chaos_dns_selector_t *selector)
 {
@@ -563,7 +544,7 @@ static int chaos_dns_selector_parse(const char *text, chaos_dns_selector_t *sele
         }
         if (strncmp(body, "*.", 2) == 0)
         {
-            body += 2; /* strip the leading "*." */
+            body += 2; /* drop the "*." */
             selector->kind = CHAOS_DNS_SELECTOR_SUFFIX;
         }
         else
@@ -589,25 +570,18 @@ static int chaos_dns_selector_parse(const char *text, chaos_dns_selector_t *sele
 }
 
 /**
- * @brief Test whether a selector matches a given domain and name, computing
- *        a specificity rank.
+ * @brief Whether @p selector matches @p name in @p domain, and how specifically.
  *
- * @details Rank values (written to @p rank_out):
- *   - 3 — EXACT match
- *   - 2 — SUFFIX match
- *   - 1 — ANY match
- *   - 0 — no match (return value is 0)
- *
- * For SUFFIX matching, the function checks that the character immediately
- * before the suffix in @p name is a `.`  to prevent `fooexample.com` from
- * matching `*.example.com`.
+ * @details Ranks written to @p rank_out: 3 EXACT, 2 SUFFIX, 1 ANY, 0 no match. Domains
+ * must be equal. SUFFIX requires @p name to be longer than the suffix, to end with it,
+ * and to have a `.` right before it.
  *
  * @param selector  Selector to test.
- * @param domain    Domain of the incoming query (LOOKUP or REVERSE).
- * @param name      Hostname or IP string to test against the selector.
- * @param rank_out  Output; set to the match rank if non-NULL and matched.
+ * @param domain    Domain of the query (LOOKUP or REVERSE).
+ * @param name      Queried host name or address text; NULL or empty yields 0.
+ * @param rank_out  Optional output: the rank, 0 when there is no match.
  *
- * @return  Non-zero if the selector matches; zero otherwise.
+ * @return  Non-zero on a match; zero otherwise.
  */
 static int chaos_dns_selector_matches_domain(
     const chaos_dns_selector_t *selector,
@@ -662,7 +636,7 @@ static int chaos_dns_selector_matches_domain(
     {
         return 0;
     }
-    /* Require a dot separator: "fooexample.com" must not match "*.example.com". */
+    /* A dot must precede the suffix: "fooexample.com" must not match "*.example.com". */
     if (name[name_len - suffix_len - 1U] != '.')
     {
         return 0;
@@ -675,15 +649,16 @@ static int chaos_dns_selector_matches_domain(
 }
 
 /* -------------------------------------------------------------------------
- * Internal helpers: value parsing
+ * Value parsing
  * ------------------------------------------------------------------------- */
 
 /**
- * @brief Parses a probability (see chaos_policy_parse_probability()): "0", "1",
- *        "0." and digits, or "1." and zeros, whatever the locale.
+ * @brief Parses a probability, locale-independently (chaos_policy_parse_probability()).
  *
- * @param text         Probability string. Must not be NULL.
- * @param probability  Output: receives the parsed value. Must not be NULL.
+ * @details Accepts "0", "1", "0." followed by digits, or "1." followed by zeros.
+ *
+ * @param text         Probability text; must not be NULL.
+ * @param probability  Output; must not be NULL.
  * @return 0 on success; -1 when @p text is not a probability.
  */
 static int chaos_dns_parse_probability(const char *text, double *probability)
@@ -692,13 +667,13 @@ static int chaos_dns_parse_probability(const char *text, double *probability)
 }
 
 /**
- * @brief Parse a latency value (milliseconds) from a NUL-terminated string.
+ * @brief Parses a LATENCY delay in ms.
  *
- * @details Accepts a non-negative decimal integer up to UINT_MAX.  The value
- * is stored as `unsigned int` (milliseconds).  Values larger than 0xffffffff
- * are rejected because the sleep loop uses `useconds_t` chunks.
+ * @details strtoul semantics (leading blanks and a sign accepted; "-1" wraps above the
+ * limit and is rejected), trailing blanks allowed, nothing else after the digits. The
+ * limit, 0xffffffff ms, is the range of the unsigned int field: about 49.7 days.
  *
- * @param text        Input string.
+ * @param text        Decimal text.
  * @param latency_ms  Output; set on success.
  * @return  0 on success; -1 on failure.
  */
@@ -723,15 +698,14 @@ static int chaos_dns_parse_latency(const char *text, unsigned int *latency_ms)
 }
 
 /**
- * @brief Parse a list-length limit value from a NUL-terminated string.
+ * @brief Parses a LIMIT count in [1, 0xffffffff].
  *
- * @details Accepts a positive decimal integer in [1, UINT_MAX].  Zero is
- * explicitly rejected: a limit of zero would silently discard all results,
- * which is almost certainly a config error.
+ * @details Same syntax as chaos_dns_parse_latency(). Zero is rejected: a limit of zero
+ * would turn every lookup into EAI_NONAME, which a GAI rule expresses explicitly.
  *
- * @param text   Input string.
- * @param limit  Output; set on success; guaranteed >= 1.
- * @return  0 on success; -1 on failure or zero value.
+ * @param text   Decimal text.
+ * @param limit  Output; >= 1 on success.
+ * @return  0 on success; -1 on failure or zero.
  */
 static int chaos_dns_parse_limit(const char *text, unsigned int *limit)
 {
@@ -744,7 +718,7 @@ static int chaos_dns_parse_limit(const char *text, unsigned int *limit)
     }
 
     value = strtoul(text, &end, 10);
-    /* Reject zero: a zero limit is a config mistake, not a valid no-op. */
+    /* Zero is rejected: an empty answer is a GAI rule's job, not a LIMIT's. */
     if (end == text || *chaos_dns_trim(end) != '\0' || value == 0UL || value > 0xffffffffUL)
     {
         return -1;
@@ -755,17 +729,16 @@ static int chaos_dns_parse_limit(const char *text, unsigned int *limit)
 }
 
 /**
- * @brief Return non-zero if @p effect is permitted for @p selector's domain.
+ * @brief Whether @p effect may be used with @p selector's domain.
  *
- * @details LOOKUP selectors (dns://) allow all effects.  REVERSE selectors
- * (rdns://) only allow a subset: GAI (EAI_* errors), LATENCY, REWRITE
- * (hostname replacement), and SERVICE (port replacement).  Result-set
- * transforms (OVERRIDE, FILTER_FAMILY, SHUFFLE, LIMIT) are meaningless for
- * getnameinfo because it does not return an addrinfo list.
+ * @details dns:// selectors accept every effect. rdns:// selectors accept only GAI,
+ * LATENCY, REWRITE (the returned host name) and SERVICE (the returned service name):
+ * OVERRIDE, FILTER_FAMILY, SHUFFLE and LIMIT shape an address list, which a reverse
+ * lookup does not return.
  *
  * @param selector  The parsed selector.
  * @param effect    The effect to check.
- * @return  Non-zero if allowed; zero if the combination is invalid.
+ * @return  Non-zero if allowed; zero otherwise.
  */
 static int chaos_dns_effect_allowed(const chaos_dns_selector_t *selector, chaos_dns_effect_t effect)
 {
@@ -787,17 +760,15 @@ static int chaos_dns_effect_allowed(const chaos_dns_selector_t *selector, chaos_
 }
 
 /**
- * @brief Parse an address-family filter token string into the enum value.
+ * @brief Parses a FILTER_FAMILY value.
  *
- * @details Accepted tokens (case-sensitive):
- *   - `"inet4"` or `"ipv4"` → CHAOS_DNS_FAMILY_INET4
- *   - `"inet6"` or `"ipv6"` → CHAOS_DNS_FAMILY_INET6
- *   - `"any"`               → CHAOS_DNS_FAMILY_ANY
+ * @details Case-sensitive tokens:
+ *   - `inet4` or `ipv4` -> CHAOS_DNS_FAMILY_INET4
+ *   - `inet6` or `ipv6` -> CHAOS_DNS_FAMILY_INET6
+ *   - `any`             -> CHAOS_DNS_FAMILY_ANY (parses, but filters nothing)
  *
- * Both `inet4`/`ipv4` spellings are accepted for user convenience.
- *
- * @param text  Token string; NULL returns INVALID.
- * @return  The parsed family filter value, or CHAOS_DNS_FAMILY_INVALID.
+ * @param text  Token; NULL yields INVALID.
+ * @return  The family, or CHAOS_DNS_FAMILY_INVALID.
  */
 static chaos_dns_family_filter_t chaos_dns_parse_family_filter(const char *text)
 {
@@ -821,17 +792,15 @@ static chaos_dns_family_filter_t chaos_dns_parse_family_filter(const char *text)
 }
 
 /**
- * @brief Map an EAI_* error name string to its integer constant.
+ * @brief Maps an EAI_* name to its value.
  *
- * @details Returns `0x7fffffff` (a sentinel that cannot be a real EAI code)
- * if @p text does not match any known name.  This sentinel is used by the
- * caller to distinguish a successfully-parsed EAI code from an unrecognised
- * effect keyword.
+ * @details Accepted (exact, case-sensitive): EAI_AGAIN, EAI_FAIL, EAI_NONAME, EAI_MEMORY,
+ * EAI_SYSTEM. Anything else yields 0x7fffffff, which no EAI_* constant equals (they are
+ * small negative numbers on glibc and musl), so the caller can tell "not an EAI name"
+ * from a valid code.
  *
- * Supported names: EAI_AGAIN, EAI_FAIL, EAI_NONAME, EAI_MEMORY, EAI_SYSTEM.
- *
- * @param text  Effect field text from a config line.
- * @return  The EAI_* constant, or 0x7fffffff if not recognised.
+ * @param text  Effect field of a rule line.
+ * @return  The EAI_* value, or 0x7fffffff.
  */
 static int chaos_dns_parse_gai_name(const char *text)
 {
@@ -863,16 +832,13 @@ static int chaos_dns_parse_gai_name(const char *text)
 }
 
 /**
- * @brief Copy a non-empty string into a fixed-size buffer.
- *
- * @details Fails if @p text is empty, or if its length (including NUL) would
- * exceed @p target_size.  Uses memcpy rather than strncpy to avoid the
- * zero-fill overhead on large buffers.
+ * @brief Copies a non-empty string into a fixed buffer.
  *
  * @param text         Source string.
  * @param target       Destination buffer.
  * @param target_size  Size of @p target in bytes.
- * @return  0 on success; -1 if @p text is empty, too long, or any pointer is NULL.
+ * @return  0 on success; -1 if @p text is empty, does not fit with its NUL, or a pointer
+ *          is NULL.
  */
 static int chaos_dns_copy_text_value(const char *text, char *target, size_t target_size)
 {
@@ -893,19 +859,16 @@ static int chaos_dns_copy_text_value(const char *text, char *target, size_t targ
 }
 
 /**
- * @brief Split an effect value field into a payload and an optional probability.
+ * @brief Splits `<payload>[@<probability>]` into the payload and the probability.
  *
- * @details The optional probability is appended to the payload with an `@`
- * separator, e.g. `"192.168.1.1@0.5"`.  `strrchr` is used (not `strchr`) so
- * that IPv6 addresses containing `@` in user data are handled — though in
- * practice no IP address contains `@`; the rightmost `@` is the separator.
+ * @details The last `@` is the separator, so a payload may itself contain `@`. Without
+ * one, the probability is 1.0. The payload is trimmed; it and the probability text must
+ * both be non-empty.
  *
- * If no `@` is present, probability defaults to 1.0 (always trigger).
- *
- * @param text          The raw value field text.
- * @param payload       Output buffer for the payload portion.
- * @param payload_size  Size of @p payload in bytes.
- * @param probability   Output; set to the parsed probability or 1.0.
+ * @param text          The value field.
+ * @param payload       Output buffer for the payload.
+ * @param payload_size  Size of @p payload.
+ * @param probability   Output: the parsed probability, or 1.0.
  * @return  0 on success; -1 on any parse or copy failure.
  */
 static int chaos_dns_parse_payload_probability(
@@ -949,14 +912,12 @@ static int chaos_dns_parse_payload_probability(
 }
 
 /**
- * @brief Return non-zero if @p token is a valid IPv4 or IPv6 address literal.
+ * @brief Whether @p token is an IPv4 or IPv6 literal (`192.168.1.1`, `::1`, `[::1]`).
  *
- * @details Accepts bare IPv4 (`"192.168.1.1"`), bare IPv6 (`"::1"`), or
- * bracketed IPv6 (`"[::1]"`).  Uses inet_pton for validation, not a regex,
- * so the accepted set is exactly the set of addresses the real getaddrinfo
- * can resolve with AI_NUMERICHOST.
+ * @details Validated with inet_pton, so the accepted set is the set the real
+ * getaddrinfo resolves under AI_NUMERICHOST without a query.
  *
- * @param token  NUL-terminated address token.
+ * @param token  NUL-terminated token.
  * @return  Non-zero if valid; zero otherwise.
  */
 static int chaos_dns_override_token_valid(const char *token)
@@ -993,14 +954,14 @@ static int chaos_dns_override_token_valid(const char *token)
 }
 
 /**
- * @brief Validate that @p text is a non-empty comma-separated list of IP literals.
+ * @brief Whether @p text is a non-empty comma-separated list of IP literals.
  *
- * @details Splits on commas (in a copy of @p text to avoid modifying the caller's
- * buffer), trims each token, and calls chaos_dns_override_token_valid() on each.
- * Returns 0 if any token is invalid or if the list is empty.
+ * @details Splits a copy on commas, trims each token and validates it with
+ * chaos_dns_override_token_valid(); an empty token (`a,,b`) is invalid. The count limit
+ * of 32 literals is enforced at lookup time (chaos_dns_apply_override()), not here.
  *
- * @param text  The raw override value string (not modified).
- * @return  Non-zero if all tokens are valid IP literals; zero otherwise.
+ * @param text  Override value; not modified.
+ * @return  Non-zero if every token is a valid literal; zero otherwise.
  */
 static int chaos_dns_validate_override_value(const char *text)
 {
@@ -1041,21 +1002,19 @@ static int chaos_dns_validate_override_value(const char *text)
 }
 
 /* -------------------------------------------------------------------------
- * mtime hashing
+ * Change stamp
  * ------------------------------------------------------------------------- */
 
 /**
- * @brief Ensure a computed mtime hash does not collide with a sentinel value.
+ * @brief Moves a computed stamp off the three reserved values.
  *
- * @details If the FNV-style hash of the mtime fields coincidentally equals one
- * of the three sentinel constants (MISSING, RELOADING, UNKNOWN), XOR it with
- * the golden-ratio constant to produce a different, non-sentinel value.  The
- * probability of a natural collision is negligible (3 out of 2^64), but the
- * consequence of a collision — a missed reload or an incorrect RELOADING
- * state — is severe enough to guard against.
+ * @details A stamp equal to MISSING (0), RELOADING (2^64 - 2) or UNKNOWN (2^64 - 1) is
+ * XORed with the golden-ratio constant; for these three inputs the result is never
+ * itself reserved. A collision would be rare (3 in 2^64) but would misread as "no file",
+ * "reload in progress" or "never loaded".
  *
- * @param value  Raw mtime hash from chaos_dns_config_hash_mtime().
- * @return  A value that is guaranteed not to equal any sentinel.
+ * @param value  Stamp from chaos_dns_config_hash_mtime().
+ * @return  @p value, or the remapped value on a collision.
  */
 static uint64_t chaos_dns_config_normalize_mtime_hash(uint64_t value)
 {
@@ -1069,25 +1028,19 @@ static uint64_t chaos_dns_config_normalize_mtime_hash(uint64_t value)
 }
 
 /**
- * @brief Computes a 64-bit change stamp of the file: mtime, size, inode and device.
+ * @brief 64-bit change stamp of the rule file: FNV-1a-style mix of mtime, size, inode and
+ *        device.
  *
- * @details Uses FNV-prime multiplications over the mtime seconds and
- * nanoseconds, the size, the inode and the device to spread the change domain
- * across the full 64-bit output space.
+ * @details mtime alone is not enough: file systems stamp it from a coarse clock (a few
+ * ms), so two writes in one tick leave it unchanged. The size catches an append, the
+ * inode a rewrite through a temporary file and rename(2) (`sed -i`), even within one
+ * tick; a same-size in-place rewrite within one tick is left to the provisional re-read.
+ * The multiplier is the FNV-1a 64-bit prime; the start value 1469598103934665603 is the
+ * FNV offset basis (14695981039346656037) without its last digit. Any fixed start works
+ * for change detection, so this costs nothing but the name.
  *
- * The mtime alone is not enough: file systems stamp it from a coarse clock (a
- * few milliseconds), so two writes in one tick leave it unchanged. Mixing in the
- * size catches an append, and the inode catches a rewrite through a temporary
- * file and rename(2) (`sed -i`), even within one tick.
- *
- * The base value (0x1469598103934665603) is an arbitrary non-zero odd
- * constant; the multiplier (FNV prime 1099511628211) is the standard FNV-1a
- * 64-bit prime.
- *
- * Returns CHAOS_DNS_MTIME_MISSING if @p st is NULL (file absent).
- *
- * @param st  Pointer to the struct stat of the config file; NULL if absent.
- * @return  Hash value guaranteed not to collide with RELOADING or UNKNOWN.
+ * @param st  stat/fstat result, or NULL for a missing file.
+ * @return  The normalised stamp, or CHAOS_DNS_MTIME_MISSING for NULL.
  */
 static uint64_t chaos_dns_config_hash_mtime(const struct stat *st)
 {
@@ -1113,14 +1066,13 @@ static uint64_t chaos_dns_config_hash_mtime(const struct stat *st)
 }
 
 /**
- * @brief Stat the config file and return its mtime hash.
+ * @brief stat(2)s the rule file and returns its change stamp.
  *
- * @details Sets the reentrancy guard around the stat(2) call so that if the
- * stat itself triggers any interposed call (unlikely but possible on exotic
- * filesystems), the guard prevents re-entrant chaos injection.
+ * @details stat goes through libc, so other preloaded libraries that wrap it see it; the
+ * guard only keeps libchaos-dns's own wrappers out.
  *
- * @return  Mtime hash for the current file state, or CHAOS_DNS_MTIME_MISSING
- *          if the file does not exist or stat fails.
+ * @return  The stamp, or CHAOS_DNS_MTIME_MISSING if stat fails for any reason.
+ * @par errno: clobbered; chaos_dns_config_prepare() restores it.
  */
 static uint64_t chaos_dns_config_observed_mtime(void)
 {
@@ -1140,19 +1092,20 @@ static uint64_t chaos_dns_config_observed_mtime(void)
 }
 
 /**
- * @brief Read the config file into the shared read buffer.
+ * @brief Reads the whole rule file into g_chaos_dns_config_buffer and checks it is still
+ *        the file whose stamp triggered the reload.
  *
- * @details Opens the file at CHAOS_DNS_CONFIG_PATH, reads it in a loop to
- * handle partial reads, and NUL-terminates the result.  The reentrancy guard
- * is held for the entire duration so that no other interposed call can observe
- * partial state.  The file is rejected (returns -1) if it is larger than
- * CHAOS_DNS_MAX_CONFIG_BYTES; this prevents unbounded memory use.
+ * @details CHAOS_CONFIG_FILE_OPEN/READ/CLOSE are raw openat/read/close system calls on
+ * Linux, so libchaos-io neither sees nor faults the library's own read. EINTR is retried.
+ * After EOF, fstat must reproduce @p expected_stamp; a writer that rewrote or appended
+ * meanwhile could have left a half-old, half-new copy. On success the mtime decides
+ * whether the load is provisional, and the buffer is NUL-terminated.
  *
- * @param size_out  Output: number of bytes read (not including NUL terminator).
- * @return  0 on success; -1 on open/read failure, or if the file is too large.
- *
- * @post  On success, g_chaos_dns_config_buffer[0..*size_out] is the file
- *        contents with a NUL terminator at [*size_out].
+ * @param size_out        Output: bytes read, NUL not counted.
+ * @param expected_stamp  Stamp observed by the stat that triggered this reload.
+ * @return  0 on success; -1 transient (open/read error, file changed): retry later;
+ *          -2 file is CHAOS_DNS_MAX_CONFIG_BYTES or larger; -3 EACCES/EPERM on open or
+ *          EISDIR on read. -2 and -3 reject the file until it changes.
  */
 static int chaos_dns_config_read_file(size_t *size_out, uint64_t expected_stamp)
 {
@@ -1173,8 +1126,8 @@ static int chaos_dns_config_read_file(size_t *size_out, uint64_t expected_stamp)
     } while (fd < 0 && errno == EINTR);
     if (fd < 0)
     {
-        /* No permission lasts until the file changes; anything else (gone since
-         * the stat, out of descriptors, ...) is retried on the next check. */
+        /* EACCES/EPERM persist until the file changes; anything else (gone since the
+         * stat, out of descriptors, ...) is retried on the next look. */
         const int open_error = errno;
 
         chaos_dns_leave_internal(previous);
@@ -1203,7 +1156,7 @@ static int chaos_dns_config_read_file(size_t *size_out, uint64_t expected_stamp)
             break;
         }
         total += (size_t)rc;
-        /* Reject files that hit the size cap to avoid silent truncation. */
+        /* Filling the buffer means the file is at or over the limit: reject, do not cut. */
         if (total == CHAOS_DNS_MAX_CONFIG_BYTES)
         {
             CHAOS_CONFIG_FILE_CLOSE(fd);
@@ -1212,10 +1165,10 @@ static int chaos_dns_config_read_file(size_t *size_out, uint64_t expected_stamp)
         }
     }
 
-    /* The file must still be the one whose change triggered this reload. A writer
-     * that rewrote or appended to it while it was read leaves a different stamp; the
-     * copy may then be half old, half new, so it is not used and the next call
-     * reloads the finished file. */
+    /* The file must still be the one whose stamp triggered this reload. A writer that
+     * rewrote or appended to it during the read leaves a different stamp; the copy may
+     * be half old, half new, so it is discarded and the next look reloads the finished
+     * file. */
     if (fstat(fd, &st) != 0 || chaos_dns_config_hash_mtime(&st) != expected_stamp)
     {
         CHAOS_CONFIG_FILE_CLOSE(fd);
@@ -1234,26 +1187,25 @@ static int chaos_dns_config_read_file(size_t *size_out, uint64_t expected_stamp)
 }
 
 /**
- * @brief Split a trimmed config line into selector, effect, and value fields.
+ * @brief Splits a trimmed rule line into selector, effect and value.
  *
- * @details A config line has the form:
+ * @details Form:
  * @code
  *   <selector> : <effect> : <value>
  * @endcode
- * where `<selector>` is one of the URI-prefixed patterns and the two `:`
- * delimiters are found after the selector (skipping the `://` in the URI).
- * This function modifies @p line in place by NUL-terminating each field.
+ * The selector end is found by its scheme, so the `:` of `://` and of an IPv6 address
+ * are not taken as separators:
+ *   - `*:` -- a bare `*` immediately followed by `:` (no blank in between);
+ *   - `dns://...` and unbracketed `rdns://...` -- the first `:` after the scheme;
+ *   - `rdns://[...]` -- the `]` must be followed directly by `:`.
+ * The effect ends at the next `:`; the value is the rest (it may contain `:`, e.g. an
+ * OVERRIDE list of IPv6 literals). Fields are trimmed; @p line is modified in place.
  *
- * The function handles the special case of `rdns://[...]` selectors where the
- * IPv6 address is bracketed: it locates the closing `]` first, then expects
- * a `:` immediately after the bracket, avoiding false splits on the `:` inside
- * the address.
- *
- * @param line           Mutable, trimmed line buffer (comment already stripped).
- * @param selector_text  Output pointer to the selector field start.
- * @param effect_text    Output pointer to the effect field start.
- * @param value_text     Output pointer to the value field start.
- * @return  Non-zero on successful split; zero if the line has unrecognised format.
+ * @param line           Writable line, comment already cut.
+ * @param selector_text  Output: selector field.
+ * @param effect_text    Output: effect field.
+ * @param value_text     Output: value field.
+ * @return  Non-zero on success; zero for an unrecognised selector or a missing `:`.
  */
 static int
 chaos_dns_split_rule_fields(char *line, char **selector_text, char **effect_text, char **value_text)
@@ -1276,7 +1228,7 @@ chaos_dns_split_rule_fields(char *line, char **selector_text, char **effect_text
     }
     else if (strncmp(line, "rdns://[", 8) == 0)
     {
-        /* Bracketed IPv6: find the closing ']', then expect ':' immediately after. */
+        /* Bracketed IPv6: the ']' must be followed directly by ':'. */
         char *close = strchr(line + 8, ']');
 
         if (close == NULL || close[1] != ':')
@@ -1313,11 +1265,14 @@ chaos_dns_split_rule_fields(char *line, char **selector_text, char **effect_text
 }
 
 /* =========================================================================
- * Public API implementation
+ * Public API
  * ========================================================================= */
 
 /**
- * @brief Initialise the config subsystem.  See chaos_dns_config.h.
+ * @brief Resets the rule subsystem (contract in chaos_dns_config.h).
+ *
+ * @details Also records the pid and hits-file number for the hits report. Both snapshots
+ * end with an even sequence, index 0 active, stamp CHAOS_DNS_MTIME_UNKNOWN.
  */
 void chaos_dns_config_init(void)
 {
@@ -1332,7 +1287,7 @@ void chaos_dns_config_init(void)
         g_chaos_dns_atfork_registered = 1;
         (void)pthread_atfork(NULL, NULL, chaos_dns_config_after_fork);
     }
-    /* Find the vDSO clock now, not first inside a wrapper a signal handler may re-enter. */
+    /* Resolve the vDSO clock now, not first inside a wrapper a signal handler re-entered. */
     (void)chaos_clock_now_ns();
     chaos_dns_config_reset_state(&g_chaos_dns_config_states[0], 1);
     chaos_dns_config_reset_state(&g_chaos_dns_config_states[1], 1);
@@ -1343,13 +1298,12 @@ void chaos_dns_config_init(void)
 }
 
 /**
- * @brief Parse one line into a rule.  See chaos_dns_config.h for the contract.
+ * @brief Parses one rule line (contract in chaos_dns_config.h).
  *
- * @details The effect is identified first by trying to parse an EAI_* name
- * (which cannot be confused with keyword effects), then by strcmp against the
- * known keyword strings.  Each effect branch validates that the selector
- * domain permits that effect before attempting to parse the value field,
- * avoiding partial population of @p rule on mismatched combinations.
+ * @details The effect field is tried as an EAI_* name first (effect GAI), then against
+ * the keywords. OVERRIDE, FILTER_FAMILY, LIMIT and SHUFFLE check the selector domain
+ * before parsing their value; GAI, LATENCY, REWRITE and SERVICE are valid in both
+ * domains.
  */
 int chaos_dns_config_parse_line(char *line, chaos_dns_rule_t *rule)
 {
@@ -1385,9 +1339,9 @@ int chaos_dns_config_parse_line(char *line, chaos_dns_rule_t *rule)
         return -1;
     }
 
-    /* GAI, LATENCY, REWRITE and SERVICE apply to lookups and reverse lookups alike,
-     * the only domains chaos_dns_selector_parse() produces: only the other effects
-     * ask chaos_dns_effect_allowed(). */
+    /* GAI, LATENCY, REWRITE and SERVICE apply to lookups and reverse lookups alike, the
+     * only domains chaos_dns_selector_parse() produces: only the other effects ask
+     * chaos_dns_effect_allowed(). */
     gai_error = chaos_dns_parse_gai_name(effect_text);
     if (gai_error != 0x7fffffff)
     {
@@ -1492,12 +1446,11 @@ int chaos_dns_config_parse_line(char *line, chaos_dns_rule_t *rule)
 }
 
 /**
- * @brief Parse a complete config buffer into a rule array.  See chaos_dns_config.h.
+ * @brief Parses a whole rule file (contract in chaos_dns_config.h).
  *
- * @details Stops and returns -1 on the first malformed non-blank line.  This
- * fail-fast behaviour ensures that a partially-valid file never results in a
- * partial rule set: either all rules parse successfully or the snapshot is
- * reset to empty.
+ * @details All or nothing: the first rejected line ends the parse with -1, so a partly
+ * valid file never yields a partial rule set. The line as written is kept in the error
+ * record before the parser edits it; the same copy becomes the rule's hits-file text.
  */
 int chaos_dns_config_parse_buffer(char *buffer, chaos_dns_rule_t *rules, size_t *rule_count)
 {
@@ -1548,7 +1501,7 @@ int chaos_dns_config_parse_buffer(char *buffer, chaos_dns_rule_t *rules, size_t 
         {
             if (!chaos_policy_is_empty(&policy))
             {
-                /* Qualifiers without a rule. */
+                /* Qualifiers on a blank or comment-only line: invalid. */
                 chaos_status_reject(&g_chaos_dns_config_error, CHAOS_STATUS_REASON_INVALID);
                 *rule_count = 0U;
                 return -1;
@@ -1582,20 +1535,19 @@ const chaos_status_error_t *chaos_dns_config_last_error(void)
 }
 
 /**
- * @brief Internal: select the best-matching rule for a given domain, effect, and name.
+ * @brief Best rule for @p domain, @p effect and @p name in @p rules.
  *
- * @details Scans all rules, computing a rank for each matching rule.
- * The winner is the rule with the highest rank; ties are broken by
- * selector_len (longer = more specific).  The winning rule is copied by value
- * into @p rule so the caller does not need to hold any snapshot reference.
+ * @details Considers every rule: highest rank wins, then the longer selector text, then
+ * (strict comparisons) the earlier rule. The winner is copied by value, so the caller
+ * holds no reference into a snapshot.
  *
- * @param rules       Rule array to scan.
- * @param rule_count  Number of valid entries.
- * @param effect      Effect category to filter by.
+ * @param rules       Rule array.
+ * @param rule_count  Valid entries.
+ * @param effect      Effect to match.
  * @param domain      LOOKUP or REVERSE.
- * @param name        Hostname or IP string.
- * @param rule        Output for the winning rule.
- * @return  Non-zero if a match was found; zero otherwise.
+ * @param name        Host name or address text.
+ * @param rule        Output: the winning rule.
+ * @return  Non-zero if a rule matched; zero otherwise.
  */
 static int chaos_dns_config_select_rule_domain(
     const chaos_dns_rule_t *rules,
@@ -1642,7 +1594,7 @@ static int chaos_dns_config_select_rule_domain(
 }
 
 /**
- * @brief Select the best forward-lookup rule.  See chaos_dns_config.h.
+ * @brief Best forward-lookup rule (contract in chaos_dns_config.h).
  */
 int chaos_dns_config_select_rule(
     const chaos_dns_rule_t *rules,
@@ -1658,7 +1610,7 @@ int chaos_dns_config_select_rule(
 }
 
 /**
- * @brief Select the best reverse-lookup rule.  See chaos_dns_config.h.
+ * @brief Best reverse-lookup rule (contract in chaos_dns_config.h).
  */
 int chaos_dns_config_select_reverse_rule(
     const chaos_dns_rule_t *rules,
@@ -1674,12 +1626,12 @@ int chaos_dns_config_select_reverse_rule(
 }
 
 /**
- * @brief Marks @p state as the result of a rule file that cannot be used as a whole.
+ * @brief Publishes @p state as "file rejected as a whole" with @p reason.
  *
- * @details A file at or over the size limit, or one this process may not open
- * (EACCES) or read (a directory), stays so until it changes, unlike a read that
- * failed or met a concurrent writer: it is reported like a rejected file (no
- * rules, state=error) and not re-read until the file changes.
+ * @details For conditions that persist until the file changes: too large (TOO_LARGE),
+ * not openable (EACCES/EPERM) or a directory (UNREADABLE), a NUL byte (NUL). Unlike a
+ * transient read failure the file is not re-read on every look: the snapshot has no
+ * rules, the status file says state=error, and the next stamp change retries.
  */
 static void chaos_dns_config_reject_file(chaos_dns_config_state_t *state, const char *reason)
 {
@@ -1689,13 +1641,15 @@ static void chaos_dns_config_reject_file(chaos_dns_config_state_t *state, const 
 }
 
 /**
- * @brief Reports this process's hit counts after a hit on @p slot (NULL: at exit).
+ * @brief Writes this process's hit counts after a hit on @p slot (NULL: forced, at exit
+ *        or after an idle interval).
  *
- * @details Writes the hits file on each of the first CHAOS_HITS_EAGER hits, then at
- * most every CHAOS_HITS_INTERVAL_MS; the exit report covers the rest. One thread
- * writes at a time: a hit that finds the writer busy leaves `pending` set, and the
- * writer repeats the write before it lets go. A forked child inherits the parent's
- * counts; they are cleared at the child's first hit so no hit is reported twice.
+ * @details Rate: each of the first CHAOS_HITS_EAGER (64) hits, then at most every
+ * CHAOS_HITS_INTERVAL_MS (100 ms); a NULL call writes whatever is pending. One writer at
+ * a time, chosen by CAS, never by waiting (a signal handler may hit while this thread
+ * writes): a hit that finds the writer busy leaves `pending` set, and the writer loops
+ * until nothing is pending. Only the pid the counts belong to writes, which keeps a
+ * vfork() child, sharing this memory, out. A fork() child starts from zero (atfork).
  */
 static void chaos_dns_config_report_hits(chaos_hit_slot_t *slot)
 {
@@ -1709,8 +1663,8 @@ static void chaos_dns_config_report_hits(chaos_hit_slot_t *slot)
         {
             g_chaos_dns_hits_pending = 1;
         }
-        /* Past the eager hits and inside the interval there is nothing to write:
-         * no system call, no shared write beyond the counters. */
+        /* Past the eager phase and inside the interval: counters only, no system
+         * call. */
         if (g_chaos_dns_hits_total > CHAOS_HITS_EAGER &&
             now - g_chaos_dns_hits_last_ms < CHAOS_HITS_INTERVAL_MS)
         {
@@ -1753,18 +1707,19 @@ static void chaos_dns_config_report_hits(chaos_hit_slot_t *slot)
         g_chaos_dns_hits_last_ms = now;
         __sync_lock_release(&g_chaos_dns_hits_writing);
         __sync_synchronize();
-        /* A hit that found the writer busy after its last check is written now. */
+        /* A hit that found the writer busy after the last check is written now. */
     } while (g_chaos_dns_hits_pending != 0);
 }
 
 /**
- * @brief Child side of fork(): forgets what threads of the parent were doing.
+ * @brief fork() child handler: drops the state of parent threads that do not exist here.
  *
- * @details Registered with pthread_atfork(). The thread that held a reload claim,
- * the hits writer flag or a REGRESS decision does not exist in the child, so those
- * are released; counts and @first claims start from zero for the new process, and
- * its hits file is its own. vfork children and posix_spawn run no atfork handler:
- * they share the parent's memory, see its claims as busy and write nothing.
+ * @details Registered with pthread_atfork() by chaos_dns_config_init(). A reload claim
+ * held at the fork reverts to CHAOS_DNS_MTIME_UNKNOWN (the next call reloads), the hits
+ * writer flag is cleared, counts restart at zero for the child's pid and hits file, the
+ * PRNG is reseeded on its next draw, and @first claims restart
+ * (chaos_hits_pool_after_fork()). vfork() children and posix_spawn run no handler: they
+ * share the parent's memory, see its claims as busy and write nothing.
  */
 static void chaos_dns_config_after_fork(void)
 {
@@ -1779,8 +1734,8 @@ static void chaos_dns_config_after_fork(void)
     g_chaos_dns_hits_pid = (uint64_t)getpid();
     g_chaos_dns_hits_file = chaos_hits_file_number(CHAOS_DNS_HITS_PREFIX);
     g_chaos_dns_hits_owned = 0;
-    /* The child must not draw the parent's numbers (pre-fork workers would all
-     * decide alike): its PRNG reseeds from its own thread id on the next draw. */
+    /* The child must not draw the parent's numbers (pre-fork workers would all decide
+     * alike): its PRNG reseeds from its own thread id on the next draw. */
     g_chaos_dns_tls_prng_state = 0U;
     chaos_hits_pool_after_fork(
         g_chaos_dns_hit_pool,
@@ -1790,18 +1745,18 @@ static void chaos_dns_config_after_fork(void)
     );
 }
 
-/** @brief Reports the hits not yet written when the process exits normally. */
+/** @brief Writes pending hit counts at normal exit (exit() or return from main). */
 __attribute__((destructor)) static void chaos_dns_config_report_hits_at_exit(void)
 {
     chaos_dns_config_report_hits(NULL);
 }
 
 /**
- * @brief Gives each rule of a freshly parsed snapshot its counter and text.
+ * @brief Gives each rule of a freshly parsed snapshot its text, hit slot and generation.
  *
- * @details A rule whose text is unchanged from the active snapshot keeps its slot
- * (chaos_hits_assign()), so adding one rule does not reset the counts of the
- * others and a firing through an older rule copy still lands.
+ * @details A rule whose text equals one in the active snapshot keeps that rule's slot
+ * (chaos_hits_assign()), so adding a rule does not reset the others' counts, and a firing
+ * through a rule copy taken before the reload still lands on the right counter.
  */
 static void chaos_dns_config_attach_hits(chaos_dns_config_state_t *next_state)
 {
@@ -1836,10 +1791,11 @@ static void chaos_dns_config_attach_hits(chaos_dns_config_state_t *next_state)
 }
 
 /**
- * @brief Writes the status file for a load that produced @p state.
+ * @brief Writes the status file for the load that produced @p state.
  *
- * @details Called by the reload owner before the snapshot is published. No rule
- * file means nothing to report, so the status file is removed.
+ * @details Called by the reload owner before publishing. No rule file: the status file
+ * is removed. Rejected file: state=error with line and reason. Otherwise state=ok with
+ * the rule count.
  */
 static void chaos_dns_config_report(uint64_t observed_mtime, const chaos_dns_config_state_t *state)
 {
@@ -1859,20 +1815,21 @@ static void chaos_dns_config_report(uint64_t observed_mtime, const chaos_dns_con
     }
 }
 
-/** @brief When this process last looked at the rule file (vDSO CLOCK_MONOTONIC, ns). */
+/** @brief Last look at the rule file (vDSO CLOCK_MONOTONIC, ns); see chaos_clock.h. */
 static volatile uint64_t g_chaos_dns_last_check_ns = 0U;
 
-/** @brief Throttle for looking at the rule file; 0 looks on every call (unit tests). */
+/** @brief Look throttle in ns: CHAOS_CHECK_INTERVAL_NS (1 ms); unit tests set 0 (every call). */
 static uint64_t g_chaos_dns_check_interval_ns = CHAOS_CHECK_INTERVAL_NS;
 
 /**
  * @brief Whether the rule file was looked at too recently to look again.
  *
- * @details Each look is a stat() system call, the largest part of a wrapper's cost.
- * Once rules are loaded the file is looked at no more than every
- * CHAOS_CHECK_INTERVAL_NS, so a change takes effect within that time instead of on
- * the very next call. The first load, and any call while no rules are loaded yet,
- * always looks.
+ * @details A look is a stat(2), the largest part of a wrapper's cost. After the first
+ * completed load the file is looked at no more than once per CHAOS_CHECK_INTERVAL_NS
+ * (1 ms) per process, so a change takes effect within 1 ms instead of on the next call.
+ * Every call looks while no load has completed (UNKNOWN), while another thread holds the
+ * claim (RELOADING), and when no vDSO clock is available (chaos_clock_now_ns() returns 0).
+ * The timestamp is a plain word: two threads racing on it at worst both look.
  */
 static int chaos_dns_config_checked_recently(void)
 {
@@ -1886,18 +1843,14 @@ static int chaos_dns_config_checked_recently(void)
 }
 
 /**
- * @brief Check for file changes and reload if needed.  See chaos_dns_config.h.
+ * @brief Looks for a change of the rule file and reloads it if needed.
  *
- * @details The two-snapshot CAS protocol is:
- *   1. Stat the file, compute the mtime hash.
- *   2. Load the cached mtime with a fence.
- *   3. If equal, no reload needed — return immediately.
- *   4. CAS the cached mtime from `cached_mtime` to RELOADING.
- *      Only one thread succeeds; losers use the current active snapshot.
- *   5. Determine next_index = 1 - active_index.
- *   6. Reset next_state, attempt to read and parse into it.
- *   7. On parse failure, reset next_state to empty (fail-open).
- *   8. Publish: fence + store next_index + fence + store observed_mtime.
+ * @details The protocol and failure behaviour of the file header. Also flushes hits
+ * pending for longer than CHAOS_HITS_INTERVAL_MS, so a process that stopped hitting
+ * still reports its last hits. Every early return reports the active snapshot.
+ *
+ * @return  Non-zero if the snapshot active afterwards parsed and has at least one rule.
+ * @par errno: clobbered; see chaos_dns_config_prepare().
  */
 static int chaos_dns_config_refresh(void)
 {
@@ -1913,8 +1866,8 @@ static int chaos_dns_config_refresh(void)
     {
         return chaos_dns_config_active_state()->rule_count != 0U;
     }
-    /* Hits of an interval that is over are written now, not only at the next hit
-     * or at exit: a long-running process that stopped hitting reports them too. */
+    /* Hits of an interval that is over are written now, not only at the next hit or at
+     * exit: a long-running process that stopped hitting reports them too. */
     if (g_chaos_dns_hits_pending != 0 &&
         chaos_hits_now_ms() - g_chaos_dns_hits_last_ms >= CHAOS_HITS_INTERVAL_MS)
     {
@@ -1927,11 +1880,10 @@ static int chaos_dns_config_refresh(void)
     {
         return chaos_dns_config_active_state()->rule_count != 0U;
     }
-    /* Another thread owns this reload cycle; use the current snapshot.  Without this
-     * check the CAS below succeeds as RELOADING -> RELOADING and a second thread would
-     * reload into the same inactive snapshot and read buffer concurrently. */
-    /* Another thread of this process owns the reload; a claim inherited through
-     * fork() was released by the atfork handler, and a vfork child must not take
+    /* Another thread of this process owns the reload: use the active snapshot. Without
+     * this check the CAS below would succeed as RELOADING -> RELOADING and two threads
+     * would fill the same inactive snapshot and read buffer. A claim inherited through
+     * fork() was already released by the atfork handler; a vfork child must not take
      * over its parent's. */
     if (cached_mtime == CHAOS_DNS_MTIME_RELOADING)
     {
@@ -1965,7 +1917,7 @@ static int chaos_dns_config_refresh(void)
         else if (read_rc != 0)
         {
             /* A failed read says nothing about the rules: keep the active snapshot and
-             * release the claim with the previous stamp, so the next call retries
+             * release the claim with the previous stamp, so the next look retries
              * instead of running with no rules until the file changes again. */
             __sync_synchronize();
             g_chaos_dns_cached_mtime = cached_mtime;
@@ -1976,8 +1928,8 @@ static int chaos_dns_config_refresh(void)
             content = chaos_config_content_hash(g_chaos_dns_config_buffer, config_size);
             if (observed_mtime == cached_mtime && content == g_chaos_dns_config_content)
             {
-                /* A provisional load read again and found nothing new: the snapshot
-                 * stays, with its counts, claims and FAIL_AFTER counters. */
+                /* A provisional load re-read and found the same bytes: the snapshot
+                 * stays, with its hit counts and @first claims. */
                 __sync_synchronize();
                 g_chaos_dns_cached_mtime = cached_mtime;
                 return chaos_dns_config_active_state()->rule_count != 0U;
@@ -1985,7 +1937,7 @@ static int chaos_dns_config_refresh(void)
         }
         if (config_size > 0U && memchr(g_chaos_dns_config_buffer, '\0', config_size) != NULL)
         {
-            /* The parser would stop at the NUL and drop every rule after it unreported. */
+            /* The parser would stop at the NUL and drop every later rule unreported. */
             chaos_dns_config_reject_file(next_state, CHAOS_STATUS_REASON_NUL);
             config_size = 0U;
         }
@@ -1994,7 +1946,7 @@ static int chaos_dns_config_refresh(void)
                 g_chaos_dns_config_buffer, next_state->rules, &next_state->rule_count
             ) != 0)
         {
-            /* Parse failed: mark the snapshot invalid so match queries return 0. */
+            /* Rejected: parse_ok = 0, so this snapshot never matches. */
             chaos_dns_config_reset_state(next_state, 0);
         }
     }
@@ -2002,8 +1954,8 @@ static int chaos_dns_config_refresh(void)
     g_chaos_dns_config_content = content;
     chaos_dns_config_attach_hits(next_state);
     chaos_dns_config_report(observed_mtime, next_state);
-    /* Slots of rules that leave with this load: freed, and outdated in rule copies
-     * still held. Before the publish, while this thread still holds the claim. */
+    /* Slots of rules that leave with this load are freed and marked outdated for rule
+     * copies still held. Done before the publish, while this thread holds the claim. */
     chaos_hits_release(
         g_chaos_dns_hit_pool,
         sizeof(g_chaos_dns_hit_pool) / sizeof(g_chaos_dns_hit_pool[0]),
@@ -2015,11 +1967,11 @@ static int chaos_dns_config_refresh(void)
 }
 
 /**
- * @brief Refreshes the snapshot if the config file changed, leaving errno untouched.
+ * @brief Reloads the rule file if it changed, preserving errno.
  *
- * @details The stat, open and read calls of a refresh belong to the library, not to
- * the caller: an interposed call that then succeeds must not report the errno of a
- * missing config file.
+ * @details The stat, openat, read and status-file calls of a reload belong to the
+ * library: a wrapped call that then succeeds must not report, say, the ENOENT of a
+ * missing rule file.
  */
 int chaos_dns_config_prepare(void)
 {
@@ -2031,7 +1983,7 @@ int chaos_dns_config_prepare(void)
 }
 
 /**
- * @brief Match against the active snapshot (forward lookup).  See chaos_dns_config.h.
+ * @brief Forward match in the active snapshot, seqlock-validated (contract in the header).
  */
 int chaos_dns_config_match_loaded(
     chaos_dns_effect_t effect, const char *name, chaos_dns_rule_t *rule
@@ -2050,7 +2002,7 @@ int chaos_dns_config_match_loaded(
 }
 
 /**
- * @brief Match against the active snapshot (reverse lookup).  See chaos_dns_config.h.
+ * @brief Reverse match in the active snapshot, seqlock-validated (contract in the header).
  */
 int chaos_dns_config_match_reverse_loaded(
     chaos_dns_effect_t effect, const char *address, chaos_dns_rule_t *rule
@@ -2071,7 +2023,7 @@ int chaos_dns_config_match_reverse_loaded(
 }
 
 /**
- * @brief Prepare then match (forward lookup).  See chaos_dns_config.h.
+ * @brief Prepare, then forward match (contract in chaos_dns_config.h).
  */
 int chaos_dns_config_match(chaos_dns_effect_t effect, const char *name, chaos_dns_rule_t *rule)
 {
@@ -2084,7 +2036,7 @@ int chaos_dns_config_match(chaos_dns_effect_t effect, const char *name, chaos_dn
 }
 
 /**
- * @brief Prepare then match (reverse lookup).  See chaos_dns_config.h.
+ * @brief Prepare, then reverse match (contract in chaos_dns_config.h).
  */
 int chaos_dns_config_match_reverse(
     chaos_dns_effect_t effect, const char *address, chaos_dns_rule_t *rule

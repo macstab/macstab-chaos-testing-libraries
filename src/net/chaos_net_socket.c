@@ -1,59 +1,52 @@
 /**
  * @file chaos_net_socket.c
- * @brief LD_PRELOAD interposition wrappers for connection-lifecycle and I/O socket syscalls.
+ * @brief Wrappers for the connection lifecycle, send, receive and the generic descriptor
+ *        calls on sockets (read, write, readv, writev, close).
  *
  * @details
- * This file provides the exported interposition symbols for:
- *   - Connection lifecycle: bind, listen, connect, accept, accept4 (Linux).
- *   - Send path: send, sendto, sendmsg.
- *   - Receive path: recv, recvfrom, recvmsg.
+ * Exported wrappers: bind, listen, connect, accept, accept4 (Linux); send, sendto,
+ * sendmsg; recv, recvfrom, recvmsg; read, readv, write, writev, close; and on glibc the
+ * fortified __recv_chk, __recvfrom_chk, __read_chk, __poll_chk, __ppoll_chk.
  *
- * Each wrapper follows an identical three-phase pattern:
- *   1. **Guard check**: if chaos_net_in_internal() is non-zero, the call originated
- *      from within libchaos-net itself (e.g., getsockname called during endpoint
- *      resolution). Fast-path directly to the real symbol.
- *   2. **Endpoint resolution**: translate the syscall arguments (sockaddr parameter
- *      or fd-based getsockname/getpeername) into a chaos_net_endpoint_t. If
- *      resolution fails (unsupported socket type, abstract UNIX path, etc.), the
- *      call is passed through without injection.
- *   3. **Rule matching and effect application**: look up the config rule for
- *      (operation, endpoint). Apply pre-call effects (latency, errno-injection)
- *      before the real call; apply post-call effects (corruption) after.
- *
- * @par accept / accept4 endpoint direction:
- * For accept and accept4, the sockaddr parameter is an *output* — it is filled in
- * by the kernel after the call and is uninitialised before it. Using the sockaddr
- * from the argument as a selector would read uninitialised memory. Instead, the
- * listening socket's local address (obtained via getsockname on @p sockfd) is used
- * as the matching endpoint. This is consistent with user intent: a rule saying
- * "inject on accept for port 8080" refers to the listening port, not the ephemeral
- * client port that only becomes known after the call.
- *
- * @par read() and write():
- * read, write, readv, writev and close are interposed too, and follow the recv,
- * send and close rules on sockets only; on anything else they are forwarded. On a
- * socket libchaos-io leaves them alone (its `*` rule matches files only).
+ * Every wrapper follows the same shape:
+ *   1. chaos_net_ensure_symbols(), then the guard: a call from inside the library goes
+ *      straight to the real function.
+ *   2. Resolve the endpoint (sockaddr argument, getsockname, getpeername). A call whose
+ *      endpoint does not resolve (not a socket, unsupported family or type) is forwarded
+ *      untouched.
+ *   3. Match the active snapshot; apply pre-call effects (LATENCY, ERRNO), make the real
+ *      call, apply post-call effects (CORRUPT; DUP and TRICKLE reshape the receive).
+ * While no rule is active, step 2 is skipped for the connected-socket and descriptor
+ * paths, so an idle library costs one throttled check per call.
  *
  * @par Which end a rule names:
- * A rule names an address. On a connected socket a client's rule names its server
- * (the peer), a server's rule its own port (the local end), so send and receive
- * rules are matched on either end (chaos_net_match_connected()): receives try the
- * local end first, sends the peer.
+ *   A rule names an address. On a connected socket a client's rule names its server (the
+ *   peer), a server's rule its own port (the local end), so send and receive rules match
+ *   either end (chaos_net_match_connected()); on equal specificity receives prefer the
+ *   local end, sends the peer. sendto/sendmsg with a destination match that address only.
  *
- * @par Receive-side CORRUPT application:
- * Corruption is applied only when:
- *   - The real recv call returned a positive byte count (rc > 0).
- *   - The matched rule has effect == CORRUPT.
- *   - chaos_net_rule_should_trigger() fires (probability check).
- * Applying corruption to a return value of 0 (EOF) or -1 (error) is meaningless
- * and could write past the actual data in the buffer.
+ * @par accept / accept4:
+ *   Their sockaddr is an output, uninitialised before the call; the endpoint is the
+ *   listening socket's local address, i.e. the server's port.
  *
- * @par sendto / sendmsg endpoint resolution:
- * These functions carry an optional explicit destination address. When present
- * (address_ptr != NULL for sendto, message->msg_name != NULL for sendmsg), the
- * destination address is used as the endpoint. When absent (connected-mode send),
- * getpeername is used to resolve the peer address. This matches how applications
- * use these calls: datagram sends include the destination; stream sends do not.
+ * @par read, write and close:
+ *   Also wrapped by libchaos-io. Each library acts only on its own kind of descriptor
+ *   (here: sockets, recognised by a successful endpoint lookup) and always forwards to
+ *   the next definition (RTLD_NEXT), so every library sees every call in either preload
+ *   order. read/readv count as `recv`, write/writev as `send`.
+ *
+ * @par Post-call bounds:
+ *   CORRUPT touches only bytes the kernel actually wrote: chaos_net_received_bytes() caps
+ *   a MSG_TRUNC datagram length at the buffer and treats a MSG_TRUNC stream receive (which
+ *   discards data) as writing nothing. DUP bypasses MSG_TRUNC receives altogether.
+ *
+ * @par Fork:
+ *   The DUP slot table survives fork(); an atfork handler releases slot locks held by
+ *   parent threads. vfork() children share the table and run no handler.
+ *
+ * @par Test seams:
+ *   CHAOS_NET_DUP_MAP/UNMAP, CHAOS_NET_DUP_BEFORE_TAG, CHAOS_NET_DUP_SOCKET,
+ *   CHAOS_NET_SOCKET_TYPE, g_chaos_net_chk_fail.
  *
  * @par Module: chaos-net
  * @par Stability: private / internal
@@ -72,23 +65,16 @@
 #include <sys/syscall.h>
 
 /**
- * @brief Flips one bit in a scattered I/O vector using pre-drawn PRNG samples.
+ * @brief Flips one bit of a scatter list, treating its first @p size bytes as one buffer.
  *
- * @details Treats the iovec array as a logically contiguous buffer of @p size bytes
- * and selects the target byte by walking through segments until the cumulative
- * offset equals `index_sample % size`. The bit within the byte is selected by
- * `bit_sample & 7`. This is the recvmsg counterpart of chaos_net_corrupt_buffer():
- * the caller's data lives in multiple disjoint segments and cannot be corrupted
- * with a single pointer + offset.
+ * @details The byte is `index_sample % size` over the concatenated segments, the bit
+ * `bit_sample & 7`; the segment holding that byte is found by walking the list. The
+ * vector counterpart of chaos_net_corrupt_buffer(), for recvmsg and readv.
  *
- * Only one bit is flipped across the entire scatter, consistent with the flat-buffer
- * contract in chaos_net_actions.h. After the bit is flipped, the function returns
- * immediately without examining further segments.
- *
- * @param iov     Scatter array describing the receive buffers.
- * @param iovcnt  Number of entries in @p iov. Must be > 0.
- * @param size    Total byte count to consider (typically the recvmsg return value).
- *                Must be > 0 and <= the sum of iov_len values.
+ * @param iov     Scatter list the kernel filled; NULL is a no-op.
+ * @param iovcnt  Entries in @p iov; <= 0 is a no-op.
+ * @param size    Bytes received, already capped at the vector's capacity; 0 is a no-op.
+ * @par Thread-safety: advances the calling thread's PRNG by two steps.
  */
 static void chaos_net_corrupt_iovecs(const struct iovec *iov, int iovcnt, size_t size)
 {
@@ -116,7 +102,7 @@ static void chaos_net_corrupt_iovecs(const struct iovec *iov, int iovcnt, size_t
         }
         if (index < segment_len)
         {
-            /* The target byte falls within this segment. */
+            /* The target byte is in this segment. */
             chaos_net_corrupt_buffer_sample(
                 iov[entry].iov_base, segment_len, (uint32_t)index, bit_sample
             );
@@ -125,7 +111,7 @@ static void chaos_net_corrupt_iovecs(const struct iovec *iov, int iovcnt, size_t
 
         if (segment_len > 0U)
         {
-            /* Advance past this segment and continue searching. */
+            /* Step past this segment. */
             index -= segment_len;
             remaining -= segment_len;
         }
@@ -133,17 +119,17 @@ static void chaos_net_corrupt_iovecs(const struct iovec *iov, int iovcnt, size_t
 }
 
 /*---------------------------------------------------------------------------
- * Real-symbol call wrappers
+ * Calls to the real functions
  *
- * These wrappers set the reentrancy guard, invoke the real symbol, and restore
- * the guard. A pointer that is still NULL (a call that arrives while the symbols
- * are being resolved) is served by the system call itself. They exist to centralise the guard
- *management so that the interposition wrappers themselves read clearly without guard boilerplate on
- *every call site.
+ * Each helper sets the reentrancy guard, calls the real function and restores the
+ * guard, so the wrappers stay free of guard boilerplate. A pointer still NULL (a call
+ * that arrives during symbol resolution: a signal handler, or an allocator doing I/O
+ * inside dlsym) is served by the system call itself. amd64 and arm64 lack send, recv
+ * and (arm64) several wait calls, so those fall back to their general forms.
  *---------------------------------------------------------------------------*/
 
 /**
- * @brief Calls the real bind(2) with reentrancy guard set.
+ * @brief Calls the real bind(2) with the guard set; SYS_bind before resolution.
  */
 static int
 chaos_net_call_real_bind(int sockfd, const struct sockaddr *address, socklen_t address_length)
@@ -153,9 +139,9 @@ chaos_net_call_real_bind(int sockfd, const struct sockaddr *address, socklen_t a
 
     if (g_chaos_net_real_bind == NULL)
     {
-        /* Not resolved yet: a call from inside the symbol lookup (a signal handler,
-         * or an allocator that does I/O while dlsym runs). The system call does
-         * what libc would. */
+        /* Not resolved yet: a call from inside the symbol lookup (a signal handler, or
+         * an allocator that does I/O while dlsym runs). The system call does what libc
+         * would. */
         return (int)syscall(SYS_bind, sockfd, address, address_length);
     }
     previous = chaos_net_enter_internal();
@@ -165,7 +151,7 @@ chaos_net_call_real_bind(int sockfd, const struct sockaddr *address, socklen_t a
 }
 
 /**
- * @brief Calls the real listen(2) with reentrancy guard set.
+ * @brief Calls the real listen(2) with the guard set; SYS_listen before resolution.
  */
 static int chaos_net_call_real_listen(int sockfd, int backlog)
 {
@@ -183,7 +169,7 @@ static int chaos_net_call_real_listen(int sockfd, int backlog)
 }
 
 /**
- * @brief Calls the real connect(2) with reentrancy guard set.
+ * @brief Calls the real connect(2) with the guard set; SYS_connect before resolution.
  */
 static int
 chaos_net_call_real_connect(int sockfd, const struct sockaddr *address, socklen_t address_length)
@@ -202,7 +188,7 @@ chaos_net_call_real_connect(int sockfd, const struct sockaddr *address, socklen_
 }
 
 /**
- * @brief Calls the real accept(2) with reentrancy guard set.
+ * @brief Calls the real accept(2) with the guard set; SYS_accept before resolution.
  */
 static int
 chaos_net_call_real_accept(int sockfd, struct sockaddr *address, socklen_t *address_length)
@@ -222,7 +208,7 @@ chaos_net_call_real_accept(int sockfd, struct sockaddr *address, socklen_t *addr
 
 #ifdef __linux__
 /**
- * @brief Calls the real accept4(2) with reentrancy guard set (Linux only).
+ * @brief Calls the real accept4(2) with the guard set; SYS_accept4 before resolution.
  */
 static int chaos_net_call_real_accept4(
     int sockfd, struct sockaddr *address, socklen_t *address_length, int flags
@@ -243,7 +229,7 @@ static int chaos_net_call_real_accept4(
 #endif
 
 /**
- * @brief Calls the real send(2) with reentrancy guard set.
+ * @brief Calls the real send(2) with the guard set; SYS_sendto before resolution.
  */
 static ssize_t chaos_net_call_real_send(int sockfd, const void *buffer, size_t size, int flags)
 {
@@ -262,7 +248,7 @@ static ssize_t chaos_net_call_real_send(int sockfd, const void *buffer, size_t s
 }
 
 /**
- * @brief Calls the real sendto(2) with reentrancy guard set.
+ * @brief Calls the real sendto(2) with the guard set; SYS_sendto before resolution.
  */
 static ssize_t chaos_net_call_real_sendto(
     int sockfd,
@@ -287,7 +273,7 @@ static ssize_t chaos_net_call_real_sendto(
 }
 
 /**
- * @brief Calls the real sendmsg(2) with reentrancy guard set.
+ * @brief Calls the real sendmsg(2) with the guard set; SYS_sendmsg before resolution.
  */
 static ssize_t chaos_net_call_real_sendmsg(int sockfd, const struct msghdr *message, int flags)
 {
@@ -305,7 +291,7 @@ static ssize_t chaos_net_call_real_sendmsg(int sockfd, const struct msghdr *mess
 }
 
 /**
- * @brief Calls the real recv(2) with reentrancy guard set.
+ * @brief Calls the real recv(2) with the guard set; SYS_recvfrom before resolution.
  */
 static ssize_t chaos_net_call_real_recv(int sockfd, void *buffer, size_t size, int flags)
 {
@@ -324,7 +310,7 @@ static ssize_t chaos_net_call_real_recv(int sockfd, void *buffer, size_t size, i
 }
 
 /**
- * @brief Calls the real recvfrom(2) with reentrancy guard set.
+ * @brief Calls the real recvfrom(2) with the guard set; SYS_recvfrom before resolution.
  */
 static ssize_t chaos_net_call_real_recvfrom(
     int sockfd,
@@ -349,7 +335,7 @@ static ssize_t chaos_net_call_real_recvfrom(
 }
 
 /**
- * @brief Calls the real recvmsg(2) with reentrancy guard set.
+ * @brief Calls the real recvmsg(2) with the guard set; SYS_recvmsg before resolution.
  */
 static ssize_t chaos_net_call_real_recvmsg(int sockfd, struct msghdr *message, int flags)
 {
@@ -367,22 +353,18 @@ static ssize_t chaos_net_call_real_recvmsg(int sockfd, struct msghdr *message, i
 }
 
 /*---------------------------------------------------------------------------
- * Pre-call effect dispatcher
+ * Pre-call effects
  *---------------------------------------------------------------------------*/
 
 /**
- * @brief Applies pre-call effects (latency or errno injection) for connection-lifecycle
- *        and send operations.
+ * @brief Applies the pre-call effects LATENCY and ERRNO.
  *
- * @details Returns -1 if the call should be intercepted and the real syscall skipped
- * (errno injection fired). Returns 0 if the real syscall should proceed (either a
- * latency was applied and we continue, or the errno injection did not fire).
+ * @details Used by every wrapper whose operation has no post-call effect: bind, listen,
+ * connect, accept, accept4, send, sendto, sendmsg, write, writev. Any other effect is
+ * ignored here.
  *
- * This dispatcher is used by bind, listen, connect, accept, accept4, send, sendto,
- * sendmsg. It does NOT handle CORRUPT (post-call only) or TIMEOUT (poll-family only).
- *
- * @param rule  Matched rule; may be NULL (returns 0 immediately).
- * @return 0 to proceed with the real call; -1 to return immediately (errno set).
+ * @param rule  Matched rule copy; NULL yields 0.
+ * @return 0 to make the real call (after any delay); -1 to return -1 at once, errno set.
  */
 static int chaos_net_apply_pre_call_rule(const chaos_net_rule_t *rule)
 {
@@ -403,17 +385,15 @@ static int chaos_net_apply_pre_call_rule(const chaos_net_rule_t *rule)
 }
 
 /*---------------------------------------------------------------------------
- * Interposed symbols
+ * Wrappers: connection lifecycle and send
  *---------------------------------------------------------------------------*/
 
 /**
- * @brief Interposed bind(2).
+ * @brief bind(2) wrapper: BIND rules on the address being bound.
  *
- * @details Endpoint is derived from the caller-provided sockaddr + socket type.
- * If the endpoint cannot be resolved (e.g., unsupported address family) or no
- * rule matches, the call is forwarded to the real bind without modification.
- * The CHAOS_NET_CONST_SOCKADDR_PARAM / CHAOS_NET_CONST_SOCKADDR_VALUE macros
- * handle the glibc sockaddr union ABI on the parameter.
+ * @details Endpoint from the sockaddr argument plus SO_TYPE. Unresolvable endpoint or no
+ * matching rule: forwarded unchanged. The CHAOS_NET_*SOCKADDR* macros absorb glibc's
+ * transparent-union parameter.
  */
 CHAOS_NET_EXPORT int
 bind(int sockfd, CHAOS_NET_CONST_SOCKADDR_PARAM address, socklen_t address_length)
@@ -439,12 +419,10 @@ bind(int sockfd, CHAOS_NET_CONST_SOCKADDR_PARAM address, socklen_t address_lengt
 }
 
 /**
- * @brief Interposed listen(2).
+ * @brief listen(2) wrapper: LISTEN rules on the socket's bound address.
  *
- * @details Endpoint is derived from the local address of the listening socket
- * (getsockname). The sockaddr is an input parameter to listen() only implicitly:
- * it was set by a prior bind(). Using getsockname here is consistent with how
- * users write config rules: "listen on port 8080" refers to the bound address.
+ * @details listen() has no address argument; getsockname reports what bind() set, which
+ * is what a rule for "the server on port 8080" names.
  */
 CHAOS_NET_EXPORT int listen(int sockfd, int backlog)
 {
@@ -467,11 +445,11 @@ CHAOS_NET_EXPORT int listen(int sockfd, int backlog)
 }
 
 /**
- * @brief Interposed connect(2).
+ * @brief connect(2) wrapper: CONNECT rules on the destination address.
  *
- * @details Endpoint is derived from the caller-provided destination address and
- * the socket's type (SO_TYPE). This allows rules to target connects to a specific
- * remote endpoint: `tcp4://10.0.0.1:6379 : connect : ECONNREFUSED : 1.0`.
+ * @details Endpoint from the destination sockaddr plus SO_TYPE, e.g.
+ * `tcp4://10.0.0.1:6379 : connect : ECONNREFUSED : 1.0`. An ERRNO firing never reaches
+ * the kernel: no SYN is sent and the socket stays unconnected.
  */
 CHAOS_NET_EXPORT int
 connect(int sockfd, CHAOS_NET_CONST_SOCKADDR_PARAM address, socklen_t address_length)
@@ -497,12 +475,10 @@ connect(int sockfd, CHAOS_NET_CONST_SOCKADDR_PARAM address, socklen_t address_le
 }
 
 /**
- * @brief Interposed accept(2).
+ * @brief accept(2) wrapper: ACCEPT rules on the listening socket's local address.
  *
- * @details The sockaddr output parameter is an OUTPUT filled by the kernel post-call;
- * it is uninitialised at entry. Endpoint is therefore derived from the listening
- * socket's local address (getsockname on sockfd), not from the sockaddr argument.
- * See the file-level comment for the full rationale.
+ * @details The sockaddr argument is an output, uninitialised on entry; the listening
+ * port is what a rule names. An ERRNO firing leaves the pending connection queued.
  */
 CHAOS_NET_EXPORT int accept(int sockfd, CHAOS_NET_SOCKADDR_PARAM address, socklen_t *address_length)
 {
@@ -527,12 +503,7 @@ CHAOS_NET_EXPORT int accept(int sockfd, CHAOS_NET_SOCKADDR_PARAM address, sockle
 
 #ifdef __linux__
 /**
- * @brief Interposed accept4(2) (Linux only).
- *
- * @details Same endpoint-direction rationale as accept(): the sockaddr is an output
- * parameter. The endpoint is resolved from getsockname on the listening socket.
- * The flags parameter (SOCK_CLOEXEC, SOCK_NONBLOCK) is forwarded to the real call
- * unchanged; fault injection does not affect the semantics of the returned fd.
+ * @brief accept4(2) wrapper (Linux): as accept(); @p flags is forwarded unchanged.
  */
 CHAOS_NET_EXPORT int
 accept4(int sockfd, CHAOS_NET_SOCKADDR_PARAM address, socklen_t *address_length, int flags)
@@ -558,21 +529,22 @@ accept4(int sockfd, CHAOS_NET_SOCKADDR_PARAM address, socklen_t *address_length,
 #endif
 
 /*---------------------------------------------------------------------------
- * DUP: duplicate delivery
+ * DUP: deliver a socket's previous payload once more
  *---------------------------------------------------------------------------*/
 
-/** @brief Sockets whose last payload is kept at the same time (by descriptor). */
+/** @brief Sockets whose last payload can be kept at once (slots indexed by fd % 64). */
 #define CHAOS_NET_DUP_SLOTS 64
 
-/** @brief Longest payload kept for replay; a longer one is replayed truncated. */
+/** @brief Longest kept payload in bytes; a longer stream payload is kept truncated. */
 #define CHAOS_NET_DUP_MAX_BYTES 4096U
 
 /**
  * @brief The last payload received on one socket, kept for a DUP rule.
  *
- * @details Slots are indexed by descriptor modulo CHAOS_NET_DUP_SLOTS and tagged
- * with the descriptor, so a collision drops the older socket's payload instead of
- * replaying it on the wrong socket.
+ * @details Slot `fd % CHAOS_NET_DUP_SLOTS`, tagged with the descriptor and the socket's
+ * identity (inode, device). A colliding descriptor overwrites the slot, so the older
+ * payload is lost rather than replayed on the wrong socket. `lock` is a try-lock: nobody
+ * waits for a slot.
  */
 typedef struct chaos_net_dup_slot
 {
@@ -587,11 +559,11 @@ typedef struct chaos_net_dup_slot
 } chaos_net_dup_slot_t;
 
 /**
- * @brief How the slot table is mapped and unmapped: raw system calls, so that
- *        libchaos-memory rules on mmap cannot decide whether net keeps a payload.
+ * @brief Maps and unmaps the slot table with raw system calls, so libchaos-memory rules
+ *        on mmap cannot decide whether libchaos-net keeps a payload.
  *
- * @details Unit tests define these before including this file to make the mapping
- * fail or lose the race to another thread.
+ * @details Test seam: unit tests define these before including this file to make the
+ * mapping fail or lose the publication race to another thread.
  */
 #ifndef CHAOS_NET_DUP_MAP
 #ifdef __linux__
@@ -608,22 +580,22 @@ typedef struct chaos_net_dup_slot
 #endif
 
 /**
- * @brief Runs between a store's close check and its tag; does nothing in the library.
+ * @brief Hook between a store's close check and its tag; a no-op in the library.
  *
- * @details Unit tests define it before including this file to close the descriptor
- * exactly there, the window a concurrent close() can hit.
+ * @details Test seam: unit tests define it to close the descriptor exactly there, the
+ * window a concurrent close() can hit.
  */
 #ifndef CHAOS_NET_DUP_BEFORE_TAG
 #define CHAOS_NET_DUP_BEFORE_TAG(fd) ((void)(fd))
 #endif
 
 /**
- * @brief Identity of the socket behind @p fd (its inode and device); 0 when unknown.
+ * @brief Identity of the socket behind @p fd: inode XOR (device << 32); 0 if unknown.
  *
- * @details A descriptor number outlives its socket when it is closed or replaced
- * where net does not see it (dup2(), fclose() of an fdopen() stream, a raw close):
- * a payload is replayed only on the socket it came from. Unit tests define
- * CHAOS_NET_DUP_SOCKET before including this file.
+ * @details A descriptor number outlives its socket when it is closed or replaced where
+ * libchaos-net does not see it (dup2(), fclose() of an fdopen() stream, a raw close
+ * system call); the identity keeps a payload from replaying on a different socket that
+ * reuses the number. errno is preserved. Test seam: CHAOS_NET_DUP_SOCKET.
  */
 #ifndef CHAOS_NET_DUP_SOCKET
 static uint64_t chaos_net_dup_socket(int fd)
@@ -644,14 +616,14 @@ static uint64_t chaos_net_dup_socket(int fd)
 
 static int chaos_net_is_stream(int fd);
 
-/** @brief The slot table, mapped on the first DUP rule; NULL before (or if mapping failed). */
+/** @brief The slot table, mapped at the first DUP receive; NULL before, or if mmap failed. */
 static chaos_net_dup_slot_t *volatile g_chaos_net_dup_slots = NULL;
 
 /**
- * @brief Releases, in a fork() child, the slot locks other threads held at the fork.
+ * @brief fork() child handler: releases slot locks held by parent threads.
  *
- * @details Those threads do not exist in the child: without this their slots would
- * never replay there. A vfork child shares the table and runs no atfork handler.
+ * @details Those threads do not exist in the child; a lock they held would make its slot
+ * skip DUP forever there. A vfork() child shares the table and runs no handler.
  */
 static void chaos_net_dup_after_fork(void)
 {
@@ -665,10 +637,14 @@ static void chaos_net_dup_after_fork(void)
 }
 
 /**
- * @brief Maps the slot table on first use with a raw system call.
+ * @brief The slot table, mapped on first use: 64 slots of about 4.2 KiB, about 267 KiB.
  *
- * @details A raw mmap, like the io fd cache: libchaos-memory interposes mmap and
- * its rules must not decide whether net can keep a payload.
+ * @details Raw mmap for the same reason as the libchaos-io fd cache: libchaos-memory
+ * wraps mmap, and its rules must not decide whether libchaos-net can keep a payload.
+ * Racing threads each map; the CAS loser unmaps its copy. The winner registers the
+ * atfork handler. errno is preserved.
+ *
+ * @return The table, or NULL if mmap failed (DUP then never replays).
  */
 static chaos_net_dup_slot_t *chaos_net_dup_table(void)
 {
@@ -703,13 +679,18 @@ static chaos_net_dup_slot_t *chaos_net_dup_table(void)
     }
     else
     {
-        /* Registered once, by the thread whose table is published. */
+        /* Registered once, by the thread whose table was published. */
         (void)pthread_atfork(NULL, NULL, chaos_net_dup_after_fork);
     }
     return g_chaos_net_dup_slots;
 }
 
-/** @brief Locks and returns the slot of @p fd, or NULL without a table. */
+/**
+ * @brief Try-locks the slot of @p fd; NULL if the table is absent or the slot is busy.
+ *
+ * @param create  Non-zero maps the table if needed (store path); 0 only uses an existing
+ *                one (replay path).
+ */
 static chaos_net_dup_slot_t *chaos_net_dup_lock(int fd, int create)
 {
     chaos_net_dup_slot_t *table = create ? chaos_net_dup_table() : g_chaos_net_dup_slots;
@@ -720,8 +701,8 @@ static chaos_net_dup_slot_t *chaos_net_dup_lock(int fd, int create)
         return NULL;
     }
     slot = &table[fd % CHAOS_NET_DUP_SLOTS];
-    /* Never wait: the holder may be this very thread, interrupted by a signal
-     * handler that receives or closes. A busy slot just skips DUP for this call. */
+    /* Never wait: the holder may be this very thread, interrupted by a signal handler
+     * that receives or closes. A busy slot skips DUP for this call. */
     if (__sync_lock_test_and_set(&slot->lock, 1) != 0)
     {
         return NULL;
@@ -736,9 +717,10 @@ static void chaos_net_dup_unlock(chaos_net_dup_slot_t *slot)
 }
 
 /**
- * @brief The close count of @p fd's slot, taken before a receive whose payload is kept.
+ * @brief Close count of @p fd's slot, read before a receive whose payload is kept.
  *
- * @details Maps the table if needed; 0 without one (nothing is kept then).
+ * @details Maps the table if needed; 0 without one (nothing is kept then). Compared
+ * again by chaos_net_dup_store() to detect a close during the receive.
  */
 static unsigned chaos_net_dup_generation(int fd)
 {
@@ -753,12 +735,14 @@ static unsigned chaos_net_dup_generation(int fd)
 }
 
 /**
- * @brief Keeps the @p received bytes just read into @p iov as @p fd's last payload.
+ * @brief Keeps the @p received bytes the receive wrote into @p iov as @p fd's last payload.
  *
  * @details @p generation is the slot's close count from before the receive. If a
- * descriptor in the slot was closed since (by another thread, while this one was
- * receiving), the number may already name a new socket: the payload is dropped
- * rather than replayed there.
+ * descriptor in this slot was closed since (another thread, while this one received), the
+ * number may already name a new socket, and the payload is dropped instead of being
+ * replayed there. A datagram longer than CHAOS_NET_DUP_MAX_BYTES is not kept: replayed
+ * cut, it would be a different message. A stream payload is kept up to that size. The
+ * datagram sender address is kept for recvfrom/recvmsg replays.
  */
 static void chaos_net_dup_store(
     int fd,
@@ -779,7 +763,7 @@ static void chaos_net_dup_store(
     {
         return;
     }
-    /* A datagram is one message: kept cut, it would replay as another one. */
+    /* A datagram is one message: kept cut, it would replay as a different one. */
     if ((size_t)received > CHAOS_NET_DUP_MAX_BYTES && !chaos_net_is_stream(fd))
     {
         return;
@@ -817,9 +801,9 @@ static void chaos_net_dup_store(
     }
     CHAOS_NET_DUP_BEFORE_TAG(fd);
     slot->fd = fd;
-    /* A close since the check above either saw the tag (and cleared it) or bumped
-     * the count before this re-check: then the payload is dropped. The slot lock is
-     * held, so only a close can write the tag meanwhile, and it writes -1 too. */
+    /* A close since the check above either saw the tag (and cleared it) or bumped the
+     * count before this re-check, which then drops the payload. The slot lock is held, so
+     * only a close can write the tag meanwhile, and it writes -1. */
     __sync_synchronize();
     if (slot->closes != generation)
     {
@@ -829,16 +813,18 @@ static void chaos_net_dup_store(
 }
 
 /**
- * @brief Delivers @p fd's last payload again when a DUP rule fires.
+ * @brief Delivers @p fd's kept payload again if the DUP rule fires.
  *
- * @details Each payload is replayed at most once: the slot is emptied, so the next
- * receive reads the socket again. The sender address is copied to @p name when the
- * caller asked for one.
+ * @details The payload must belong to this descriptor and to the same socket identity;
+ * a stale one is discarded. The rule is asked only when a payload exists, so a hit means
+ * a real duplicate. Each payload replays at most once (the slot is emptied), so the next
+ * receive reads the socket again. The sender address is copied into @p name, truncated
+ * to the caller's capacity, with the full length reported, as the kernel does.
  *
- * @param truncated  Output, may be NULL: 1 when the buffers held less than the
- *                   payload (a datagram's MSG_TRUNC).
- * @return Bytes delivered, or -1 when nothing was replayed (no payload kept, or the
- *         rule did not fire) and the caller must receive normally.
+ * @param truncated  Output, may be NULL: 1 when the buffers held less than the payload
+ *                   (recvmsg reports MSG_TRUNC for a datagram).
+ * @return Bytes delivered, or -1 when nothing was replayed (no payload, busy slot, rule
+ *         did not fire): the caller then receives normally.
  */
 static ssize_t chaos_net_dup_replay(
     const chaos_net_rule_t *rule,
@@ -903,7 +889,7 @@ static ssize_t chaos_net_dup_replay(
     return (ssize_t)delivered;
 }
 
-/** @brief Drops @p fd's kept payload; called when the descriptor is closed. */
+/** @brief Drops @p fd's kept payload; called by close() before the real close. */
 static void chaos_net_dup_forget(int fd)
 {
     chaos_net_dup_slot_t *table = g_chaos_net_dup_slots;
@@ -912,13 +898,13 @@ static void chaos_net_dup_forget(int fd)
     {
         return;
     }
-    /* Without the lock: close() must not wait. The count goes first, so a payload
-     * being stored for the closed descriptor right now is dropped by its writer. */
+    /* Lock-free: close() must not wait. The count goes first, so a store for this
+     * descriptor in progress right now drops its payload itself. */
     (void)__sync_fetch_and_add(&table[fd % CHAOS_NET_DUP_SLOTS].closes, 1U);
     (void)__sync_bool_compare_and_swap(&table[fd % CHAOS_NET_DUP_SLOTS].fd, fd, -1);
 }
 
-/** @brief Receive flags under which DUP receives for real (nothing is consumed or kept). */
+/** @brief Receive flags that bypass DUP (the call is made for real, nothing is kept). */
 #ifdef MSG_ERRQUEUE
 #define CHAOS_NET_DUP_SKIP_FLAGS (MSG_PEEK | MSG_TRUNC | MSG_OOB | MSG_WAITALL | MSG_ERRQUEUE)
 #else
@@ -928,11 +914,10 @@ static void chaos_net_dup_forget(int fd)
 /**
  * @brief Whether a receive of @p requested bytes with @p flags goes through DUP.
  *
- * @details Peeks consume nothing; MSG_TRUNC may report more than the buffer
- * holds; out-of-band and error-queue data is not the stream; MSG_WAITALL asks for
- * the whole buffer, which a kept payload shorter than it would not give, as with
- * TRICKLE. An empty buffer
- * is left alone too: a replay into it would return 0, which reads as EOF.
+ * @details Bypassed: MSG_PEEK (consumes nothing), MSG_TRUNC (may report more than the
+ * buffer holds), MSG_OOB and MSG_ERRQUEUE (not the data stream), MSG_WAITALL (asks for
+ * the whole buffer, which a shorter kept payload would not give). An empty or unknown-size
+ * request is bypassed too: a replay into it would return 0, which reads as EOF.
  */
 static int chaos_net_dups(const chaos_net_rule_t *rule, int flags, uint64_t requested)
 {
@@ -940,13 +925,14 @@ static int chaos_net_dups(const chaos_net_rule_t *rule, int flags, uint64_t requ
            requested != 0U && requested != CHAOS_POLICY_NO_SIZE;
 }
 
-/** @brief Largest iovec array a TRICKLE rule reshapes; longer ones are left alone. */
+/** @brief Longest iovec array TRICKLE reshapes (stack copy); longer arrays are left alone. */
 #define CHAOS_NET_TRICKLE_MAX_IOV 64
 
 /**
- * @brief The socket type of @p fd, asked with a raw system call; -1 when unknown.
+ * @brief SO_TYPE of @p fd via a raw getsockopt system call; -1 when unknown.
  *
- * @details Unit tests define CHAOS_NET_SOCKET_TYPE before including this file.
+ * @details Raw so that no wrapper sees it; errno is preserved. Test seam:
+ * CHAOS_NET_SOCKET_TYPE.
  */
 #ifndef CHAOS_NET_SOCKET_TYPE
 static int chaos_net_socket_type(int fd)
@@ -972,8 +958,8 @@ static int chaos_net_socket_type(int fd)
 /**
  * @brief Whether @p fd is a stream socket.
  *
- * @details TRICKLE only shortens receives on streams: on a datagram socket a
- * shorter buffer truncates the datagram and the kernel drops the rest.
+ * @details TRICKLE shortens only stream receives: on a datagram socket a shorter buffer
+ * truncates the datagram and the kernel discards the rest.
  */
 static int chaos_net_is_stream(int fd)
 {
@@ -981,11 +967,11 @@ static int chaos_net_is_stream(int fd)
 }
 
 /**
- * @brief Bytes of a @p size-byte buffer that a receive returning @p rc filled.
+ * @brief Bytes of a @p size-byte buffer that a receive returning @p rc actually filled.
  *
- * @details With MSG_TRUNC a datagram receive returns the datagram's full length,
- * which can exceed the buffer, and a stream receive discards the data without
- * writing the buffer at all. CORRUPT must stay inside what was written.
+ * @details With MSG_TRUNC, a datagram receive returns the full datagram length, which can
+ * exceed the buffer, and a stream receive discards the data without writing the buffer.
+ * CORRUPT must stay inside what was written.
  */
 static size_t chaos_net_received_bytes(int fd, ssize_t rc, size_t size, int flags)
 {
@@ -999,10 +985,10 @@ static size_t chaos_net_received_bytes(int fd, ssize_t rc, size_t size, int flag
 /**
  * @brief Whether a TRICKLE rule fires for a receive of @p requested bytes on @p fd.
  *
- * @details Only a stream socket and a request larger than the chunk are shortened,
- * so a call TRICKLE leaves alone is not counted as a hit. MSG_WAITALL asks for the
- * whole count, which the kernel delivers short only on a signal, an error or the
- * end of the stream: such a receive is left alone too.
+ * @details Only a stream socket and a request larger than the chunk are shortened, and
+ * the rule is asked last, so a call TRICKLE leaves alone is not counted as a hit.
+ * MSG_WAITALL asks for the whole count, which the kernel shortens only on a signal, an
+ * error or end of stream; such a receive is left alone too.
  */
 static int chaos_net_trickles(const chaos_net_rule_t *rule, int fd, uint64_t requested, int flags)
 {
@@ -1012,10 +998,10 @@ static int chaos_net_trickles(const chaos_net_rule_t *rule, int fd, uint64_t req
 }
 
 /**
- * @brief Copies @p iov into @p out keeping at most @p limit bytes; returns the entry count.
+ * @brief Copies @p iov into @p out, cut to at most @p limit bytes; returns the entry count.
  *
- * @details TRICKLE on vectored receives: the kernel fills the shortened vector, so
- * the caller's buffers receive the first bytes exactly as a short read would.
+ * @details TRICKLE for vectored receives: the kernel fills the shortened vector, so the
+ * caller's buffers receive the first bytes exactly as a short read would deliver them.
  */
 static int
 chaos_net_limit_iovecs(const struct iovec *iov, int iovcnt, size_t limit, struct iovec *out)
@@ -1060,11 +1046,10 @@ int chaos_net_match_connected(
 }
 
 /**
- * @brief Interposed send(2).
+ * @brief send(2) wrapper: SEND rules on either end of the connection.
  *
- * @details send() is a connected-mode operation; there is no explicit destination
- * address. The endpoint is resolved via getpeername on the socket. If the socket is
- * not connected (getpeername fails), the call is passed through without injection.
+ * @details send() has no destination argument; chaos_net_match_connected() searches both
+ * ends of the connection, the peer winning ties. `@size` sees @p size.
  */
 CHAOS_NET_EXPORT ssize_t send(int sockfd, const void *buffer, size_t size, int flags)
 {
@@ -1086,14 +1071,11 @@ CHAOS_NET_EXPORT ssize_t send(int sockfd, const void *buffer, size_t size, int f
 }
 
 /**
- * @brief Interposed sendto(2).
+ * @brief sendto(2) wrapper: SEND rules on the destination, or on the connection.
  *
- * @details sendto() may be called in two modes:
- *   - With an explicit destination (address_ptr != NULL): typical for UDP datagrams.
- *     The destination sockaddr is used for endpoint resolution.
- *   - Without a destination (address_ptr == NULL): connected-mode send on a socket
- *     for which sendto is used as an alias for send(). The peer address from
- *     getpeername is used.
+ * @details With a destination (typical for UDP), that address alone is matched. Without
+ * one (connected mode, sendto used as send), chaos_net_match_connected() searches both
+ * ends, the peer winning ties. `@size` sees @p size.
  */
 CHAOS_NET_EXPORT ssize_t sendto(
     int sockfd,
@@ -1111,8 +1093,8 @@ CHAOS_NET_EXPORT ssize_t sendto(
 
     chaos_net_ensure_symbols();
 
-    /* Use the explicit destination if provided; fall back to getpeername for connected
-     * mode. A call from inside the library is not looked at. */
+    /* Match the explicit destination if there is one, else the connection. A call from
+     * inside the library is not looked at. */
     matched = !chaos_net_in_internal() &&
               (address_ptr != NULL
                    ? chaos_net_endpoint_from_sockaddr_fd(
@@ -1133,11 +1115,10 @@ CHAOS_NET_EXPORT ssize_t sendto(
 }
 
 /**
- * @brief Interposed sendmsg(2).
+ * @brief sendmsg(2) wrapper: SEND rules on msg_name, or on the connection.
  *
- * @details sendmsg() may carry an explicit destination address in msg_name (non-NULL
- * for datagram sends) or may rely on the socket being connected (msg_name == NULL).
- * Endpoint resolution mirrors sendto(): use msg_name if present, otherwise getpeername.
+ * @details As sendto(): msg_name when present, else chaos_net_match_connected(). `@size`
+ * sees the iovec total, or no size for an invalid vector.
  */
 CHAOS_NET_EXPORT ssize_t sendmsg(int sockfd, const struct msghdr *message, int flags)
 {
@@ -1170,16 +1151,12 @@ CHAOS_NET_EXPORT ssize_t sendmsg(int sockfd, const struct msghdr *message, int f
 }
 
 /**
- * @brief Interposed recv(2).
+ * @brief recv(2) wrapper: RECV rules on either end of the connection.
  *
- * @details The endpoint is derived from the local address (getsockname) because:
- *   - For connected TCP sockets, the local port identifies the service.
- *   - For UDP sockets, the local port identifies the listening endpoint.
- *   Using the peer address would require the socket to be connected, which excludes
- *   UDP servers calling recvfrom without a prior connect.
- *
- * CORRUPT is applied post-call only on rc > 0. If rc == 0 (EOF) or rc < 0 (error),
- * there is no receive buffer content to corrupt and the buffer may be uninitialised.
+ * @details chaos_net_match_connected() searches both ends, the local end winning ties.
+ * Order of effects: LATENCY or ERRNO before the call; then DUP (replay, or receive and keep);
+ * else TRICKLE (shorten the request); then the real call; then CORRUPT within the bytes
+ * the buffer actually holds. EOF (0) and errors (-1) are never corrupted.
  */
 CHAOS_NET_EXPORT ssize_t recv(int sockfd, void *buffer, size_t size, int flags)
 {
@@ -1224,7 +1201,7 @@ CHAOS_NET_EXPORT ssize_t recv(int sockfd, void *buffer, size_t size, int flags)
         size = rule.chunk_bytes;
     }
     rc = chaos_net_call_real_recv(sockfd, buffer, size, flags);
-    /* Apply corruption only to the received bytes the buffer holds. */
+    /* Corrupt only received bytes that are inside the buffer. */
     if (rule.effect == CHAOS_NET_EFFECT_CORRUPT)
     {
         const size_t filled = chaos_net_received_bytes(sockfd, rc, size, flags);
@@ -1238,11 +1215,11 @@ CHAOS_NET_EXPORT ssize_t recv(int sockfd, void *buffer, size_t size, int flags)
 }
 
 /**
- * @brief Interposed recvfrom(2).
+ * @brief recvfrom(2) wrapper: as recv(); the sender address is passed through, and kept
+ *        and replayed by DUP.
  *
- * @details Same endpoint resolution and CORRUPT application logic as recv(). The
- * caller-supplied address parameter (output) is forwarded to the real call unchanged;
- * libchaos-net does not modify the sender address.
+ * @details A DUP replay copies the kept sender address into @p address, truncated to the
+ * caller's capacity, and reports its full length, as the kernel does.
  */
 CHAOS_NET_EXPORT ssize_t recvfrom(
     int sockfd,
@@ -1302,8 +1279,8 @@ CHAOS_NET_EXPORT ssize_t recvfrom(
                 1,
                 rc,
                 address_ptr,
-                /* The kernel reports the full address length even when it had to
-                 * cut the address to fit the caller's buffer. */
+                /* The kernel reports the full address length even when it cut the address
+                 * to fit the caller's buffer: keep only what was written. */
                 address_ptr != NULL && address_length != NULL
                     ? (*address_length < capacity ? *address_length : capacity)
                     : 0,
@@ -1326,12 +1303,13 @@ CHAOS_NET_EXPORT ssize_t recvfrom(
 }
 
 /**
- * @brief Interposed recvmsg(2).
+ * @brief recvmsg(2) wrapper: as recv(), on a scatter list.
  *
- * @details Same endpoint and pre-call logic as recv(). Post-call CORRUPT uses
- * chaos_net_corrupt_iovecs() because the receive buffer is described by the iovec
- * array in message->msg_iov, not a single flat buffer. The total received byte
- * count (rc) bounds the corruption to the actually-written portion of the scatter.
+ * @details CORRUPT uses chaos_net_corrupt_iovecs() within the bytes the vector holds.
+ * TRICKLE copies at most CHAOS_NET_TRICKLE_MAX_IOV entries into a shortened vector and
+ * copies the kernel's msg_namelen, msg_controllen and msg_flags back. A DUP replay sets
+ * msg_controllen to 0 (no ancillary data is kept) and MSG_TRUNC for a datagram that did
+ * not fit.
  */
 CHAOS_NET_EXPORT ssize_t recvmsg(int sockfd, struct msghdr *message, int flags)
 {
@@ -1410,7 +1388,7 @@ CHAOS_NET_EXPORT ssize_t recvmsg(int sockfd, struct msghdr *message, int flags)
             message->msg_iov, (int)message->msg_iovlen, rule.chunk_bytes, limited
         );
         rc = chaos_net_call_real_recvmsg(sockfd, &shortened, flags);
-        /* The kernel reports these through the header it was given. */
+        /* The kernel reported these through the header it was given. */
         message->msg_namelen = shortened.msg_namelen;
         message->msg_controllen = shortened.msg_controllen;
         message->msg_flags = shortened.msg_flags;
@@ -1436,21 +1414,21 @@ CHAOS_NET_EXPORT ssize_t recvmsg(int sockfd, struct msghdr *message, int flags)
 /* ---------------------------------------------------------------------------
  * glibc fortified entry points
  *
- * `_FORTIFY_SOURCE` builds call `__recv_chk()`, `__recvfrom_chk()`, `__read_chk()`,
- * `__poll_chk()` and `__ppoll_chk()` instead of the base functions when the buffer
- * size is known. They check the buffer the way glibc does and then run the
- * wrapper. libchaos-io also exports `__read_chk()` for files; both forward to
- * `read()`, which reaches both libraries in either preload order. musl has no
- * fortified variants.
+ * `_FORTIFY_SOURCE` builds call __recv_chk(), __recvfrom_chk(), __read_chk(),
+ * __poll_chk() and __ppoll_chk() instead of the base functions when the buffer size is
+ * known at compile time. Without these exports such calls would bypass the wrappers.
+ * Each checks the size the way glibc does (__chk_fail() on overflow) and then calls the
+ * wrapper. libchaos-io also exports __read_chk() for files; both forward to read(),
+ * which reaches both libraries in either preload order. musl has no fortified variants.
  * ------------------------------------------------------------------------- */
 #if defined(__GLIBC__)
 
 extern void __chk_fail(void) __attribute__((__noreturn__));
 
-/** Overflow handler of the fortified variants; replaceable so tests can observe it. */
+/** @brief Overflow handler of the fortified variants; a test seam (tests observe it). */
 static void (*g_chaos_net_chk_fail)(void) = __chk_fail;
 
-/** @brief Fortified `recv()`: aborts like glibc when @p size exceeds the buffer. */
+/** @brief Fortified recv(): __chk_fail() when @p size exceeds @p buffer_size. */
 CHAOS_NET_EXPORT ssize_t
 __recv_chk(int sockfd, void *buffer, size_t size, size_t buffer_size, int flags)
 {
@@ -1463,7 +1441,7 @@ __recv_chk(int sockfd, void *buffer, size_t size, size_t buffer_size, int flags)
     return recv(sockfd, buffer, size, flags);
 }
 
-/** @brief Fortified `recvfrom()`: aborts like glibc when @p size exceeds the buffer. */
+/** @brief Fortified recvfrom(): __chk_fail() when @p size exceeds @p buffer_size. */
 CHAOS_NET_EXPORT ssize_t __recvfrom_chk(
     int sockfd,
     void *buffer,
@@ -1483,7 +1461,7 @@ CHAOS_NET_EXPORT ssize_t __recvfrom_chk(
     return recvfrom(sockfd, buffer, size, flags, address, address_length);
 }
 
-/** @brief Fortified `read()`: aborts like glibc when @p size exceeds the buffer. */
+/** @brief Fortified read(): __chk_fail() when @p size exceeds @p buffer_size. */
 CHAOS_NET_EXPORT ssize_t __read_chk(int fd, void *buffer, size_t size, size_t buffer_size)
 {
     chaos_net_ensure_symbols();
@@ -1495,7 +1473,7 @@ CHAOS_NET_EXPORT ssize_t __read_chk(int fd, void *buffer, size_t size, size_t bu
     return read(fd, buffer, size);
 }
 
-/** @brief Fortified `poll()`: aborts like glibc when @p nfds exceeds the array. */
+/** @brief Fortified poll(): __chk_fail() when @p nfds exceeds the array. */
 CHAOS_NET_EXPORT int __poll_chk(struct pollfd *fds, nfds_t nfds, int timeout, size_t fds_size)
 {
     chaos_net_ensure_symbols();
@@ -1507,7 +1485,7 @@ CHAOS_NET_EXPORT int __poll_chk(struct pollfd *fds, nfds_t nfds, int timeout, si
     return poll(fds, nfds, timeout);
 }
 
-/** @brief Fortified `ppoll()`: aborts like glibc when @p nfds exceeds the array. */
+/** @brief Fortified ppoll(): __chk_fail() when @p nfds exceeds the array. */
 CHAOS_NET_EXPORT int __ppoll_chk(
     struct pollfd *fds,
     nfds_t nfds,
@@ -1530,20 +1508,19 @@ CHAOS_NET_EXPORT int __ppoll_chk(
 /*---------------------------------------------------------------------------
  * Generic descriptor calls on sockets: read, write, readv, writev, close
  *
- * libchaos-io interposes the same symbols for files. Each library acts only on
- * its own kind of descriptor -- here sockets, recognised by the endpoint lookup
- * that fails with ENOTSOCK for anything else -- and always forwards the call to
- * the next definition in the chain (`RTLD_NEXT`), never straight to libc. So
- * whichever library is preloaded first, a file reaches libchaos-io's rules, a
- * socket reaches these, and every library sees every call.
+ * libchaos-io wraps the same symbols for files. Each library acts only on its own
+ * kind of descriptor -- here sockets, recognised by an endpoint lookup that fails with
+ * ENOTSOCK for anything else -- and always forwards to the next definition in the chain
+ * (RTLD_NEXT), never straight to libc. Whichever library is preloaded first, a file
+ * reaches libchaos-io's rules, a socket reaches these, and every library sees every
+ * call.
  *
- * read/readv on a socket count as `recv`, write/writev as `send`, so a rule such
- * as `tcp4://10.0.0.5:6379:recv:ECONNRESET:1.0` applies whichever call the
- * program uses. Without any net rule the wrappers forward without a socket
- * lookup.
+ * read/readv on a socket count as `recv`, write/writev as `send`, so
+ * `tcp4://10.0.0.5:6379:recv:ECONNRESET:1.0` applies whichever call the program uses.
+ * With no active rule the wrappers forward without any socket lookup.
  *---------------------------------------------------------------------------*/
 
-/** @brief Calls the next read(2) in the chain with the reentrancy guard set. */
+/** @brief Calls the next read(2) in the chain with the guard set; SYS_read before resolution. */
 static ssize_t chaos_net_call_real_read(int fd, void *buffer, size_t size)
 {
     int previous;
@@ -1559,7 +1536,7 @@ static ssize_t chaos_net_call_real_read(int fd, void *buffer, size_t size)
     return result;
 }
 
-/** @brief Calls the next write(2) in the chain with the reentrancy guard set. */
+/** @brief Calls the next write(2) with the guard set; SYS_write before resolution. */
 static ssize_t chaos_net_call_real_write(int fd, const void *buffer, size_t size)
 {
     int previous;
@@ -1575,7 +1552,7 @@ static ssize_t chaos_net_call_real_write(int fd, const void *buffer, size_t size
     return result;
 }
 
-/** @brief Calls the next readv(2) in the chain with the reentrancy guard set. */
+/** @brief Calls the next readv(2) with the guard set; SYS_readv before resolution. */
 static ssize_t chaos_net_call_real_readv(int fd, const struct iovec *iov, int iovcnt)
 {
     int previous;
@@ -1591,7 +1568,7 @@ static ssize_t chaos_net_call_real_readv(int fd, const struct iovec *iov, int io
     return result;
 }
 
-/** @brief Calls the next writev(2) in the chain with the reentrancy guard set. */
+/** @brief Calls the next writev(2) with the guard set; SYS_writev before resolution. */
 static ssize_t chaos_net_call_real_writev(int fd, const struct iovec *iov, int iovcnt)
 {
     int previous;
@@ -1607,7 +1584,7 @@ static ssize_t chaos_net_call_real_writev(int fd, const struct iovec *iov, int i
     return result;
 }
 
-/** @brief Calls the next close(2) in the chain with the reentrancy guard set. */
+/** @brief Calls the next close(2) with the guard set; SYS_close before resolution. */
 static int chaos_net_call_real_close(int fd)
 {
     int previous;
@@ -1623,7 +1600,7 @@ static int chaos_net_call_real_close(int fd)
     return result;
 }
 
-/** @brief Calls the next setsockopt(2) in the chain with the reentrancy guard set. */
+/** @brief Calls the real setsockopt(2) with the guard set; used by RESET (not a wrapper). */
 static int
 chaos_net_call_real_setsockopt(int fd, int level, int name, const void *value, socklen_t length)
 {
@@ -1641,15 +1618,17 @@ chaos_net_call_real_setsockopt(int fd, int level, int name, const void *value, s
 }
 
 /**
- * @brief Finds the rule for a generic descriptor call, if @p fd is a socket.
+ * @brief The rule for a generic descriptor call, if @p fd is a socket.
  *
- * @details The config is consulted first, so without rules no socket lookup is
- * made. For a file, the endpoint lookup fails (ENOTSOCK) and the call is not
- * ours; errno is preserved by the lookup.
+ * @details The snapshot is checked first, so with no active rule no socket lookup is
+ * made. SEND and RECV match both ends of the connection (peer first for SEND); CLOSE
+ * matches the local address, else the peer. A non-socket fails the lookup (ENOTSOCK,
+ * errno preserved) and the call is not libchaos-net's.
  *
  * @param fd         Descriptor of the call.
- * @param operation  RECV, SEND or CLOSE.
- * @param rule       Output: the matching rule.
+ * @param operation  CHAOS_NET_OP_RECV, _SEND or _CLOSE.
+ * @param size       Byte count for `@size`; CHAOS_POLICY_NO_SIZE when there is none.
+ * @param rule       Output: the matching rule copy, with call_size set.
  * @return Non-zero when @p fd is a socket with a matching rule.
  */
 static int chaos_net_match_descriptor_rule(
@@ -1681,7 +1660,8 @@ static int chaos_net_match_descriptor_rule(
 }
 
 /**
- * @brief Interposed read(2): `recv` rules for sockets, anything else forwarded.
+ * @brief read(2) wrapper: `recv` rules on sockets (with DUP, TRICKLE, CORRUPT); every
+ *        other descriptor is forwarded.
  */
 CHAOS_NET_EXPORT ssize_t read(int fd, void *buffer, size_t size)
 {
@@ -1732,7 +1712,8 @@ CHAOS_NET_EXPORT ssize_t read(int fd, void *buffer, size_t size)
 }
 
 /**
- * @brief Interposed readv(2): `recv` rules for sockets, anything else forwarded.
+ * @brief readv(2) wrapper: `recv` rules on sockets (with DUP, TRICKLE, CORRUPT); every
+ *        other descriptor is forwarded.
  */
 CHAOS_NET_EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
 {
@@ -1786,7 +1767,8 @@ CHAOS_NET_EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
 }
 
 /**
- * @brief Interposed write(2): `send` rules for sockets, anything else forwarded.
+ * @brief write(2) wrapper: `send` rules (LATENCY, ERRNO) on sockets; everything else
+ *        forwarded.
  */
 CHAOS_NET_EXPORT ssize_t write(int fd, const void *buffer, size_t size)
 {
@@ -1802,7 +1784,8 @@ CHAOS_NET_EXPORT ssize_t write(int fd, const void *buffer, size_t size)
 }
 
 /**
- * @brief Interposed writev(2): `send` rules for sockets, anything else forwarded.
+ * @brief writev(2) wrapper: `send` rules (LATENCY, ERRNO) on sockets; everything else
+ *        forwarded.
  */
 CHAOS_NET_EXPORT ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
 {
@@ -1820,19 +1803,19 @@ CHAOS_NET_EXPORT ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
 }
 
 /**
- * @brief Interposed close(2): `close` rules for sockets, anything else forwarded.
+ * @brief close(2) wrapper: `close` rules on sockets; every other descriptor forwarded.
  *
  * @details The endpoint is resolved before the descriptor goes away. Effects:
- *   - RESET: arms SO_LINGER with a zero timeout, so the close aborts the
- *     connection and the peer receives an RST (ECONNRESET) instead of a FIN.
- *     This is how a crashed or killed process, or a load balancer dropping a
- *     connection, looks from the other side.
+ *   - RESET: SO_LINGER {l_onoff 1, l_linger 0} before the close, so the kernel aborts the
+ *     connection and the peer receives an RST (ECONNRESET) instead of a FIN: what a
+ *     crashed or killed process, or a load balancer dropping a connection, looks like
+ *     from the other side. A setsockopt failure is ignored, errno preserved.
  *   - LATENCY: delays the close.
- *   - ERRNO: closes, then reports the error. Linux releases the descriptor even
- *     when close reports an error, and programs never retry it, so a synthetic
- *     error that kept the descriptor open would leak it.
- * The close itself always runs through the chain, so a library that shares
- * `close` (libchaos-io keeps an fd cache) sees every call.
+ *   - ERRNO: closes first, then reports the error. Linux releases the descriptor even
+ *     when close reports an error and programs never retry it, so a synthetic error that
+ *     kept the descriptor open would leak it.
+ * The close itself always goes through the chain, so a library that also wraps close
+ * (libchaos-io keeps an fd cache) sees every call, and the DUP slot is forgotten first.
  */
 CHAOS_NET_EXPORT int close(int fd)
 {

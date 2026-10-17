@@ -1,6 +1,18 @@
 /**
  * @file chaos_dns_owned.c
- * @brief Address lists libchaos-dns builds itself, and their release.
+ * @brief Registry of the address lists libchaos-dns allocates itself (OVERRIDE).
+ *
+ * @details Each list is one malloc() block: a header, the nodes, one sockaddr_storage
+ * per node, then the canonical name. Up to CHAOS_DNS_MAX_OWNED (256) blocks are alive at
+ * once, kept in a fixed table guarded by a spin lock that is held only for a table scan
+ * (at most 256 entries, no allocation, no system call). A node belongs to a block when
+ * its address lies inside the block's node array, so any node of a shuffled list finds
+ * its block.
+ *
+ * Thread-safety: all three functions may run concurrently. The spin lock is not
+ * async-signal-safe: a signal handler that calls getaddrinfo or freeaddrinfo while its
+ * thread holds the lock would spin forever (POSIX does not make getaddrinfo or
+ * freeaddrinfo async-signal-safe either).
  */
 
 #include "chaos_dns_owned.h"
@@ -10,17 +22,18 @@
 #include <string.h>
 #include <sys/socket.h>
 
-/** @brief One allocation: the nodes, then their addresses, then the canonical name. */
+/** @brief Header of one allocation: the nodes, then their addresses, then the name. */
 typedef struct chaos_dns_owned_block
 {
     size_t count;
     struct addrinfo *first; /**< nodes[0]: the block holds nodes [first, first + count). */
 } chaos_dns_owned_block_t;
 
-/** @brief Blocks alive, guarded by a spin lock held only for a scan of the table. */
+/** @brief Blocks alive; slots are NULL when free. Guarded by g_chaos_dns_owned_lock. */
 static chaos_dns_owned_block_t *g_chaos_dns_owned[CHAOS_DNS_MAX_OWNED];
 static volatile int g_chaos_dns_owned_lock = 0;
 
+/** @brief Takes the table lock; spins without yielding, since holders only scan. */
 static void chaos_dns_owned_acquire(void)
 {
     while (__sync_lock_test_and_set(&g_chaos_dns_owned_lock, 1) != 0)
@@ -28,12 +41,13 @@ static void chaos_dns_owned_acquire(void)
     }
 }
 
+/** @brief Releases the table lock (release barrier). */
 static void chaos_dns_owned_release(void)
 {
     __sync_lock_release(&g_chaos_dns_owned_lock);
 }
 
-/** @brief Index of the block @p node lies in; -1. Call with the lock held. */
+/** @brief Index of the block whose node array contains @p node; -1. Lock held. */
 static int chaos_dns_owned_find(const struct addrinfo *node)
 {
     size_t index;
@@ -51,6 +65,14 @@ static int chaos_dns_owned_find(const struct addrinfo *node)
     return -1;
 }
 
+/**
+ * @brief Copies the nodes of @p lists into one registered block (contract in the header).
+ *
+ * @details Each node keeps its family, socket type, protocol and flags; its address is
+ * copied into the block (truncated to sizeof(struct sockaddr_storage)), ai_canonname is
+ * cleared except on the first node, and ai_next links the copies in order. The block is
+ * registered last; a full table frees it and returns NULL.
+ */
 struct addrinfo *
 chaos_dns_owned_copy(struct addrinfo *const *lists, size_t count, const char *canonname)
 {
@@ -128,6 +150,7 @@ chaos_dns_owned_copy(struct addrinfo *const *lists, size_t count, const char *ca
     return nodes;
 }
 
+/** @brief Whether @p node lies in a registered block (contract in the header). */
 int chaos_dns_owned_contains(const struct addrinfo *node)
 {
     int found;
@@ -138,6 +161,12 @@ int chaos_dns_owned_contains(const struct addrinfo *node)
     return found;
 }
 
+/**
+ * @brief Unregisters and frees the block holding @p node (contract in the header).
+ *
+ * @details free() runs after the lock is released. NULL, or a node of a real result,
+ * returns 0 and frees nothing.
+ */
 int chaos_dns_owned_free(const struct addrinfo *node)
 {
     chaos_dns_owned_block_t *block = NULL;

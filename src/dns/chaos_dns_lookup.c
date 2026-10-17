@@ -1,67 +1,43 @@
 /**
  * @file chaos_dns_lookup.c
- * @brief Interposed getaddrinfo(3) and getnameinfo(3) entry points.
+ * @brief Wrappers for the resolver entry points: getaddrinfo, freeaddrinfo, getnameinfo,
+ *        and the gethostbyname / gethostbyaddr family.
  *
  * @details
- * This translation unit contains the two exported symbols that LD_PRELOAD
- * causes the dynamic linker to resolve before their libc counterparts:
- *   - getaddrinfo(3)  — forward name-to-address lookup
- *   - getnameinfo(3)  — reverse address-to-name lookup
+ * ### getaddrinfo pipeline
+ * Rules are matched on the queried name as the caller passed it, one effect at a time:
+ *   1. **Guard / NULL or empty node** -- forwarded untouched (a NULL node means the
+ *      local host or a service-only lookup; it names nothing a rule could select).
+ *   2. **LATENCY** -- sleep, whatever follows.
+ *   3. **GAI** -- return the EAI_* code without resolving (EAI_SYSTEM with errno EIO).
+ *   4. **REWRITE / SERVICE** -- resolve another name and/or service.
+ *   5. **OVERRIDE or the real resolver** -- OVERRIDE answers with its IP literals, copied
+ *      into one block of its own (chaos_dns_owned.h).
+ *   6. **FILTER_FAMILY, SHUFFLE, LIMIT**, in that order (rationale in
+ *      chaos_dns_actions.h). An empty result is EAI_NONAME.
+ * Steps 4 to 6 (chaos_dns_resolve_with_rules()) also serve the gethostbyname family, so
+ * a name's answer is shaped identically whichever API resolves it.
  *
- * Both functions follow the same structural pattern:
- *   1. **Reentrancy guard check** — if the call originates from within the
- *      library (e.g., from the OVERRIDE path calling the real getaddrinfo),
- *      delegate directly to the real implementation and return.
- *   2. **Pre-call effects** — check for LATENCY (sleep) and GAI (synthetic
- *      error) rules.  The GAI path returns early without calling the real
- *      resolver.
- *   3. **Input substitution** — check for REWRITE (hostname) and SERVICE
- *      (port) rules, replacing the relevant pointer before the real call.
- *   4. **Real call / OVERRIDE** — either call the real resolver with the
- *      (possibly substituted) inputs, or build a synthetic result list from
- *      literal IP addresses (OVERRIDE).
- *   5. **Post-call transforms** — apply FILTER_FAMILY, SHUFFLE, and LIMIT
- *      in that fixed order.  See chaos_dns_actions.h for why order matters.
+ * ### Result ownership and freeaddrinfo
+ * `*result` is either a list from the real getaddrinfo (possibly with nodes released by
+ * FILTER_FAMILY or LIMIT and reordered by SHUFFLE) or an OVERRIDE block. musl frees a
+ * real result as one reference-counted block charged to its last node, so lists from
+ * several real calls must never be spliced: OVERRIDE copies its per-literal results and
+ * releases them at once. The freeaddrinfo wrapper frees an OVERRIDE block when given any
+ * of its nodes, and hands everything else to the real freeaddrinfo.
  *
- * ### addrinfo list ownership and freeaddrinfo interception
+ * ### getnameinfo
+ * Matched on the address in inet_ntop form (rdns:// rules). LATENCY and GAI before the
+ * real call; REWRITE and SERVICE overwrite the caller's host and service buffers after
+ * it, returning EAI_OVERFLOW when the replacement does not fit. No allocation.
  *
- * After a successful getaddrinfo call (real or OVERRIDE), `*result` points to
- * a list of addrinfo nodes that were allocated by the real getaddrinfo.
- * Ownership is returned to the calling application.
- *
- * When post-call transforms run:
- *   - FILTER_FAMILY and LIMIT may free individual nodes or sub-lists via
- *     g_chaos_dns_real_freeaddrinfo (see chaos_dns_actions.c).  Those nodes
- *     are gone; the application never sees them.
- *   - SHUFFLE only relinks nodes; no allocation or freeing occurs.
- *
- * The surviving list is still a valid "real getaddrinfo" list: every node in
- * it was allocated by the real getaddrinfo and must be freed by the real
- * freeaddrinfo.  There is therefore no special freeaddrinfo interception
- * needed: the application calls freeaddrinfo normally, which (if interposed)
- * passes through to the real freeaddrinfo because the reentrancy guard is not
- * set from application code.
- *
- * The OVERRIDE path calls the real getaddrinfo for each IP literal with
- * AI_NUMERICHOST, then concatenates the resulting sub-lists.  The combined
- * list is identical in structure to a real resolver result: all nodes were
- * allocated by the real getaddrinfo, so the application's freeaddrinfo call
- * works correctly without any special ownership tracking.
- *
- * ### getnameinfo does not return an addrinfo list
- *
- * getnameinfo writes into caller-supplied character buffers; there is no heap
- * allocation involved in the chaos path.  REWRITE and SERVICE effects on the
- * getnameinfo path directly overwrite the output buffers in place.
- *
- * ### Fail-open principle
- *
- * If any internal operation fails (config parse error, allocation failure in
- * SHUFFLE, etc.) the library either passes through to the real implementation
- * unchanged or returns the result as-is.  It never silently drops a result
- * that would otherwise have been returned.  The only exceptions are FILTER_FAMILY
- * and LIMIT producing an empty list, which both return EAI_NONAME — the same
- * error a real resolver would return for a genuinely empty result set.
+ * ### Failure behaviour (fail-open)
+ * Internal failures (rule file problems, SHUFFLE's allocation) leave the call to the
+ * real resolver or the result as it was. Results shrink only by FILTER_FAMILY and LIMIT;
+ * an empty list becomes EAI_NONAME, what a resolver reports for a name without the
+ * wanted addresses. Before the real functions are resolved, the wrappers fail with
+ * EAI_SYSTEM / ENOSYS (hostent forms: NETDB_INTERNAL / ENOSYS): no system call can stand
+ * in for a resolver.
  *
  * @module  libchaos-dns entry points
  * @stability  Public API (interposed symbols); internal implementation is private.
@@ -77,25 +53,21 @@
 #include <string.h>
 
 /* -------------------------------------------------------------------------
- * Internal call wrappers
- * These set the reentrancy guard so that recursive calls from within the
- * real resolver (which may itself call getaddrinfo or getnameinfo) are
- * passed straight through without chaos injection.
+ * Calls to the real functions, with the guard set so that a resolver calling
+ * getaddrinfo or getnameinfo internally reaches the real function unmatched.
  * ------------------------------------------------------------------------- */
 
 /**
- * @brief Call the real getaddrinfo under the reentrancy guard.
+ * @brief Calls the real getaddrinfo with the guard set.
  *
- * @details All internal callers that need the real getaddrinfo must use this
- * wrapper rather than calling g_chaos_dns_real_getaddrinfo directly.  Setting
- * the guard ensures that any call the real resolver makes back into
- * getaddrinfo (e.g., on systems where the resolver uses getaddrinfo
- * internally) is not re-intercepted.
+ * @details The only way the library calls getaddrinfo (OVERRIDE's literals, REWRITE,
+ * the hostent pipeline): the guard keeps a resolver that calls getaddrinfo internally
+ * from being matched again. Before resolution: EAI_SYSTEM with errno ENOSYS.
  *
- * @param node     Hostname or address string (may be NULL).
- * @param service  Service name or port string (may be NULL).
- * @param hints    Optional resolver hints (may be NULL).
- * @param result   Output pointer for the result list.
+ * @param node     Host name or address string; may be NULL.
+ * @param service  Service name or port string; may be NULL.
+ * @param hints    Optional hints; may be NULL.
+ * @param result   Output list.
  * @return  0 on success; an EAI_* code on failure.
  */
 static int chaos_dns_call_real_getaddrinfo(
@@ -107,8 +79,8 @@ static int chaos_dns_call_real_getaddrinfo(
 
     if (g_chaos_dns_real_getaddrinfo == NULL)
     {
-        /* Not resolved yet (a call from inside the symbol lookup): there is no
-         * system call to fall back to, so fail as getaddrinfo reports errors. */
+        /* Not resolved yet (a call from inside the symbol lookup): there is no system
+         * call to fall back to, so fail the way getaddrinfo reports system errors. */
         errno = ENOSYS;
         return EAI_SYSTEM;
     }
@@ -119,17 +91,16 @@ static int chaos_dns_call_real_getaddrinfo(
 }
 
 /**
- * @brief Call the real getnameinfo under the reentrancy guard.
- *
- * @details Same guard rationale as chaos_dns_call_real_getaddrinfo.
+ * @brief Calls the real getnameinfo with the guard set; EAI_SYSTEM / ENOSYS before
+ *        resolution.
  *
  * @param address      Socket address to look up.
  * @param address_len  Size of @p address in bytes.
- * @param host         Output buffer for the hostname (may be NULL).
+ * @param host         Output buffer for the host name; may be NULL.
  * @param host_len     Size of @p host.
- * @param service      Output buffer for the service name (may be NULL).
+ * @param service      Output buffer for the service name; may be NULL.
  * @param service_len  Size of @p service.
- * @param flags        Flags (NI_NUMERICHOST, NI_NAMEREQD, etc.).
+ * @param flags        NI_* flags.
  * @return  0 on success; an EAI_* code on failure.
  */
 static int chaos_dns_call_real_getnameinfo(
@@ -159,12 +130,12 @@ static int chaos_dns_call_real_getnameinfo(
 }
 
 /**
- * @brief Call the real freeaddrinfo under the reentrancy guard.
+ * @brief Calls the real freeaddrinfo with the guard set.
  *
- * @details Not resolved yet, the list is left alone: there is no system call that
- * frees it, and leaking it is the only safe choice.
+ * @details Before resolution the list is leaked: no system call frees it, and leaking is
+ * the only safe choice.
  *
- * @param result  List allocated by the real getaddrinfo.
+ * @param result  List from the real getaddrinfo (never an OVERRIDE block).
  */
 static void chaos_dns_call_real_freeaddrinfo(struct addrinfo *result)
 {
@@ -184,17 +155,16 @@ static void chaos_dns_call_real_freeaddrinfo(struct addrinfo *result)
  * ------------------------------------------------------------------------- */
 
 /**
- * @brief Copy @p text into a caller-supplied output buffer of size @p target_size.
+ * @brief Copies @p text into a caller's output buffer of @p target_size bytes.
  *
- * @details Used to overwrite getnameinfo output buffers for REWRITE and SERVICE
- * effects.  Fails if the replacement text is too long — the caller then returns
- * EAI_OVERFLOW to the application, matching POSIX semantics for a too-short
- * output buffer.
+ * @details For getnameinfo/gethostbyaddr REWRITE and SERVICE. A replacement that does
+ * not fit with its NUL fails, and getnameinfo then returns EAI_OVERFLOW, as the real
+ * function does for a short buffer; the buffer is left as the real call wrote it.
  *
- * @param text         NUL-terminated replacement string.
+ * @param text         NUL-terminated replacement.
  * @param target       Output buffer.
- * @param target_size  Size of @p target in bytes (cast from socklen_t at call site).
- * @return  0 on success; -1 if @p text (+ NUL) is too long for @p target.
+ * @param target_size  Size of @p target in bytes.
+ * @return  0 on success; -1 if it does not fit or an argument is NULL/0.
  */
 static int chaos_dns_copy_output_text(const char *text, char *target, size_t target_size)
 {
@@ -216,28 +186,18 @@ static int chaos_dns_copy_output_text(const char *text, char *target, size_t tar
 }
 
 /**
- * @brief Extract a printable IP address string from a struct sockaddr.
+ * @brief The rdns:// lookup key of a socket address: its inet_ntop text.
  *
- * @details Used by the getnameinfo interposer to build the reverse-lookup
- * key for rule matching.  Handles AF_INET and AF_INET6; returns 0 for any
- * other address family (the interposer then passes through unchanged).
+ * @details AF_INET and AF_INET6 only; any other family, or an @p address_len shorter
+ * than the family's sockaddr, yields 0 and getnameinfo forwards untouched. The family is
+ * checked before the cast. inet_ntop is also how rdns:// selectors are stored, so the
+ * comparison is an exact string match.
  *
- * The address family is checked first so that the struct cast to the narrower
- * sockaddr_in / sockaddr_in6 type is always safe.  address_len is validated
- * against the minimum required structure size as an additional safeguard
- * against caller bugs.
- *
- * The output string format matches the canonical form produced by inet_ntop(3),
- * which is the same format used when storing reverse-selector text in
- * chaos_dns_parse_reverse_selector_body() — ensuring exact-match comparisons
- * work correctly without normalisation at lookup time.
- *
- * @param address      Pointer to the socket address structure.
- * @param address_len  Byte length of the structure pointed to by @p address.
- * @param buffer       Output buffer for the printable address.
- * @param buffer_size  Size of @p buffer; INET6_ADDRSTRLEN (46) is sufficient.
- * @return  Non-zero on success; zero if the address family is unsupported or
- *          address_len is too small.
+ * @param address      Socket address.
+ * @param address_len  Bytes valid at @p address.
+ * @param buffer       Output for the text.
+ * @param buffer_size  Size of @p buffer; INET6_ADDRSTRLEN (46) suffices.
+ * @return  Non-zero on success; zero otherwise.
  */
 static int chaos_dns_reverse_query_from_sockaddr(
     const struct sockaddr *address, socklen_t address_len, char *buffer, size_t buffer_size
@@ -273,17 +233,15 @@ static int chaos_dns_reverse_query_from_sockaddr(
 }
 
 /**
- * @brief Strip IPv6 square-bracket notation from an address token.
+ * @brief Strips the brackets of an IPv6 OVERRIDE literal (`[::1]` -> `::1`).
  *
- * @details OVERRIDE rule text stores IPv6 addresses as `[::1]` so that the
- * comma-delimited list is unambiguous.  This function strips the brackets
- * before passing the address to getaddrinfo.  IPv4 addresses and bare IPv6
- * addresses (without brackets) are copied verbatim.
+ * @details Other tokens are copied as they are. getaddrinfo with AI_NUMERICHOST does not
+ * accept brackets.
  *
- * @param token      Source token (e.g., `"[::1]"` or `"192.168.1.1"`).
- * @param host       Output buffer for the stripped address string.
+ * @param token      Token, e.g. `[::1]` or `192.168.1.1`.
+ * @param host       Output buffer.
  * @param host_size  Size of @p host.
- * @return  0 on success; -1 if @p token is empty, malformed, or too long.
+ * @return  0 on success; -1 if @p token is empty or does not fit.
  */
 static int chaos_dns_strip_ipv6_brackets(const char *token, char *host, size_t host_size)
 {
@@ -319,11 +277,11 @@ static int chaos_dns_strip_ipv6_brackets(const char *token, char *host, size_t h
 }
 
 /* -------------------------------------------------------------------------
- * OVERRIDE implementation
+ * OVERRIDE
  * ------------------------------------------------------------------------- */
 
 /**
- * @brief The address family of IP literal @p host; 0 when it is neither.
+ * @brief Family of IP literal @p host: AF_INET, AF_INET6, or 0 for neither.
  */
 static int chaos_dns_literal_family(const char *host)
 {
@@ -336,27 +294,27 @@ static int chaos_dns_literal_family(const char *host)
     return inet_pton(AF_INET6, host, address) == 1 ? AF_INET6 : 0;
 }
 
-/** @brief Most literals one OVERRIDE rule may list. */
+/** @brief Most literals one OVERRIDE rule may list; more fail the lookup with EAI_FAIL. */
 #define CHAOS_DNS_MAX_OVERRIDE 32U
 
 /**
- * @brief Resolve the comma-separated IP literals of an OVERRIDE rule.
+ * @brief Builds the answer of an OVERRIDE rule from its comma-separated IP literals.
  *
- * @details Each literal is resolved by the real getaddrinfo with AI_NUMERICHOST
- * (so @p service and the hints' socket type expand as usual, without a DNS
- * query); literals of a family the hints exclude are skipped. The nodes are
- * copied into one list of our own (chaos_dns_owned.h) and the real results are
- * released at once, so no list ever spans several of the C library's
- * allocations. With AI_CANONNAME the queried @p name is the canonical name.
+ * @details Each literal is resolved by the real getaddrinfo with AI_NUMERICHOST added to
+ * the caller's hints, so @p service and the socket type expand as usual without a DNS
+ * query; a literal of a family the hints exclude is skipped. The nodes are copied into
+ * one block of our own (chaos_dns_owned_copy()) and the real results are released at
+ * once, so no returned list spans several C library allocations (see the file header).
+ * With AI_CANONNAME the queried @p name becomes the canonical name.
  *
- * @param rule     Matched OVERRIDE rule; `rule->text` is the IP literal list.
+ * @param rule     Matched OVERRIDE rule; `rule->text` holds the literals.
  * @param name     The name looked up.
- * @param service  Service/port string to pass to each real getaddrinfo call.
- * @param hints    Hints from the original getaddrinfo call; may be NULL.
- * @param result   Output; set to the list on success.
- * @return 0; EAI_NONAME when no literal fits the hints; EAI_MEMORY when the list
- *         cannot be allocated; EAI_FAIL for a malformed rule; or the error of a
- *         literal the real getaddrinfo rejects.
+ * @param service  Service string for each real getaddrinfo call (after SERVICE rules).
+ * @param hints    The caller's hints; may be NULL.
+ * @param result   Output: the list on success.
+ * @return 0; EAI_NONAME when no literal fits the hints; EAI_MEMORY when the block cannot
+ *         be allocated or 256 blocks are alive; EAI_FAIL for a malformed rule or more
+ *         than 32 literals; or the error of a literal the real getaddrinfo rejects.
  */
 static int chaos_dns_apply_override(
     const chaos_dns_rule_t *rule,
@@ -445,17 +403,19 @@ static int chaos_dns_apply_override(
 }
 
 /* =========================================================================
- * Interposed entry points
+ * Wrappers
  * ========================================================================= */
 
 /**
- * @brief Steps 4-10 of getaddrinfo(): REWRITE, SERVICE, OVERRIDE or the real
+ * @brief The result-shaping half of getaddrinfo: REWRITE, SERVICE, OVERRIDE or the real
  *        resolver, then FILTER_FAMILY, SHUFFLE and LIMIT.
  *
- * @details Runs after LATENCY and GAI. Shared with the gethostbyname family, so a
- * rule shapes a name's answer identically whichever API resolves it.
+ * @details Runs after LATENCY and GAI. Shared with the gethostbyname family. Every rule
+ * is matched on the original @p node, not on a REWRITE target. When FILTER_FAMILY or
+ * LIMIT empties an OVERRIDE list, its block is freed here and EAI_NONAME returned;
+ * an emptied real list has already been released node by node.
  *
- * @return  0 on success; an EAI_* error code on failure.
+ * @return  0 on success; an EAI_* code on failure.
  */
 static int chaos_dns_resolve_with_rules(
     const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **result
@@ -472,31 +432,30 @@ static int chaos_dns_resolve_with_rules(
     const struct addrinfo *owned = NULL;
     int rc;
 
-    /* 4. NULL result pointer: pass through (real API semantics unchanged). */
+    /* NULL result pointer: forward; the real function defines that case. */
     if (result == NULL)
     {
         return chaos_dns_call_real_getaddrinfo(node, service, hints, result);
     }
 
-    /* 5. REWRITE: substitute the lookup hostname. */
+    /* REWRITE: resolve another name. */
     if (chaos_dns_config_match(CHAOS_DNS_EFFECT_REWRITE, node, &rewrite_rule) &&
         chaos_dns_rule_should_trigger(&rewrite_rule))
     {
-        /* The rule copy lives until the call returns. */
+        /* Points into the rule copy, which lives until this function returns. */
         effective_node = rewrite_rule.text;
     }
 
-    /* 6. SERVICE: substitute the service/port string. */
+    /* SERVICE: use another service string (matched on the queried name). */
     if (chaos_dns_config_match(CHAOS_DNS_EFFECT_SERVICE, node, &service_rule) &&
         chaos_dns_rule_should_trigger(&service_rule))
     {
         effective_service = service_rule.text;
     }
 
-    /* 7. OVERRIDE or real call.
-     * Both paths produce a list of nodes allocated by the real getaddrinfo.
-     * Ownership of *result is held by this interposer and ultimately by the
-     * application. */
+    /* OVERRIDE or the real resolver. *result is either a real list or an OVERRIDE
+     * block (chaos_dns_owned.h); `owned` remembers the block so an emptied list can
+     * still be freed. */
     *result = NULL;
     if (chaos_dns_config_match(CHAOS_DNS_EFFECT_OVERRIDE, node, &override_rule) &&
         chaos_dns_rule_should_trigger(&override_rule))
@@ -513,29 +472,27 @@ static int chaos_dns_resolve_with_rules(
         return rc;
     }
 
-    /* 8. FILTER_FAMILY (first transform): drop nodes of the wrong family.
-     * Must run before SHUFFLE and LIMIT so that those transforms see only
-     * the set of nodes that will actually be returned. */
+    /* FILTER_FAMILY first: SHUFFLE and LIMIT then see only the addresses that will be
+     * returned. A rule with family ANY is skipped without counting a hit. */
     if (chaos_dns_config_match(CHAOS_DNS_EFFECT_FILTER_FAMILY, node, &filter_rule) &&
         filter_rule.family != CHAOS_DNS_FAMILY_ANY && chaos_dns_rule_should_trigger(&filter_rule) &&
         !chaos_dns_filter_result_list(result, filter_rule.family))
     {
-        /* All nodes were filtered out; the real resolver found nothing matching.
-         * A list of ours is freed as a whole (its nodes were only unlinked). */
+        /* Nothing left. Dropped real nodes are released already; an OVERRIDE block is
+         * freed as a whole (its nodes were only unlinked). */
         (void)chaos_dns_owned_free(owned);
         return EAI_NONAME;
     }
 
-    /* 9. SHUFFLE (second transform): randomise the surviving node order.
-     * Must run before LIMIT so that the limit selects from the random order,
-     * not the OS-determined order. */
+    /* SHUFFLE before LIMIT: LIMIT then keeps a random subset, not the resolver's first
+     * entries. */
     if (chaos_dns_config_match(CHAOS_DNS_EFFECT_SHUFFLE, node, &shuffle_rule) &&
         chaos_dns_rule_should_trigger(&shuffle_rule))
     {
         chaos_dns_shuffle_result_list(result);
     }
 
-    /* 10. LIMIT (third transform): truncate to at most N nodes. */
+    /* LIMIT last. The parser guarantees limit >= 1; the NULL check covers limit 0. */
     if (chaos_dns_config_match(CHAOS_DNS_EFFECT_LIMIT, node, &limit_rule) &&
         chaos_dns_rule_should_trigger(&limit_rule))
     {
@@ -551,64 +508,28 @@ static int chaos_dns_resolve_with_rules(
 }
 
 /**
- * @brief Interposed getaddrinfo(3) — forward name-to-address lookup.
+ * @brief getaddrinfo(3) wrapper: dns:// rules of @p node.
  *
- * @details This is a drop-in replacement for the POSIX getaddrinfo(3) function.
- * It is resolved before the libc version because it is marked
- * CHAOS_DNS_EXPORT and libchaos-dns is loaded via LD_PRELOAD.
+ * @details Order:
+ *   1. Guard set, or NULL/empty @p node: forwarded untouched.
+ *   2. **LATENCY** -- sleep before anything else, whether GAI or OVERRIDE follows: it
+ *      models resolver delay, which precedes any outcome.
+ *   3. **GAI** -- return the EAI_* code without resolving. EAI_SYSTEM sets errno to EIO,
+ *      since EAI_SYSTEM tells the caller to read errno.
+ *   4. chaos_dns_resolve_with_rules(): NULL @p result is forwarded; REWRITE, SERVICE,
+ *      OVERRIDE or the real call; FILTER_FAMILY, SHUFFLE, LIMIT.
  *
- * **Execution order and rationale**
+ * On success `*result` is a list from the real getaddrinfo or an OVERRIDE block; the
+ * application frees either with freeaddrinfo, whose wrapper tells them apart.
  *
- * 1. **Reentrancy guard** — if the current thread is already inside the
- *    library, bypass chaos entirely.  This prevents infinite recursion when
- *    the real resolver calls getaddrinfo internally.
+ * @param node     Host name or address string; may be NULL.
+ * @param service  Service name or port string; may be NULL.
+ * @param hints    Optional hints; may be NULL.
+ * @param result   Output list.
+ * @return  0 on success; an EAI_* code on failure.
  *
- * 2. **NULL / empty node** — bypass chaos.  The real getaddrinfo defines the
- *    semantics of a NULL node (means the local host); we don't chaos-inject
- *    that case.
- *
- * 3. **LATENCY** — look up a LATENCY rule for @p node; if it fires, sleep
- *    before continuing.  Sleep happens regardless of whether the GAI or
- *    OVERRIDE paths subsequently apply, because LATENCY models network delay
- *    that occurs regardless of outcome.
- *
- * 4. **GAI (synthetic failure)** — look up a GAI rule; if it fires, return
- *    the configured EAI_* code immediately, no real resolver call.
- *
- * 5. **NULL result pointer** — if the caller passed result == NULL, bypass
- *    chaos (the real getaddrinfo defines the semantics in this case).
- *
- * 6. **REWRITE / SERVICE** — substitute hostname and/or service before the
- *    real call.  `effective_node` and `effective_service` are updated to
- *    point into stack buffers if substitution applies.
- *
- * 7. **OVERRIDE vs real call** — if an OVERRIDE rule fires, call
- *    chaos_dns_apply_override() instead of the real resolver.  Both paths
- *    produce a `*result` list owned by this interposer (ultimately owned by
- *    the application).
- *
- * 8. **FILTER_FAMILY** — drop nodes of the wrong family; return EAI_NONAME
- *    if the list becomes empty.
- *
- * 9. **SHUFFLE** — randomise node order.
- *
- * 10. **LIMIT** — truncate to N nodes; return EAI_NONAME if limit == 0.
- *
- * **addrinfo ownership**
- *
- * `*result` on successful return points to a list allocated by the real
- * getaddrinfo, or, after OVERRIDE, to one allocation of our own
- * (chaos_dns_owned.h). The application frees either with freeaddrinfo, which
- * this library interposes to tell them apart.
- *
- * @param node     Hostname or address string (may be NULL).
- * @param service  Service name or port number string (may be NULL).
- * @param hints    Optional resolver hints (may be NULL).
- * @param result   Output pointer for the result addrinfo list.
- * @return  0 on success; an EAI_* error code on failure.
- *
- * @threadsafety  Safe — all shared state access is either read-only (active
- *               config snapshot) or TLS (PRNG, reentrancy guard).
+ * @threadsafety  Any thread: rules are copied out of the active snapshot; PRNG and guard
+ *               are thread-local.
  */
 CHAOS_DNS_EXPORT int getaddrinfo(
     const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **result
@@ -620,20 +541,20 @@ CHAOS_DNS_EXPORT int getaddrinfo(
 
     chaos_dns_ensure_symbols();
 
-    /* 1. Reentrancy guard: bypass if already inside the library. */
+    /* Guard set, or no name to select on: forward. */
     if (chaos_dns_in_internal() || node == NULL || *node == '\0')
     {
         return chaos_dns_call_real_getaddrinfo(node, service, hints, result);
     }
 
-    /* 2. LATENCY: inject delay before resolver, regardless of what follows. */
+    /* LATENCY: delay before the resolver, whatever follows. */
     if (chaos_dns_config_match(CHAOS_DNS_EFFECT_LATENCY, node, &latency_rule) &&
         chaos_dns_rule_should_trigger(&latency_rule))
     {
         chaos_dns_rule_apply_latency(&latency_rule);
     }
 
-    /* 3. GAI: return a synthetic EAI_* error; skip the real resolver. */
+    /* GAI: a synthetic EAI_* error; the resolver is not called. */
     if (chaos_dns_config_match(CHAOS_DNS_EFFECT_GAI, node, &gai_rule) &&
         chaos_dns_rule_apply_gai(&gai_rule, &gai_error))
     {
@@ -644,15 +565,15 @@ CHAOS_DNS_EXPORT int getaddrinfo(
         return gai_error;
     }
 
-    /* 4.-10. Result-shaping rules, shared with the gethostbyname family. */
+    /* REWRITE, SERVICE, OVERRIDE and the transforms, shared with the hostent family. */
     return chaos_dns_resolve_with_rules(node, service, hints, result);
 }
 
 /**
- * @brief Interposed freeaddrinfo(3): frees a list of ours (OVERRIDE), else the real one.
+ * @brief freeaddrinfo(3) wrapper: frees an OVERRIDE block, else calls the real one.
  *
- * @details Any node of a list of ours frees it: SHUFFLE may have made any of them
- * the head the application holds.
+ * @details Any node of an OVERRIDE block frees the whole block: SHUFFLE may have made any
+ * of them the head the application holds. NULL goes to the real freeaddrinfo.
  */
 CHAOS_DNS_EXPORT void freeaddrinfo(struct addrinfo *result)
 {
@@ -664,46 +585,27 @@ CHAOS_DNS_EXPORT void freeaddrinfo(struct addrinfo *result)
 }
 
 /**
- * @brief Interposed getnameinfo(3) — reverse address-to-name lookup.
+ * @brief getnameinfo(3) wrapper: rdns:// rules of the address.
  *
- * @details This is a drop-in replacement for the POSIX getnameinfo(3) function.
+ * @details Order:
+ *   1. Guard set, NULL @p address, or a family other than AF_INET/AF_INET6: forwarded
+ *      untouched.
+ *   2. **LATENCY**, then **GAI** (returned as is; unlike getaddrinfo, errno is not set
+ *      for EAI_SYSTEM).
+ *   3. The real call with the original arguments; its failure is returned.
+ *   4. **REWRITE** overwrites @p host, **SERVICE** @p service, each only when the caller
+ *      passed that buffer; a replacement that does not fit returns EAI_OVERFLOW.
  *
- * **Execution order**
- *
- * 1. **Reentrancy guard / NULL address** — bypass chaos entirely.
- *
- * 2. **Reverse query key extraction** — convert the struct sockaddr to a
- *    normalised IP string using chaos_dns_reverse_query_from_sockaddr().
- *    If the address family is unsupported, bypass chaos.
- *
- * 3. **LATENCY** — inject delay before the real call.
- *
- * 4. **GAI** — return a synthetic EAI_* error before the real call.
- *
- * 5. **Real call** — call getnameinfo with the original, unmodified arguments.
- *    If the real call fails, return the error immediately.
- *
- * 6. **REWRITE** — if the rule fires and the replacement hostname fits in the
- *    output buffer, overwrite `host` in place.  If it doesn't fit, return
- *    EAI_OVERFLOW (matching POSIX semantics for a too-short host buffer).
- *
- * 7. **SERVICE** — same as REWRITE but for the `service` output buffer.
- *
- * **No addrinfo list** — getnameinfo writes into caller-supplied character
- * buffers; there is no heap allocation in the chaos path and therefore no
- * ownership transfer to reason about.
- *
- * @param address      Socket address to resolve.
- * @param address_len  Byte size of @p address.
- * @param host         Output buffer for the resolved hostname (may be NULL).
+ * @param address      Socket address to look up.
+ * @param address_len  Size of @p address in bytes.
+ * @param host         Output buffer for the host name; may be NULL.
  * @param host_len     Size of @p host in bytes.
- * @param service      Output buffer for the resolved service name (may be NULL).
+ * @param service      Output buffer for the service name; may be NULL.
  * @param service_len  Size of @p service in bytes.
- * @param flags        Resolver flags (NI_NUMERICHOST, NI_NAMEREQD, etc.).
- * @return  0 on success; an EAI_* error code on failure (including EAI_OVERFLOW
- *          if REWRITE or SERVICE text is too long for the output buffer).
+ * @param flags        NI_* flags.
+ * @return  0 on success; an EAI_* code on failure, including EAI_OVERFLOW.
  *
- * @threadsafety  Safe — see getaddrinfo for general thread-safety notes.
+ * @threadsafety  Any thread; see getaddrinfo().
  */
 CHAOS_DNS_EXPORT int getnameinfo(
     const struct sockaddr *address,
@@ -725,7 +627,7 @@ CHAOS_DNS_EXPORT int getnameinfo(
 
     chaos_dns_ensure_symbols();
 
-    /* 1. Reentrancy guard / NULL address. */
+    /* Guard set, or no address: forward. */
     if (chaos_dns_in_internal() || address == NULL)
     {
         return chaos_dns_call_real_getnameinfo(
@@ -733,8 +635,7 @@ CHAOS_DNS_EXPORT int getnameinfo(
         );
     }
 
-    /* 2. Extract the reverse-lookup key (normalised IP string).
-     * If the address family is unsupported, bypass chaos entirely. */
+    /* The rdns:// key is the inet_ntop text; any other family is forwarded untouched. */
     if (!chaos_dns_reverse_query_from_sockaddr(address, address_len, query, sizeof(query)))
     {
         return chaos_dns_call_real_getnameinfo(
@@ -742,21 +643,21 @@ CHAOS_DNS_EXPORT int getnameinfo(
         );
     }
 
-    /* 3. LATENCY: inject delay before the real resolver call. */
+    /* LATENCY: delay before the real call. */
     if (chaos_dns_config_match_reverse(CHAOS_DNS_EFFECT_LATENCY, query, &latency_rule) &&
         chaos_dns_rule_should_trigger(&latency_rule))
     {
         chaos_dns_rule_apply_latency(&latency_rule);
     }
 
-    /* 4. GAI: return a synthetic EAI_* error; skip the real resolver. */
+    /* GAI: a synthetic EAI_* error; the resolver is not called. */
     if (chaos_dns_config_match_reverse(CHAOS_DNS_EFFECT_GAI, query, &gai_rule) &&
         chaos_dns_rule_apply_gai(&gai_rule, &gai_error))
     {
         return gai_error;
     }
 
-    /* 5. Real call: perform the actual reverse lookup. */
+    /* The real reverse lookup, with the caller's arguments. */
     rc = chaos_dns_call_real_getnameinfo(
         address, address_len, host, host_len, service, service_len, flags
     );
@@ -765,9 +666,8 @@ CHAOS_DNS_EXPORT int getnameinfo(
         return rc;
     }
 
-    /* 6. REWRITE: overwrite the hostname in the caller's output buffer.
-     * If the replacement text is too long, return EAI_OVERFLOW so the caller
-     * knows the buffer was too small — same semantics as the real getnameinfo. */
+    /* REWRITE: overwrite the host name the real call wrote. A replacement that does not
+     * fit returns EAI_OVERFLOW, as the real getnameinfo does for a short buffer. */
     if (host != NULL && host_len > 0U &&
         chaos_dns_config_match_reverse(CHAOS_DNS_EFFECT_REWRITE, query, &rewrite_rule) &&
         chaos_dns_rule_should_trigger(&rewrite_rule) &&
@@ -776,7 +676,7 @@ CHAOS_DNS_EXPORT int getnameinfo(
         return EAI_OVERFLOW;
     }
 
-    /* 7. SERVICE: overwrite the service name in the caller's output buffer. */
+    /* SERVICE: overwrite the service name the same way. */
     if (service != NULL && service_len > 0U &&
         chaos_dns_config_match_reverse(CHAOS_DNS_EFFECT_SERVICE, query, &service_rule) &&
         chaos_dns_rule_should_trigger(&service_rule) &&
@@ -789,30 +689,32 @@ CHAOS_DNS_EXPORT int getnameinfo(
 }
 
 /* -------------------------------------------------------------------------
- * The legacy hostent resolvers: gethostbyname, gethostbyname2, their _r forms,
+ * The hostent resolvers: gethostbyname, gethostbyname2, their _r forms,
  * gethostbyaddr and gethostbyaddr_r
  *
- * glibc and musl resolve these through their internal lookup code, never through
- * getaddrinfo() or getnameinfo(), so dns:// and rdns:// rules would not reach
- * them. Forward lookups follow the dns:// rules of the name, reverse lookups the
- * rdns:// rules of the address. LATENCY and GAI apply first; GAI's EAI_* code is
- * reported as the matching h_errno. When only those rules match, the real
- * resolver answers, unchanged. When a rule shapes the answer (REWRITE, OVERRIDE,
- * FILTER_FAMILY, SHUFFLE, LIMIT), the answer comes from the same pipeline as
- * getaddrinfo() and is converted to a hostent, so both APIs see the same result.
- * Reverse lookups support REWRITE of the returned name.
+ * glibc and musl resolve these through internal lookup code, never through
+ * getaddrinfo() or getnameinfo(), so they need wrappers of their own. Forward lookups
+ * follow the dns:// rules of the name, reverse lookups the rdns:// rules of the
+ * address (inet_ntop text). LATENCY and GAI apply first; GAI's EAI_* code becomes the
+ * matching h_errno. When no result-shaping rule (REWRITE, OVERRIDE, FILTER_FAMILY,
+ * SHUFFLE, LIMIT) matches the name, the real resolver answers unchanged; otherwise the
+ * answer comes from chaos_dns_resolve_with_rules() and is converted to a hostent, so
+ * both APIs see the same result. Reverse lookups support REWRITE of h_name only.
+ * The non-reentrant forms return static data, as their contract allows; they are not
+ * thread-safe, exactly like the libc originals.
  * ------------------------------------------------------------------------- */
 
 #ifndef NETDB_INTERNAL
 #define NETDB_INTERNAL (-1)
 #endif
 
-/** Storage behind the non-reentrant forms, which by contract return static data. */
+/** Storage of the non-reentrant forms (2048-byte buffer); returned as static data. */
 static struct hostent g_chaos_dns_hostent;
 static char g_chaos_dns_hostent_buffer[2048];
 
 /**
- * @brief Maps a getaddrinfo EAI_* code to the h_errno a hostent resolver reports.
+ * @brief The h_errno for an EAI_* code: NONAME -> HOST_NOT_FOUND, AGAIN -> TRY_AGAIN,
+ *        NODATA/ADDRFAMILY -> NO_DATA, anything else -> NO_RECOVERY.
  */
 static int chaos_dns_h_errno_for(int eai_error)
 {
@@ -836,11 +738,11 @@ static int chaos_dns_h_errno_for(int eai_error)
 }
 
 /**
- * @brief Applies LATENCY, then GAI, for a hostent lookup of @p query.
+ * @brief LATENCY, then GAI, for a hostent lookup of @p query.
  *
- * @param query    Forward host name or reverse IP text.
- * @param reverse  Non-zero to use the rdns:// rules.
- * @param h_error  Receives the h_errno when GAI fires.
+ * @param query    Host name (forward) or inet_ntop text (reverse).
+ * @param reverse  Non-zero for the rdns:// rules.
+ * @param h_error  Output: the h_errno when GAI fires.
  * @return Non-zero when GAI fired and the lookup must fail.
  */
 static int chaos_dns_hostent_prelude(const char *query, int reverse, int *h_error)
@@ -867,7 +769,10 @@ static int chaos_dns_hostent_prelude(const char *query, int reverse, int *h_erro
     return 0;
 }
 
-/** @brief Non-zero when any rule that shapes a forward answer matches @p name. */
+/**
+ * @brief Whether a result-shaping rule (REWRITE, OVERRIDE, FILTER_FAMILY, SHUFFLE, LIMIT)
+ *        matches @p name; only matching, no firing decision and no hit.
+ */
 static int chaos_dns_has_result_rule(const char *name)
 {
     chaos_dns_rule_t rule;
@@ -882,11 +787,12 @@ static int chaos_dns_has_result_rule(const char *name)
 /**
  * @brief Lays out a hostent for the @p family addresses of @p list inside @p buffer.
  *
- * @details Layout: alias list (empty), address list, addresses, name. The name is
- * the canonical name of the first node, or @p name.
+ * @details Layout: padding to pointer alignment, the alias list (empty) and the address
+ * pointer list, the addresses, the name. The name is the first node's canonical name if
+ * it has one, else @p name. Nodes of the other family are skipped.
  *
- * @return 0 on success; ERANGE when @p buffer is too small; ENOENT when @p list
- *         holds no address of @p family.
+ * @return 0 on success; ERANGE when @p buffer is too small; ENOENT when @p list holds no
+ *         address of @p family.
  */
 static int chaos_dns_fill_hostent(
     const char *name,
@@ -926,7 +832,7 @@ static int chaos_dns_fill_hostent(
     }
     name_size = strlen(host_name) + 1U;
 
-    /* Pointers first, aligned for char *; then addresses; then the name. */
+    /* Pointers first (aligned for char *), then the addresses, then the name. */
     offset = (size_t)((uintptr_t)buffer % sizeof(char *));
     offset = offset == 0U ? 0U : sizeof(char *) - offset;
     pointers_size = (count + 2U) * sizeof(char *);
@@ -978,8 +884,12 @@ static int chaos_dns_fill_hostent(
 /**
  * @brief Resolves @p name through the getaddrinfo rule pipeline into a hostent.
  *
- * @return 0, or ERANGE when @p buffer is too small; *result is NULL on failure
- *         and *h_error then says why.
+ * @details Hints: @p family, SOCK_STREAM (one node per address), AI_CANONNAME. The list
+ * is freed (OVERRIDE block or real list) before returning.
+ *
+ * @return 0, or ERANGE (h_errno NETDB_INTERNAL, errno ERANGE) when @p buffer is too
+ *         small; on any failure *result is NULL and *h_error says why (EAI_* mapped, or
+ *         NO_DATA when no address of @p family remains).
  */
 static int chaos_dns_hostent_from_rules(
     const char *name,
@@ -1027,10 +937,10 @@ static int chaos_dns_hostent_from_rules(
 }
 
 /**
- * @brief The failure of a reentrant hostent resolver that is not resolved yet.
+ * @brief Failure of a reentrant hostent wrapper before the real function is resolved.
  *
- * @details No system call resolves a name: fail as these functions report a
- * system error, NETDB_INTERNAL with errno ENOSYS.
+ * @details No system call resolves a name: fail as these functions report a system
+ * error, NETDB_INTERNAL with errno ENOSYS.
  *
  * @return ENOSYS.
  */
@@ -1049,7 +959,7 @@ static int chaos_dns_hostent_r_unresolved(struct hostent **result, int *h_error)
 }
 
 /**
- * @brief The failure of a non-reentrant hostent resolver that is not resolved yet.
+ * @brief Failure of a non-reentrant hostent wrapper before the real function is resolved.
  *
  * @return NULL, with h_errno NETDB_INTERNAL and errno ENOSYS.
  */
@@ -1060,7 +970,7 @@ static struct hostent *chaos_dns_hostent_unresolved(void)
     return NULL;
 }
 
-/** @brief Calls the real gethostbyname2_r under the reentrancy guard. */
+/** @brief Calls the real gethostbyname2_r with the guard set. */
 static int chaos_dns_call_real_gethostbyname2_r(
     const char *name,
     int family,
@@ -1086,7 +996,7 @@ static int chaos_dns_call_real_gethostbyname2_r(
     return rc;
 }
 
-/** @brief Calls the real gethostbyname2 under the reentrancy guard. */
+/** @brief Calls the real gethostbyname2 with the guard set. */
 static struct hostent *chaos_dns_call_real_gethostbyname2(const char *name, int family)
 {
     struct hostent *entry;
@@ -1103,10 +1013,12 @@ static struct hostent *chaos_dns_call_real_gethostbyname2(const char *name, int 
 }
 
 /**
- * @brief Interposed gethostbyname2_r(3): the dns:// rules of @p name.
+ * @brief gethostbyname2_r(3) wrapper: dns:// rules of @p name.
  *
- * @return 0, with *result NULL and *h_error set when the lookup failed; ERANGE
- *         when @p buffer is too small.
+ * @details Guard set, NULL/empty @p name, or NULL @p result / @p h_error: forwarded.
+ *
+ * @return 0, with *result NULL and *h_error set when the lookup failed; ERANGE when
+ *         @p buffer is too small for a rule-shaped answer.
  */
 CHAOS_DNS_EXPORT int gethostbyname2_r(
     const char *name,
@@ -1145,7 +1057,7 @@ CHAOS_DNS_EXPORT int gethostbyname2_r(
     );
 }
 
-/** @brief Interposed gethostbyname_r(3): gethostbyname2_r() for AF_INET. */
+/** @brief gethostbyname_r(3) wrapper: gethostbyname2_r() for AF_INET. */
 CHAOS_DNS_EXPORT int gethostbyname_r(
     const char *name,
     struct hostent *entry,
@@ -1159,9 +1071,10 @@ CHAOS_DNS_EXPORT int gethostbyname_r(
 }
 
 /**
- * @brief Interposed gethostbyname2(3): the dns:// rules of @p name.
+ * @brief gethostbyname2(3) wrapper: dns:// rules of @p name.
  *
- * @return The (static) entry, or NULL with h_errno set.
+ * @return The entry (static storage, overwritten by the next call), or NULL with
+ *         h_errno set.
  */
 CHAOS_DNS_EXPORT struct hostent *gethostbyname2(const char *name, int family)
 {
@@ -1198,13 +1111,13 @@ CHAOS_DNS_EXPORT struct hostent *gethostbyname2(const char *name, int family)
     return chaos_dns_call_real_gethostbyname2(name, family);
 }
 
-/** @brief Interposed gethostbyname(3): gethostbyname2() for AF_INET. */
+/** @brief gethostbyname(3) wrapper: gethostbyname2() for AF_INET. */
 CHAOS_DNS_EXPORT struct hostent *gethostbyname(const char *name)
 {
     return gethostbyname2(name, AF_INET);
 }
 
-/** @brief Renders a binary address as the rdns:// lookup key; 0 when unsupported. */
+/** @brief The rdns:// key of a binary address (inet_ntop text); 0 for an unsupported one. */
 static int chaos_dns_reverse_query_from_address(
     const void *address, socklen_t length, int family, char *buffer, size_t buffer_size
 )
@@ -1218,7 +1131,7 @@ static int chaos_dns_reverse_query_from_address(
     return inet_ntop(family, address, buffer, (socklen_t)buffer_size) != NULL;
 }
 
-/** @brief The REWRITE text for reverse key @p query, or NULL when none fires. */
+/** @brief The REWRITE text for reverse key @p query when a rule fires; NULL otherwise. */
 static const char *chaos_dns_reverse_rewrite(const char *query, chaos_dns_rule_t *rule)
 {
     if (chaos_dns_config_match_reverse(CHAOS_DNS_EFFECT_REWRITE, query, rule) &&
@@ -1230,10 +1143,12 @@ static const char *chaos_dns_reverse_rewrite(const char *query, chaos_dns_rule_t
 }
 
 /**
- * @brief Interposed gethostbyaddr_r(3): the rdns:// rules of the address.
+ * @brief gethostbyaddr_r(3) wrapper: rdns:// rules of the address.
  *
- * @details A REWRITE replaces h_name; the new name is stored at the end of
- * @p buffer, and the real resolver gets the rest.
+ * @details A firing REWRITE reserves strlen + 1 bytes at the end of @p buffer for the new
+ * h_name and gives the real resolver the rest; a buffer smaller than the name fails with
+ * ERANGE (h_errno NETDB_INTERNAL). The REWRITE fires (and counts) before the real call,
+ * so it is counted even when the address does not resolve.
  */
 CHAOS_DNS_EXPORT int gethostbyaddr_r(
     const void *address,
@@ -1295,7 +1210,12 @@ CHAOS_DNS_EXPORT int gethostbyaddr_r(
     return rc;
 }
 
-/** @brief Interposed gethostbyaddr(3): the rdns:// rules of the address. */
+/**
+ * @brief gethostbyaddr(3) wrapper: rdns:// rules of the address.
+ *
+ * @details A firing REWRITE replaces h_name with a copy in function-static storage
+ * (CHAOS_DNS_MAX_VALUE bytes); not thread-safe, like the libc original's static entry.
+ */
 CHAOS_DNS_EXPORT struct hostent *gethostbyaddr(const void *address, socklen_t length, int family)
 {
     static char rewritten_name[CHAOS_DNS_MAX_VALUE];
