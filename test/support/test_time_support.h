@@ -1,35 +1,27 @@
 /**
  * @file test_time_support.h
- * @brief TIME-domain test globals, reset helper, and dlsym cast utility.
+ * @brief Unit-test scaffolding for libchaos-time: runtime globals, reset helper, dlsym cast.
  *
- * Subsystem under test: chaos-time (LD_PRELOAD time fault injection via
- *   clock_gettime / nanosleep / usleep interception).
+ * @details Unit tests compile the libchaos-time sources directly into the test binary
+ * (`#include "…/chaos_time_*.c"`) instead of loading the shared object, so the globals that
+ * libchaos-time defines in its own translation units must be supplied by the test. This
+ * header provides:
  *
- * This header is included by every unit test that exercises the TIME domain.
- * It provides:
+ *   1. CHAOS_TIME_DEFINE_TEST_GLOBALS(): defines every runtime global declared `extern` in
+ *      chaos_time_internal.h, plus an empty chaos_time_ensure_symbols() so no wrapper ever
+ *      calls dlsym(RTLD_NEXT). Expand exactly once per test binary, at file scope.
+ *   2. chaos_time_test_reset_runtime(): returns those globals to their initial state; call
+ *      at the start of every test so state cannot leak between tests.
+ *   3. CHAOS_TIME_TEST_DLSYM_RESULT(type, function): converts a typed function pointer to
+ *      the `void *` a stub dlsym() returns, via memcpy (ISO C forbids the direct cast).
  *
- *   1. `CHAOS_TIME_DEFINE_TEST_GLOBALS()` -- instantiates all TIME-domain
- *      runtime globals. Must be expanded exactly once per test binary.
+ * libchaos-time holds eight real functions: clock_gettime, nanosleep, usleep, gettimeofday,
+ * time, clock_nanosleep, sleep and timespec_get. Rule selectors name three operations
+ * (clock_gettime, nanosleep, usleep); the other wrappers map onto those.
  *
- *   2. `chaos_time_test_reset_runtime()` -- resets all TIME runtime globals to
- *      their initial (NULL/zero) state. Call at the start of every test function.
- *
- *   3. `CHAOS_TIME_TEST_DLSYM_RESULT(type, function)` -- type-safe function
- *      pointer to `void *` conversion for dlsym stubs.
- *
- * The TIME domain intercepts three functions: clock_gettime (for the OFFSET and
- * ERRNO/LATENCY effects), nanosleep, and usleep (for LATENCY and ERRNO effects).
- * The OFFSET effect skews `tv_sec`/`tv_nsec` returned by clock_gettime by
- * `rule.offset_ms` milliseconds, either forward (positive) or backward (negative).
- *
- * Coverage approach:
- * - Tests directly `#include` production `.c` files after symbol overrides.
- * - The LD_PRELOAD interposition path is NOT tested here.
- *
- * What is NOT tested via this header:
- * - Actual clock resolution or monotonicity guarantees.
- * - Thread-safety of the TLS guard under concurrent clock_gettime calls.
- * - nanosleep EINTR behaviour with real signal delivery.
+ * Not covered by tests built on this header: LD_PRELOAD interposition itself, real clock
+ * resolution or monotonicity, the per-thread reentrancy guard under concurrency, and EINTR
+ * from real signal delivery. The runtime suites (test/runtime) cover interposition.
  */
 
 #ifndef CHAOS_TIME_TEST_SUPPORT_H
@@ -46,14 +38,16 @@
 #include <unistd.h>
 
 /**
- * @brief Instantiate all TIME-domain runtime globals for one test translation unit.
+ * @brief Defines the libchaos-time runtime globals for one test binary.
  *
- * Must be expanded exactly once at file scope. Defines:
- * - `g_chaos_time_real_clock_gettime`, `g_chaos_time_real_nanosleep`,
- *   `g_chaos_time_real_usleep` -- all NULL.
- * - `__thread int g_chaos_time_tls_guard` -- per-thread re-entrancy guard.
- * - `__thread uint64_t g_chaos_time_tls_prng_state` -- per-thread PRNG state.
- * - `uint64_t g_chaos_time_process_seed` -- process-wide PRNG seed (1).
+ * Expand exactly once at file scope (a second expansion is a duplicate definition). Defines:
+ * - chaos_time_ensure_symbols() as a no-op, so real functions stay what the test assigns.
+ * - The eight `g_chaos_time_real_*` real-function pointers, all NULL.
+ * - `__thread int g_chaos_time_tls_guard` (reentrancy guard) = 0.
+ * - `__thread uint64_t g_chaos_time_tls_prng_state` (per-thread PRNG state) = 0; 0 makes the
+ *   PRNG reseed from the process seed on first use.
+ * - `uint64_t g_chaos_time_process_seed` = 1 instead of the /dev/urandom seed of
+ *   chaos_time_init(); per-thread streams still mix in the TID and a stack address.
  */
 #define CHAOS_TIME_DEFINE_TEST_GLOBALS()                                                           \
     void chaos_time_ensure_symbols(void) {}                                                        \
@@ -70,11 +64,10 @@
     uint64_t g_chaos_time_process_seed = 1U
 
 /**
- * @brief Reset all TIME-domain runtime globals to their initial state.
+ * @brief Restores every global defined by CHAOS_TIME_DEFINE_TEST_GLOBALS() to its initial value.
  *
- * Sets all three real-function-pointer globals to NULL, zeroes the TLS guard and
- * TLS PRNG state, and resets the process seed to 1. Call at the start of each
- * test function to prevent cross-test contamination.
+ * Sets the eight real-function pointers to NULL, zeroes the calling thread's reentrancy guard
+ * and PRNG state, and resets the process seed to 1. Only the calling thread's TLS is reset.
  */
 static inline void chaos_time_test_reset_runtime(void)
 {
@@ -92,11 +85,14 @@ static inline void chaos_time_test_reset_runtime(void)
 }
 
 /**
- * @brief Convert a typed function pointer to `void *` using `memcpy`.
+ * @brief Copies a function pointer's bytes into a `void *`.
  *
- * @param function_bytes  Address of a function-pointer-typed value.
- * @param function_size   `sizeof` the function pointer type; must be <= sizeof(void *).
- * @return `void *` carrying the same bit pattern as the function pointer.
+ * ISO C leaves function-pointer to object-pointer casts undefined; POSIX guarantees the
+ * representations match, so a byte copy is the portable way to build a dlsym() result.
+ *
+ * @param function_bytes  Address of a function-pointer object; must not be NULL (asserted).
+ * @param function_size   Size of that object; must be <= sizeof(void *) (asserted).
+ * @return A `void *` with the same bit pattern as the function pointer.
  */
 static inline void *chaos_time_test_dlsym_pointer(const void *function_bytes, size_t function_size)
 {
@@ -109,10 +105,11 @@ static inline void *chaos_time_test_dlsym_pointer(const void *function_bytes, si
 }
 
 /**
- * @brief Produce the `void *` return value for a TIME `dlsym` stub entry.
+ * @brief Yields the `void *` a stub dlsym() returns for @p function.
  *
- * @param type      Function pointer typedef (e.g. `chaos_time_clock_gettime_fn`).
- * @param function  Stub function to associate with this symbol name.
+ * @param type      Function-pointer typedef, e.g. `chaos_time_clock_gettime_fn`; a mismatch
+ *                  with @p function draws a compiler diagnostic via the compound literal.
+ * @param function  Stub to hand back for the requested symbol name.
  */
 #define CHAOS_TIME_TEST_DLSYM_RESULT(type, function)                                               \
     chaos_time_test_dlsym_pointer(&(type){function}, sizeof(type))

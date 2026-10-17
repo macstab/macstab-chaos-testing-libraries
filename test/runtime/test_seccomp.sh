@@ -1,31 +1,52 @@
 #!/bin/sh
 #
-# test_seccomp.sh — io, net, memory and process rules in SECCOMP mode (Docker).
+# test_seccomp.sh: io, net, memory and process rules applied by chaos-init in SECCOMP mode, on glibc
+# and musl (Docker).
 #
-# Builds chaos-init (docker/Dockerfile.build) and a statically linked Go program
-# (CGO_ENABLED=0, the kind LD_PRELOAD cannot reach), then runs them and a static
-# C probe under chaos-init in glibc and musl containers, with Docker's default
-# security profile:
+# Proves that chaos-init applies rules to programs LD_PRELOAD cannot reach: a static C probe
+# (seccomp_probe.c) and a static Go program (seccomp_go, CGO_ENABLED=0, raw system calls). Under
+# Docker's default seccomp profile:
 #
-# - an open rule fails the open with its errno (C and Go), unmatched paths open;
-# - a LATENCY rule delays the open (C and Go);
-# - @first=1 fires once per process, a forked child included, and each process
-#   writes its own hits file; a program an execve starts counts as a new process;
-# - the io status file reports the loaded rules;
-# - a connect rule refuses the connection (C and Go), a recv LATENCY rule delays
-#   the server side's read (Go), and the net status file reports the rules;
-# - an mmap rule fails a mapping of its size (C and Go), a fork rule fails fork
-#   (C), a posix_spawn rule fails Go's os/exec, an execve rule fails a later
-#   exec but never the start of the application itself;
-# - a rule SECCOMP mode cannot apply (TORN) rejects its file, named in the status;
-# - the dynamic loader of a program is faulted like the program (glibc).
+# - io: an open rule fails the open with its errno (C, Go) and unmatched paths open; LATENCY
+#   delays the open (C, Go), also under SIGALRM every 20 ms, where the delay is neither cut
+#   short nor restarted per signal and counts one hit (also with the pre-5.19 test build,
+#   CHAOS_INIT_TEST_NO_KILLABLE_WAIT); a rule naming a symlink covers the real file;
+#   @first=1 fires once per process, a forked child included, one hits file per process; an
+#   execve starts a new process for @first while the old image keeps its hits file; the
+#   status file reports the rules;
+# - lifecycle: when chaos-init is not PID 1, the application exit code returns at once and
+#   an orphan it left is still answered (its rule applied, or the open allowed where Yama
+#   ptrace_scope hides its path), never ENOSYS; the background chaos-init exits with it;
+# - net: a connect rule refuses the connection (C, Go); recv LATENCY delays the server read
+#   (Go); a poll TIMEOUT makes select and poll wait out 200 ms with nothing ready while a
+#   select without timeout still returns; the status file reports the rules;
+# - memory: an mmap rule gated by @size fails only mappings of that size (C, Go); on glibc an
+#   mmap/file rule makes the dynamic loader of /bin/ls fail (exit 127);
+# - process: an execve rule never blocks the start of the application itself (direct, PATH
+#   search, #!-less script via /bin/sh), a non-executable command exits 126, a later exec is
+#   refused, a fork rule fails fork (C), a posix_spawn rule fails Go os/exec;
+# - a rule SECCOMP mode cannot apply (TORN) rejects the whole file, named in the status;
+# - without chaos-init the same rules change nothing.
 #
-# Without chaos-init the same opens succeed. Under emulation (amd64 on an arm64
-# host) seccomp is unavailable and the test is skipped.
+# Under emulation (a foreign architecture through QEMU) seccomp user notification is unavailable:
+# the suite exits CHAOS_SKIP_EXIT from inside the container.
 #
-# Usage:   test_seccomp.sh [linux/amd64|linux/arm64]
-# Env:     CHAOS_SECCOMP_DOCKER_PLATFORM  platform override
-# Prereqs: docker with buildx and multi-arch support
+# Method: docker buildx builds the static chaos-init (make cross-init-<arch>) on alpine:3.20 and
+# golang:1.24-alpine builds seccomp_go. In gcc:bookworm and then alpine:3.20 containers,
+# seccomp_probe.c and the pre-5.19 chaos-init test build are compiled from the read-only repository
+# mount and the checks run.
+#
+# Usage:   test_seccomp.sh [linux/amd64|linux/arm64]   (default: the host architecture)
+# Env:     CHAOS_SECCOMP_DOCKER_PLATFORM  platform when no argument is given
+#          CHAOS_SKIP_EXIT  exit status of a skip (default 0; CI sets 1); passed into
+#          the containers
+# Prereqs: docker with buildx; a kernel with seccomp user notification (5.5+). Run by
+#          `make test`.
+# Exit:    0 when every check passes; 1 when chaos-init or the Go probe was not built;
+#          non-zero when a container check fails (all checks of a libc still run and
+#          report); 2 on bad usage; CHAOS_SKIP_EXIT when the host or platform is not
+#          amd64/arm64, docker is missing, its daemon is unreachable, or SECCOMP mode is
+#          unavailable in the container.
 
 set -eu
 
@@ -106,7 +127,8 @@ case "$LIBC" in
     musl) apk add --no-cache build-base linux-headers >/dev/null ;;
 esac
 gcc -D_GNU_SOURCE -std=c99 -Wall -Wextra -Werror -pedantic -O2 -static -o /tmp/probe /work/test/runtime/seccomp_probe.c
-# chaos-init as on kernels before 5.19, where a signal restarts a delayed call.
+# A chaos-init test build that behaves as on kernels before 5.19, which lack the killable
+# notification wait: there a signal restarts a delayed call as a new notification.
 (cd /work && gcc -D_GNU_SOURCE -Isrc -Isrc/common -Isrc/core -Isrc/config -Isrc/effects \
     -Isrc/wrappers -Isrc/net -Isrc/dns -Isrc/time -Isrc/process -Isrc/memory -Isrc/init \
     -std=c99 -Wall -Wextra -Werror -pedantic -O2 -static -DCHAOS_INIT_TEST_NO_KILLABLE_WAIT \
@@ -124,10 +146,10 @@ fi
 expect "C: no rules, no chaos-init: open works" "$(/tmp/probe open /tmp/sec/data/x)" "ok"
 printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/slow:open:LATENCY:150 # t" \
     "/tmp/sec/once:open:EACCES:1.0 @first=1 # t" > /tmp/.chaos-io.conf
-# A signal every 20 ms must neither cut the delay short nor restart it: the
-# kernel restarts an interrupted call as a new notification, which would be
-# delayed again and again (without the killable wait of 5.19, without the
-# delay queue recognising it).
+# A signal every 20 ms must neither cut the delay short nor restart it. The kernel restarts an
+# interrupted call as a new notification; without the 5.19 killable wait, and without the
+# delay queue recognising the restart, each one would be delayed again and the call would
+# never finish. Both builds must take 150-2000 ms and count one hit.
 for variant in "$init" /tmp/chaos-init-restart; do
     rm -f /tmp/.chaos-io.hits.*
     ms=$(timeout 10 $variant --libs io -- /tmp/probe signalled /tmp/sec/slow/x || echo 99999)
@@ -140,17 +162,17 @@ for variant in "$init" /tmp/chaos-init-restart; do
     expect "$variant: the interrupted delay counted once" \
         "$(cat /tmp/.chaos-io.hits.* 2>/dev/null | awk -F "\t" "\$2 ~ /slow/ { s += \$1 } END { print s + 0 }")" "1"
 done
-# chaos-init is not PID 1 here (sh is): when the application exits, its exit code
-# is returned at once, and the child it left behind is still answered, rules
-# included, instead of every filtered call failing with ENOSYS.
+# chaos-init is not PID 1 here (sh is). When the application exits, its exit code is returned
+# at once, and the child it left behind is still answered, rules included, instead of every
+# filtered call of that child failing with ENOSYS.
 rm -f /tmp/sec/orphan.out
 code=0
 $init --libs io -- /tmp/probe orphan /tmp/sec/data/x /tmp/sec/orphan.out >/dev/null || code=$?
 expect "the application exit code returns before its orphan is done" "$code $(cat /tmp/sec/orphan.out 2>/dev/null || echo none)" "3 none"
 sleep 1
-# The copy that answers it is not its ancestor: where Yama allows only ancestors to
-# read a process (ptrace_scope 1, as on Ubuntu hosts), its path is unknown and the
-# open runs. Answered either way, never ENOSYS or blocked.
+# The chaos-init copy that answers the orphan is not its ancestor. Where Yama lets only
+# ancestors read a process (ptrace_scope 1, the Ubuntu default), the orphan path arguments are
+# unreadable and the open is allowed. Answered either way, never ENOSYS and never blocked.
 if [ "$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 0)" = 0 ]; then
     expect "the orphan is still answered, its rule applied" "$(cat /tmp/sec/orphan.out 2>/dev/null)" "EIO"
 else
@@ -158,8 +180,8 @@ else
 fi
 expect "the background chaos-init ends with the last process" \
     "$(grep -l chaos-init /proc/[0-9]*/comm 2>/dev/null | wc -l | tr -d " ")" "0"
-# A rule written with the name of a link covers the files under its real name, which
-# is how /proc names an open descriptor.
+# A rule written with the name of a symlink covers the files under its real name, which is the
+# name /proc reports for an open descriptor.
 mkdir -p /tmp/sec/real && echo data > /tmp/sec/real/f && ln -sfn /tmp/sec/real /tmp/sec/link
 cp /tmp/.chaos-io.conf /tmp/sec/io.conf
 echo "/tmp/sec/link:read:EIO:1.0 # t" > /tmp/.chaos-io.conf
@@ -209,8 +231,8 @@ expect "C: mmap rule fails a mapping of its size" "$($init --libs memory -- /tmp
 expect "C: other sizes map" "$($init --libs memory -- /tmp/probe mmap 4096)" "ok"
 expect "Go: mmap rule fails a mapping of its size" "$($init --libs memory -- $go mmap 1234567)" "ENOMEM"
 expect "Go: other sizes map, the runtime runs" "$($init --libs memory -- $go mmap 4096)" "ok"
-# The dynamic loader is a part of the process too (docs/SECCOMP.md section 5): a
-# rule on file mappings keeps a dynamic program from mapping its libraries.
+# The dynamic loader is part of the process too (docs/SECCOMP.md section 5): an mmap/file
+# rule keeps a dynamic program from mapping its libraries, so it exits 127 (glibc only).
 if [ "$LIBC" = glibc ]; then
     printf "%s\n" "mmap/file:ERRNO:ENOMEM # t" > /tmp/.chaos-memory.conf
     code=0
@@ -224,9 +246,9 @@ expect "C: the application starts despite an execve rule" "$($init --libs proces
 mkdir -p /tmp/sec/bin && cp /tmp/probe /tmp/sec/bin/probe-in-path
 expect "C: one found by PATH search starts too" \
     "$(PATH=/nonexistent:/tmp/sec/bin $init --libs process -- probe-in-path open /tmp/sec/other)" "ok"
-# As execvp() would: a script without #! runs through /bin/sh, still as the start
-# the execve rule leaves alone; a command found only without execute permission
-# is refused (126), not missing (127).
+# As execvp() does: a script without #! runs through /bin/sh and is still the start the execve
+# rule leaves alone; a command found only without execute permission is refused (126), not
+# missing (127).
 printf "%s\n" "echo script-ok" > /tmp/sec/noshebang && chmod 755 /tmp/sec/noshebang
 expect "C: a script without #! starts through /bin/sh" "$($init --libs process -- /tmp/sec/noshebang)" "script-ok"
 printf "%s\n" "echo no" > /tmp/sec/bin/not-executable && chmod 644 /tmp/sec/bin/not-executable

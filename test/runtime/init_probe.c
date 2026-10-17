@@ -1,15 +1,25 @@
 /**
  * @file init_probe.c
- * @brief Runtime probe: the application chaos-init starts in test_init.sh.
+ * @brief The tracee test_init.sh starts under chaos-init in SECCOMP mode; each mode exercises
+ *        one part of the process model chaos-init must keep transparent.
  *
- * Usage: init_probe status|work|exit <n>|selfkill|term|orphans
+ * @details
+ * Usage: init_probe status|work|exit <n>|selfkill|term|orphans. Built -static, so it also
+ * proves the mode for programs with no dynamic loader (LD_PRELOAD mode cannot reach them).
  *
- * - status:   prints /tmp/.chaos-init.status
- * - work:     files, sockets, mmap, fork and exec all still work under the filter
- * - exit:     exits with <n>
- * - selfkill: dies by SIGKILL
- * - term:     prints "ready", exits 42 on SIGTERM
- * - orphans:  leaves a grandchild to chaos-init and checks that no zombie remains
+ * - status:   prints /tmp/.chaos-init.status; exit 1 when it is missing or empty.
+ * - work:     file write/pread, loopback TCP connect/accept/send/recv, mmap/munmap, fork +
+ *             exec of itself; prints "work ok (0)" or "work failed (<step>)" and exits with
+ *             the failing step number (1 file, 2 listen, 3 connect, 4 accept/send/recv,
+ *             5 mmap, 6 fork/exec/wait).
+ * - exit <n>: exits with n (exit-status pass-through).
+ * - selfkill: raise(SIGKILL) (death-by-signal pass-through, shell status 137).
+ * - term:     prints "ready", then exits 42 on SIGTERM (signal forwarding).
+ * - orphans:  leaves a grandchild that outlives its parent by 200 ms, so chaos-init (PID 1 of
+ *             the tracee tree) inherits it; prints "zombies=<n>" after waiting up to 5 s and
+ *             exits 0 only when no zombie is left in the PID namespace.
+ *
+ * Exit: as listed per mode; 2 on bad usage.
  */
 
 #ifndef _GNU_SOURCE
@@ -29,6 +39,7 @@
 #include <time.h>
 #include <unistd.h>
 
+/** @brief Sleeps @p ms milliseconds with nanosleep(); EINTR ends the sleep early. */
 static void pause_ms(long ms)
 {
     struct timespec delay = {ms / 1000L, (ms % 1000L) * 1000000L};
@@ -36,6 +47,7 @@ static void pause_ms(long ms)
     (void)nanosleep(&delay, NULL);
 }
 
+/** @brief Exercises files, sockets, mmap, fork and exec; 0 or the failing step (1-6). */
 static int work(void)
 {
     char buffer[8] = {0};
@@ -93,13 +105,14 @@ static int work(void)
     return 0;
 }
 
+/** @brief SIGTERM handler: exits 42 so the caller can tell forwarding from a default kill. */
 static void on_term(int signal_number)
 {
     (void)signal_number;
     _exit(42);
 }
 
-/** @brief Number of zombie processes in this PID namespace. */
+/** @brief Counts processes in state Z in /proc, i.e. zombies in this PID namespace. */
 static int zombies(void)
 {
     DIR *proc = opendir("/proc");
@@ -189,8 +202,8 @@ int main(int argc, char **argv)
             _exit(0);
         }
         (void)waitpid(child, NULL, 0);
-        /* The grandchild ends after 200 ms; chaos-init reaps it soon after, on a
-         * busy machine not always within a fixed time: up to 5 s. */
+        /* The grandchild ends after 200 ms and chaos-init must reap it; on a loaded or emulated
+         * machine that is not bounded, so poll for up to 50 x 100 ms = 5 s. */
         {
             int tries = 0;
 

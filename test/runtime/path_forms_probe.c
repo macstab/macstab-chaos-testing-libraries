@@ -1,24 +1,36 @@
 /**
  * @file path_forms_probe.c
- * @brief Runtime probe: the path forms of file operations are faulted like the *at forms.
+ * @brief Proves that libchaos-io faults the path forms of file operations like their *at and
+ *        descriptor forms, matches paths as the kernel resolves them, and keeps its descriptor
+ *        bookkeeping and vectored writes safe.
  *
+ * @details
  * glibc and musl implement unlink(), rmdir(), remove(), rename(), renameat2() (glibc),
- * truncate(), creat(), fopen(), freopen() and posix_fallocate() with
- * their own system calls rather than through unlinkat(), renameat(), ftruncate(),
- * open() or fallocate(). They are the forms most programs use (the JDK deletes with unlink() and
- * moves with rename()), so each must reach the same rule as its *at or descriptor
- * form. Every call below runs under a rule that fails its operation, then once more
- * without a rule to show the real call still works.
+ * truncate(), creat(), fopen(), fopen64() (glibc), freopen() and posix_fallocate() with their
+ * own system calls instead of calling unlinkat(), renameat(), ftruncate(), open() or
+ * fallocate(). These are the forms most programs use (the JDK deletes with unlink() and moves
+ * with rename()), so each needs its own wrapper reaching the same rule. Each call runs under a
+ * rule that fails its operation, the file system must be unchanged afterwards, and the real
+ * call must work once the rule is gone. posix_fallocate must return the error and keep errno.
  *
- * Paths are matched as the kernel resolves them (`.`, `..`, `//`, relative), and a
- * file opened through a link is known by its real path to the descriptor rules.
+ * Further checks:
+ * - check_path_spellings: `.`, `..`, `//` and relative paths reach a path rule; a descriptor
+ *   opened through a symlink is matched by its real path, and a rule naming the symlink
+ *   covers the file under its real name.
+ * - check_unseen_close: a descriptor libc closes internally (closedir) is dropped from the
+ *   fd cache, so a pipe that reuses the number is not mistaken for the directory.
+ * - check_wildcard_spares_non_files: `*:write:TORN` tears a regular file but writes an
+ *   eventfd, a pipe and a socket whole; tearing an 8-byte eventfd write would be EINVAL.
+ * - check_vectored_writes: under a matching TORN rule, writev with an unmapped iovec array
+ *   gets the kernel's EFAULT and with IOV_MAX + 1 entries the kernel's EINVAL instead of a
+ *   crash in the wrapper; a 100-entry vector too long to tear is written whole; a 2-entry
+ *   vector is torn to 1 byte.
  *
- * Vectored writes under a matching rule also get the kernel's answer for an array
- * the kernel rejects (unmapped, longer than IOV_MAX) instead of a crash in the
- * wrapper, and a vector too long to tear is written whole.
+ * Usage: path_forms_probe, under LD_PRELOAD of libchaos-io; run by test_path_forms.sh on glibc
+ * and musl. Works in /tmp/path-forms-probe.
  *
- * Usage: path_forms_probe   (under LD_PRELOAD of libchaos-io)
- * Exit code 0 when every call was faulted and then succeeded, 1 otherwise.
+ * Exit: 0 when every check passed; 1 when any failed (all run; each prints ok/FAIL); 2 on a
+ * setup failure.
  */
 
 #ifndef _GNU_SOURCE
@@ -46,6 +58,7 @@
 
 static int g_failures = 0;
 
+/** @brief Prints ok, or FAIL with errno and records a failure. */
 static void expect(const char *what, int ok)
 {
     if (!ok)
@@ -57,13 +70,13 @@ static void expect(const char *what, int ok)
     (void)printf("ok   %s\n", what);
 }
 
-/** Replaces the rule file atomically (new inode), as the framework's writers do. */
 /**
- * @brief Waits until the library is due to look at its rule file again.
+ * @brief Sleeps 2 ms so the next intercepted call re-checks the rule file.
  *
- * Once rules are loaded the libraries look at the rule file at most every
- * millisecond, so a change takes effect within that time, not on the very next
- * call. The sleep is a raw system call: libchaos-time may be faulting nanosleep.
+ * With rules loaded, a library stats its rule file at most once per CHAOS_CHECK_INTERVAL_NS
+ * (1 ms); a rewrite is seen by the first call after that, not necessarily the next call. The
+ * sleep is a raw clock_nanosleep system call, restarted on EINTR, so no wrapper (libchaos-time
+ * faults nanosleep) can fail or stretch it.
  */
 static void wait_for_rule_check(void)
 {
@@ -74,6 +87,14 @@ static void wait_for_rule_check(void)
     }
 }
 
+/**
+ * @brief Replaces `/tmp/.chaos-io.conf` atomically: writes its `.staging` sibling, then
+ *        rename()s it over the rule file.
+ *
+ * The rename gives the file a new inode, which changes the reload change stamp regardless of
+ * mtime granularity, and a library never reads a half-written file. This is how the framework's
+ * own writers update rule files. Exits the probe with status 2 on any I/O error.
+ */
 static void write_rules_now(const char *rules)
 {
     FILE *file = fopen(CONF ".staging", "w");
@@ -86,13 +107,14 @@ static void write_rules_now(const char *rules)
     }
 }
 
-/** @brief Writes the rules, then waits until the library looks at them. */
+/** @brief write_rules_now(), then wait_for_rule_check(). */
 static void write_rules(const char *rules)
 {
     write_rules_now(rules);
     wait_for_rule_check();
 }
 
+/** @brief Creates @p path holding the 7 bytes "payload"; exits 2 on failure. */
 static void make_file(const char *path)
 {
     int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
@@ -118,9 +140,10 @@ static int open_fails_eio(const char *path)
 }
 
 /**
- * @brief A path is matched as the kernel resolves it: `.`, `..`, repeated slashes
- *        and relative forms reach the rule, and a file opened through a link is
- *        known by its real path to the descriptor rules.
+ * @brief Paths are matched as the kernel resolves them: `.`, `..`, repeated slashes and
+ *        relative forms reach a path rule, and a descriptor opened through a symlink is known
+ *        by its real path to descriptor rules. Without this, any spelling other than the
+ *        rule's would bypass it.
  */
 static void check_path_spellings(void)
 {
@@ -154,7 +177,7 @@ static void check_path_spellings(void)
         fd >= 0 && read(fd, buffer, sizeof(buffer)) == -1 && errno == EIO && close(fd) == 0
     );
 
-    /* A rule written with the link's name covers the file under its real name. */
+    /* The rule's own path is resolved too: a rule naming the symlink covers the real file. */
     write_rules(PROBE_DIR "/link:read:EIO:1.0\n");
     fd = open(PROBE_DIR "/data/f", O_RDONLY);
     errno = 0;
@@ -172,8 +195,9 @@ static void check_path_spellings(void)
 }
 
 /**
- * @brief A descriptor the C library closes itself (closedir) is forgotten: a pipe
- *        that gets its number is not taken for the directory.
+ * @brief A descriptor libc closes internally (closedir) is dropped from the fd cache: a pipe
+ *        that reuses the number is read normally instead of matching the directory's
+ *        read:EIO rule.
  */
 static void check_unseen_close(void)
 {
@@ -206,8 +230,9 @@ static void check_unseen_close(void)
 }
 
 /**
- * @brief A `*` rule is for files: an eventfd, a pipe and a socket are written whole
- *        under `*:write:TORN`, while a file is torn.
+ * @brief A `*` selector covers files only: under `*:write:TORN` an eventfd, a pipe and a socket
+ *        are written whole (an eventfd write shorter than 8 bytes is EINVAL) while a regular
+ *        file is torn.
  */
 static void check_wildcard_spares_non_files(void)
 {
@@ -237,10 +262,15 @@ static void check_wildcard_spares_non_files(void)
     expect("torn file removed", unlink(PROBE_DIR "/torn.bin") == 0);
 }
 
-/** @brief writev through a pointer, so libc's attributes accept invalid arguments. */
+/** @brief writev called through a volatile pointer, so the compiler cannot reject or fold the
+ * deliberately invalid arguments using libc's declaration attributes. */
 static ssize_t (*volatile g_writev)(int, const struct iovec *, int) = writev;
 
-/** @brief Vectored writes with arrays the wrapper must not walk or cannot tear. */
+/**
+ * @brief writev under a matching TORN rule with arrays the wrapper must not walk (unmapped:
+ *        EFAULT; IOV_MAX + 1 entries: EINVAL, both from the kernel) or cannot tear (100
+ *        entries, written whole); a 2-entry vector is torn to 1 byte.
+ */
 static void check_vectored_writes(void)
 {
     static struct iovec many[100];

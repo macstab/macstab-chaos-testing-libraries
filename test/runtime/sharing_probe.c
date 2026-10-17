@@ -1,25 +1,35 @@
 /**
  * @file sharing_probe.c
- * @brief Runtime probe: libchaos-io and libchaos-net share read/write/close safely.
+ * @brief Proves that libchaos-io and libchaos-net share read/write/readv/writev/close safely in
+ *        any preload order.
  *
- * Both libraries interpose read, write, readv, writev and close: io acts on files,
- * net on sockets, each forwarding everything else down the chain. This probe checks
- * that the right library's rules apply to the right descriptor whichever libraries
- * are preloaded and in whichever order, and checks the descriptor bookkeeping the
- * sharing depends on.
+ * @details
+ * Both libraries wrap read, write, readv, writev and close: libchaos-io acts on files,
+ * libchaos-net on sockets, and each forwards every other descriptor to the next definition in
+ * the chain. A wrong classification would fault a file with a network rule (or the reverse),
+ * or swallow the call. The probe also checks the descriptor bookkeeping the sharing relies on:
+ * libchaos-io's fd-to-path cache must follow close, fd reuse and dup2 across threads.
  *
  * Usage: sharing_probe <scenario>
- *   socket-rules     net rules fault socket read/write/readv/writev; files untouched
- *   file-rules       io rules fault file read/write/close; sockets untouched
- *   close-reset      a net close:RESET rule makes the peer see ECONNRESET
- *   close-errno      an injected close error is reported after a real close (io and net)
- *   cache-threads    a close on one thread invalidates the path another thread cached
- *   cache-dup2       dup2 onto a cached descriptor makes it match the new file
- *   no-rules         nothing changes without rules
+ * - socket-rules   net recv/send rules fault read/readv/write/writev on a socket, a file is
+ *                  untouched, and the socket works again once the rule file is removed.
+ * - file-rules     io read/write rules fault a file; a socket is untouched.
+ * - close-reset    net close:RESET: close() succeeds and the peer reads ECONNRESET, not EOF.
+ * - close-errno    an injected close error (net EINTR, io EIO) is returned only after the
+ *                  descriptor was really closed (F_GETFD then fails with EBADF), as Linux
+ *                  close(2) semantics require: retrying close must never hit a reused fd.
+ * - cache-threads  a close on one thread and reuse of the fd number for another file make a
+ *                  second thread's next pread match the new file's rule.
+ * - cache-dup2     dup2() onto a cached descriptor makes it match the new file's rule.
+ * - no-rules       without rule files, file and socket I/O and close behave normally and the
+ *                  peer sees an orderly end of stream.
  *
- * Scenarios that need a library check for its rule file being honoured and report
- * "skip" when that library is not preloaded, so every preload combination can run
- * every scenario. Exit code 0 on success, 1 on the first failure.
+ * A scenario that needs a library not named in LD_PRELOAD prints "skip" and passes, so every
+ * preload combination can run every scenario. Run by test_sharing_glibc.sh under io, net,
+ * "io net" and "net io".
+ *
+ * Exit: 0 when every check of the scenario passed (or it skipped); 1 when any check failed
+ * (all run; each prints ok/FAIL); 2 on bad usage or a setup failure.
  */
 
 #ifndef _GNU_SOURCE
@@ -47,6 +57,7 @@
 
 static int g_failures = 0;
 
+/** @brief Prints ok, or FAIL with errno and records a failure. */
 static void check(const char *what, int ok)
 {
     if (!ok)
@@ -58,13 +69,13 @@ static void check(const char *what, int ok)
     (void)printf("ok   %s\n", what);
 }
 
-/** Replaces a rule file atomically (new inode), as the framework's writers do. */
 /**
- * @brief Waits until the library is due to look at its rule file again.
+ * @brief Sleeps 2 ms so the next intercepted call re-checks the rule file.
  *
- * Once rules are loaded the libraries look at the rule file at most every
- * millisecond, so a change takes effect within that time, not on the very next
- * call. The sleep is a raw system call: libchaos-time may be faulting nanosleep.
+ * With rules loaded, a library stats its rule file at most once per CHAOS_CHECK_INTERVAL_NS
+ * (1 ms); a rewrite is seen by the first call after that, not necessarily the next call. The
+ * sleep is a raw clock_nanosleep system call, restarted on EINTR, so no wrapper (libchaos-time
+ * faults nanosleep) can fail or stretch it.
  */
 static void wait_for_rule_check(void)
 {
@@ -75,6 +86,14 @@ static void wait_for_rule_check(void)
     }
 }
 
+/**
+ * @brief Replaces the rule file at @p path atomically: writes `<path>.staging`, then
+ *        rename()s it over @p path.
+ *
+ * The rename gives the file a new inode, which changes the reload change stamp regardless of
+ * mtime granularity, and a library never reads a half-written file. This is how the framework's
+ * own writers update rule files. Exits the probe with status 2 on any I/O error.
+ */
 static void write_rules_now(const char *path, const char *rules)
 {
     char staging[256];
@@ -89,13 +108,14 @@ static void write_rules_now(const char *path, const char *rules)
     }
 }
 
-/** @brief Writes the rules, then waits until the library looks at them. */
+/** @brief write_rules_now(), then wait_for_rule_check(). */
 static void write_rules(const char *path, const char *rules)
 {
     write_rules_now(path, rules);
     wait_for_rule_check();
 }
 
+/** @brief Non-zero when LD_PRELOAD contains @p name. */
 static int preloaded(const char *name)
 {
     const char *preload = getenv("LD_PRELOAD");
@@ -103,7 +123,7 @@ static int preloaded(const char *name)
     return preload != NULL && strstr(preload, name) != NULL;
 }
 
-/** A connected loopback TCP pair: *client and *server, listening port in *port. */
+/** @brief Connected loopback TCP pair on an ephemeral port; exits 2 on failure. */
 static void tcp_pair(int *client, int *server, unsigned int *port)
 {
     struct sockaddr_in address;
@@ -131,6 +151,10 @@ static void tcp_pair(int *client, int *server, unsigned int *port)
     (void)close(listener);
 }
 
+/**
+ * @brief Creates @p dir (0700) and @p dir/@p name holding "abcdefgh", offset rewound to 0;
+ *        exits 2 on failure.
+ */
 static int open_data_file(const char *dir, const char *name)
 {
     char path[256];
@@ -299,6 +323,7 @@ static pthread_mutex_t g_step_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_step_cond = PTHREAD_COND_INITIALIZER;
 static int g_step = 0;
 
+/** @brief Blocks until the shared step counter reaches @p step (orders the two threads). */
 static void wait_step(int step)
 {
     (void)pthread_mutex_lock(&g_step_lock);
@@ -309,6 +334,7 @@ static void wait_step(int step)
     (void)pthread_mutex_unlock(&g_step_lock);
 }
 
+/** @brief Sets the shared step counter to @p step and wakes the waiter. */
 static void advance_step(int step)
 {
     (void)pthread_mutex_lock(&g_step_lock);
@@ -317,19 +343,22 @@ static void advance_step(int step)
     (void)pthread_mutex_unlock(&g_step_lock);
 }
 
-/** Reads the shared descriptor twice: before and after the main thread swapped its file. */
+/**
+ * @brief Reader thread: preads the shared descriptor before and after the main thread closed
+ *        it and reused the number for a file under a rule.
+ */
 static void *cache_reader(void *unused)
 {
     char buffer[4];
     (void)unused;
 
-    /* Caches the descriptor as DATA_DIR/a.bin; no rule covers that directory. */
+    /* This pread makes libchaos-io cache the fd as DATA_DIR/a.bin, which no rule covers. */
     check(
         "reader thread: first read of a.bin is untouched", pread(g_shared_fd, buffer, 2U, 0) == 2
     );
     advance_step(1);
     wait_step(2);
-    /* The number now refers to OTHER_DIR/b.bin, which the rule covers. */
+    /* The number now names OTHER_DIR/b.bin; a stale cache entry would let this pass. */
     errno = 0;
     check(
         "reader thread: the reused descriptor matches the new file's rule",
@@ -354,7 +383,7 @@ static void scenario_cache_threads(void)
     number = g_shared_fd;
     (void)pthread_create(&reader, NULL, cache_reader, NULL);
     wait_step(1);
-    /* Close on this thread, reopen another file: the lowest free number comes back. */
+    /* POSIX open() returns the lowest free number, so the reopen reuses the closed fd. */
     (void)close(g_shared_fd);
     reopened = open_data_file(OTHER_DIR, "b.bin");
     check("the descriptor number was reused", reopened == number);

@@ -1,26 +1,32 @@
 /**
  * @file seccomp_probe.c
- * @brief Runtime probe for test_seccomp.sh: a static program under chaos-init.
+ * @brief Static C tracee for test_seccomp.sh: performs one intercepted operation per mode and
+ *        prints the outcome for the script to compare.
  *
- * Usage: seccomp_probe open <path>    prints "ok" or the errno name
- *        seccomp_probe openms <path>  prints how long the open took, in ms
- *        seccomp_probe read <path>    opens the file and reads it: "ok" or the errno name
- *        seccomp_probe signalled <path> the same, with a SIGALRM (SA_RESTART)
- *                                     every 20 ms interrupting the open
- *        seccomp_probe first <path>   opens twice, then once in a forked child:
- *                                     "parent=<1st>,<2nd> child=<1st>"
- *        seccomp_probe connect <port> listens on 127.0.0.1:<port>, connects to it:
- *                                     "ok" or the errno name
- *        seccomp_probe mmap <bytes>   maps that many anonymous bytes
- *        seccomp_probe waits <port>   a readable socket waited on by select and poll
- *                                     with 200 ms, and by select without a timeout:
- *                                     "select=<rc>,<set>,<ms> poll=<rc>,<revents>
- *                                     forever=<rc>"
- *        seccomp_probe orphan <path> <out> exits 3 at once, leaving a child that
- *                                     opens <path> 300 ms later and writes the
- *                                     result ("ok" or the errno name) to <out>
- *        seccomp_probe fork           forks a child that exits at once
- *        seccomp_probe exec           executes /bin/true (prints only on failure)
+ * @details
+ * Built -static, so no dynamic loader exists and LD_PRELOAD mode cannot reach it; every fault
+ * it observes comes from chaos-init answering seccomp user notifications (SECCOMP mode). It
+ * prints errno names (EIO, EACCES, ECONNREFUSED, ENOMEM; strerror() text otherwise).
+ *
+ * Usage: seccomp_probe <mode> [arg]
+ * - open <path>         open(O_RDONLY|O_CREAT): "ok" or the errno name.
+ * - openms <path>       the same, printing the elapsed ms instead (LATENCY checks).
+ * - read <path>         open, then read 1 byte: "ok" or the errno name of the failing call.
+ * - signalled <path>    openms with SIGALRM (SA_RESTART) every 20 ms: a delayed open must
+ *                       be neither cut short nor restarted and delayed again per signal.
+ * - first <path>        opens twice, then once in a forked child:
+ *                       "parent=<1st>,<2nd> child=<1st>" (@first is per process).
+ * - connect <port>      listens on 127.0.0.1:<port> and connects to it.
+ * - mmap <bytes>        anonymous mapping of that size (@size gates).
+ * - waits <port>        with one byte pending, select and poll with 200 ms, then select with
+ *                       no timeout: "select=<rc>,<isset>,<waited|early> poll=<rc>,<revents>
+ *                       forever=<rc>"; "waited" means >= 150 ms elapsed.
+ * - orphan <path> <out> exits 3 at once, leaving a child that opens <path> 300 ms later and
+ *                       writes "ok" or the errno name to <out>.
+ * - fork                fork + waitpid: "ok" or the errno name.
+ * - exec                execl("/bin/true"); prints the errno name only when it fails.
+ *
+ * Exit: 0 after printing (orphan: 3); 1 on a setup failure; 2 on bad usage.
  */
 
 #ifndef _GNU_SOURCE
@@ -44,6 +50,7 @@
 #include <time.h>
 #include <unistd.h>
 
+/** @brief Symbolic name for the errnos the script compares, strerror() text otherwise. */
 static const char *try_open_errno_name(int error)
 {
     switch (error)
@@ -61,6 +68,7 @@ static const char *try_open_errno_name(int error)
     }
 }
 
+/** @brief open(O_RDONLY|O_CREAT, 0644) and close: "ok" or the errno name. */
 static const char *try_open(const char *path)
 {
     const int fd = open(path, O_RDONLY | O_CREAT, 0644);
@@ -73,12 +81,13 @@ static const char *try_open(const char *path)
     return try_open_errno_name(errno);
 }
 
+/** @brief Empty SIGALRM handler: the signal exists only to interrupt the delayed call. */
 static void on_alarm(int signal_number)
 {
     (void)signal_number;
 }
 
-/** @brief Prints how long opening @p path takes, in ms. */
+/** @brief Prints how long opening @p path takes, in ms (CLOCK_MONOTONIC). */
 static void print_open_ms(const char *path)
 {
     struct timespec start;

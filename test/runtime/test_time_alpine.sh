@@ -1,15 +1,29 @@
 #!/bin/sh
 #
-# test_time_alpine.sh — libchaos-time runtime validation on musl/Alpine (Docker).
+# test_time_alpine.sh: libchaos-time end-to-end in LD_PRELOAD mode on musl (Alpine 3.20).
 #
-# Builds libchaos-time.so for the target platform using Docker buildx with a
-# musl (alpine) base, then runs the pre-compiled time_probe binary under
-# LD_PRELOAD in an Alpine container. Validates clock_gettime, clock_getres,
-# nanosleep, and usleep fault injection on musl libc for amd64 and arm64.
+# Proves, for one architecture per run, that clock_gettime, gettimeofday, time, timespec_get,
+# nanosleep, clock_nanosleep, usleep and sleep honour ERRNO, LATENCY, OFFSET and REGRESS rules,
+# including absolute-deadline conversion under OFFSET; time_probe.c lists every check.
 #
-# Usage:   test_time_alpine.sh [linux/amd64|linux/arm64]
-# Env:     CHAOS_TIME_DOCKER_PLATFORM  platform override
-# Prereqs: docker with buildx and multi-arch support
+# Method: docker buildx builds libchaos-time-musl-<arch>.so (make cross-musl-<arch>) from
+# docker/Dockerfile.build on alpine:3.20. Then a fresh alpine:3.20 container (build-base installed
+# at run time) compiles test/runtime/time_probe.c from the read-only repository mount and runs it
+# with LD_PRELOAD=/tmp/libchaos-time.so. The probe is compiled in the target image so it uses the
+# same libc the library was built against.
+#
+# Interposition happens at symbol binding, so calls that libc would serve from the vDSO are still
+# intercepted; only a program that calls the vDSO directly bypasses libchaos-time.
+#
+# Usage:   test_time_alpine.sh [linux/amd64|linux/arm64]   (default: the host architecture)
+# Env:     CHAOS_TIME_DOCKER_PLATFORM  platform when no argument is given
+#          CHAOS_SKIP_EXIT  exit status of a skip (default 0; CI sets 1)
+# Prereqs: docker with buildx; QEMU binfmt for a foreign platform. Run by `make test` and,
+#          once per platform, by `make test-matrix`.
+# Exit:    the probe's exit code (0 = every check passed; time_probe.c lists the others);
+#          non-zero when the build fails or yields no library; 2 on bad usage;
+#          CHAOS_SKIP_EXIT when the host or platform is not amd64/arm64, docker is missing
+#          or its daemon is unreachable.
 
 set -eu
 

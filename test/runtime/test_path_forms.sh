@@ -1,15 +1,25 @@
 #!/bin/sh
 #
-# test_path_forms.sh — unlink, rmdir, rename, truncate and creat are faulted (Docker).
+# test_path_forms.sh: libchaos-io faults the path forms of file operations (unlink, rmdir, remove,
+# rename, renameat2, truncate, creat, fopen, freopen, posix_fallocate) on glibc and musl (Docker).
 #
-# Builds libchaos-io for glibc (debian:bookworm) and musl (alpine:3.20) and runs
-# path_forms_probe under each. Both libcs implement these path forms with their own
-# system calls rather than through the *at or descriptor forms, so each needs its
-# own wrapper to reach the unlink, rename_to, truncate and open rules.
+# Proves that each libc's own implementations of these calls, which issue their own system calls
+# instead of going through the *at or descriptor forms, reach the unlink, rename_to, truncate, open
+# and allocate rules; plus path-spelling resolution, fd-cache hygiene and vectored-write safety
+# (path_forms_probe.c lists every check).
 #
-# Usage:   test_path_forms.sh [linux/amd64|linux/arm64]
-# Env:     CHAOS_PATH_FORMS_DOCKER_PLATFORM  platform override
-# Prereqs: docker with buildx and multi-arch support
+# Method: for glibc (gcc:bookworm) and then musl (alpine:3.20), docker buildx builds libchaos-io
+# (make cross-<libc>-<arch>), and a fresh container of the same image compiles path_forms_probe.c
+# and runs it with LD_PRELOAD of that build.
+#
+# Usage:   test_path_forms.sh [linux/amd64|linux/arm64]   (default: the host architecture)
+# Env:     CHAOS_PATH_FORMS_DOCKER_PLATFORM  platform when no argument is given
+#          CHAOS_SKIP_EXIT  exit status of a skip (default 0; CI sets 1)
+# Prereqs: docker with buildx; QEMU binfmt for a foreign platform. Run by `make test`.
+# Exit:    0 when both libcs pass; the probe's 1 or 2 for the first failing libc; non-zero
+#          when a build fails or yields no library; 2 on bad usage; CHAOS_SKIP_EXIT when the
+#          host or platform is not amd64/arm64, docker is missing or its daemon is
+#          unreachable.
 
 set -eu
 

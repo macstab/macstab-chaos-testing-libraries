@@ -1,18 +1,30 @@
 #!/bin/sh
 #
-# test_process_glibc.sh — libchaos-process runtime validation on glibc (Docker).
+# test_process_glibc.sh: libchaos-process end-to-end in LD_PRELOAD mode on glibc (Debian bookworm,
+# glibc 2.36).
 #
-# Builds libchaos-process.so for the target platform using Docker buildx with a
-# glibc (debian:bookworm) base, then runs the pre-compiled process_probe binary
-# under LD_PRELOAD in a glibc container. Validates pthread_create, fork,
-# posix_spawn, execve, execveat, and waitpid fault injection (ERRNO, LATENCY,
-# FAIL_AFTER) on glibc. Note: on glibc, posix_spawn uses clone(CLONE_VFORK)
-# and does not call the libc fork() symbol — fork rules do not cascade to
-# posix_spawn on glibc.
+# Proves, for one architecture per run, that pthread_create, fork, posix_spawn/posix_spawnp, the
+# exec family, system, popen and the wait family honour ERRNO, LATENCY and FAIL_AFTER rules with
+# each function's own error contract; process_probe.c lists every check.
 #
-# Usage:   test_process_glibc.sh [linux/amd64|linux/arm64]
-# Env:     CHAOS_PROCESS_DOCKER_PLATFORM  platform override
-# Prereqs: docker with buildx and multi-arch support
+# Method: docker buildx builds libchaos-process-glibc-<arch>.so (make cross-glibc-<arch>) from
+# docker/Dockerfile.build on gcc:bookworm. Then a fresh gcc:bookworm container compiles
+# test/runtime/process_probe.c from the read-only repository mount and runs it with
+# LD_PRELOAD=/tmp/libchaos-process.so. The probe is compiled in the target image so it uses the same
+# libc the library was built against.
+#
+# posix_spawn is faulted through its own selector: neither glibc's nor musl's posix_spawn calls the
+# public fork() (both clone with CLONE_VM|CLONE_VFORK), so fork rules do not reach it.
+#
+# Usage:   test_process_glibc.sh [linux/amd64|linux/arm64]   (default: the host architecture)
+# Env:     CHAOS_PROCESS_DOCKER_PLATFORM  platform when no argument is given
+#          CHAOS_SKIP_EXIT  exit status of a skip (default 0; CI sets 1)
+# Prereqs: docker with buildx; QEMU binfmt for a foreign platform. Run by `make test` and,
+#          once per platform, by `make test-matrix`.
+# Exit:    the probe's exit code (0 = every check passed; process_probe.c lists the others);
+#          non-zero when the build fails or yields no library; 2 on bad usage;
+#          CHAOS_SKIP_EXIT when the host or platform is not amd64/arm64, docker is missing
+#          or its daemon is unreachable.
 
 set -eu
 

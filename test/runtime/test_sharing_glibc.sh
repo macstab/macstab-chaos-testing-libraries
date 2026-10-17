@@ -1,17 +1,28 @@
 #!/bin/sh
 #
-# test_sharing_glibc.sh — libchaos-io and libchaos-net share read/write/close safely (Docker).
+# test_sharing_glibc.sh: libchaos-io and libchaos-net share read/write/readv/writev/close safely in
+# every preload order (glibc, Docker).
 #
-# Builds the libraries for the target platform using Docker buildx with a glibc
-# (debian:bookworm) base, then runs every sharing_probe scenario under io alone,
-# net alone, io then net, and net then io. Files must only ever see io's rules and
-# sockets only net's, whatever the preload order; close keeps Linux semantics; the
-# fd cache follows close, dup2 and other threads. Finally a program whose library
-# constructors do file I/O must start under the preload (the lazy symbol table).
+# Proves that files only ever see libchaos-io's rules and sockets only libchaos-net's, whatever the
+# order in LD_PRELOAD; that close keeps Linux semantics (the fd is closed even when an error is
+# injected); and that libchaos-io's fd cache follows close, dup2 and other threads. Finally proves
+# the lazy symbol table: setpriv's linked libraries do file I/O in their constructors, which can
+# reach a wrapper before that library's own constructor has resolved its real functions; setpriv
+# must still start under both orders.
 #
-# Usage:   test_sharing_glibc.sh [linux/amd64|linux/arm64]
-# Env:     CHAOS_SHARING_DOCKER_PLATFORM  platform override
-# Prereqs: docker with buildx and multi-arch support
+# Method: docker buildx builds the glibc libraries (make cross-glibc-<arch>) on gcc:bookworm; a
+# fresh gcc:bookworm container compiles sharing_probe.c and runs all seven scenarios under
+# LD_PRELOAD of io, net, "io net" and "net io", then runs `setpriv --dump` under both combined
+# orders.
+#
+# Usage:   test_sharing_glibc.sh [linux/amd64|linux/arm64]   (default: the host architecture)
+# Env:     CHAOS_SHARING_DOCKER_PLATFORM  platform when no argument is given
+#          CHAOS_SKIP_EXIT  exit status of a skip (default 0; CI sets 1)
+# Prereqs: docker with buildx; QEMU binfmt for a foreign platform. Run by `make test`.
+# Exit:    0 when every scenario passes and setpriv starts; the first failing command's status
+#          otherwise; non-zero when the build fails or a library is missing; 2 on bad usage;
+#          CHAOS_SKIP_EXIT when the host or platform is not amd64/arm64, docker is missing
+#          or its daemon is unreachable.
 
 set -eu
 

@@ -1,14 +1,30 @@
-/*
- * mptcp_probe.c — chaos-init's view of Multipath TCP sockets, on the host.
+/**
+ * @file mptcp_probe.c
+ * @brief Proves that chaos-init's socket-address queries answer for Multipath TCP sockets
+ *        exactly as the kernel does, on the host kernel.
  *
- * Builds the chaos-init socket queries (src/init/chaos_init_net.c) into this
- * program and asks them, for this process's own sockets, what the kernel answers
- * directly: an MPTCP listener, an MPTCP client and the connection accepted for
- * it, and a plain TCP client of the MPTCP listener and its accepted connection
- * (which the kernel may hand out as a TCP socket). Prints one line per socket
- * and query, and exits 1 when chaos-init's answer differs, 77 when the kernel
- * has no MPTCP. Where MPTCP sockets cannot be looked up at all (no mptcp_diag),
- * chaos-init must say so, and only the TCP sockets have to match.
+ * @details
+ * Go listens and dials with MPTCP by default from Go 1.24 where the kernel offers it. MPTCP
+ * sockets appear in no /proc/net table, so chaos-init (which must read a tracee's socket
+ * addresses from outside to match net selectors) asks NETLINK_SOCK_DIAG for them. A wrong
+ * answer would make every net rule miss Go programs.
+ *
+ * The probe compiles chaos-init's query code (chaos_init_net.c, chaos_init_proc.c,
+ * chaos_init_tracee.c) into itself and creates an MPTCP listener, an MPTCP client with its
+ * accepted connection, and a plain TCP client of the MPTCP listener with its accepted
+ * connection (the kernel may hand that one out as a TCP socket). For each socket it compares
+ * chaos_init_net_getsockname()/getpeername() with the kernel's getsockname()/getpeername()
+ * (return code, family, port) and prints one ok/FAIL line per socket and side, plus the raw
+ * sock_diag answer for diagnosis.
+ *
+ * Where MPTCP sockets cannot be looked up at all (no mptcp_diag module),
+ * chaos_init_net_mptcp_unresolvable() must report it (chaos-init then turns MPTCP off for Go);
+ * MPTCP lookups then print "n/a" and only the TCP sockets must match.
+ *
+ * Run by test_mptcp.sh on the host (Docker Desktop's kernel has no MPTCP).
+ *
+ * Exit: 0 when every comparison matched; 1 on a mismatch or a setup failure; 77 when the
+ * kernel has no MPTCP (socket(IPPROTO_MPTCP) fails), which test_mptcp.sh turns into a skip.
  */
 
 #include "../../src/init/chaos_init_net.c"
@@ -21,11 +37,11 @@
 
 static int g_failures = 0;
 
-/* Where MPTCP sockets cannot be looked up, chaos-init turns MPTCP off for Go: their
- * lookups failing is then expected, and only that chaos-init says so is checked. */
+/* Set when chaos-init reports MPTCP sockets unresolvable (it then turns MPTCP off for Go):
+ * failed MPTCP lookups are expected and reported as "n/a" instead of FAIL. */
 static int g_unresolvable = 0;
 
-/** @brief The port of a sockaddr, or -1 for another family. */
+/** @brief Port of an AF_INET/AF_INET6 address in host order, or -1 for another family. */
 static int port_of(const struct sockaddr_storage *address)
 {
     if (address->ss_family == AF_INET)
@@ -39,7 +55,10 @@ static int port_of(const struct sockaddr_storage *address)
     return -1;
 }
 
-/** @brief Compares chaos-init's own address and peer of @p fd with the kernel's. */
+/**
+ * @brief Compares chaos-init's local and peer address of @p fd with the kernel's (return code,
+ *        family, port), prints one line per side and counts mismatches.
+ */
 static void check(const char *what, int fd)
 {
     struct sockaddr_storage real;
@@ -130,7 +149,8 @@ int main(void)
         perror("accept");
         return 1;
     }
-    /* What sock_diag answers when asked for MPTCP sockets at all. */
+    /* Diagnostic only: print what sock_diag answers to an MPTCP dump request (an NLMSG_ERROR
+     * here means no mptcp_diag), so a failure can be attributed to the kernel. */
     {
         struct
         {

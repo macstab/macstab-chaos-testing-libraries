@@ -1,30 +1,42 @@
 #!/bin/sh
 #
-# test_status.sh — every library reports a rejected rule file in its status file (Docker).
+# test_status.sh: every library reports the outcome of loading its rule file in its status file, on
+# glibc and musl (Docker).
 #
-# Builds all libchaos libraries for glibc (gcc:bookworm) and musl (alpine:3.20), then,
-# for each library, starts a program under LD_PRELOAD with three rule files in turn:
+# Proves, for each of the six libraries, that the constructor alone (the program, /bin/true, calls
+# nothing) writes /tmp/.chaos-<lib>.status, and that each report carries the pid of the process that
+# loaded the rules:
 #
-#   - a file whose third line is invalid  -> state=error naming line 3 and its text
-#   - a file with one valid rule          -> state=ok, rules=1
-#   - no rule file                        -> no status file
+#   - third line invalid   -> state=error, rules=0, line=3, reason=invalid rule, text=<line>
+#   - one valid rule       -> state=ok, rules=1
+#   - no rule file         -> no status file (a stale one is removed)
 #
-# The status is written by the library's constructor, so the program needs to call
-# nothing. Each report must carry the pid of the program that loaded the rules.
-# On glibc, a rule file reloaded after the program switched to de_DE.UTF-8 must
-# read the same (locale_probe), and a user other than the status file's owner must
-# still update it.
+# On glibc it further proves that a non-root user (setpriv uid 1000) can update a status file root
+# created in sticky /tmp, by rewriting it in place since it cannot rename over it, and that a rule
+# file read after the program switched to de_DE.UTF-8 still parses "1.0" as a probability
+# (locale_probe.c). The locale check prints "skip" and passes when the locale cannot be installed
+# (it needs apt network access).
 #
-# Usage:   test_status.sh [linux/amd64|linux/arm64]
-# Env:     CHAOS_STATUS_DOCKER_PLATFORM  platform override
-# Prereqs: docker with buildx and multi-arch support
+# Method: for glibc (gcc:bookworm) and then musl (alpine:3.20), docker buildx builds all libraries
+# (make cross-<libc>-<arch>), and a fresh container of the same image runs the checks with
+# test/runtime mounted read-only.
+#
+# Usage:   test_status.sh [linux/amd64|linux/arm64]   (default: the host architecture)
+# Env:     CHAOS_STATUS_DOCKER_PLATFORM  platform when no argument is given
+#          CHAOS_SKIP_EXIT  exit status of a skip (default 0; CI sets 1)
+# Prereqs: docker with buildx; QEMU binfmt for a foreign platform. Run by `make test`.
+# Exit:    0 when every check passes; non-zero when any check fails (all checks of a libc
+#          still run and report) or a build fails; 2 on bad usage; CHAOS_SKIP_EXIT when the
+#          host or platform is not amd64/arm64, docker is missing or its daemon is
+#          unreachable.
 
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 TMP_DIR=$(mktemp -d)
-# Mounted into the containers, where another user (setpriv) loads the libraries
-# from it: mktemp makes it private to this user, the builds below may too.
+# The build output is mounted into the containers, where uid 1000 (setpriv) must load the
+# libraries: mktemp creates the directory 0700, so open it up (the builds get chmod a+rX
+# below).
 chmod 755 "$TMP_DIR"
 
 if [ "$#" -gt 1 ]; then
@@ -77,7 +89,8 @@ if ! docker version >/dev/null 2>&1; then
     exit "${CHAOS_SKIP_EXIT:-0}"
 fi
 
-# One valid rule per library; "bogus-rule" is invalid for all of them.
+# Runs inside each container. valid_rule gives one rule every library accepts in its own
+# grammar; "bogus-rule" is invalid for all six.
 CHECK_SCRIPT='
 set -eu
 failures=0
@@ -139,9 +152,9 @@ for lib in io net dns time memory process; do
     fi
 done
 
-# An image that starts as root and runs the application as another user: the
-# other user cannot rename over the status file root wrote in sticky /tmp, so it rewrites
-# it in place (glibc image: setpriv).
+# Images often start as root and run the application as another user. In sticky /tmp that
+# user cannot rename over the status file root created, so the library must rewrite it in
+# place; the file stays owned by root. glibc image only: it ships setpriv.
 if [ "$LIBC" = glibc ] && command -v setpriv >/dev/null 2>&1; then
     so=/out/libchaos-io-$LIBC-'"$ARCH"'.so
     echo "/data:write:EIO:1.0" > /tmp/.chaos-io.conf
@@ -160,8 +173,9 @@ if [ "$LIBC" = glibc ] && command -v setpriv >/dev/null 2>&1; then
     rm -f /tmp/.chaos-io.conf /tmp/.chaos-io.status /tmp/.chaos-staging-*
 fi
 
-# A program that switches to a locale with a decimal comma (a JVM does, from LANG)
-# must still get "1.0" read as a probability (glibc; musl has no such locales).
+# A program that switches to a locale with a decimal comma (a JVM does, from LANG) must
+# still get "1.0" read as a probability. glibc only: musl locales do not change the decimal
+# point.
 if [ "$LIBC" = glibc ]; then
     if apt-get update >/dev/null 2>&1 && apt-get install -y --no-install-recommends locales >/dev/null 2>&1 &&
         localedef -i de_DE -f UTF-8 de_DE.UTF-8 >/dev/null 2>&1; then

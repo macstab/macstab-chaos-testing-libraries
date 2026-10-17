@@ -1,29 +1,44 @@
 #!/bin/sh
 #
-# test_init.sh — chaos-init process model in SECCOMP mode (Docker).
+# test_init.sh: chaos-init keeps the process model transparent in SECCOMP mode, on glibc and musl
+# (Docker).
 #
-# Builds chaos-init with docker/Dockerfile.build (one static binary per
-# architecture) and runs it in glibc (gcc:bookworm) and musl (alpine:3.20)
-# containers under Docker's default security profile, with the filter of all
-# libraries active. The supervisor still lets every call through, so the
-# application must behave exactly as without it:
+# Proves that with the seccomp user-notification filter of all six libraries installed and no rule
+# active, the tracee behaves exactly as without chaos-init:
 #
-# - files, sockets, mmap, fork and exec work, for a static and a dynamic program;
-# - the status file says active (or unsupported, with the reason);
-# - exit codes and death by signal pass through; SIGTERM reaches the application;
-# - orphans are reaped; a missing command exits 127;
-# - a file limit of 256 neither stops the application nor the mode;
-# - a kernel older than 5.5 (test build) starts the application without a filter;
-# - a handover the child cannot send (test build) ends the start instead of hanging;
-# - a profile that refuses seccomp starts it without a filter and without
-#   no_new_privs.
+# - a static (init_probe.c) and a dynamic program (/bin/sh, ls) can use files, sockets, mmap,
+#   fork and exec;
+# - the status file says state=active with the selected libraries (or unsupported, with the
+#   reason);
+# - exit codes and death by signal pass through (7, 137); SIGTERM reaches the application
+#   (42); a missing command exits 127; an unknown library is a usage error (2);
+# - orphans re-parented to chaos-init are reaped;
+# - RLIMIT_NOFILE 256 neither stops the application nor the mode;
+# - a kernel older than 5.5 (test build, CHAOS_INIT_TEST_RELEASE=4.19.0) starts the
+#   application without a filter and reports why;
+# - a listener handover the child cannot send (test build, CHAOS_INIT_TEST_HANDOVER_FAILS)
+#   ends the start with 125 within 10 s instead of hanging;
+# - a container seccomp profile that refuses seccomp(), or only the filter install (as
+#   EBUSY from another supervisor would), starts the application without chaos and without
+#   no_new_privs, which chaos-init sets only once seccomp answers.
 #
-# Under emulation (amd64 on an arm64 host) seccomp is unavailable: then only the
-# unsupported path is checked.
+# Under emulation (a foreign architecture through QEMU) seccomp user notification is unavailable;
+# the suite detects that from the status file and checks only the unsupported path.
 #
-# Usage:   test_init.sh [linux/amd64|linux/arm64]
-# Env:     CHAOS_INIT_DOCKER_PLATFORM  platform override
-# Prereqs: docker with buildx and multi-arch support
+# Method: docker buildx builds the static chaos-init (make cross-init-<arch>) on alpine:3.20. In
+# gcc:bookworm and then alpine:3.20 containers under Docker's default seccomp profile, init_probe.c
+# and the two test builds of chaos-init are compiled from the read-only repository mount and the
+# checks run. The refusal checks then run in alpine:3.20 with custom seccomp profiles.
+#
+# Usage:   test_init.sh [linux/amd64|linux/arm64]   (default: the host architecture)
+# Env:     CHAOS_INIT_DOCKER_PLATFORM  platform when no argument is given
+#          CHAOS_SKIP_EXIT  exit status of a skip (default 0; CI sets 1)
+# Prereqs: docker with buildx; a kernel with seccomp user notification (5.5+) for the
+#          active path. Run by `make test`.
+# Exit:    0 when every check passes; 1 when chaos-init was not built or a refusal check
+#          fails; non-zero when a container check fails (all checks of a libc still run and
+#          report); 2 on bad usage; CHAOS_SKIP_EXIT when the host or platform is not
+#          amd64/arm64, docker is missing or its daemon is unreachable.
 
 set -eu
 
@@ -130,8 +145,8 @@ kill -TERM $pid; wait $pid; expect "SIGTERM reaches the application" "$?" "42"
 set -e
 expect "orphans are reaped" "$($init --libs $all -- /tmp/probe orphans)" "zombies=0"
 
-# The listener goes over whatever descriptor the child has, so a low file limit
-# neither stops the container nor the mode.
+# The child hands its notification listener to chaos-init on whatever descriptor number it
+# has free, so a low file limit must neither stop the application nor disable the mode.
 expect "file limit 256: the application starts" "$( (ulimit -n 256; $init --libs $all -- /tmp/probe work) 2>&1)" "work ok (0)"
 if [ "$emulated" -eq 0 ]; then
     expect "file limit 256: the mode is active" "$( (ulimit -n 256; $init --libs io -- /tmp/probe status) | head -1)" "state=active"
@@ -173,8 +188,8 @@ for libc in glibc musl; do
         sh -c "$CHECK_SCRIPT"
 done
 
-# A profile that refuses seccomp: the application runs without chaos, and without
-# no_new_privs, which chaos-init only sets once seccomp answers.
+# A profile that refuses seccomp() outright: the application runs without chaos and without
+# no_new_privs, which chaos-init sets only once seccomp answers.
 printf '%s' '{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["seccomp"],"action":"SCMP_ACT_ERRNO"}]}' \
     > "$TMP_DIR/no-seccomp.json"
 refused=$(docker run --rm \
@@ -192,8 +207,9 @@ else
     exit 1
 fi
 
-# A profile that answers the question but refuses the install itself (as another
-# supervisor's listener makes the kernel do, with EBUSY): the same.
+# A profile that answers the capability query but refuses the filter install
+# (SECCOMP_SET_MODE_FILTER, op 1), as the kernel does with EBUSY when another supervisor
+# already holds a listener: the same outcome is required.
 printf '%s' '{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["seccomp"],"action":"SCMP_ACT_ERRNO","args":[{"index":0,"value":1,"op":"SCMP_CMP_EQ"}]}]}' \
     > "$TMP_DIR/no-filter.json"
 refused=$(docker run --rm \

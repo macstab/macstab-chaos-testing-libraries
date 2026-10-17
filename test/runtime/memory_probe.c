@@ -1,39 +1,39 @@
 /**
  * @file memory_probe.c
- * @brief Runtime validation probe for libchaos-memory under LD_PRELOAD.
+ * @brief End-to-end probe for libchaos-memory in LD_PRELOAD mode on glibc and musl.
  *
  * @details
- * Standalone C program compiled inside a Docker container and executed under
- * `LD_PRELOAD=libchaos-memory.so`. Validates end-to-end fault injection for
- * the memory library's interposed symbols: `mmap`, `mprotect`, `madvise`,
- * and `munmap`.
+ * Proves that rules in the rule file `/tmp/.chaos-memory.conf` fault the memory-mapping entry
+ * points with the documented result and errno contract. Exit code of each check, its rule, and
+ * the behaviour proven:
  *
- * Each subtest writes a config rule with a future-mtime timestamp to
- * `/tmp/.chaos-memory.conf`, then exercises the interposed symbol and asserts
- * the expected behavior. The future-mtime pattern guarantees a config reload
- * cycle on the first post-write invocation, ensuring the new rule is active.
+ * - 10      mmap/anon:ERRNO:ENOMEM; an anonymous mmap returns MAP_FAILED, errno ENOMEM.
+ * - 20-22   mmap/file:ERRNO:EACCES; a MAP_SHARED file mapping returns MAP_FAILED/EACCES.
+ *           Together with 10 this proves the anon/file target split.
+ * - 30-33   mmap:LATENCY:150; an anonymous mapping succeeds and takes >= 120 ms.
+ * - 40-41   mprotect:ERRNO:EACCES; -1 with errno EACCES.
+ * - 50-54   mprotect:LATENCY:120; succeeds and takes >= 90 ms.
+ * - 60-61   madvise:ERRNO:EINVAL; -1 with errno EINVAL.
+ * - 62-63   madvise:ERRNO:EINVAL also fails posix_madvise, which returns EINVAL and leaves
+ *           errno untouched.
+ * - 70-74   madvise:LATENCY:100; succeeds and takes >= 80 ms.
+ * - 80-82   munmap:ERRNO:EINVAL; -1/EINVAL and the mapping stays mapped: after clearing the
+ *           rule a second munmap of the same range succeeds.
+ * - 90-94   munmap:LATENCY:100; succeeds and takes >= 80 ms.
+ * - 200-204 the rule file could not be written.
  *
- * Subtests cover:
- * - `ERRNO` injection on anonymous `mmap` (`mmap/anon` selector, synthetic `ENOMEM`)
- * - `ERRNO` injection on file-backed `mmap` (`mmap/file` selector, synthetic `EACCES`)
- * - `LATENCY` injection on `mmap` (≥ 120 ms added sleep on anonymous mapping)
- * - `ERRNO` injection on `mprotect` (synthetic `EACCES`)
- * - `LATENCY` injection on `mprotect` (≥ 90 ms added sleep)
- * - `ERRNO` injection on `madvise` (synthetic `EINVAL`)
- * - `LATENCY` injection on `madvise` (≥ 80 ms added sleep)
- * - `ERRNO` on `madvise` also fails `posix_madvise`, returned as the error number
- * - `ERRNO` injection on `munmap` (synthetic `EINVAL`; chaos cleared before cleanup)
- * - `LATENCY` injection on `munmap` (≥ 80 ms added sleep)
+ * Lower bounds sit 20-30 ms under the configured latency so a loaded or emulated (QEMU) runner
+ * does not flake. The allocator differences (glibc mmaps only above M_MMAP_THRESHOLD, 128 KiB
+ * by default; musl mallocng mmaps for every size class) do not matter here: the probe calls
+ * mmap directly.
  *
- * The `MAP_ANONYMOUS` portability shim (`MAP_ANON` fallback) allows the probe
- * to compile on macOS for development, though the library itself targets Linux.
+ * Run by test_memory_glibc.sh (gcc:bookworm) and test_memory_alpine.sh (alpine:3.20), which
+ * build the library, compile this file in the container and run it with
+ * `LD_PRELOAD=/tmp/libchaos-memory.so`. Checks run in main()'s order and stop at the first
+ * failure. The MAP_ANON fallback only lets the file compile on BSD/macOS for editing.
  *
- * The `munmap` ERRNO subtest requires a two-phase config pattern: inject the
- * error, confirm it fires, then clear the config and call `munmap` again to
- * release the intentionally retained mapping without triggering another fault.
- *
- * Returns 0 on success; returns a non-zero numbered exit code identifying
- * the failing subtest.
+ * Exit: 0 when every check passes (the rule file is removed); otherwise the code of the first
+ * failing check above. The probe never skips.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -61,11 +61,12 @@ static long long elapsed_ms(const struct timespec *start, const struct timespec 
 }
 
 /**
- * @brief Waits until the library is due to look at its rule file again.
+ * @brief Sleeps 2 ms so the next intercepted call re-checks the rule file.
  *
- * Once rules are loaded the libraries look at the rule file at most every
- * millisecond, so a change takes effect within that time, not on the very next
- * call. The sleep is a raw system call: libchaos-time may be faulting nanosleep.
+ * With rules loaded, a library stats its rule file at most once per CHAOS_CHECK_INTERVAL_NS
+ * (1 ms); a rewrite is seen by the first call after that, not necessarily the next call. The
+ * sleep is a raw clock_nanosleep system call, restarted on EINTR, so no wrapper (libchaos-time
+ * faults nanosleep) can fail or stretch it.
  */
 static void wait_for_rule_check(void)
 {
@@ -76,6 +77,16 @@ static void wait_for_rule_check(void)
     }
 }
 
+/**
+ * @brief Replaces the rule file `/tmp/.chaos-memory.conf` with @p text plus a newline and stamps a
+ *        fresh mtime.
+ *
+ * The mtime is set explicitly to 9000, 9001, ... seconds since the epoch, so each write
+ * changes the reload change stamp even when two writes land within one filesystem timestamp
+ * tick.
+ *
+ * @return 0, or 200 (fopen), 201 (fprintf), 202 (fflush), 203 (futimens), 204 (fclose).
+ */
 static int write_config_now(const char *text)
 {
     struct timespec times[2];
@@ -112,7 +123,7 @@ static int write_config_now(const char *text)
     return 0;
 }
 
-/** @brief Writes the rules, then waits until the library looks at them. */
+/** @brief write_config_now(), then wait_for_rule_check(); returns write_config_now()'s code. */
 static int write_config(const char *text)
 {
     const int rc = write_config_now(text);
@@ -121,12 +132,14 @@ static int write_config(const char *text)
     return rc;
 }
 
+/** @brief sysconf(_SC_PAGESIZE), or 4096 when it fails. */
 static size_t page_size_value(void)
 {
     long value = sysconf(_SC_PAGESIZE);
     return value > 0 ? (size_t)value : 4096U;
 }
 
+/** @brief Maps one private anonymous read-write page; MAP_FAILED on error. */
 static void *map_rw_page(size_t *length_out)
 {
     size_t length = page_size_value();
@@ -312,8 +325,9 @@ static int probe_madvise_errno(void)
 }
 
 /*
- * posix_madvise() is implemented with the madvise system call directly; it must
- * still follow the madvise rules, report the error by value and keep errno.
+ * posix_madvise() issues the madvise system call itself instead of calling madvise(), so it
+ * has its own wrapper. It must follow the madvise rules while keeping its own error contract:
+ * the error number is the return value and errno stays untouched (sentinel 4242).
  */
 static int probe_posix_madvise_errno(void)
 {
@@ -405,7 +419,7 @@ static int probe_munmap_errno(void)
         return 81;
     }
 
-    /* Disable chaos before cleanup so the intentionally retained mapping is released. */
+    /* The faulted munmap left the page mapped; clear the rule so this munmap really unmaps. */
     rc = write_config("");
     if (rc != 0)
     {

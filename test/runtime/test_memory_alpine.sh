@@ -1,16 +1,26 @@
 #!/bin/sh
 #
-# test_memory_alpine.sh — libchaos-memory runtime validation on musl/Alpine (Docker).
+# test_memory_alpine.sh: libchaos-memory end-to-end in LD_PRELOAD mode on musl (Alpine 3.20).
 #
-# Builds libchaos-memory.so for the target platform using Docker buildx with a
-# musl (alpine) base, then runs the pre-compiled memory_probe binary under
-# LD_PRELOAD in an Alpine container. Validates mmap, munmap, mprotect, and
-# madvise fault injection on musl mallocng where mmap is used for all allocation
-# sizes (no brk/sbrk path).
+# Proves, for one architecture per run, that mmap (anon and file targets), mprotect, madvise,
+# posix_madvise and munmap honour ERRNO and LATENCY rules, each with its own error contract;
+# memory_probe.c lists every check.
 #
-# Usage:   test_memory_alpine.sh [linux/amd64|linux/arm64]
-# Env:     CHAOS_MEMORY_DOCKER_PLATFORM  platform override
-# Prereqs: docker with buildx and multi-arch support
+# Method: docker buildx builds libchaos-memory-musl-<arch>.so (make cross-musl-<arch>) from
+# docker/Dockerfile.build on alpine:3.20. Then a fresh alpine:3.20 container (build-base installed
+# at run time) compiles test/runtime/memory_probe.c from the read-only repository mount and runs it
+# with LD_PRELOAD=/tmp/libchaos-memory.so. The probe is compiled in the target image so it uses the
+# same libc the library was built against.
+#
+# Usage:   test_memory_alpine.sh [linux/amd64|linux/arm64]   (default: the host architecture)
+# Env:     CHAOS_MEMORY_DOCKER_PLATFORM  platform when no argument is given
+#          CHAOS_SKIP_EXIT  exit status of a skip (default 0; CI sets 1)
+# Prereqs: docker with buildx; QEMU binfmt for a foreign platform. Run by `make test` and,
+#          once per platform, by `make test-matrix`.
+# Exit:    the probe's exit code (0 = every check passed; memory_probe.c lists the others);
+#          non-zero when the build fails or yields no library; 2 on bad usage;
+#          CHAOS_SKIP_EXIT when the host or platform is not amd64/arm64, docker is missing
+#          or its daemon is unreachable.
 
 set -eu
 

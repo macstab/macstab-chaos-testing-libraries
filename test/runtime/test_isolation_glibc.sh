@@ -1,18 +1,27 @@
 #!/bin/sh
 #
-# test_isolation_glibc.sh — no library's rules change another library's effects (Docker).
+# test_isolation_glibc.sh: no library's rules change another library's effects or its access to its
+# rule file (glibc, Docker).
 #
-# Builds all libchaos libraries for the target platform using Docker buildx with
-# a glibc (debian:bookworm) base, then runs isolation_probe for io, net, dns,
-# memory and process, each preloaded together with libchaos-time in both orders.
-# libchaos-time fails every usleep and nanosleep; the library's own LATENCY
-# delay must still last its full duration.
-# Then net, dns, memory and process run with libchaos-io failing every file
-# access under /tmp: they must still read their rule files (/tmp/.chaos-*).
+# Proves two isolation properties. (1) Each library's LATENCY sleeps outside libc: with
+# libchaos-time failing every usleep and nanosleep, a 300 ms LATENCY in io, net, dns, memory and
+# process still lasts >= 280 ms, with libchaos-time preloaded before and after the library. (2) The
+# rule files are out of libchaos-io's reach: with libchaos-io failing every open/read/write/rename
+# under /tmp, net, dns, memory and process still read their /tmp/.chaos-* rule files, in both
+# preload orders.
 #
-# Usage:   test_isolation_glibc.sh [linux/amd64|linux/arm64]
-# Env:     CHAOS_ISOLATION_DOCKER_PLATFORM  platform override
-# Prereqs: docker with buildx and multi-arch support
+# Method: docker buildx builds the six glibc libraries (make cross-glibc-<arch>) on gcc:bookworm; a
+# fresh gcc:bookworm container compiles isolation_probe.c and runs it for every pair and order
+# above.
+#
+# Usage:   test_isolation_glibc.sh [linux/amd64|linux/arm64]   (default: the host architecture)
+# Env:     CHAOS_ISOLATION_DOCKER_PLATFORM  platform when no argument is given
+#          CHAOS_SKIP_EXIT  exit status of a skip (default 0; CI sets 1)
+# Prereqs: docker with buildx; QEMU binfmt for a foreign platform. Run by `make test`.
+# Exit:    0 when every run passes; the probe's 1 or 2 for the first failing run; non-zero
+#          when the build fails or a library is missing; 2 on bad usage; CHAOS_SKIP_EXIT when
+#          the host or platform is not amd64/arm64, docker is missing or its daemon is
+#          unreachable.
 
 set -eu
 

@@ -1,24 +1,31 @@
 /**
  * @file isolation_probe.c
- * @brief Runtime probe: one library's rules never change another library's effects.
+ * @brief Proves that one library's rules never alter another library's effects or its access to
+ *        its own rule file.
  *
- * Each library implements LATENCY by sleeping. If that sleep went through the
- * exported usleep or nanosleep, libchaos-time would intercept it: a time rule
- * such as `usleep:ERRNO:EINTR` would end the delay at once, and `usleep:LATENCY`
- * would add to it. The probe loads libchaos-time with rules that fail every
- * sleep, sets a 300 ms LATENCY rule in the library under test, and checks the
- * call still takes the full 300 ms. Time is measured with the raw system call so
- * the measurement itself cannot be affected.
+ * @details
+ * Default mode (`<lib>`): every library implements LATENCY with chaos_sleep_ms(), a raw
+ * clock_nanosleep system call. Had it gone through the exported usleep/nanosleep, libchaos-time
+ * would intercept it: `usleep:ERRNO:EINTR` would end the delay at once and `usleep:LATENCY`
+ * would stretch it. The probe loads libchaos-time rules that fail every usleep and nanosleep
+ * with EINTR, triggers a 300 ms LATENCY rule in the library under test, and requires the call
+ * to take >= 280 ms. Elapsed time comes from a raw clock_gettime system call, so no rule can
+ * skew the measurement.
  *
- * In `control:<lib>` mode the other library is libchaos-io, with rules failing
- * every open, read and write under /tmp. The control files (`/tmp/.chaos-*`) are
- * outside its reach: the library under test must still read its rules and the
- * probe still write them.
+ * Control mode (`control:<lib>`): libchaos-io fails every open (EACCES), read, write and
+ * rename target (EIO) under /tmp. The rule files `/tmp/.chaos-*` are exempt from libchaos-io's
+ * rules, so the probe can still write the other library's rules and that library can still
+ * read them; the 300 ms LATENCY firing proves it.
  *
- * Usage: isolation_probe [control:]io|net|dns|memory|process
- *        (under LD_PRELOAD of that library and libchaos-time, or libchaos-io in
- *        control mode, in either order)
- * Exit code 0 when the delay was intact, 1 otherwise.
+ * Triggers (each a 300 ms LATENCY rule): io fsync, net send, dns getaddrinfo("localhost"),
+ * memory madvise, process waitpid.
+ *
+ * Usage: isolation_probe [control:]io|net|dns|memory|process, under LD_PRELOAD of that library
+ * plus libchaos-time (or libchaos-io in control mode), in either order; run by
+ * test_isolation_glibc.sh.
+ *
+ * Exit: 0 when the delay lasted >= 280 ms; 1 when it was shorter; 2 on bad usage or a setup
+ * failure.
  */
 
 #ifndef _GNU_SOURCE
@@ -41,13 +48,13 @@
 
 #define LATENCY_MS 300LL
 
-/** Replaces a rule file atomically (new inode), as the framework's writers do. */
 /**
- * @brief Waits until the library is due to look at its rule file again.
+ * @brief Sleeps 2 ms so the next intercepted call re-checks the rule file.
  *
- * Once rules are loaded the libraries look at the rule file at most every
- * millisecond, so a change takes effect within that time, not on the very next
- * call. The sleep is a raw system call: libchaos-time may be faulting nanosleep.
+ * With rules loaded, a library stats its rule file at most once per CHAOS_CHECK_INTERVAL_NS
+ * (1 ms); a rewrite is seen by the first call after that, not necessarily the next call. The
+ * sleep is a raw clock_nanosleep system call, restarted on EINTR, so no wrapper (libchaos-time
+ * faults nanosleep) can fail or stretch it.
  */
 static void wait_for_rule_check(void)
 {
@@ -58,6 +65,14 @@ static void wait_for_rule_check(void)
     }
 }
 
+/**
+ * @brief Replaces the rule file at @p path atomically: writes `<path>.staging`, then
+ *        rename()s it over @p path.
+ *
+ * The rename gives the file a new inode, which changes the reload change stamp regardless of
+ * mtime granularity, and a library never reads a half-written file. This is how the framework's
+ * own writers update rule files. Exits the probe with status 2 on any I/O error.
+ */
 static void write_rules_now(const char *path, const char *rules)
 {
     char staging[256];
@@ -72,13 +87,14 @@ static void write_rules_now(const char *path, const char *rules)
     }
 }
 
-/** @brief Writes the rules, then waits until the library looks at them. */
+/** @brief write_rules_now(), then wait_for_rule_check(). */
 static void write_rules(const char *path, const char *rules)
 {
     write_rules_now(path, rules);
     wait_for_rule_check();
 }
 
+/** @brief CLOCK_MONOTONIC in ms via a raw system call, immune to libchaos-time rules. */
 static long long now_ms(void)
 {
     struct timespec now;
@@ -87,6 +103,7 @@ static long long now_ms(void)
     return (long long)now.tv_sec * 1000LL + (long long)now.tv_nsec / 1000000LL;
 }
 
+/** @brief io: fsync under LATENCY:300 on the file. Exits 2 when the call fails. */
 static void trigger_io(void)
 {
     int fd = open("/tmp/isolation-probe.bin", O_CREAT | O_RDWR | O_TRUNC, 0600);
@@ -100,6 +117,7 @@ static void trigger_io(void)
     (void)close(fd);
 }
 
+/** @brief net: send on a loopback connection under send:LATENCY:300. Exits 2 on failure. */
 static void trigger_net(void)
 {
     struct sockaddr_in address;
@@ -131,6 +149,7 @@ static void trigger_net(void)
     }
 }
 
+/** @brief dns: getaddrinfo("localhost") under LATENCY:300; its result is not checked. */
 static void trigger_dns(void)
 {
     struct addrinfo *result = NULL;
@@ -143,6 +162,7 @@ static void trigger_dns(void)
     }
 }
 
+/** @brief memory: madvise under madvise:LATENCY:300. Exits 2 on failure. */
 static void trigger_memory(void)
 {
     void *mapping = mmap(NULL, 4096U, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -155,6 +175,7 @@ static void trigger_memory(void)
     }
 }
 
+/** @brief process: waitpid on an exited child under waitpid:LATENCY:300. Exits 2 on failure. */
 static void trigger_process(void)
 {
     pid_t child = fork();
@@ -188,7 +209,7 @@ int main(int argc, char **argv)
     lib = argv[1];
     if (strncmp(lib, "control:", 8U) == 0)
     {
-        /* Every file access under /tmp fails, except the control files. */
+        /* Every file access under /tmp fails; the rule files /tmp/.chaos-* are exempt. */
         lib += 8;
         other_rules = "/tmp/.chaos-io.conf";
         write_rules(
@@ -199,7 +220,7 @@ int main(int argc, char **argv)
     }
     else
     {
-        /* Every sleep that reaches libchaos-time fails at once. */
+        /* Any sleep that goes through libchaos-time returns EINTR at once. */
         write_rules(other_rules, "usleep:ERRNO:EINTR\nnanosleep:ERRNO:EINTR\n");
     }
 

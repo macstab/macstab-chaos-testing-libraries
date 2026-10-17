@@ -1,13 +1,18 @@
 /**
  * @file thread_probe.c
- * @brief Runtime probe: threads work under libchaos-process, and a rule still faults them.
+ * @brief Proves that pthread_create works under the preloaded libraries and that a
+ *        libchaos-process rule still faults it when libpthread is linked.
  *
- * On glibc before 2.34 `pthread_create` lives in libpthread, not libc. A program
- * that does not link libpthread never loads it, so the library cannot resolve the
- * symbol at startup; a program that does link it must still be faulted.
+ * @details
+ * On glibc before 2.34, pthread_create lives in libpthread, not libc. In a program that does
+ * not link libpthread the symbol does not exist at start-up, so libchaos-process resolves it
+ * lazily; this probe links -pthread, so the symbol appears and must be found and faulted.
  *
- * Usage: thread_probe [expected-errno]   (0 or omitted: the thread must start)
- * Exit code 0 when pthread_create returned the expected value, 1 otherwise.
+ * Usage: thread_probe [expected-errno]; 0 or omitted means the thread must start. Run by
+ * test_baseline_glibc.sh with no argument and with 11 (EAGAIN on Linux) under
+ * `pthread_create:ERRNO:EAGAIN`.
+ *
+ * Exit: 0 when pthread_create returned the expected value; 1 otherwise.
  */
 
 #include <pthread.h>
@@ -15,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+/** @brief Thread body: returns at once. */
 static void *run(void *argument)
 {
     return argument;

@@ -1,20 +1,25 @@
 /**
  * @file fork_probe.c
- * @brief Runtime probe: an @first budget across vfork, fork and posix_spawn children.
+ * @brief Drives an `@first` budget and the per-thread PRNG across vfork, fork and posix_spawn
+ *        children for test_fork.sh, which judges the result.
  *
- * Usage: fork_probe vfork|fork|spawn|open|draws   (under LD_PRELOAD of libchaos-io)
+ * @details
+ * Usage: fork_probe vfork|fork|spawn|open|draws, under LD_PRELOAD of libchaos-io with an
+ * open rule on /tmp/fork-data.
  *
- * The parent opens /tmp/fork-data/file, starts a child that opens it too, then opens
- * it again, and prints which of the three opens failed with EIO:
+ * - vfork|fork|spawn: the parent opens /tmp/fork-data/file, starts a child of that kind which
+ *   opens it once, then opens it again, and prints which opens failed with EIO, e.g.
+ *   `parent=EIO child=ok parent=ok` ("error" when the child could not be started or reaped).
+ *   With `@first=1` this shows whose budget each process used; test_fork.sh also counts the
+ *   hits files and hits.
+ * - open: one open; exit status 1 on EIO, 0 otherwise. The spawn mode posix_spawn()s the probe
+ *   itself in this mode.
+ * - draws: parent and a forked child each open 64 times under a probability rule and the probe
+ *   prints "same" when both saw the identical failure pattern, "different" otherwise. A child
+ *   that inherited the parent's PRNG state would print "same" (1 in 2^64 by chance at p = 0.5).
  *
- *   parent=EIO child=ok parent=ok
- *
- * `open` only opens the file once and exits 1 on EIO; `spawn` runs the probe itself
- * in that mode. test_fork.sh compares the line and the hits files.
- *
- * `draws` opens 64 times in the parent and in a forked child under a rule with a
- * probability, and prints "same" when both saw the same failures, "different"
- * otherwise: a child must not repeat its parent's random numbers.
+ * Exit: 0 after printing (open mode: 1 on EIO); 2 on bad usage or a pipe/fork failure in
+ * draws mode.
  */
 
 #ifndef _GNU_SOURCE
@@ -44,7 +49,8 @@ static int open_fails(void)
     return errno == EIO;
 }
 
-/** @brief Waits for @p child; 1 when it reported a faulted open. */
+/** @brief Reaps @p child; 1 when it exited 1 (faulted open), 0 otherwise, -1 when it could
+ * not be reaped or did not exit normally. */
 static int child_failed(pid_t child)
 {
     int status = 0;
@@ -56,12 +62,14 @@ static int child_failed(pid_t child)
     return WEXITSTATUS(status) == 1;
 }
 
+/** @brief "EIO" for 1, "ok" for 0, "error" for anything else. */
 static const char *word(int failed)
 {
     return failed == 1 ? "EIO" : failed == 0 ? "ok" : "error";
 }
 
-/** @brief Opens the faulted file 64 times; which opens failed, as '0'/'1'. */
+/** @brief Opens the faulted file 64 times and records each outcome as '1' (EIO) or '0' in
+ * @p pattern (65 bytes, NUL-terminated). */
 static void draw(char *pattern)
 {
     int index;
@@ -119,8 +127,9 @@ int main(int argc, char **argv)
     first = open_fails();
     if (strcmp(argv[1], "vfork") == 0)
     {
-        /* The child runs the wrapper in the parent's memory, as a JDK VFORK launch or
-         * a shell's vfork does before exec. */
+        /* The child runs the wrapper in the parent's memory, as a JDK VFORK launch or a
+         * shell's vfork does before exec: it sees the parent's claimed budget and must not
+         * consume or reset it. */
         pid = vfork();
         if (pid == 0)
         {

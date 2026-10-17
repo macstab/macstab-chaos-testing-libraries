@@ -1,38 +1,31 @@
 /**
  * @file test_net_support.h
- * @brief NET-domain test globals, reset helper, sockaddr builders, and dlsym cast utility.
+ * @brief Unit-test scaffolding for libchaos-net: runtime globals, reset helper, kernel-direct
+ *        descriptor calls, sockaddr builders and dlsym cast.
  *
- * Subsystem under test: chaos-net (LD_PRELOAD network fault injection via
- *   bind / connect / listen / accept / send / recv / poll / select / etc.).
+ * @details Unit tests compile the libchaos-net sources directly into the test binary instead
+ * of loading the shared object, so the globals libchaos-net defines in its own translation
+ * units must be supplied by the test. This header provides:
  *
- * This header is included by every unit test that exercises the NET domain.
- * It provides:
+ *   1. CHAOS_NET_DEFINE_TEST_GLOBALS(): defines the 26 portable real-function pointers, the
+ *      5 Linux-only ones (accept4, sendmmsg, recvmmsg, epoll_wait, epoll_pwait, through
+ *      CHAOS_NET_DEFINE_TEST_ACCEPT4_GLOBAL()), the reentrancy guard, the PRNG state and
+ *      seed, and an empty chaos_net_ensure_symbols(). Expand exactly once per test binary.
+ *   2. chaos_net_test_reset_runtime(): returns those globals to their initial state.
+ *   3. chaos_net_test_kernel_*(): read/write/readv/writev/close/setsockopt as raw system
+ *      calls, which the reset installs as the real functions for those six operations.
+ *   4. chaos_net_test_set_ipv4() / chaos_net_test_set_ipv6(): build a sockaddr_in /
+ *      sockaddr_in6 from text, for endpoint tests such as test_net_endpoint.c.
+ *   5. CHAOS_NET_TEST_DLSYM_RESULT(type, function): converts a typed function pointer to the
+ *      `void *` a stub dlsym() returns, via memcpy (ISO C forbids the direct cast).
  *
- *   1. `CHAOS_NET_DEFINE_TEST_GLOBALS()` -- instantiates all real-function-pointer
- *      globals and PRNG/TLS globals. Platform-conditional on Linux:
- *      `CHAOS_NET_DEFINE_TEST_ACCEPT4_GLOBAL()` additionally instantiates the
- *      Linux-only globals for accept4, sendmmsg, recvmmsg, epoll_wait, and
- *      epoll_pwait.
+ * Runtime tests (test_net_runtime.c) additionally `#define` dlsym, dlerror, abort and, on
+ * Linux, syscall before including the production sources, so the constructor and config path
+ * run without LD_PRELOAD.
  *
- *   2. `chaos_net_test_reset_runtime()` -- resets all NET runtime globals to
- *      their initial (NULL/zero) state.
- *
- *   3. `chaos_net_test_set_ipv4()` and `chaos_net_test_set_ipv6()` -- helpers
- *      that build a `sockaddr_in` / `sockaddr_in6` from a text IP and port. Used
- *      by endpoint-resolution tests that need real sockaddr values.
- *
- *   4. `CHAOS_NET_TEST_DLSYM_RESULT(type, function)` -- type-safe function
- *      pointer to `void *` conversion for use in dlsym stubs.
- *
- * Coverage approach:
- * - Tests directly `#include` production `.c` files after `#define`-overriding
- *   `dlsym`, `dlerror`, `abort`, and (on Linux) `syscall`.
- * - The LD_PRELOAD interposition path is NOT tested here.
- *
- * What is NOT tested via this header:
- * - Actual socket connection/data transfer semantics.
- * - Thread-safety of the TLS guard under concurrent socket calls.
- * - OS-specific epoll/kqueue behaviour.
+ * Not covered by tests built on this header: LD_PRELOAD interposition (the runtime suites
+ * cover it), real connection and data-transfer semantics, epoll behaviour, and the
+ * reentrancy guard under concurrent socket calls.
  */
 
 #ifndef CHAOS_NET_TEST_SUPPORT_H
@@ -58,16 +51,16 @@
 #include <sys/syscall.h>
 
 /**
- * @defgroup chaos_net_test_linux_globals Linux-only NET test globals
+ * @defgroup chaos_net_test_linux_globals Linux-only libchaos-net test globals
  * @{
  *
- * Conditional macros for the five Linux-only socket operations.
- * On non-Linux platforms these expand to nothing.
+ * The real functions for accept4, sendmmsg, recvmmsg, epoll_wait and epoll_pwait exist only
+ * on Linux, where libchaos-net declares them; elsewhere both macros expand to nothing.
  *
- * `CHAOS_NET_DEFINE_TEST_ACCEPT4_GLOBAL()` -- declares the globals (used once
- *   at file scope inside `CHAOS_NET_DEFINE_TEST_GLOBALS()`).
- * `CHAOS_NET_RESET_TEST_ACCEPT4_GLOBAL()` -- sets all five globals to NULL
- *   (used inside `chaos_net_test_reset_runtime()`).
+ * - CHAOS_NET_DEFINE_TEST_ACCEPT4_GLOBAL() defines the five pointers as NULL; expanded inside
+ *   CHAOS_NET_DEFINE_TEST_GLOBALS().
+ * - CHAOS_NET_RESET_TEST_ACCEPT4_GLOBAL() sets them back to NULL; expanded inside
+ *   chaos_net_test_reset_runtime().
  */
 #ifdef __linux__
 #define CHAOS_NET_DEFINE_TEST_ACCEPT4_GLOBAL()                                                     \
@@ -89,11 +82,17 @@
 /** @} */
 
 /**
- * @brief Instantiate all NET-domain runtime globals for one test translation unit.
+ * @brief Defines the libchaos-net runtime globals for one test binary.
  *
- * Must be expanded exactly once at file scope. Defines all 20 portable
- * real-function-pointer globals (bind through getsockopt) plus the Linux-only
- * five, plus the TLS guard, TLS PRNG state, and process seed.
+ * Expand exactly once at file scope (a second expansion is a duplicate definition). Defines:
+ * - The 26 portable `g_chaos_net_real_*` real-function pointers (bind through close), NULL.
+ *   `g_chaos_net_real_writev` is declared with chaos_net_readv_fn, as in production.
+ * - chaos_net_ensure_symbols() as a no-op, so real functions stay what the test assigns.
+ * - The five Linux-only pointers via CHAOS_NET_DEFINE_TEST_ACCEPT4_GLOBAL().
+ * - `__thread int g_chaos_net_tls_guard` (reentrancy guard) = 0.
+ * - `__thread uint64_t g_chaos_net_tls_prng_state` = 0, which makes the per-thread PRNG seed
+ *   itself on first use.
+ * - `uint64_t g_chaos_net_process_seed` = 1, a fixed process seed.
  */
 #define CHAOS_NET_DEFINE_TEST_GLOBALS()                                                            \
     chaos_net_bind_fn g_chaos_net_real_bind = NULL;                                                \
@@ -129,19 +128,13 @@
     uint64_t g_chaos_net_process_seed = 1U
 
 /**
- * @brief Reset all NET-domain runtime globals to their initial state.
+ * @name Kernel-direct descriptor calls for tests
  *
- * Sets all real-function-pointer globals to NULL, zeroes the TLS guard, TLS
- * PRNG state, and resets the process seed to 1. Call at the start of each test
- * function that modifies NET runtime state.
- */
-/**
- * @name Descriptor calls for tests
- *
- * libchaos-net interposes read/write/readv/writev/close for sockets, and a test
- * binary that includes the wrappers routes its own descriptor I/O through them.
- * These helpers go straight to the kernel, so the "real" pointers can be bound
- * without dlsym (which some tests stub) and without pointing a wrapper at itself.
+ * libchaos-net wraps read/write/readv/writev/close (and setsockopt) for sockets, so a test
+ * binary that compiles the wrappers in routes its own descriptor I/O through them. These
+ * helpers issue the system call directly. That lets the reset install working real functions
+ * without dlsym() (which runtime tests stub) and without a real-function pointer that names
+ * the wrapper itself, which would recurse. Return values and errno are the kernel's.
  * @{
  */
 static ssize_t chaos_net_test_kernel_read(int fd, void *buffer, size_t size)
@@ -176,6 +169,14 @@ chaos_net_test_kernel_setsockopt(int fd, int level, int name, const void *value,
 }
 /** @} */
 
+/**
+ * @brief Restores every global defined by CHAOS_NET_DEFINE_TEST_GLOBALS() to its initial value.
+ *
+ * Sets the real functions to NULL, except setsockopt, read, write, readv, writev and close,
+ * which point at the chaos_net_test_kernel_*() helpers so the test's own descriptor I/O keeps
+ * working. Zeroes the calling thread's reentrancy guard and PRNG state and resets the process
+ * seed to 1. Call at the start of each test that touches libchaos-net runtime state.
+ */
 static inline void chaos_net_test_reset_runtime(void)
 {
     g_chaos_net_real_bind = NULL;
@@ -211,14 +212,15 @@ static inline void chaos_net_test_reset_runtime(void)
 }
 
 /**
- * @brief Fill a `sockaddr_in` with the given IPv4 address and port.
+ * @brief Fills a `sockaddr_in` with an IPv4 address and port.
  *
- * Used by endpoint tests that need a valid `struct sockaddr_in` to pass to
- * `chaos_net_endpoint_from_sockaddr()` or similar helpers.
+ * Feeds endpoint tests that pass real socket addresses to
+ * chaos_net_endpoint_from_sockaddr_fd().
  *
- * @param address  Output sockaddr_in; memory is zeroed before population.
- * @param ip       Dotted-decimal IPv4 address string (e.g. "127.0.0.1").
- * @param port     Port number in host byte order.
+ * @param address  Output; zeroed first, must not be NULL (asserted).
+ * @param ip       Dotted-decimal IPv4 text, e.g. "127.0.0.1"; inet_pton() must accept it
+ *                 (asserted).
+ * @param port     Port in host byte order; stored in network byte order.
  */
 static inline void
 chaos_net_test_set_ipv4(struct sockaddr_in *address, const char *ip, unsigned short port)
@@ -231,13 +233,12 @@ chaos_net_test_set_ipv4(struct sockaddr_in *address, const char *ip, unsigned sh
 }
 
 /**
- * @brief Fill a `sockaddr_in6` with the given IPv6 address and port.
+ * @brief Fills a `sockaddr_in6` with an IPv6 address and port.
  *
- * Used by endpoint tests that need a valid `struct sockaddr_in6`.
- *
- * @param address  Output sockaddr_in6; memory is zeroed before population.
- * @param ip       IPv6 address string (e.g. "::1").
- * @param port     Port number in host byte order.
+ * @param address  Output; zeroed first (flow info and scope id stay 0), must not be NULL
+ *                 (asserted).
+ * @param ip       IPv6 text, e.g. "::1"; inet_pton() must accept it (asserted).
+ * @param port     Port in host byte order; stored in network byte order.
  */
 static inline void
 chaos_net_test_set_ipv6(struct sockaddr_in6 *address, const char *ip, unsigned short port)
@@ -250,11 +251,14 @@ chaos_net_test_set_ipv6(struct sockaddr_in6 *address, const char *ip, unsigned s
 }
 
 /**
- * @brief Convert a typed function pointer to `void *` using `memcpy`.
+ * @brief Copies a function pointer's bytes into a `void *`.
  *
- * @param function_bytes  Address of a function-pointer-typed value.
- * @param function_size   `sizeof` the function pointer type; must be <= sizeof(void *).
- * @return `void *` carrying the same bit pattern as the function pointer.
+ * ISO C leaves function-pointer to object-pointer casts undefined; POSIX guarantees the
+ * representations match, so a byte copy is the portable way to build a dlsym() result.
+ *
+ * @param function_bytes  Address of a function-pointer object; must not be NULL (asserted).
+ * @param function_size   Size of that object; must be <= sizeof(void *) (asserted).
+ * @return A `void *` with the same bit pattern as the function pointer.
  */
 static inline void *chaos_net_test_dlsym_pointer(const void *function_bytes, size_t function_size)
 {
@@ -267,10 +271,11 @@ static inline void *chaos_net_test_dlsym_pointer(const void *function_bytes, siz
 }
 
 /**
- * @brief Produce the `void *` return value for a NET `dlsym` stub entry.
+ * @brief Yields the `void *` a stub dlsym() returns for @p function.
  *
- * @param type      Function pointer typedef (e.g. `chaos_net_bind_fn`).
- * @param function  Stub function to associate with this symbol name.
+ * @param type      Function-pointer typedef, e.g. `chaos_net_bind_fn`; a mismatch
+ *                  with @p function draws a compiler diagnostic via the compound literal.
+ * @param function  Stub to hand back for the requested symbol name.
  */
 #define CHAOS_NET_TEST_DLSYM_RESULT(type, function)                                                \
     chaos_net_test_dlsym_pointer(&(type){function}, sizeof(type))

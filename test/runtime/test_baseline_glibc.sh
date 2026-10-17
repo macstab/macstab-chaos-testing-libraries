@@ -1,18 +1,28 @@
 #!/bin/sh
 #
-# test_baseline_glibc.sh — the release build loads into ordinary programs on glibc 2.31 (Docker).
+# test_baseline_glibc.sh: the release build of every library loads into ordinary programs on glibc
+# 2.31 (Docker).
 #
-# Builds every libchaos library exactly as `make docker-build-all` does for a release
-# (gcc:10, glibc 2.31, the oldest glibc the libraries support) and preloads them into
-# programs that never link libpthread: cat and sh. On glibc before 2.34 pthread_once
-# and pthread_create live in libpthread, so a library that needs either at load time
-# fails with "undefined symbol" or aborts before main() for every such program.
-# Each library runs alone and all six together, and libchaos-process must still
-# start and fault threads in a program that does link libpthread.
+# Proves that the libraries, built exactly as `make docker-build-all` builds a release (gcc:10
+# image, glibc 2.31), can be preloaded into programs that never link libpthread (cat, sh). Before
+# glibc 2.34, pthread_once and pthread_create live in libpthread, so a library that needs either at
+# load time fails such programs with "undefined symbol" or aborts before main(). Each library runs
+# alone and all six together. libchaos-process must also start, and fault pthread_create (resolved
+# after load), in a program that links libpthread (thread_probe.c).
 #
-# Usage:   test_baseline_glibc.sh [linux/amd64|linux/arm64]
-# Env:     CHAOS_BASELINE_DOCKER_PLATFORM  platform override
-# Prereqs: docker with buildx and multi-arch support
+# Method: docker buildx builds the six glibc libraries (make cross-glibc-<arch>) on gcc:10; a fresh
+# gcc:10 container prints its glibc version, compiles thread_probe.c with -pthread and runs cat, sh
+# and the probe under each library, then under all six, then under `pthread_create:ERRNO:EAGAIN`
+# expecting EAGAIN (11).
+#
+# Usage:   test_baseline_glibc.sh [linux/amd64|linux/arm64]   (default: the host architecture)
+# Env:     CHAOS_BASELINE_DOCKER_PLATFORM  platform when no argument is given
+#          CHAOS_SKIP_EXIT  exit status of a skip (default 0; CI sets 1)
+# Prereqs: docker with buildx; QEMU binfmt for a foreign platform. Run by `make test`.
+# Exit:    0 when every program starts and the fault fires; the first failing command's
+#          status otherwise; non-zero when the build fails or a library is missing; 2 on bad
+#          usage; CHAOS_SKIP_EXIT when the host or platform is not amd64/arm64, docker is
+#          missing or its daemon is unreachable.
 
 set -eu
 

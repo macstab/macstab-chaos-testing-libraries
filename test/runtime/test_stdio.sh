@@ -1,16 +1,26 @@
 #!/bin/sh
 #
-# test_stdio.sh — buffered stdio reads and writes are faulted by the io rules (Docker).
+# test_stdio.sh: libchaos-io read/write rules fault buffered stdio (fread, fgets, fgetc, getline,
+# fwrite, fputs, fprintf, fflush) on glibc and musl (Docker).
 #
-# Builds libchaos-io for glibc (gcc:bookworm) and musl (alpine:3.20) and runs
-# stdio_probe under each. Both libcs read and write FILE streams with their own
-# internal system calls, so fread, fgets, fwrite, fprintf and friends need their own
-# wrappers. On glibc the probe is also built with _FORTIFY_SOURCE=2, which turns
-# its calls into __fread_chk, __fgets_chk and __fprintf_chk.
+# Proves that FILE-stream I/O, which both libcs perform with internal system calls instead of the
+# exported read()/write(), is faulted like a real I/O error and that fclose drops the fd cache entry
+# (stdio_probe.c lists every check). On glibc the probe is also built with _FORTIFY_SOURCE=2, which
+# routes its calls to __fread_chk, __fgets_chk and __fprintf_chk, so the fortified wrappers are
+# proven too.
 #
-# Usage:   test_stdio.sh [linux/amd64|linux/arm64]
-# Env:     CHAOS_STDIO_DOCKER_PLATFORM  platform override
-# Prereqs: docker with buildx and multi-arch support
+# Method: for glibc (gcc:bookworm) and then musl (alpine:3.20), docker buildx builds libchaos-io
+# (make cross-<libc>-<arch>), and a fresh container of the same image compiles stdio_probe.c and
+# runs it with LD_PRELOAD of that build.
+#
+# Usage:   test_stdio.sh [linux/amd64|linux/arm64]   (default: the host architecture)
+# Env:     CHAOS_STDIO_DOCKER_PLATFORM  platform when no argument is given
+#          CHAOS_SKIP_EXIT  exit status of a skip (default 0; CI sets 1)
+# Prereqs: docker with buildx; QEMU binfmt for a foreign platform. Run by `make test`.
+# Exit:    0 when every build passes; the probe's 1 or 2 for the first failing run; non-zero
+#          when a build fails or yields no library; 2 on bad usage; CHAOS_SKIP_EXIT when the
+#          host or platform is not amd64/arm64, docker is missing or its daemon is
+#          unreachable.
 
 set -eu
 

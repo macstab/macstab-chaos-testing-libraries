@@ -1,36 +1,28 @@
 /**
  * @file test_process_support.h
- * @brief PROCESS-domain test globals, reset helper, and dlsym cast utility.
+ * @brief Unit-test scaffolding for libchaos-process: runtime globals, reset helper, dlsym cast.
  *
- * Subsystem under test: chaos-process (LD_PRELOAD process lifecycle fault injection
- *   via pthread_create / fork / posix_spawn / execve / waitpid interception).
+ * @details Unit tests compile the libchaos-process sources directly into the test binary
+ * instead of loading the shared object, so the globals libchaos-process defines in its own
+ * translation units must be supplied by the test. This header provides:
  *
- * This header is included by every unit test that exercises the PROCESS domain.
- * It provides:
+ *   1. CHAOS_PROCESS_DEFINE_TEST_GLOBALS(): defines every runtime global declared `extern`
+ *      for libchaos-process, including the FAIL_AFTER counter array, plus test versions of
+ *      chaos_process_ensure_symbols() (no-op) and chaos_process_resolve_pthread_create().
+ *      Expand exactly once per test binary, at file scope.
+ *   2. chaos_process_test_reset_runtime(): returns those globals to their initial state,
+ *      FAIL_AFTER counters included; call at the start of every test.
+ *   3. CHAOS_PROCESS_TEST_DLSYM_RESULT(type, function): converts a typed function pointer to
+ *      the `void *` a stub dlsym() returns, via memcpy (ISO C forbids the direct cast).
  *
- *   1. `CHAOS_PROCESS_DEFINE_TEST_GLOBALS()` -- instantiates all process-domain
- *      runtime globals. Notably includes the `fail_after_counters` volatile array
- *      (one `uint64_t` per operation kind) used by the FAIL_AFTER countdown effect.
+ * libchaos-process holds thirteen real functions: pthread_create, fork, posix_spawn,
+ * posix_spawnp, execve, execveat (Linux only), execvpe, fexecve, system, popen, waitpid,
+ * wait4 and waitid. Its LATENCY effect sleeps through chaos_sleep_ms(); include
+ * test_sleep_support.h first to record those sleeps instead of performing them.
  *
- *   2. `chaos_process_test_reset_runtime()` -- resets all process runtime globals
- *      to their initial state. Zeroes the fail_after_counters array via `memset`
- *      in addition to the standard pointer/seed resets.
- *
- *   3. `CHAOS_PROCESS_TEST_DLSYM_RESULT(type, function)` -- type-safe function
- *      pointer to `void *` conversion for dlsym stubs.
- *
- * The PROCESS domain intercepts pthread_create, fork, posix_spawn, posix_spawnp,
- * execve, execveat (Linux only), waitpid, wait4 and waitid. Its LATENCY effect sleeps through
- * chaos_sleep_ms(); see test_sleep_support.h.
- *
- * Coverage approach:
- * - Tests directly `#include` production `.c` files after symbol overrides.
- * - The LD_PRELOAD interposition path is NOT tested here.
- *
- * What is NOT tested via this header:
- * - Real fork/exec semantics, child process creation, or process table effects.
- * - Thread-safety of the fail_after_counters under concurrent pthread_create calls.
- * - Signal handling across fork.
+ * Not covered by tests built on this header: real fork/exec/spawn semantics, signals across
+ * fork, LD_PRELOAD interposition, and the FAIL_AFTER counters under concurrent callers. The
+ * runtime suites (test/runtime) cover interposition.
  */
 
 #ifndef CHAOS_PROCESS_TEST_SUPPORT_H
@@ -47,17 +39,25 @@
 #include <unistd.h>
 
 /**
- * @brief Instantiate all PROCESS-domain runtime globals for one test translation unit.
+ * @brief Defines the libchaos-process runtime globals for one test binary.
  *
- * Must be expanded exactly once at file scope. Defines:
- * - All nine real-function-pointer globals (NULL-initialised).
- * - `__thread int g_chaos_process_tls_guard` -- per-thread re-entrancy guard.
- * - `__thread uint64_t g_chaos_process_tls_prng_state` -- per-thread PRNG state.
- * - `uint64_t g_chaos_process_process_seed` -- process-wide PRNG seed (1).
- * - `volatile uint64_t g_chaos_process_fail_after_counters[CHAOS_PROCESS_OP_COUNT]`
- *   -- per-operation countdown counters for the FAIL_AFTER effect. Initialised to
- *   all-zeros; each element counts down from `rule.fail_after_count` and triggers
- *   the error once it reaches zero.
+ * Expand exactly once at file scope (a second expansion is a duplicate definition). Defines:
+ * - chaos_process_ensure_symbols() as a no-op, so real functions stay what the test assigns.
+ * - chaos_process_resolve_pthread_create(), which installs `g_test_late_pthread_create` only
+ *   while the real pthread_create is still NULL. It models the production lazy resolution,
+ *   where pthread_create can appear later (libpthread brought in by dlopen()), so tests can
+ *   prove the wrapper retries resolution instead of failing for good.
+ * - The thirteen `g_chaos_process_real_*` real-function pointers, all NULL.
+ * - `__thread int g_chaos_process_tls_guard` (reentrancy guard) = 0.
+ * - `__thread uint64_t g_chaos_process_tls_prng_state` = 0, which makes the per-thread PRNG
+ *   seed itself on first use.
+ * - `uint64_t g_chaos_process_process_seed` = 1 in place of the /dev/urandom seed.
+ * - `volatile uint64_t g_chaos_process_fail_after_counters[CHAOS_PROCESS_OP_COUNT]` = 0:
+ *   one call counter per operation, counting up from 0. The FAIL_AFTER effect increments it
+ *   on every matching call and injects the error once the pre-increment value reaches
+ *   `rule.fail_after_count` (and the probability draw hits). In production the counters are
+ *   also zeroed on every reload and, by the pthread_atfork child handler, in a fork child, so
+ *   FAIL_AFTER counts per process.
  */
 #define CHAOS_PROCESS_DEFINE_TEST_GLOBALS()                                                        \
     void chaos_process_ensure_symbols(void) {}                                                     \
@@ -88,16 +88,14 @@
     volatile uint64_t g_chaos_process_fail_after_counters[CHAOS_PROCESS_OP_COUNT] = {0U}
 
 /**
- * @brief Reset all PROCESS-domain runtime globals to their initial state.
+ * @brief Restores every global defined by CHAOS_PROCESS_DEFINE_TEST_GLOBALS() to its initial
+ *        value.
  *
- * Sets all real-function-pointer globals to NULL, zeroes the TLS guard and PRNG
- * state, resets the process seed to 1, and zeroes all elements of the
- * `g_chaos_process_fail_after_counters` array. The `memset` cast to `void *` is
- * required because the array is `volatile`.
- *
- * Call at the start of each test function to prevent cross-test contamination,
- * especially important for FAIL_AFTER tests where counter state from a previous
- * test could cause spurious failures in the next.
+ * Sets the thirteen real-function pointers to NULL, zeroes the calling thread's reentrancy
+ * guard and PRNG state, resets the process seed to 1 and zeroes every FAIL_AFTER counter. A
+ * counter left over from an earlier test would shift the call on which FAIL_AFTER fires.
+ * `g_test_late_pthread_create` is not reset. The memset() argument is cast to `void *`
+ * because passing a pointer to volatile discards the qualifier.
  */
 static inline void chaos_process_test_reset_runtime(void)
 {
@@ -125,11 +123,14 @@ static inline void chaos_process_test_reset_runtime(void)
 }
 
 /**
- * @brief Convert a typed function pointer to `void *` using `memcpy`.
+ * @brief Copies a function pointer's bytes into a `void *`.
  *
- * @param function_bytes  Address of a function-pointer-typed value.
- * @param function_size   `sizeof` the function pointer type; must be <= sizeof(void *).
- * @return `void *` carrying the same bit pattern as the function pointer.
+ * ISO C leaves function-pointer to object-pointer casts undefined; POSIX guarantees the
+ * representations match, so a byte copy is the portable way to build a dlsym() result.
+ *
+ * @param function_bytes  Address of a function-pointer object; must not be NULL (asserted).
+ * @param function_size   Size of that object; must be <= sizeof(void *) (asserted).
+ * @return A `void *` with the same bit pattern as the function pointer.
  */
 static inline void *
 chaos_process_test_dlsym_pointer(const void *function_bytes, size_t function_size)
@@ -143,10 +144,11 @@ chaos_process_test_dlsym_pointer(const void *function_bytes, size_t function_siz
 }
 
 /**
- * @brief Produce the `void *` return value for a PROCESS `dlsym` stub entry.
+ * @brief Yields the `void *` a stub dlsym() returns for @p function.
  *
- * @param type      Function pointer typedef (e.g. `chaos_process_fork_fn`).
- * @param function  Stub function to associate with this symbol name.
+ * @param type      Function-pointer typedef, e.g. `chaos_process_fork_fn`; a mismatch
+ *                  with @p function draws a compiler diagnostic via the compound literal.
+ * @param function  Stub to hand back for the requested symbol name.
  */
 #define CHAOS_PROCESS_TEST_DLSYM_RESULT(type, function)                                            \
     chaos_process_test_dlsym_pointer(&(type){function}, sizeof(type))

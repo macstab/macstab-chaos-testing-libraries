@@ -1,15 +1,22 @@
 /**
  * @file hits_probe.c
- * @brief Runtime probe: calls the operation of one library's test rule twice.
+ * @brief Calls the faulted operation of one library's test rule a fixed number of times so
+ *        test_hits.sh can check the hits files the library writes.
  *
- * Usage: hits_probe io|net|dns|time|memory|process   (under LD_PRELOAD of that library)
- *        hits_probe burst   (libchaos-io) opens the faulted file 100 times, waits
- *                           past the hits interval, makes one unrelated call and
- *                           prints the hits its own file reports while it runs
- *        hits_probe exec    (libchaos-io) opens the faulted file 3 times, then
- *                           executes itself as `hits_probe io` (2 more)
+ * @details
+ * Usage, under LD_PRELOAD of the named library:
+ * - hits_probe io|net|dns|time|memory|process: two calls of the library's operation
+ *   (open of /tmp/hits-data/file, connect to 127.0.0.1:9, getaddrinfo("api.example.com"),
+ *   a 1 us nanosleep, a 4096-byte anonymous mmap, fork + waitpid). Results are ignored.
+ * - hits_probe burst (libchaos-io): 100 faulted opens, a 200 ms sleep (past
+ *   CHAOS_HITS_INTERVAL_MS, 100 ms), one unmatched open so a rule-file check runs, then
+ *   prints the sum of its own `/tmp/.chaos-io.hits.<pid>` file. The first 64 hits are
+ *   written eagerly; 100 proves the interval write happened while the process still runs,
+ *   not only at exit.
+ * - hits_probe exec (libchaos-io): 3 faulted opens, then execs itself as `hits_probe io`
+ *   (2 more) under the same pid; the old image's hits file must survive beside the new one.
  *
- * Results are ignored; test_hits.sh checks the hits files the library wrote.
+ * Exit: 0; 1 when the exec fails; 2 on bad usage.
  */
 
 #ifndef _GNU_SOURCE
@@ -28,6 +35,7 @@
 #include <time.h>
 #include <unistd.h>
 
+/** @brief One call of @p lib's test operation; the outcome is ignored. */
 static void call_once(const char *lib)
 {
     if (strcmp(lib, "io") == 0)
@@ -91,7 +99,7 @@ static void call_once(const char *lib)
     }
 }
 
-/** @brief The burst mode: the hits this process's file reports while it still runs. */
+/** @brief Burst mode: prints the hits this process's own hits file reports while it runs. */
 static int burst(void)
 {
     const struct timespec past_interval = {0, 200000000L};

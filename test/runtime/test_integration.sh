@@ -1,19 +1,31 @@
 #!/bin/sh
 #
-# test_integration.sh — Native libchaos-io integration test (no Docker).
+# test_integration.sh: libchaos-io end-to-end on the host, without Docker.
 #
-# Builds libchaos-io.so natively via make, compiles a C probe from an inline
-# heredoc, and runs the probe under LD_PRELOAD on the host Linux system.
-# Validates end-to-end fault injection for: write, read, readv, writev, pread,
-# pwrite, preadv, pwritev, sendfile, copy_file_range, ftruncate, fallocate,
-# unlinkat, renameat, and fsync. Each subtest writes a config rule with a
-# future mtime to guarantee a reload cycle before the injected call.
+# Proves, against the native build (make native, build/libchaos-io.so) on the host's own libc and
+# kernel, that:
 #
-# Exits 0 on success; exits with a numbered non-zero code identifying the
-# failing subtest on any assertion failure.
+# - with no rule file, write, read, openat, writev, readv, sendfile, preadv, copy_file_range
+#   and pwritev move the right bytes (pass-through is transparent);
+# - write:EIO fails write, writev, sendfile and copy_file_range on the target; open:EIO fails
+#   openat; pwrite:EIO fails pwritev; truncate/allocate/unlink/rename_from:EIO fail
+#   ftruncate, fallocate, unlinkat and renameat with errno EIO (fixture exit status 5);
+# - read:CORRUPT and pread:CORRUPT alter the bytes readv and preadv return;
+# - LATENCY:200 delays write, ftruncate, fallocate, unlinkat and renameat (rename_to) by
+#   >= 150 ms, and the delayed rename still completes;
+# - write:TORN shortens a sendfile copy to 1-7 of its 8 bytes;
+# - after the rule file is removed, I/O is transparent again.
+#
+# Method: compiles an inline C fixture (one operation per invocation) and runs each case as a new
+# process under LD_PRELOAD, so every case starts by loading the rule file just written. An existing
+# /tmp/.chaos-io.conf is backed up and restored on exit.
 #
 # Usage:   test_integration.sh
-# Prereqs: Linux, cc, make; exits cleanly (exit 0) on non-Linux.
+# Env:     CHAOS_SKIP_EXIT  exit status of a skip (default 0; CI sets 1)
+# Prereqs: Linux, cc, make, GNU date (%3N). Run by `make test` and CI.
+# Exit:    0 when every case passes ("integration test passed"); 1 or the failing
+#          command's status at the first failing case (no per-case codes);
+#          CHAOS_SKIP_EXIT on a non-Linux host.
 
 set -eu
 

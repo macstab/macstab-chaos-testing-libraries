@@ -1,19 +1,35 @@
 #!/bin/sh
 #
-# test_fork.sh — per-process state across vfork, fork and posix_spawn (Docker).
+# test_fork.sh: per-process rule state across vfork, fork and posix_spawn, on glibc and musl
+# (Docker).
 #
-# Builds libchaos-io for glibc (gcc:bookworm) and musl (alpine:3.20). An open rule
-# with @first=1 faults the first open of each process. fork_probe opens the file,
-# starts a child that opens it, and opens it again:
+# Proves how an `@first=1` budget, the hits files and the PRNG behave in child processes. fork_probe
+# opens a faulted file, starts a child that opens it, and opens it again:
 #
-# - vfork: the child shares the parent's memory and runs no atfork handler, so it
-#   must neither take over nor reset the parent's budget, and writes no hits file;
-# - fork: the atfork handler gives the child its own budget and hits file;
-# - posix_spawn: the exec'd child starts fresh; the parent is unaffected.
+# - vfork: the child shares the parent's memory and runs no atfork handler, so it must
+#   neither take over nor reset the parent's budget, and writes no hits file. Expected:
+#   "parent=EIO child=ok parent=ok", 1 hit in 1 hits file.
+# - fork: the atfork child handler gives the child its own budget and hits file. Expected:
+#   "parent=EIO child=EIO parent=ok", 2 hits in 2 files.
+# - posix_spawn: the exec'd child starts with fresh state; the parent is unaffected.
+#   Expected as for fork.
+# - draws: under a 0.5 probability rule a forked child's 64 outcomes must differ from the
+#   parent's, i.e. the child reseeds its PRNG instead of repeating the parent's numbers.
 #
-# Usage:   test_fork.sh [linux/amd64|linux/arm64]
-# Env:     CHAOS_FORK_DOCKER_PLATFORM  platform override
-# Prereqs: docker with buildx and multi-arch support
+# Hits are summed from the `# first` rule's lines in /tmp/.chaos-io.hits.*.
+#
+# Method: for glibc (gcc:bookworm) and then musl (alpine:3.20), docker buildx builds libchaos-io
+# (make cross-<libc>-<arch>), and a fresh container of the same image compiles fork_probe.c and runs
+# the four checks.
+#
+# Usage:   test_fork.sh [linux/amd64|linux/arm64]   (default: the host architecture)
+# Env:     CHAOS_FORK_DOCKER_PLATFORM  platform when no argument is given
+#          CHAOS_SKIP_EXIT  exit status of a skip (default 0; CI sets 1)
+# Prereqs: docker with buildx; QEMU binfmt for a foreign platform. Run by `make test`.
+# Exit:    0 when both libcs pass all checks; non-zero when any check fails (all checks of a
+#          libc still run and report) or a build fails; 2 on bad usage; CHAOS_SKIP_EXIT when
+#          the host or platform is not amd64/arm64, docker is missing or its daemon is
+#          unreachable.
 
 set -eu
 

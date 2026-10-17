@@ -1,16 +1,35 @@
 #!/bin/sh
 #
-# test_hits.sh — every library counts how often each rule fired (Docker).
+# test_hits.sh: every library counts how often each rule fired and writes the counts to per-process
+# hits files, on glibc and musl (Docker).
 #
-# Builds all libchaos libraries for glibc (gcc:bookworm) and musl (alpine:3.20). For
-# each library a rule file holds one rule that fires and one that never matches;
-# hits_probe calls the faulted operation twice, and runs twice. The hits files of the
-# two processes must add up to 4 for the firing rule and 0 for the other. Then a rule
-# with @first=1 must fire once per process, and one whose @until passed never.
+# Proves, for each of the six libraries (hits_probe makes two calls per process, two processes per
+# check):
 #
-# Usage:   test_hits.sh [linux/amd64|linux/arm64]
-# Env:     CHAOS_HITS_DOCKER_PLATFORM  platform override
-# Prereqs: docker with buildx and multi-arch support
+#   - a firing rule totals 4 hits over 2 hits files; a rule that never matches totals 0;
+#   - `@first=1` fires once per process (total 2); `@until=1` (Unix ms 1, long past) never.
+#
+# Then, for libchaos-io: a burst of 100 hits is on file while the process still runs (eager writes
+# cover only the first 64), and hits counted before an execve survive in their own file beside the
+# new image's (5 hits in 2 files). For io and net, a LATENCY rule with `@first=1` counts as a hit
+# and delays once per process. For libchaos-memory, `@size>4095` fires on 4096-byte mappings while
+# `@size>4096` does not.
+#
+# Hits are summed from the matching rule's lines (count<TAB>rule text) over all
+# /tmp/.chaos-<lib>.hits.* files.
+#
+# Method: for glibc (gcc:bookworm) and then musl (alpine:3.20), docker buildx builds all libraries
+# (make cross-<libc>-<arch>), and a fresh container of the same image compiles hits_probe.c and runs
+# the checks.
+#
+# Usage:   test_hits.sh [linux/amd64|linux/arm64]   (default: the host architecture)
+# Env:     CHAOS_HITS_DOCKER_PLATFORM  platform when no argument is given
+#          CHAOS_SKIP_EXIT  exit status of a skip (default 0; CI sets 1)
+# Prereqs: docker with buildx; QEMU binfmt for a foreign platform. Run by `make test`.
+# Exit:    0 when every check passes; non-zero when any check fails (all checks of a libc
+#          still run and report) or a build fails; 2 on bad usage; CHAOS_SKIP_EXIT when the
+#          host or platform is not amd64/arm64, docker is missing or its daemon is
+#          unreachable.
 
 set -eu
 
@@ -110,7 +129,7 @@ for lib in io net dns time memory process; do
     fi
     rm -f /tmp/.chaos-$lib.conf /tmp/.chaos-$lib.hits.*
 
-    # @first=1 fires once per process; a window that ended long ago never fires.
+    # @first=1 fires once per process; @until=1 (Unix ms 1) ended in 1970 and never fires.
     { echo "$fired @first=1 # first"; echo "$fired @until=1 # expired"; } > /tmp/.chaos-$lib.conf
     LD_PRELOAD=$so /tmp/hits-probe "$lib"
     LD_PRELOAD=$so /tmp/hits-probe "$lib"
@@ -126,8 +145,8 @@ for lib in io net dns time memory process; do
     rm -f /tmp/.chaos-$lib.conf /tmp/.chaos-$lib.hits.*
 done
 
-# Hits of the last interval reach the file while the process still runs: 100
-# hits, past the 64 written at once, then the interval passes and one more call.
+# Hits after the 64 eager writes reach the file on the next due write (>= 100 ms later) while
+# the process still runs: 100 hits, a 200 ms pause, one more intercepted call, read back.
 so=/out/libchaos-io-$LIBC-'"$ARCH"'.so
 echo "/tmp/hits-data:open:EIO:1.0 # burst" > /tmp/.chaos-io.conf
 burst=$(LD_PRELOAD=$so /tmp/hits-probe burst)
@@ -139,7 +158,8 @@ else
 fi
 rm -f /tmp/.chaos-io.conf /tmp/.chaos-io.hits.*
 
-# A program started by execve keeps the pid: the hits counted before the exec stay.
+# execve keeps the pid but replaces the image: the 3 hits counted before the exec stay in their
+# own file and the new image writes its 2 to a new one.
 echo "/tmp/hits-data:open:EIO:1.0 # exec" > /tmp/.chaos-io.conf
 LD_PRELOAD=$so /tmp/hits-probe exec
 files=$(ls /tmp/.chaos-io.hits.* 2>/dev/null | wc -l)
@@ -152,8 +172,8 @@ else
 fi
 rm -f /tmp/.chaos-io.conf /tmp/.chaos-io.hits.*
 
-# A delay is a hit like any other effect and honours @first: hits_probe calls the
-# operation twice, so @first=1 delays once per process.
+# A delay is a hit like any other effect and honours @first: hits_probe calls the operation
+# twice, so @first=1 delays once per process (2 hits over 2 processes).
 for lib in io net; do
     so=/out/libchaos-$lib-$LIBC-'"$ARCH"'.so
     case "$lib" in
@@ -173,7 +193,7 @@ for lib in io net; do
     rm -f /tmp/.chaos-$lib.conf /tmp/.chaos-$lib.hits.*
 done
 
-# @size: hits_probe maps 4096 bytes, so only the gate below that size fires.
+# @size: hits_probe maps 4096 bytes twice, so @size>4095 fires twice and @size>4096 never.
 so=/out/libchaos-memory-$LIBC-'"$ARCH"'.so
 { echo "mmap/anon:ERRNO:ENOMEM @size>4095 # small"; echo "mmap/anon:LATENCY:1 @size>4096 # large"; } > /tmp/.chaos-memory.conf
 LD_PRELOAD=$so /tmp/hits-probe memory

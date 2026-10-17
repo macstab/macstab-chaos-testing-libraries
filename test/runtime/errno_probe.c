@@ -1,17 +1,25 @@
 /**
  * @file errno_probe.c
- * @brief Runtime probe: an idle libchaos library never changes errno on success.
+ * @brief Proves that an idle libchaos library never changes errno on a successful call.
  *
- * Every successful call below starts with errno set to a sentinel and checks it is
- * still the sentinel afterwards. POSIX lets a successful call leave errno alone, and
- * applications rely on that (for example `errno = 0; ...; if (errno)`). A library
- * that runs its own stat(2), open(2) or getsockname(2) before forwarding the call
- * would leak ENOENT or ENOTCONN into errno even though the caller's call succeeded.
+ * @details
+ * POSIX lets a successful call leave errno untouched and applications rely on it
+ * (`errno = 0; f(); if (errno) ...`). A wrapper that runs its own stat(2), open(2) or
+ * getsockname(2) before forwarding (rule-file checks, endpoint lookups) would leak ENOENT or
+ * ENOTCONN into errno although the caller's call succeeded.
  *
- * Run once without a config file and once with a config file whose rules match
- * nothing here, under LD_PRELOAD of each libchaos library in turn.
+ * Each call below starts with errno = 4242 and must succeed with errno still 4242: connect,
+ * send (libchaos-net), open, write, fsync, pread (libchaos-io), mmap, munmap
+ * (libchaos-memory), clock_gettime, nanosleep (libchaos-time), fork, waitpid
+ * (libchaos-process). getaddrinfo (libchaos-dns) is checked for success only, because glibc's
+ * getaddrinfo sets errno to 0 on success with or without a preloaded library.
  *
- * Exit code 0 on success, 1 on the first leaked errno.
+ * Run by test_errno_glibc.sh under LD_PRELOAD of each library in turn, twice per library: with
+ * no rule file, and with a rule file holding only a comment (rules loaded path, nothing
+ * matches).
+ *
+ * Exit: 0 when no errno changed; 1 when any check failed (all checks run; each failure is
+ * printed); 2 when the loopback listener cannot be set up.
  */
 
 #include <arpa/inet.h>
@@ -31,6 +39,7 @@
 
 static int g_failures = 0;
 
+/** @brief Records a failure when the call failed (@p ok == 0) or errno is no longer 4242. */
 static void check(const char *what, int ok)
 {
     if (!ok)
@@ -112,9 +121,9 @@ int main(void)
     errno = SENTINEL;
     check("waitpid", waitpid(child, &status, 0) == child);
 
-    /* glibc's getaddrinfo() itself resets errno to 0 on success, with or without a
-     * preloaded library, so only success is checked; the call still drives the dns
-     * library through its config refresh. */
+    /* glibc's getaddrinfo() sets errno to 0 on success, with or without a preloaded library,
+     * so only success is checked; the call still drives libchaos-dns through its rule-file
+     * check. */
     if (getaddrinfo("localhost", NULL, NULL, &result) != 0)
     {
         (void)fprintf(stderr, "FAIL getaddrinfo: call failed\n");

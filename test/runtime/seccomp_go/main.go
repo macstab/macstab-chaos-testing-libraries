@@ -1,9 +1,18 @@
-// Runtime probe for test_seccomp.sh: a statically linked Go program
-// (CGO_ENABLED=0), which LD_PRELOAD cannot reach, under chaos-init.
+// Command seccomp_go is the Go tracee for test_seccomp.sh. Built with CGO_ENABLED=0 it is a
+// static binary that makes raw system calls without libc, so LD_PRELOAD mode cannot reach it;
+// faults it observes come only from chaos-init in SECCOMP mode. Each mode prints one result
+// line for the script to compare.
 //
-// Usage: seccomp_go open <path> | openms <path> | dial <port> | recvms <port> |
+// Usage:
 //
-//	spawn | mmap <bytes>
+//	seccomp_go open <path>    os.OpenFile(O_RDONLY|O_CREATE): "ok", "EIO" or the error text
+//	seccomp_go openms <path>  the same, printing the elapsed ms (LATENCY checks)
+//	seccomp_go dial <port>    listen on 127.0.0.1:<port>, net.Dial it: "ok" or "ECONNREFUSED"
+//	seccomp_go recvms <port>  ms the server side takes to read one byte the client sent
+//	seccomp_go spawn          os/exec runs /bin/true: "ok", "EAGAIN" or the error text
+//	seccomp_go mmap <bytes>   syscall.Mmap of that many anonymous bytes: "ok" or "ENOMEM"
+//
+// Exit status: 0 after printing; 2 on bad usage.
 package main
 
 import (
@@ -17,6 +26,7 @@ import (
 	"time"
 )
 
+// tryOpen opens path with O_CREATE and closes it: "ok", "EIO" or the error text.
 func tryOpen(path string) string {
 	file, err := os.OpenFile(path, os.O_RDONLY|os.O_CREATE, 0o644)
 	if err == nil {
@@ -30,7 +40,8 @@ func tryOpen(path string) string {
 	return err.Error()
 }
 
-// dial listens on 127.0.0.1:port and dials it.
+// dial listens on 127.0.0.1:port and dials it; returns "ok", "ECONNREFUSED" or the error
+// text.
 func dial(port string) string {
 	listener, err := net.Listen("tcp", "127.0.0.1:"+port)
 	if err != nil {
@@ -49,7 +60,9 @@ func dial(port string) string {
 	return "ok"
 }
 
-// recvms measures how long the server side of 127.0.0.1:port takes to read one byte.
+// recvms returns how many ms the accepted server connection on 127.0.0.1:port blocks in Read
+// for the one byte a client goroutine sends, or -1 on a setup error. A recv LATENCY rule on
+// that port must add its delay here.
 func recvms(port string) int64 {
 	listener, err := net.Listen("tcp", "127.0.0.1:"+port)
 	if err != nil {
@@ -92,7 +105,8 @@ func main() {
 	case "recvms":
 		fmt.Println(recvms(os.Args[2]))
 	case "spawn":
-		// os/exec starts children with clone(CLONE_VFORK): posix_spawn rules.
+		// os/exec starts children with clone(CLONE_VFORK|CLONE_VM), which chaos-init maps to
+		// the posix_spawn operation, so a posix_spawn rule must fail it.
 		err := exec.Command("/bin/true").Run()
 		var errno syscall.Errno
 		switch {

@@ -1,15 +1,22 @@
 #!/bin/sh
 #
-# check_coverage.sh — Source-line coverage gate for libchaos-io.
+# check_coverage.sh: 100% line-coverage gate for every library, chaos-init and the shared
+# headers.
 #
-# Compiles all src/ and test/ files with --coverage (gcov instrumentation),
-# runs the unit tests, then calls gcov on each instrumented object and asserts
-# that each source file meets its minimum per-file line-coverage percentage.
-# Exits non-zero if any threshold is not met.
+# Proves: each listed source file reaches 100.00% executed lines in the unit test that owns it
+# (check_target), and each shared header (src/common/*.h and every <lib>_internal.h) has every
+# executable line run by at least one unit test (check_union). Any untested line in a wrapper,
+# parser or effect is a gate failure, not a statistic.
 #
-# Usage:   check_coverage.sh
-# Env:     CC, CPPFLAGS, CFLAGS, BUILD_DIR  (forwarded to make(1))
-# Prereqs: gcc or clang with gcov support; make
+# Method: wipes BUILD_DIR, runs `make unit` with `-O0 --coverage` appended to CFLAGS (the last
+# -O wins, so no line is optimised away), then parses gcov output per .gcno. A header compiled
+# into many tests is merged across all of them: a line counts as run when any test ran it.
+#
+# Usage:   check_coverage.sh                (`make coverage` runs it with BUILD_DIR=build-coverage)
+# Env:     CC, CPPFLAGS, CFLAGS, BUILD_DIR  forwarded to make (defaults below)
+# Prereqs: a compiler with gcov support (gcc + gcov, or clang with a gcov-compatible tool); make
+# Exit:    0 every gate met; non-zero at the first file below 100%, a header line no test ran
+#          (listed as `<file>:<line> not run by any test`), or a missing .gcno. Never skips.
 
 set -eu
 
@@ -53,8 +60,11 @@ check_target() {
     '
 }
 
-# A header every library includes is compiled into many tests: its coverage is
-# that of all of them together, a line counting as run when any test ran it.
+# check_union: a header every library includes is compiled into many tests, so no single .gcno
+# is authoritative. Runs gcov -p (path-mangled report names, '/' -> '#') on every .gcno, keeps
+# each run's reports in its own directory, then merges the reports for this header: a line is
+# executable if any report lists it and run if any report has a non-zero count. Fails unless
+# the header has executable lines and none is missed.
 check_union() {
     source_path=$1
     key=$(printf '%s' "$source_path" | sed 's|/|#|g')
@@ -189,6 +199,6 @@ done
 
 echo "coverage check passed"
 
-# gcov writes .gcov annotation files into the working directory; remove them
-# now that the gate has passed — they are intermediate artifacts, not outputs.
+# check_target leaves gcov's .gcov reports in the working directory (the repository root);
+# they are intermediates. On failure the script exits earlier and leaves them for inspection.
 rm -f ./*.gcov

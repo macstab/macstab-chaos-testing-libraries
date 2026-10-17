@@ -1,57 +1,47 @@
 /**
  * @file process_probe.c
- * @brief Runtime validation probe for libchaos-process under LD_PRELOAD.
+ * @brief End-to-end probe for libchaos-process in LD_PRELOAD mode on glibc and musl.
  *
  * @details
- * Standalone C program compiled inside a Docker container and executed under
- * `LD_PRELOAD=libchaos-process.so`. Validates end-to-end fault injection for
- * the process library's interposed symbols: `pthread_create`, `fork`,
- * `posix_spawn`, `posix_spawnp`, `execve`, `execveat`, and `waitpid`.
+ * Proves that rules in the rule file `/tmp/.chaos-process.conf` fault thread creation, process
+ * creation, exec and reaping with each function's own error contract. Exit code of each check,
+ * its rule, and the behaviour proven:
  *
- * Each subtest writes a config rule with a future-mtime timestamp to
- * `/tmp/.chaos-process.conf`, then exercises the interposed symbol and asserts
- * the expected behavior. This probe uses `utime()` rather than `futimens()` to
- * advance the mtime, because `futimens()` requires the fd to remain open past
- * `fclose()`, which conflicts with the write-close-then-stamp ordering needed
- * for `utime()`. The incrementing `g_config_stamp` still guarantees each
- * `write_config()` call produces a strictly newer mtime.
+ * - 10      pthread_create:ERRNO:EAGAIN; returns EAGAIN, errno stays 0 (pthread functions
+ *           report errors by return value).
+ * - 20-24   pthread_create:LATENCY:100; succeeds and takes >= 80 ms.
+ * - 30-32   pthread_create:FAIL_AFTER:EAGAIN,1; the 1st call succeeds, the 2nd returns EAGAIN.
+ * - 40      fork:ERRNO:EAGAIN; -1 with errno EAGAIN, no child.
+ * - 50-55   fork:LATENCY:100; fork returns >= 80 ms later and the child exits 0.
+ * - 60      posix_spawn:ERRNO:EAGAIN; returns EAGAIN, errno stays 0, nothing spawned.
+ * - 70-75   posix_spawnp:LATENCY:100; spawns `true` via PATH, >= 80 ms, exit status 0.
+ * - 80-83   execve:ERRNO:EACCES; in a forked child, execve returns -1/EACCES instead of
+ *           replacing the image.
+ * - 90-93   execveat:ERRNO:ENOENT; same, for execveat. Passes without running when the libc
+ *           has no execveat symbol (weak reference resolves to NULL, e.g. glibc < 2.34).
+ * - 100-103 waitpid:ERRNO:EINTR; -1/EINTR without reaping; the child is reaped after the rule
+ *           is cleared, proving the fault consumed no zombie.
+ * - 110-115 waitpid:LATENCY:100; reaps the child >= 80 ms later.
+ * - 110-114, 120-123  waitpid:ERRNO:ECHILD also fails wait, wait3, wait4 and waitid (glibc and
+ *           musl issue their own system calls, so each has its own wrapper); each reaps once the
+ *           rule is gone. These codes overlap the previous check's; the order disambiguates.
+ * - 130-134 execve:ERRNO:EACCES also fails execv, execvp, execl, execlp and execle, which reach
+ *           the kernel on internal libc paths.
+ * - 136-139 posix_spawn:ERRNO:EAGAIN fails system (-1/EAGAIN) and popen (NULL/EAGAIN); both
+ *           work again once the rule is cleared.
+ * - 200-204 the rule file could not be written.
  *
- * Subtests cover:
- * - `ERRNO` on `pthread_create` (synthetic `EAGAIN`; returned as errno-style int)
- * - `LATENCY` on `pthread_create` (≥ 80 ms added sleep before thread creation)
- * - `FAIL_AFTER` on `pthread_create` (N=1: first call succeeds, second returns `EAGAIN`)
- * - `ERRNO` on `fork` (synthetic `EAGAIN`)
- * - `LATENCY` on `fork` (≥ 80 ms added sleep; measured in parent before child reap)
- * - `ERRNO` on `posix_spawn` (synthetic `EAGAIN`; no process created)
- * - `LATENCY` on `posix_spawnp` (≥ 80 ms added sleep; spawns `/bin/true`)
- * - `ERRNO` on `execve` (synthetic `EACCES`; verified in forked child)
- * - `ERRNO` on `execveat` (synthetic `ENOENT`; skipped gracefully if weak symbol is NULL)
- * - `ERRNO` on `waitpid` (synthetic `EINTR`; config cleared before reaping zombie)
- * - `LATENCY` on `waitpid` (≥ 80 ms added sleep; child exits immediately)
- * - `ERRNO` on `execve` also fails `execv`, `execvp`, `execl`, `execlp` and `execle`, and
- *   `ERRNO` on `posix_spawn` fails `system` and `popen`; all run on internal paths in libc
- * - `ERRNO` on `waitpid` also fails `wait`, `wait3`, `wait4` and `waitid`, which glibc and
- *   musl implement with their own system calls; each still reaps once the rule is gone
+ * posix_spawn is faulted through its own selector: neither glibc's nor musl's posix_spawn calls
+ * the public fork() (both clone with CLONE_VM|CLONE_VFORK), so a fork rule never reaches it.
  *
- * `pthread_create` errors are returned as the function's int return value, not
- * via `errno` — the probe verifies `rc == EAGAIN && errno == 0` to distinguish
- * this from POSIX-style syscall errors.
+ * Run by test_process_glibc.sh (gcc:bookworm) and test_process_alpine.sh (alpine:3.20), which
+ * build the library, compile this file with -pthread in the container and run it with
+ * `LD_PRELOAD=/tmp/libchaos-process.so`. Needs /bin/sh, /bin/true and `true` in PATH. Checks
+ * run in main()'s order and stop at the first failure.
  *
- * `posix_spawn` on glibc uses `clone(CLONE_VFORK|CLONE_VM)` internally,
- * bypassing the libc `fork()` symbol; the interposed `posix_spawn` symbol is
- * therefore the only reliable injection point on glibc. On musl, `posix_spawn`
- * calls `fork()` internally, so `fork` rules would also cascade — the probe
- * tests `posix_spawn` directly to avoid this ambiguity.
- *
- * `execveat` is declared as a weak symbol; the probe skips the subtest when
- * the kernel does not expose it (older kernels, non-Linux containers).
- *
- * `waitpid` ERRNO requires a zombie-reap cleanup pass: after confirming the
- * injected error, the config is cleared and `wait_for_child()` is called in a
- * retry loop to release the zombie before the process exits.
- *
- * Returns 0 on success; returns a non-zero numbered exit code identifying
- * the failing subtest.
+ * Exit: 0 when every check passes; otherwise the code of the first failing check above. The
+ * rule file is left in place (empty after the last check). The probe never skips; execveat is
+ * the only check that can pass vacuously.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -86,11 +76,12 @@ static long long elapsed_ms(const struct timespec *start, const struct timespec 
 }
 
 /**
- * @brief Waits until the library is due to look at its rule file again.
+ * @brief Sleeps 2 ms so the next intercepted call re-checks the rule file.
  *
- * Once rules are loaded the libraries look at the rule file at most every
- * millisecond, so a change takes effect within that time, not on the very next
- * call. The sleep is a raw system call: libchaos-time may be faulting nanosleep.
+ * With rules loaded, a library stats its rule file at most once per CHAOS_CHECK_INTERVAL_NS
+ * (1 ms); a rewrite is seen by the first call after that, not necessarily the next call. The
+ * sleep is a raw clock_nanosleep system call, restarted on EINTR, so no wrapper (libchaos-time
+ * faults nanosleep) can fail or stretch it.
  */
 static void wait_for_rule_check(void)
 {
@@ -101,6 +92,15 @@ static void wait_for_rule_check(void)
     }
 }
 
+/**
+ * @brief Replaces the rule file `/tmp/.chaos-process.conf` with @p text plus a newline, then
+ *        sets its mtime with utime() to 12000, 12001, ... seconds since the epoch.
+ *
+ * The explicit, strictly increasing mtime changes the reload change stamp even when two writes
+ * land within one filesystem timestamp tick. The stamp is applied by path after fclose().
+ *
+ * @return 0, or 200 (fopen), 201 (fprintf), 202 (fflush), 204 (fclose), 203 (utime).
+ */
 static int write_config_now(const char *text)
 {
     FILE *config = fopen("/tmp/.chaos-process.conf", "w");
@@ -136,7 +136,7 @@ static int write_config_now(const char *text)
     return 0;
 }
 
-/** @brief Writes the rules, then waits until the library looks at them. */
+/** @brief write_config_now(), then wait_for_rule_check(); returns write_config_now()'s code. */
 static int write_config(const char *text)
 {
     const int rc = write_config_now(text);
@@ -145,11 +145,17 @@ static int write_config(const char *text)
     return rc;
 }
 
+/** @brief Empties the rule file: no rules, every wrapper passes through. */
 static int clear_config(void)
 {
     return write_config("");
 }
 
+/**
+ * @brief Reaps @p pid with waitpid(), retrying on EINTR.
+ * @return 0 when reaped, -1 on any other failure. Must only run with no waitpid ERRNO rule
+ *         active, or it spins on an injected EINTR.
+ */
 static int wait_for_child(pid_t pid, int *status)
 {
     for (;;)
@@ -538,8 +544,9 @@ static int probe_waitpid_latency(void)
 }
 
 /*
- * wait(), wait3(), wait4() and waitid() follow the waitpid rules. Each is failed
- * with ECHILD while a child is pending, then reaps that child once the rule is gone.
+ * wait(), wait3(), wait4() and waitid() follow the waitpid rules. Each is failed with ECHILD
+ * while a child is pending (a value the kernel would never return then, so the fault is
+ * unambiguous), then reaps that child once the rule is gone.
  */
 static int probe_wait_family(void)
 {
@@ -621,8 +628,9 @@ static int probe_wait_family(void)
 }
 
 /*
- * Runs one exec form in a child. The child exits 42 when the exec was faulted with
- * EACCES; an exec that went through would run /bin/true and exit 0 instead.
+ * Runs exec form @p form (0 execv, 1 execvp, 2 execl, 3 execlp, 4 execle) in a child. The child
+ * exits 42 when the exec failed with EACCES, 43 on any other failure; an exec that went through
+ * runs /bin/true and exits 0. Returns 1 only for 42.
  */
 static int exec_form_faulted(int form)
 {

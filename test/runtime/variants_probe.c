@@ -1,15 +1,26 @@
 /**
  * @file variants_probe.c
- * @brief Runtime probe: glibc's alternate entry points are faulted like the base calls.
+ * @brief Proves that glibc's alternate entry points are faulted exactly like the base calls.
  *
- * On 64-bit glibc the large-file names (`open64`, `pread64`, `mmap64`, ...) are
- * separate symbols, and `_FORTIFY_SOURCE` builds call `__read_chk`, `__open_2`,
- * `__recv_chk` and friends instead of the base functions. Programs bind to whichever
- * name their build chose, so each must be intercepted on its own. Every call below
- * runs under a rule that fails its operation and must report the injected errno.
+ * @details
+ * On 64-bit glibc the large-file names (open64, pread64, mmap64, ...) are separate exported
+ * symbols, and _FORTIFY_SOURCE builds call __read_chk, __open_2, __recv_chk and friends instead
+ * of the base functions. A program binds to whichever name its build chose, so a library that
+ * wraps only the base name silently misses it. Every call below runs under a rule that fails
+ * its operation and must return -1 with the injected errno:
  *
- * Usage: variants_probe io|memory|net   (under LD_PRELOAD of the matching library)
- * Exit code 0 when every variant was faulted, 1 otherwise.
+ * - io: open64, openat64, __open_2, __open64_2, __openat_2, __openat64_2 (open:EIO);
+ *   __read_chk (read); pread64, preadv64, __pread_chk, __pread64_chk (pread); pwrite64,
+ *   pwritev64 (pwrite); ftruncate64 (truncate); fallocate64 (allocate); sendfile64 (write).
+ * - memory: mmap64 (mmap/anon:ERRNO:ENOMEM).
+ * - net: __recv_chk, __recvfrom_chk and __read_chk on a socket (recv:ECONNRESET), and
+ *   __poll_chk/__ppoll_chk returning 0 under poll:TIMEOUT with data pending.
+ *
+ * Usage: variants_probe io|memory|net, under LD_PRELOAD of the matching library; run by
+ * test_variants_glibc.sh. glibc only: the symbols do not exist on musl.
+ *
+ * Exit: 0 when every variant was faulted; 1 when any was not (all run; each prints ok/FAIL);
+ * 2 on bad usage or a setup failure.
  */
 
 #ifndef _GNU_SOURCE
@@ -32,7 +43,8 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
-/* Fortified entry points; glibc declares them only for _FORTIFY_SOURCE builds. */
+/* Fortified entry points: glibc exports them but declares them only for _FORTIFY_SOURCE
+ * builds, which this probe is not, so they are declared here to be called directly. */
 extern ssize_t __read_chk(int fd, void *buffer, size_t count, size_t buffer_size);
 extern ssize_t __pread_chk(int fd, void *buffer, size_t count, off_t offset, size_t buffer_size);
 extern ssize_t __pread64_chk(int fd, void *buffer, size_t count, off_t offset, size_t buffer_size);
@@ -64,6 +76,7 @@ extern ssize_t __recvfrom_chk(
 
 static int g_failures = 0;
 
+/** @brief Prints ok, or records a failure unless @p rc is -1 and errno is @p expected_errno. */
 static void expect_fault(const char *what, long rc, int expected_errno)
 {
     if (rc != -1 || errno != expected_errno)
@@ -77,13 +90,13 @@ static void expect_fault(const char *what, long rc, int expected_errno)
     (void)printf("ok   %s\n", what);
 }
 
-/** Replaces a rule file atomically (new inode), as the framework's writers do. */
 /**
- * @brief Waits until the library is due to look at its rule file again.
+ * @brief Sleeps 2 ms so the next intercepted call re-checks the rule file.
  *
- * Once rules are loaded the libraries look at the rule file at most every
- * millisecond, so a change takes effect within that time, not on the very next
- * call. The sleep is a raw system call: libchaos-time may be faulting nanosleep.
+ * With rules loaded, a library stats its rule file at most once per CHAOS_CHECK_INTERVAL_NS
+ * (1 ms); a rewrite is seen by the first call after that, not necessarily the next call. The
+ * sleep is a raw clock_nanosleep system call, restarted on EINTR, so no wrapper (libchaos-time
+ * faults nanosleep) can fail or stretch it.
  */
 static void wait_for_rule_check(void)
 {
@@ -94,6 +107,14 @@ static void wait_for_rule_check(void)
     }
 }
 
+/**
+ * @brief Replaces the rule file at @p path atomically: writes `<path>.staging`, then
+ *        rename()s it over @p path.
+ *
+ * The rename gives the file a new inode, which changes the reload change stamp regardless of
+ * mtime granularity, and a library never reads a half-written file. This is how the framework's
+ * own writers update rule files. Exits the probe with status 2 on any I/O error.
+ */
 static void write_rules_now(const char *path, const char *rules)
 {
     char staging[256];
@@ -108,7 +129,7 @@ static void write_rules_now(const char *path, const char *rules)
     }
 }
 
-/** @brief Writes the rules, then waits until the library looks at them. */
+/** @brief write_rules_now(), then wait_for_rule_check(). */
 static void write_rules(const char *path, const char *rules)
 {
     write_rules_now(path, rules);
@@ -221,10 +242,11 @@ static void probe_net(void)
         __recvfrom_chk(server, buffer, 4U, sizeof(buffer), 0, NULL, NULL),
         ECONNRESET
     );
-    /* A fortified read on a socket reaches libchaos-net even without libchaos-io. */
+    /* libchaos-net wraps __read_chk itself: a fortified read on a socket is faulted even when
+     * libchaos-io is not loaded. */
     expect_fault("__read_chk (socket)", __read_chk(server, buffer, 4U, sizeof(buffer)), ECONNRESET);
 
-    /* Data is pending, so only an injected TIMEOUT makes the fortified polls return 0. */
+    /* Data is pending, so a return of 0 can only come from the injected TIMEOUT. */
     (void)snprintf(
         rules, sizeof(rules), "tcp4://127.0.0.1:%u:poll:TIMEOUT:1.0\n", ntohs(address.sin_port)
     );

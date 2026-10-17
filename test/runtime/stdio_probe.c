@@ -1,14 +1,24 @@
 /**
  * @file stdio_probe.c
- * @brief Runtime probe: buffered stdio calls are faulted by the io read/write rules.
+ * @brief Proves that libchaos-io read and write rules fault buffered stdio the way the C
+ *        library reports a real I/O error.
  *
- * glibc and musl read and write FILE streams with their own internal system calls,
- * so these checks fail without the stdio wrappers. Each call runs under a rule for
- * its operation and must fail the way the C library reports an I/O error, with
- * errno set and ferror() true; then it runs once more without a rule.
+ * @details
+ * glibc and musl fill and flush FILE buffers with internal system calls, not through the
+ * exported read()/write(), so without dedicated stdio wrappers these calls would never be
+ * faulted. Each call runs under a rule for its operation on /tmp/stdio-probe and must fail as
+ * libc fails on a real error (short count or EOF/NULL/-1, errno set, ferror() set where
+ * checked), then work again once the rule is gone:
+ * - read:EIO: fread, fgets, fgetc, getline.
+ * - read:CORRUPT: fread returns all 5 bytes, altered.
+ * - write:ENOSPC: fwrite, fputs, fprintf, fflush.
+ * - fd reuse: after fclose of a cached stream, /proc/self/status opened under the same fd
+ *   number is read normally, proving fclose drops libchaos-io's fd-to-path cache entry.
  *
- * Usage: stdio_probe   (under LD_PRELOAD of libchaos-io)
- * Exit code 0 when every call behaved, 1 otherwise.
+ * Results go to stderr. Usage: stdio_probe, under LD_PRELOAD of libchaos-io; run by
+ * test_stdio.sh on glibc (plain and _FORTIFY_SOURCE=2) and musl.
+ *
+ * Exit: 0 when every check passed; 1 when any failed (all run); 2 on a setup failure.
  */
 
 #ifndef _GNU_SOURCE
@@ -30,6 +40,7 @@
 
 static int g_failures = 0;
 
+/** @brief Prints ok, or FAIL with errno and records a failure (both to stderr). */
 static void expect(const char *what, int ok)
 {
     if (!ok)
@@ -41,7 +52,11 @@ static void expect(const char *what, int ok)
     (void)fprintf(stderr, "ok   %s\n", what);
 }
 
-/** @brief Replaces the rule file and waits until the library looks at it again. */
+/**
+ * @brief Replaces `/tmp/.chaos-io.conf` atomically (write `.staging`, rename) and sleeps 2 ms
+ *        with a raw clock_nanosleep so the 1 ms rule-file check throttle has elapsed. Exits 2
+ *        on an I/O error.
+ */
 static void write_rules(const char *rules)
 {
     struct timespec delay = {0, 2000000L};
@@ -85,12 +100,13 @@ int main(void)
     clearerr(stream);
     expect("getline faulted", getline(&line, &capacity, stream) == -1 && errno == EIO);
     {
-        /* A descriptor number reused after fclose() must not keep the old path. */
+        /* fclose() must drop the fd's cached path: a stream that reuses the number for an
+         * unmatched file must not inherit the old file's read:EIO rule. */
         FILE *first = fopen(DIR "/other.txt", "w");
         FILE *proc;
         int first_fd = first != NULL ? fileno(first) : -1;
 
-        /* Writing through the stream makes the library look up, and cache, its path. */
+        /* The fwrite makes libchaos-io resolve and cache this fd's path. */
         expect(
             "fclose of a matched file",
             first != NULL && fwrite("x", 1U, 1U, first) == 1U && fclose(first) == 0

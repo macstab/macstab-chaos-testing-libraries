@@ -1,16 +1,26 @@
 #!/bin/sh
 #
-# test_reload.sh — @first holds while the rule file is reloaded under load (Docker).
+# test_reload.sh: an @first budget holds while the rule file is reloaded under concurrent firing, on
+# glibc and musl (Docker).
 #
-# Builds libchaos-io for glibc (gcc:bookworm) and musl (alpine:3.20) and runs
-# reload_probe in a container limited to two CPUs, where threads are preempted
-# between taking a rule copy and firing it: six threads fire an @first=1 rule while
-# the main thread reloads the rule file twice per round. No round may fail more
-# than one open; a reload must neither lose a firing nor give the rule a fresh budget.
+# Proves that reloading a rule file that keeps an `@first=1` rule neither resets nor duplicates its
+# budget while threads are firing it: in 1000 rounds, six threads hammer open() while the main
+# thread reloads twice per round, and no round may fail more than one open (reload_probe.c). The
+# container is limited to two CPUs so threads are preempted between copying a rule and firing it,
+# which is where a budget race would show.
 #
-# Usage:   test_reload.sh [linux/amd64|linux/arm64]
-# Env:     CHAOS_RELOAD_DOCKER_PLATFORM  platform override
-# Prereqs: docker with buildx and multi-arch support
+# Method: for glibc (gcc:bookworm) and then musl (alpine:3.20), docker buildx builds libchaos-io
+# (make cross-<libc>-<arch>), and a fresh container of the same image (--cpus=2) compiles
+# reload_probe.c and runs it with pauses of 0 and 200 us between reloads.
+#
+# Usage:   test_reload.sh [linux/amd64|linux/arm64]   (default: the host architecture)
+# Env:     CHAOS_RELOAD_DOCKER_PLATFORM  platform when no argument is given
+#          CHAOS_SKIP_EXIT  exit status of a skip (default 0; CI sets 1)
+# Prereqs: docker with buildx; QEMU binfmt for a foreign platform. Run by `make test`.
+# Exit:    0 when both libcs pass both pauses; non-zero when any run broke @first (both pauses
+#          still run and report) or a build fails; 2 on bad usage; CHAOS_SKIP_EXIT when the
+#          host or platform is not amd64/arm64, docker is missing or its daemon is
+#          unreachable.
 
 set -eu
 

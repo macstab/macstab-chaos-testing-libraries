@@ -1,12 +1,20 @@
 /**
  * @file locale_probe.c
- * @brief Runtime probe: rules are read the same under a locale with a decimal comma.
+ * @brief Proves that libchaos-io parses a rule file the same way after the program switched to
+ *        a locale with a decimal comma.
  *
- * Usage: locale_probe   (under LD_PRELOAD of libchaos-io, with de_DE.UTF-8 installed)
+ * @details
+ * A JVM calls setlocale() from LANG. Under de_DE.UTF-8, strtod() reads "1.0" as 1 followed by
+ * junk, so a parser using locale-dependent conversion would reject or misread every
+ * probability. The probe switches to de_DE.UTF-8, installs `/tmp/locale-data:open:EIO:1.0`
+ * atomically, sleeps 5 ms (raw clock_nanosleep, past the 1 ms rule-file check throttle) and
+ * opens a covered file.
  *
- * Switches to de_DE.UTF-8 as a JVM does from LANG, writes the rule
- * `/tmp/locale-data:open:EIO:1.0`, and opens a file it covers. Prints "EIO" when
- * the rule was applied, "ok" when it was not, "no-locale" when the locale is missing.
+ * Prints "EIO" when the rule applied, "ok" when it did not, "no-locale" when de_DE.UTF-8 is
+ * not installed. Usage: locale_probe, under LD_PRELOAD of libchaos-io; run by test_status.sh on
+ * glibc, which judges the output.
+ *
+ * Exit: 0 after printing; 2 when the rule file cannot be written.
  */
 
 #ifndef _GNU_SOURCE
@@ -41,7 +49,7 @@ int main(void)
         perror("rules");
         return 2;
     }
-    /* Past the library's next look at the rule file; a raw call no rule can fault. */
+    /* 5 ms outlasts the 1 ms check throttle; a raw system call so no rule can fault it. */
     (void)syscall(SYS_clock_nanosleep, CLOCK_MONOTONIC, 0, &delay, NULL);
     errno = 0;
     fd = open("/tmp/locale-data/file", O_RDONLY | O_CREAT, 0600);

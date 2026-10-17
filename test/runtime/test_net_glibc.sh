@@ -1,16 +1,29 @@
 #!/bin/sh
 #
-# test_net_glibc.sh — libchaos-net runtime validation on glibc (Docker).
+# test_net_glibc.sh: libchaos-net end-to-end in LD_PRELOAD mode on glibc (Debian bookworm, glibc
+# 2.36).
 #
-# Builds libchaos-net.so for the target platform using Docker buildx with a
-# glibc (debian:bookworm) base, then runs the pre-compiled net_probe binary
-# under LD_PRELOAD in a glibc container. Validates connect, send, recv, accept,
-# poll, and epoll_wait fault injection (ERRNO, LATENCY, CORRUPT, TIMEOUT) on
-# glibc amd64 and arm64.
+# Proves, for one architecture per run, that every libchaos-net wrapper (bind, listen, connect,
+# accept/accept4, send*/recv* and read/readv on sockets, socket/socketpair, shutdown,
+# poll/ppoll/select/pselect, epoll_wait/epoll_pwait) fires on real loopback TCP, UDP and unix
+# sockets with the ERRNO, LATENCY, CORRUPT, TIMEOUT, TRICKLE and DUP effects; net_probe.c lists
+# every check.
 #
-# Usage:   test_net_glibc.sh [linux/amd64|linux/arm64]
-# Env:     CHAOS_NET_DOCKER_PLATFORM  platform override
-# Prereqs: docker with buildx and multi-arch support
+# Method: docker buildx builds libchaos-net-glibc-<arch>.so (make cross-glibc-<arch>) from
+# docker/Dockerfile.build on gcc:bookworm. Then a fresh gcc:bookworm container compiles
+# test/runtime/net_probe.c from the read-only repository mount and runs it with
+# LD_PRELOAD=/tmp/libchaos-net.so. The probe is compiled in the target image so it uses the same
+# libc the library was built against.
+#
+# Usage:   test_net_glibc.sh [linux/amd64|linux/arm64]   (default: the host architecture)
+# Env:     CHAOS_NET_DOCKER_PLATFORM  platform when no argument is given
+#          CHAOS_SKIP_EXIT  exit status of a skip (default 0; CI sets 1)
+# Prereqs: docker with buildx; QEMU binfmt for a foreign platform. Run by `make test` and,
+#          once per platform, by `make test-matrix`.
+# Exit:    the probe's exit code (0 = every check passed; net_probe.c lists the others);
+#          non-zero when the build fails or yields no library; 2 on bad usage;
+#          CHAOS_SKIP_EXIT when the host or platform is not amd64/arm64, docker is missing
+#          or its daemon is unreachable.
 
 set -eu
 

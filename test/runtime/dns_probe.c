@@ -1,37 +1,40 @@
 /**
  * @file dns_probe.c
- * @brief Runtime validation probe for libchaos-dns under LD_PRELOAD.
+ * @brief End-to-end probe for libchaos-dns in LD_PRELOAD mode on glibc and musl.
  *
  * @details
- * Standalone C program compiled inside a Docker container and executed under
- * `LD_PRELOAD=libchaos-dns.so`. Validates end-to-end fault injection for the
- * DNS library's interposed symbols: `getaddrinfo` and `getnameinfo`.
+ * Proves that `dns://<host>` and `rdns://<address>` rules in the rule file
+ * `/tmp/.chaos-dns.conf` reach forward and reverse resolution, including the legacy hostent
+ * API. No network is needed: every name is localhost, a literal or an OVERRIDE. Exit code of
+ * each check, its rule, and the behaviour proven:
  *
- * Each subtest writes a config rule with a future-mtime timestamp to
- * `/tmp/.chaos-dns.conf`, then exercises the interposed symbol and asserts the
- * expected behavior. The future-mtime pattern guarantees a config reload cycle
- * on the first post-write invocation, ensuring the new rule is active.
+ * - 10      dns://localhost GAI EAI_AGAIN; getaddrinfo returns EAI_AGAIN.
+ * - 20-23   dns://localhost LATENCY:200; getaddrinfo succeeds and takes >= 150 ms.
+ * - 30      dns://example.invalid REWRITE:localhost; an unresolvable name resolves.
+ * - 40-42   dns://localhost SERVICE:8081; service "80" comes back as port 8081.
+ * - 50-52   OVERRIDE 127.0.0.1,[::1] + FILTER_FAMILY:inet4 + LIMIT:1 on one name; exactly one
+ *           AF_INET result carrying the requested port 8080. Proves the effects compose in
+ *           one lookup.
+ * - 60-61   OVERRIDE (3 literals) + SHUFFLE:1.0 + LIMIT:2, 20000 lookups with AI_CANONNAME;
+ *           always 2 results, canonical name "many.test" on the head, RSS growth < 256 pages.
+ * - 60      rdns://127.0.0.1 GAI EAI_AGAIN; getnameinfo returns EAI_AGAIN.
+ * - 61-64   rdns://127.0.0.1 LATENCY:200; getnameinfo succeeds and takes >= 150 ms.
+ * - 65-67   rdns://127.0.0.1 REWRITE:ptr.example + SERVICE:redis; host and service replaced.
+ * - 400-406 the same rules on gethostbyname(_r), gethostbyname2(_r), gethostbyaddr(_r): a GAI
+ *           error becomes h_errno HOST_NOT_FOUND, OVERRIDE supplies the address list, REWRITE
+ *           the reverse name; with the rules cleared, localhost resolves again.
+ * - 200-204 the rule file could not be written.
  *
- * Subtests cover:
- * - `EAI_AGAIN` injection on `getaddrinfo` (synthetic transient failure)
- * - `LATENCY` injection on `getaddrinfo` (≥ 150 ms added sleep)
- * - `REWRITE` on `getaddrinfo` (hostname substitution: example.invalid → localhost)
- * - `SERVICE` rewrite on `getaddrinfo` (port override: 80 → 8081)
- * - `OVERRIDE` + `FILTER_FAMILY` + `LIMIT` pipeline (synthetic address list,
- *   IPv4-only, single result)
- * - `EAI_AGAIN` injection on `getnameinfo` (synthetic transient failure)
- * - `LATENCY` injection on `getnameinfo` (≥ 150 ms added sleep)
- * - `REWRITE` + `SERVICE` on `getnameinfo` (PTR hostname and service name override)
- * - the same rules on `gethostbyname`, `gethostbyname2`, their `_r` forms, `gethostbyaddr`
- *   and `gethostbyaddr_r`, which glibc and musl resolve without getaddrinfo/getnameinfo
+ * Codes 60 and 61 are reused by consecutive checks; main()'s order disambiguates. The hostent
+ * functions are separate checks because glibc and musl resolve them without calling the
+ * public getaddrinfo/getnameinfo, so each needs its own wrapper.
  *
- * The `OVERRIDE` subtest exercises the full FILTER→SHUFFLE→LIMIT transform
- * pipeline in a single call: the injected address list [127.0.0.1, ::1] is
- * filtered to IPv4-only by `FILTER_FAMILY:inet4`, then trimmed to one result
- * by `LIMIT:1`. All three rules are written as a multi-line config block.
+ * Run by test_dns_glibc.sh (gcc:bookworm) and test_dns_alpine.sh (alpine:3.20), which build the
+ * library, compile this file in the container and run it with `LD_PRELOAD=/tmp/libchaos-dns.so`.
+ * Checks stop at the first failure.
  *
- * Returns 0 on success; returns a non-zero numbered exit code identifying
- * the failing subtest.
+ * Exit: 0 when every check passes; otherwise the code of the first failing check above. The
+ * rule file is left in place (cleared by the last check). The probe never skips.
  */
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -47,6 +50,7 @@
 
 static time_t g_config_stamp = 5000;
 
+/** @brief Fills @p address with @p host:@p port; aborts on an unparsable literal. */
 static void set_ipv4_address(struct sockaddr_in *address, const char *host, unsigned short port)
 {
     (void)memset(address, 0, sizeof(*address));
@@ -67,11 +71,12 @@ static long long elapsed_ms(const struct timespec *start, const struct timespec 
 }
 
 /**
- * @brief Waits until the library is due to look at its rule file again.
+ * @brief Sleeps 2 ms so the next intercepted call re-checks the rule file.
  *
- * Once rules are loaded the libraries look at the rule file at most every
- * millisecond, so a change takes effect within that time, not on the very next
- * call. The sleep is a raw system call: libchaos-time may be faulting nanosleep.
+ * With rules loaded, a library stats its rule file at most once per CHAOS_CHECK_INTERVAL_NS
+ * (1 ms); a rewrite is seen by the first call after that, not necessarily the next call. The
+ * sleep is a raw clock_nanosleep system call, restarted on EINTR, so no wrapper (libchaos-time
+ * faults nanosleep) can fail or stretch it.
  */
 static void wait_for_rule_check(void)
 {
@@ -82,6 +87,16 @@ static void wait_for_rule_check(void)
     }
 }
 
+/**
+ * @brief Replaces the rule file `/tmp/.chaos-dns.conf` with @p text plus a newline and stamps a
+ *        fresh mtime.
+ *
+ * The mtime is set explicitly to 5000, 5001, ... seconds since the epoch, so each write
+ * changes the reload change stamp even when two writes land within one filesystem timestamp
+ * tick.
+ *
+ * @return 0, or 200 (fopen), 201 (fprintf), 202 (fflush), 203 (futimens), 204 (fclose).
+ */
 static int write_config_now(const char *text)
 {
     struct timespec times[2];
@@ -118,7 +133,7 @@ static int write_config_now(const char *text)
     return 0;
 }
 
-/** @brief Writes the rules, then waits until the library looks at them. */
+/** @brief write_config_now(), then wait_for_rule_check(); returns write_config_now()'s code. */
 static int write_config(const char *text)
 {
     const int rc = write_config_now(text);
@@ -265,7 +280,7 @@ static int probe_override_filter_limit(void)
     return 0;
 }
 
-/** @brief Resident set size of this process in pages. */
+/** @brief Resident set size in pages from /proc/self/statm; -1 when unavailable. */
 static long resident_pages(void)
 {
     long size = 0L;
@@ -284,13 +299,15 @@ static long resident_pages(void)
 }
 
 /**
- * @brief OVERRIDE with several literals, shuffled and cut, many times over.
+ * @brief Regression check: OVERRIDE with several literals, shuffled and cut, 20000 times,
+ *        must neither crash nor leak (exit 60-61).
  *
- * musl allocates each getaddrinfo() result as one reference-counted block; a list
- * spliced from several of them leaked on every lookup and, once SHUFFLE and LIMIT
- * reordered and cut it, freed a block still in use. The list is one of the
- * library's own now: the loop must neither crash nor grow. The canonical name
- * is the queried name, on the head, after every shuffle.
+ * musl allocates each getaddrinfo() result as one reference-counted block. A result list
+ * spliced from several such blocks leaked on every lookup and, once SHUFFLE and LIMIT
+ * reordered and cut it, freed a block still in use. libchaos-dns now builds the whole list in
+ * its own allocation. Each result must have exactly 2 entries with the canonical name
+ * "many.test" on the head after every shuffle; RSS must grow by < 256 pages (1 MiB at 4 KiB
+ * pages). Fails when /proc/self/statm is unreadable.
  */
 static int probe_override_many(void)
 {
@@ -323,7 +340,8 @@ static int probe_override_many(void)
         freeaddrinfo(result);
     }
     after = resident_pages();
-    /* A leak of even one small block per lookup would grow by megabytes. */
+    /* 256 pages (1 MiB at 4 KiB) over 20000 lookups allows ~52 bytes per lookup: less than
+     * any leaked addrinfo block. */
     return before > 0L && after - before < 256L ? 0 : 61;
 }
 
@@ -430,9 +448,10 @@ static int probe_reverse_rewrite_service(void)
 }
 
 /*
- * The legacy hostent resolvers follow the same dns:// and rdns:// rules as
- * getaddrinfo() and getnameinfo(): a GAI error becomes h_errno, OVERRIDE supplies
- * the addresses, REWRITE replaces the reverse name.
+ * The legacy hostent resolvers follow the same dns:// and rdns:// rules as getaddrinfo() and
+ * getnameinfo() (exit 400-406): EAI_NONAME becomes h_errno HOST_NOT_FOUND (and the _r forms'
+ * *h_errnop), OVERRIDE supplies a one-entry address list, REWRITE replaces h_name. The last
+ * step proves an empty rule set restores real resolution.
  */
 static int probe_hostent_resolvers(void)
 {

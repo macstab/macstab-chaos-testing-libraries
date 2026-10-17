@@ -1,37 +1,29 @@
 /**
  * @file test_dns_support.h
- * @brief DNS-domain test globals, reset helper, and dlsym cast utility.
+ * @brief Unit-test scaffolding for libchaos-dns: runtime globals, reset helper, dlsym cast.
  *
- * Subsystem under test: chaos-dns (LD_PRELOAD DNS fault injection via
- *   getaddrinfo / getnameinfo interception).
+ * @details Unit tests compile the libchaos-dns sources directly into the test binary
+ * instead of loading the shared object, so the globals libchaos-dns defines in its own
+ * translation units must be supplied by the test. This header provides:
  *
- * This header is included by every unit test that exercises the DNS domain.
- * It provides two categories of support:
+ *   1. CHAOS_DNS_DEFINE_TEST_GLOBALS(): defines every runtime global declared `extern` in
+ *      chaos_dns_internal.h, plus an empty chaos_dns_ensure_symbols() so no wrapper calls
+ *      dlsym(RTLD_NEXT). Expand exactly once per test binary, at file scope.
+ *   2. chaos_dns_test_reset_runtime(): returns those globals to their initial state; call at
+ *      the start of every test that touches runtime state.
+ *   3. CHAOS_DNS_TEST_DLSYM_RESULT(type, function): converts a typed function pointer to the
+ *      `void *` a stub dlsym() returns, via memcpy (ISO C forbids the direct cast).
  *
- *   1. `CHAOS_DNS_DEFINE_TEST_GLOBALS()` -- a macro that instantiates all
- *      translation-unit-scoped globals declared `extern` in the production
- *      DNS internal header. Each test `.c` file must expand this macro exactly
- *      once at file scope.
+ * libchaos-dns holds seven real functions: getaddrinfo, getnameinfo, freeaddrinfo,
+ * gethostbyname2, gethostbyname2_r, gethostbyaddr and gethostbyaddr_r.
  *
- *   2. `chaos_dns_test_reset_runtime()` -- resets all DNS runtime globals to
- *      their initial (NULL/zero) state. Call at the start of every test
- *      function that modifies runtime state.
+ * Runtime tests (test_dns_runtime.c) additionally `#define` dlsym, dlerror, abort and, on
+ * Linux, syscall before including the production sources, which lets them drive the
+ * constructor and the config path without LD_PRELOAD.
  *
- *   3. `CHAOS_DNS_TEST_DLSYM_RESULT(type, function)` -- a type-safe macro that
- *      converts a typed function pointer to `void *` via `memcpy`, avoiding
- *      strict-aliasing UB in the dlsym stub. Required when building a stub
- *      `dlsym` that maps symbol names to test functions.
- *
- * Coverage approach:
- * - Tests directly `#include` production `.c` files after overriding `dlsym`,
- *   `dlerror`, `abort`, and (on Linux) `syscall` via `#define`. This exercises
- *   the constructor and config subsystem without requiring LD_PRELOAD.
- * - The actual DNS interposition path (RTLD_NEXT-based interception in a live
- *   process) is NOT tested here.
- *
- * What is NOT tested via this header:
- * - Thread-safety of the TLS PRNG state under concurrent getaddrinfo calls.
- * - OS-level DNS resolver behaviour or network availability.
+ * Not covered by tests built on this header: interposition through RTLD_NEXT in a live
+ * process (the runtime suites cover it), the system resolver and the network, and the
+ * per-thread PRNG under concurrent lookups.
  */
 
 #ifndef CHAOS_DNS_TEST_SUPPORT_H
@@ -48,15 +40,16 @@
 #include <unistd.h>
 
 /**
- * @brief Instantiate all DNS-domain runtime globals for one test translation unit.
+ * @brief Defines the libchaos-dns runtime globals for one test binary.
  *
- * Must be expanded exactly once at file scope. Defines:
- * - `g_chaos_dns_real_getaddrinfo`, `g_chaos_dns_real_getnameinfo`,
- *   `g_chaos_dns_real_freeaddrinfo` -- real-function-pointer globals, all NULL.
- * - `__thread int g_chaos_dns_tls_guard` -- per-thread re-entrancy guard.
- * - `__thread uint64_t g_chaos_dns_tls_prng_state` -- per-thread PRNG state.
- * - `uint64_t g_chaos_dns_process_seed` -- process-wide PRNG seed, initialised
- *   to 1 (non-zero) so PRNG operations are defined without calling the constructor.
+ * Expand exactly once at file scope (a second expansion is a duplicate definition). Defines:
+ * - chaos_dns_ensure_symbols() as a no-op, so real functions stay what the test assigns.
+ * - The seven `g_chaos_dns_real_*` real-function pointers, all NULL.
+ * - `__thread int g_chaos_dns_tls_guard` (reentrancy guard) = 0.
+ * - `__thread uint64_t g_chaos_dns_tls_prng_state` = 0, which makes the per-thread PRNG seed
+ *   itself on first use.
+ * - `uint64_t g_chaos_dns_process_seed` = 1 in place of the /dev/urandom seed, so probability
+ *   draws work without running the constructor.
  */
 #define CHAOS_DNS_DEFINE_TEST_GLOBALS()                                                            \
     void chaos_dns_ensure_symbols(void) {}                                                         \
@@ -72,11 +65,10 @@
     uint64_t g_chaos_dns_process_seed = 1U
 
 /**
- * @brief Reset all DNS-domain runtime globals to their initial state.
+ * @brief Restores every global defined by CHAOS_DNS_DEFINE_TEST_GLOBALS() to its initial value.
  *
- * Sets all three real-function-pointer globals to NULL, zeroes the TLS guard,
- * TLS PRNG state, and resets the process seed to 1. Call at the start of each
- * test function to prevent cross-test state contamination.
+ * Sets the seven real-function pointers to NULL, zeroes the calling thread's reentrancy guard
+ * and PRNG state, and resets the process seed to 1. Only the calling thread's TLS is reset.
  */
 static inline void chaos_dns_test_reset_runtime(void)
 {
@@ -93,15 +85,14 @@ static inline void chaos_dns_test_reset_runtime(void)
 }
 
 /**
- * @brief Convert a typed function pointer to `void *` using `memcpy`.
+ * @brief Copies a function pointer's bytes into a `void *`.
  *
- * Direct casts between function pointers and `void *` are undefined behaviour
- * in C99. This helper copies the pointer bits through a `void *` local so the
- * conversion is well-defined.
+ * ISO C leaves function-pointer to object-pointer casts undefined; POSIX guarantees the
+ * representations match, so a byte copy is the portable way to build a dlsym() result.
  *
- * @param function_bytes  Address of a function-pointer-typed value.
- * @param function_size   `sizeof` the function pointer type; must be <= sizeof(void *).
- * @return `void *` carrying the same bit pattern as the function pointer.
+ * @param function_bytes  Address of a function-pointer object; must not be NULL (asserted).
+ * @param function_size   Size of that object; must be <= sizeof(void *) (asserted).
+ * @return A `void *` with the same bit pattern as the function pointer.
  */
 static inline void *chaos_dns_test_dlsym_pointer(const void *function_bytes, size_t function_size)
 {
@@ -114,10 +105,11 @@ static inline void *chaos_dns_test_dlsym_pointer(const void *function_bytes, siz
 }
 
 /**
- * @brief Produce the `void *` return value for a `dlsym` stub entry.
+ * @brief Yields the `void *` a stub dlsym() returns for @p function.
  *
- * @param type      The function pointer typedef (e.g. `chaos_dns_getaddrinfo_fn`).
- * @param function  The stub function to map to this symbol.
+ * @param type      Function-pointer typedef, e.g. `chaos_dns_getaddrinfo_fn`; a mismatch
+ *                  with @p function draws a compiler diagnostic via the compound literal.
+ * @param function  Stub to hand back for the requested symbol name.
  *
  * Usage in a dlsym stub:
  * @code

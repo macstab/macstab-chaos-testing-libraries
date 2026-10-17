@@ -1,16 +1,25 @@
 #!/bin/sh
 #
-# test_errno_glibc.sh — every libchaos library leaves errno alone when idle (Docker).
+# test_errno_glibc.sh: every libchaos library leaves errno untouched on success when it has no
+# matching rule (glibc, Docker).
 #
-# Builds all libchaos libraries for the target platform using Docker buildx with
-# a glibc (debian:bookworm) base, then runs errno_probe under LD_PRELOAD of each
-# library in turn: once without a config file and once with a config file that
-# holds no rules. Every successful call must leave errno exactly as it was; the
-# library's own stat/open/read and socket lookups must not leak into it.
+# Proves that the libraries' own bookkeeping (rule-file stat/open/read, socket endpoint lookups)
+# never leaks into errno of a successful call, both when the rule file is missing and when it exists
+# but holds no rule. A leaked ENOENT or ENOTCONN breaks applications that test errno after success.
 #
-# Usage:   test_errno_glibc.sh [linux/amd64|linux/arm64]
-# Env:     CHAOS_ERRNO_DOCKER_PLATFORM  platform override
-# Prereqs: docker with buildx and multi-arch support
+# Method: docker buildx builds all six glibc libraries (make cross-glibc-<arch>) on gcc:bookworm. A
+# fresh gcc:bookworm container compiles errno_probe.c and runs it under LD_PRELOAD of each library
+# in turn (io, net, memory, time, process, dns), first with no /tmp/.chaos-<lib>.conf, then with one
+# holding only a comment.
+#
+# Usage:   test_errno_glibc.sh [linux/amd64|linux/arm64]   (default: the host architecture)
+# Env:     CHAOS_ERRNO_DOCKER_PLATFORM  platform when no argument is given
+#          CHAOS_SKIP_EXIT  exit status of a skip (default 0; CI sets 1)
+# Prereqs: docker with buildx; QEMU binfmt for a foreign platform. Run by `make test`.
+# Exit:    0 when every library passes both runs; the probe's 1 or 2 for the first failing
+#          run; non-zero when the build fails or a library is missing; 2 on bad usage;
+#          CHAOS_SKIP_EXIT when the host or platform is not amd64/arm64, docker is missing
+#          or its daemon is unreachable.
 
 set -eu
 
