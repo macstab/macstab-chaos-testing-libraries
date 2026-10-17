@@ -32,14 +32,35 @@ Principal+ Engineer · [Macstab GmbH](https://macstab.com) · Hamburg, Germany
 
 ## Overview
 
-`chaos-testing-libraries` is a set of Linux `LD_PRELOAD` fault-injection
-libraries that intercept libc symbols at the loader level. Six domains are
-covered: file I/O, network sockets, DNS resolution, clocks and sleep,
-process lifecycle, and virtual memory.
+Six Linux fault-injection libraries make real libc calls fail, stall or return
+altered results, driven by a plain-text rule file that can be rewritten while the
+target runs:
 
-There is intentionally no public C API header. Each library's surface is
-exactly its interposed libc symbols plus a plain-text config file — loaded,
-reloaded, and discarded without stopping the target process.
+| Library | Domain | Rule file |
+|---|---|---|
+| `libchaos-io` | file I/O, including buffered stdio | `/tmp/.chaos-io.conf` |
+| `libchaos-net` | sockets, multiplexed waits | `/tmp/.chaos-net.conf` |
+| `libchaos-dns` | `getaddrinfo`, `getnameinfo`, `gethostby*` | `/tmp/.chaos-dns.conf` |
+| `libchaos-time` | clocks and sleeps | `/tmp/.chaos-time.conf` |
+| `libchaos-memory` | `mmap`, `munmap`, `mprotect`, `madvise` | `/tmp/.chaos-memory.conf` |
+| `libchaos-process` | threads, `fork`, spawn, exec, wait | `/tmp/.chaos-process.conf` |
+
+Two injection modes apply the same rule files:
+
+- **LD_PRELOAD mode.** Each library is a shared object whose exported wrappers
+  shadow the libc symbols. A wrapper matches the call against the rules, applies the
+  effect, and forwards to the real function (the next definition, resolved with
+  `dlsym(RTLD_NEXT)`). Works for any dynamically linked program, in any language.
+- **SECCOMP mode.** `chaos-init`, a static supervisor run as the container's PID 1,
+  installs a seccomp user-notification filter on its child (the tracee) and decides
+  every notified system call with the libraries' own rule cores. Works for statically
+  linked programs (Go with `CGO_ENABLED=0`, `FROM scratch` images) that `LD_PRELOAD`
+  cannot reach. It applies io, net, memory and process rules; see
+  [SECCOMP Mode (chaos-init)](#seccomp-mode-chaos-init).
+
+There is no public C API. A library's whole interface is its interposed symbols,
+its rule file, its status file (`/tmp/.chaos-<lib>.status`) and its hits files
+(`/tmp/.chaos-<lib>.hits.<n>`).
 
 ## Part of a Three-Layer Chaos Engineering Stack
 
@@ -47,45 +68,34 @@ reloaded, and discarded without stopping the target process.
 
 | Layer                              | Repo                                                                                                    | What it covers                                                                                                                                                                                                                |
 |------------------------------------|---------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **`LD_PRELOAD` libc** (this repo)  | [`macstab/macstab-chaos-testing-libraries`](https://github.com/macstab/macstab-chaos-testing-libraries) | Pure C99 `LD_PRELOAD` shared objects: file I/O (latency / `errno` / torn / corrupt), network, DNS, clock, process, memory. **glibc + musl × amd64 + arm64**, 100 % line coverage on shipped sources, Docker runtime validation as a quality gate. Language-agnostic — works for any process inside any container. |
+| **`LD_PRELOAD` libc** (this repo)  | [`macstab/macstab-chaos-testing-libraries`](https://github.com/macstab/macstab-chaos-testing-libraries) | Pure C99 `LD_PRELOAD` shared objects: file I/O (latency / `errno` / torn / corrupt), network, DNS, clock, process, memory, plus the `chaos-init` seccomp supervisor for static binaries. **glibc + musl × amd64 + arm64**, 100 % line coverage on shipped sources, Docker runtime validation as a quality gate. Language-agnostic — works for any process inside any container. |
 | **JVM bytecode**                   | [`macstab/macstab-chaos-jvm-agent`](https://github.com/macstab/macstab-chaos-jvm-agent)                 | 62 JDK call sites instrumented in-process. Spring Boot 3/4 + Micronaut + Quarkus integration. JUnit 5 `@ChaosTest`. Selector × effect × policy DSL. Live config reload.                                                       |
 | **Container orchestration**        | [`macstab/chaos-testing`](https://github.com/macstab/chaos-testing)                                     | Annotation-driven chaos on top of Testcontainers. CPU throttling, memory pressure, disk I/O, network partitions, DNS failures, pre-built Redis Sentinel + replication-lag scenarios, Toxiproxy adapter, Redis-aware fault injection.                                                                              |
 
-**Start here** if you need failure injection that crosses language boundaries — or if you need *kernel-real* time skew, slow disks, and DNS slowdowns that no in-process agent can fake (e.g. `clock_gettime` is a syscall the JVM cannot intrinsically intercept; the LD_PRELOAD lib can).
+**Start here** when failure injection must cross language boundaries, or when the
+fault has to be kernel-real: time skew, slow disks and DNS slowdowns that an
+in-process agent cannot produce. Example: `clock_gettime` is served by the vDSO,
+which the JVM does not route through any interceptable Java call site; the libc
+layer wraps it.
 
-**Compose layers** for full distributed-system coverage:
+**Compose layers** for distributed-system coverage:
 - Add the JVM agent for selector × effect × policy chaos *inside* JVM call sites — DNS, JDBC, NIO, virtual threads, monitors, GC.
-- Add the orchestration layer to wire chaos directly to Testcontainers-managed Redis, Postgres, Kafka — including pre-built scenarios like *replication lag during pod drainage*.
+- Add the orchestration layer to wire chaos to Testcontainers-managed Redis, Postgres, Kafka — including pre-built scenarios like *replication lag during pod drainage*.
 
-Three repos, one mental model: **the same selector × effect × policy DSL spans the libc layer, the JVM layer, and the orchestration layer.** No cross-layer coupling — each layer is independently adoptable, independently versioned, independently released.
+All three layers share one model: **selector × effect × policy** (mapping in
+[`docs/DSL.md`](docs/DSL.md)). There is no cross-layer coupling; each layer is
+adopted, versioned and released independently.
 
 ## Design Constraints
 
-- Pure C99.
-- Very small shared objects.
-- No runtime dependency beyond libc and `libdl`.
-- Works with glibc and musl builds.
-- Safe fallback behavior: invalid, unreadable, or missing config means full passthrough.
-- Quality gate is enforced in-repo:
-  - `fmt-check`: `clang-format` style check across all shipped `src/**/*.c`,
-    `src/**/*.h`, `test/**/*.c`, and `test/**/*.h`
-  - `libchaos-io`: unit tests plus 100% source line coverage for its shipped
-    `src/*.c`, plus Docker runtime validation
-  - `libchaos-net`: unit tests plus 100% source line coverage for its shipped
-    `src/net/*.c`, plus Docker runtime validation across glibc and musl on
-    amd64 and arm64
-  - `libchaos-dns`: unit tests plus an enforced source-line coverage floor for
-    its shipped `src/dns/*.c`, plus Docker runtime validation across glibc and
-    musl on amd64 and arm64
-  - `libchaos-time`: unit tests plus 100% source line coverage for its shipped
-    `src/time/*.c`, plus Docker runtime validation across glibc and musl on
-    amd64 and arm64
-  - `libchaos-memory`: unit tests plus 100% source line coverage for its
-    shipped `src/memory/*.c`, plus Docker runtime validation across glibc and
-    musl on amd64 and arm64
-  - `libchaos-process`: unit tests plus 100% source line coverage for its
-    shipped `src/process/*.c`, plus Docker runtime validation across glibc and
-    musl on amd64 and arm64
+| Constraint | How it is held |
+|---|---|
+| Pure C99, no C++ runtime | `-std=c99 -pedantic -Wall -Wextra -Werror` on every library, `chaos-init` and unit-test build |
+| No runtime dependency beyond libc and `libdl` | `-ldl` is the only link library; status and hits files are written with raw system calls |
+| glibc and musl, amd64 and arm64 | Docker runtime probes on all four cells (`make test-matrix`); release `.so` files reference no glibc symbol version above `GLIBC_2.17` (`test/runtime/check_glibc_baseline.sh`) |
+| Fail-open | A missing, unreadable or invalid rule file means no rules: every call passes through unchanged |
+| Small, boring artifacts | Hidden visibility, section GC, stripped, no unwind tables ([Minimal Artifact Strategy](#minimal-artifact-strategy)) |
+| Quality gate in-repo | `make check` = `fmt-check` + 100 % line coverage of every shipped source + runtime probes ([Build And Test](#build-and-test)) |
 
 ## Table of Contents
 <!-- TOC -->
@@ -94,18 +104,24 @@ Three repos, one mental model: **the same selector × effect × policy DSL spans
   * [Part of a Three-Layer Chaos Engineering Stack](#part-of-a-three-layer-chaos-engineering-stack)
   * [Design Constraints](#design-constraints)
   * [Table of Contents](#table-of-contents)
-  * [Repository Layout](#repository-layout)
-  * [libchaos-time](#libchaos-time)
-  * [libchaos-memory](#libchaos-memory)
-  * [libchaos-process](#libchaos-process)
-  * [libchaos-dns](#libchaos-dns)
-  * [libchaos-net](#libchaos-net)
+  * [Quick Start](#quick-start)
+  * [Rule Files](#rule-files)
+  * [Rule Qualifiers](#rule-qualifiers)
+  * [Status and Hits Files](#status-and-hits-files)
   * [libchaos-io Config Format](#libchaos-io-config-format)
     * [Operations](#operations)
     * [Effects](#effects)
     * [Supported Errnos](#supported-errnos)
     * [Matching Rules](#matching-rules)
+  * [libchaos-net](#libchaos-net)
+  * [libchaos-dns](#libchaos-dns)
+  * [libchaos-time](#libchaos-time)
+  * [libchaos-memory](#libchaos-memory)
+  * [libchaos-process](#libchaos-process)
   * [Runtime Behavior](#runtime-behavior)
+  * [SECCOMP Mode (chaos-init)](#seccomp-mode-chaos-init)
+  * [Limits](#limits)
+  * [Repository Layout](#repository-layout)
   * [Build And Test](#build-and-test)
     * [Fast local loop](#fast-local-loop)
     * [Coverage gate](#coverage-gate)
@@ -123,392 +139,293 @@ Three repos, one mental model: **the same selector × effect × policy DSL spans
     * [Available for Principal+ engineering engagements](#available-for-principal-engineering-engagements)
 <!-- TOC -->
 
-## Repository Layout
+## Quick Start
 
-```text
-ROADMAP.md
-src/
-  init/
-    chaos_init.c            # chaos-init: PID 1, filter, event loop (SECCOMP mode)
-    chaos_init_core.c       # arguments, BPF filter, status, exit code
-    chaos_init_<lib>.c      # io, net, memory, process: calls to rule decisions
-    chaos_init_tracee.c     # per-process hits, @first, FAIL_AFTER
-    chaos_init_proc.c       # reading a supervised process's memory and /proc
-    chaos_init_delay.c      # LATENCY queue
-  common/
-    chaos_domain_stub.c
-    chaos_domain_stub.h
-  core/
-    chaos_io.c
-    chaos_io_internal.h
-    chaos_io_wrappers.h
-  config/
-    chaos_io_config.c
-    chaos_io_config.h
-    chaos_io_fdcache.c
-    chaos_io_fdcache.h
-  effects/
-    chaos_io_actions.c
-    chaos_io_actions.h
-  dns/
-    chaos_dns.c
-    chaos_dns_actions.c
-    chaos_dns_actions.h
-    chaos_dns_config.c
-    chaos_dns_config.h
-    chaos_dns_internal.h
-    chaos_dns_lookup.c
-  memory/
-    chaos_memory.c
-  net/
-    chaos_net.c
-    chaos_net_actions.c
-    chaos_net_config.c
-    chaos_net_endpoint.c
-    chaos_net_extra.c
-    chaos_net_internal.h
-    chaos_net_socket.c
-    chaos_net_wait.c
-  process/
-    chaos_process.c
-    chaos_process_actions.c
-    chaos_process_actions.h
-    chaos_process_config.c
-    chaos_process_config.h
-    chaos_process_hooks.c
-    chaos_process_internal.h
-  time/
-    chaos_time.c
-  wrappers/
-    chaos_io_fsops.c
-    chaos_io_open.c
-    chaos_io_rw.c
-    chaos_io_sync.c
-test/
-  runtime/
-    dns_probe.c
-    check_coverage.sh
-    test_alpine.sh
-    test_dns_alpine.sh
-    test_dns_glibc.sh
-    test_glibc.sh
-    test_integration.sh
-    test_net_alpine.sh
-    test_net_glibc.sh
-  support/
-    test_dns_support.h
-    test_net_support.h
-    test_chaos_io_harness.h
-    test_support.h
-  unit/
-    test_actions.c
-    test_chaos_dns.c
-    test_chaos_io.c
-    test_config_parse.c
-    test_dns_actions.c
-    test_dns_config.c
-    test_dns_runtime.c
-    test_fdcache.c
-    test_chaos_net.c
-    test_net_actions.c
-    test_net_config.c
-    test_net_endpoint.c
-    test_net_runtime.c
-docker/
-  Dockerfile.build
-docs/
-  ARCHITECTURE.md
-  BENCHMARKS.md
-  DNS.md
-  DSL.md
-  ENGINEERING.md
-  IO.md
-  MEMORY.md
-  NETWORK.md
-  PLATFORM.md
-  PROCESS.md
-  SAFETY.md
-  SYSTEM.md
-  TIME.md
-  diagrams/
-    atsecure.puml
-    composition.puml
-    config_reload.puml
-    dispatch.puml
-    dsl_pipeline.puml
-    fdcache.puml
-    linkmap.puml
-    vdso.puml
-Makefile
+LD_PRELOAD mode, on a Linux host (`make native` refuses other hosts):
+
+```sh
+make native                                    # build/libchaos-{io,net,dns,time,process,memory}.so
+mkdir -p /tmp/demo && echo hello > /tmp/demo/f
+printf '/tmp/demo:read:EIO:1.0\n' > /tmp/.chaos-io.conf
+LD_PRELOAD=$PWD/build/libchaos-io.so cat /tmp/demo/f   # cat: /tmp/demo/f: Input/output error
+cat /tmp/.chaos-io.status                      # state=ok, rules=1, pid=<pid of that cat>
+cat /tmp/.chaos-io.hits.*                      # 1<TAB>/tmp/demo:read:EIO:1.0
+rm -f /tmp/.chaos-io.conf /tmp/.chaos-io.hits.*
 ```
 
-Planned extension work and scope boundaries live in
-[`ROADMAP.md`](ROADMAP.md).
+- Several libraries load together:
+  `LD_PRELOAD="$PWD/build/libchaos-io.so $PWD/build/libchaos-net.so"`.
+  They share no state, and `libchaos-io`/`libchaos-net` split `read`, `write`,
+  `readv`, `writev` and `close` by descriptor type (files vs sockets) in either order.
+- The library constructor loads the rule file, so rules written before the program
+  starts apply from its first call. A rewrite while it runs takes effect within about
+  1 ms ([Runtime Behavior](#runtime-behavior)).
+- Rule files are trusted input: any user who can write `/tmp` can create them
+  ([`docs/SAFETY.md` §9](docs/SAFETY.md#9-config-file-security)).
 
-Deep subsystem references:
+SECCOMP mode, for a statically linked program:
 
-- [`docs/DSL.md`](docs/DSL.md)
-  Cross-layer selector × effect × policy grammar (ABNF); identity proof across all six libraries;
-  specificity ordering; (S × E × P) algebra; full effect taxonomy A–E
-- [`docs/PLATFORM.md`](docs/PLATFORM.md)
-  ELF gABI §5.2 link-map mechanics, PLT/GOT lazy binding, RTLD_NEXT chain, STT_GNU_IFUNC
-  resolver phase, GNU symbol versioning, AT_SECURE auxv, static-binary immunity (and SECCOMP mode)
-- [`docs/SYSTEM.md`](docs/SYSTEM.md)
-  Global system manual: symbol ownership theorem, loader/libc/kernel interaction,
-  cross-library composition, formal one-symbol-one-owner invariant
-- [`docs/IO.md`](docs/IO.md)
-  `libchaos-io`: FD cache design, /proc/self/fd resolution, pread GNU symbol versioning,
-  splice/tee non-coverage, O_DIRECT alignment hazard
-- [`docs/NETWORK.md`](docs/NETWORK.md)
-  `libchaos-net`: endpoint selector normalisation, SCM_RIGHTS non-coverage,
-  TCP Fast Open, io_uring non-coverage
-- [`docs/DNS.md`](docs/DNS.md)
-  `libchaos-dns`: NSS plumbing (nsswitch.conf, nss_files/nss_dns/nss_resolve),
-  getaddrinfo call flow, FILTER_FAMILY/SHUFFLE/LIMIT post-call mutations
-- [`docs/TIME.md`](docs/TIME.md)
-  `libchaos-time`: full clock taxonomy (9 POSIX + Linux extensions), vDSO offload table
-  per-arch (x86_64/aarch64/riscv64/…), OFFSET monotonicity semantics
-- [`docs/MEMORY.md`](docs/MEMORY.md)
-  `libchaos-memory`: virtual-memory taxonomy, ptmalloc2/mallocng divergence, MAP_ANONYMOUS
-  dispatch, MADVISE hint catalogue, mremap/mlock non-coverage
-- [`docs/PROCESS.md`](docs/PROCESS.md)
-  `libchaos-process`: clone(2) flag taxonomy, NPTL pthread_create internals,
-  posix_spawn glibc/musl cascade gap, FAIL_AFTER atomic counter, exec family matrix
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-  Component map, dispatch pipeline, FD cache, config reload, formal symbol-ownership theorem
-- [`docs/ENGINEERING.md`](docs/ENGINEERING.md)
-  Build flag rationale (`-fvisibility=hidden`, `-fno-stack-protector`, `--gc-sections`, …),
-  ABI commitments, CI gates
-- [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)
-  rdtsc/CNTPCT_EL0 measurement methodology, per-library hot-path overhead tables,
-  cold-path reload cost, libfaketime/toxiproxy comparison
-- [`docs/SECCOMP.md`](docs/SECCOMP.md)
-  SECCOMP mode: `chaos-init` applies io, net, memory and process rules to statically
-  linked programs (Go, `FROM scratch`) through seccomp user notification
-- [`docs/SAFETY.md`](docs/SAFETY.md)
-  AT_SECURE kernel mechanics, container capability model, seccomp syscall table,
-  fail-open guarantee, sanitiser interactions, config file security
-- [`docs/diagrams/`](docs/diagrams/)
-  PlantUML: `linkmap.puml`, `vdso.puml`, `dispatch.puml`, `fdcache.puml`,
-  `config_reload.puml`, `composition.puml`, `atsecure.puml`, `dsl_pipeline.puml`
-
-## libchaos-time
-
-Config path:
-
-```text
-/tmp/.chaos-time.conf
+```sh
+make native-init                               # build/chaos-init, linked -static
+printf '/data:write:EIO:1.0\n' > /tmp/.chaos-io.conf
+build/chaos-init --libs io -- /usr/local/bin/my-static-app
+cat /tmp/.chaos-init.status                    # state=active | state=unsupported + reason=
 ```
 
-Each non-empty rule line is:
+In a container, `chaos-init` is the entrypoint:
+`ENTRYPOINT ["/chaos-init", "--libs", "io,net", "--", "/app"]`.
+
+The [`demo/`](demo/README.md) directory has 15 runnable `docker compose` profiles,
+one per fault.
+
+## Rule Files
+
+Every library reads `/tmp/.chaos-<lib>.conf`, one rule per line. The path is fixed at
+compile time.
+
+- A rule is `selector`, optional `operation`, `effect`, `value`, separated by `:`. The
+  exact field layout differs per library and is given in each library's section.
+- `#` starts a comment; by convention the comment names the rule's owner
+  (`… # payments-team`). Blank lines are skipped.
+- **Probability** is written `0`, `1`, `0.` followed by digits, or `1.` followed by
+  zeros: `[0.0, 1.0]`, parsed without `strtod`, so the application's `LC_NUMERIC`
+  cannot change it. `nan`, `inf`, exponents and hex are rejected.
+- **Latency** is a decimal count of milliseconds, at most 4 294 967 295.
+- **Specificity**: when several rules match one call, the most specific selector wins
+  (exact over prefix/suffix over wildcard; for io, the longest path prefix). io and
+  net apply one rule per call. dns, time, memory and process match each effect kind
+  separately, so a `LATENCY` rule and an `ERRNO` rule compose on the same call
+  (`LATENCY` first).
+- **All or nothing.** One invalid line rejects the whole file and leaves the library
+  with no rules. The status file names the line.
+- **Limits.** At most 256 rules and 1024 bytes per line. A file of 256 KiB
+  (256 × 1024 bytes) or more is rejected as `file too large`; a file holding a NUL byte
+  is rejected too.
+
+## Rule Qualifiers
+
+Every library accepts the same qualifiers (`src/common/chaos_policy.h`), written as
+separate whitespace-delimited words after the rule and before any `#` comment:
+
+| Qualifier | Meaning |
+|---|---|
+| `@first=N` | Fire at most N times per process (N ≥ 1), then go inert. |
+| `@from=T` | Active once the wall clock reaches T (Unix milliseconds). |
+| `@until=T` | Active while the wall clock is before T; the window is `[from, until)`. `@until` ≤ `@from` rejects the line. |
+| `@size>N`, `@size<N` | Only calls that move more / fewer than N bytes. A call without a byte count never matches a size-gated rule (list in [`docs/DSL.md` §7.1](docs/DSL.md#71-todays-surface)). |
 
 ```text
-<selector>:<effect>:<value>
+tcp4://127.0.0.1:5432:connect:ECONNREFUSED:1.0 @first=3 # net
+/data:write:EIO:1.0 @from=1760000000000 @until=1760000005000 # disk
+tcp4://127.0.0.1:9092:send:LATENCY:200 @size>65536
 ```
 
-Examples:
+- Windows are absolute so that every process in a container agrees on them. The time
+  is read from the vDSO, so a `libchaos-time` `OFFSET` rule never moves another rule's
+  window.
+- A rule fires only when its probability gate, window, size gate and `@first` budget
+  all pass. Only a firing counts as a hit.
+- `@first` budgets are per process, survive a reload that keeps the rule's text, and
+  start from zero in a forked child.
+- An unknown or malformed qualifier, or qualifiers on a line without a rule, rejects
+  the file. Numbers have at most 18 digits.
+
+## Status and Hits Files
+
+A rule file that does not parse and a rule that parses but never matches both look
+like "no fault". Two files per library make each case visible; their full contract is
+in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#status-file).
+
+**Status file** `/tmp/.chaos-<lib>.status`, rewritten after every load:
 
 ```text
-*:ERRNO:EINVAL@0.05
-clock_gettime:ERRNO:EFAULT@0.01
-clock_gettime/monotonic:OFFSET:500
-nanosleep:LATENCY:200
-usleep:ERRNO:EINTR@0.1
+state=error
+rules=0
+line=3
+reason=invalid rule
+text=bogus-rule # typo
+pid=4711
 ```
 
-Exact interposed symbols today:
+- `state=ok` with `rules=<n>` on success. On rejection: the 1-based `line`, the
+  `reason` (`invalid rule`, `too many rules`, `file too large`, `file unreadable`,
+  `file contains a NUL byte`, or in SECCOMP mode `unsupported in seccomp mode`) and the
+  line as written (`text`, at most 200 bytes). File-level reasons report `line=0`.
+- `pid` is the process that loaded the file. Every process with the library writes the
+  same report; check that `pid` is the program you started.
+- Without a rule file the status file is removed.
 
-- `clock_gettime()`
-- `gettimeofday()` and `time()` (governed by the `clock_gettime/realtime` rules)
-- `timespec_get()` (governed by the `clock_gettime/realtime` rules)
-- `nanosleep()`
-- `clock_nanosleep()` and `sleep()` (governed by the `nanosleep` rules)
-- `usleep()`
-
-Supported selectors:
-
-- `*`
-- `clock_gettime`
-- `clock_gettime/<clock-name-or-id>`
-- `nanosleep`
-- `usleep`
-
-Implemented effects:
-
-- `ERRNO`
-  Synthetic pre-call failure with optional `@probability`
-- `LATENCY`
-  Added pre-call milliseconds with optional `@probability`
-- `OFFSET`
-  Signed milliseconds added to `clock_gettime()` results, with optional
-  `@probability`
-- `REGRESS`
-  Positive milliseconds: the clock goes back once. The first read under the
-  rule is real, the next read (where the optional `@probability` fires) is that
-  much earlier, and every read after stays shifted, so the clock keeps
-  advancing from the earlier time: `clock_gettime/monotonic:REGRESS:5000`
-  is CLOCK_MONOTONIC stepping back 5 s, as after a VM migration or a buggy
-  hypervisor timer
-
-Important current boundary:
-
-- `OFFSET` and `REGRESS` are supported for `clock_gettime()` only; `REGRESS`
-  needs a clock (`clock_gettime/monotonic`, ...), since the jump is tracked per rule
-- sleep wrappers support `ERRNO` and `LATENCY`, not returned-time mutation
-- injected `ERRNO:EINTR` on `nanosleep()` copies the requested interval into
-  `remaining` because the failure is injected before the real sleep runs
-- this library does not currently interpose `clock_nanosleep()`,
-  `gettimeofday()`, `sleep()`, `alarm()`, `setitimer()`, timerfd APIs, or
-  futex timeout paths
-
-## libchaos-memory
-
-Config path:
+**Hits files** `/tmp/.chaos-<lib>.hits.<n>`, one per process, one line per rule:
 
 ```text
-/tmp/.chaos-memory.conf
+3	tcp4://127.0.0.1:5432:connect:ECONNREFUSED:1.0 # net
+0	tcp4://127.0.0.1:6379:recv:LATENCY:200 # redis
 ```
 
-Each non-empty rule line is:
+- `<n>` is the pid. A program started by `execve` keeps the pid, so its file is
+  `<pid>` followed by nine digits of its load time; the replaced image's file stays.
+- Written on each of a process's first 64 hits, then at most every 100 ms on a hit,
+  and at normal exit. A hit that is not due makes no system call.
+- A forked child starts from zero; a `vfork` child counts into its parent's slots.
+- Files of finished processes stay: sum every `.hits.<digits>` file for totals and
+  remove them between test runs.
+- Both files are written via a staging file and `rename`, with raw system calls, so an
+  io rule cannot fail or delay a report, and `errno` is preserved. They are created
+  with mode 0666 so that a process that dropped root can still update them.
+
+## libchaos-io Config Format
+
+Rule file `/tmp/.chaos-io.conf`. Each rule is exactly four fields:
 
 ```text
-<selector>:<effect>:<value>
+<path-prefix>:<operation>:<effect>:<value>
 ```
-
-Examples:
 
 ```text
-*:ERRNO:ENOMEM@0.05
-mmap/anon:ERRNO:ENOMEM
-mmap:LATENCY:150
-munmap:ERRNO:EINVAL
-mprotect:ERRNO:EACCES
-madvise:LATENCY:100
+/data:write:EIO:0.3
+/data/wal.log:fsync:EIO:0.1
+/data:write:LATENCY:200
+/data:write:TORN:0.1
+/data:read:CORRUPT:0.5
+*:open:EMFILE:0.05
 ```
 
-Exact interposed symbols today:
+### Operations
 
-- `mmap()`
-- `munmap()`
-- `mprotect()`
-- `madvise()`, and `posix_madvise()` under the `madvise` rules (error returned by value)
+| Operation | Calls |
+|---|---|
+| `read` | `read`, `readv`, `__read_chk`; stdio `fread`, `fgets`, `fgetc`, `getc`, `getline`, `getdelim`, `__getdelim`, `__fread_chk`, `__fgets_chk` |
+| `write` | `write`, `writev`; Linux `sendfile` and `copy_file_range` (matched on the destination); stdio `fwrite`, `fputs`, `fputc`, `putc`, `fprintf`, `vfprintf`, `fflush`, `__fprintf_chk`, `__vfprintf_chk` |
+| `open` | `open`, `openat`, `creat`, `fopen`, `freopen`, `__open_2`, `__openat_2` |
+| `close` | `close` |
+| `fsync` | `fsync` |
+| `fdatasync` | `fdatasync` |
+| `pread` | `pread`, `preadv`, `__pread_chk` |
+| `pwrite` | `pwrite`, `pwritev` |
+| `truncate` | `truncate`, `ftruncate` |
+| `allocate` | Linux `fallocate`, `posix_fallocate` |
+| `unlink` | `unlink`, `unlinkat`, `rmdir`, `remove` |
+| `rename_from` | `rename`, `renameat`, `renameat2`, matched on the source path |
+| `rename_to` | `rename`, `renameat`, `renameat2`, matched on the destination path |
 
-Supported selectors:
+On 64-bit glibc the large-file names (`open64`, `openat64`, `creat64`, `pread64`,
+`pwrite64`, `preadv64`, `pwritev64`, `truncate64`, `ftruncate64`, `fallocate64`,
+`posix_fallocate64`, `sendfile64`, `fopen64`, `freopen64`, `__open64_2`,
+`__openat64_2`, `__pread64_chk`) are aliases of the same wrappers. The JDK, Redis,
+nginx and MySQL bind to the `64` names and `_FORTIFY_SOURCE` builds to the `_chk`/`_2`
+names, so each is interposed.
 
-- `*`
-- `mmap`
-- `mmap/anon`
-- `mmap/file`
-- `munmap`
-- `mprotect`
-- `madvise`
+### Effects
 
-Implemented effects:
+| Effect field | `value` | Valid for | Behaviour |
+|---|---|---|---|
+| an errno name (`ERRNO`) | probability | every operation | Returns the call's failure value with `errno` set, without calling the real function. On `close` the real close runs first and the error is reported after it. Stdio calls fail as stdio does (0 items, `NULL`, `EOF`, -1) and raise the stream's error indicator, so `ferror()` is true. |
+| `LATENCY` | milliseconds | every operation | Sleeps before the real call. Always fires: io `LATENCY` takes no probability. |
+| `TORN` | probability | `write`, `pwrite` (not stdio) | Calls the real function with a shortened count: a short write, the rest of the buffer never written. |
+| `CORRUPT` | probability | `read`, `pread`, stdio reads | Calls the real function, then flips a bit in the bytes it returned. |
 
-- `ERRNO`
-  Synthetic pre-call failure with optional `@probability`
-- `LATENCY`
-  Added pre-call milliseconds with optional `@probability`
+### Supported Errnos
 
-Important current boundary:
+`EIO`, `ENOSPC`, `EDQUOT`, `EROFS`, `EACCES`, `EMFILE`, `ENFILE`, `ENOENT`.
 
-- `mmap()` is the only hook with selector-specific matching by call shape, via
-  `mmap/anon` and `mmap/file`
-- `munmap()`, `mprotect()`, and `madvise()` are matched by symbol only; the
-  library does not keep region provenance metadata
-- latency is injected before the real call; there is no post-call mutation of
-  protection, advice, or returned mappings
-- synthetic `munmap()` failure intentionally leaves the mapping alive until
-  the process retries successfully or exits
-- this library does not currently interpose `mmap64()`, `mremap()`, `mlock*()`,
-  `brk()`, or `sbrk()`
+### Matching Rules
 
-## libchaos-process
+- The longest matching path prefix wins; on equal length the earlier line wins.
+- Matching is path-boundary aware: `/data` matches `/data` and `/data/file`, not
+  `/database`.
+- Paths are resolved before matching. Relative paths are joined to the working
+  directory or the `*at` directory descriptor, then normalised lexically (`//`, `.`,
+  `..`). Descriptor-based calls use the kernel's name from `/proc/self/fd/<fd>`.
+  A rule prefix that contains a symbolic link also matches its resolved form
+  (`/lib` matches `/usr/lib` where `/lib` links there).
+- `*` matches regular paths only. Pipes, sockets, anonymous inodes and memfds
+  (`pipe:[N]`, `socket:[N]`, `anon_inode:[…]`, `/memfd:…`) are left to rules that
+  name them, so a `*` `TORN` rule cannot break an eventfd or a socket protocol.
+- Never faulted: descriptors 0–2, every libchaos control file (`/tmp/.chaos-*`), and
+  anything under `/proc`, `/sys` or `/dev`.
 
-Config path:
+## libchaos-net
+
+Rule file `/tmp/.chaos-net.conf`. Each rule is exactly four fields:
 
 ```text
-/tmp/.chaos-process.conf
+<endpoint-selector>:<operation>:<effect>:<value>
 ```
-
-Each non-empty rule line is:
 
 ```text
-<selector>:<effect>:<value>
+tcp4://127.0.0.1:5432:connect:ECONNREFUSED:1.0
+tcp4://*:8080:listen:LATENCY:250
+udp4://127.0.0.1:5353:send:EHOSTUNREACH:0.2
+tcp4://127.0.0.1:9000:recv:CORRUPT:0.1
+tcp4://127.0.0.1:6379:recv:TRICKLE:1
+tcp4://127.0.0.1:9092:recv:DUP:0.05
+tcp4://*:5432:close:RESET:1.0
+*:connect:ETIMEDOUT:0.05
 ```
 
-Examples:
+**Endpoint selectors.** `*`; `tcp4://<ipv4>:<port>`, `tcp4://*:<port>`;
+`tcp6://[<ipv6>]:<port>`, `tcp6://*:<port>`; the same for `udp4`/`udp6`;
+`unix://<path>`, `unix://*`, and `unix://@name` for abstract sockets. The port is a
+decimal number 0–65535; there is no port wildcard. Rank, lowest to highest: `*`, a
+wildcard host or `unix://*`, an exact address and port, an exact UNIX path. The
+family must match: `tcp4` never matches a `tcp6` or UDP socket.
 
-```text
-*:LATENCY:25@0.01
-pthread_create:ERRNO:EAGAIN
-pthread_create:FAIL_AFTER:EAGAIN,128
-fork:ERRNO:EAGAIN
-posix_spawnp:LATENCY:150
-execve:ERRNO:EACCES
-waitpid:ERRNO:EINTR@0.1
-```
+**Operations and the address they match.**
 
-Exact interposed symbols today:
+| Operation | Calls | Matched address |
+|---|---|---|
+| `socket` | `socket`, `socketpair` | family and type only: `*`, `<family>://*:0` or `unix://*` |
+| `bind` | `bind` | the address being bound |
+| `listen` | `listen` | the socket's local address |
+| `connect` | `connect` | the destination |
+| `accept` | `accept`, Linux `accept4` | the listening socket's local address |
+| `shutdown` | `shutdown` | local address, else the peer |
+| `send` | `send`, `sendto`, `sendmsg`, Linux `sendmmsg`; `write`, `writev` on sockets | an explicit destination, else both ends (peer tried first) |
+| `recv` | `recv`, `recvfrom`, `recvmsg`, Linux `recvmmsg`, glibc `__recv_chk`, `__recvfrom_chk`; `read`, `readv`, `__read_chk` on sockets | both ends (local tried first) |
+| `poll` | `poll`, `ppoll`, `select`, `pselect`, `__poll_chk`, `__ppoll_chk`, Linux `epoll_wait`, `epoll_pwait` | any watched descriptor's endpoint |
+| `close` | `close` on sockets | local address, else the peer |
 
-- `pthread_create()`
-- `fork()`
-- `posix_spawn()`
-- `posix_spawnp()`
-- `execve()`, and under its rules `execv()`, `execvp()`, `execvpe()`, `execl()`, `execlp()`, `execle()`
-- `execveat()`, and under its rules `fexecve()`
-- `system()` and `popen()` under the `posix_spawn` rules
-- `waitpid()`, and under its rules `wait()`, `wait3()`, `wait4()` and `waitid()`
+On a connected socket, `send` and `recv` rules match either end in one search, so a
+client rule naming the server's port and a server rule naming its own port both
+match, and a wildcard for one end never shadows a more specific rule for the other.
+`epoll_*` membership is read from `/proc/self/fdinfo/<epfd>`; if that read fails the
+call passes through.
 
-Supported selectors:
+**Effects.**
 
-- `*`
-- `pthread_create`
-- `fork`
-- `posix_spawn`
-- `posix_spawnp`
-- `execve`
-- `execveat`
-- `waitpid`
+| Effect field | `value` | Valid for | Behaviour |
+|---|---|---|---|
+| an errno name (`ERRNO`) | probability | every operation | Fails the call with that `errno` before the real call. On `close` the socket is closed first and the error reported after. |
+| `LATENCY` | milliseconds | every operation | Sleeps before the real call; always fires. |
+| `TIMEOUT` | probability | `poll` | Skips the real wait and waits out the call's own timeout as if nothing became ready (a signal ends it with `EINTR`, as it would end the real wait; `ppoll`, `pselect` and `epoll_pwait` wait under their signal mask), then returns 0 with `revents` / descriptor sets cleared; `select` leaves its timeout at 0. A wait without a timeout (-1 or `NULL`) is never timed out. |
+| `CORRUPT` | probability | `recv` | Flips one bit within the bytes the real receive wrote. |
+| `TRICKLE` | bytes per call (≥ 1) | `recv` | Every receive on a stream socket returns at most that many bytes; data stays complete and in order. Not applied to datagram sockets, `MSG_WAITALL` receives, requests no larger than the chunk, or `recvmsg`/`readv` with more than 64 iovecs. No probability. |
+| `DUP` | probability | `recv` | Delivers the socket's previous payload again (with its sender address for datagrams) instead of new data: at-least-once delivery. Payloads are kept per socket up to 4 KiB (longer ones replay truncated) for 64 sockets at once. Skipped for `MSG_PEEK`, `MSG_TRUNC`, `MSG_OOB`, `MSG_WAITALL` and empty buffers. |
+| `RESET` | probability | `close` | Sets `SO_LINGER` to 0 before the close, so the peer receives an RST (`ECONNRESET`) instead of a FIN, as after a crashed process or a load balancer drop. |
 
-Implemented effects:
+**Errnos.** `ECONNREFUSED`, `ETIMEDOUT`, `ECONNRESET`, `EHOSTUNREACH`, `ENETUNREACH`,
+`EADDRINUSE`, `EADDRNOTAVAIL`, `EAFNOSUPPORT`, `EPROTONOSUPPORT`, `EPIPE`, `ENOTCONN`,
+`EOPNOTSUPP`, `EINVAL`, `EINTR`, `ENOMEM`, `ENOBUFS`, `EMFILE`, `ENFILE`, `EAGAIN`.
 
-- `ERRNO`
-  Synthetic pre-call failure with optional `@probability`
-- `LATENCY`
-  Added pre-call milliseconds with optional `@probability`
-- `FAIL_AFTER`
-  Allow the first `N` calls for that operation, then fail later calls with the
-  configured error, with optional `@probability`
+**Boundaries.**
 
-Important current boundary:
-
-- selectors are symbol-only today
-- `FAIL_AFTER` counters are per operation and reset on config reload
-- `pthread_create()` and `posix_spawn*()` return the configured error number
-  directly on synthetic failure; they do not set `errno`
-- `fork()`, `execve()`, `execveat()`, and `waitpid()` return `-1` and set
-  `errno` on synthetic failure
-- `execveat()` is interposed when the target libc exports that symbol; some
-  musl environments do not expose it as a public libc symbol
-- this library does not currently interpose `waitid()`, `kill()`,
-  `pthread_kill()`, `clone*()`, or `vfork()`
+- `read`, `write`, `readv`, `writev` and `close` are shared with `libchaos-io`: net
+  decides for sockets, io for files, each forwards the rest down the chain, so the two
+  compose in either `LD_PRELOAD` order (`test/runtime/test_sharing_glibc.sh` checks
+  every order). `libchaos-io`'s `*` rule never matches a socket.
+- A socket whose endpoint cannot be resolved (unsupported family, unconnected for a
+  peer lookup) passes through.
+- Not covered: io_uring; corrupting or withholding descriptors received through
+  `SCM_RIGHTS` (effects act on the payload only;
+  [`docs/NETWORK.md` §16a](docs/NETWORK.md#16a-scm_rights-and-fd-passing--non-coverage)).
 
 ## libchaos-dns
 
-Config path:
-
-```text
-/tmp/.chaos-dns.conf
-```
-
-Each non-empty rule line is:
+Rule file `/tmp/.chaos-dns.conf`. Each rule is three fields:
 
 ```text
 <selector>:<effect>:<value>
 ```
-
-Examples:
 
 ```text
 dns://api.example.com:EAI_AGAIN:0.5
@@ -523,283 +440,297 @@ rdns://127.0.0.1:REWRITE:localhost.test
 rdns://[::1]:SERVICE:https
 ```
 
-Exact interposed symbols today:
+**Selectors.** Forward lookups: `*` (same as `dns://*`), `dns://<name>`,
+`dns://*.<suffix>`. Reverse lookups: `rdns://<ipv4>`, `rdns://[<ipv6>]`, `rdns://*`.
+An exact name beats a suffix, a suffix beats `*`.
 
-- `getaddrinfo()`
-- `getnameinfo()`
-- `gethostbyname()`, `gethostbyname2()`, their `_r` forms, `gethostbyaddr()` and
-  `gethostbyaddr_r()`, under the same `dns://` and `rdns://` rules
+**Interposed calls.** `getaddrinfo` and the legacy `gethostbyname`,
+`gethostbyname2`, `gethostbyname_r`, `gethostbyname2_r` use the `dns://` rules, so a
+rule shapes a name's answer identically whichever API resolves it. `getnameinfo`,
+`gethostbyaddr` and `gethostbyaddr_r` use the `rdns://` rules. `freeaddrinfo` is
+interposed to release the lists `OVERRIDE` builds. The `res_*` resolver API is not
+interposed.
 
-Supported selectors:
+**Effects.**
 
-- forward lookup:
-  `*`, `dns://*`, `dns://<name>`, `dns://*.<suffix>`
-- reverse lookup:
-  `rdns://<ipv4>`, `rdns://[<ipv6>]`, `rdns://*`
+| Effect | `value` | Forward | Reverse | Behaviour |
+|---|---|---|---|---|
+| `EAI_AGAIN`, `EAI_FAIL`, `EAI_NONAME`, `EAI_MEMORY`, `EAI_SYSTEM` | probability | yes | yes | Returns that error without calling the resolver (`gethostby*`: the matching `h_errno`). |
+| `LATENCY` | `ms[@p]` | yes | yes | Sleeps before the lookup. |
+| `REWRITE` | `name[@p]` | yes | yes | Forward: resolves the given name instead. Reverse: returns the given host name. |
+| `SERVICE` | `service[@p]` | yes | yes | Forward: replaces the service/port argument. Reverse: returns the given service name. |
+| `OVERRIDE` | `ip[,ip…][@p]` | yes | no | Answers with up to 32 IP literals (`[…]` for IPv6) without asking the resolver. |
+| `FILTER_FAMILY` | `inet4`/`ipv4`, `inet6`/`ipv6`, `any` `[@p]` | yes | no | Drops results of the other family; an empty result returns `EAI_NONAME`. |
+| `SHUFFLE` | probability | yes | no | Randomises result order. |
+| `LIMIT` | `n[@p]` | yes | no | Keeps at most n results. |
 
-Implemented effects:
+A forward lookup runs `LATENCY`, then `EAI_*`, then `REWRITE` and `SERVICE`, then
+`OVERRIDE` or the real resolver, then `FILTER_FAMILY` → `SHUFFLE` → `LIMIT` in that
+fixed order. Each effect kind is matched separately, so different kinds compose on
+one query.
 
-- forward `getaddrinfo()` effects:
-  `EAI_AGAIN`, `EAI_FAIL`, `EAI_NONAME`, `EAI_MEMORY`, `EAI_SYSTEM`,
-  `LATENCY`, `REWRITE`, `SERVICE`, `OVERRIDE`, `FILTER_FAMILY`, `LIMIT`,
-  `SHUFFLE`
-- reverse `getnameinfo()` effects:
-  `EAI_AGAIN`, `EAI_FAIL`, `EAI_NONAME`, `EAI_MEMORY`, `EAI_SYSTEM`,
-  `LATENCY`, `REWRITE`, `SERVICE`
+## libchaos-time
 
-Important current boundary:
-
-- `libchaos-dns` currently owns `getaddrinfo()`, `getnameinfo()` and the legacy
-  `gethostbyname*()`/`gethostbyaddr*()` resolvers
-- reverse rules are address-based and use `rdns://...` selectors
-- reverse lookup currently supports `EAI_*`, `LATENCY`, `REWRITE`, and
-  `SERVICE` only
-- the raw `res_*()` resolver API remains future work
-- rule matching is selector-specific and effect-specific; different effect
-  kinds can compose on the same query
-- post-resolution transforms for `getaddrinfo()` currently run in this order:
-  `FILTER_FAMILY`, `SHUFFLE`, then `LIMIT`
-
-## libchaos-net
-
-Config path:
+Rule file `/tmp/.chaos-time.conf`. Each rule is three fields, the probability
+optional:
 
 ```text
-/tmp/.chaos-net.conf
+<selector>:<effect>:<value>[@probability]
 ```
-
-Each non-empty rule line is:
 
 ```text
-<endpoint-selector>:<operation>:<effect>:<value>
+*:ERRNO:EINVAL@0.05
+clock_gettime:ERRNO:EFAULT@0.01
+clock_gettime/monotonic:OFFSET:500
+clock_gettime/monotonic:REGRESS:5000
+nanosleep:LATENCY:200
+usleep:ERRNO:EINTR@0.1
 ```
 
-Examples:
+**Selectors.** `*`, `clock_gettime`, `clock_gettime/<clock>`, `nanosleep`, `usleep`.
+`<clock>` is `realtime`, `monotonic`, `monotonic_raw`, `realtime_coarse`,
+`monotonic_coarse`, `boottime`, `tai`, `process_cputime_id`, `thread_cputime_id`, or a
+decimal clock id.
+
+**Interposed calls.**
+
+| Calls | Rules |
+|---|---|
+| `clock_gettime` | `clock_gettime[/<clock>]` |
+| `gettimeofday`, `time`, `timespec_get` | `clock_gettime/realtime` (they read the realtime clock from the vDSO without calling `clock_gettime`, so without this one process would see two wall clocks) |
+| `nanosleep`, `clock_nanosleep`, `sleep` | `nanosleep` |
+| `usleep` | `usleep` |
+
+**Effects.**
+
+| Effect | `value` | Valid for | Behaviour |
+|---|---|---|---|
+| `ERRNO` | `EINVAL`, `EFAULT`, `EINTR`, `EPERM`, `ENOSYS`, `EAGAIN` | every selector | Fails before the real call. An injected `EINTR` copies the request into `remaining` (relative sleeps only). `clock_nanosleep` returns the error number; `sleep` returns the whole request unslept. |
+| `LATENCY` | milliseconds | every selector | Sleeps before the real call. |
+| `OFFSET` | signed milliseconds, ±100 years | `clock_gettime[/<clock>]` | Adds the offset to every returned time the probability gate lets through. |
+| `REGRESS` | positive milliseconds, ≤ 100 years | `clock_gettime/<clock>` only | Steps that clock back once: the first read under the rule is real, the next read where the gate fires is that much earlier, and every read after stays shifted, so the clock keeps advancing from the earlier time. `clock_gettime/monotonic:REGRESS:5000` is `CLOCK_MONOTONIC` going back 5 s, as after a VM migration. A clock is required because the jump state is per rule. |
+
+- `REGRESS` state is per process and survives a reload that keeps the rule's text; a
+  forked child starts its own.
+- A `clock_nanosleep` with `TIMER_ABSTIME` computed from a shifted clock is translated
+  back to the real clock (deterministic `OFFSET` at probability 1 and `REGRESS`), so
+  a shifted clock neither stalls nor shortens absolute sleeps.
+- Not interposed: `alarm`, `setitimer`, timer and `timerfd` APIs, futex timeouts.
+
+## libchaos-memory
+
+Rule file `/tmp/.chaos-memory.conf`. Each rule is three fields, the probability
+optional:
 
 ```text
-tcp4://127.0.0.1:5432:connect:ECONNREFUSED:1.0
-tcp4://*:8080:listen:LATENCY:250
-udp4://127.0.0.1:5353:send:EHOSTUNREACH:0.2
-tcp4://127.0.0.1:9000:recv:CORRUPT:0.1
-*:connect:ETIMEDOUT:0.05
+<selector>:<effect>:<value>[@probability]
 ```
-
-Implemented logical operations:
-
-- `socket`
-  Applies to `socket()` and `socketpair()`
-- `bind`
-- `listen`
-- `connect`
-- `accept`
-  Applies to `accept()` and Linux `accept4()`
-- `shutdown`
-  Applies to `shutdown()`
-- `poll`
-  Applies to `poll()`, `ppoll()`, `select()`, `pselect()`, and Linux
-  `epoll_wait()` plus `epoll_pwait()`
-- `send`
-  Applies to `send()`, `sendto()`, `sendmsg()`, and Linux `sendmmsg()`; also to
-  `write()` and `writev()` on sockets
-- `recv`
-  Applies to `recv()`, `recvfrom()`, `recvmsg()`, and Linux `recvmmsg()`, and on glibc to the fortified
-  `__recv_chk()` and `__recvfrom_chk()`; also to `read()`, `__read_chk()` and `readv()` on sockets
-- `close`
-  Applies to `close()` on sockets
-
-Exact interposed symbols today:
-
-- `socket()`, `socketpair()`, `bind()`, `listen()`, `connect()`, `accept()`,
-  Linux `accept4()`, `shutdown()`
-- `send()`, `sendto()`, `sendmsg()`, Linux `sendmmsg()`
-- `recv()`, `recvfrom()`, `recvmsg()`, Linux `recvmmsg()`
-- `poll()`, `ppoll()` (and their fortified `__poll_chk()`, `__ppoll_chk()`), `select()`,
-  `pselect()`, Linux `epoll_wait()`, Linux `epoll_pwait()`
-- `read()`, `readv()`, `write()`, `writev()`, `close()`, shared with
-  `libchaos-io`: net decides for sockets, io for files
-
-Implemented effects:
-
-- `ERRNO`
-  Probability from `0.0` to `1.0`
-- `LATENCY`
-  Milliseconds
-- `CORRUPT`
-  Probability from `0.0` to `1.0`; valid only for `recv`
-- `TIMEOUT`
-  Probability from `0.0` to `1.0`; valid only for `poll`
-- `RESET`
-  Probability from `0.0` to `1.0`; valid only for `close`. The socket is closed
-  abortively (`SO_LINGER` 0), so the peer receives an RST (`ECONNRESET`) instead
-  of an orderly end of stream.
-- `TRICKLE`
-  Bytes per call (at least 1); valid only for `recv`, applied to stream sockets
-  only (a datagram would be cut). Every receive (`recv`,
-  `recvfrom`, `recvmsg`, `read`, `readv` on the socket) returns at most that many
-  bytes. The data is complete and correct, only the chunking is pathological:
-  `recv:TRICKLE:1` breaks any parser that assumes one read yields one message.
-- `DUP`
-  Probability from `0.0` to `1.0`; valid only for `recv`. When it fires, a
-  receive delivers the socket's previous payload once more (with its sender
-  address for datagrams) instead of new data: at-least-once delivery, for
-  testing idempotency. Payloads are kept up to 4 KiB per socket.
-
-Supported endpoint selectors:
-
-- `*`
-- `tcp4://<ipv4-or-*>:<port>`
-- `tcp6://[<ipv6>]:<port>`
-- `tcp6://*:<port>`
-- `udp4://<ipv4-or-*>:<port>`
-- `udp6://[<ipv6>]:<port>`
-- `udp6://*:<port>`
-- `unix://<path>`
-
-Important current boundary:
-
-- `libchaos-net` shares `read()`, `write()`, `readv()`, `writev()` and
-  `close()` with `libchaos-io`: it decides for sockets, io for files, and each
-  forwards everything else down the chain, so the two compose in either
-  `LD_PRELOAD` order (`test/runtime/test_sharing_glibc.sh` checks every order)
-- `libchaos-net` no longer owns DNS lookup interception; that surface now lives
-  in `libchaos-dns`
-- wait-path matching is endpoint-aware and best-effort; Linux `epoll_*`
-  matching is derived from `/proc/self/fdinfo/<epfd>` rather than a persistent
-  membership cache
-- runtime behavior is Docker-validated across glibc/musl and amd64/arm64
-- the strict 100% source coverage gate now asserts `libchaos-io`,
-  `libchaos-net`, `libchaos-time`, `libchaos-memory`, and
-  `libchaos-process`
-
-## libchaos-io Config Format
-
-Config path:
 
 ```text
-/tmp/.chaos-io.conf
+*:ERRNO:ENOMEM@0.05
+mmap/anon:ERRNO:ENOMEM
+mmap:LATENCY:150
+munmap:ERRNO:EINVAL
+mprotect:ERRNO:EACCES
+madvise:LATENCY:100
 ```
 
-Each non-empty rule line is:
+| Selector | Calls |
+|---|---|
+| `mmap` | `mmap`, and `mmap64` on 64-bit glibc |
+| `mmap/anon`, `mmap/file` | the same, split by `MAP_ANONYMOUS` |
+| `munmap` | `munmap` |
+| `mprotect` | `mprotect` |
+| `madvise` | `madvise`, `posix_madvise` (which returns the error number) |
+| `*` | all of the above |
+
+| Effect | `value` | Behaviour |
+|---|---|---|
+| `ERRNO` | `ENOMEM`, `EINVAL`, `EACCES`, `EPERM`, `EBADF`, `ENODEV`, `EAGAIN`, `EFAULT`, `ENOSYS`, `ENFILE`, `EMFILE` | Fails before the real call (`mmap` returns `MAP_FAILED`). |
+| `LATENCY` | milliseconds | Sleeps before the real call. |
+
+- `munmap`, `mprotect` and `madvise` match by symbol only; the library keeps no
+  region provenance. An injected `munmap` failure leaves the mapping in place.
+- Which `malloc` calls reach `mmap` depends on the allocator: glibc maps requests at
+  or above `M_MMAP_THRESHOLD` (128 KiB initially, raised dynamically up to 32 MiB on
+  64-bit), musl maps new memory for every size class. An allocation served from memory
+  the allocator already holds cannot fail ([`docs/MEMORY.md`](docs/MEMORY.md)).
+- Not interposed: `mremap`, `mlock*`, `brk`, `sbrk`.
+
+## libchaos-process
+
+Rule file `/tmp/.chaos-process.conf`. Each rule is three fields, the probability
+optional:
 
 ```text
-<path-prefix>:<operation>:<errno|action>:<value>
+<selector>:<effect>:<value>[@probability]
 ```
-
-Examples:
 
 ```text
-/data:write:EIO:0.3
-/data/wal.log:fsync:EIO:0.1
-/data:write:LATENCY:200
-/data:write:TORN:0.1
-/data:read:CORRUPT:0.5
-*:open:EMFILE:0.05
+*:LATENCY:25@0.01
+pthread_create:ERRNO:EAGAIN
+pthread_create:FAIL_AFTER:EAGAIN,128
+fork:ERRNO:EAGAIN
+posix_spawnp:LATENCY:150
+execve:ERRNO:EACCES
+waitpid:ERRNO:EINTR@0.1
 ```
 
-### Operations
+| Selector | Calls | Failure reported as |
+|---|---|---|
+| `pthread_create` | `pthread_create` | error number returned, `errno` untouched |
+| `fork` | `fork` | -1, `errno` |
+| `posix_spawn` | `posix_spawn`, `system`, `popen` | `posix_spawn`: error number returned; `system`: -1, `errno`; `popen`: `NULL`, `errno` |
+| `posix_spawnp` | `posix_spawnp` | error number returned |
+| `execve` | `execve`, `execv`, `execvp`, `execvpe`, `execl`, `execlp`, `execle` | -1, `errno` |
+| `execveat` | `execveat`, `fexecve` | -1, `errno` |
+| `waitpid` | `waitpid`, `wait`, `wait3`, `wait4`, `waitid` | -1, `errno` |
+| `*` | all of the above | |
 
-- `read`
-  Applies to `read()` and `readv()`.
-- `write`
-  Applies to `write()`, `writev()`, Linux `sendfile()`, and Linux
-  `copy_file_range()` destination paths.
-- `open`
-  Applies to `open()`, `openat()` and `creat()`.
-- `close`
-- `fsync`
-- `fdatasync`
-- `pread`
-  Applies to `pread()` and `preadv()`.
-- `pwrite`
-  Applies to `pwrite()` and `pwritev()`.
-- `truncate`
-  Applies to `ftruncate()` and `truncate()`.
-- `allocate`
-  Applies to Linux `fallocate()` and `posix_fallocate()`.
-- `unlink`
-  Applies to `unlinkat()`, `unlink()`, `rmdir()` and `remove()`.
-- `rename_from`
-  Applies to `renameat()`, `renameat2()` and `rename()` source paths.
-- `rename_to`
-  Applies to `renameat()`, `renameat2()` and `rename()` destination paths.
+| Effect | `value` | Behaviour |
+|---|---|---|
+| `ERRNO` | `EAGAIN`, `ENOMEM`, `EACCES`, `ENOENT`, `EINTR`, `ECHILD`, `EPERM`, `ESRCH`, `EBUSY`, `EINVAL`, `ENOSYS`, `EMFILE`, `ENFILE`, `E2BIG` | Fails before the real call. |
+| `LATENCY` | milliseconds | Sleeps before the real call. |
+| `FAIL_AFTER` | `<errno>,<count>` | Lets the first `count` matching calls of that operation through, then fails later ones (where the probability gate fires). |
 
-### Effects
-
-- `ERRNO`
-  `value` is a probability from `0.0` to `1.0`.
-- `LATENCY`
-  `value` is milliseconds.
-- `TORN`
-  `value` is a probability from `0.0` to `1.0`.
-  Valid only for `write` and `pwrite`.
-- `CORRUPT`
-  `value` is a probability from `0.0` to `1.0`.
-  Valid only for `read` and `pread`.
-
-### Supported Errnos
-
-- `EIO`
-- `ENOSPC`
-- `EDQUOT`
-- `EROFS`
-- `EACCES`
-- `EMFILE`
-- `ENFILE`
-- `ENOENT`
-
-### Matching Rules
-
-- Longest prefix wins.
-- `*` is the lowest-priority wildcard.
-- Prefix matching is path-boundary aware.
-  `/data` matches `/data` and `/data/file`.
-  `/data` does not match `/database`.
-- Invalid lines invalidate the full config load and force passthrough. The
-  rejected line is reported in `/tmp/.chaos-<lib>.status` (`state=error`,
-  `line=`, `reason=`, `text=`); a successful load reports `state=ok` and the
-  rule count. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status-file).
-- Every process reports how often each rule fired in
-  `/tmp/.chaos-<lib>.hits.<pid>` (`<count><TAB><rule as written>`); sum the
-  files of all processes. See
-  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#hit-counters).
-
-## Rule Qualifiers
-
-Every library accepts the same qualifiers after a rule, before any `# owner`
-comment: `@first=N` (fire at most N times per process), `@from=T` / `@until=T`
-(active only in that wall-clock window, Unix milliseconds) and `@size>N` /
-`@size<N` (only calls moving more / fewer than N bytes). An unknown qualifier
-rejects the line. See [docs/DSL.md](docs/DSL.md#71-todays-surface).
-
-```text
-tcp4://127.0.0.1:5432:connect:ECONNREFUSED:1.0 @first=3 # net
-/data:write:EIO:1.0 @from=1760000000000 @until=1760000005000 # disk
-```
+- `FAIL_AFTER` counts every call of the operation that a `FAIL_AFTER` rule matches,
+  per operation, not per rule. The counters restart at 0 when a changed rule file is
+  loaded and in a forked child.
+- `fork` rules do not cover `posix_spawn`: glibc spawns with `clone(CLONE_VFORK)`.
+  Write `posix_spawn` rules for spawn paths.
+- Not interposed: `vfork`, `clone*`, `kill`, `pthread_kill`. `execveat` and `fexecve`
+  are interposed where the C library exports them.
 
 ## Runtime Behavior
 
-- The intercepted libc entry points are `read`, `readv`, `write`, `writev`, `open`, `openat`, `close`, `fsync`, `fdatasync`, `pread`, `preadv`, `pwrite`, `pwritev`, `ftruncate`, `truncate`, `unlinkat`, `unlink`, `rmdir`, `remove`, `renameat`, `renameat2`, `rename`, `creat`, `fopen`, `freopen`, the stdio stream calls (`fread`, `fgets`, `fgetc`, `getc`, `getline`, `getdelim`, `fwrite`, `fputs`, `fputc`, `putc`, `fprintf`, `vfprintf`, `fflush`), `posix_fallocate`, and Linux `sendfile`, `copy_file_range`, plus `fallocate`.
-- `close()` keeps Linux semantics: the descriptor is always released, and an injected error is reported after the real close (a synthetic error that left it open would leak it in programs that, correctly, never retry close).
-- `dup2`, `dup3` and `close_range` are forwarded unchanged; they only keep the fd-to-path cache correct for the descriptors they free or reassign. The cache is one lazily mapped table per process (no per-thread memory), so a close on one thread is seen by all.
-- On 64-bit glibc the large-file names `open64`, `openat64`, `pread64`, `pwrite64`, `preadv64`, `pwritev64`, `ftruncate64`, `fallocate64`, `sendfile64`, `fopen64` and `freopen64` are the same wrappers, and the fortified `__read_chk`, `__pread_chk`, `__pread64_chk`, `__open_2`, `__open64_2`, `__openat_2` and `__openat64_2` check the buffer like glibc and then run them. Programs bind to whichever name their build chose (the JDK, Redis, nginx and MySQL use the `64` names; `_FORTIFY_SOURCE` builds use the fortified ones), so each is intercepted.
-- Once rules are loaded, the config file is checked with `stat()` at most every
-  millisecond (timed with the kernel's vDSO clock, not the interposed
-  `clock_gettime`), so a change takes effect within about 1 ms. Without a vDSO
-  clock it is checked on every call.
-- Reload is lock-free for readers and swaps between two config snapshots.
-- FD-backed operations resolve paths through `/proc/self/fd/<fd>` and cache them in thread-local storage.
-- The library uses a thread-local recursion guard.
-- The library seeds a thread-local PRNG once per thread.
-- `readv(2)` and `preadv(2)` reuse the logical `read` and `pread` rule classes across the concatenated iovec byte stream.
-- `writev(2)` and `pwritev(2)` reuse the logical `write` and `pwrite` rule classes across the concatenated iovec byte stream.
-- Linux `sendfile(2)` and `copy_file_range(2)` use the logical `write` rule class and match on the destination fd path.
-- `ftruncate(2)` and Linux `fallocate(2)` use the logical `truncate` and `allocate` rule classes on the target fd path.
-- `unlinkat(2)` matches the logical `unlink` rule class on the resolved target path.
-- `renameat(2)` matches the logical `rename_from` and `rename_to` rule classes against the resolved source and destination paths.
-- Successful `unlinkat(2)` and `renameat(2)` calls reset the current thread fd cache because cached path identities may now be stale.
-- Programs that copy data with `splice(2)`, `mmap(2)`, or other non-`write(2)`/`writev(2)`/`sendfile(2)`/`copy_file_range(2)` paths bypass `write` and `pwrite` rules.
-- Injection is never applied to:
-  `stdin`, `stdout`, `stderr`, `/tmp/.chaos-io.conf`, `/proc`, `/sys`, or `/dev`.
+- **Reload.** Once rules are loaded, each library `stat()`s its rule file at most
+  every 1 ms, timed with the vDSO clock (not the interposed `clock_gettime`); without
+  a vDSO clock it checks on every call. A change is detected by mtime, size, inode and
+  device, so an append or a `rename`-based rewrite within one mtime tick is still
+  seen. Tests that write rules and call at once must wait at least 2 ms.
+- **Lock-free reads.** Each library keeps two rule snapshots. One thread wins the
+  reload by compare-and-swap, fills the inactive snapshot and flips the active index;
+  readers never block. A snapshot carries a sequence number (seqlock), so a reader
+  that copied a rule from a snapshot rewritten meanwhile discards the copy and passes
+  the call through.
+- **Reentrancy.** Every wrapper checks a thread-local guard and forwards directly to
+  the real function when the library itself is inside libc.
+- **Randomness.** One PRNG per thread, seeded lazily; a forked child reseeds, so
+  pre-fork workers do not draw the same sequence.
+- **close().** Linux releases the descriptor even when `close` reports an error, and
+  correct programs never retry it. io and net therefore always run the real close and
+  report an injected error after it.
+- **fd-to-path cache (io).** One process-wide 32-slot table, mapped lazily with a raw
+  `mmap` system call, guarded per slot by a seqlock and a generation counter. `close`,
+  `dup2`, `dup3`, `close_range`, `closefrom`, `fclose`, `closedir` and `pclose`
+  invalidate the descriptors they release; a successful `unlinkat` or `renameat`
+  clears the table. A miss reads `/proc/self/fd/<fd>`.
+- **errno.** An idle wrapper leaves `errno` as it found it
+  (`test/runtime/test_errno_glibc.sh`).
+- **fork and exec.** Hit counts and `@first` budgets start from zero in a forked
+  child. A program started by `execve` loads the libraries anew.
+- **Not reached by `LD_PRELOAD`.** Statically linked programs; set-user-ID and
+  file-capability programs (the loader ignores `LD_PRELOAD` under `AT_SECURE`); system
+  calls the C library makes internally without its exported symbol (glibc's
+  `posix_spawn` clones directly, never calling `fork`); I/O through io_uring, `splice`
+  or a file `mmap`. Details: [`docs/PLATFORM.md`](docs/PLATFORM.md),
+  [`docs/SAFETY.md`](docs/SAFETY.md).
+
+## SECCOMP Mode (chaos-init)
+
+`chaos-init` applies the same rule files to processes `LD_PRELOAD` cannot reach,
+through the kernel's seccomp user notification. Full reference:
+[`docs/SECCOMP.md`](docs/SECCOMP.md).
+
+```sh
+chaos-init --libs io,net,memory,process -- /usr/local/bin/nats-server -js
+```
+
+- It forks the tracee, which sets `no_new_privs`, installs the filter, hands the
+  listener back and executes the command. The supervisor answers each notified call:
+  fail it, delay it (`LATENCY`, from a timer queue), return without running it (poll
+  `TIMEOUT`), or let it run. It forwards termination and user signals, reaps orphans
+  and exits with the application's exit code (128 + signal if killed). Its own exit
+  codes: 2 usage error, 125 setup failure, 126 command not executable, 127 command not
+  found.
+- `src/init/chaos_init_<lib>.c` turns a system call into what the library's wrapper
+  would pass to the rule core; parsing, reload, matching, qualifiers and the status and
+  hits files are the libraries' own source files.
+- `/tmp/.chaos-init.status` reports `state=active` with `libs=` and `pid=` (and
+  `mptcp=off` when chaos-init disabled Go's Multipath TCP), or `state=unsupported` with
+  a `reason=`. The application starts in both cases; unsupported means no chaos.
+
+| Library | Applied in SECCOMP mode |
+|---|---|
+| io | errno and `LATENCY` on every operation (`close`: `LATENCY` only) |
+| net | errno and `LATENCY` on every operation (`close`: `LATENCY` only); `TIMEOUT` on `poll` |
+| memory | `ERRNO`, `LATENCY` |
+| process | `ERRNO`, `LATENCY`, `FAIL_AFTER`; `clone` is classified as `pthread_create` (`CLONE_THREAD`), `posix_spawn` (`CLONE_VFORK`) or `fork` |
+| dns, time | nothing: name resolution is a library function, clocks are read from the vDSO |
+
+- Rules seccomp cannot carry out reject their whole file with
+  `reason=unsupported in seccomp mode`: io `TORN`/`CORRUPT`, net
+  `CORRUPT`/`TRICKLE`/`DUP`/`RESET`, errno on `close`, and any `posix_spawnp` rule.
+- Per-process state follows the libraries (hits, `@first`, a new count after
+  `execve`), with one difference: a forked child continues its parent's `FAIL_AFTER`
+  counts, where the library's atfork handler resets them to 0.
+- Every system call of the process counts, including the dynamic loader's `open` and
+  `mmap` and the allocator's mappings. Narrow paths, `@size`, `@first` or `@from`
+  keep a rule to the calls meant.
+- Requires kernel 5.5 or newer, x86_64 or aarch64 (native, not emulated), and no
+  privilege beyond Docker's default seccomp profile. One notified call costs about
+  2.5 µs instead of 0.2 µs (Docker Desktop, kernel 6.10); only the requested
+  libraries' system calls are notified.
+
+## Limits
+
+| Limit | Value |
+|---|---|
+| Rules per file | 256 |
+| Bytes per rule line | 1024 |
+| Rule file size | < 256 KiB |
+| Rule text reported in status and hits files, and used to keep a rule's counts across reloads | first 200 bytes |
+| `LATENCY` | 0 – 4 294 967 295 ms |
+| `OFFSET`, `REGRESS` | ±3 155 760 000 000 ms (100 years) |
+| `OVERRIDE` literals per rule | 32 |
+| `DUP` payload kept per socket / sockets tracked | 4096 bytes / 64 |
+| `TRICKLE` iovec entries reshaped | 64 |
+| io fd-to-path cache | 32 slots |
+| Qualifier numbers | 18 digits |
+| `chaos-init` processes with counts / delayed calls / descriptors scanned per poll | 128 / 1024 / 1024 |
+
+## Repository Layout
+
+```text
+src/
+  common/      shared headers: qualifiers (chaos_policy.h), status file (chaos_status.h),
+               hits files and seqlock (chaos_hits.h), vDSO clock (chaos_clock.h), sleep
+  core/        libchaos-io runtime state, symbol resolution, path filters
+  config/      libchaos-io rule parser and reload; fd-to-path cache
+  effects/     libchaos-io effect decisions (ERRNO, LATENCY, TORN, CORRUPT)
+  wrappers/    libchaos-io wrappers: open, read/write, fs operations, sync/close, stdio
+  net/         libchaos-net: rules, endpoints, socket and wait wrappers
+  dns/         libchaos-dns: rules, lookups, result transforms, owned address lists
+  time/        libchaos-time: rules, actions, hooks
+  memory/      libchaos-memory: rules, actions, hooks
+  process/     libchaos-process: rules, actions, hooks
+  init/        chaos-init: supervisor loop, filter and status (core), per-library
+               call mapping (chaos_init_<lib>.c), tracee state, /proc and memory
+               reads, LATENCY timer queue
+test/
+  unit/        one assert-based binary per module; sources are #included directly
+  support/     per-library test globals and stubs
+  runtime/     Docker and host probes (*_probe.c, test_*.sh), coverage and format gates
+  fuzz/        libFuzzer harnesses for the six rule parsers (make fuzz)
+benchmark/     harness, kernels, scenarios, driver (benchmark/README.md)
+demo/          15 docker compose fault profiles (demo/README.md)
+docker/        build and CI images
+docs/          subsystem references; diagrams/ holds the PlantUML sources
+scripts/       run_verified_examples.sh (make verify-docs)
+Makefile
+```
+
+Planned work and scope boundaries: [`docs/development/ROADMAP.md`](docs/development/ROADMAP.md).
 
 ## Build And Test
 
@@ -809,15 +740,11 @@ tcp4://127.0.0.1:5432:connect:ECONNREFUSED:1.0 @first=3 # net
 make unit
 ```
 
-Runs all unit binaries:
-
-- config parsing and reload logic
-- effect helpers
-- fd cache logic
-- full wrapper behavior across `src/core/chaos_io.c`,
-  `src/wrappers/chaos_io_fsops.c`,
-  `src/wrappers/chaos_io_open.c`, `src/wrappers/chaos_io_rw.c`, and
-  `src/wrappers/chaos_io_sync.c`
+Builds and runs every unit binary in `test/unit/`: parsers and reload, effect
+decisions, fd cache, every wrapper of all six libraries, the property-based parser
+test (`test_config_proptest`), and every `chaos-init` module. Unit tests `#include`
+the library sources instead of loading the shared objects. The `chaos-init` tests need
+Linux headers; on macOS run `make ci-local-unit`, which uses the Linux CI image.
 
 ### Coverage gate
 
@@ -825,48 +752,16 @@ Runs all unit binaries:
 make coverage
 ```
 
-This compiles an instrumented build and enforces `100.00%` line coverage for
-the shipped `libchaos-io`, `libchaos-net`, `libchaos-time`,
-`libchaos-memory`, and `libchaos-process` sources:
+Builds an instrumented `make unit` in `build-coverage/` and fails unless every
+shipped source reaches `100.00%` line coverage
+(`test/runtime/check_coverage.sh`):
 
-- `src/core/chaos_io.c`
-- `src/wrappers/chaos_io_fsops.c`
-- `src/wrappers/chaos_io_open.c`
-- `src/wrappers/chaos_io_rw.c`
-- `src/wrappers/chaos_io_sync.c`
-- `src/effects/chaos_io_actions.c`
-- `src/config/chaos_io_config.c`
-- `src/config/chaos_io_fdcache.c`
-- `src/net/chaos_net_actions.c`
-- `src/net/chaos_net_config.c`
-- `src/net/chaos_net_endpoint.c`
-- `src/net/chaos_net_extra.c`
-- `src/net/chaos_net_socket.c`
-- `src/net/chaos_net_wait.c`
-- `src/net/chaos_net.c`
-- `src/time/chaos_time_actions.c`
-- `src/time/chaos_time_config.c`
-- `src/time/chaos_time.c`
-- `src/time/chaos_time_hooks.c`
-- `src/memory/chaos_memory_actions.c`
-- `src/memory/chaos_memory_config.c`
-- `src/memory/chaos_memory.c`
-- `src/memory/chaos_memory_hooks.c`
-- `src/process/chaos_process_actions.c`
-- `src/process/chaos_process_config.c`
-- `src/process/chaos_process.c`
-- `src/process/chaos_process_hooks.c`
-
-DNS is also part of the repository coverage gate:
-
-- `src/dns/chaos_dns_actions.c`: `100.00%`
-- `src/dns/chaos_dns.c`: `100.00%`
-- `src/dns/chaos_dns_config.c`: minimum `85.00%`
-- `src/dns/chaos_dns_lookup.c`: minimum `85.00%`
-
-That split is intentional: DNS now participates in the enforced coverage gate,
-but only IO, NET, TIME, MEMORY, and PROCESS are held at strict `100.00%`
-line coverage today.
+- every `.c` of `libchaos-io` (`src/core`, `src/config`, `src/effects`,
+  `src/wrappers`), `libchaos-net`, `libchaos-dns`, `libchaos-time`,
+  `libchaos-memory` and `libchaos-process`;
+- every `src/init/` module except the process glue in `chaos_init.c`;
+- the shared headers (`src/common/*.h` and each library's `*_internal.h`), counted as
+  the union over all test binaries that include them.
 
 ### C style gate
 
@@ -874,52 +769,35 @@ line coverage today.
 make fmt-check
 ```
 
-This runs `clang-format` in check mode across all shipped C sources and tests.
-Use `make fmt` to rewrite the tree to the repository style.
+Runs `clang-format` (repository `.clang-format`, 100 columns) in check mode over
+every `.c` and `.h` under `src/` and `test/`. `make fmt` rewrites them.
 
 ### Docker runtime probes
 
-`libchaos-io` runtime proof:
+Each script builds the libraries in Docker, runs a probe under `LD_PRELOAD` (or
+`chaos-init`), and skips when Docker is unavailable. Per-library scripts take an
+optional platform (`linux/amd64`, `linux/arm64`; default: the host).
 
-- `sh test/runtime/test_glibc.sh linux/amd64`
-- `sh test/runtime/test_glibc.sh linux/arm64`
-- `sh test/runtime/test_alpine.sh linux/amd64`
-- `sh test/runtime/test_alpine.sh linux/arm64`
-
-`libchaos-net` runtime proof:
-
-- `sh test/runtime/test_net_glibc.sh linux/amd64`
-- `sh test/runtime/test_net_glibc.sh linux/arm64`
-- `sh test/runtime/test_net_alpine.sh linux/amd64`
-- `sh test/runtime/test_net_alpine.sh linux/arm64`
-
-`libchaos-dns` runtime proof:
-
-- `sh test/runtime/test_dns_glibc.sh linux/amd64`
-- `sh test/runtime/test_dns_glibc.sh linux/arm64`
-- `sh test/runtime/test_dns_alpine.sh linux/amd64`
-- `sh test/runtime/test_dns_alpine.sh linux/arm64`
-
-`libchaos-time` runtime proof:
-
-- `sh test/runtime/test_time_glibc.sh linux/amd64`
-- `sh test/runtime/test_time_glibc.sh linux/arm64`
-- `sh test/runtime/test_time_alpine.sh linux/amd64`
-- `sh test/runtime/test_time_alpine.sh linux/arm64`
-
-`libchaos-memory` runtime proof:
-
-- `sh test/runtime/test_memory_glibc.sh linux/amd64`
-- `sh test/runtime/test_memory_glibc.sh linux/arm64`
-- `sh test/runtime/test_memory_alpine.sh linux/amd64`
-- `sh test/runtime/test_memory_alpine.sh linux/arm64`
-
-`libchaos-process` runtime proof:
-
-- `sh test/runtime/test_process_glibc.sh linux/amd64`
-- `sh test/runtime/test_process_glibc.sh linux/arm64`
-- `sh test/runtime/test_process_alpine.sh linux/amd64`
-- `sh test/runtime/test_process_alpine.sh linux/arm64`
+| Script | Proves |
+|---|---|
+| `test_glibc.sh`, `test_alpine.sh` | libchaos-io effects on glibc / musl |
+| `test_net_{glibc,alpine}.sh` | libchaos-net |
+| `test_dns_{glibc,alpine}.sh` | libchaos-dns |
+| `test_time_{glibc,alpine}.sh` | libchaos-time |
+| `test_memory_{glibc,alpine}.sh` | libchaos-memory |
+| `test_process_{glibc,alpine}.sh` | libchaos-process |
+| `test_integration.sh` | libchaos-io natively on a Linux host, no Docker |
+| `test_errno_glibc.sh` | an idle library leaves `errno` alone |
+| `test_variants_glibc.sh` | glibc's `64`, `_chk` and `_2` entry points are faulted like the base calls |
+| `test_sharing_glibc.sh` | io and net share `read`/`write`/`close` in every `LD_PRELOAD` order |
+| `test_isolation_glibc.sh` | no library's rules change another library's effects |
+| `test_baseline_glibc.sh` | the release build loads into ordinary programs on glibc 2.31 |
+| `test_path_forms.sh` | unlink, rmdir, rename, truncate and creat are faulted |
+| `test_stdio.sh` | buffered stdio reads and writes are faulted; `ferror()` is set |
+| `test_status.sh`, `test_hits.sh` | status and hits files of every library |
+| `test_reload.sh` | `@first` holds while the rule file is reloaded under load |
+| `test_fork.sh` | per-process state across `vfork`, `fork` and `posix_spawn` |
+| `test_init.sh`, `test_seccomp.sh`, `test_mptcp.sh` | `chaos-init` process model; SECCOMP-mode effects on static C and Go programs; MPTCP socket lookups |
 
 ### Full local quality gate
 
@@ -927,15 +805,11 @@ Use `make fmt` to rewrite the tree to the repository style.
 make check
 ```
 
-This runs:
-
-1. `make fmt-check`
-2. `make coverage`
-3. `make test`
-
-`make test` runs the host-architecture runtime probes for IO, NET, DNS, TIME,
-MEMORY, and PROCESS. On non-Linux hosts, the Linux-only integration test is
-skipped. The Docker probes are skipped when Docker is unavailable.
+Runs `make fmt-check`, `make coverage`, then `make test`. `make test` runs `make
+unit`, builds the libraries on Linux, and runs every script of the table above for
+the host architecture. CI (`.github/workflows/ci.yml`) adds `make verify-docs`,
+ASan and UBSan unit runs, and `scan-build`; `make ci-local` runs the same gates in a
+Linux container.
 
 ### Full Docker matrix gate
 
@@ -943,118 +817,68 @@ skipped. The Docker probes are skipped when Docker is unavailable.
 make test-matrix
 ```
 
-This runs the glibc and musl Docker probes for IO, NET, DNS, TIME, MEMORY, and
-PROCESS on both `linux/amd64` and `linux/arm64`.
-
-The Docker runtime scripts accept an optional explicit platform argument:
+Runs the twelve per-library glibc and musl scripts on `linux/amd64` and then on
+`linux/arm64`. One cell by hand:
 
 ```sh
-sh test/runtime/test_glibc.sh linux/amd64
-sh test/runtime/test_glibc.sh linux/arm64
-sh test/runtime/test_alpine.sh linux/amd64
-sh test/runtime/test_alpine.sh linux/arm64
+sh test/runtime/test_net_alpine.sh linux/arm64
 ```
-
-When no platform is given, each script falls back to the host architecture.
-
-The Docker runtime probes explicitly validate `openat()`, `readv()`, `writev()`,
-`preadv()`, `pwritev()`, `ftruncate()`, Linux `fallocate()`, `unlinkat()`,
-`renameat()`, Linux `sendfile()`, Linux `copy_file_range()`, and `fsync()`
-under `LD_PRELOAD`.
 
 ### Build targets
 
-Native Linux builds for all current libraries:
+| Target | Output |
+|---|---|
+| `make native` | `build/libchaos-<lib>.so` for all six libraries (Linux only) |
+| `make native-<lib>` | one library, `<lib>` ∈ `io net dns time process memory` |
+| `make native-init` | `build/chaos-init`, statically linked |
+| `make cross-<libc>-<arch>` | `dist/libchaos-<lib>-<libc>-<arch>.so` for all six, `<libc>` ∈ `glibc musl`, `<arch>` ∈ `amd64 arm64` (needs the cross compilers named in the Makefile) |
+| `make cross-<libc>-<arch>-<lib>` | one library, e.g. `make cross-musl-arm64-memory` |
+| `make cross-init-<arch>` | `dist/chaos-init-<arch>`; run inside an image of that architecture (`docker/Dockerfile.build`, `MAKE_TARGET=cross-init-<arch>`), because the filter's system call numbers come from that architecture's headers |
+| `make docker-build-all` | all 24 `.so` files into `dist/` via Docker Buildx (glibc on `gcc:10`, musl on `alpine:3.20`) |
+| `make fuzz` | libFuzzer harnesses in `build-fuzz/` (clang) |
+| `make clean` | removes `build/`, `build-coverage/`, `dist/` |
 
-```sh
-make native
-```
-
-Per-library native convenience targets:
-
-```sh
-make native-io
-make native-net
-make native-dns
-make native-time
-make native-process
-make native-memory
-```
-
-Cross-build outputs for all libraries in a libc/arch tuple:
-
-```sh
-make cross-glibc-amd64
-make cross-glibc-arm64
-make cross-musl-amd64
-make cross-musl-arm64
-```
-
-Per-library cross-build targets follow the same pattern:
-
-```sh
-make cross-glibc-amd64-net
-make cross-glibc-arm64-time
-make cross-musl-amd64-process
-make cross-musl-arm64-memory
-```
-
-All four distro/arch binaries via Docker Buildx:
-
-```sh
-make docker-build-all
-```
-
-Expected output names:
-
-- `dist/libchaos-<library>-glibc-amd64.so`
-- `dist/libchaos-<library>-glibc-arm64.so`
-- `dist/libchaos-<library>-musl-amd64.so`
-- `dist/libchaos-<library>-musl-arm64.so`
-
-Where `<library>` is one of:
-
-- `io`
-- `net`
-- `dns`
-- `time`
-- `process`
-- `memory`
+One `chaos-init` binary per architecture serves glibc, musl and libc-less images.
 
 ## Minimal Artifact Strategy
 
-The shared-library build is intentionally aggressive about size:
+The shared objects carry only the wrappers and their rule engine:
 
-- hidden visibility by default
-- section-level dead-code elimination
-- stripped outputs
-- no unwind tables
-- no async unwind tables
-- no stack protector
-- no extra runtime or ABI baggage from C++
+| Flag | Effect |
+|---|---|
+| `-Os` | size-optimised code |
+| `-fvisibility=hidden` | only the interposed symbols are exported |
+| `-ffunction-sections -fdata-sections` + `-Wl,--gc-sections` | unreferenced functions and data are dropped |
+| `-fno-unwind-tables -fno-asynchronous-unwind-tables` | no `.eh_frame` |
+| `-fomit-frame-pointer`, `-fno-ident` | no frame-pointer setup, no compiler ident string |
+| `-fno-stack-protector` | no canary: `__stack_chk_fail` would write to stderr through the interposed `write` ([`docs/ENGINEERING.md`](docs/ENGINEERING.md)) |
+| `-Wl,--strip-all`, `-Wl,--build-id=none` | no symbol table beyond the dynamic one, no build-id note |
+| `-Wl,-z,max-page-size=4096 -Wl,-z,common-page-size=4096` | 4 KiB segment alignment; the aarch64 GNU ld default of 64 KiB pads every segment |
 
-The goal is simple: keep the `.so` small, predictable, and boring.
+No C++ runtime, no allocator in the hot path, `-ldl` as the only link library.
 
 ## More Detail
 
 | Document | Content |
 |---|---|
-| [`docs/DSL.md`](docs/DSL.md) | Grammar, specificity ordering, identity proof |
-| [`docs/PLATFORM.md`](docs/PLATFORM.md) | ELF, PLT/GOT, RTLD_NEXT, vDSO, AT_SECURE |
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Component map, call flow, formal theorems |
-| [`docs/ENGINEERING.md`](docs/ENGINEERING.md) | Build flags, ABI, CI, no-C++ rationale |
-| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Overhead model, rdtsc methodology, comparisons |
-| [`docs/SAFETY.md`](docs/SAFETY.md) | AT_SECURE, seccomp, fail-open, sanitisers |
-| [`docs/SYSTEM.md`](docs/SYSTEM.md) | Global system manual, symbol ownership |
-| [`docs/IO.md`](docs/IO.md) | libchaos-io internals |
-| [`docs/NETWORK.md`](docs/NETWORK.md) | libchaos-net internals |
-| [`docs/DNS.md`](docs/DNS.md) | libchaos-dns internals |
-| [`docs/TIME.md`](docs/TIME.md) | libchaos-time internals |
-| [`docs/MEMORY.md`](docs/MEMORY.md) | libchaos-memory internals |
-| [`docs/PROCESS.md`](docs/PROCESS.md) | libchaos-process internals |
-| [`docs/diagrams/`](docs/diagrams/) | 8 PlantUML architecture diagrams |
+| [`docs/DSL.md`](docs/DSL.md) | Rule grammar (ABNF), qualifiers, specificity order, cross-layer mapping |
+| [`docs/PLATFORM.md`](docs/PLATFORM.md) | ELF link map, PLT/GOT, `RTLD_NEXT`, IFUNC, symbol versioning, vDSO, `AT_SECURE`, static binaries |
+| [`docs/SYSTEM.md`](docs/SYSTEM.md) | Loader/libc/kernel interaction, one-symbol-one-owner invariant, composition |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Component map, call flow, reload protocol, status and hits files, fd cache |
+| [`docs/SECCOMP.md`](docs/SECCOMP.md) | SECCOMP mode: model, call mapping, rejected rules, requirements |
+| [`docs/IO.md`](docs/IO.md) | libchaos-io internals: fd cache, `/proc/self/fd`, symbol versioning, non-covered paths |
+| [`docs/NETWORK.md`](docs/NETWORK.md) | libchaos-net internals: endpoint normalisation, `SCM_RIGHTS`, TCP Fast Open, io_uring |
+| [`docs/DNS.md`](docs/DNS.md) | libchaos-dns internals: NSS plumbing, `getaddrinfo` flow, result transforms |
+| [`docs/TIME.md`](docs/TIME.md) | libchaos-time internals: clock taxonomy, vDSO per architecture, `OFFSET` semantics |
+| [`docs/MEMORY.md`](docs/MEMORY.md) | libchaos-memory internals: ptmalloc2/mallocng divergence, `MAP_ANONYMOUS` dispatch |
+| [`docs/PROCESS.md`](docs/PROCESS.md) | libchaos-process internals: clone flags, NPTL, spawn cascade, exec family |
+| [`docs/ENGINEERING.md`](docs/ENGINEERING.md) | Build flag rationale, ABI commitments, CI gates |
+| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Measurement methodology, per-library overhead, comparisons |
+| [`docs/SAFETY.md`](docs/SAFETY.md) | `AT_SECURE`, container capabilities, seccomp, fail-open, rule-file security, sanitisers |
+| [`docs/diagrams/`](docs/diagrams/) | 8 PlantUML diagrams |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md) | Contribution workflow; vulnerability reporting |
 
-Code-level intent lives in the internal headers under [`src/`](src).
+Code-level intent lives in the file headers and the internal headers under [`src/`](src).
 
 ---
 
@@ -1087,17 +911,18 @@ This three-repo stack — [`macstab-chaos-jvm-agent`](https://github.com/macstab
 
 **Diplom Informatiker** — German pre-Bologna 5-year computer-science degree, equivalent to a master's. 42 years of programming, 36 years of professional systems work, 30 years of enterprise software, 24 of Python, 10 of Go, 7 of Kotlin.
 
-The depth shown in this project — `LD_PRELOAD` symbol interposition that composes cleanly with `dlsym(RTLD_NEXT, ...)`, lock-free config reload via two-snapshot pointer swap, thread-local fd-path caching that respects `unlinkat()`/`renameat()` invalidation, endpoint-aware wait-path matching derived from `/proc/self/fdinfo/<epfd>`, hand-tuned `.so` outputs with hidden visibility and section-level dead-code elimination, and a 100 % source-line coverage gate enforced across glibc + musl × amd64 + arm64 — comes from a path that started with peeking C64 memory at 10, ran through the demoscene where every cycle counted on the wire, through game studios that shipped on cartridges with no recall option, and then 30 years of production enterprise software. Most engineers enter at the framework layer and look down. **This stack reads from below.** Principal-engineer titles are job descriptions; assembler at 10, the demoscene at 15, and shipping for game studios at 16 — that is a starting line.
+The depth shown in this project — `LD_PRELOAD` symbol interposition that composes cleanly with `dlsym(RTLD_NEXT, ...)`, lock-free config reload via two-snapshot pointer swap, a process-wide fd-path cache that respects `unlinkat()`/`renameat()` invalidation, endpoint-aware wait-path matching derived from `/proc/self/fdinfo/<epfd>`, hand-tuned `.so` outputs with hidden visibility and section-level dead-code elimination, and a 100 % source-line coverage gate enforced across glibc + musl × amd64 + arm64 — comes from a path that started with peeking C64 memory at 10, ran through the demoscene where every cycle counted on the wire, through game studios that shipped on cartridges with no recall option, and then 30 years of production enterprise software. Most engineers enter at the framework layer and look down. **This stack reads from below.** Principal-engineer titles are job descriptions; assembler at 10, the demoscene at 15, and shipping for game studios at 16 — that is a starting line.
 
 ### Specific evidence in this project
 
 Concrete artifacts a reviewer can read:
 
 - **Six libraries shipped** — `libchaos-io`, `libchaos-net`, `libchaos-dns`, `libchaos-time`, `libchaos-process`, `libchaos-memory` — each with its own selector grammar, config file, and runtime contract; no shared mutable state across libraries
+- **A second injection mode** — `chaos-init` applies the same rule files to statically linked programs through seccomp user notification, compiling the libraries' own rule cores
 - **Cross-libc and cross-arch validation** — `glibc + musl × amd64 + arm64`, every release walked through Docker runtime probes on all four matrix cells
-- **Strict 100 % source-line coverage** on shipped sources for IO, NET, TIME, MEMORY, and PROCESS; DNS at an enforced floor with the strict gate scoped intentionally
-- **Honest documentation** of what *cannot* work and why — every library has an explicit "Important current boundary" section calling out the symbols and edge cases left as future work, not papered over
-- **Composable by design** — `libchaos-net` deliberately does not own `read()`, `write()`, or `close()` so it composes cleanly with `libchaos-io`; DNS interception was extracted out of `libchaos-net` into its own library for the same reason
+- **Strict 100 % source-line coverage** on every shipped source of all six libraries and of `chaos-init`'s modules
+- **Honest documentation** of what *cannot* work and why — every library section names the symbols and edge cases it does not cover, not papered over
+- **Composable by design** — `libchaos-net` and `libchaos-io` share `read()`, `write()` and `close()` by descriptor type and compose in either `LD_PRELOAD` order; DNS interception was extracted out of `libchaos-net` into its own library
 - **Apache 2.0 throughout** — usable in production, in commercial products, no lock-in
 
 ### Available for Principal+ engineering engagements
