@@ -1,59 +1,33 @@
 /**
  * @file test_config_parse.c
- * @brief Unit tests for IO-domain configuration parsing, buffer selection, file I/O, and
- *   hot-reload state machine.
+ * @brief Proves the libchaos-io rule file pipeline: field parsers, line and buffer
+ *        parsing, rule selection, reading the rule file, the reload state machine, status
+ *        and hits reporting, qualifiers, and rules that follow symlinks.
  *
- * Subsystem under test: `src/config/chaos_io_config.c`
+ * @details Unit under test: `src/config/chaos_io_config.c`, compiled in by `#include`.
  *
- * Coverage approach:
- * - The production source file is included directly after three simple I/O stubs
- *   (`chaos_test_stub_open`, `chaos_test_stub_read`, `chaos_test_stub_close`) are defined.
- *   The stubs do not intercept by `#define` — instead the real-function-pointer globals
- *   (`g_chaos_io_real_open`, `g_chaos_io_real_read`, `g_chaos_io_real_close`) are reassigned
- *   at runtime, which is the same dispatch path used by the production library.
- * - Tests that require real filesystem access call `chaos_test_use_real_io()` to restore the
- *   libc function pointers, then `chaos_test_write_text_file()` to create the config file.
- * - `CHAOS_IO_DEFINE_TEST_GLOBALS()` instantiates all real-function-pointer globals required by
- *   the production config module.
- * - `g_config_backup` records the content of `CHAOS_IO_CONFIG_PATH` before the test suite
- *   runs; `chaos_test_restore_config_path()` is registered via `atexit()` to restore it
- *   regardless of how the process exits.
+ * Isolation:
+ * - The module reads the rule file through the real-function pointers
+ *   `g_chaos_io_real_open` / `_read` / `_close`, the same dispatch the wrappers use. Tests
+ *   point them at stubs (fixed result and errno, call counters, EINTR injection) to reach
+ *   every failure branch, or back at libc via `chaos_test_use_real_io()` to run against
+ *   the live rule file `/tmp/.chaos-io.conf`.
+ * - Build hooks defined before the include: `CHAOS_IO_RULE_SUPPORTED` switches every rule
+ *   to unsupported (the chaos-init rejection path); `CHAOS_IO_LINKS_RECHECK_MS` makes a
+ *   symlink-dependent load due for re-resolution at once; `CHAOS_RACY_WINDOW_MS` is
+ *   widened to 5000 ms so a restored mtime still counts as recent on a slow machine.
+ * - Module state (`g_chaos_io_cached_mtime`, hits counters, throttle stamps) is set
+ *   directly to reach sentinel and timing branches deterministically.
+ * - The live rule file is backed up before the suite and restored by an atexit handler,
+ *   also after an assertion failure.
  *
- * Properties under test:
- * - Primitive helpers: `chaos_io_is_blank_char`, `chaos_io_trim` (NULL, whitespace-only,
- *   embedded whitespace), `chaos_io_strip_comment` (NULL, comment present),
- *   `chaos_io_config_reset_state` (NULL ignored; zero-initialises `rule_count` and `parse_ok`).
- * - `chaos_io_parse_operation`: all 14 valid names plus NULL and unrecognised string.
- * - `chaos_io_parse_errno_name`: 8 supported names (EIO through ENOENT), NULL → -1,
- *   unsupported name (EINVAL) → -1.
- * - `chaos_io_parse_probability`: NULL input or NULL output → -1; non-numeric suffix → -1;
- *   value > 1.0 → -1; valid string with trailing whitespace → 0, value stored.
- * - `chaos_io_parse_latency`: NULL, non-numeric, overflow (>UINT32_MAX), trailing whitespace,
- *   and NULL output pointer.
- * - `chaos_io_effect_allowed`: TORN only on write-class ops; CORRUPT only on read-class ops;
- *   INVALID → 0.
- * - Mtime sentinel normalisation: MISSING, RELOADING, UNKNOWN all map to non-sentinel values;
- *   regular hash passes through unchanged.
- * - Line parsing: 17 valid format variants (all operations × effects); comment lines → 0;
- *   empty lines → 0; and 16 invalid inputs → -1.
- * - Buffer parsing and rule selection: wildcard `*` prefix; most-specific path wins over
- *   shorter prefix; operation mismatch → no match.
- * - Buffer error paths: invalid rule resets `rule_count` to 0; rule count overflow.
- * - File read paths: NULL size_out; NULL real_open; open fails; open succeeds but read fails
- *   (verifying close is called); read returns `MAX_CONFIG_BYTES` (buffer full); real I/O
- *   with an actual file.
- * - Reload state machine: missing file → `MTIME_MISSING`; stub I/O reload → `rule_count == 0`;
- *   real file → prepare succeeds → match works; `MTIME_RELOADING` → prepare returns 1 without
- *   re-reading; invalid rule file with `MTIME_UNKNOWN` → prepare returns 0, match returns 0.
- *
- * What is NOT tested here:
- * - Wrapper call paths that invoke `chaos_io_config_match_path` at interception time.
- * - Thread-safety of the double-buffered config state (concurrent prepare/match races).
- * - Config file parsing through the full LD_PRELOAD constructor path.
+ * Not covered here: the wrapper call paths (test_chaos_io.c), concurrent
+ * prepare/match races on the double-buffered snapshot, and loading through the
+ * LD_PRELOAD constructor.
  */
 
-/* A rule file counts as just written for 5 s, not 20 ms: the racily-clean tests
- * restore an earlier mtime and must find it still recent on a slow machine. */
+/* A rule file counts as just written for 5 s instead of 20 ms: the racily-clean test
+ * restores an earlier mtime and must still find it recent on a slow machine. */
 #define CHAOS_RACY_WINDOW_MS 5000
 #include "../support/test_support.h"
 
@@ -62,71 +36,28 @@
 
 CHAOS_IO_DEFINE_TEST_GLOBALS();
 
-/**
- * @brief Result code returned by the open stub.
- *
- * Defaults to -1 (open fails). Set to a non-negative value to simulate a successful open
- * returning that file descriptor number.
- */
+/** @brief fd the open stub returns; -1 (default) makes it fail with `g_stub_open_errno`. */
 static int g_stub_open_result = -1;
 
-/**
- * @brief errno value set by the open stub before returning.
- *
- * Defaults to EIO. Set before calling `chaos_io_config_read_file()` via stub I/O to control
- * the error code visible to the production code after a failed open.
- */
+/** @brief errno the open stub sets (default EIO, retried; EACCES/EPERM are lasting). */
 static int g_stub_open_errno = EIO;
 
-/**
- * @brief Return value for the close stub.
- *
- * Defaults to 0 (success). Can be set to -1 to simulate a close failure, though the
- * production config reader does not inspect the close return value.
- */
+/** @brief Value the close stub returns; the reader ignores it. */
 static int g_stub_close_result = 0;
 
-/**
- * @brief Number of times the close stub has been called since the last reset.
- *
- * Used to assert that the production code closes the file descriptor after a read failure
- * (i.e., the resource is not leaked on the error path).
- */
+/** @brief close stub calls; proves the fd is closed on every error path after open. */
 static int g_stub_close_calls = 0;
 
-/**
- * @brief Result code returned by the read stub.
- *
- * Defaults to -1 (read fails). Set to `CHAOS_IO_MAX_CONFIG_BYTES` to simulate a completely
- * full buffer read, which should cause `chaos_io_config_read_file` to return -1.
- */
+/** @brief Value the read stub returns; CHAOS_IO_MAX_CONFIG_BYTES simulates a full buffer. */
 static ssize_t g_stub_read_result = -1;
 
-/**
- * @brief errno value set by the read stub before returning.
- *
- * Defaults to EIO. Visible to the production code when `g_stub_read_result` is -1.
- */
+/** @brief errno the read stub sets (default EIO; EISDIR is lasting). */
 static int g_stub_read_errno = EIO;
 
-/**
- * @brief Number of times the read stub has been called since the last reset.
- *
- * Used to verify that `chaos_io_config_read_file` does not call read more than once
- * when the first read returns the full buffer capacity.
- */
+/** @brief read stub calls; a full first read must stop the loop after one call. */
 static size_t g_stub_read_calls = 0U;
 
-/**
- * @brief Stub open function controlled by `g_stub_open_result` and `g_stub_open_errno`.
- *
- * Always sets errno to `g_stub_open_errno` and returns `g_stub_open_result`, ignoring
- * `path` and `flags`. Used to inject open-failure scenarios without touching the filesystem.
- *
- * @param path  Ignored.
- * @param flags Ignored.
- * @return `g_stub_open_result`.
- */
+/** @brief open stand-in: sets `g_stub_open_errno`, returns `g_stub_open_result`. */
 static int chaos_test_stub_open(const char *path, int flags, ...)
 {
     (void)path;
@@ -135,17 +66,7 @@ static int chaos_test_stub_open(const char *path, int flags, ...)
     return g_stub_open_result;
 }
 
-/**
- * @brief Stub read function that counts calls and injects configurable errors.
- *
- * Increments `g_stub_read_calls`, sets errno to `g_stub_read_errno`, and returns
- * `g_stub_read_result` without inspecting `fd`, `buffer`, or `count`.
- *
- * @param fd      Ignored.
- * @param buffer  Ignored.
- * @param count   Ignored.
- * @return `g_stub_read_result`.
- */
+/** @brief read stand-in: counts, sets `g_stub_read_errno`, returns `g_stub_read_result`. */
 static ssize_t chaos_test_stub_read(int fd, void *buffer, size_t count)
 {
     (void)fd;
@@ -156,13 +77,10 @@ static ssize_t chaos_test_stub_read(int fd, void *buffer, size_t count)
     return g_stub_read_result;
 }
 
-/** Number of upcoming reads `chaos_test_eintr_read` fails with EINTR before reading for real. */
+/** @brief Upcoming reads `chaos_test_eintr_read` fails with EINTR before reading for real. */
 static int g_stub_read_eintr = 0;
 
-/**
- * @brief Read that fails with EINTR `g_stub_read_eintr` times, as a signal would make it,
- * then reads for real.
- */
+/** @brief read that fails with EINTR `g_stub_read_eintr` times, then reads for real. */
 static ssize_t chaos_test_eintr_read(int fd, void *buffer, size_t count)
 {
     if (g_stub_read_eintr > 0)
@@ -174,16 +92,7 @@ static ssize_t chaos_test_eintr_read(int fd, void *buffer, size_t count)
     return read(fd, buffer, count);
 }
 
-/**
- * @brief Stub close function that counts calls and returns a configurable result.
- *
- * Increments `g_stub_close_calls` and returns `g_stub_close_result` without performing
- * any actual system call. Used to verify that the production code closes the fd after
- * a read failure.
- *
- * @param fd  Ignored.
- * @return `g_stub_close_result`.
- */
+/** @brief close stand-in: counts and returns `g_stub_close_result` without closing. */
 static int chaos_test_stub_close(int fd)
 {
     (void)fd;
@@ -191,42 +100,25 @@ static int chaos_test_stub_close(int fd)
     return g_stub_close_result;
 }
 
-/* The build hook for rules a build cannot apply (chaos-init defines it): a switch. */
+/* Build hook chaos-init uses to reject rules it cannot apply; here a runtime switch. */
 static int g_test_rules_unsupported = 0;
 #define CHAOS_IO_RULE_SUPPORTED(rule) ((void)(rule), !g_test_rules_unsupported)
-/* How long a load whose rules depend on links is used: tests make it due at once. */
+/* How long a load whose rules resolve through symlinks is trusted; 0 makes it due at once. */
 static unsigned g_test_links_recheck_ms = 1000U;
 #define CHAOS_IO_LINKS_RECHECK_MS g_test_links_recheck_ms
 #include "../../src/config/chaos_io_config.c"
 
-/**
- * @brief Saved copy of `CHAOS_IO_CONFIG_PATH` as it existed before the test suite started.
- *
- * Populated in `main()` via `chaos_test_backup_file()` and restored via the atexit handler
- * `chaos_test_restore_config_path()`. Ensures that tests which write a new config file do not
- * permanently alter the developer's local config.
- */
+/** @brief The live rule file as it was before the suite, restored at exit. */
 static chaos_test_file_backup_t g_config_backup;
 
-/**
- * @brief atexit handler that restores `CHAOS_IO_CONFIG_PATH` to its pre-test state.
- *
- * Called automatically when the process exits, whether normally or via an assertion failure.
- * Uses `chaos_test_restore_file()` to write back the original bytes (or unlink if the file
- * did not exist before the test suite ran).
- */
+/** @brief atexit handler: restores (or removes) the live rule file. */
 static void chaos_test_restore_config_path(void)
 {
     chaos_test_restore_file(CHAOS_IO_CONFIG_PATH, &g_config_backup);
     chaos_test_free_backup(&g_config_backup);
 }
 
-/**
- * @brief Reset all stub control variables to their defaults.
- *
- * Resets open/read/close stub results, errno values, and call counters. Does not reset the
- * real-function-pointer globals; callers must assign those separately.
- */
+/** @brief Resets stub results, errnos and counters; leaves the function pointers alone. */
 static void chaos_test_reset_read_stubs(void)
 {
     g_stub_open_result = -1;
@@ -239,34 +131,14 @@ static void chaos_test_reset_read_stubs(void)
 }
 
 /**
- * @brief Invariant: primitive string and enum helpers produce correct results at all boundaries.
+ * @brief Field-level helpers at their boundaries.
  *
- * Triggering condition: direct calls to `chaos_io_is_blank_char`, `chaos_io_trim`,
- *   `chaos_io_strip_comment`, `chaos_io_config_reset_state`, `chaos_io_parse_operation`,
- *   `chaos_io_parse_errno_name`, `chaos_io_parse_probability`, `chaos_io_parse_latency`,
- *   `chaos_io_effect_allowed`, `chaos_io_config_normalize_mtime_hash`, and
- *   `chaos_io_config_hash_mtime`.
- *
- * Expected observable behaviour:
- * - `is_blank_char(' ')` → true; `is_blank_char('x')` → false.
- * - `trim(NULL)` → NULL; `trim("  /data  \r\n")` → `"/data"`;
- *   `trim(" \t\r\n")` → `""`.
- * - `strip_comment("value # comment")` modifies the buffer to `"value "`.
- * - `config_reset_state(NULL, 1)` is a no-op; `config_reset_state(&state, 0)` zeroes
- *   `rule_count` and `parse_ok` even when the struct was memset to 0xff.
- * - All 14 valid operation names map to their corresponding enum values; NULL and "bogus"
- *   return `CHAOS_IO_OP_INVALID`.
- * - 8 valid errno names map to their numeric codes; NULL and "EINVAL" return -1.
- * - Probability parsing rejects NULL input, trailing non-numeric characters, values > 1.0,
- *   and NULL output pointer; accepts "0.25  " and stores 0.25.
- * - Latency parsing rejects NULL, non-numeric text, overflow value (4294967296), and NULL
- *   output pointer; accepts "25  " and stores 25.
- * - `effect_allowed`: TORN allowed only on WRITE/PWRITE; CORRUPT allowed only on READ/PREAD;
- *   INVALID never allowed.
- * - Mtime sentinel normalisation maps MISSING, RELOADING, and UNKNOWN to distinct
- *   non-sentinel values; a plain integer 7 passes through unchanged.
- * - `config_hash_mtime(NULL)` → `CHAOS_IO_MTIME_MISSING`; a stat with non-zero mtime
- *   produces a value != `CHAOS_IO_MTIME_MISSING`.
+ * @details Trimming, comment stripping, state reset (from 0xff garbage), all 14 operation
+ * names, the 8 accepted errno names (EINVAL is not one), probability and latency parsing
+ * (NULL input or output, trailing garbage, > 1.0, > UINT32_MAX ms, trailing whitespace
+ * allowed), the TORN/CORRUPT operation classes, and the change-stamp sentinels: a real
+ * stat hash that collides with MISSING, RELOADING or UNKNOWN is moved off it, so a file
+ * can never be mistaken for a sentinel state.
  */
 static void test_helper_primitives(void)
 {
@@ -383,20 +255,8 @@ static void test_helper_primitives(void)
 }
 
 /**
- * @brief Invariant: `chaos_io_config_parse_line` accepts all 17 valid line formats and returns
- *   0 for comment and empty lines.
- *
- * Triggering condition: a compile-time table of 17 `{line, operation, effect, errnum,
- *   probability, latency_ms}` entries iterated by a loop that calls `parse_line` and checks
- *   each rule field based on the effect type.
- *
- * Expected observable behaviour:
- * - All 13 ERRNO variants (one per operation) return 1; `rule.operation`, `rule.errnum`, and
- *   `rule.probability` match the table entry.
- * - LATENCY variants for write and truncate return 1; `rule.latency_ms` matches.
- * - TORN (write) and CORRUPT (read) variants return 1; `rule.probability` matches.
- * - A pure comment line (`" # only comment"`) returns 0.
- * - An empty string returns 0.
+ * @brief Every operation with ERRNO, plus LATENCY, TORN and CORRUPT, parses into the
+ *        expected fields; comment-only and empty lines return 0 (no rule).
  */
 static void test_parse_line_valid_cases(void)
 {
@@ -468,25 +328,10 @@ static void test_parse_line_valid_cases(void)
 }
 
 /**
- * @brief Invariant: `chaos_io_config_parse_line` rejects all malformed or semantically
- *   invalid lines.
- *
- * Triggering condition: 16 distinct invalid inputs passed to `parse_line` one at a time.
- *
- * Expected observable behaviour:
- * - NULL line or NULL rule output → -1.
- * - Too many fields (5 colon-separated tokens) → -1.
- * - Too few fields (3 tokens, missing value) → -1.
- * - Empty path prefix (line starts with `:`) → -1.
- * - Empty operation field, empty effect field, or empty value field → -1.
- * - Unrecognised operation name (`rename`) → -1.
- * - Non-numeric probability value (`not-a-number`) → -1.
- * - Unrecognised effect name (`BOOM`) → -1.
- * - TORN on a read operation → -1 (effect disallowed for this operation class).
- * - TORN on a truncate operation → -1.
- * - Non-numeric latency value → -1.
- * - Probability out of range: > 1.0 for CORRUPT → -1; < 0.0 for TORN → -1.
- * - Path component exceeding `CHAOS_IO_MAX_RULE_PATH` bytes → -1.
+ * @brief Malformed or semantically invalid lines return -1: NULL arguments, 3 or 5
+ *        fields, any empty field, unknown operation or effect, non-numeric value, TORN on
+ *        a non-write operation, probability outside [0, 1], and a path prefix of
+ *        CHAOS_IO_MAX_RULE_PATH bytes or more.
  */
 static void test_parse_line_invalid_cases(void)
 {
@@ -536,23 +381,13 @@ static void test_parse_line_invalid_cases(void)
 }
 
 /**
- * @brief Invariant: buffer parsing loads all valid rules and rule selection returns the
- *   most-specific matching prefix for the given path and operation.
+ * @brief Buffer parsing and rule selection.
  *
- * Triggering condition: `chaos_io_config_parse_buffer` with a 4-rule buffer (wildcard,
- *   `/data`, `/data/wal.log`, `/data/wal/`), then `chaos_io_rule_prefix_matches` and
- *   `chaos_io_config_select_rule` with various path/operation combinations.
- *
- * Expected observable behaviour:
- * - NULL buffer, rules, or rule_count → -1.
- * - 4-rule buffer parses successfully with `rule_count == 4`.
- * - `prefix_matches(NULL, ...)` and `prefix_matches(..., NULL)` → 0.
- * - Wildcard `*` matches any path; `/data` matches `/data` and `/data/file` but not
- *   `/tmp/file` or `/database`.
- * - `select_rule` with NULL arguments → 0.
- * - `/data/wal.log` selects the most specific rule (errnum == ENOSPC), not the `/data` rule.
- * - `/tmp/file` for OPEN matches the wildcard rule; for WRITE no rule matches → 0.
- * - `/tmp/file` for CLOSE (no matching rule) → 0.
+ * @details Comments and blank lines are skipped. An unsupported rule rejects the whole
+ * buffer with the line number. Prefix matching is boundary-aware (`/data` covers
+ * `/data/file`, not `/database`); `*` matches files only, never pipes, sockets,
+ * anonymous inodes or memfds. Selection picks the longest matching prefix for the
+ * operation, and returns 0 when no rule has the operation.
  */
 static void test_parse_buffer_and_selection(void)
 {
@@ -573,7 +408,7 @@ static void test_parse_buffer_and_selection(void)
     assert(chaos_io_config_parse_buffer(buffer, rules, &rule_count) == 0);
     assert(rule_count == 4U);
 
-    /* A build that cannot apply a rule (chaos-init) rejects the file at it. */
+    /* A build that cannot apply a rule (chaos-init) rejects the file and names the line. */
     {
         char unsupported[] = "/data:write:EIO:1.0\n";
         size_t rejected_count = 9U;
@@ -587,7 +422,8 @@ static void test_parse_buffer_and_selection(void)
     assert(chaos_io_rule_prefix_matches(NULL, "/data") == 0);
     assert(chaos_io_rule_prefix_matches(&rules[0], NULL) == 0);
     assert(chaos_io_rule_prefix_matches(&rules[0], "/tmp/file"));
-    /* `*` is for files: not pipes, sockets, anonymous inodes or memfds. */
+    /* `*` is for files: a TORN or CORRUPT meant for files would break the protocols of
+     * pipes, sockets, anonymous inodes (eventfd) and memfds. */
     assert(!chaos_io_rule_prefix_matches(&rules[0], "pipe:[1234]"));
     assert(!chaos_io_rule_prefix_matches(&rules[0], "socket:[1234]"));
     assert(!chaos_io_rule_prefix_matches(&rules[0], "anon_inode:[eventfd]"));
@@ -621,16 +457,9 @@ static void test_parse_buffer_and_selection(void)
 }
 
 /**
- * @brief Invariant: `chaos_io_config_parse_buffer` resets `rule_count` to 0 on parse error
- *   and fails when the number of rules exceeds `CHAOS_IO_MAX_RULES`.
- *
- * Triggering condition: a single-rule buffer with an invalid rule (TORN on read), then a
- *   dynamically allocated buffer containing `CHAOS_IO_MAX_RULES + 1` valid rules.
- *
- * Expected observable behaviour:
- * - A buffer containing an invalid rule returns -1; `rule_count` is reset to 0 even if it
- *   was non-zero before the call (17 in this test, to verify the reset is unconditional).
- * - A buffer with more than `CHAOS_IO_MAX_RULES` lines returns -1; `rule_count` is reset to 0.
+ * @brief A buffer with an invalid rule, or with CHAOS_IO_MAX_RULES + 1 rules, returns -1
+ *        and sets the rule count to 0 whatever it held before (17, 99), so a rejected file
+ *        never leaves a partial rule set.
  */
 static void test_parse_buffer_error_paths(void)
 {
@@ -658,23 +487,13 @@ static void test_parse_buffer_error_paths(void)
 }
 
 /**
- * @brief Invariant: `chaos_io_config_read_file` validates its arguments, propagates I/O
- *   errors, closes the file descriptor on read failure, and correctly reads an actual file.
+ * @brief Reading the rule file: argument checks and error classification.
  *
- * Triggering condition: `chaos_io_config_read_file` called with progressively more
- *   permissive stub configurations, culminating in real I/O against a written config file.
- *
- * Expected observable behaviour:
- * - NULL size_out → -1 (no I/O attempted).
- * - NULL `g_chaos_io_real_open` → -1.
- * - Stub open returns -1 with EIO → -1 (retried); with EACCES → -3 (lasting until the
- *   file changes).
- * - Stub open returns a valid fd, stub read returns -1 → -1 and `g_stub_close_calls == 1`
- *   (the fd is closed before returning).
- * - Stub read returns exactly `CHAOS_IO_MAX_CONFIG_BYTES` → -1 (buffer full, only one read
- *   call made: `g_stub_read_calls == 1`).
- * - Real I/O with file content `"/data:write:EIO:1.0\n"` → 0, `size_out` equals
- *   `strlen("/data:write:EIO:1.0\n")`, and `g_chaos_io_config_buffer` contains that text.
+ * @details Return codes: 0 read; -1 transient (retried on the next check); -2 file fills
+ * CHAOS_IO_MAX_CONFIG_BYTES (reported as too large); -3 lasting (EACCES/EPERM on open,
+ * kept until the file changes). A NULL size_out or any NULL real-function pointer is -1
+ * without I/O; a failed read still closes the fd; a full first read stops after one call.
+ * Finally a real read of the live file returns its exact bytes.
  */
 static void test_read_file_paths(void)
 {
@@ -718,28 +537,13 @@ static void test_read_file_paths(void)
 }
 
 /**
- * @brief Invariant: the hot-reload state machine correctly responds to missing files,
- *   mtime changes, the RELOADING sentinel, and invalid config content.
+ * @brief The reload state machine and matching on the active snapshot.
  *
- * Triggering condition: `chaos_io_config_prepare()` and `chaos_io_config_match_loaded()`
- *   called in sequence as the config file is created, modified, and corrupted, with
- *   targeted mutations of `g_chaos_io_cached_mtime` to exercise sentinel branches.
- *
- * Expected observable behaviour:
- * - After removing the config file: `observed_mtime()` → `CHAOS_IO_MTIME_MISSING`;
- *   `reload(MTIME_MISSING)` keeps `cached_mtime == MTIME_MISSING`; two consecutive
- *   `prepare()` calls both return 0 (no file → no rules loaded).
- * - With failing stub I/O and `reload(1234)`: nothing is published and `cached_mtime`
- *   returns to the previous stamp (`MTIME_UNKNOWN`), so the next call retries.
- * - After writing a valid config and restoring real I/O: `observed_mtime()` !=
- *   `MTIME_MISSING`; `prepare()` returns 1; `match_loaded(WRITE, "/data/file.bin")`
- *   returns 1 with `rule.errnum == EIO`; `match_loaded(OPEN, ...)` returns 0;
- *   `match_loaded(..., NULL, ...)` returns 0; `match_path(...)` returns 1 for a matching
- *   path and 0 for a non-matching path or NULL path.
- * - With `cached_mtime == MTIME_RELOADING`: `prepare()` returns 1 immediately without
- *   re-reading the file (the RELOADING sentinel means another thread is already reloading).
- * - After writing an invalid rule file and setting `cached_mtime == MTIME_UNKNOWN`:
- *   `prepare()` returns 0 (parse failure); `match_loaded` and `match_path` return 0.
+ * @details A missing file publishes an empty snapshot under the MISSING stamp. A failed
+ * read publishes nothing and restores the previous stamp so the next call retries. A
+ * valid file loads and matches by operation and path (excluded paths such as /proc
+ * never match). While another caller holds the RELOADING claim, prepare() serves the
+ * active snapshot without reading. An invalid file publishes an empty snapshot.
  */
 static void test_reload_prepare_and_match(void)
 {
@@ -761,8 +565,8 @@ static void test_reload_prepare_and_match(void)
     g_chaos_io_real_read = chaos_test_stub_read;
     g_chaos_io_real_close = chaos_test_stub_close;
     chaos_io_config_reload(UINT64_C(1234), CHAOS_IO_MTIME_UNKNOWN);
-    /* The read failed: nothing is published and the claim is released with the
-     * previous stamp, so the next call retries. */
+    /* The read failed: nothing is published and the claim is released with the previous
+     * stamp, so the next call retries instead of running without rules. */
     assert(g_chaos_io_cached_mtime == CHAOS_IO_MTIME_UNKNOWN);
     assert(chaos_io_config_active_state()->rule_count == 0U);
 
@@ -791,12 +595,9 @@ static void test_reload_prepare_and_match(void)
 }
 
 /**
- * @brief Invariant: a failed config read keeps the active rules and is retried.
- *
- * Triggering condition: the file changes while `open()` fails.
- *
- * Expected observable behaviour: the previously loaded rule set stays active, the
- * cached stamp is not advanced, and the next call loads the new content.
+ * @brief A transient read failure keeps the active rules and retries: with open failing
+ *        the old single rule stays active and the stamp is not advanced (nor left at
+ *        RELOADING); the next call with working I/O loads both new rules.
  */
 static void test_read_failure_keeps_rules_and_retries(void)
 {
@@ -820,11 +621,8 @@ static void test_read_failure_keeps_rules_and_retries(void)
 }
 
 /**
- * @brief Invariant: the change stamp sees writes within one mtime tick.
- *
- * Triggering condition: stat results that differ only in size or only in inode.
- *
- * Expected observable behaviour: each difference yields a different stamp.
+ * @brief The change stamp hashes size and inode as well as mtime, so a rewrite within one
+ *        mtime tick that changes size, or an atomic replace (new inode), is still seen.
  */
 static void test_change_stamp_beyond_mtime(void)
 {
@@ -847,13 +645,14 @@ static void test_change_stamp_beyond_mtime(void)
 }
 
 /**
- * @brief Invariant: a child forked during a reload takes the orphaned claim over.
+ * @brief A RELOADING claim is never taken over by prepare(); only the fork child handler
+ *        releases it.
  *
- * Triggering condition: the cached stamp is RELOADING but the claim was recorded
- * by another process id, as a forked child sees it.
- *
- * Expected observable behaviour: `prepare()` reloads and publishes the file's rules;
- * a claim recorded by this process is left alone.
+ * @details The test name predates this design: a vfork child shares memory with a parent
+ * whose reload may still be running, so prepare() must not steal the claim whoever made
+ * it. chaos_io_config_after_fork() resets the child's PRNG state, rebinds the hits pid and
+ * turns RELOADING into UNKNOWN so the next prepare() reloads; on a settled stamp it
+ * changes nothing.
  */
 static void test_fork_takes_over_orphaned_reload(void)
 {
@@ -861,8 +660,8 @@ static void test_fork_takes_over_orphaned_reload(void)
     chaos_io_config_init();
     chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/data:write:EIO:1.0\n");
 
-    /* A claim is never taken over, whoever made it: in a vfork child the parent's
-     * reload thread is still running. A fork() child's atfork handler releases it. */
+    /* A claim is never taken over, whoever made it: in a vfork child the parent's reload
+     * thread is still running. A fork() child's atfork handler releases it. */
     g_chaos_io_cached_mtime = CHAOS_IO_MTIME_RELOADING;
     (void)chaos_io_config_prepare();
     assert(g_chaos_io_cached_mtime == CHAOS_IO_MTIME_RELOADING);
@@ -883,12 +682,8 @@ static void test_fork_takes_over_orphaned_reload(void)
 }
 
 /**
- * @brief Invariant: refreshing the config never changes the caller's errno.
- *
- * Triggering condition: `prepare()` with no config file, so its stat(2) fails with
- * ENOENT, and with a file to read.
- *
- * Expected observable behaviour: errno holds the caller's value afterwards.
+ * @brief prepare() never changes the caller's errno: neither the ENOENT of stat(2) on a
+ *        missing file nor anything from a successful load.
  */
 static void test_prepare_preserves_errno(void)
 {
@@ -905,13 +700,7 @@ static void test_prepare_preserves_errno(void)
     assert(errno == EBADF);
 }
 
-/**
- * @brief Invariant: a config read interrupted by a signal is retried, not treated as failure.
- *
- * Triggering condition: the first `read()` fails with EINTR.
- *
- * Expected observable behaviour: the rules are loaded as if nothing had happened.
- */
+/** @brief A read failing with EINTR is retried and the rules load normally. */
 static void test_interrupted_read_is_retried(void)
 {
     chaos_test_use_real_io();
@@ -926,11 +715,9 @@ static void test_interrupted_read_is_retried(void)
 }
 
 /**
- * @brief Invariant: a file that changed while it was read is not used.
- *
- * Expected observable behaviour: reading with the stamp of the file as it is now
- * succeeds; reading with any other stamp (the file changed after the stat that
- * started the reload) fails, so the reload keeps the previous rules and retries.
+ * @brief A file whose stamp after reading differs from the stamp that triggered the
+ *        reload is discarded (-1): the copy may be half old, half new. The matching stamp
+ *        reads successfully.
  */
 static void test_read_file_rejects_changed_file(void)
 {
@@ -947,9 +734,7 @@ static void test_read_file_rejects_changed_file(void)
     (void)unlink(CHAOS_IO_CONFIG_PATH);
 }
 
-/**
- * @brief Reads the status file into @p buffer; returns 0 when it does not exist.
- */
+/** @brief Reads the status file into @p buffer; returns 0 when it does not exist. */
 static int read_status_file(char *buffer, size_t size)
 {
     FILE *file = fopen(CHAOS_IO_STATUS_PATH, "r");
@@ -966,15 +751,10 @@ static int read_status_file(char *buffer, size_t size)
 }
 
 /**
- * @brief Invariant: a rejected line is recorded with its number, its text as written
- *   and the reason, and a full rule set followed by comments is still accepted.
- *
- * Triggering condition: a buffer whose fourth line is invalid and carries a comment;
- *   then exactly CHAOS_IO_MAX_RULES valid rules followed by a comment; then one rule more.
- *
- * Expected observable behaviour: the invalid buffer reports line 4, "invalid rule" and
- *   the line before the parser cut the comment off; the full set parses with no error;
- *   the oversized set reports the first rule beyond the limit as "too many rules".
+ * @brief The rejected line is recorded with its 1-based number, the reason and its text
+ *        as written (comment included, though the parser cuts it); exactly
+ *        CHAOS_IO_MAX_RULES rules followed by a comment is accepted with no error; one
+ *        rule more reports that rule as "too many rules".
  */
 static void test_parse_buffer_reports_rejected_line(void)
 {
@@ -1017,14 +797,13 @@ static void test_parse_buffer_reports_rejected_line(void)
 }
 
 /**
- * @brief Invariant: every load reports its outcome in the status file.
+ * @brief Every load outcome is written to the status file, stamped with this pid.
  *
- * Triggering condition: a rule file whose second line is invalid, then a valid rule
- *   file, then no rule file.
- *
- * Expected observable behaviour: state=error naming line 2 and its text, then
- *   state=ok with the rule count, both stamped with this process id; without a rule
- *   file the status file is removed.
+ * @details An invalid line gives state=error with line, reason and text; a valid file
+ * gives state=ok with the rule count; a file of CHAOS_IO_MAX_CONFIG_BYTES is "file too
+ * large", one containing a NUL byte "file contains a NUL byte", a directory (EISDIR) or
+ * an unreadable file (EACCES, skipped as root) "file unreadable". Without a rule file
+ * the status file is removed.
  */
 static void test_prepare_reports_status(void)
 {
@@ -1053,7 +832,7 @@ static void test_prepare_reports_status(void)
     (void)snprintf(expected, sizeof(expected), "state=ok\nrules=1\npid=%ld\n", (long)getpid());
     assert(strcmp(status, expected) == 0);
 
-    /* A file at the size limit is reported, not silently re-read. */
+    /* A file at the size limit is reported, not silently truncated or re-read. */
     {
         FILE *large = fopen(CHAOS_IO_CONFIG_PATH, "w");
         size_t index;
@@ -1078,8 +857,8 @@ static void test_prepare_reports_status(void)
 
     (void)unlink(CHAOS_IO_CONFIG_PATH);
 
-    /* A NUL byte rejects the file: the parser would stop there and drop every rule
-     * after it, reporting state=ok. */
+    /* A NUL byte rejects the file: the line parser would stop there and silently drop
+     * every rule after it while reporting state=ok. */
     {
         static const char text[] = "# rules\n\0\n";
         FILE *nul = fopen(CHAOS_IO_CONFIG_PATH, "w");
@@ -1099,8 +878,8 @@ static void test_prepare_reports_status(void)
     assert(strcmp(status, expected) == 0);
     (void)unlink(CHAOS_IO_CONFIG_PATH);
 
-    /* A rule file that cannot be read is reported too: a directory (EISDIR on read),
-     * and, unless running as root, a file without read permission (EACCES on open). */
+    /* An unreadable rule file is reported: a directory (EISDIR on read) and, unless
+     * running as root (which bypasses permissions), mode 000 (EACCES on open). */
     assert(mkdir(CHAOS_IO_CONFIG_PATH, 0700) == 0);
     assert(chaos_io_config_prepare() == 0);
     assert(read_status_file(status, sizeof(status)));
@@ -1129,9 +908,7 @@ static void test_prepare_reports_status(void)
     assert(!read_status_file(status, sizeof(status)));
 }
 
-/**
- * @brief Reads this process's hits file into @p buffer; returns 0 when it does not exist.
- */
+/** @brief Reads this process's hits file into @p buffer; returns 0 when it does not exist. */
 static int read_hits_file(char *buffer, size_t size)
 {
     char path[64];
@@ -1151,20 +928,9 @@ static int read_hits_file(char *buffer, size_t size)
 }
 
 /**
- * @brief Invariant: every rule of a loaded snapshot counts its hits, the process
- *   reports the counts with the rule text, and a reload keeps the count of a rule
- *   that is still in the file.
- *
- * Triggering condition: one rule loaded and hit twice; then a second rule added
- *   and hit once.
- *
- * Expected observable behaviour: the hits file lists "2<TAB>rule # a", then also
- *   "1<TAB>rule # b" with the first count unchanged.
- */
-/**
- * @brief Invariant: a rule written with a link's name also covers the files under
- *        the link's target, by which descriptors are known; rule paths are
- *        normalised like the paths they are matched against.
+ * @brief A rule naming a symlink also covers paths under its target, the form in which
+ *        /proc/self/fd reports descriptors; rule paths are normalised (`//tmp//plain/`
+ *        becomes `/tmp/plain`) and a prefix that is no link gets no resolved name.
  */
 static void test_rules_follow_links(void)
 {
@@ -1192,9 +958,15 @@ static void test_rules_follow_links(void)
 }
 
 /**
- * @brief Invariant: a rule names a file under a link even before the file exists,
- *        and follows the link when it moves (a ConfigMap update), without the rule
- *        file changing; a load whose links have not moved is kept.
+ * @brief Symlink resolution keeps up with links that move, without a rule file change.
+ *
+ * @details A rule for a file that does not exist yet resolves its directory and appends
+ * the name. When the link is retargeted (as a ConfigMap update does),
+ * the new target is used once the recheck is due, not before. A due recheck that finds
+ * nothing moved keeps the snapshot (same active index), preserving counts and claims. A
+ * prefix without links is never rechecked; a prefix that does not exist at all is
+ * rechecked and stays unresolved; a resolution too long to append the rest stays
+ * unresolved.
  */
 static void test_rules_follow_moving_links(void)
 {
@@ -1214,11 +986,11 @@ static void test_rules_follow_moving_links(void)
     chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/tmp/chaos-cm/db:write:EIO:1.0\n");
     g_chaos_io_cached_mtime = CHAOS_IO_MTIME_UNKNOWN;
     assert(chaos_io_config_prepare() == 1);
-    /* db does not exist yet: its directory is resolved, the name appended. */
+    /* db does not exist yet: its directory is resolved and the name appended. */
     assert(chaos_io_config_match_loaded(CHAOS_IO_OP_WRITE, "/tmp/chaos-cm-a/db", &rule) == 1);
     assert(chaos_io_config_active_state()->links);
 
-    /* The link moves: not looked at before it is due, then followed. */
+    /* The link moves: not re-resolved before the recheck is due, then followed. */
     assert(unlink("/tmp/chaos-cm") == 0 && symlink("/tmp/chaos-cm-b", "/tmp/chaos-cm") == 0);
     assert(chaos_io_config_prepare() == 1);
     assert(chaos_io_config_match_loaded(CHAOS_IO_OP_WRITE, "/tmp/chaos-cm-b/db", &rule) == 0);
@@ -1226,15 +998,15 @@ static void test_rules_follow_moving_links(void)
     assert(chaos_io_config_prepare() == 1);
     assert(chaos_io_config_match_loaded(CHAOS_IO_OP_WRITE, "/tmp/chaos-cm-b/db", &rule) == 1);
     assert(chaos_io_config_match_loaded(CHAOS_IO_OP_WRITE, "/tmp/chaos-cm-a/db", &rule) == 0);
-    /* Due again with nothing moved: the load stays, no new snapshot. */
+    /* Due again with nothing moved: no new snapshot is published. */
     index = g_chaos_io_active_config_index;
     assert(chaos_io_config_prepare() == 1);
     assert(g_chaos_io_active_config_index == index);
     g_test_links_recheck_ms = 1000U;
 
-    /* No link and all of it there: never looked at again. Nothing of it there at
-     * all: looked at again, nothing resolved. A resolution too long for the rest
-     * to be appended: none. */
+    /* A prefix with no link that exists: never rechecked. A prefix that does not exist:
+     * rechecked, nothing resolved. A resolution too long for the remaining components to
+     * be appended within PATH_MAX: none. */
     chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/tmp:write:EIO:1.0\n");
     g_chaos_io_cached_mtime = CHAOS_IO_MTIME_UNKNOWN;
     assert(chaos_io_config_prepare() == 1);
@@ -1281,8 +1053,9 @@ static void test_rules_follow_moving_links(void)
 }
 
 /**
- * @brief Invariant: an image whose pid already has a hits file (the image an execve
- *        replaced) writes its own file under a number no pid reaches.
+ * @brief When the pid already has a hits file (left by the image an execve replaced), the
+ *        new image writes under pid * 10^9 + salt, above any pid (PID_MAX_LIMIT 2^22),
+ *        instead of overwriting it; errno is preserved.
  */
 static void test_hits_file_survives_exec(void)
 {
@@ -1302,6 +1075,18 @@ static void test_hits_file_survives_exec(void)
     assert(unlink(path) == 0);
 }
 
+/**
+ * @brief Hit counting and hits file reporting through reloads, contention, throttling,
+ *        exit and fork.
+ *
+ * @details Each rule of a snapshot owns a hit slot; the hits file lists count and rule
+ * text. A reload keeps the count of a rule whose text is unchanged. A hit that finds the
+ * writer flag held stays pending instead of being lost; past CHAOS_HITS_EAGER hits a hit
+ * within CHAOS_HITS_INTERVAL_MS is deferred to the exit report, which then has nothing
+ * left. In a fork child the writer flag is released, counts restart at 0, a REGRESS
+ * decision in progress (state 3) re-arms (1) and a fired one (2) stays. A process that
+ * only inherited counts (other pid) writes nothing at exit.
+ */
 static void test_hits_are_counted_and_reported(void)
 {
     char hits[1024];
@@ -1359,8 +1144,9 @@ static void test_hits_are_counted_and_reported(void)
     chaos_io_config_report_hits(NULL);
     g_chaos_io_hits_total = 0U;
 
-    /* A writer flag held when the process forked is released in the child, which
-     * starts counting from zero. */
+    /* A writer flag held when the process forked would never be released in the child
+     * (the writer thread does not exist there): after_fork releases it and the child
+     * counts from zero. */
     g_chaos_io_hits_writing = 1;
     state->rules[0].hit->state = 3U; /* a once-only effect deciding in the parent */
     state->rules[1].hit->state = 2U; /* one that already fired */
@@ -1389,14 +1175,8 @@ static void test_hits_are_counted_and_reported(void)
 }
 
 /**
- * @brief Invariant: once rules are loaded, the rule file is looked at no more often
- *   than the check interval, and is looked at again once the interval has passed.
- *
- * Triggering condition: rules loaded; the rule file removed; prepare called right
- *   after a look, then again with the last look one interval ago.
- *
- * Expected observable behaviour: the first call still sees the loaded rules (no
- *   look), the second sees the file is gone.
+ * @brief Once rules are loaded, the rule file is stat'ed at most once per check interval:
+ *        right after a check a removed file goes unnoticed, one interval later it is seen.
  */
 static void test_rule_file_check_is_throttled(void)
 {
@@ -1419,12 +1199,9 @@ static void test_rule_file_check_is_throttled(void)
 }
 
 /**
- * @brief Invariant: qualifiers after a rule are parsed into its policy, and a bad
- *   qualifier rejects the line.
- *
- * Expected observable behaviour: every qualifier lands in the policy and the rule
- *   itself still parses; an unknown qualifier, qualifiers without a rule and an
- *   `@until` before its `@from` are rejected as invalid rules.
+ * @brief Qualifiers after a rule land in its policy (a trailing comment is allowed) and
+ *        the rule starts with an unknown call size; an unknown qualifier, qualifiers on a
+ *        line without a rule, `@until` before `@from` and `@first=0` reject the buffer.
  */
 static void test_rule_qualifiers(void)
 {
@@ -1455,16 +1232,13 @@ static void test_rule_qualifiers(void)
 }
 
 /**
- * @brief Invariant: a rewrite in place within one mtime tick is still seen, and a
- *        provisional load that reads the file again unchanged keeps its snapshot.
+ * @brief An in-place rewrite within one mtime tick is still loaded.
  *
- * Triggering condition: a rule file loaded right after it was written, then
- * rewritten in place with the same size and its mtime set back to the first one,
- * so that mtime, size, inode and device all stay as they were.
- *
- * Expected observable behaviour: the load is provisional; reading the unchanged
- * file again keeps the snapshot; the rewrite is loaded; an mtime older than
- * the window ends the provisional state.
+ * @details The rewrite keeps size, inode, device and (restored via futimens) mtime, so
+ * the change stamp cannot see it. A load of a file whose mtime is within
+ * CHAOS_RACY_WINDOW_MS is therefore provisional and re-read on every check; an unchanged
+ * re-read keeps the snapshot (content hash equal), the rewrite is loaded. Once the mtime
+ * lies outside the window the load becomes final.
  */
 static void test_racy_rewrite_is_seen(void)
 {
@@ -1486,11 +1260,11 @@ static void test_racy_rewrite_is_seen(void)
     assert(g_chaos_io_config_provisional == 1);
     assert(read_status_file(status, sizeof(status)) && strstr(status, "rules=1\n") != NULL);
 
-    /* Read again, nothing changed: the same snapshot stays. */
+    /* Re-read with nothing changed: the same snapshot stays. */
     assert(chaos_io_config_prepare());
     assert(g_chaos_io_config_content == chaos_config_content_hash(rule, sizeof(rule) - 1U));
 
-    /* The same bytes but the first commented out, written in place, same mtime. */
+    /* Same size, first byte commented out, written in place, mtime restored. */
     (void)memcpy(rewritten, rule, sizeof(rule));
     rewritten[0] = '#';
     file = fopen(CHAOS_IO_CONFIG_PATH, "r+");
@@ -1501,7 +1275,7 @@ static void test_racy_rewrite_is_seen(void)
     assert(chaos_io_config_prepare() == 0);
     assert(read_status_file(status, sizeof(status)) && strstr(status, "rules=0\n") != NULL);
 
-    /* An mtime outside the window: the load is final and not read again. */
+    /* An mtime outside the window (1970): the load is final and not re-read. */
     times[1].tv_sec = 60;
     times[1].tv_nsec = 0L;
     assert(utimensat(AT_FDCWD, CHAOS_IO_CONFIG_PATH, times, 0) == 0);
@@ -1513,8 +1287,8 @@ static void test_racy_rewrite_is_seen(void)
 }
 
 /**
- * @brief Invariant: hits still pending when their interval is over are written by
- *        the next look at the rule file, not only by the next hit or at exit.
+ * @brief Pending hits are flushed by the next rule file check once CHAOS_HITS_INTERVAL_MS
+ *        has passed, not only by the next hit or at exit; before that they stay pending.
  */
 static void test_pending_hits_written_after_interval(void)
 {
@@ -1532,13 +1306,10 @@ static void test_pending_hits_written_after_interval(void)
     g_chaos_io_check_interval_ns = interval;
 }
 
-/** Number of upcoming opens `chaos_test_eintr_open` fails with EINTR before opening. */
+/** @brief Upcoming opens `chaos_test_eintr_open` fails with EINTR before opening for real. */
 static int g_stub_open_eintr = 0;
 
-/**
- * @brief Open that fails with EINTR `g_stub_open_eintr` times, as a signal would make
- * it, then opens for real.
- */
+/** @brief open that fails with EINTR `g_stub_open_eintr` times, then opens for real. */
 static int chaos_test_eintr_open(const char *path, int flags, ...)
 {
     if (g_stub_open_eintr > 0)
@@ -1551,15 +1322,10 @@ static int chaos_test_eintr_open(const char *path, int flags, ...)
 }
 
 /**
- * @brief Invariant: each way reading the rule file can fail is classified: lasting
- *   (-3, kept until the file changes) or retried (-1); an interrupted open is retried.
- *
- * Expected observable behaviour:
- * - No read function → -1, nothing opened.
- * - open() fails with EPERM → -3, like EACCES.
- * - read() fails with EISDIR (a directory in the file's place) → -3, descriptor closed.
- * - fstat() fails on the descriptor → -1, descriptor closed.
- * - open() fails with EINTR once → retried, and the file is read.
+ * @brief Failure classification of the rule file read: no read function is -1 with
+ *        nothing opened; EPERM on open is lasting (-3) like EACCES; EISDIR on read is
+ *        lasting and closes the fd; a failing fstat (EBADF on fd 1000) is transient (-1)
+ *        and closes the fd; an open interrupted by EINTR is retried.
  */
 static void test_read_file_failure_kinds(void)
 {
@@ -1584,7 +1350,7 @@ static void test_read_file_failure_kinds(void)
     assert(chaos_io_config_read_file(&size_out, 0U) == -3);
     assert(g_stub_close_calls == 1);
 
-    /* A descriptor number that is not open: fstat() fails with EBADF. */
+    /* fd 1000 is not open: read returns 0 (stub) and the stamp fstat fails with EBADF. */
     chaos_test_reset_read_stubs();
     g_stub_open_result = 1000;
     g_stub_read_result = 0;
@@ -1604,9 +1370,10 @@ static void test_read_file_failure_kinds(void)
 }
 
 /**
- * @brief Invariant: matching edges: the effects each operation class allows, a last
- *   line without a newline, the more specific rule winning in either order, and a
- *   rule matching through its resolved name as well as its written one.
+ * @brief Matching edge cases: TORN/CORRUPT operation classes, a last line without a
+ *        newline, the longest prefix winning whatever the rule order, an empty prefix
+ *        covering only absolute paths, and a rule matching through both its written and
+ *        its resolved prefix at a path boundary (`/real` does not cover `/realm`).
  */
 static void test_matching_edges(void)
 {
@@ -1630,7 +1397,7 @@ static void test_matching_edges(void)
     assert(chaos_io_config_select_rule(rules, count, CHAOS_IO_OP_WRITE, "/data/other", &match));
     assert(match.errnum == EIO);
 
-    /* An empty prefix covers a path only at a boundary: a leading slash. */
+    /* An empty prefix covers a path only at a boundary, i.e. an absolute path. */
     assert(chaos_io_prefix_covers("", 0U, "/x"));
     assert(!chaos_io_prefix_covers("", 0U, "x"));
 
@@ -1646,7 +1413,8 @@ static void test_matching_edges(void)
 }
 
 /**
- * @brief Invariant: past the eager hits, a hit after the interval is written at once.
+ * @brief Past CHAOS_HITS_EAGER hits, a hit arriving after CHAOS_HITS_INTERVAL_MS is written
+ *        at once (nothing left pending).
  */
 static void test_hit_after_interval_is_written(void)
 {
@@ -1676,14 +1444,9 @@ static void test_hit_after_interval_is_written(void)
 }
 
 /**
- * @brief Invariant: a rule follows a link only when the link's target fits a rule
- *   path; a prefix that is no link keeps no second name.
- *
- * Triggering condition: a link to a directory whose path is longer than
- *   CHAOS_IO_MAX_RULE_PATH, and a rule for `/tmp`, a plain directory.
- *
- * Expected observable behaviour: the link rule matches by the link's name only; the
- *   `/tmp` rule has no resolved prefix.
+ * @brief A link whose target is CHAOS_IO_MAX_RULE_PATH bytes or longer is not followed:
+ *        the rule matches by the link's name only, never under the target; a plain
+ *        directory prefix (`/tmp`) has no resolved name.
  */
 static void test_long_link_target_is_not_followed(void)
 {
@@ -1737,7 +1500,7 @@ static void test_long_link_target_is_not_followed(void)
 
 int main(void)
 {
-    /* Look at the rule file on every call; the throttle has its own test. */
+    /* Check the rule file on every call; the throttle has its own test. */
     g_chaos_io_check_interval_ns = 0U;
     chaos_test_backup_file(CHAOS_IO_CONFIG_PATH, &g_config_backup);
     assert(atexit(chaos_test_restore_config_path) == 0);

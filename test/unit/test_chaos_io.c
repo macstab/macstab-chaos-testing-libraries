@@ -1,74 +1,30 @@
 /**
  * @file test_chaos_io.c
- * @brief Integration-style unit tests for the IO-domain constructor, open/openat wrappers,
- *   read/write/vectored wrappers, filesystem-lifecycle operations, and positioned I/O.
+ * @brief Proves the libchaos-io wrapper layer: symbol resolution and the constructor,
+ *        path resolution and normalisation, and every wrapper's decision to pass
+ *        through, delay, fail, tear or corrupt, together with its fd-cache bookkeeping.
  *
- * Subsystem under test: `src/core/chaos_io.c`, `src/wrappers/chaos_io_open.c`,
- *   `src/wrappers/chaos_io_rw.c`, `src/wrappers/chaos_io_fsops.c`,
- *   `src/wrappers/chaos_io_sync.c`.
+ * @details Units under test, compiled in through `test_chaos_io_harness.h`:
+ * `src/core/chaos_io.c` and the wrappers in `src/wrappers/chaos_io_{open,rw,fsops,sync,
+ * stdio}.c`.
  *
- * Coverage approach:
- * - The entire wrapper layer is compiled into the test binary via
- *   `test_chaos_io_harness.h`, which includes all five production source files
- *   after replacing `dlsym`, `dlerror`, `abort`, and `syscall` with test-local
- *   stubs. The harness also provides stub implementations of all config, fdcache,
- *   and actions functions so that the wrapper layer can be exercised in isolation.
- * - `chaos_test_reset_state()` (defined in the harness) must be called at the start
- *   of every test function to clear all ~100 global counters, captured arguments,
- *   and function-pointer table entries.
- * - `chaos_test_bind_real_functions()` wires the `g_chaos_io_real_*` table to the
- *   harness stubs so the full wrapper call path can be exercised without real syscalls.
- * - `chaos_test_bind_libc_functions_for_exit()` is called at the end of `main()`
- *   so the C runtime's shutdown IO (stdout/stderr flush, file descriptor close) goes
- *   through real libc functions rather than the stubs.
+ * Isolation:
+ * - The harness replaces the config, fd-cache and effect modules with recording stubs
+ *   (call counters, configurable results, captured arguments), so each test states which
+ *   rule matched and which effect fires and asserts exactly what the wrapper did, without
+ *   a rule file or a PRNG.
+ * - The real functions (`g_chaos_io_real_*`) point at stubs that record their arguments
+ *   and the TLS guard value seen during the call; the guard must be 1 there, proving the
+ *   wrapper cannot re-enter itself through the real function.
+ * - `dlsym`, `dlerror`, `abort`, `syscall` and the process_vm_readv seam are redefined;
+ *   `CHAOS_IO_SYSCALL` is defined here to the real system call so the unresolved-symbol
+ *   fallbacks act on real files.
+ * - Every test starts with `chaos_test_reset_state()`; `main()` rebinds the C library
+ *   before returning because the exit path writes and closes through these wrappers.
  *
- * Properties under test:
- * - `chaos_io_resolve_symbol()`: successful resolution wires the pointer; failure
- *   (NULL from dlsym) triggers `abort()`.
- * - `chaos_io_read_seed_material()`: full 8-byte read delivers the seed; short read
- *   and failed open both fall back to the PID-XOR seed.
- * - `chaos_io_call_real_open()` / `chaos_io_call_real_openat()`: guard held during
- *   call; mode forwarded when O_CREAT is set; guard restored to 0 after return.
- * - `chaos_io_copy_path()`, `chaos_io_join_paths()`, `chaos_io_resolve_at_path()`,
- *   `chaos_io_getcwd_path()`: NULL/zero/short-buffer inputs return 0; absolute paths
- *   pass through; relative paths are joined with the CWD or fdcache-resolved base.
- * - `chaos_io_match_fd_rule()`: gate on `config_prepare`; skip `/proc` paths; resolve
- *   via fdcache; call `config_match_loaded`; return rule on match.
- * - `chaos_io_init()`: all real-function-pointer globals wired; `config_init` called
- *   once; `fdcache_reset` called once; `process_seed` and `tls_prng_state` non-zero.
- * - `chaos_io_match_loaded_path_rule()` and `chaos_io_match_rename_rule()`: NULL
- *   guards; skip `/proc` paths; two-sided rename rule matching.
- * - `ftruncate` / `fallocate` wrappers: passthrough with guard; latency; errno injection.
- * - `unlinkat` wrapper: fdcache invalidated on success; no invalidation on failure;
- *   latency and errno effects.
- * - `renameat` wrapper: fdcache invalidated on success; rename-from and rename-to
- *   matching with latency and errno effects.
- * - `open` wrapper: guard bypass when `tls_guard == 1`; `/proc` bypass; latency;
- *   errno injection; O_CREAT mode forwarded; relative paths joined with CWD.
- * - `openat` wrapper: guard bypass; relative paths resolved via CWD or fdcache;
- *   non-FDCWD dirfd path; errno and mode forwarding; fdcache_resolve call count.
- * - `read` / `write` wrappers: passthrough with guard; corrupt, torn, latency, errno.
- * - `readv` / `writev` wrappers: passthrough with guard; corrupt, torn, latency, errno;
- *   zero-length iovec TORN fallback.
- * - Vectored helpers: `chaos_io_iovec_total_bytes()` overflow and NULL guards;
- *   `chaos_io_trim_iovecs()` clip and NULL guards;
- *   `chaos_io_build_torn_iovecs()` zero count and excess count guards;
- *   `chaos_io_corrupt_iovecs()` NULL/zero guards; single-segment PRNG routing.
- * - Linux `sendfile` / `copy_file_range` wrappers: guard bypass; torn, latency, errno.
- * - `preadv` / `pwritev` wrappers: passthrough; corrupt, torn, latency, errno; offset
- *   forwarded; zero-iovec TORN fallback.
- * - `close` wrapper: fdcache invalidated on success; no invalidation on failure; errno.
- * - `fsync` / `fdatasync` wrappers: passthrough; latency; errno.
- * - `pread` / `pwrite` wrappers: guard bypass; corrupt, torn, latency, errno; offset
- *   forwarded.
- * - Unresolved downstream symbols (a call during symbol resolution): the system-call
- *   wrappers make the system call themselves, the stdio ones fail with ENOSYS.
- *
- * What is NOT tested here:
- * - Concurrent access to the TLS guard from multiple threads.
- * - Real OS-level partial read/write or EINTR retry semantics.
- * - Config hot-reload under genuine filesystem mtime changes.
- * - LD_PRELOAD interposition via the dynamic linker (covered by integration tests).
+ * Not covered here: dynamic-linker interposition of the built .so (runtime suites), real
+ * partial transfers and EINTR from the kernel, and reload on real rule-file changes
+ * (test_config_parse.c).
  */
 
 #include <stdarg.h>
@@ -77,8 +33,8 @@
 #include <unistd.h>
 
 /**
- * @brief The real system call, for the fallbacks a wrapper makes while its symbol
- *        is unresolved; the harness turns the wrappers' own `syscall` into a stub.
+ * @brief The real syscall(2), for the fallbacks a wrapper takes while its symbol is
+ *        unresolved; the harness redefines the wrappers' own `syscall` as a stub.
  */
 static long chaos_test_raw_syscall(long number, ...)
 {
@@ -104,24 +60,12 @@ static long chaos_test_raw_syscall(long number, ...)
 #include <sys/resource.h>
 
 /**
- * @brief Invariant: `chaos_io_resolve_symbol()` wires a pointer and `chaos_io_read_seed_material()`
- *   returns the seeded value or a PID-based fallback.
+ * @brief Symbol resolution and seed material.
  *
- * Triggering conditions:
- * - `chaos_io_resolve_symbol(&resolved_read, "read")` with a functioning dlsym stub.
- * - `chaos_io_resolve_symbol()` with `g_dlsym_fail_symbol = "read"` and `g_abort_expected = 1`.
- * - `chaos_io_read_seed_material()` with successful open+full read (`g_sys_read_result ==
- * sizeof(uint64_t)`).
- * - `chaos_io_read_seed_material()` with a short read (`g_sys_read_result == 1`).
- * - `chaos_io_read_seed_material()` with a failed open (`g_sys_open_result == -1`).
- *
- * Expected observable behaviour:
- * - Successful resolve: `resolved_read == chaos_test_real_read_impl`.
- * - Failed resolve: `longjmp` transfers out of `setjmp` block; `g_abort_called == 1`.
- * - Full seed read: `chaos_io_read_seed_material() == 0x0123456789abcdef`; syscall
- *   counts each equal 1; `g_chaos_io_tls_guard == 0` after return.
- * - Short read: returns `0x6a09e667f3bcc909 XOR getpid()`; close syscall still issued.
- * - Failed open: returns `0x6a09e667f3bcc909 XOR getpid()`; no read or close syscall.
+ * @details A resolved symbol is stored; a symbol dlsym cannot find aborts (the library
+ * could not even pass calls through), caught here with setjmp. The seed is 8 bytes from
+ * /dev/urandom read with raw system calls under the guard; a short read or a failed open
+ * falls back to 0x6a09e667f3bcc909 ^ pid, and an opened descriptor is always closed.
  */
 static void test_resolve_symbol_and_seed_material(void)
 {
@@ -161,31 +105,13 @@ static void test_resolve_symbol_and_seed_material(void)
 }
 
 /**
- * @brief Invariant: `chaos_io_call_real_open()`, `chaos_io_call_real_openat()`, and path-resolution
- *   helpers operate correctly; `chaos_io_match_fd_rule()` gates on config and fdcache state.
+ * @brief Real-open helpers, path helpers, and fd rule matching.
  *
- * Triggering conditions:
- * - `chaos_io_call_real_open()` with and without O_CREAT to verify mode forwarding and guard state.
- * - `chaos_io_call_real_openat()` with AT_FDCWD and a concrete dirfd, with and without O_CREAT.
- * - `chaos_io_copy_path()`, `chaos_io_join_paths()`, `chaos_io_getcwd_path()`,
- *   `chaos_io_resolve_at_path()` with NULL, zero-length, buffer-too-short, and valid inputs.
- * - `chaos_io_match_fd_rule()` with `config_prepare == 0`; with `fdcache_resolve == 0`;
- *   with `config_match_loaded == 0`; and with a successful match.
- *
- * Expected observable behaviour:
- * - `call_real_open`: `g_real_open_guard == 1` during the call; `g_chaos_io_tls_guard == 0`
- *   after return; mode captured only when O_CREAT is set.
- * - `call_real_openat`: `g_real_openat_guard == 1`; dirfd forwarded; mode captured for O_CREAT.
- * - `copy_path(NULL, ...)`, `copy_path(..., 0, ...)`, `copy_path(..., NULL)` → 0.
- * - `copy_path(..., 4, "/tmp/path")` → 0 (buffer too short including NUL).
- * - `resolve_at_path(AT_FDCWD, "/tmp/absolute.bin", ...)` → 1, path unchanged.
- * - `join_paths(NULL, ...)`, `join_paths(..., "", ...)`, `join_paths(..., ..., "")` → 0.
- * - `join_paths(..., 4, "/tmp", "child.bin")` → 0 (combined path too long).
- * - `resolve_at_path(AT_FDCWD, "relative.bin", ...)` joins with `getcwd()` result.
- * - `match_fd_rule` with `config_prepare == 0` → 0 immediately.
- * - `match_fd_rule` with `fdcache_resolve == 0` → 0 (no path to match against).
- * - `match_fd_rule` with `config_match_loaded == 0` → 0.
- * - `match_fd_rule` with all stubs succeeding → 1; captured operation and path correct.
+ * @details The real open/openat run under the guard and receive a mode only with
+ * O_CREAT. copy/join/getcwd/resolve_at reject NULL, zero sizes and results that do not
+ * fit, rather than truncating; a relative path joins the cwd, or the fd-cache path of the
+ * dirfd. chaos_io_match_fd_rule() needs a loaded rule set (prepare), a resolvable fd
+ * (fd 0-2 never are) and a matching rule, in that order.
  */
 static void test_call_real_open_and_match_fd_rule(void)
 {
@@ -244,7 +170,7 @@ static void test_call_real_open_and_match_fd_rule(void)
     assert(chaos_io_resolve_at_path(AT_FDCWD, NULL, path, sizeof(path)) == 0);
     assert(chaos_io_resolve_at_path(AT_FDCWD, "relative.bin", NULL, sizeof(path)) == 0);
     assert(chaos_io_resolve_at_path(AT_FDCWD, "relative.bin", path, 0U) == 0);
-    /* A result that does not fit the buffer: absolute, and joined to the cwd. */
+    /* A result that does not fit is rejected, never truncated: absolute and cwd-joined. */
     assert(chaos_io_resolve_at_path(AT_FDCWD, "/tmp/absolute.bin", path, 4U) == 0);
     assert(chaos_io_resolve_at_path(AT_FDCWD, "relative.bin", path, 4U) == 0);
     g_fdcache_resolve_result = 1;
@@ -279,19 +205,9 @@ static void test_call_real_open_and_match_fd_rule(void)
 }
 
 /**
- * @brief Invariant: `chaos_io_init()` wires all real-function-pointer globals, seeds the PRNG,
- *   and calls both `config_init` and `fdcache_reset` exactly once.
- *
- * Triggering condition: `chaos_io_init()` called after `chaos_test_reset_state()` with
- *   `g_sys_open_result = 5` and `g_sys_read_result = sizeof(uint64_t)` to deliver a
- *   deterministic seed (`0xfeedbeef12345678`).
- *
- * Expected observable behaviour:
- * - Every `g_chaos_io_real_*` pointer is set to the corresponding stub (16 portable + 3 Linux).
- * - `g_chaos_io_process_seed == 0xfeedbeef12345678`.
- * - `g_chaos_io_tls_prng_state != 0` (derived from the process seed).
- * - `g_config_init_calls == 1`.
- * - `g_fdcache_reset_calls == 1`.
+ * @brief The constructor resolves every real function, seeds the process and this
+ *        thread's PRNG from the seed material, initialises the config once, loads the
+ *        rule file once (so a bad file is reported at start-up) and resets the fd cache.
  */
 static void test_init_runtime(void)
 {
@@ -334,40 +250,15 @@ static void test_init_runtime(void)
 }
 
 /**
- * @brief Invariant: filesystem-lifecycle wrappers (`ftruncate`, `fallocate`, `unlinkat`,
- *   `renameat`) apply effects correctly and manage the fdcache.
+ * @brief Path rule helpers and the ftruncate, fallocate, unlinkat and renameat wrappers.
  *
- * Triggering conditions:
- * - `chaos_io_match_loaded_path_rule()` and `chaos_io_match_rename_rule()` with NULL,
- *   `/proc` paths, and full-success scenarios.
- * - `ftruncate(fd, length)` in passthrough mode, with LATENCY, and with ERRNO.
- * - `fallocate(fd, mode, offset, length)` (Linux-only) in passthrough, LATENCY, ERRNO modes.
- * - `unlinkat(AT_FDCWD, path, 0)` in passthrough, failed-syscall (no cache invalidation),
- *   LATENCY (with invalidation), and ERRNO (no real call, no invalidation) modes.
- * - `renameat(olddirfd, oldpath, newdirfd, newpath)` analogously.
- *
- * Expected observable behaviour:
- * - `match_loaded_path_rule(op, NULL, rule)` → 0 (no config call).
- * - `match_loaded_path_rule(op, "/proc/self/maps", rule)` → 0 (proc bypass).
- * - Successful path rule match: `g_last_match_loaded_operation` and path captured.
- * - `match_rename_rule(AT_FDCWD, from, AT_FDCWD, to, NULL)` → 0 (NULL rule out pointer).
- * - `match_rename_rule` with both paths NULL → 0.
- * - `match_rename_rule` with `config_prepare == 0` → 0; `g_config_prepare_calls == 1`.
- * - Two-sided rename match tries RENAME_FROM first, then RENAME_TO.
- * - `ftruncate` passthrough: guard == 1; fd and length forwarded; no latency or errno.
- * - `ftruncate` LATENCY: `g_latency_calls == 1`; real call still made.
- * - `ftruncate` ERRNO: `g_rule_apply_errno_result` causes return -1; `g_real_ftruncate_calls == 0`.
- * - `fallocate` passthrough: guard == 1; mode, offset, length forwarded.
- * - `fallocate` LATENCY: `g_latency_calls == 1`.
- * - `fallocate` ERRNO (ENOSPC): return -1; `g_real_fallocate_calls == 0`.
- * - `unlinkat` success: `g_fdcache_reset_calls == 1` (cache cleared after unlink).
- * - `unlinkat` failure: `g_fdcache_reset_calls == 0` (no cache clear on error).
- * - `unlinkat` LATENCY: latency applied; fdcache cleared after real call.
- * - `unlinkat` ERRNO: real call skipped; fdcache not cleared.
- * - `renameat` success: fdcache cleared.
- * - `renameat` failure: fdcache not cleared.
- * - `renameat` LATENCY (RENAME_TO rule): latency applied; fdcache cleared.
- * - `renameat` ERRNO (RENAME_FROM rule): real call skipped; fdcache not cleared.
+ * @details Path matching skips NULL, /proc and every library's control files
+ * (`/tmp/.chaos-<lib>.*`) before any rule lookup. A rename matches rename_from on the
+ * source and rename_to on the destination (an excluded side is skipped). Each wrapper
+ * passes through under the guard, delays and then calls the real function under LATENCY,
+ * and fails with the rule's errno without the real call under ERRNO. A successful
+ * unlinkat or renameat resets the whole fd cache (a namespace change can make any cached
+ * path stale); a failed or faulted one does not.
  */
 static void test_fsops_helpers_and_wrappers(void)
 {
@@ -377,7 +268,7 @@ static void test_fsops_helpers_and_wrappers(void)
     assert(chaos_io_match_loaded_path_rule(CHAOS_IO_OP_UNLINK, NULL, &rule) == 0);
     assert(chaos_io_match_loaded_path_rule(CHAOS_IO_OP_UNLINK, "/tmp/unlink.bin", NULL) == 0);
     assert(chaos_io_match_loaded_path_rule(CHAOS_IO_OP_UNLINK, "/proc/self/maps", &rule) == 0);
-    /* Every library's control files, not only io's own rule file. */
+    /* Every library's control files are excluded, not only io's own rule file. */
     assert(chaos_io_match_loaded_path_rule(CHAOS_IO_OP_UNLINK, "/tmp/.chaos-io.conf", &rule) == 0);
     assert(chaos_io_match_loaded_path_rule(CHAOS_IO_OP_OPEN, "/tmp/.chaos-net.conf", &rule) == 0);
     assert(
@@ -608,29 +499,14 @@ static void test_fsops_helpers_and_wrappers(void)
 }
 
 /**
- * @brief Invariant: the `open` wrapper bypasses chaos for re-entrant and `/proc` calls,
- *   and applies latency, errno, or passthrough for ordinary paths.
+ * @brief open(): guard and /proc bypass, LATENCY, ERRNO, mode forwarding, relative and
+ *        unnormalised paths.
  *
- * Triggering conditions:
- * - `open("/tmp/direct.bin", O_RDONLY)` with `g_chaos_io_tls_guard = 1` set externally
- *   (simulating a re-entrant call from within the interception layer).
- * - `open("/proc/self/maps", O_RDONLY)` (proc filesystem bypass).
- * - `open("/tmp/latency.bin", O_RDONLY)` with LATENCY rule and `config_match_path == 1`.
- * - `open("/tmp/fail.bin", O_RDONLY)` with ERRNO/EIO and `rule_apply_errno_result == 1`.
- * - `open("/tmp/create.bin", O_CREAT | O_WRONLY, 0600)` to verify mode forwarding.
- * - `open("relative-open.bin", O_RDONLY)` with LATENCY rule to verify CWD join and
- *   fdcache store path.
- *
- * Expected observable behaviour:
- * - Guard bypass: `g_config_match_path_calls == 0`; `g_fdcache_store_calls == 0`; real
- *   open called with no chaos applied.
- * - Proc bypass: same as guard bypass (no match attempt, no fdcache store).
- * - LATENCY: `g_latency_calls == 1`; the descriptor's entry is dropped and resolved
- *   anew from the kernel (`/proc/self/fd`), not stored under the caller's string.
- * - ERRNO: returns -1, errno == EIO; `g_real_open_calls == 0`; `g_fdcache_store_calls == 0`.
- * - O_CREAT: `g_real_open_has_mode == 1`; `g_real_open_mode == 0600`.
- * - Relative path: matched path equals `CWD + "/relative-open.bin"`.
- * - `.`, `..` and `//` in an absolute path are normalised before matching.
+ * @details Under the guard or for /proc no rule is looked up and nothing is cached.
+ * LATENCY delays then opens; the new descriptor's cache entry is invalidated and resolved
+ * from the kernel, never stored under the caller's string (which may differ from the
+ * kernel's name). ERRNO fails without opening. A relative path is matched joined to the
+ * cwd; `.`, `..` and `//` are normalised before matching.
  */
 static void test_open_wrapper(void)
 {
@@ -661,8 +537,8 @@ static void test_open_wrapper(void)
     assert(open("/tmp/latency.bin", O_RDONLY) == 15);
     assert(g_config_match_path_calls == 1);
     assert(g_latency_calls == 1);
-    /* The new descriptor is cached under the kernel's name for it, never under a
-     * stale entry of an earlier descriptor with that number. */
+    /* The new descriptor is cached under the kernel's name for it, never under a stale
+     * entry of an earlier descriptor with that number. */
     assert(g_fdcache_store_calls == 0);
     assert(g_fdcache_invalidate_calls == 1 && g_last_invalidate_fd == 15);
     assert(g_fdcache_resolve_calls == 1);
@@ -697,7 +573,7 @@ static void test_open_wrapper(void)
     );
     assert(strcmp(g_last_match_path, expected_path) == 0);
 
-    /* Matched as the kernel resolves it: `.`, `..` and repeated slashes. */
+    /* Matched as the kernel resolves it: `.`, `..` and repeated slashes removed. */
     chaos_test_reset_state();
     chaos_test_bind_real_functions();
     g_real_open_return = 18;
@@ -708,9 +584,9 @@ static void test_open_wrapper(void)
 }
 
 /**
- * @brief Invariant: paths are normalised lexically: one slash between components,
- *   no `.`, `..` taking the component before it (not above the root), no trailing
- *   slash; relative paths are left alone.
+ * @brief Lexical normalisation: one slash between components, no `.`, `..` removes the
+ *        preceding component and stops at the root, no trailing slash; names that merely
+ *        start with dots are kept, relative paths are left alone, NULL is ignored.
  */
 static void test_normalize_path(void)
 {
@@ -744,27 +620,12 @@ static void test_normalize_path(void)
 }
 
 /**
- * @brief Invariant: the `openat` wrapper resolves paths via CWD, fdcache, and dirfd correctly,
- *   and applies effects or bypasses re-entrant calls.
+ * @brief openat(): guard bypass, path resolution through the cwd or the dirfd's cached
+ *        path, ERRNO, and mode forwarding.
  *
- * Triggering conditions:
- * - `openat(7, "direct.bin", O_RDONLY)` with `g_chaos_io_tls_guard = 1` (re-entrant bypass).
- * - `openat(AT_FDCWD, "relative-openat.bin", O_RDONLY)` with LATENCY and no fdcache match
- *   (path joined with CWD).
- * - `openat(21, "child.bin", O_RDONLY)` with a fdcache hit for dirfd 21 (base "/tmp/openat-base").
- * - `openat(22, "child.bin", O_RDONLY)` with fdcache hit and ERRNO/EIO injection.
- * - `openat(23, "child.bin", O_CREAT | O_WRONLY, 0640)` (mode forwarding; no match because no
- *   path probe with `g_config_match_path_result == 0`).
- *
- * Expected observable behaviour:
- * - Guard bypass: `g_config_match_path_calls == 0`; `g_fdcache_store_calls == 0`.
- * - CWD resolve + LATENCY: matched and stored path equals `CWD + "/relative-openat.bin"`;
- *   `g_latency_calls == 1`.
- * - Fdcache dirfd resolve + LATENCY: matched and stored path == `/tmp/openat-base/child.bin`;
- *   `g_real_openat_dirfd == 21`; real path arg == `"child.bin"`.
- * - ERRNO: returns -1, errno == EIO; `g_real_openat_calls == 0`.
- * - O_CREAT: `g_real_openat_has_mode == 1`; mode == 0640; `g_fdcache_resolve_calls == 2`
- *   (dirfd path probe + store-time path construction attempt).
+ * @details The real call always receives the caller's dirfd and relative path; only the
+ * matched string is resolved. When the dirfd cannot be resolved no rule is looked up,
+ * yet the new descriptor is still refreshed from the kernel (2 resolutions, no store).
  */
 static void test_openat_wrapper(void)
 {
@@ -831,30 +692,9 @@ static void test_openat_wrapper(void)
 }
 
 /**
- * @brief Invariant: the `read` and `write` wrappers apply corrupt, torn, latency, and errno
- *   effects, and call through to the real function in passthrough mode.
- *
- * Triggering conditions:
- * - `read(5, buffer, 8)` in passthrough mode (no config match).
- * - `read(9, buffer, 8)` with CORRUPT effect and `rule_should_trigger == 1`.
- * - `read(9, buffer, 8)` with LATENCY effect.
- * - `read(9, buffer, 8)` with ERRNO/ENOSPC and `rule_apply_errno_result == 1`.
- * - `write(7, data, 6)` in passthrough mode.
- * - `write(9, data, 6)` with TORN effect: `g_torn_count_result == 2`.
- * - `write(9, data, 3)` with LATENCY effect.
- * - `write(9, data, 3)` with ERRNO/EROFS.
- *
- * Expected observable behaviour:
- * - Passthrough read: `g_real_read_calls == 1`; `g_real_read_guard == 1`; buffer filled
- *   from `g_real_read_fill`.
- * - CORRUPT read: `g_corrupt_calls == 1`; `g_last_corrupt_size == 4`.
- * - LATENCY read: `g_latency_calls == 1`; real read still made.
- * - ERRNO read: returns -1, errno == ENOSPC; `g_real_read_calls == 0`.
- * - Passthrough write: `g_real_write_calls == 1`; `g_real_write_guard == 1`.
- * - TORN write: returns `g_torn_count_result (2)`; `g_last_torn_requested == 6`;
- *   `g_real_write_count == 2`.
- * - LATENCY write: `g_latency_calls == 1`; real write still made.
- * - ERRNO write: returns -1, errno == EROFS; real write not made.
+ * @brief read() and write(): passthrough under the guard, CORRUPT on the bytes actually
+ *        read, TORN writing only the torn count, LATENCY then the real call, ERRNO
+ *        without the real call.
  */
 static void test_read_and_write_wrappers(void)
 {
@@ -954,27 +794,12 @@ static void test_read_and_write_wrappers(void)
 }
 
 /**
- * @brief Invariant: iovec helper functions enforce bounds, detect overflow, and route
- *   corruption to the correct iov segment.
+ * @brief iovec helpers.
  *
- * Triggering conditions:
- * - `chaos_io_iovec_total_bytes()` with NULL iov, NULL total, zero count, and SSIZE_MAX overflow.
- * - `chaos_io_iovec_total_bytes()` with two valid segments totalling 5 bytes.
- * - `chaos_io_trim_iovecs()` with NULL, zero count, zero limit, and valid 3-byte clip.
- * - `chaos_io_build_torn_iovecs()` with zero torn count, zero-length iovecs, count >= total,
- *   and a valid 3-byte result clipping a 5-byte total.
- * - `chaos_io_corrupt_iovecs()` with NULL, zero count, zero size, and various PRNG seeds
- *   to confirm single-segment routing when total == 2 and index picks odd.
- *
- * Expected observable behaviour:
- * - `iovec_total_bytes`: any NULL or zero-count input → 0; SSIZE_MAX + 1 → 0 (overflow); 2+3 → 5.
- * - `trim_iovecs`: any NULL input → 0; limit=3 clips first segment to 2, second to 1.
- * - `build_torn_iovecs`: torn count == 0 → 0; iov total == 0 → 0; torn >= total → 0; valid → 1.
- * - `corrupt_iovecs`: NULL iov, zero count, or zero size → no corrupt call.
- * - `corrupt_iovecs` with two 4-byte segments and size=3: exactly one call;
- * `last_corrupt_sample_size == 3`.
- * - `corrupt_iovecs` with two 1-byte segments and an odd PRNG draw: routes to second segment
- *   with `last_corrupt_sample_size == 1`.
+ * @details total_bytes rejects NULL, a zero count and totals above SSIZE_MAX; trim clips
+ * a vector to a byte budget; build_torn rejects a torn count of 0 or >= the total and an
+ * empty vector; corrupt_iovecs ignores NULL/zero input and routes the flip to the segment
+ * that holds the chosen byte (a seed drawing an odd index lands in the second segment).
  */
 static void test_vectored_helpers(void)
 {
@@ -1041,7 +866,8 @@ static void test_vectored_helpers(void)
     assert(g_corrupt_sample_calls == 1);
     assert(g_last_corrupt_sample_size == 3U);
 
-    /* Find a seed that makes the PRNG draw an odd value for the two-segment routing test. */
+    /* Search for a seed whose first draw is odd, so the flip lands in the second of two
+     * 1-byte segments; the bound of 256 seeds keeps the search finite. */
     chaos_test_reset_state();
     source[0].iov_len = 1U;
     source[1].iov_len = 1U;
@@ -1062,33 +888,10 @@ static void test_vectored_helpers(void)
 }
 
 /**
- * @brief Invariant: `readv` and `writev` wrappers apply corrupt, torn, latency, and errno
- *   effects, and pass through with guard state and iov layout captured.
- *
- * Triggering conditions:
- * - `readv(5, read_iov, 2)` in passthrough mode.
- * - `readv(9, read_iov, 2)` with CORRUPT effect.
- * - `readv(9, read_iov, 2)` with LATENCY effect.
- * - `readv(9, read_iov, 2)` with ERRNO/EIO.
- * - `writev(7, write_iov, 2)` in passthrough mode.
- * - `writev(9, write_iov, 2)` with LATENCY effect.
- * - `writev(9, write_iov, 2)` with TORN effect and `g_torn_count_result == 3`.
- * - `writev(9, empty_iov, 0)` with TORN effect and zero-count iov (fallback to real call).
- * - `writev(9, write_iov, 2)` with ERRNO/EROFS.
- *
- * Expected observable behaviour:
- * - Passthrough readv: `g_real_readv_calls == 1`; `g_real_readv_guard == 1`; iov buffers filled
- *   from `g_real_read_fill` in segment order.
- * - CORRUPT readv: `g_corrupt_sample_calls == 1`; at least one byte in first or second buffer
- *   differs from the fill pattern (one bit flip by the harness corrupt stub).
- * - LATENCY readv: `g_latency_calls == 1`.
- * - ERRNO readv: returns -1, errno == EIO; `g_real_readv_calls == 0`.
- * - Passthrough writev: `g_real_writev_calls == 1`; iov count and lengths captured correctly.
- * - LATENCY writev: `g_latency_calls == 1`.
- * - TORN writev: `g_last_torn_requested == 6`; trimmed iov passed to real call
- *   (`lengths[0] == 2`, `lengths[1] == 1`); operation recorded as OP_WRITE.
- * - Zero-iov TORN fallback: real writev called without torn trimming.
- * - ERRNO writev: returns -1, errno == EROFS; `g_real_writev_calls == 0`.
+ * @brief readv() and writev(): passthrough with the iovec layout intact, CORRUPT on the
+ *        read data, TORN as a trimmed copy of the vector (6 bytes torn to 3 gives lengths
+ *        2 and 1), a zero-count vector written unchanged, LATENCY, and ERRNO without the
+ *        real call.
  */
 static void test_readv_and_writev_wrappers(void)
 {
@@ -1223,7 +1026,7 @@ static void test_readv_and_writev_wrappers(void)
     assert(g_real_writev_calls == 0);
 }
 
-/** @brief Arms a matching rule with @p effect for the vectored-input tests. */
+/** @brief Arms a matching rule with @p effect on fd 9 (path /tmp/vector.bin). */
 static void chaos_test_arm_vector_rule(chaos_io_effect_t effect)
 {
     chaos_test_reset_state();
@@ -1237,19 +1040,16 @@ static void chaos_test_arm_vector_rule(chaos_io_effect_t effect)
 }
 
 /**
- * @brief Invariant: the vectored wrappers read the caller's iovec array only once a
- *   rule matched, never past IOV_MAX entries, and only through the checked copy; an
- *   array they cannot read reaches the kernel unchanged instead of crashing them.
+ * @brief The caller's iovec array is read only after a rule matched, never past IOV_MAX
+ *        entries, and only through a checked copy; an unreadable array reaches the kernel
+ *        unchanged instead of faulting the wrapper.
  *
- * Expected observable behaviour:
- * - No rule: the array is not read at all.
- * - LATENCY: `call_size` is the vector's byte total, also across copy chunks of 64.
- * - Unreadable array (EFAULT), negative or over-IOV_MAX counts, a total past
- *   SSIZE_MAX: `call_size` is unknown and the call is passed through with the
- *   caller's own arguments and errno.
- * - Copy unavailable (ENOSYS, EPERM): the array is copied directly.
- * - TORN: an unreadable array, or one longer than 64 entries, is written whole and
- *   the rule is not counted.
+ * @details No match: no copy at all. LATENCY: `call_size` is the byte total, also across
+ * copy chunks of 64 entries. An unreadable array (EFAULT), a negative or > IOV_MAX count,
+ * or a total past SSIZE_MAX gives an unknown size and passes the caller's own arguments
+ * and errno through. If the checked copy is unavailable (ENOSYS, EPERM) the array is
+ * copied directly. TORN on an unreadable array or one longer than 64 entries writes the
+ * vector whole and does not count a hit; exactly 64 entries are torn.
  */
 static void test_vectored_input_checks(void)
 {
@@ -1257,7 +1057,8 @@ static void test_vectored_input_checks(void)
     static char bytes[CHAOS_IO_TORN_MAX_IOV + 36];
     struct iovec pair[CHAOS_TEST_IOV_SNAPSHOT_COUNT]; /* the stubs snapshot this many */
     int index;
-    /* Called through a pointer: libc's attributes would reject the invalid arguments. */
+    /* Called through a pointer: libc's fortify attributes would reject the invalid
+     * arguments at compile time. */
     ssize_t (*volatile writev_unchecked)(int, const struct iovec *, int) = writev;
 
     (void)memset(pair, 0, sizeof(pair));
@@ -1321,7 +1122,7 @@ static void test_vectored_input_checks(void)
     assert(g_real_writev_calls == 3);
     assert(g_real_writev_iovcnt == 2);
 
-    /* The first chunk of 64 sums to exactly SSIZE_MAX; the second overflows it. */
+    /* The first chunk of 64 sums to exactly SSIZE_MAX; the second chunk overflows it. */
     many[0].iov_len = (size_t)SSIZE_MAX - (size_t)(CHAOS_IO_TORN_MAX_IOV - 1);
     chaos_test_arm_vector_rule(CHAOS_IO_EFFECT_LATENCY);
     g_real_writev_return = -1;
@@ -1356,21 +1157,8 @@ static void test_vectored_input_checks(void)
 
 #ifdef __linux__
 /**
- * @brief Invariant: the `sendfile` wrapper bypasses chaos for re-entrant calls and
- *   applies torn, latency, and errno effects.
- *
- * Triggering conditions:
- * - `sendfile(8, 4, &offset, 5)` with `g_chaos_io_tls_guard = 1` (re-entrant bypass).
- * - `sendfile(9, 4, NULL, 6)` with TORN effect and `g_torn_count_result == 3`.
- * - `sendfile(9, 4, NULL, 2)` with LATENCY effect.
- * - `sendfile(9, 4, NULL, 2)` with ERRNO/EIO.
- *
- * Expected observable behaviour:
- * - Guard bypass: real sendfile called immediately; guard captured as 1; `g_real_sendfile_out_fd ==
- * 8`; `g_real_sendfile_in_fd == 4`; offset pointer forwarded.
- * - TORN: `g_last_torn_requested == 6`; `g_real_sendfile_count == 3`; operation == OP_WRITE.
- * - LATENCY: `g_latency_calls == 1`.
- * - ERRNO: returns -1, errno == EIO; `g_real_sendfile_calls == 0`.
+ * @brief sendfile(): guard bypass with all arguments forwarded; matched as a write to the
+ *        output fd; TORN sends the torn count, LATENCY then the real call, ERRNO without it.
  */
 static void test_sendfile_wrapper(void)
 {
@@ -1429,22 +1217,8 @@ static void test_sendfile_wrapper(void)
 }
 
 /**
- * @brief Invariant: the `copy_file_range` wrapper bypasses chaos for re-entrant calls and
- *   applies torn, latency, and errno effects; flags are forwarded to the real function.
- *
- * Triggering conditions:
- * - `copy_file_range(4, &in_offset, 8, &out_offset, 5, 0)` with `g_chaos_io_tls_guard = 1`.
- * - `copy_file_range(4, NULL, 9, NULL, 6, 0)` with TORN effect and `g_torn_count_result == 3`.
- * - `copy_file_range(4, NULL, 9, NULL, 2, 7)` with LATENCY effect (non-zero flags).
- * - `copy_file_range(4, NULL, 9, NULL, 2, 0)` with ERRNO/EIO.
- *
- * Expected observable behaviour:
- * - Guard bypass: real copy_file_range called; both fd and offset pointers forwarded;
- *   `g_real_copy_file_range_flags == 0`.
- * - TORN: `g_last_torn_requested == 6`; `g_real_copy_file_range_count == 3`; operation == OP_WRITE.
- * - LATENCY: `g_latency_calls == 1`; `g_real_copy_file_range_flags == 7` (non-zero flags
- * preserved).
- * - ERRNO: returns -1, errno == EIO; `g_real_copy_file_range_calls == 0`.
+ * @brief copy_file_range(): guard bypass with fds, offset pointers and flags forwarded;
+ *        matched as a write to the output fd; TORN, LATENCY (non-zero flags kept), ERRNO.
  */
 static void test_copy_file_range_wrapper(void)
 {
@@ -1508,32 +1282,9 @@ static void test_copy_file_range_wrapper(void)
 #endif
 
 /**
- * @brief Invariant: `preadv` and `pwritev` wrappers apply corrupt, torn, latency, and errno
- *   effects; the file offset is forwarded to the real function; and zero-iovec TORN falls back.
- *
- * Triggering conditions:
- * - `preadv(5, read_iov, 2, 11)` in passthrough mode.
- * - `preadv(9, read_iov, 2, 13)` with CORRUPT effect.
- * - `preadv(9, read_iov, 2, 13)` with LATENCY effect.
- * - `preadv(9, read_iov, 2, 13)` with ERRNO/ENOSPC.
- * - `pwritev(7, write_iov, 2, 17)` in passthrough mode.
- * - `pwritev(9, write_iov, 2, 19)` with LATENCY effect.
- * - `pwritev(9, write_iov, 2, 19)` with TORN effect.
- * - `pwritev(9, empty_iov, 0, 19)` with TORN effect and zero-count iov.
- * - `pwritev(9, write_iov, 2, 19)` with ERRNO/EACCES.
- *
- * Expected observable behaviour:
- * - Passthrough preadv: `g_real_preadv_calls == 1`; guard == 1; offset == 11; buffers filled.
- * - CORRUPT preadv: `g_corrupt_sample_calls == 1`; at least one buffer byte changed.
- * - LATENCY preadv: `g_latency_calls == 1`.
- * - ERRNO preadv: returns -1, errno == ENOSPC; `g_real_preadv_calls == 0`.
- * - Passthrough pwritev: `g_real_pwritev_calls == 1`; guard == 1; offset == 17; iov lengths
- * captured.
- * - LATENCY pwritev: `g_latency_calls == 1`.
- * - TORN pwritev: `g_last_torn_requested == 6`; trimmed iov (`lengths[0]==2`, `lengths[1]==1`);
- *   operation == OP_PWRITE; offset == 19.
- * - Zero-iov TORN fallback: real pwritev called once without torn trimming.
- * - ERRNO pwritev: returns -1, errno == EACCES; `g_real_pwritev_calls == 0`.
+ * @brief preadv() and pwritev(): the offset reaches the real call in every mode; CORRUPT
+ *        on read data, TORN as a trimmed vector matched as pwrite, a zero-count vector
+ *        written unchanged, LATENCY, and ERRNO without the real call.
  */
 static void test_preadv_and_pwritev_wrappers(void)
 {
@@ -1671,40 +1422,13 @@ static void test_preadv_and_pwritev_wrappers(void)
 }
 
 /**
- * @brief Invariant: `close`, `fsync`, `fdatasync`, `pread`, and `pwrite` wrappers apply effects
- *   correctly and manage the fdcache or bypass for re-entrant calls.
+ * @brief close(), fsync(), fdatasync(), pread() and pwrite().
  *
- * Triggering conditions:
- * - `close(11)` in passthrough mode (success and failure paths).
- * - `close(11)` with ERRNO/EACCES; `close(11)` with LATENCY effect.
- * - `fsync(12)` in passthrough, LATENCY, and ERRNO/ENOSPC modes.
- * - `fdatasync(13)` in passthrough, LATENCY, and ERRNO/EIO modes.
- * - `pread(13, buffer, 8, 2)` with `g_chaos_io_tls_guard = 1` (guard bypass).
- * - `pread(13, buffer, 8, 5)` with CORRUPT effect.
- * - `pread(13, buffer, 8, 1)` with LATENCY and ERRNO/EIO modes.
- * - `pwrite(13, "xyz", 3, 9)` with `g_chaos_io_tls_guard = 1` (guard bypass).
- * - `pwrite(13, "xyz", 3, 9)` with TORN effect (`g_torn_count_result == 1`).
- * - `pwrite(13, "xyz", 3, 9)` with LATENCY and ERRNO/ENOSPC modes.
- *
- * Expected observable behaviour:
- * - `close` success passthrough: `g_fdcache_invalidate_calls == 1`; `g_last_invalidate_fd == 11`.
- * - `close` failure passthrough: `g_fdcache_invalidate_calls == 0`.
- * - `close` ERRNO: returns -1, errno == EACCES; real close not called.
- * - `close` LATENCY: `g_latency_calls == 1`; fdcache invalidated.
- * - `fsync` passthrough: `g_real_fsync_calls == 1`.
- * - `fsync` LATENCY: `g_latency_calls == 1`.
- * - `fsync` ERRNO: returns -1, errno == ENOSPC.
- * - `fdatasync` passthrough: `g_real_fdatasync_calls == 1`.
- * - `fdatasync` LATENCY: `g_latency_calls == 1`.
- * - `fdatasync` ERRNO: returns -1, errno == EIO.
- * - `pread` guard bypass: real pread called; no config lookup.
- * - `pread` CORRUPT: `g_corrupt_calls == 1`; offset forwarded to real call.
- * - `pread` LATENCY: `g_latency_calls == 1`.
- * - `pread` ERRNO: returns -1, errno == EIO.
- * - `pwrite` guard bypass: real pwrite called immediately.
- * - `pwrite` TORN: real write count == `g_torn_count_result (1)`; offset forwarded.
- * - `pwrite` LATENCY: `g_latency_calls == 1`.
- * - `pwrite` ERRNO: returns -1, errno == ENOSPC.
+ * @details close() always invalidates the fd's cache entry once the real close ran, also
+ * when it failed (Linux releases the descriptor even then). An ERRNO rule on close runs
+ * the real close first and then reports the injected error, as Linux reports a deferred
+ * EIO. fsync/fdatasync honour LATENCY and ERRNO. pread/pwrite bypass under the guard and
+ * forward the offset under CORRUPT and TORN.
  */
 static void test_close_sync_and_positioned_wrappers(void)
 {
@@ -1721,7 +1445,7 @@ static void test_close_sync_and_positioned_wrappers(void)
     chaos_test_bind_real_functions();
     g_real_close_return = -1;
     assert(close(11) == -1);
-    /* Linux releases the descriptor even when close reports an error. */
+    /* Linux releases the descriptor even when close reports an error: invalidate anyway. */
     assert(g_fdcache_invalidate_calls == 1);
 
     chaos_test_reset_state();
@@ -1735,7 +1459,8 @@ static void test_close_sync_and_positioned_wrappers(void)
     g_rule_apply_errno_result = 1;
     assert(close(11) == -1);
     assert(errno == EACCES);
-    /* The injected error is reported after a real close, as Linux reports EIO. */
+    /* The injected error is reported after a real close, as Linux reports a deferred EIO;
+     * failing without closing would leak the descriptor. */
     assert(g_real_close_calls == 1);
     assert(g_fdcache_invalidate_calls == 1);
 
@@ -1900,18 +1625,15 @@ static void test_close_sync_and_positioned_wrappers(void)
 }
 
 /**
- * @brief Regression: wrappers must survive being reached before the constructor.
+ * @brief Regression: wrappers reached before the constructor resolve their symbols
+ *        instead of calling through NULL.
  *
- * @details `LD_PRELOAD` maps this object before the executable's own
- * `DT_NEEDED` libraries, but ELF initialisers run in dependency order, so
- * another library's constructor can call an interposed symbol while
- * `chaos_io_init()` is still pending.  `libcap-ng` does exactly this — its
- * initialiser performs file I/O — which made every `setpriv`, `su` and
- * `runuser` invocation under libchaos-io abort with SIGSEGV.
- *
- * Each case below puts the library back into its pre-constructor state
- * (`chaos_test_reset_state()` clears the pointer table and the ready flag),
- * then calls a wrapper directly.  Before the fix these dereferenced NULL.
+ * @details LD_PRELOAD maps this object first, but ELF initialisers run in dependency
+ * order, so another library's constructor can call an interposed symbol before
+ * chaos_io_init(). libcap-ng's initialiser does file I/O, which made every setpriv, su
+ * and runuser under libchaos-io crash with SIGSEGV. Each case restores the
+ * pre-constructor state (`chaos_test_reset_state()` clears the pointer table and the
+ * once-control) and calls one wrapper; resolution is idempotent.
  */
 static void test_wrappers_resolve_symbols_before_constructor(void)
 {
@@ -1919,10 +1641,9 @@ static void test_wrappers_resolve_symbols_before_constructor(void)
     ssize_t transferred;
     int rc;
 
-    /* Results are captured rather than cast to void: glibc marks read() and
-     * write() warn_unused_result, and a (void) cast does not suppress that
-     * under GCC.  The values themselves are irrelevant here -- the assertion
-     * is that the call resolved its symbol instead of faulting. */
+    /* Results are captured rather than cast to void: glibc marks read() and write()
+     * warn_unused_result, which a (void) cast does not silence under GCC. The values are
+     * irrelevant; the assertion is that the call resolved its symbol. */
 
     /* close(): the first wrapper libcap-ng's initialiser can reach. */
     chaos_test_reset_state();
@@ -1951,7 +1672,7 @@ static void test_wrappers_resolve_symbols_before_constructor(void)
     (void)transferred;
     assert(g_chaos_io_real_write != NULL);
 
-    /* Resolution is idempotent: a second call must not re-resolve or fault. */
+    /* Resolution is idempotent: a second call neither re-resolves nor faults. */
     chaos_test_reset_state();
     chaos_io_ensure_symbols();
     assert(g_chaos_io_real_read != NULL);
@@ -1971,11 +1692,11 @@ static int g_ensure_worker_failed[CHAOS_TEST_ENSURE_THREADS];
 static int g_ensure_worker_index[CHAOS_TEST_ENSURE_THREADS];
 
 /**
- * @brief Hammers `chaos_io_ensure_symbols()` and checks the table is fully published.
+ * @brief Calls chaos_io_ensure_symbols() 64 times and checks the table is fully published
+ *        each time.
  *
- * @details Observing a NULL pointer after the call has returned means the
- * readiness signal became visible before the pointer stores did — precisely the
- * failure a non-synchronising guard permits.
+ * @details A NULL pointer seen after the call returned means the "done" state became
+ * visible before the pointer stores, which an unordered guard permits.
  */
 static void *chaos_test_ensure_worker(void *argument)
 {
@@ -1996,18 +1717,14 @@ static void *chaos_test_ensure_worker(void *argument)
 }
 
 /**
- * @brief Regression: concurrent resolution must never expose a half-built table.
+ * @brief Regression: concurrent first calls never observe a half-built symbol table.
  *
- * @details `chaos_io_ensure_symbols()` is reached from every interposed wrapper
- * on every thread, so its guard has to order the pointer stores against the
- * readiness signal.  A plain `volatile` flag does not: on a weakly ordered
- * architecture a second thread can observe the flag set while some stores are
- * still invisible to it, and call through NULL.  `pthread_once` supplies the
- * release/acquire pairing that makes this safe.
- *
- * A passing run cannot prove the absence of a race, but the test does fail
- * outright if the guard is replaced by something that publishes readiness
- * without ordering the stores behind it.
+ * @details chaos_io_ensure_symbols() is reached from every wrapper on every thread, so
+ * its once-control (chaos_once.h) must order the pointer stores before the "done" state
+ * with release/acquire semantics; a plain volatile flag would let another thread on a
+ * weakly ordered CPU see "done" and call through NULL. Eight threads race on it. A pass
+ * cannot prove the absence of a race, but the test fails when the guard publishes
+ * readiness without ordering the stores.
  */
 static void test_ensure_symbols_is_thread_safe(void)
 {
@@ -2042,26 +1759,22 @@ static void test_ensure_symbols_is_thread_safe(void)
 }
 
 #if defined(__GLIBC__) && defined(__LP64__)
-/** Times the stubbed overflow handler of the fortified variants ran. */
+/** @brief Calls of the stand-in overflow handler of the fortified variants. */
 static int g_chk_fail_calls = 0;
 
-/** Stands in for glibc's `__chk_fail()`, which would abort the test. */
+/** @brief Stands in for glibc's `__chk_fail()`, which would abort the test. */
 static void chaos_test_chk_fail(void)
 {
     ++g_chk_fail_calls;
 }
 
 /**
- * @brief Invariant: glibc's alternate entry points run the same wrappers.
+ * @brief glibc's alternate entry points run the same wrappers.
  *
- * Triggering conditions: the large-file names are taken by address, and each
- * fortified variant is called within and beyond its buffer.
- *
- * Expected observable behaviour:
- * - Every large-file name is the base wrapper itself (same address).
- * - A fortified call within the buffer reaches the real function through the wrapper.
- * - A fortified call beyond the buffer, or `__open_2()` with flags that need a mode,
- *   goes to the overflow handler and never reaches the real function.
+ * @details Every *64 large-file name is the base wrapper itself (same address, an alias).
+ * A fortified call within its declared buffer reaches the real function; one beyond it,
+ * or __open_2()/__openat_2() with flags that need a mode, goes to the overflow handler
+ * and never reaches the real function.
  */
 static void test_glibc_alternate_entries(void)
 {
@@ -2107,8 +1820,8 @@ static void test_glibc_alternate_entries(void)
     assert(__read_chk(5, buffer, 4U, sizeof(buffer)) == 4);
     assert(g_real_read_calls == 1);
     g_chk_fail_calls = 0;
-    /* The declared buffer size is the check's input: a count beyond it trips the
-     * check without writing past the real buffer, which the compiler would reject. */
+    /* The declared buffer size is the check's input: a count beyond it trips the check
+     * without writing past the real buffer, which the compiler would reject. */
     assert(__read_chk(5, buffer, 4U, 2U) == -1);
     assert(g_chk_fail_calls == 1);
     assert(g_real_read_calls == 1);
@@ -2149,22 +1862,7 @@ static void test_glibc_alternate_entries(void)
 #endif
 
 /**
- * @brief Invariant: calls that free or reassign a descriptor invalidate its cache entry.
- *
- * Triggering conditions: `dup2`, `dup3` and `close_range` with successful and failing
- * real calls, `close_range` with CLOSE_RANGE_CLOEXEC, a reversed range, a narrow and a
- * wide range, and a C library without `close_range`.
- *
- * Expected observable behaviour:
- * - A successful dup2/dup3 invalidates the target descriptor; dup2 onto itself and a
- *   failed call invalidate nothing.
- * - A successful close_range invalidates each descriptor of a narrow range and resets
- *   the whole cache for a wide one; CLOEXEC, a reversed range and a failure invalidate
- *   nothing.
- * - Without a real close_range the wrapper fails with ENOSYS.
- */
-/**
- * @brief Releases what the closedir/pclose test opened, with the C library's own
+ * @brief Releases what the closedir/pclose test opened, through the C library's own
  *        functions (the interposed ones only reached stubs).
  */
 static int closedir_real_release(DIR *directory, FILE *stream)
@@ -2179,6 +1877,17 @@ static int closedir_real_release(DIR *directory, FILE *stream)
     return real_closedir(directory) | real_fclose(stream);
 }
 
+/**
+ * @brief Calls that free or reassign a descriptor drop its cache entry.
+ *
+ * @details A successful dup2/dup3 invalidates the target; dup2 onto itself and a failed
+ * call invalidate nothing. A successful close_range invalidates each fd of a narrow range
+ * and resets the whole cache for a wide one; CLOSE_RANGE_CLOEXEC, a reversed range and a
+ * failure invalidate nothing; without a real close_range the wrapper fails with ENOSYS.
+ * closedir/pclose invalidate their stream's fd and keep errno; closefrom resets the cache
+ * and, without closefrom in libc, falls back to close_range, else closes each fd up to
+ * RLIMIT_NOFILE (16 here, so fds 10..15: 6 closes).
+ */
 static void test_descriptor_reassignment_wrappers(void)
 {
     chaos_test_reset_state();
@@ -2226,9 +1935,10 @@ static void test_descriptor_reassignment_wrappers(void)
     assert(errno == ENOSYS);
     chaos_test_bind_real_functions();
 
-    /* Descriptors the C library closes with its own system calls: forgotten too. */
+    /* Descriptors the C library closes with its own system calls are forgotten too. */
     {
-        /* Through pointers: the compiler knows these free their argument. */
+        /* Through pointers: the compiler knows these free their argument and would warn
+         * about the later use. */
         int (*volatile closedir_wrapper)(DIR *) = closedir;
         int (*volatile pclose_wrapper)(FILE *) = pclose;
         struct rlimit original;
@@ -2263,7 +1973,7 @@ static void test_descriptor_reassignment_wrappers(void)
         assert(g_real_closefrom_calls == 1 && g_real_closefrom_lowfd == 9);
         assert(g_fdcache_reset_calls == 1);
 
-        /* Without closefrom in the C library: close_range, else each descriptor. */
+        /* Without closefrom in libc: close_range, else one close per descriptor. */
         g_chaos_io_real_closefrom = NULL;
         g_sys_close_range_result = 0;
         errno = 4242;
@@ -2282,16 +1992,15 @@ static void test_descriptor_reassignment_wrappers(void)
 }
 
 /**
- * @brief Invariant: the path forms reach the same rules as the descriptor and *at forms.
+ * @brief The path forms reach the same rules as the descriptor and *at forms.
  *
- * Expected observable behaviour:
- * - `unlink(p)` → real unlinkat(AT_FDCWD, p, 0); `rmdir(p)` → flags AT_REMOVEDIR; both
- *   match the `unlink` rules.
- * - `rename(a, b)` → real renameat(AT_FDCWD, a, AT_FDCWD, b) under the rename rules.
- * - `creat(p, m)` → real open(p, O_CREAT | O_WRONLY | O_TRUNC, m) under the open rules.
- * - `truncate(p, n)`: passthrough under the guard, for excluded or unmatched paths;
- *   matched by path against the `truncate` rules; LATENCY then real call; ERRNO fails
- *   without the real call.
+ * @details unlink and rmdir go to the real unlinkat (rmdir with AT_REMOVEDIR) under the
+ * unlink rules; rename to renameat under the rename rules; creat to open with
+ * O_CREAT|O_WRONLY|O_TRUNC under the open rules. truncate matches by path. remove()
+ * unlinks and retries with AT_REMOVEDIR on EISDIR. renameat2 passes flags through, resets
+ * the cache on success and, without renameat2 in libc, makes the system call.
+ * posix_fallocate follows the allocate rules but returns the error number and leaves
+ * errno untouched, as POSIX specifies.
  */
 static void test_path_form_wrappers(void)
 {
@@ -2480,15 +2189,13 @@ static void test_path_form_wrappers(void)
 }
 
 /**
- * @brief Invariant: fopen() and freopen() are faulted by the open rules.
+ * @brief fopen() and freopen() follow the open rules.
  *
- * Expected observable behaviour:
- * - an ERRNO open rule makes fopen() return NULL with that errno, without the real call;
- * - freopen() under the same rule fails the real freopen() (empty path), which closes
- *   the stream the C library's way, and returns NULL with the rule's errno;
- * - LATENCY delays, then opens; an unmatched path, the guard and a NULL freopen()
- *   path reach the real call unchanged;
- * - fopen64 and freopen64 are the same wrappers.
+ * @details ERRNO makes fopen() return NULL without the real call. Under ERRNO freopen()
+ * still calls the real freopen() with an empty path, so the C library closes the stream
+ * its own way, then returns NULL with the rule's errno. LATENCY delays then opens; an
+ * unmatched path, the guard and a NULL freopen() path reach the real call unchanged.
+ * fopen64/freopen64 are the same wrappers.
  */
 static void test_stdio_open_wrappers(void)
 {
@@ -2546,8 +2253,9 @@ static void test_stdio_open_wrappers(void)
 }
 
 /**
- * @brief Invariant: data-moving wrappers hand the call's byte count to the matched
- *   rule, so `@size` gates see it; an iovec call reports its total.
+ * @brief Data-moving wrappers pass the call's byte count to the matched rule for `@size`:
+ *        the count argument, the iovec total, the fallocate length; an empty vector has
+ *        no size.
  */
 static void test_wrappers_record_call_size(void)
 {
@@ -2608,7 +2316,7 @@ static int chaos_test_call_vfprintf_chk(FILE *stream, const char *format, ...)
     return rc;
 }
 
-/** @brief Arms the config stubs so that every stdio stream matches a rule of @p effect. */
+/** @brief Arms the stubs so every stdio stream with a descriptor matches a rule of @p effect. */
 static void chaos_test_stdio_rule(chaos_io_effect_t effect)
 {
     chaos_test_reset_state();
@@ -2636,10 +2344,14 @@ static FILE *chaos_test_stdio_stream(void)
 }
 
 /**
- * @brief Invariant: the stdio wrappers apply the io read/write rules to the stream's
- *   descriptor: ERRNO fails the call the way the C library does and raises the error
- *   indicator, LATENCY delays it, CORRUPT changes what a read returned, and calls
- *   without a rule, on a NULL stream or on a stream without a descriptor pass through.
+ * @brief stdio wrappers apply the read/write rules to the stream's descriptor.
+ *
+ * @details ERRNO fails each form with its own C library failure value and sets the
+ * stream's error indicator; LATENCY delays then runs the real call; CORRUPT flips the
+ * data a read returned and leaves an empty result alone. The standard streams, streams
+ * without a descriptor (fmemopen) and calls without a rule pass through. Without the
+ * fortified functions in libc the plain ones run. A size that overflows count * size has
+ * no byte count.
  */
 static void test_stdio_wrappers(void)
 {
@@ -2672,7 +2384,7 @@ static void test_stdio_wrappers(void)
     assert(g_rule_apply_errno_calls == 0);
     assert(fclose(stream) == 0);
 
-    /* ERRNO: every form fails with its C library error value and sets ferror. */
+    /* ERRNO: every form fails with its C library failure value and sets ferror. */
     stream = chaos_test_stdio_stream();
     chaos_test_stdio_rule(CHAOS_IO_EFFECT_ERRNO);
     errno = 0;
@@ -2740,7 +2452,7 @@ static void test_stdio_wrappers(void)
     chaos_test_reset_state();
     assert(fclose(stream) == 0);
 
-    /* Byte counts for @size gates; a request that overflows has none. */
+    /* Byte counts for `@size`: size * count, none (CHAOS_POLICY_NO_SIZE) on overflow. */
     assert(chaos_io_stdio_size(4U, 3U) == 12U);
     assert(chaos_io_stdio_size(SIZE_MAX, 3U) == CHAOS_POLICY_NO_SIZE);
     assert(chaos_io_stdio_size(0U, 3U) == 0U);
@@ -2748,13 +2460,12 @@ static void test_stdio_wrappers(void)
 }
 
 /**
- * @brief Invariant: streams keep the fd-to-path cache right, and stdio lookups leave
- *   errno alone.
+ * @brief Streams keep the fd cache right, and stdio lookups leave errno alone.
  *
- * Expected observable behaviour: fopen drops any entry of the stream's descriptor
- *   and resolves it anew; so does freopen; fclose drops it; nothing is
- *   cached under the guard; a passthrough call on a stream without a descriptor
- *   leaves errno as it was.
+ * @details fopen and freopen drop the entry of the stream's descriptor and resolve it from
+ * the kernel; freopen with a NULL path keeps the file and changes nothing; a stream
+ * without a descriptor is never cached; under the guard nothing is cached or dropped;
+ * fclose drops the entry; a passthrough call on a descriptor-less stream keeps errno.
  */
 static void test_stdio_streams_keep_the_cache_right(void)
 {
@@ -2812,9 +2523,10 @@ static void test_stdio_streams_keep_the_cache_right(void)
 }
 
 /**
- * @brief Invariant: the path filters exclude the control files and the `/proc`, `/sys`
- *   and `/dev` trees at a path boundary only; a join inserts one separator and fails
- *   one byte short; a zero seed is replaced, never kept.
+ * @brief Path filters exclude the control files and the /proc, /sys and /dev trees at a
+ *        path boundary only (`/process`, `/system`, `/devices` are not excluded); a join
+ *        inserts exactly one separator and fails one byte short; a zero seed is replaced
+ *        (xorshift would stay at 0 forever), and maps to the same state as seed 1.
  */
 static void test_path_filters_join_and_seed(void)
 {
@@ -2853,8 +2565,8 @@ static void test_path_filters_join_and_seed(void)
     assert(g_chaos_io_tls_prng_state == state_of_zero);
 }
 
-/* rmdir() and unlinkat() here are the wrappers over the harness stubs, and syscall()
- * is the harness's stand-in: removing a directory needs the raw system call. */
+/* rmdir() and unlinkat() here are the wrappers over the harness stubs, and syscall() is
+ * the harness's stand-in: removing a directory for real needs the raw system call. */
 #undef syscall
 /** @brief Removes the empty directory @p path for real; 0 on success. */
 static int chaos_test_remove_directory(const char *path)
@@ -2864,14 +2576,12 @@ static int chaos_test_remove_directory(const char *path)
 #define syscall chaos_test_syscall
 
 /**
- * @brief Invariant: a path that cannot be resolved for matching is never matched, and
- *   the call still reaches the real function unchanged.
+ * @brief A path that cannot be resolved for matching is never matched, and the call still
+ *        reaches the real function unchanged (fail-open).
  *
- * Triggering conditions: a working directory that was removed (getcwd() fails), a
- * directory descriptor whose cached path leaves no room for the child, an absolute
- * path longer than PATH_MAX, and an excluded path through openat().
- *
- * Expected observable behaviour: no rule lookup; the real open/openat/fopen runs.
+ * @details Cases: a removed working directory (getcwd fails; errno preserved), a dirfd
+ * whose cached path leaves no room for the child, an absolute path longer than
+ * CHAOS_IO_MAX_PATH (open and fopen), and /proc through openat.
  */
 static void test_unresolvable_paths_pass_through(void)
 {
@@ -2923,8 +2633,8 @@ static void test_unresolvable_paths_pass_through(void)
 }
 
 /**
- * @brief Invariant: an open rule that matched but did not fire (its probability
- *   missed) opens the file, and a mode is forwarded for O_TMPFILE as for O_CREAT.
+ * @brief An open rule that matched but whose probability missed opens the file; O_TMPFILE
+ *        forwards a mode like O_CREAT; a failed real fopen/freopen caches nothing.
  */
 static void test_open_rule_that_does_not_fire(void)
 {
@@ -2957,8 +2667,8 @@ static void test_open_rule_that_does_not_fire(void)
 }
 
 /**
- * @brief Invariant: under the reentrancy guard every descriptor wrapper calls the real
- *   function straight away: no config look-up, no fd-cache resolution, no effect.
+ * @brief Under the reentrancy guard every descriptor and path wrapper calls the real
+ *        function at once: no rule lookup, no fd resolution, no effect, offset untouched.
  */
 static void test_descriptor_wrappers_under_guard(void)
 {
@@ -3015,9 +2725,14 @@ static void test_descriptor_wrappers_under_guard(void)
 }
 
 /**
- * @brief Invariant: a rule that matched but does not fire leaves the call exactly as
- *   the real function made it: ERRNO whose probability missed, CORRUPT and TORN that
- *   did not trigger, and a matched call the real function itself failed.
+ * @brief A rule that matched but does not fire leaves the call exactly as the real
+ *        function made it.
+ *
+ * @details Covered: ERRNO whose probability missed (also neither failing nor tearing
+ * writes), no rule for the descriptor, CORRUPT at end of file (nothing read, nothing
+ * checked), CORRUPT and TORN that did not trigger, TORN with a torn count of 0, and a
+ * real unlink/rename that failed after LATENCY (no cache reset, the namespace did not
+ * change).
  */
 static void test_rules_that_do_not_fire(void)
 {
@@ -3056,7 +2771,8 @@ static void test_rules_that_do_not_fire(void)
     assert(g_real_writev_calls == 1 && g_real_ftruncate_calls == 1 && g_real_truncate_calls == 1);
     assert(g_real_unlinkat_calls == 1 && g_real_renameat_calls == 1);
     assert(g_real_fsync_calls == 1 && g_real_fdatasync_calls == 1 && g_real_close_calls == 1);
-    /* Each real success changed the namespace: the cache was reset each time. */
+    /* Each real success that changes the namespace (unlinkat, renameat, renameat2) reset
+     * the cache. */
     assert(g_fdcache_reset_calls == 3);
 
     /* Writes under an ERRNO rule that missed are neither failed nor torn. */
@@ -3158,12 +2874,9 @@ static void test_rules_that_do_not_fire(void)
 }
 
 /**
- * @brief Invariant: unlink and rename rules look only at paths they can resolve and
- *   that are not excluded, and only once a rule file is loaded.
- *
- * Expected observable behaviour: an excluded path, a path too long to resolve or no
- *   loaded rules pass the call through unmatched; a rename with one resolvable side is
- *   matched on that side alone; neither side resolvable matches nothing.
+ * @brief unlink, truncate and rename rules look only at resolvable, non-excluded paths,
+ *        and only once rules are loaded; a rename with one resolvable side is matched on
+ *        that side alone, with neither side resolvable no rule is consulted.
  */
 static void test_unlink_and_rename_matching_inputs(void)
 {
@@ -3205,8 +2918,8 @@ static void test_unlink_and_rename_matching_inputs(void)
 }
 
 /**
- * @brief Invariant: the iovec helpers skip empty segments, and a vector whose byte
- *   total does not fit `ssize_t` is neither torn nor given a size.
+ * @brief Empty segments are kept by trimming and skipped by corruption; a vector whose
+ *        total does not fit ssize_t is neither torn nor given a size.
  */
 static void test_vectored_edge_segments(void)
 {
@@ -3239,8 +2952,8 @@ static void test_vectored_edge_segments(void)
 }
 
 /**
- * @brief Invariant: close_range() forgets each descriptor of a narrow range up to
- *   INT_MAX and stops there: no descriptor number past INT_MAX exists.
+ * @brief close_range() invalidates each fd of a narrow range up to INT_MAX and stops there
+ *        (no descriptor number exceeds INT_MAX), without wrapping or resetting the cache.
  */
 static void test_close_range_at_int_max(void)
 {
@@ -3254,9 +2967,9 @@ static void test_close_range_at_int_max(void)
 }
 
 /**
- * @brief Invariant: stdio calls with a rule that does not fail them run the real
- *   function: LATENCY on the write forms, ERRNO whose probability missed, a read at
- *   end of file under CORRUPT, and a line read with no room reports no byte count.
+ * @brief stdio calls under a rule that does not fail them run the real function: LATENCY
+ *        on the write forms, ERRNO whose probability missed, fortified reads without
+ *        their libc variants, CORRUPT at end of file; fgets with no room has no byte count.
  */
 static void test_stdio_rules_that_do_not_fail(void)
 {
@@ -3272,7 +2985,7 @@ static void test_stdio_rules_that_do_not_fail(void)
     assert(fflush(stream) == 0);
     assert(fprintf(stream, "%d", 7) == 1);
     assert(g_latency_calls == 4);
-    /* fgets() with no room: the C library refuses it; no byte count for @size. */
+    /* fgets() with no room: the C library refuses it; no byte count for `@size`. */
     errno = 0;
     assert(fgets(buffer, 0, stream) == NULL);
     assert(g_latency_calls == 5 && g_last_call_size == CHAOS_POLICY_NO_SIZE);
@@ -3331,13 +3044,14 @@ static long chaos_test_file_size(const char *path)
 }
 
 /**
- * @brief Invariant: a wrapper whose downstream symbol is still unresolved (a call that
- *   arrives during symbol resolution) makes the system call itself instead of
- *   jumping through a NULL pointer.
+ * @brief A wrapper whose real function is still unresolved (a call arriving during symbol
+ *        resolution) makes the system call itself instead of calling through NULL.
  *
- * Expected observable behaviour: every call has its real effect on a real file --
- * bytes written and read back, files opened, created, truncated, allocated, renamed
- * and removed, descriptors duplicated and closed.
+ * @details Every call acts on a real temporary file and is checked by its effect: bytes
+ * written and read back, creation modes, dup2/dup3 semantics, sizes changed by truncate
+ * and fallocate, kernel-side copies, rename and unlink. posix_fallocate returns its error
+ * and keeps errno. closedir/pclose cannot be emulated (the stream belongs to libc) and
+ * fail with ENOSYS.
  */
 static void test_unresolved_symbols_use_system_calls(void)
 {
@@ -3487,9 +3201,9 @@ static void test_unresolved_symbols_use_system_calls(void)
 }
 
 /**
- * @brief Invariant: a stdio wrapper whose downstream symbol is still unresolved
- *   fails the way the function reports errors, with errno ENOSYS: no system call
- *   can stand in for the C library's own stream object.
+ * @brief A stdio wrapper whose real function is unresolved fails the way that function
+ *        reports errors, with errno ENOSYS: no system call can operate on libc's stream
+ *        object. The stream is left untouched and still usable.
  */
 static void test_unresolved_stdio_fails_with_enosys(void)
 {
@@ -3603,8 +3317,8 @@ int main(void)
     test_unresolved_symbols_use_system_calls();
     test_unresolved_stdio_fails_with_enosys();
     chaos_test_bind_libc_functions_for_exit();
-    /* Shutdown I/O, the coverage dump included, goes straight to the C library:
-     * rule lookups made while the line counts are written would skew them. */
+    /* Shutdown I/O, the coverage dump included, bypasses the wrappers: rule lookups made
+     * while the line counts are written would skew them. */
     (void)chaos_io_enter_internal();
     return 0;
 }

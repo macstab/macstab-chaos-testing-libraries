@@ -1,32 +1,25 @@
 /**
  * @file test_time_runtime.c
- * @brief Unit tests for the TIME-domain constructor: symbol resolution, seed material,
- *   and function-pointer table wiring.
+ * @brief Proves the libchaos-time constructor: real-function resolution, the abort on a
+ *   failed lookup, seed collection and its fallback, and the start-up rule load.
  *
- * Subsystem under test: `src/time/chaos_time.c` (the `chaos_time_init()` constructor).
+ * @details Unit under test: `src/time/chaos_time.c`, included directly so its `static`
+ * functions are callable. Isolation seams, all applied by `#define` before the include:
+ * - `dlsym` maps each of the eight real function names (clock_gettime, nanosleep, usleep,
+ *   gettimeofday, time, clock_nanosleep, sleep, timespec_get) to a local no-op stub and
+ *   returns NULL for anything else, so no real libc symbol is ever bound.
+ * - `dlerror` returns a test-chosen string and counts calls, which separates "symbol absent
+ *   but no error" (accepted) from "lookup failed" (abort).
+ * - `abort` `longjmp`s back into the test when an abort is expected, and asserts otherwise.
+ * - `syscall` (Linux only) fakes the raw openat/read/close sequence on `/dev/urandom`: it
+ *   returns fd 9, writes the fixed seed 0x1122334455667788 and can force an open failure or
+ *   a 7-byte short read. Production uses raw syscalls here, so stubbing libc `open`/`read`
+ *   would not intercept anything.
+ * - `chaos_time_config_init()` and `chaos_time_config_prepare()` are replaced by counting
+ *   stubs, so no rule file is read.
  *
- * Coverage approach:
- * - All three intercepted symbols (clock_gettime, nanosleep, usleep) are mapped to local
- *   stubs via a test-controlled `dlsym` stub.
- * - `dlerror`, `abort`, and (on Linux) `syscall` are overridden via `#define` before
- *   `chaos_time.c` is included, exercising the constructor without LD_PRELOAD.
- * - On Linux, the raw-syscall stub delivers a deterministic 8-byte seed value
- *   (0x1122334455667788) to verify the exact stored `process_seed`.
- * - The abort path is intercepted via `setjmp`/`longjmp` to verify fatal-error behaviour.
- *
- * Properties under test:
- * - `chaos_time_resolve_symbol()`: pointer wired correctly; `dlerror()` called once.
- * - `chaos_time_read_seed_material()` (Linux): returns 0x1122334455667788; exactly
- *   one openat, one read, one close raw syscall.
- * - `chaos_time_read_seed_material()` (non-Linux): returns a non-zero value.
- * - Abort path: unresolvable symbol triggers `abort()`.
- * - Linux seed fallback: open failure → PID-based fallback; short read → same fallback.
- * - `chaos_time_init()`: all three real-function-pointer globals wired; config_init called
- *   once; process_seed and tls_prng_state non-zero.
- *
- * What is NOT tested here:
- * - Config file loading or rule matching.
- * - TIME wrapper call paths (tested in test_chaos_time.c).
+ * Out of scope: rule parsing and matching (test_time_config.c) and the wrappers
+ * (test_chaos_time.c).
  */
 
 #include "../support/test_time_support.h"
@@ -36,34 +29,35 @@
 #include <setjmp.h>
 #include <stdarg.h>
 
-/** @brief Number of times `chaos_time_config_init()` stub was called. */
+/** @brief Calls to the `chaos_time_config_init()` stub. */
 static int g_config_init_calls = 0;
 
-/** @brief Number of times the `chaos_time_config_prepare()` stub was called. */
+/** @brief Calls to the `chaos_time_config_prepare()` stub (the start-up rule load). */
 static int g_config_prepare_calls = 0;
-/** @brief Number of times the `dlerror` stub was called. */
+/** @brief Calls to the `dlerror` stub; one per lookup proves the error state is cleared. */
 static int g_dlerror_calls = 0;
-/** @brief Error string returned by the `dlerror` stub; NULL means no error. */
+/** @brief Value the `dlerror` stub returns; NULL reports "no lookup error". */
 static const char *g_dlerror_text = NULL;
-/** @brief `setjmp` buffer used to return from an expected `abort()`. */
+/** @brief Return point for an expected `abort()`. */
 static jmp_buf g_abort_env;
-/** @brief Non-zero when the test expects `abort()` to be called. */
+/** @brief Non-zero while a test expects `abort()`; any other abort fails the run. */
 static int g_expect_abort = 0;
 #ifdef __linux__
-/** @brief SYS_openat dispatch count. */
+/** @brief Raw `SYS_openat` calls seen by the `syscall` stub. */
 static int g_syscall_open_calls = 0;
-/** @brief SYS_read dispatch count. */
+/** @brief Raw `SYS_read` calls seen by the `syscall` stub. */
 static int g_syscall_read_calls = 0;
-/** @brief SYS_close dispatch count. */
+/** @brief Raw `SYS_close` calls seen by the `syscall` stub. */
 static int g_syscall_close_calls = 0;
-/** @brief When non-zero, causes SYS_openat to return -1. */
+/** @brief Non-zero makes `SYS_openat` fail with -1. */
 static int g_force_open_fail = 0;
-/** @brief When non-zero, causes SYS_read to return sizeof(seed)-1 (short read). */
+/** @brief Non-zero makes `SYS_read` return 7 of the 8 requested bytes. */
 static int g_force_short_read = 0;
 #endif
 
 /**
- * @brief Reset all test-local and runtime globals before each test function.
+ * @brief Clears the runtime globals and every stub counter and switch, so each test
+ *   starts with unresolved function pointers and no injected failure.
  */
 static void reset_test_state(void)
 {
@@ -82,7 +76,12 @@ static void reset_test_state(void)
 #endif
 }
 
-/** @brief Stub for `clock_gettime(2)`. Returns 0 without modifying @p value. */
+/*
+ * Real-function stubs. They are never called; only their addresses matter, as proof that
+ * the constructor stored the pointer `dlsym` returned for each name.
+ */
+
+/** @brief Address stand-in for the real `clock_gettime`. */
 static int stub_clock_gettime(clockid_t clock_id, struct timespec *value)
 {
     (void)clock_id;
@@ -90,7 +89,7 @@ static int stub_clock_gettime(clockid_t clock_id, struct timespec *value)
     return 0;
 }
 
-/** @brief Stub for `nanosleep(2)`. Returns 0 (success, no sleep). */
+/** @brief Address stand-in for the real `nanosleep`. */
 static int stub_nanosleep(const struct timespec *request, struct timespec *remaining)
 {
     (void)request;
@@ -98,14 +97,14 @@ static int stub_nanosleep(const struct timespec *request, struct timespec *remai
     return 0;
 }
 
-/** @brief Stub for `usleep(3)`. Returns 0 (success, no sleep). */
+/** @brief Address stand-in for the real `usleep`. */
 static int stub_usleep(useconds_t usec)
 {
     (void)usec;
     return 0;
 }
 
-/** @brief Stub for `gettimeofday(2)`. Returns 0. */
+/** @brief Address stand-in for the real `gettimeofday`. */
 static int stub_gettimeofday(struct timeval *value, void *zone)
 {
     (void)value;
@@ -113,28 +112,28 @@ static int stub_gettimeofday(struct timeval *value, void *zone)
     return 0;
 }
 
-/** @brief Stub for `time(2)`. Returns 0. */
+/** @brief Address stand-in for the real `time`. */
 static time_t stub_time(time_t *out)
 {
     (void)out;
     return 0;
 }
 
-/** @brief Stub for `sleep(3)`. Returns 0. */
+/** @brief Address stand-in for the real `sleep`. */
 static unsigned int stub_sleep(unsigned int seconds)
 {
     (void)seconds;
     return 0U;
 }
 
-/** @brief Stub for `timespec_get(3)`. Returns @p base. */
+/** @brief Address stand-in for the real `timespec_get`. */
 static int stub_timespec_get(struct timespec *value, int base)
 {
     (void)value;
     return base;
 }
 
-/** @brief Stub for `clock_nanosleep(2)`. Returns 0 (success, no sleep). */
+/** @brief Address stand-in for the real `clock_nanosleep`. */
 static int stub_clock_nanosleep(
     clockid_t clock_id, int flags, const struct timespec *request, struct timespec *remaining
 )
@@ -146,19 +145,15 @@ static int stub_clock_nanosleep(
     return 0;
 }
 
-/**
- * @brief Stub for `chaos_time_config_init()`.
- *
- * Increments the call counter to verify the constructor calls it exactly once.
- */
+/** @brief Replaces the config initialiser; counts calls so the constructor's single call is
+ *   observable. */
 void chaos_time_config_init(void)
 {
     ++g_config_init_calls;
 }
 
-/**
- * @brief Stub for `chaos_time_config_prepare()`: counts the start-up load.
- */
+/** @brief Replaces the start-up rule load; counts calls and reports success without reading
+ *   a rule file. */
 int chaos_time_config_prepare(void)
 {
     ++g_config_prepare_calls;
@@ -166,10 +161,10 @@ int chaos_time_config_prepare(void)
 }
 
 /**
- * @brief Stub for `dlerror()`.
+ * @brief `dlerror` seam: returns `g_dlerror_text` and counts calls.
  *
- * Returns `g_dlerror_text` and increments `g_dlerror_calls`. The call count
- * verifies that the production resolver calls `dlerror()` once per symbol.
+ * The resolver calls `dlerror()` once to clear stale state before `dlsym` and, only when
+ * `dlsym` returns NULL, once more to tell a missing symbol from a failed lookup.
  */
 static char *chaos_time_test_dlerror(void)
 {
@@ -178,11 +173,11 @@ static char *chaos_time_test_dlerror(void)
 }
 
 /**
- * @brief Stub for `dlsym(RTLD_NEXT, symbol)`.
+ * @brief `dlsym` seam: returns the matching address stand-in for each of the eight real
+ *   function names, and NULL for any other name.
  *
- * Maps each expected symbol name to the corresponding stub via
- * `CHAOS_TIME_TEST_DLSYM_RESULT`. Returns NULL for unrecognised symbols, which triggers
- * the abort path in the production resolver.
+ * A NULL result reaches `abort()` only when `dlerror` also reports an error, which the abort
+ * test arranges through `g_dlerror_text`.
  */
 static void *chaos_time_test_dlsym(void *handle, const char *symbol)
 {
@@ -209,11 +204,12 @@ static void *chaos_time_test_dlsym(void *handle, const char *symbol)
 
 #ifdef __linux__
 /**
- * @brief Stub for `syscall(2)` used by the constructor to read `/dev/urandom`.
+ * @brief `syscall` seam for the raw `/dev/urandom` read.
  *
- * Delivers seed `0x1122334455667788` on a successful SYS_read. Returns -1 for
- * SYS_openat when `g_force_open_fail != 0`. Returns `sizeof(seed)-1` for SYS_read
- * when `g_force_short_read != 0` (triggering the PID-based fallback path).
+ * `SYS_openat` returns fd 9 (or -1 under `g_force_open_fail`). `SYS_read` asserts it
+ * received fd 9 and an 8-byte request, writes 0x1122334455667788 and returns 8, or 7 under
+ * `g_force_short_read`; the bytes are written even on the short read, so only the length
+ * check can reject them. `SYS_close` succeeds. Any other number returns -1.
  */
 static long chaos_time_test_syscall(long number, ...)
 {
@@ -260,10 +256,8 @@ static long chaos_time_test_syscall(long number, ...)
 #endif
 
 /**
- * @brief Stub for `abort()`.
- *
- * When `g_expect_abort != 0`, uses `longjmp` to return to the test's `setjmp`
- * frame. An unexpected abort triggers `assert(!"unexpected abort")`.
+ * @brief `abort` seam: `longjmp`s to `g_abort_env` when an abort is expected and fails the
+ *   run otherwise, so the fatal path can be tested in-process.
  */
 static void chaos_time_test_abort(void)
 {
@@ -275,7 +269,8 @@ static void chaos_time_test_abort(void)
 }
 
 /* -------------------------------------------------------------------------
- * Symbol overrides and production source inclusion
+ * Seams: the macros rename the calls inside chaos_time.c only; they are undefined again
+ * right after the include so the tests below use the real names.
  * --------------------------------------------------------------------- */
 
 #define dlsym chaos_time_test_dlsym
@@ -297,17 +292,15 @@ static void chaos_time_test_abort(void)
  * --------------------------------------------------------------------- */
 
 /**
- * @brief Invariant: `chaos_time_resolve_symbol()` wires a pointer and reads a valid seed.
+ * @brief Proves the resolver stores the `dlsym` result, never replaces a wired pointer, and
+ *   that seed collection returns the 8 bytes read from `/dev/urandom`.
  *
- * Triggering condition: `chaos_time_resolve_symbol(&clock_gettime_fn, "clock_gettime")`
- *   with clean state.
- *
- * Expected observable behaviour:
- * - `clock_gettime_fn` is set to `stub_clock_gettime`.
- * - `g_dlerror_calls == 1`.
- * - On Linux: `chaos_time_read_seed_material()` returns 0x1122334455667788; exactly
- *   one of each raw syscall is issued.
- * - Non-Linux: returns a non-zero value.
+ * @details One resolve stores the stand-in with one `dlerror` call (the clearing call; the
+ * second call happens only on a NULL result). A second resolve of an unknown name on the
+ * same, already wired pointer must return before `dlsym`/`dlerror`, which is what lets a test
+ * harness pre-wire pointers. On Linux the seed must equal the stub's bytes after exactly one
+ * openat, read and close; elsewhere only the pid-derived value is available, so the test
+ * checks it is non-zero.
  */
 static void test_resolve_symbol_and_seed_helpers(void)
 {
@@ -334,11 +327,10 @@ static void test_resolve_symbol_and_seed_helpers(void)
 }
 
 /**
- * @brief Invariant: `chaos_time_resolve_symbol()` calls `abort()` for a missing symbol.
+ * @brief Proves a failed lookup aborts: `dlsym` returns NULL and `dlerror` reports an error.
  *
- * Triggering condition: `g_dlerror_text = "missing"` with an unrecognised symbol name.
- *
- * Expected observable behaviour: `longjmp` transfers control out of the setjmp block.
+ * @details Aborting is deliberate; the process must never run with a NULL real function.
+ * Reaching the assert after the call means the resolver returned instead of aborting.
  */
 static void test_resolve_symbol_abort_path(void)
 {
@@ -357,13 +349,11 @@ static void test_resolve_symbol_abort_path(void)
 
 #ifdef __linux__
 /**
- * @brief Invariant: seed fallback paths produce PID-based seeds when /dev/urandom fails.
+ * @brief Proves both `/dev/urandom` failures fall back to `0x6a09e667f3bcc909 ^ getpid()`.
  *
- * Triggering conditions:
- * - `g_force_open_fail = 1`: no read or close attempted.
- * - `g_force_short_read = 1`: read returns one fewer byte; close is still called.
- *
- * Expected observable behaviour: both paths return `0x6a09e667f3bcc909 XOR getpid()`.
+ * @details A failed open issues no read and no close. A 7-byte short read is rejected even
+ * though the stub wrote all 8 bytes, and the fd is still closed, so the fallback leaks no
+ * descriptor.
  */
 static void test_seed_fallback_paths(void)
 {
@@ -386,16 +376,12 @@ static void test_seed_fallback_paths(void)
 #endif
 
 /**
- * @brief Invariant: `chaos_time_init()` wires every function pointer and seeds the PRNG.
+ * @brief Proves the constructor binds all eight real functions, seeds the process and the
+ *   calling thread's PRNG, initialises the config once and loads the rules once.
  *
- * Triggering condition: `chaos_time_init()` called after `reset_test_state()`.
- *
- * Expected observable behaviour:
- * - `g_chaos_time_real_clock_gettime == stub_clock_gettime`.
- * - `g_chaos_time_real_nanosleep == stub_nanosleep`.
- * - `g_chaos_time_real_usleep == stub_usleep`.
- * - `g_config_init_calls` increments by 1.
- * - `g_chaos_time_process_seed != 0` and `g_chaos_time_tls_prng_state != 0`.
+ * @details The run-once flag is reset because resolution goes through `chaos_once()`; without
+ * the reset an earlier resolution in this binary would turn the call into a no-op.
+ * `reset_test_state()` cleared the pointers, so each one must come from the `dlsym` seam.
  */
 static void test_constructor_init(void)
 {
@@ -416,7 +402,7 @@ static void test_constructor_init(void)
     assert(g_chaos_time_real_sleep == stub_sleep);
     assert(g_chaos_time_real_timespec_get == stub_timespec_get);
     assert(g_config_init_calls == config_calls_before + 1);
-    /* The constructor loads the rules at once so a bad rule file is reported. */
+    /* The rules load at start-up, so a bad rule file is reported before main(). */
     assert(g_config_prepare_calls == prepare_calls_before + 1);
     assert(g_chaos_time_process_seed != 0U);
     assert(g_chaos_time_tls_prng_state != 0U);

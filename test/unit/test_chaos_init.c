@@ -1,44 +1,59 @@
 /**
  * @file test_chaos_init.c
- * @brief Unit tests for the system-call-free part of chaos-init.
+ * @brief Proves the supervisor-side building blocks of chaos-init that need no seccomp
+ *        notification: argument parsing, the BPF filter, status and exit reporting, the
+ *        delay queue, tracee memory and /proc access, and the per-process tracee table.
  *
- * Subsystems under test: `src/init/chaos_init_core.c`, `chaos_init_delay.c`,
- * `chaos_init_proc.c`, `chaos_init_tracee.c`
+ * @details Units under test, compiled in by `#include`: `src/init/chaos_init_core.c`,
+ * `chaos_init_delay.c`, `chaos_init_proc.c`, `chaos_init_tracee.c`.
  *
- * Coverage approach:
- * - The production sources are included directly.
- * - Memory and /proc are read for real, from this test process itself; only the
- *   /proc reader of chaos_init_process_of() is replaced, to feed it malformed
- *   files, and the process lookup of the tracee table, to control pids.
- * - The filter is not checked instruction by instruction: a small interpreter for
- *   the classic BPF the filter uses (load word, jump if equal / greater or equal,
- *   return) runs it on seccomp_data built per case, and the test asserts the
- *   decision, so a wrong jump offset fails like a wrong system call list.
+ * Isolation:
+ * - Memory and /proc access run for real against this test process, which plays the
+ *   tracee (process_vm_readv(2)/process_vm_writev(2) on its own pid).
+ * - Seam `CHAOS_INIT_PROC_READ`: `g_fake_status` / `g_fake_stat` substitute canned
+ *   `/proc/<pid>/status` and `/proc/<pid>/stat` text to drive the parsers through
+ *   malformed and edge-case input; NULL delegates to the real reader.
+ * - Seam `CHAOS_INIT_PROCESS_OF`: the tracee table resolves tids through the
+ *   `g_fake_tgid` / `g_fake_start` tables (tids 1..199), so pid reuse, threads of one
+ *   process and ended processes are set up without forking.
+ * - The filter is verified by behaviour, not by instruction listing: `run_filter()`
+ *   interprets the subset of classic BPF the builder emits (LD|W|ABS, JEQ, JGE, RET)
+ *   over a `seccomp_data` built per case. A wrong jump offset therefore fails exactly
+ *   like a missing system call. The interpreter asserts on any other opcode, on an
+ *   out-of-bounds load and on running off the end of the program.
  *
- * Properties under test:
- * - Arguments: `--libs <names> -- <command>` with known names only.
- * - Filter: each library's calls are notified, other calls and other architectures
- *   pass, and of all sendmsg calls only the handover passes.
- * - Exit code, kernel version check, unsupported reasons, status text.
- * - Delays: the earliest first, one at a time, a full queue refuses.
- * - Memory: strings up to an unmapped page, partial reads, /proc links, the
- *   process and start time of a thread.
- * - Tracee table: one entry per process, a reused pid starts over, a full table
- *   frees ended processes first and the oldest last; counts follow rule texts
- *   across reloads; hits files are written eagerly, then on flush.
+ * Properties proven:
+ * - arguments: exactly `--libs <name>[,<name>...] -- <command...>`, known names only;
+ * - filter: each library's system calls are notified and no others; calls shared by
+ *   libraries appear once; foreign architectures and (x86_64) the x32 ABI pass; of all
+ *   sendmsg calls only the handover (fd and flags both exact) passes; too small an
+ *   output buffer is refused rather than overrun;
+ * - exit code (shell convention, 128 + signal), kernel >= 5.5 check, unsupported
+ *   reasons by errno, status file text, GODEBUG multipathtcp handling, PATH search;
+ * - delay queue: next() reports the earliest due time; pop() releases only due calls,
+ *   one per call; a full queue refuses; a parked call re-notified after a signal keeps
+ *   its due time and answer under its new id;
+ * - tracee memory: strings stop at a NUL before an unmapped page, partial reads and
+ *   writes fail with EFAULT; /proc link and stat/status parsing, including the
+ *   start-time + image fingerprint that tells an execve'd image from the old one;
+ * - tracee table: one entry per process, pid reuse starts over, a full table reclaims
+ *   ended processes before evicting the least recently used live one; counts follow
+ *   rule texts across reloads; hits files are written eagerly, then on flush.
  */
 
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
 
-/* /proc reader of chaos_init_process_of(): real, or a canned malformed file. */
+/* Seam for the /proc parsers: NULL reads the real file, non-NULL returns the canned text
+ * for `status` or (any other name) `stat`. */
 static const char *g_fake_status = NULL;
 static const char *g_fake_stat = NULL;
 static long test_proc_read(pid_t pid, const char *name, char *out, size_t size);
 #define CHAOS_INIT_PROC_READ test_proc_read
 
-/* Process lookup of the tracee table: tid -> (tgid, start) set by the test. */
+/* Seam for the tracee table: tid -> (tgid, start fingerprint); tgid 0 means no such
+ * process. Lets the test model threads, pid reuse and process exit without forking. */
 #define TEST_PIDS 200
 static pid_t g_fake_tgid[TEST_PIDS];
 static unsigned long long g_fake_start[TEST_PIDS];
@@ -82,7 +97,14 @@ static int test_process_of(pid_t tid, pid_t *tgid, uint64_t *start)
 #include <linux/audit.h>
 #include <stdint.h>
 
-/** @brief Runs @p filter (as built by chaos_init_build_filter) on @p data. */
+/**
+ * @brief Interprets @p filter (as built by chaos_init_build_filter()) over @p data and
+ *        returns the SECCOMP_RET_* value it reaches.
+ *
+ * @details Supports only the opcodes the builder emits; anything else, a load outside
+ * `struct seccomp_data`, or falling off the end aborts the test, so a builder change
+ * that the interpreter does not model cannot pass silently.
+ */
 static uint32_t
 run_filter(const struct sock_filter *filter, size_t length, const struct seccomp_data *data)
 {
@@ -117,10 +139,14 @@ run_filter(const struct sock_filter *filter, size_t length, const struct seccomp
     return 0U;
 }
 
-/* Descriptor the filters of decide() let the handover sendmsg through on. */
+/* Handover descriptor compiled into every filter decide() builds; the one sendmsg the
+ * filter allows unnotified is on this fd with CHAOS_INIT_HANDOVER_FLAGS. */
 static int g_test_handover = 1000;
 
-/** @brief The decision for system call @p nr with arguments @p fd and @p flags. */
+/**
+ * @brief Builds the filter for @p libs and returns its verdict for system call @p nr on
+ *        architecture @p arch, with @p fd as args[0] and @p flags as args[2] (sendmsg).
+ */
 static uint32_t decide(unsigned libs, long nr, uint64_t fd, uint64_t flags, uint32_t arch)
 {
     struct sock_filter filter[CHAOS_INIT_MAX_FILTER];
@@ -141,6 +167,7 @@ static uint32_t decide(unsigned libs, long nr, uint64_t fd, uint64_t flags, uint
 #define ALLOW SECCOMP_RET_ALLOW
 #define ARCH CHAOS_INIT_AUDIT_ARCH
 
+/** @brief Only `--libs <known,...> -- <command>` parses; command index is argv[4]. */
 static void test_parse_args(void)
 {
     char *good[] = {"chaos-init", "--libs", "io,net,process", "--", "/app", "-x", NULL};
@@ -167,7 +194,8 @@ static void test_filter_decisions(void)
 {
     struct sock_filter small[8];
 
-    /* Each library's calls, and only those, go to the supervisor. */
+    /* Each library's calls, and only those, are notified to the supervisor; sendmsg
+     * is not an io call, so io alone lets it through. */
     assert(decide(CHAOS_INIT_LIB_IO, __NR_openat, 0U, 0U, ARCH) == NOTIFY);
     assert(decide(CHAOS_INIT_LIB_IO, __NR_fsync, 0U, 0U, ARCH) == NOTIFY);
     assert(decide(CHAOS_INIT_LIB_IO, __NR_connect, 0U, 0U, ARCH) == ALLOW);
@@ -181,22 +209,25 @@ static void test_filter_decisions(void)
     assert(decide(CHAOS_INIT_LIB_PROCESS, __NR_execve, 0U, 0U, ARCH) == NOTIFY);
     assert(decide(CHAOS_INIT_LIB_PROCESS, __NR_getpid, 0U, 0U, ARCH) == ALLOW);
 
-    /* Shared calls appear once, and every call of every library is notified. */
+    /* read is in both io and net yet notified once (deduplicated, so jump offsets
+     * stay right); with all six libraries every listed call is still reached. */
     assert(decide(CHAOS_INIT_LIB_IO | CHAOS_INIT_LIB_NET, __NR_read, 0U, 0U, ARCH) == NOTIFY);
     assert(decide(0x3fU, __NR_munmap, 0U, 0U, ARCH) == NOTIFY);
     assert(decide(0x3fU, __NR_waitid, 0U, 0U, ARCH) == NOTIFY);
     assert(decide(0x3fU, __NR_getpid, 0U, 0U, ARCH) == ALLOW);
 
-    /* dns and time have no system calls of their own here. */
+    /* dns and time contribute no system calls: SECCOMP mode does not intercept them. */
     assert(decide(CHAOS_INIT_LIB_DNS | CHAOS_INIT_LIB_TIME, __NR_connect, 0U, 0U, ARCH) == ALLOW);
 
-    /* Of all sendmsg calls only the handover passes. */
+    /* Only the handover sendmsg passes unnotified: right fd and exact flags. Any other
+     * flags or fd is notified, so the application cannot use the bypass by accident. */
     assert(
         decide(CHAOS_INIT_LIB_NET, __NR_sendmsg, 1000U, CHAOS_INIT_HANDOVER_FLAGS, ARCH) == ALLOW
     );
     assert(decide(CHAOS_INIT_LIB_NET, __NR_sendmsg, 1000U, MSG_NOSIGNAL, ARCH) == NOTIFY);
     assert(decide(CHAOS_INIT_LIB_NET, __NR_sendmsg, 7U, CHAOS_INIT_HANDOVER_FLAGS, ARCH) == NOTIFY);
-    /* The handover descriptor is whichever the child has, a low one included. */
+    /* The handover fd is a build parameter, not a constant: a low fd (4) works, and the
+     * previous fd 1000 is then notified. */
     g_test_handover = 4;
     assert(decide(CHAOS_INIT_LIB_NET, __NR_sendmsg, 4U, CHAOS_INIT_HANDOVER_FLAGS, ARCH) == ALLOW);
     assert(
@@ -204,16 +235,18 @@ static void test_filter_decisions(void)
     );
     g_test_handover = 1000;
 
-    /* Another architecture passes, and so does the x32 ABI. */
+    /* chaos-init decodes only its native ABI: a foreign AUDIT_ARCH and, on x86_64, an
+     * x32 system call number (bit 30 set) pass unnotified. */
     assert(decide(CHAOS_INIT_LIB_NET, __NR_connect, 0U, 0U, 0x12345678U) == ALLOW);
 #ifdef __x86_64__
     assert(decide(CHAOS_INIT_LIB_NET, 0x40000000L | __NR_connect, 0U, 0U, ARCH) == ALLOW);
 #endif
 
-    /* Too little room is refused, not overrun. */
+    /* An output buffer too small for the program returns 0 rather than overrunning. */
     assert(chaos_init_build_filter(0x3fU, 4, small, sizeof(small) / sizeof(small[0])) == 0U);
 }
 
+/** @brief Wait status maps to the shell convention: exit status, or 128 + signal. */
 static void test_exit_code(void)
 {
     assert(chaos_init_exit_code(0) == 0);
@@ -222,10 +255,14 @@ static void test_exit_code(void)
     assert(chaos_init_exit_code(15) == 143);
 }
 
+/**
+ * @brief Caller-gone detection, the kernel >= 5.5 gate (seccomp user notification with
+ *        SECCOMP_USER_NOTIF_FLAG_CONTINUE), and the reason text for each install errno.
+ */
 static void test_kernel_and_reasons(void)
 {
-    /* Only ENOENT from NOTIF_ID_VALID means the thread is gone; any other error
-     * still gets the call answered. */
+    /* Only ENOENT from SECCOMP_IOCTL_NOTIF_ID_VALID means the caller is gone; any other
+     * error must still get the call answered, or the tracee would hang. */
     assert(chaos_init_caller_gone(ENOENT));
     assert(!chaos_init_caller_gone(EINVAL));
     assert(!chaos_init_caller_gone(ENOTTY));
@@ -246,6 +283,7 @@ static void test_kernel_and_reasons(void)
     assert(strcmp(chaos_init_unsupported_reason(EIO), "seccomp could not be installed") == 0);
 }
 
+/** @brief Status file text for active and unsupported states, and GODEBUG merging. */
 static void test_status_text(void)
 {
     char text[256];
@@ -264,11 +302,14 @@ static void test_status_text(void)
     );
     assert(strcmp(text, "state=unsupported\nreason=kernel older than 5.5\nlibs=net\npid=7\n") == 0);
     assert(chaos_init_format_status(tiny, sizeof(tiny), CHAOS_INIT_LIB_NET, NULL, 1L, 0) == 0U);
-    /* Multipath TCP turned off for the application: said when active. */
+    /* A too-small buffer returns 0 (above). When MPTCP was turned off for the
+     * application, the active status says so with `mptcp=off`. */
     assert(chaos_init_format_status(text, sizeof(text), CHAOS_INIT_LIB_NET, NULL, 1L, 1) > 0U);
     assert(strcmp(text, "state=active\nlibs=net\npid=1\nmptcp=off\n") == 0);
 
-    /* GODEBUG with MPTCP off: set, added to what is there, never over the user's. */
+    /* GODEBUG gets `multipathtcp=0` appended to existing settings; a user's own
+     * `multipathtcp=` setting (first, or after a comma) is left alone (returns 0), a
+     * key that merely ends in `multipathtcp` is not one, and an overflow returns 0. */
     {
         char value[32];
 
@@ -286,6 +327,7 @@ static void test_status_text(void)
     }
 }
 
+/** @brief PATH search for the command, with execvp(3) semantics where they matter. */
 static void test_find_command(void)
 {
     char path[256];
@@ -293,7 +335,7 @@ static void test_find_command(void)
 
     assert(chaos_init_find_command("sh", "/nonexistent:/bin:/usr/bin", path, sizeof(path)));
     assert(strcmp(path, "/bin/sh") == 0);
-    /* An empty entry is the current directory. */
+    /* An empty PATH entry is the current directory, and the result is the bare name. */
     {
         char here[256];
         FILE *file;
@@ -313,11 +355,12 @@ static void test_find_command(void)
     assert(!chaos_init_find_command("", NULL, path, sizeof(path)));
     assert(!chaos_init_find_command(NULL, NULL, path, sizeof(path)));
     assert(chaos_init_find_command("sh", NULL, path, sizeof(path)));
-    /* No room to write to. */
+    /* A name with '/' is used as is; an empty or NULL name, a too-small output, a NULL
+     * PATH (default search path) are covered above. No output buffer is refused. */
     assert(!chaos_init_find_command("sh", NULL, NULL, sizeof(path)));
     assert(!chaos_init_find_command("sh", NULL, path, 0U));
-    /* An entry whose joined path does not fit is skipped, not cut short: the next
-     * one that fits is found. */
+    /* A PATH entry whose joined path does not fit is skipped, never truncated into a
+     * different path; the next entry that fits is found. */
     {
         char small[12];
 
@@ -326,8 +369,8 @@ static void test_find_command(void)
         ));
         assert(strcmp(small, "/bin/sh") == 0);
     }
-    /* A regular file without execute permission is skipped, as execvp() skips it;
-     * when nothing else is found, the command is refused (EACCES), not missing. */
+    /* A regular file without execute permission is skipped, as execvp(3) skips it;
+     * when nothing else is found the result is -1 (refused, EACCES), not 0 (missing). */
     {
         FILE *file = fopen("/tmp/chaos-init-not-executable", "w");
 
@@ -340,6 +383,7 @@ static void test_find_command(void)
     }
 }
 
+/** @brief The queue of calls held back by LATENCY until their due time. */
 static void test_delays(void)
 {
     chaos_init_call_t call;
@@ -362,6 +406,9 @@ static void test_delays(void)
     call.args[0] = 5U;
     call.args[2] = 4096U;
 
+    /* next() reports the earliest due time; pop() releases due calls only, one per
+     * call and in no guaranteed order (8 and 9 are both due by 250); a full queue of
+     * CHAOS_INIT_MAX_DELAYED refuses the next add. */
     assert(chaos_init_delay_next(&due) == 0);
     assert(chaos_init_delay_pop(1000U, &id, &answer) == 0);
     assert(chaos_init_delay_add(7U, &call, 300U, &run) == 0);
@@ -388,8 +435,9 @@ static void test_delays(void)
     {
     }
 
-    /* A parked call a signal interrupted comes back under a new id: it keeps its
-     * due time and error. Another thread, call or argument is a new call. */
+    /* A parked call interrupted by a signal is re-notified under a new id; resume()
+     * matches it by tid, number and all six arguments and rebinds the id, keeping the
+     * due time and answer. A different tid, number or argument is a new call. */
     assert(chaos_init_delay_resume(&call, 20U) == 0);
     assert(chaos_init_delay_add(10U, &call, 500U, &eio) == 0);
     other = call;
@@ -407,7 +455,8 @@ static void test_delays(void)
     assert(chaos_init_delay_pop(500U, &id, &answer) == 1 && id == 22U && answer.error == EIO);
     assert(chaos_init_delay_next(&due) == 0);
 
-    /* What a delay ends in: its error, its value, or the call running. */
+    /* The answer sent when a delay expires, delay cleared: FAIL if an errno is set,
+     * else RETURN if the verdict carries a value, else PASS (the call runs). */
     {
         chaos_init_verdict_t verdict;
 
@@ -423,6 +472,7 @@ static void test_delays(void)
     }
 }
 
+/** @brief Tracee memory access and /proc parsing, with this process as the tracee. */
 static void test_memory_and_proc(void)
 {
     const long page = sysconf(_SC_PAGESIZE);
@@ -435,7 +485,8 @@ static void test_memory_and_proc(void)
     pid_t tgid = 0;
     uint64_t start = 0U;
 
-    /* Plain reads of this very process. */
+    /* Reads of this process: a fixed-size read, a string, a string longer than the
+     * buffer (ENAMETOOLONG), and a NULL address. */
     assert(
         chaos_init_read_memory(getpid(), (uintptr_t)text, out, 6U) == 0 &&
         memcmp(out, "chaos-", 6U) == 0
@@ -449,8 +500,10 @@ static void test_memory_and_proc(void)
     );
     assert(chaos_init_read_string(getpid(), 0U, out, sizeof(out)) == -1);
 
-    /* A string that ends right before an unmapped page is read; one that runs
-     * into it is not, and a partial read is an error. */
+    /* Page-boundary handling: string reads never cross into the next page unless the
+     * NUL was not found, so "end" just before a PROT_NONE page is read, while "endX"
+     * runs into it and fails. A fixed read straddling the page fails with EFAULT, even
+     * though process_vm_readv(2) returns a short count without setting errno. */
     assert(pages != MAP_FAILED && mprotect(pages + page, (size_t)page, PROT_NONE) == 0);
     memcpy(pages + page - 4, "end", 4U);
     assert(chaos_init_read_string(getpid(), (uintptr_t)(pages + page - 4), out, sizeof(out)) == 3);
@@ -461,7 +514,8 @@ static void test_memory_and_proc(void)
         chaos_init_read_memory(getpid(), (uintptr_t)(pages + page - 4), out, 8U) == -1 &&
         errno == EFAULT
     );
-    /* Writes: into this very process, and cut short by the unmapped page. */
+    /* Writes into this process; a write cut short by the PROT_NONE page, or to an
+     * unmapped address, fails with EFAULT. */
     assert(chaos_init_write_memory(getpid(), (uintptr_t)(pages + page - 8), "12345678", 8U) == 0);
     assert(memcmp(pages + page - 8, "12345678", 8U) == 0);
     errno = 0;
@@ -473,7 +527,8 @@ static void test_memory_and_proc(void)
     assert(chaos_init_write_memory(getpid(), 8U, "1", 1U) == -1 && errno == EFAULT);
     (void)munmap(pages, (size_t)page * 2U);
 
-    /* /proc links. */
+    /* /proc links: `cwd` resolves; a missing entry, a zero-size buffer and a name that
+     * overflows the 64-byte path buffer fail; reading a directory fails. */
     assert(getcwd(cwd, sizeof(cwd)) != NULL);
     assert(
         chaos_init_proc_link(getpid(), "cwd", link, sizeof(link)) == (long)strlen(cwd) &&
@@ -491,7 +546,9 @@ static void test_memory_and_proc(void)
     );
     assert(chaos_init_proc_read(getpid(), "fd", link, sizeof(link)) == -1); /* a directory */
 
-    /* The process of a thread and its start time; ended or malformed ones fail. */
+    /* Thread -> (tgid, start time from stat field 22). A gone pid, a status without
+     * Tgid, a truncated stat, a non-numeric field 22 fail. The comm field may contain
+     * ')' ("a) b"), so parsing starts at the last ')'. */
     assert(chaos_init_process_of(getpid(), &tgid, &start) == 0 && tgid == getpid() && start > 0U);
     assert(chaos_init_process_of(999999999, &tgid, &start) == -1);
     g_fake_status = "Name:\tx\n";
@@ -503,8 +560,10 @@ static void test_memory_and_proc(void)
     assert(chaos_init_process_of(getpid(), &tgid, &start) == -1);
     g_fake_stat = "12 (a) b) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242 99";
     assert(chaos_init_process_of(getpid(), &tgid, &start) == 0 && tgid == 12 && start == 4242U);
-    /* An execve keeps pid and start time; the start of code (26) and stack (28) tell
-     * the new image from the old. */
+    /* execve keeps pid and start time, so stat fields 26 (start of code) and 28 (start
+     * of stack) are mixed into the fingerprint: changing either changes it, changing
+     * another field (29) does not, and zeros (hidden by the kernel) leave the bare
+     * start time. */
     {
         uint64_t image;
 
@@ -527,7 +586,8 @@ static void test_memory_and_proc(void)
         g_fake_stat = "12 (x) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242 1 2 3 0 5 0 7";
         assert(chaos_init_process_of(getpid(), &tgid, &start) == 0 && start == 4242U);
     }
-    /* The parent of a process; none for one that is gone or a malformed status. */
+    /* PPid parsing: -1 for a gone process, a status without PPid, or a non-numeric
+     * PPid. Also a stat without any ')' fails process lookup. */
     assert(chaos_init_parent_of(999999999) == -1);
     g_fake_status = "Name:\tx\nTgid:\t12\nPPid:\t7\n";
     assert(chaos_init_parent_of(12) == 7);
@@ -538,19 +598,20 @@ static void test_memory_and_proc(void)
     g_fake_status = "Name:\tx\nTgid:\t12\n";
     g_fake_stat = "12 no-paren";
     assert(chaos_init_process_of(getpid(), &tgid, &start) == -1);
-    /* A Tgid that is no number; a process whose stat is gone by the time it is read. */
+    /* A non-numeric Tgid, and a Tgid whose stat vanished between the two reads. */
     g_fake_status = "Name:\tx\nTgid:\tx\n";
     assert(chaos_init_process_of(getpid(), &tgid, &start) == -1);
     g_fake_status = "Name:\tx\nTgid:\t999999999\n";
     g_fake_stat = NULL;
     assert(chaos_init_process_of(getpid(), &tgid, &start) == -1);
     g_fake_status = NULL;
-    /* The parent of this very process, and of one that is gone. */
+    /* Against the real /proc: this process's parent, and a gone pid. */
     assert(chaos_init_parent_of(getpid()) == getppid());
     assert(chaos_init_parent_of(999999999) == -1);
 }
 
-/* A library for the tracee table: two snapshots of rule texts. */
+/* A stand-in library for the tracee table, with room for 4 rules per process. The test
+ * edits `g_test_texts` and bumps `g_test_generation` to simulate a reload. */
 CHAOS_INIT_RULES_STORAGE(g_test_rules, 4U);
 static chaos_init_text_t g_test_texts[5];
 static size_t g_test_text_count = 0U;
@@ -577,7 +638,10 @@ static chaos_init_rules_t g_test_lib = {
     g_test_rules_file,
 };
 
-/** @brief The hits file of process @p tgid into @p out; 0 when there is none. */
+/**
+ * @brief Reads and deletes the hits file `/tmp/.chaos-inittest.hits.<tgid>`; returns 0
+ *        when it does not exist. Deleting makes the next call prove a fresh write.
+ */
 static int read_hits(pid_t tgid, char *out, size_t size)
 {
     char path[64];
@@ -597,6 +661,7 @@ static int read_hits(pid_t tgid, char *out, size_t size)
     return 1;
 }
 
+/** @brief Per-process entries, hit slots and hits files of the tracee table. */
 static void test_tracee_table(void)
 {
     chaos_init_rules_t too_many = g_test_lib;
@@ -606,6 +671,9 @@ static void test_tracee_table(void)
     int first;
     int index;
 
+    /* Registration refuses a library wider than CHAOS_INIT_MAX_RULES and more than
+     * CHAOS_INIT_MAX_LIBS libraries. Registering g_test_lib in all six slots is harmless:
+     * hit reports find the first. */
     too_many.max_rules = CHAOS_INIT_MAX_RULES + 1U;
     assert(chaos_init_tracee_register(&too_many) == -1);
     assert(chaos_init_tracee_register(&g_test_lib) == 0);
@@ -619,7 +687,8 @@ static void test_tracee_table(void)
     strcpy(g_test_texts[1], "/b:open:EIO:1.0");
     g_test_text_count = 2U;
 
-    /* One entry per process; an unknown thread has none. */
+    /* One entry per process: two threads of process 10 share it; an unresolvable tid
+     * gets none. */
     assert(chaos_init_tracee_of(0) == -1);
     g_fake_tgid[10] = 10;
     g_fake_start[10] = 5U;
@@ -627,25 +696,28 @@ static void test_tracee_table(void)
     g_fake_start[11] = 5U;
     first = chaos_init_tracee_of(10);
     assert(first >= 0 && chaos_init_tracee_of(11) == first);
-    /* Found by process without allocating; an entry knows its process. */
+    /* find() looks up by tgid without allocating; tgid 0 never matches a free entry. */
     assert(chaos_init_tracee_find(10) == first && chaos_init_tracee_tgid(first) == 10);
     assert(chaos_init_tracee_find(12) == -1 && chaos_init_tracee_find(0) == -1);
 
-    /* A hit is counted in the process's slot and written at once. */
+    /* A hit is counted in the process's slot and the hits file is written at once;
+     * slots exist only for the snapshot's 2 rules. */
     slot = chaos_init_tracee_slot(&g_test_lib, first, 1U);
     assert(slot != NULL && chaos_init_tracee_slot(&g_test_lib, first, 2U) == NULL);
     chaos_hit_record(slot);
     assert(read_hits(10, hits, sizeof(hits)));
     assert(strcmp(hits, "0\t/a:open:EIO:1.0\n1\t/b:open:EIO:1.0\n") == 0);
 
-    /* A reload keeps the count of a rule whose text stayed, wherever it moved. */
+    /* On reload a count follows its rule text (matched by hash), here from index 1 to
+     * index 0; a new text starts at 0. */
     strcpy(g_test_texts[0], "/b:open:EIO:1.0");
     strcpy(g_test_texts[1], "/c:open:EIO:1.0");
     ++g_test_generation;
     slot = chaos_init_tracee_slot(&g_test_lib, first, 0U);
     assert(slot->count == 1U && chaos_init_tracee_slot(&g_test_lib, first, 1U)->count == 0U);
 
-    /* After CHAOS_HITS_EAGER hits, writes wait for a flush. */
+    /* The first CHAOS_HITS_EAGER hits are written immediately; the next one only marks
+     * the entry pending until a flush. flush(1) also rewrites entries with any hits. */
     for (index = 1; index < (int)CHAOS_HITS_EAGER; ++index)
     {
         chaos_hit_record(slot);
@@ -659,7 +731,8 @@ static void test_tracee_table(void)
     chaos_init_tracee_flush(1);
     assert(read_hits(10, hits, sizeof(hits)));
 
-    /* The slot for a rule copy: of the snapshot's slots, for a known process. */
+    /* tracee_hit() maps a matched rule copy's snapshot slot to the caller's slot by
+     * index; a slot outside the snapshot, a NULL slot or an unresolvable tid gives NULL. */
     {
         chaos_hit_slot_t pool[2];
         chaos_hit_slot_t *snapshot[2] = {&pool[0], &pool[1]};
@@ -673,12 +746,14 @@ static void test_tracee_table(void)
         assert(chaos_init_tracee_hit(&g_test_lib, 0, snapshot, 2U, &pool[0]) == NULL);
     }
 
-    /* A slot of no registered library is ignored. */
+    /* A report from a slot outside every registered library's storage is ignored
+     * rather than indexing out of bounds. */
     memset(&foreign, 0, sizeof(foreign));
     foreign.report = chaos_init_tracee_report;
     chaos_hit_record(&foreign);
 
-    /* The pid of an ended process, now another one's: its counts start over. */
+    /* Pid reuse: process 10 gets a new start time. The old entry is dropped (its
+     * pending hits written first) and the new process starts from 0 under a new serial. */
     chaos_hit_record(slot);
     chaos_hit_record(slot); /* pending: written when the entry is dropped */
     {
@@ -687,11 +762,13 @@ static void test_tracee_table(void)
         g_fake_start[10] = 6U;
         g_fake_start[11] = 6U;
         assert(chaos_init_tracee_of(10) >= 0);
-        /* Another process holds the entry now: another serial. */
+        /* The serial distinguishes holders of the same entry and pid. */
         assert(chaos_init_tracee_serial(chaos_init_tracee_find(10)) != ended);
     }
     assert(chaos_init_tracee_slot(&g_test_lib, chaos_init_tracee_of(10), 0U)->count == 0U);
-    /* Its hits go to a file of its own; the ended one's file is kept. */
+    /* The new process does not overwrite the old process's hits file: since
+     * `.hits.10` exists, it gets a file numbered pid * 10^9 + salt. The old file holds
+     * the old process's final 67 hits (1 + 63 + 1 + 2 pending at drop). */
     chaos_hit_record(chaos_init_tracee_slot(&g_test_lib, chaos_init_tracee_of(10), 0U));
     {
         const long number = g_test_rules_file[chaos_init_tracee_of(10)];
@@ -703,7 +780,8 @@ static void test_tracee_table(void)
     }
     assert(read_hits(10, hits, sizeof(hits)) && strncmp(hits, "67\t", 3U) == 0);
 
-    /* A full table frees ended processes first... */
+    /* A full table (CHAOS_INIT_MAX_TRACEES = 128: process 10, 20..139, 140..146) first
+     * reclaims ended processes: process 30 ends and 150 takes its entry... */
     for (index = 0; index < (int)CHAOS_INIT_MAX_TRACEES - 1; ++index)
     {
         g_fake_tgid[20 + index % 100] = 0;
@@ -725,8 +803,9 @@ static void test_tracee_table(void)
     g_fake_tgid[150] = 150;
     g_fake_start[150] = 1U;
     assert(chaos_init_tracee_of(150) >= 0);
-    /* ...and when none ended, the one unused longest gives way: process 20, not
-     * process 10, which came first but has just been used again. */
+    /* ...and when none ended, the least recently used entry is evicted: process 20,
+     * not process 10, which was allocated first but has just been used again (its
+     * count survives at 2). */
     slot = chaos_init_tracee_slot(&g_test_lib, chaos_init_tracee_of(10), 0U);
     chaos_hit_record(slot);
     g_fake_tgid[151] = 151;
@@ -749,10 +828,9 @@ static void test_tracee_table(void)
         assert(g_chaos_init_tracees[index].tgid != 20);
     }
 
-    /* A full table with two ended processes frees both at once: one whose pid now
-     * has another start time, one whose pid is now a thread of another process.
-     * The new process takes the first entry, the next one the second, and no
-     * live process gives way. */
+    /* Reclaim frees every ended entry in one pass: 40 (pid reused, new start time)
+     * and 42 (pid now a thread of process 43). The next two processes take those
+     * entries in index order and no live process is evicted. */
     {
         const int reused = chaos_init_tracee_find(40);
         const int threaded = chaos_init_tracee_find(42);
@@ -770,12 +848,12 @@ static void test_tracee_table(void)
         assert(chaos_init_tracee_find(10) >= 0 && chaos_init_tracee_find(21) >= 0);
     }
 
-    /* A full flush writes the processes with hits only. */
+    /* flush(1) skips processes without hits: process 21 gets no hits file. */
     chaos_init_tracee_flush(1);
     assert(!read_hits(21, hits, sizeof(hits)));
 
-    /* A snapshot with more rules than the library has slots for: the first
-     * max_rules are counted and written, the rest are not. */
+    /* A snapshot with more rules (5) than the library's max_rules (4): the first 4 get
+     * slots and appear in the hits file, the fifth has no slot. */
     strcpy(g_test_texts[0], "/d0:open:EIO:1.0");
     strcpy(g_test_texts[1], "/d1:open:EIO:1.0");
     strcpy(g_test_texts[2], "/d2:open:EIO:1.0");

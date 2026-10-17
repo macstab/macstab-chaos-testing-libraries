@@ -1,67 +1,44 @@
 /**
  * @file test_chaos_dns.c
- * @brief Unit tests for the DNS-domain lookup wrapper: static helpers, passthrough
- *   paths, reverse-lookup paths, latency, GAI injection, REWRITE/SERVICE/OVERRIDE
- *   effects, and post-rule list operations.
+ * @brief Unit tests for the libchaos-dns wrappers: getaddrinfo, getnameinfo, freeaddrinfo and
+ *   the gethostbyname / gethostbyaddr families.
  *
- * Subsystem under test: `src/dns/chaos_dns_lookup.c`.
+ * @details
+ * Unit under test: `src/dns/chaos_dns_lookup.c` (with `chaos_dns_owned.c`). The suite proves
+ * the wrapper pipeline, not rule parsing or the effects themselves:
+ * - bypass: re-entrant calls (TLS guard), a NULL or empty name, a NULL address, an address
+ *   too short or of a family with no reverse key, and a NULL result pointer all go straight
+ *   to the real function;
+ * - order: LATENCY, then GAI (which skips the real resolver; EAI_SYSTEM sets errno EIO), then
+ *   REWRITE/SERVICE on the arguments, OVERRIDE or the real call, then FILTER_FAMILY, SHUFFLE
+ *   and LIMIT on the result; reverse lookups apply REWRITE/SERVICE to the outputs after a
+ *   successful real call, with EAI_OVERFLOW when the caller's buffer is too small;
+ * - OVERRIDE resolves each IP literal with the real getaddrinfo, copies all nodes into one
+ *   list of ours and releases the real results at once; the interposed freeaddrinfo frees
+ *   ours itself and hands every other list to the real function;
+ * - the hostent resolvers follow the same `dns://` / `rdns://` rules, map EAI codes to
+ *   h_errno, build entries from the getaddrinfo pipeline when a result-shaping rule matches,
+ *   and report ERANGE for a short caller buffer;
+ * - a rule that matches but does not fire changes nothing;
+ * - before the real functions are resolved every wrapper fails cleanly (EAI_SYSTEM or
+ *   NETDB_INTERNAL with errno ENOSYS) instead of calling through NULL.
  *
- * Coverage approach:
- * - `chaos_dns_lookup.c` is included directly after providing stub implementations of
- *   all config-match functions (`chaos_dns_config_match`, `chaos_dns_config_match_reverse`)
- *   and all action functions (`chaos_dns_rule_apply_latency`, `chaos_dns_rule_should_trigger`,
- *   `chaos_dns_rule_apply_gai`, `chaos_dns_filter_result_list`, `chaos_dns_shuffle_result_list`,
- *   `chaos_dns_limit_result_list`).
- * - `CHAOS_DNS_DEFINE_TEST_GLOBALS()` instantiates the real-function-pointer globals
- *   (`g_chaos_dns_real_getaddrinfo`, `g_chaos_dns_real_getnameinfo`,
- *   `g_chaos_dns_real_freeaddrinfo`).
- * - `g_stub_rules[8]` and `g_stub_match[8]` are indexed by `chaos_dns_effect_t` value,
- *   allowing tests to activate any single effect or combination of effects independently.
- * - `make_result_node(family)` allocates a minimal `struct addrinfo` with a corresponding
- *   `sockaddr_in` or `sockaddr_in6`, providing realistic linked-list input for post-rule tests.
- * - `chaos_dns_test_getaddrinfo` returns an AF_INET or AF_INET6 node depending on whether
- *   the node string contains a colon; it also supports per-call error injection via
- *   `g_real_getaddrinfo_error_call`.
- * - `chaos_dns_test_getnameinfo` captures the reverse query address and fills host/service
- *   with "localhost"/"http" on success.
- * - `chaos_dns_test_freeaddrinfo` properly releases nodes created by both `make_result_node`
- *   and `chaos_dns_test_getaddrinfo`.
- * - `reset_wrapper_state()` must be called before each test or scenario within a test to
- *   clear all call counters, stub tables, and function-pointer globals.
+ * Seams:
+ * - The config and action entry points the wrapper calls are defined here as stubs, driven
+ *   per effect by `g_stub_match[]` / `g_stub_rules[]` (indexed by `chaos_dns_effect_t`),
+ *   `g_should_trigger` (default 1) and `g_gai_trigger`. The transform stubs only count calls,
+ *   except FILTER_FAMILY drop-all and LIMIT 0/1, which reshape the list like the real ones,
+ *   including "unlink only" for lists of ours.
+ * - `CHAOS_DNS_DEFINE_TEST_GLOBALS()` provides the real-function pointers; each scenario wires
+ *   the ones it needs to local fakes. The fake getaddrinfo records its arguments and returns
+ *   one AF_INET6 node for a name containing ':' and one AF_INET node otherwise, failing with
+ *   `g_real_getaddrinfo_error` on every call or on call N; the fake getnameinfo records the
+ *   reverse key and answers "localhost"/"http"; the fake freeaddrinfo frees and counts nodes.
+ * - `reset_wrapper_state()` starts every scenario from no rules, no real functions and zero
+ *   counters, so scenarios do not leak state into each other.
  *
- * Properties under test:
- * - `chaos_dns_copy_output_text()`: copies on success; non-zero on buffer-too-short or
- *   nothing to copy.
- * - `chaos_dns_strip_ipv6_brackets()`: strips `[` and `]` from `[::1]`; passes through
- *   IPv4 strings unchanged; NULL input returns non-zero.
- * - `chaos_dns_reverse_query_from_sockaddr()`: extracts dotted-decimal IPv4 from sockaddr_in;
- *   fails when address_len < sizeof(sockaddr_in).
- * - `chaos_dns_literal_family()`: IPv4, IPv6 and non-literal text.
- * - `chaos_dns_call_real_getaddrinfo()` and `chaos_dns_call_real_getnameinfo()`: dispatch
- *   to the real stubs and return their values.
- * - `getaddrinfo` passthrough: NULL or empty node → real lookup; TLS guard set → bypass; NULL
- *   result pointer → accepted without crash.
- * - `getnameinfo` passthrough: TLS guard set → bypass; short address_len → bypass (cannot
- *   extract reverse-query address).
- * - `getnameinfo` LATENCY: latency applied; real call still made.
- * - `getnameinfo` GAI (EAI_FAIL): real call skipped; error returned.
- * - `getnameinfo` REWRITE + SERVICE: host and service output overwritten with rule text.
- * - `getnameinfo` REWRITE overflow: returns EAI_OVERFLOW when rule text exceeds host buffer.
- * - `getaddrinfo` LATENCY: latency applied; real call still made.
- * - `getaddrinfo` GAI (EAI_FAIL, EAI_AGAIN): real call skipped; error returned.
- * - `getaddrinfo` REWRITE + SERVICE: node and service arguments rewritten before real call.
- * - `getaddrinfo` OVERRIDE: two addresses parsed from comma-separated text, two real
- *   `getaddrinfo` calls made, result list has two nodes.
- * - `chaos_dns_apply_override()` with NULL rule → EAI_FAIL; partial error on second address
- *   allocation → EAI_AGAIN with partial list freed.
- * - FILTER_FAMILY with drop-all: result list freed; EAI_NONAME returned.
- * - SHUFFLE: shuffle stub called once.
- * - LIMIT (limit=1): limit stub called; result list truncated.
- *
- * What is NOT tested here:
- * - Constructor and symbol resolution (`chaos_dns_init()`).
- * - Config file parsing and rule matching (tested in test_dns_config.c).
- * - DNS action implementations (tested in test_dns_actions.c).
+ * Out of scope: symbol resolution (`test_dns_runtime.c`), rule parsing and matching
+ * (`test_dns_config.c`) and the effect implementations (`test_dns_actions.c`).
  */
 
 #include "../support/test_dns_support.h"
@@ -73,87 +50,44 @@
 
 CHAOS_DNS_DEFINE_TEST_GLOBALS();
 
-/**
- * @brief Per-effect rule table indexed by `chaos_dns_effect_t`.
- *
- * Tests set `g_stub_rules[effect]` and `g_stub_match[effect] = 1` to activate
- * a particular effect. The config-match stubs consult these arrays.
- */
+/** @brief Rule each config-match stub returns, indexed by `chaos_dns_effect_t`. */
 static chaos_dns_rule_t g_stub_rules[8];
-/**
- * @brief Per-effect match-enable flags indexed by `chaos_dns_effect_t`.
- *
- * Non-zero means `chaos_dns_config_match` and `chaos_dns_config_match_reverse`
- * return 1 and copy the corresponding rule for that effect.
- */
+/** @brief Non-zero makes the forward and reverse match stubs report a match for that effect. */
 static int g_stub_match[8];
-/** @brief Number of times `chaos_dns_rule_apply_latency` was called. */
+/** @brief Calls of the LATENCY stub (no sleep is performed). */
 static int g_latency_calls = 0;
-/**
- * @brief When non-zero, causes `chaos_dns_rule_apply_gai` to inject the rule's
- *   gai_error and return 1 (simulating a triggered GAI fault).
- */
+/** @brief Non-zero makes a matched GAI rule fire and report its `gai_error`. */
 static int g_gai_trigger = 0;
-/**
- * @brief Return value for `chaos_dns_rule_should_trigger`.
- *
- * Defaults to 1 (always triggered) so probability-gated effects fire unless
- * a test explicitly sets this to 0.
- */
+/** @brief Result of the should-trigger stub; 1 by default, 0 for "matched but not fired". */
 static int g_should_trigger = 1;
-/** @brief Number of times `chaos_dns_filter_result_list` was called. */
+/** @brief Calls of the FILTER_FAMILY stub. */
 static int g_filter_calls = 0;
-/**
- * @brief When non-zero, `chaos_dns_filter_result_list` frees the entire result
- *   list and sets `*result = NULL`, simulating a family-filter that drops all nodes.
- */
+/** @brief Non-zero makes the FILTER_FAMILY stub drop every node, as for a family-less answer. */
 static int g_filter_drop_all = 0;
-/** @brief Number of times `chaos_dns_shuffle_result_list` was called. */
+/** @brief Calls of the SHUFFLE stub. */
 static int g_shuffle_calls = 0;
-/** @brief Number of times `chaos_dns_limit_result_list` was called. */
+/** @brief Calls of the LIMIT stub. */
 static int g_limit_calls = 0;
-/** @brief Number of times `chaos_dns_test_getaddrinfo` was called. */
+/** @brief Calls of the fake real getaddrinfo. */
 static int g_real_getaddrinfo_calls = 0;
-/**
- * @brief Error code to return from `chaos_dns_test_getaddrinfo`.
- *
- * When non-zero and the call index matches `g_real_getaddrinfo_error_call`
- * (or `g_real_getaddrinfo_error_call == 0` meaning every call), the stub
- * returns this error instead of allocating a node.
- */
+/** @brief Non-zero: the fake real getaddrinfo fails with this EAI code (see next). */
 static int g_real_getaddrinfo_error = 0;
-/**
- * @brief Call index on which to inject `g_real_getaddrinfo_error`.
- *
- * 0 means inject on every call; N means inject only on the Nth call (by
- * `g_real_getaddrinfo_calls` value at entry time).
- */
+/** @brief 1-based call on which `g_real_getaddrinfo_error` applies; 0 means every call. */
 static int g_real_getaddrinfo_error_call = 0;
-/** @brief Number of times `chaos_dns_test_getnameinfo` was called. */
+/** @brief Calls of the fake real getnameinfo. */
 static int g_real_getnameinfo_calls = 0;
-/** @brief Error code to return from `chaos_dns_test_getnameinfo`. */
+/** @brief Non-zero: the fake real getnameinfo fails with this EAI code. */
 static int g_real_getnameinfo_error = 0;
-/** @brief Number of times `chaos_dns_test_freeaddrinfo` node-free loop iterated. */
+/** @brief Nodes released by the fake real freeaddrinfo (nodes, not calls). */
 static int g_real_freeaddrinfo_calls = 0;
-/** @brief Node argument captured from the most recent `chaos_dns_test_getaddrinfo` call. */
+/** @brief Name the fake real getaddrinfo last received; proves REWRITE reached it. */
 static char g_last_node[CHAOS_DNS_MAX_VALUE];
-/** @brief Service argument captured from the most recent `chaos_dns_test_getaddrinfo` call. */
+/** @brief Service the fake real getaddrinfo last received; proves SERVICE reached it. */
 static char g_last_service[CHAOS_DNS_MAX_VALUE];
-/**
- * @brief Dotted-decimal (or colon-hex) address captured by `chaos_dns_test_getnameinfo`.
- *
- * Used to verify that the getnameinfo wrapper passes the correct sockaddr to the real
- * function before applying any REWRITE override.
- */
+/** @brief Numeric address the fake real getnameinfo last received. */
 static char g_last_reverse_query[CHAOS_DNS_MAX_TEXT];
 
-/**
- * @brief Reset all wrapper-layer test state between test scenarios.
- *
- * Calls `chaos_dns_test_reset_runtime()` to clear runtime globals, then zeroes all
- * stub tables and local call counters. Called at the start of every test function and
- * at the beginning of each scenario within a test that changes the stub configuration.
- */
+/** @brief Clears every rule, flag, counter and real-function pointer; call per scenario. */
 static void reset_wrapper_state(void)
 {
     size_t index;
@@ -182,12 +116,7 @@ static void reset_wrapper_state(void)
     g_last_reverse_query[0] = '\0';
 }
 
-/**
- * @brief Stub for `chaos_dns_config_match()`.
- *
- * Returns 1 and copies the corresponding rule when `g_stub_match[effect] != 0`
- * and all parameters are valid. Returns 0 otherwise without modifying @p rule.
- */
+/** @brief Forward-match stub: the table entry for @p effect when enabled; the name is ignored. */
 int chaos_dns_config_match(chaos_dns_effect_t effect, const char *name, chaos_dns_rule_t *rule)
 {
     (void)name;
@@ -200,12 +129,7 @@ int chaos_dns_config_match(chaos_dns_effect_t effect, const char *name, chaos_dn
     return 1;
 }
 
-/**
- * @brief Stub for `chaos_dns_config_match_reverse()`.
- *
- * Identical gate logic to `chaos_dns_config_match`; the @p address argument is
- * unused because the test table is indexed by effect alone.
- */
+/** @brief Reverse-match stub: same table as the forward stub; the address is ignored. */
 int chaos_dns_config_match_reverse(
     chaos_dns_effect_t effect, const char *address, chaos_dns_rule_t *rule
 )
@@ -220,37 +144,21 @@ int chaos_dns_config_match_reverse(
     return 1;
 }
 
-/**
- * @brief Stub for `chaos_dns_rule_apply_latency()`.
- *
- * Increments the call counter to verify the wrapper invokes it when LATENCY
- * is matched. No actual sleep is performed.
- */
+/** @brief LATENCY stub: counts calls without sleeping. */
 void chaos_dns_rule_apply_latency(const chaos_dns_rule_t *rule)
 {
     assert(rule != NULL);
     ++g_latency_calls;
 }
 
-/**
- * @brief Stub for `chaos_dns_rule_should_trigger()`.
- *
- * Returns `g_should_trigger` (defaults to 1). Set to 0 to exercise the path
- * where a probabilistic rule is matched but does not fire.
- */
+/** @brief Should-trigger stub: returns `g_should_trigger` for every rule. */
 int chaos_dns_rule_should_trigger(const chaos_dns_rule_t *rule)
 {
     (void)rule;
     return g_should_trigger;
 }
 
-/**
- * @brief Stub for `chaos_dns_rule_apply_gai()`.
- *
- * When `g_gai_trigger != 0` and the rule has effect GAI with a non-NULL error
- * pointer, sets `*gai_error` to `rule->gai_error` and returns 1. Returns 0
- * otherwise so callers proceed to the real lookup.
- */
+/** @brief GAI stub: fires a GAI rule while `g_gai_trigger` is set, mirroring the real checks. */
 int chaos_dns_rule_apply_gai(const chaos_dns_rule_t *rule, int *gai_error)
 {
     if (rule == NULL || gai_error == NULL || rule->effect != CHAOS_DNS_EFFECT_GAI ||
@@ -263,11 +171,8 @@ int chaos_dns_rule_apply_gai(const chaos_dns_rule_t *rule, int *gai_error)
 }
 
 /**
- * @brief Stub for `chaos_dns_filter_result_list()`.
- *
- * Increments the call counter. When `g_filter_drop_all != 0`, frees the entire
- * list via the real freeaddrinfo stub and sets `*result = NULL`, returning 0.
- * Returns 1 (list retained) otherwise.
+ * @brief FILTER_FAMILY stub: counts calls; under `g_filter_drop_all` empties the list (freeing
+ *   real nodes, only unlinking ours, like the real filter) and returns 0.
  */
 int chaos_dns_filter_result_list(struct addrinfo **result, chaos_dns_family_filter_t family)
 {
@@ -275,7 +180,6 @@ int chaos_dns_filter_result_list(struct addrinfo **result, chaos_dns_family_filt
     ++g_filter_calls;
     if (g_filter_drop_all != 0 && result != NULL && *result != NULL)
     {
-        /* Like the real filter: a list of ours is only unlinked. */
         if (!chaos_dns_owned_contains(*result))
         {
             g_chaos_dns_real_freeaddrinfo(*result);
@@ -286,12 +190,7 @@ int chaos_dns_filter_result_list(struct addrinfo **result, chaos_dns_family_filt
     return 1;
 }
 
-/**
- * @brief Stub for `chaos_dns_shuffle_result_list()`.
- *
- * Increments the call counter without modifying the list. Tests use this to
- * confirm the wrapper calls the shuffler exactly once per successful lookup.
- */
+/** @brief SHUFFLE stub: counts calls and leaves the order alone, so results stay predictable. */
 void chaos_dns_shuffle_result_list(struct addrinfo **result)
 {
     (void)result;
@@ -299,18 +198,14 @@ void chaos_dns_shuffle_result_list(struct addrinfo **result)
 }
 
 /**
- * @brief Stub for `chaos_dns_limit_result_list()`.
- *
- * Increments the call counter. When `limit == 1` and the list has more than
- * one node, truncates the list to one node by freeing the tail, matching the
- * minimum useful limit behaviour for assertion purposes.
+ * @brief LIMIT stub: counts calls; limit 0 empties the list (only unlinking ours, like the real
+ *   LIMIT) and limit 1 frees everything after the head.
  */
 void chaos_dns_limit_result_list(struct addrinfo **result, unsigned int limit)
 {
     ++g_limit_calls;
     if (result != NULL && *result != NULL && limit == 0U)
     {
-        /* Like the real limit: a list of ours is only unlinked. */
         if (!chaos_dns_owned_contains(*result))
         {
             g_chaos_dns_real_freeaddrinfo(*result);
@@ -327,14 +222,10 @@ void chaos_dns_limit_result_list(struct addrinfo **result, unsigned int limit)
 }
 
 /**
- * @brief Allocate a minimal `struct addrinfo` node with a zeroed address structure.
+ * @brief Heap-allocates one unlinked addrinfo node with a zeroed address.
  *
- * Used to build realistic linked lists for post-rule tests. The caller is
- * responsible for freeing via `chaos_dns_test_freeaddrinfo`.
- *
- * @param family  `AF_INET` to create a `sockaddr_in`; any other value creates a
- *                `sockaddr_in6`.
- * @return Newly allocated node; asserts on allocation failure.
+ * @param family  `AF_INET` gets a `sockaddr_in`; any other value an AF_INET6 `sockaddr_in6`.
+ * @return The node; asserts on allocation failure. Release with chaos_dns_test_freeaddrinfo().
  */
 static struct addrinfo *make_result_node(int family)
 {
@@ -364,12 +255,8 @@ static struct addrinfo *make_result_node(int family)
 }
 
 /**
- * @brief Stub for the real `getaddrinfo(3)`.
- *
- * Captures @p node and @p service. Returns `g_real_getaddrinfo_error` when the
- * call index matches `g_real_getaddrinfo_error_call` (or the error is injected on
- * every call when `g_real_getaddrinfo_error_call == 0`). Otherwise allocates one
- * AF_INET6 node if @p node contains a colon, or one AF_INET node otherwise.
+ * @brief Fake real getaddrinfo: records name and service, applies the configured failure, and
+ *   otherwise returns one AF_INET6 node for a name containing ':' and one AF_INET node else.
  */
 static int chaos_dns_test_getaddrinfo(
     const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **result
@@ -411,11 +298,8 @@ static int chaos_dns_test_getaddrinfo(
 }
 
 /**
- * @brief Stub for the real `getnameinfo(3)`.
- *
- * Captures the numeric address from @p address via `inet_ntop` into
- * `g_last_reverse_query`. Returns `g_real_getnameinfo_error` if non-zero;
- * otherwise fills @p host with "localhost" and @p service with "http".
+ * @brief Fake real getnameinfo: records the numeric address (empty for an unusable one), then
+ *   fails with `g_real_getnameinfo_error` or answers "localhost" / "http".
  */
 static int chaos_dns_test_getnameinfo(
     const struct sockaddr *address,
@@ -473,13 +357,7 @@ static int chaos_dns_test_getnameinfo(
     return 0;
 }
 
-/**
- * @brief Stub for the real `freeaddrinfo(3)`.
- *
- * Walks the linked list, incrementing `g_real_freeaddrinfo_calls` per node,
- * and frees `ai_addr`, `ai_canonname`, and the node itself. Compatible with
- * nodes from both `make_result_node` and `chaos_dns_test_getaddrinfo`.
- */
+/** @brief Fake real freeaddrinfo: frees and counts every node of the list. */
 static void chaos_dns_test_freeaddrinfo(struct addrinfo *result)
 {
     while (result != NULL)
@@ -494,20 +372,20 @@ static void chaos_dns_test_freeaddrinfo(struct addrinfo *result)
     }
 }
 
-/** @brief Calls made to the stubbed real hostent resolvers. */
+/** @brief Calls of the four fake real hostent resolvers together. */
 static int g_real_hostent_calls = 0;
-/** @brief When non-zero, the stubbed real hostent resolvers report "not found". */
+/** @brief Non-zero makes the fake hostent resolvers report HOST_NOT_FOUND. */
 static int g_real_hostent_missing = 0;
-/** @brief `buffer_size` passed to the most recent stubbed gethostbyaddr_r call. */
+/** @brief Buffer size the fake gethostbyaddr_r last received; shows what REWRITE reserved. */
 static size_t g_real_hostent_buffer_size = 0U;
-/** @brief When non-zero, the stubbed gethostbyaddr_r fails with this return value. */
+/** @brief Non-zero makes the fake gethostbyaddr_r fail with this return value. */
 static int g_real_hostent_rc = 0;
-/** @brief The entry the stubbed non-reentrant resolvers return. */
+/** @brief Static entry the fake non-reentrant resolvers return. */
 static struct hostent g_real_hostent;
-/** @brief Name of the stubbed real entries. */
+/** @brief h_name of every entry the fakes return. */
 static char g_real_hostent_name[] = "real.example";
 
-/** @brief Stub for the real gethostbyname2(3). */
+/** @brief Fake real gethostbyname2. */
 static struct hostent *chaos_dns_test_gethostbyname2(const char *name, int family)
 {
     (void)name;
@@ -517,7 +395,7 @@ static struct hostent *chaos_dns_test_gethostbyname2(const char *name, int famil
     return g_real_hostent_missing ? NULL : &g_real_hostent;
 }
 
-/** @brief Stub for the real gethostbyname2_r(3). */
+/** @brief Fake real gethostbyname2_r. */
 static int chaos_dns_test_gethostbyname2_r(
     const char *name,
     int family,
@@ -544,7 +422,7 @@ static int chaos_dns_test_gethostbyname2_r(
     return 0;
 }
 
-/** @brief Stub for the real gethostbyaddr(3). */
+/** @brief Fake real gethostbyaddr. */
 static struct hostent *
 chaos_dns_test_gethostbyaddr(const void *address, socklen_t length, int family)
 {
@@ -556,7 +434,7 @@ chaos_dns_test_gethostbyaddr(const void *address, socklen_t length, int family)
     return g_real_hostent_missing ? NULL : &g_real_hostent;
 }
 
-/** @brief Stub for the real gethostbyaddr_r(3): names the entry "real.example". */
+/** @brief Fake real gethostbyaddr_r: records the buffer size and names the entry "real.example". */
 static int chaos_dns_test_gethostbyaddr_r(
     const void *address,
     socklen_t length,
@@ -599,29 +477,14 @@ static int chaos_dns_test_gethostbyaddr_r(
 #include "../../src/dns/chaos_dns_owned.c"
 
 /**
- * @brief Invariant: static helper functions enforce bounds and produce correct output.
+ * @brief Proves the bounded copy, bracket-strip, reverse-key and literal-family helpers, and
+ *   the dispatch to the real functions.
  *
- * Triggering conditions:
- * - `chaos_dns_copy_output_text()` with valid, too-long and NULL inputs.
- * - `chaos_dns_strip_ipv6_brackets()` with bracketed IPv6, plain IPv4, NULL, empty and
- *   too-long tokens.
- * - `chaos_dns_reverse_query_from_sockaddr()` with valid and too-short sockaddr_in and
- *   sockaddr_in6, NULL, and a family without addresses.
- * - `chaos_dns_literal_family()` tells IPv4 and IPv6 literals from names.
- * - `chaos_dns_call_real_getaddrinfo()` and `chaos_dns_call_real_getnameinfo()` dispatch
- *   correctly with call counters incremented.
- *
- * Expected observable behaviour:
- * - Too-long or missing input → non-zero return (0 for the sockaddr query).
- * - `copy_output_text("hello", buf, sizeof(buf))` → 0; buffer contains "hello".
- * - `strip_ipv6_brackets("[::1]", host, sizeof(host))` → 0; `strcmp(host, "::1") == 0`.
- * - `strip_ipv6_brackets("127.0.0.1", host, sizeof(host))` → 0; string unchanged.
- * - `strip_ipv6_brackets(NULL, ...)` → non-zero.
- * - `reverse_query_from_sockaddr` with valid AF_INET sockaddr → true; host == "127.0.0.1".
- * - `reverse_query_from_sockaddr` with `address_len == sizeof(sa_family_t)` → false.
- * - `append_result_list` twice → head non-NULL; head->ai_next non-NULL.
- * - `call_real_getaddrinfo` → 0; `g_real_getaddrinfo_calls == 1`.
- * - `call_real_getnameinfo` → 0; host == "localhost"; service == "http".
+ * @details Every helper that writes a caller buffer fails rather than truncates: a too-long
+ * text, a NULL source or target, or a zero size. `[::1]` loses its brackets and an IPv4
+ * literal passes unchanged; an address too long for 16 bytes fails with or without brackets.
+ * A reverse key comes only from a full-length `sockaddr_in` or `sockaddr_in6`; a short length,
+ * a NULL address or AF_UNIX yields none, so the wrapper bypasses the rules.
  */
 static void test_static_helpers(void)
 {
@@ -645,7 +508,6 @@ static void test_static_helpers(void)
     assert(strcmp(host, "127.0.0.1") == 0);
     assert(chaos_dns_strip_ipv6_brackets(NULL, host, sizeof(host)) != 0);
     assert(chaos_dns_strip_ipv6_brackets("", host, sizeof(host)) != 0);
-    /* Too long for the host buffer, with and without brackets. */
     assert(chaos_dns_strip_ipv6_brackets("[1111:2222:3333:4444::1]", host, sizeof(host)) != 0);
     assert(chaos_dns_strip_ipv6_brackets("1111:2222:3333:4444::1", host, sizeof(host)) != 0);
 
@@ -660,7 +522,6 @@ static void test_static_helpers(void)
     assert(!chaos_dns_reverse_query_from_sockaddr(
         (const struct sockaddr *)&ipv4, (socklen_t)sizeof(sa_family_t), host, sizeof(host)
     ));
-    /* Nothing to read, an IPv6 address whole or cut short, a family without addresses. */
     assert(!chaos_dns_reverse_query_from_sockaddr(NULL, (socklen_t)sizeof(ipv4), host, sizeof(host))
     );
     {
@@ -714,19 +575,11 @@ static void test_static_helpers(void)
 }
 
 /**
- * @brief Invariant: `getaddrinfo` bypasses chaos for NULL/empty node, re-entrant calls,
- *   and NULL result pointers.
+ * @brief Proves getaddrinfo goes straight to the real function for a NULL or empty name,
+ *   under the TLS guard, and with a NULL result pointer.
  *
- * Triggering conditions:
- * - `getaddrinfo(NULL, NULL, NULL, &result)`: no hostname — lookup passes through.
- * - `getaddrinfo("", NULL, NULL, &result)`: empty hostname — passes through.
- * - `getaddrinfo("api.example.com", ...)` with `g_chaos_dns_tls_guard = 1`: re-entrant bypass.
- * - `getaddrinfo("api.example.com", NULL, NULL, NULL)`: NULL result pointer — accepted.
- *
- * Expected observable behaviour:
- * - All four calls increment `g_real_getaddrinfo_calls` to 1, 2, 3, 4 respectively.
- * - No config-match call is issued for any of these paths.
- * - Memory returned by the stub is freed without crash.
+ * @details No rule is enabled, so a single real call per invocation is the only observable
+ * effect; the guard case proves the library's own lookups are never subject to its rules.
  */
 static void test_passthrough_paths(void)
 {
@@ -756,27 +609,18 @@ static void test_passthrough_paths(void)
 }
 
 /**
- * @brief Invariant: `getnameinfo` applies LATENCY, GAI, and REWRITE/SERVICE effects,
- *   and bypasses chaos for re-entrant or short-address calls.
+ * @brief Proves the getnameinfo pipeline: bypass, LATENCY, GAI, output REWRITE/SERVICE and
+ *   EAI_OVERFLOW.
  *
- * Triggering conditions:
- * - `getnameinfo(...)` with `g_chaos_dns_tls_guard = 1`: re-entrant bypass.
- * - `getnameinfo(...)` with `address_len == sizeof(sa_family_t)`: address too short
- *   to extract a numeric IP — bypass (no reverse-query match possible).
- * - `getnameinfo(...)` with LATENCY rule active.
- * - `getnameinfo(...)` with GAI rule active and `g_gai_trigger = 1`: returns EAI_FAIL.
- * - `getnameinfo(...)` with REWRITE + SERVICE rules: host and service overwritten.
- * - `getnameinfo(...)` with REWRITE text longer than host buffer (12 bytes): EAI_OVERFLOW.
- *
- * Expected observable behaviour:
- * - Guard bypass: `g_real_getnameinfo_calls == 1`; no stub-config calls.
- * - Short address bypass: `g_real_getnameinfo_calls == 2` (real call made despite bypass
- *   of chaos — address too short to reverse-match but getnameinfo itself still called).
- * - LATENCY: `g_latency_calls == 1`; `g_real_getnameinfo_calls == 1`.
- * - GAI: returns EAI_FAIL; `g_real_getnameinfo_calls == 0`.
- * - REWRITE + SERVICE: returns 0; `host == "ptr.example"`; `service == "redis"`;
- *   `g_last_reverse_query == "127.0.0.1"`.
- * - REWRITE overflow: returns EAI_OVERFLOW.
+ * @details
+ * - Under the TLS guard, and with an address too short to yield a reverse key, the real
+ *   function answers.
+ * - LATENCY delays and the real call still runs; GAI returns its code without a real call.
+ * - REWRITE and SERVICE replace the host and service the real call wrote; the reverse key
+ *   passed on is the numeric address.
+ * - A failed real lookup is returned unchanged and the caller's buffer is not written.
+ * - A replacement longer than the caller's host (12 bytes) or service (8 bytes) buffer
+ *   returns EAI_OVERFLOW, as the real getnameinfo does.
  */
 static void test_reverse_lookup_paths(void)
 {
@@ -884,7 +728,6 @@ static void test_reverse_lookup_paths(void)
     g_chaos_dns_real_getnameinfo = chaos_dns_test_getnameinfo;
     g_stub_match[CHAOS_DNS_EFFECT_REWRITE] = 1;
     g_stub_rules[CHAOS_DNS_EFFECT_REWRITE].effect = CHAOS_DNS_EFFECT_REWRITE;
-    /* A failed real lookup is returned as it is, no rule applied. */
     {
         char untouched[16] = "untouched";
 
@@ -908,7 +751,6 @@ static void test_reverse_lookup_paths(void)
         assert(strcmp(untouched, "untouched") == 0);
     }
 
-    /* A service name too long for the caller's buffer is EAI_OVERFLOW. */
     reset_wrapper_state();
     g_chaos_dns_real_getnameinfo = chaos_dns_test_getnameinfo;
     g_stub_match[CHAOS_DNS_EFFECT_SERVICE] = 1;
@@ -930,7 +772,6 @@ static void test_reverse_lookup_paths(void)
     g_chaos_dns_real_getnameinfo = chaos_dns_test_getnameinfo;
     g_stub_match[CHAOS_DNS_EFFECT_REWRITE] = 1;
     g_stub_rules[CHAOS_DNS_EFFECT_REWRITE].effect = CHAOS_DNS_EFFECT_REWRITE;
-    /* 24-byte string deliberately exceeds the 12-byte host buffer used below. */
     (void)memcpy(g_stub_rules[CHAOS_DNS_EFFECT_REWRITE].text, "name-too-long-for-buffer", 25U);
     assert(
         getnameinfo(
@@ -946,17 +787,11 @@ static void test_reverse_lookup_paths(void)
 }
 
 /**
- * @brief Invariant: `getaddrinfo` applies LATENCY and GAI effects correctly.
+ * @brief Proves getaddrinfo applies LATENCY before the lookup and GAI instead of it.
  *
- * Triggering conditions:
- * - `getaddrinfo("api.example.com", ...)` with LATENCY rule active.
- * - `getaddrinfo("api.example.com", ...)` with GAI rule (EAI_FAIL) and `g_gai_trigger = 1`.
- * - `getaddrinfo("api.example.com", ..., NULL)` (NULL result) with GAI rule (EAI_AGAIN).
- *
- * Expected observable behaviour:
- * - LATENCY: `g_latency_calls == 1`; real lookup still made; result non-NULL.
- * - GAI (EAI_FAIL): returns EAI_FAIL; `g_real_getaddrinfo_calls == 0`.
- * - GAI (EAI_AGAIN, NULL result): returns EAI_AGAIN; `g_real_getaddrinfo_calls == 0`.
+ * @details GAI returns EAI_FAIL or EAI_AGAIN with no real call, also for a NULL result
+ * pointer. GAI with EAI_SYSTEM sets errno to EIO: EAI_SYSTEM tells the caller to read errno,
+ * which must then hold a system error, not a stale value.
  */
 static void test_latency_and_gai_paths(void)
 {
@@ -992,7 +827,6 @@ static void test_latency_and_gai_paths(void)
     assert(getaddrinfo("api.example.com", NULL, NULL, NULL) == EAI_AGAIN);
     assert(g_real_getaddrinfo_calls == 0);
 
-    /* EAI_SYSTEM tells the caller to look at errno: it holds a system error. */
     reset_wrapper_state();
     g_chaos_dns_real_getaddrinfo = chaos_dns_test_getaddrinfo;
     g_chaos_dns_real_freeaddrinfo = chaos_dns_test_freeaddrinfo;
@@ -1007,20 +841,17 @@ static void test_latency_and_gai_paths(void)
 }
 
 /**
- * @brief Invariant: `getaddrinfo` rewrites the node and service arguments before the real
- *   call, and OVERRIDE builds a multi-address list from comma-separated addresses.
+ * @brief Proves REWRITE/SERVICE substitute the real call's arguments, and OVERRIDE returns one
+ *   list of ours that freeaddrinfo releases.
  *
- * Triggering conditions:
- * - `getaddrinfo("api.example.com", "443", ...)` with REWRITE ("alt.example.com") and
- *   SERVICE ("8443") rules active.
- * - `getaddrinfo("api.example.com", "443", ...)` with OVERRIDE rule containing
- *   "127.0.0.1,[::1]" (two addresses).
- *
- * Expected observable behaviour:
- * - REWRITE + SERVICE: `g_last_node == "alt.example.com"`; `g_last_service == "8443"`;
- *   real getaddrinfo called once; result non-NULL.
- * - OVERRIDE: `g_real_getaddrinfo_calls == 2` (one per parsed address);
- *   result is a two-node list (IPv4 + IPv6).
+ * @details
+ * - REWRITE and SERVICE: the real getaddrinfo receives "alt.example.com" and "8443".
+ * - OVERRIDE "127.0.0.1,[::1]": one real call per literal, a two-node list in one allocation
+ *   of ours, both real results already freed; freeaddrinfo() deregisters it.
+ * - With AI_CANONNAME the queried name becomes `ai_canonname`; an AF_INET6 hint skips the v4
+ *   literal, and a rule with only v4 literals then yields EAI_NONAME.
+ * - freeaddrinfo() hands a real list to the real function and tolerates NULL with no real
+ *   function resolved.
  */
 static void test_rewrite_service_and_override_paths(void)
 {
@@ -1050,13 +881,10 @@ static void test_rewrite_service_and_override_paths(void)
     assert(g_real_getaddrinfo_calls == 2);
     assert(result != NULL);
     assert(result->ai_next != NULL);
-    /* One list of ours; the real results were released at once. */
     assert(chaos_dns_owned_contains(result) && g_real_freeaddrinfo_calls == 2);
     freeaddrinfo(result);
     assert(!chaos_dns_owned_contains(result));
 
-    /* With AI_CANONNAME the queried name is the canonical name; the hints' family
-     * skips the other literals. */
     {
         struct addrinfo hints;
 
@@ -1071,7 +899,6 @@ static void test_rewrite_service_and_override_paths(void)
         assert(getaddrinfo("api.example.com", "443", &hints, &result) == EAI_NONAME);
     }
 
-    /* freeaddrinfo hands real results to the real freeaddrinfo. */
     g_real_freeaddrinfo_calls = 0;
     freeaddrinfo(make_result_node(AF_INET));
     assert(g_real_freeaddrinfo_calls == 1);
@@ -1080,23 +907,17 @@ static void test_rewrite_service_and_override_paths(void)
 }
 
 /**
- * @brief Invariant: `chaos_dns_apply_override` handles NULL and partial-error cases;
- *   FILTER_FAMILY drop-all returns EAI_NONAME; SHUFFLE and LIMIT stubs are invoked.
+ * @brief Proves OVERRIDE failure handling and the result-list transforms after the lookup.
  *
- * Triggering conditions:
- * - `chaos_dns_apply_override(NULL, NULL, NULL, &result)`: NULL rule → EAI_FAIL.
- * - `chaos_dns_apply_override` with a valid OVERRIDE rule but `g_real_getaddrinfo_error_call = 2`
- *   (second getaddrinfo call fails with EAI_AGAIN): partial list freed; error returned.
- * - `getaddrinfo("api.example.com", ...)` with FILTER_FAMILY rule and `g_filter_drop_all = 1`.
- * - `getaddrinfo("api.example.com", ...)` with SHUFFLE and LIMIT (limit=1) rules.
- *
- * Expected observable behaviour:
- * - NULL rule → EAI_FAIL (no crash).
- * - Partial error: `chaos_dns_apply_override` returns EAI_AGAIN;
- *   `g_real_freeaddrinfo_calls == 1` (first successful node freed).
- * - FILTER drop-all: `g_filter_calls == 1`; `getaddrinfo` returns EAI_NONAME; result == NULL.
- * - SHUFFLE + LIMIT: returns 0; `g_shuffle_calls == 1`; `g_limit_calls == 1`;
- *   result is a single-node list (LIMIT truncated it).
+ * @details
+ * - A NULL rule is EAI_FAIL. A failure resolving the second literal returns that error and
+ *   frees the first literal's result. A malformed list (empty element) is EAI_FAIL after
+ *   freeing what was resolved; so is a list of more than `CHAOS_DNS_MAX_OVERRIDE` (32)
+ *   literals, after freeing all 32.
+ * - FILTER_FAMILY that drops every node returns EAI_NONAME; FILTER_FAMILY ANY is not applied.
+ * - An OVERRIDE list emptied by FILTER_FAMILY or LIMIT 0 returns EAI_NONAME and its block is
+ *   freed: the registry of our lists is empty afterwards, so nothing leaks.
+ * - SHUFFLE and LIMIT each run once on a successful lookup.
  */
 static void test_override_error_and_post_rules(void)
 {
@@ -1116,11 +937,10 @@ static void test_override_error_and_post_rules(void)
     assert(chaos_dns_apply_override(&rule, "x", NULL, NULL, &result) == EAI_AGAIN);
     assert(g_real_freeaddrinfo_calls == 1);
 
-    /* A malformed literal list fails, also one longer than the rule allows. */
     (void)memcpy(rule.text, "1.1.1.1,,2.2.2.2", 17U);
     g_real_freeaddrinfo_calls = 0;
     assert(chaos_dns_apply_override(&rule, "x", NULL, NULL, &result) == EAI_FAIL);
-    assert(g_real_freeaddrinfo_calls == 1); /* the first literal's result */
+    assert(g_real_freeaddrinfo_calls == 1); /* first literal's result */
     (void)memset(rule.text, 0, sizeof(rule.text));
     {
         size_t index;
@@ -1146,13 +966,11 @@ static void test_override_error_and_post_rules(void)
     assert(getaddrinfo("api.example.com", NULL, NULL, &result) == EAI_NONAME);
     assert(g_filter_calls == 1);
 
-    /* FILTER_FAMILY any filters nothing: the lookup succeeds with its list. */
     g_stub_rules[CHAOS_DNS_EFFECT_FILTER_FAMILY].family = CHAOS_DNS_FAMILY_ANY;
     assert(getaddrinfo("api.example.com", NULL, NULL, &result) == 0 && result != NULL);
     assert(g_filter_calls == 1);
     chaos_dns_test_freeaddrinfo(result);
 
-    /* A list of ours that FILTER or LIMIT empties is freed as a whole. */
     g_stub_match[CHAOS_DNS_EFFECT_OVERRIDE] = 1;
     g_stub_rules[CHAOS_DNS_EFFECT_OVERRIDE].effect = CHAOS_DNS_EFFECT_OVERRIDE;
     (void)memcpy(g_stub_rules[CHAOS_DNS_EFFECT_OVERRIDE].text, "127.0.0.1", 10U);
@@ -1186,7 +1004,7 @@ static void test_override_error_and_post_rules(void)
     chaos_dns_test_freeaddrinfo(result);
 }
 
-/** @brief Wires every real resolver to the test stubs. */
+/** @brief Resets all state and wires every real resolver, hostent ones included, to the fakes. */
 static void bind_hostent_stubs(void)
 {
     reset_wrapper_state();
@@ -1203,14 +1021,14 @@ static void bind_hostent_stubs(void)
 }
 
 /**
- * @brief Invariant: the hostent helpers map errors and lay out entries correctly.
+ * @brief Proves the hostent helpers: EAI to h_errno mapping, entry layout, and reverse keys.
  *
- * Expected observable behaviour:
- * - EAI codes map to HOST_NOT_FOUND, TRY_AGAIN, NO_DATA and NO_RECOVERY.
- * - The entry holds the addresses of the requested family only, an empty alias list,
- *   and the canonical name of the first node (or the query); IPv6 uses 16-byte
- *   addresses; no matching address is ENOENT; a short buffer is ERANGE.
- * - Reverse keys are built for IPv4 and IPv6 only, from addresses of full length.
+ * @details EAI_NONAME, EAI_AGAIN and EAI_FAIL map to HOST_NOT_FOUND, TRY_AGAIN and NO_RECOVERY;
+ * EAI_NODATA and EAI_ADDRFAMILY (where the libc defines them) to NO_DATA. An entry holds only
+ * addresses of the requested family (4 or 16 bytes), skips nodes without an address, has an
+ * empty alias list, and is named after the first node's canonical name or else the query. No
+ * address of the family is ENOENT; a buffer too small, also after alignment from an odd start
+ * address, is ERANGE. Reverse keys come only from full-length AF_INET and AF_INET6 addresses.
  */
 static void test_hostent_helpers(void)
 {
@@ -1282,16 +1100,18 @@ static void test_hostent_helpers(void)
 }
 
 /**
- * @brief Invariant: the forward hostent resolvers follow the dns:// rules.
+ * @brief Proves gethostbyname, gethostbyname2 and their _r forms follow the `dns://` rules.
  *
- * Expected observable behaviour:
- * - Under the guard, without a name, without output pointers or without rules the
- *   real resolver answers.
- * - LATENCY is applied; GAI fails the lookup with the mapped h_errno.
- * - A result-shaping rule answers through the getaddrinfo pipeline: success, a
- *   resolver error (mapped h_errno), no address of the family (NO_DATA) and a short
- *   buffer (ERANGE).
- * - gethostbyname and gethostbyname_r are the AF_INET forms.
+ * @details
+ * - Under the guard, with a NULL or empty name, with a NULL result or h_error pointer, or with
+ *   no rule, the real resolver answers (10 real calls).
+ * - LATENCY applies and GAI fails the lookup with the mapped h_errno (EAI_AGAIN gives
+ *   TRY_AGAIN) without a real call.
+ * - A result-shaping rule (here REWRITE) answers through the getaddrinfo pipeline: the entry
+ *   keeps the queried name, the plain form returns the library's static entry, an AF_INET6
+ *   query with only v4 results is NO_DATA, an 8-byte buffer is ERANGE with errno ERANGE and
+ *   NETDB_INTERNAL, and a resolver error maps to HOST_NOT_FOUND.
+ * - OVERRIDE, FILTER_FAMILY, SHUFFLE and LIMIT each count as result-shaping.
  */
 static void test_forward_hostent_paths(void)
 {
@@ -1404,16 +1224,16 @@ static void test_forward_hostent_paths(void)
 }
 
 /**
- * @brief Invariant: the reverse hostent resolvers follow the rdns:// rules.
+ * @brief Proves gethostbyaddr and gethostbyaddr_r follow the `rdns://` rules.
  *
- * Expected observable behaviour:
- * - Under the guard, for an unsupported family or without output pointers the real
- *   resolver answers unchanged.
- * - GAI fails the lookup with the mapped h_errno.
- * - REWRITE replaces h_name: in the tail of the caller's buffer for the _r form (the
- *   real resolver gets the rest), in static storage for the plain form; a name longer
- *   than the buffer is ERANGE; a rule that does not fire or a failed lookup changes
- *   nothing.
+ * @details
+ * - Under the guard, for a family with no reverse key, or with a NULL result pointer, the
+ *   real resolver answers unchanged.
+ * - GAI fails the lookup with the mapped h_errno (EAI_FAIL gives NO_RECOVERY).
+ * - REWRITE stores the new h_name in the tail of the caller's buffer for the _r form and hands
+ *   the real resolver only the rest, so the two never overlap; the plain form uses static
+ *   storage. A 4-byte buffer is ERANGE. A failed real lookup, or a REWRITE that does not fire,
+ *   leaves the real answer and the full buffer.
  */
 static void test_reverse_hostent_paths(void)
 {
@@ -1514,26 +1334,24 @@ static void test_reverse_hostent_paths(void)
 }
 
 /**
- * @brief Invariant: rules that match but do not fire change nothing, short or missing
- *   addresses bypass the reverse rules, and the hostent and OVERRIDE paths handle a
- *   failing resolver, a full registry of our lists and a list of ours to release.
+ * @brief Proves matched-but-not-fired rules change nothing, and covers the remaining
+ *   getnameinfo, OVERRIDE and hostent edge paths.
  *
- * Expected observable behaviour:
- * - getaddrinfo with every rule matched but none firing: the real resolver gets the
- *   original name and service, no transform runs, no delay, the real list returns.
- * - FILTER_FAMILY that keeps nodes: the lookup succeeds with the filtered list.
- * - getnameinfo with no address, or an address shorter than its family field: the real
- *   call, nothing matched; with REWRITE/SERVICE/LATENCY/GAI matched but not firing: the
- *   real host and service; asked for only the service or only the host, the rule for
- *   that output alone is applied.
- * - OVERRIDE whose first literal fails to resolve: that error, the second literal never
- *   tried; OVERRIDE with the registry of our lists full: EAI_MEMORY, the partial result
- *   freed.
- * - gethostbyname2_r through OVERRIDE: the entry is built and our list released, not
- *   handed to the real freeaddrinfo.
- * - hostent prelude with LATENCY and GAI matched but not firing: the real resolver.
- * - gethostbyaddr_r without an h_error pointer: the rules are skipped; with no rule:
- *   the real entry; a real failure with a REWRITE: its return value, no rewrite.
+ * @details
+ * - Every effect matched, none firing: getaddrinfo passes the original name and service,
+ *   runs no transform and no delay; getnameinfo returns the real host and service.
+ * - getnameinfo with a NULL address or a 1-byte address calls the real function directly.
+ *   Asked only for the service, or only for the host (the other length 0), only the rule
+ *   for the requested output is applied.
+ * - FILTER_FAMILY that keeps nodes lets the lookup continue.
+ * - OVERRIDE whose first literal fails returns that error without trying the second.
+ * - OVERRIDE with all `CHAOS_DNS_MAX_OWNED` (256) registry slots taken returns EAI_MEMORY
+ *   after freeing both literals' results.
+ * - gethostbyname2_r through OVERRIDE releases our list itself; only the literal's real
+ *   result reaches the real freeaddrinfo, and the registry ends empty.
+ * - The hostent prelude with LATENCY and GAI not firing calls the real resolver.
+ * - gethostbyaddr_r without an h_error pointer skips the rules; a real failure (ERANGE) is
+ *   returned as is and REWRITE does not touch h_name.
  */
 static void test_rules_that_do_not_fire(void)
 {
@@ -1551,7 +1369,6 @@ static void test_rules_that_do_not_fire(void)
     int effect;
     size_t index;
 
-    /* Every rule matched, none fires. */
     reset_wrapper_state();
     g_chaos_dns_real_getaddrinfo = chaos_dns_test_getaddrinfo;
     g_chaos_dns_real_freeaddrinfo = chaos_dns_test_freeaddrinfo;
@@ -1593,7 +1410,6 @@ static void test_rules_that_do_not_fire(void)
     assert(strcmp(host, "localhost") == 0 && strcmp(service, "http") == 0);
     assert(g_latency_calls == 0);
 
-    /* No address, or one too short to hold its family: straight to the real call. */
     g_real_getnameinfo_calls = 0;
     g_should_trigger = 1;
     g_gai_trigger = 1;
@@ -1607,8 +1423,6 @@ static void test_rules_that_do_not_fire(void)
     assert(g_real_getnameinfo_calls == 2);
     assert(g_latency_calls == 0);
 
-    /* A caller that asks only for the service, or only for the host: the rule for
-     * the other output is not applied, the requested one is. */
     g_gai_trigger = 0;
     assert(
         getnameinfo(
@@ -1640,7 +1454,6 @@ static void test_rules_that_do_not_fire(void)
     );
     assert(strcmp(host, "alt.example") == 0);
 
-    /* FILTER_FAMILY that keeps nodes: the lookup goes on with them. */
     reset_wrapper_state();
     g_chaos_dns_real_getaddrinfo = chaos_dns_test_getaddrinfo;
     g_chaos_dns_real_freeaddrinfo = chaos_dns_test_freeaddrinfo;
@@ -1651,7 +1464,6 @@ static void test_rules_that_do_not_fire(void)
     assert(g_filter_calls == 1);
     chaos_dns_test_freeaddrinfo(result);
 
-    /* OVERRIDE: the first literal fails, the second is never tried. */
     reset_wrapper_state();
     g_chaos_dns_real_getaddrinfo = chaos_dns_test_getaddrinfo;
     g_chaos_dns_real_freeaddrinfo = chaos_dns_test_freeaddrinfo;
@@ -1665,7 +1477,6 @@ static void test_rules_that_do_not_fire(void)
     assert(g_real_getaddrinfo_calls == 1);
     assert(g_real_freeaddrinfo_calls == 0);
 
-    /* OVERRIDE with every slot for our lists taken: EAI_MEMORY, the partial freed. */
     g_real_getaddrinfo_error = 0;
     g_real_getaddrinfo_calls = 0;
     lists[0] = make_result_node(AF_INET);
@@ -1683,7 +1494,6 @@ static void test_rules_that_do_not_fire(void)
     }
     chaos_dns_test_freeaddrinfo(lists[0]);
 
-    /* A hostent answer built from a list of ours releases that list itself. */
     bind_hostent_stubs();
     g_stub_match[CHAOS_DNS_EFFECT_OVERRIDE] = 1;
     g_stub_rules[CHAOS_DNS_EFFECT_OVERRIDE].effect = CHAOS_DNS_EFFECT_OVERRIDE;
@@ -1694,13 +1504,12 @@ static void test_rules_that_do_not_fire(void)
         ) == 0
     );
     assert(entry_result == &entry && entry.h_addrtype == AF_INET);
-    assert(g_real_freeaddrinfo_calls == 1); /* the literal's partial, not our list */
+    assert(g_real_freeaddrinfo_calls == 1); /* literal's real result only */
     for (index = 0U; index < CHAOS_DNS_MAX_OWNED; ++index)
     {
         assert(g_chaos_dns_owned[index] == NULL);
     }
 
-    /* The hostent prelude with LATENCY and GAI matched but not firing. */
     bind_hostent_stubs();
     g_stub_match[CHAOS_DNS_EFFECT_LATENCY] = 1;
     g_stub_rules[CHAOS_DNS_EFFECT_LATENCY].effect = CHAOS_DNS_EFFECT_LATENCY;
@@ -1712,8 +1521,6 @@ static void test_rules_that_do_not_fire(void)
     assert(g_latency_calls == 0);
     assert(g_real_hostent_calls == 1);
 
-    /* gethostbyaddr_r: no h_errno pointer skips the rules; no rule, the real entry;
-     * a real failure keeps its return value and no rewrite is applied. */
     address.s_addr = htonl(INADDR_LOOPBACK);
     bind_hostent_stubs();
     g_stub_match[CHAOS_DNS_EFFECT_GAI] = 1;
@@ -1765,16 +1572,13 @@ static void test_rules_that_do_not_fire(void)
 }
 
 /**
- * @brief Invariant: a lookup whose real resolver is not resolved yet fails cleanly.
+ * @brief Proves every wrapper fails cleanly while its real function is unresolved (NULL), as
+ *   during symbol resolution itself; there is no syscall to fall back to.
  *
- * Triggering condition: every real-function pointer NULL, as during the symbol
- *   lookup itself; none of these functions has a system call to fall back to.
- *
- * Expected observable behaviour:
- * - getaddrinfo and getnameinfo return EAI_SYSTEM with errno ENOSYS.
- * - The _r hostent resolvers return ENOSYS with *result NULL and NETDB_INTERNAL;
- *   the others return NULL with h_errno NETDB_INTERNAL; errno is ENOSYS.
- * - freeaddrinfo leaves the list alone (nothing to free it with).
+ * @details getaddrinfo and getnameinfo return EAI_SYSTEM with errno ENOSYS. The _r hostent
+ * forms return ENOSYS with `*result` NULL and h_error NETDB_INTERNAL; the plain forms return
+ * NULL with h_errno NETDB_INTERNAL and errno ENOSYS. freeaddrinfo leaks the list rather than
+ * free it with an unknown allocator.
  */
 static void test_unresolved_fallbacks(void)
 {

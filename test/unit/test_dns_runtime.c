@@ -1,44 +1,34 @@
 /**
  * @file test_dns_runtime.c
- * @brief Unit tests for DNS-domain constructor initialisation, symbol resolution, and
- *   entropy seeding.
+ * @brief Unit tests for the libchaos-dns constructor: real-function resolution, seeding and
+ *   the start-up rule load.
  *
- * Subsystem under test: `src/dns/chaos_dns.c`
+ * @details
+ * Unit under test: `src/dns/chaos_dns.c`. The suite proves:
+ * - `chaos_dns_resolve_symbol()` stores the `dlsym(RTLD_NEXT)` result, clears a stale
+ *   `dlerror()` once first, never overwrites a pointer that is already set, and aborts when
+ *   dlsym returns NULL with a pending dlerror (no real function means no way to delegate);
+ * - seeding on Linux reads 8 bytes from `/dev/urandom` through raw `SYS_openat`/`SYS_read`/
+ *   `SYS_close` (no interposable libc wrapper), closes the fd on a short read, and falls back
+ *   to `0x6a09e667f3bcc909 ^ getpid()` when the open fails or the read is short; on other
+ *   platforms only a non-zero seed is asserted;
+ * - the constructor wires the real getaddrinfo/getnameinfo/freeaddrinfo, seeds the process
+ *   and main-thread PRNG, initialises the config module once and loads the rule file once, so
+ *   a bad rule file is reported at start-up rather than on the first lookup.
  *
- * Coverage approach:
- * - The production source file is included directly after replacing four symbols via
- *   `#define`: `dlsym`, `dlerror`, `abort`, and (Linux only) `syscall`. The replacements
- *   allow tests to control which symbols are "found", inject abort interception via
- *   `setjmp`/`longjmp`, and exercise the `/dev/urandom` seed path through a controllable
- *   syscall stub.
- * - `chaos_dns_config_init` is replaced with a local stub that counts calls; this decouples
- *   the runtime tests from config-subsystem behaviour.
- * - On Linux, the syscall stub handles `SYS_openat`, `SYS_read`, and `SYS_close`. It returns
- *   a fake fd (9), copies a fixed 64-bit seed into the read buffer, and counts each call.
- *   `g_force_open_fail` and `g_force_short_read` inject the two fallback paths.
- * - `reset_test_state()` zeroes all counters and flags before each test.
+ * Seams: the source is compiled into this file with `dlsym`, `dlerror`, `abort` and (Linux)
+ * `syscall` macro-redirected to local stubs:
+ * - the dlsym stub returns local stubs for the three resolver symbols and NULL for any other
+ *   name; `g_dlerror_text` decides whether that NULL is an error;
+ * - the abort stub `longjmp()`s back to the test when `g_expect_abort` is set and fails the
+ *   test otherwise;
+ * - the syscall stub returns fd 9 and the fixed seed `0x1122334455667788`, with
+ *   `g_force_open_fail` and `g_force_short_read` selecting the two fallback paths.
+ * `chaos_dns_config_init()` and `chaos_dns_config_prepare()` are replaced by counters, so no
+ * rule file is read.
  *
- * Properties under test:
- * - `chaos_dns_resolve_symbol`: successfully fills a function-pointer slot and calls
- *   `dlerror` exactly once (to consume any stale error string); NULL from dlsym + non-NULL
- *   dlerror triggers `abort`.
- * - `chaos_dns_read_seed_material` (Linux): normal path returns the fixed seed constant
- *   `0x1122334455667788` via exactly 1 open, 1 read, 1 close syscall.
- * - `chaos_dns_read_seed_material` (non-Linux): returns a non-zero value (platform entropy
- *   path not fully controlled; only non-zero is asserted).
- * - `chaos_dns_init` (constructor): all three real-function-pointer globals are wired to
- *   the stubs; `g_chaos_dns_process_seed` and `g_chaos_dns_tls_prng_state` are non-zero;
- *   `chaos_dns_config_init` is called exactly once more than before the call.
- * - Linux open-fail fallback: `chaos_dns_read_seed_material` returns a deterministic PID-
- *   derived fallback seed when `SYS_openat` fails; open called once, read/close not called.
- * - Linux short-read fallback: returns the same PID-derived seed when `SYS_read` returns
- *   fewer bytes than requested; open/read/close each called once.
- *
- * What is NOT tested here:
- * - Config file parsing and rule selection (tested in `test_dns_config.c`).
- * - DNS wrapper call paths that exercise getaddrinfo/getnameinfo interception (tested in
- *   `test_chaos_dns.c`).
- * - Action helpers (tested in `test_dns_actions.c`).
+ * Out of scope: rule parsing (`test_dns_config.c`), the interposed entry points
+ * (`test_chaos_dns.c`) and the effect helpers (`test_dns_actions.c`).
  */
 
 #include "../support/test_dns_support.h"
@@ -48,64 +38,42 @@
 #include <setjmp.h>
 #include <stdarg.h>
 
-/** @brief Number of times the `chaos_dns_config_init` stub has been called. */
+/** @brief Calls of the `chaos_dns_config_init()` stub. */
 static int g_config_init_calls = 0;
 
-/** @brief Number of times the `chaos_dns_config_prepare()` stub was called. */
+/** @brief Calls of the `chaos_dns_config_prepare()` stub (start-up rule loads). */
 static int g_config_prepare_calls = 0;
 
-/** @brief Number of times `chaos_dns_test_dlerror` has been invoked. */
+/** @brief Calls of the dlerror stub. */
 static int g_dlerror_calls = 0;
 
-/**
- * @brief Text returned by the dlerror stub; NULL means no error (symbol resolved OK).
- *
- * Set to a non-NULL string before resolving a missing symbol to trigger the abort path.
- */
+/** @brief Returned by the dlerror stub; non-NULL turns a NULL dlsym result into an abort. */
 static const char *g_dlerror_text = NULL;
 
-/** @brief setjmp environment used to capture the `abort` call in abort-path tests. */
+/** @brief Where the abort stub returns to when an abort is expected. */
 static jmp_buf g_abort_env;
 
-/**
- * @brief Non-zero when the test expects `abort` to be called.
- *
- * The abort stub calls `longjmp(g_abort_env, 1)` when set; otherwise it asserts to catch
- * unexpected aborts.
- */
+/** @brief Non-zero while a test expects abort(); otherwise abort() fails the test. */
 static int g_expect_abort = 0;
 
 #ifdef __linux__
-/** @brief Number of `SYS_openat` calls dispatched by the syscall stub. */
+/** @brief `SYS_openat` calls seen by the syscall stub. */
 static int g_syscall_open_calls = 0;
 
-/** @brief Number of `SYS_read` calls dispatched by the syscall stub. */
+/** @brief `SYS_read` calls seen by the syscall stub. */
 static int g_syscall_read_calls = 0;
 
-/** @brief Number of `SYS_close` calls dispatched by the syscall stub. */
+/** @brief `SYS_close` calls seen by the syscall stub. */
 static int g_syscall_close_calls = 0;
 
-/**
- * @brief When non-zero, the `SYS_openat` case in the syscall stub returns -1.
- *
- * Used to exercise the open-failure fallback path in `chaos_dns_read_seed_material`.
- */
+/** @brief Non-zero makes `SYS_openat` fail (no `/dev/urandom`). */
 static int g_force_open_fail = 0;
 
-/**
- * @brief When non-zero, the `SYS_read` case returns `sizeof(seed) - 1` (short read).
- *
- * Used to exercise the short-read fallback path in `chaos_dns_read_seed_material`.
- */
+/** @brief Non-zero makes `SYS_read` return 7 of 8 bytes, a short read. */
 static int g_force_short_read = 0;
 #endif
 
-/**
- * @brief Reset all test-state counters and flags to zero.
- *
- * Calls `chaos_dns_test_reset_runtime()` to clear PRNG and function-pointer globals, then
- * zeroes all local counters and flags.
- */
+/** @brief Clears real-function pointers, PRNG state, counters and fault flags. */
 static void reset_test_state(void)
 {
     chaos_dns_test_reset_runtime();
@@ -123,12 +91,7 @@ static void reset_test_state(void)
 #endif
 }
 
-/**
- * @brief Stub getaddrinfo that returns 0 (success) unconditionally.
- *
- * All parameters are ignored. Used as the resolved function pointer for the "getaddrinfo"
- * symbol in `chaos_dns_test_dlsym`.
- */
+/** @brief Real getaddrinfo handed out by the dlsym stub; only its address matters. */
 static int stub_getaddrinfo(
     const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **result
 )
@@ -140,12 +103,7 @@ static int stub_getaddrinfo(
     return 0;
 }
 
-/**
- * @brief Stub getnameinfo that returns 0 (success) unconditionally.
- *
- * All parameters are ignored. Used as the resolved function pointer for the "getnameinfo"
- * symbol in `chaos_dns_test_dlsym`.
- */
+/** @brief Real getnameinfo handed out by the dlsym stub; only its address matters. */
 static int stub_getnameinfo(
     const struct sockaddr *address,
     socklen_t address_len,
@@ -166,33 +124,19 @@ static int stub_getnameinfo(
     return 0;
 }
 
-/**
- * @brief Stub freeaddrinfo that does nothing.
- *
- * Used as the resolved function pointer for the "freeaddrinfo" symbol in
- * `chaos_dns_test_dlsym`.
- *
- * @param result  Ignored.
- */
+/** @brief Real freeaddrinfo handed out by the dlsym stub; only its address matters. */
 static void stub_freeaddrinfo(struct addrinfo *result)
 {
     (void)result;
 }
 
-/**
- * @brief Stub replacing `chaos_dns_config_init`; counts invocations.
- *
- * The production `chaos_dns.c` calls this during the constructor. The test asserts that the
- * count increases by exactly 1 per `chaos_dns_init()` call.
- */
+/** @brief Replaces the config module's initialiser; counts calls. */
 void chaos_dns_config_init(void)
 {
     ++g_config_init_calls;
 }
 
-/**
- * @brief Stub for `chaos_dns_config_prepare()`: counts the start-up load.
- */
+/** @brief Replaces the start-up rule load; counts calls and reports success. */
 int chaos_dns_config_prepare(void)
 {
     ++g_config_prepare_calls;
@@ -200,13 +144,10 @@ int chaos_dns_config_prepare(void)
 }
 
 /**
- * @brief Stub dlerror that counts calls and returns `g_dlerror_text`.
+ * @brief dlerror() replacement: counts calls and returns `g_dlerror_text`.
  *
- * The production resolve helper calls `dlerror()` once after `dlsym` to check for errors.
- * When `g_dlerror_text` is non-NULL, the production code treats it as a fatal resolution
- * failure and calls `abort`.
- *
- * @return `(char *)g_dlerror_text`.
+ * The resolver calls dlerror() once before dlsym to clear stale state and a second time only
+ * when dlsym returned NULL, so a successful resolution counts exactly 1 call.
  */
 static char *chaos_dns_test_dlerror(void)
 {
@@ -215,15 +156,12 @@ static char *chaos_dns_test_dlerror(void)
 }
 
 /**
- * @brief Stub dlsym that dispatches known symbols to test stubs and returns NULL otherwise.
+ * @brief dlsym() replacement: the three resolver stubs by name, NULL for anything else.
  *
- * Returns UB-safe function-pointer results via `CHAOS_DNS_TEST_DLSYM_RESULT` for
- * "getaddrinfo", "getnameinfo", and "freeaddrinfo". Any other symbol name returns NULL,
- * which combined with a non-NULL `g_dlerror_text` will trigger the abort path.
- *
- * @param handle  Ignored.
- * @param symbol  Symbol name to resolve.
- * @return Stub function pointer or NULL.
+ * `CHAOS_DNS_TEST_DLSYM_RESULT` converts the function pointer to `void *` through memcpy, the
+ * same representation dlsym() uses, without an ISO C function-to-object pointer cast. The
+ * gethostbyname2/gethostbyaddr families resolve to NULL with no dlerror, which the resolver
+ * stores as "absent" without aborting.
  */
 static void *chaos_dns_test_dlsym(void *handle, const char *symbol)
 {
@@ -240,18 +178,11 @@ static void *chaos_dns_test_dlsym(void *handle, const char *symbol)
 
 #ifdef __linux__
 /**
- * @brief Stub syscall for `SYS_openat`, `SYS_read`, and `SYS_close`.
+ * @brief syscall() replacement modelling `/dev/urandom` for the seed reader.
  *
- * `SYS_openat`: increments `g_syscall_open_calls`; returns -1 if `g_force_open_fail`, else 9.
- * `SYS_read`: increments `g_syscall_read_calls`; asserts fd==9 and size==sizeof(uint64_t);
- *   copies the fixed seed `0x1122334455667788` into the buffer; returns short if
- *   `g_force_short_read`, else full size.
- * `SYS_close`: increments `g_syscall_close_calls`; returns 0.
- * Any other number: returns -1.
- *
- * @param number  Linux syscall number.
- * @param ...     Variadic arguments matching the syscall ABI.
- * @return Syscall return value.
+ * `SYS_openat` returns fd 9, or -1 under `g_force_open_fail`. `SYS_read` asserts it reads
+ * exactly 8 bytes from fd 9, writes `0x1122334455667788`, and reports 7 bytes under
+ * `g_force_short_read`. `SYS_close` succeeds. Each is counted; any other number returns -1.
  */
 static long chaos_dns_test_syscall(long number, ...)
 {
@@ -298,11 +229,8 @@ static long chaos_dns_test_syscall(long number, ...)
 #endif
 
 /**
- * @brief Stub abort that longjmps when expected; hard-fails otherwise.
- *
- * When `g_expect_abort` is non-zero, calls `longjmp(g_abort_env, 1)` so the test can
- * verify that the abort path was reached without terminating the process. If abort is
- * called unexpectedly, the `assert(!"unexpected abort")` fires.
+ * @brief abort() replacement: `longjmp()`s to `g_abort_env` when expected, fails the test
+ *   otherwise, so the abort path is observable without killing the test process.
  */
 static void chaos_dns_test_abort(void)
 {
@@ -328,20 +256,13 @@ static void chaos_dns_test_abort(void)
 #undef dlsym
 
 /**
- * @brief Invariant: `chaos_dns_resolve_symbol` fills the function-pointer slot and
- *   calls `dlerror` exactly once; on non-Linux platforms `chaos_dns_read_seed_material`
- *   returns a non-zero value.
+ * @brief Proves symbol resolution fills an unset pointer once and the seed comes from
+ *   `/dev/urandom`.
  *
- * Triggering condition: `chaos_dns_resolve_symbol` with symbol "getaddrinfo"; then
- *   `chaos_dns_read_seed_material` (Linux: with full syscall trace; non-Linux: just
- *   non-zero check).
- *
- * Expected observable behaviour:
- * - After `resolve_symbol(&getaddrinfo_fn, "getaddrinfo")`:
- *   `getaddrinfo_fn == stub_getaddrinfo` and `g_dlerror_calls == 1`.
- * - Linux: `chaos_dns_read_seed_material()` == `0x1122334455667788`; open/read/close each
- *   called exactly once.
- * - Non-Linux: `chaos_dns_read_seed_material()` != 0 (platform source provides entropy).
+ * @details Resolving "getaddrinfo" stores the stub with one dlerror() call. Resolving into the
+ * now-set pointer with an unknown name changes nothing and calls neither dlsym nor dlerror:
+ * a pointer a harness or an earlier call wired is never replaced. On Linux the seed equals the
+ * 8 bytes read, through exactly one open, read and close; elsewhere it is only non-zero.
  */
 static void test_resolve_symbol_and_seed_helpers(void)
 {
@@ -352,7 +273,6 @@ static void test_resolve_symbol_and_seed_helpers(void)
     assert(getaddrinfo_fn == stub_getaddrinfo);
     assert(g_dlerror_calls == 1);
 
-    /* A pointer that is already wired is left alone: no dlsym, no dlerror. */
     chaos_dns_resolve_symbol(&getaddrinfo_fn, "missing-symbol");
     assert(getaddrinfo_fn == stub_getaddrinfo);
     assert(g_dlerror_calls == 1);
@@ -368,18 +288,11 @@ static void test_resolve_symbol_and_seed_helpers(void)
 }
 
 /**
- * @brief Invariant: `chaos_dns_resolve_symbol` calls `abort` when dlsym returns NULL and
- *   dlerror returns a non-NULL error string.
+ * @brief Proves a failed lookup (dlsym NULL with a pending dlerror) aborts the process.
  *
- * Triggering condition: `g_dlerror_text = "missing"` and `g_expect_abort = 1` before
- *   calling `chaos_dns_resolve_symbol` with a symbol name not handled by the dlsym stub.
- *   A `setjmp` guard captures the `longjmp` from the abort stub.
- *
- * Expected observable behaviour:
- * - Control transfers to the `setjmp` guard (the `assert(0 && ...)` after the call is never
- *   reached).
- * - `g_expect_abort` is cleared after the test to prevent the next test from misinterpreting
- *   any subsequent abort call.
+ * @details libchaos-dns fails closed here: without the real function no wrapper could
+ * delegate. The abort stub `longjmp()`s back past the call, so reaching the assertion after
+ * it means abort() was not called.
  */
 static void test_resolve_symbol_abort_path(void)
 {
@@ -398,18 +311,11 @@ static void test_resolve_symbol_abort_path(void)
 
 #ifdef __linux__
 /**
- * @brief Invariant: `chaos_dns_read_seed_material` returns a deterministic PID-derived
- *   fallback seed when the `/dev/urandom` open or read fails.
+ * @brief Proves the seed falls back to `0x6a09e667f3bcc909 ^ getpid()` when `/dev/urandom`
+ *   cannot be opened or returns a short read (Linux only).
  *
- * Triggering condition (Linux only):
- * 1. `g_force_open_fail = 1` — SYS_openat returns -1; read and close are never invoked.
- * 2. `g_force_short_read = 1` — SYS_openat succeeds; SYS_read returns fewer bytes than
- *    requested.
- *
- * Expected observable behaviour:
- * - In both cases the return value equals `0x6a09e667f3bcc909 ^ (uint64_t)getpid()`.
- * - Open-fail: open_calls=1, read_calls=0, close_calls=0.
- * - Short-read: open_calls=1, read_calls=1, close_calls=1.
+ * @details A failed open performs no read and no close. A short read still closes the fd,
+ * so a process without full entropy does not leak a descriptor per seeding.
  */
 static void test_seed_fallback_paths(void)
 {
@@ -432,18 +338,12 @@ static void test_seed_fallback_paths(void)
 #endif
 
 /**
- * @brief Invariant: `chaos_dns_init` wires all three real-function-pointer globals, seeds
- *   the PRNG, and calls `chaos_dns_config_init` exactly once.
+ * @brief Proves the constructor resolves the real functions, seeds both PRNG states, and
+ *   initialises and loads the configuration exactly once each.
  *
- * Triggering condition: `chaos_dns_init()` called after `reset_test_state()`.
- *
- * Expected observable behaviour:
- * - `g_chaos_dns_real_getaddrinfo == stub_getaddrinfo`.
- * - `g_chaos_dns_real_getnameinfo == stub_getnameinfo`.
- * - `g_chaos_dns_real_freeaddrinfo == stub_freeaddrinfo`.
- * - `g_chaos_dns_process_seed != 0`.
- * - `g_chaos_dns_tls_prng_state != 0`.
- * - `g_config_init_calls` increased by exactly 1.
+ * @details The run-once guard is reset first because the constructor has already run when
+ * this binary was loaded; without the reset `chaos_dns_ensure_symbols()` would do nothing and
+ * the pointers cleared by `reset_test_state()` would stay NULL.
  */
 static void test_constructor_init(void)
 {
@@ -459,7 +359,6 @@ static void test_constructor_init(void)
     assert(g_chaos_dns_real_getnameinfo == stub_getnameinfo);
     assert(g_chaos_dns_real_freeaddrinfo == stub_freeaddrinfo);
     assert(g_config_init_calls == config_calls_before + 1);
-    /* The constructor loads the rules at once so a bad rule file is reported. */
     assert(g_config_prepare_calls == prepare_calls_before + 1);
     assert(g_chaos_dns_process_seed != 0U);
     assert(g_chaos_dns_tls_prng_state != 0U);

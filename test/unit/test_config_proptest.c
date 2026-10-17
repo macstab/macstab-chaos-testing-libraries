@@ -1,44 +1,36 @@
 /**
  * @file test_config_proptest.c
- * @brief Property-based round-trip and robustness tests for the IO config parser.
+ * @brief Property tests for the libchaos-io rule line parser: valid lines round-trip into
+ *        the rule struct, blank and comment lines yield no rule, malformed lines are
+ *        rejected, and arbitrary bytes never break it.
  *
- * Subsystem under test: `src/config/chaos_io_config.c` (parse_line only).
+ * @details Unit under test: `chaos_io_config_parse_line()` in
+ * `src/config/chaos_io_config.c`, compiled in by `#include`. Grammar of a rule line:
+ * `<path_prefix>:<operation>:<effect>:<param>`, where `<effect>` is an accepted errno name
+ * (ERRNO effect) or LATENCY, TORN, CORRUPT, and `<param>` is a probability in [0, 1]
+ * (milliseconds for LATENCY). The parser is pure string processing on a mutable buffer,
+ * so no rule file and no wrapper is involved.
  *
- * IO config rule format (four colon-delimited fields):
- *   <path_prefix> : <operation> : <effect_or_errno> : <param>
- * where effect_or_errno is either an errno name (EIO, ENOSPC, …) for the ERRNO
- * effect, or "LATENCY", "TORN", "CORRUPT".  The fourth field is either a
- * probability [0.0, 1.0] or a latency in milliseconds.
+ * Properties:
+ * 1. Round-trip: every field of a known-valid line lands in the rule (operation, effect,
+ *    errnum, probability, latency, path prefix and its length), for all four effects.
+ * 2. No-rule lines: empty, whitespace-only and `#` comment lines return 0, not 1 or -1,
+ *    so they neither add a rule nor reject the file.
+ * 3. Robustness: 2000 strings of 0..510 random bytes from a fixed-seed xorshift64 always
+ *    return -1, 0 or 1; a returned rule satisfies the struct invariants. Out-of-bounds
+ *    access is caught only when this test runs under the ASan/UBSan builds.
+ * 4. Rejection: NULL, too few fields, unknown operation or effect, an errno name outside
+ *    the accepted list (EINVAL), probability > 1, TORN on a read, CORRUPT on a write.
  *
- * Three property classes are verified:
- *
- *  1. Round-trip: construct a known-valid config line string, call parse_line,
- *     assert every field in the returned rule matches the constructed input.
- *     Covers ERRNO, LATENCY, TORN, and CORRUPT effects with multiple operations
- *     and probability values.
- *
- *  2. Blank/comment identity: blank lines and comment lines must return 0
- *     (not 1 and not -1).  This is an algebraic identity: a zero-rule config
- *     is behaviourally equivalent to no LD_PRELOAD at all.
- *
- *  3. Robustness: a deterministic pseudo-random byte generator produces 2000
- *     random strings of lengths 0..511.  parse_line must return 1, 0, or -1
- *     without crashing, accessing out-of-bounds memory, or invoking undefined
- *     behaviour.  When return value is 1, basic invariants on the rule struct
- *     are checked.
- *
- *  4. Rejected inputs: a set of structurally invalid lines must all return -1.
- *
- * The IO config parser is used as the representative case; all six parsers
- * share the same structural grammar so the properties hold for the other five
- * domains by construction.
+ * Scope: libchaos-io only. The other libraries' rule grammars differ in field count and
+ * semantics and have their own config suites.
  */
 
 #include "../support/test_support.h"
 
 CHAOS_IO_DEFINE_TEST_GLOBALS();
 
-/* parse_line is pure string parsing — no I/O globals are called. */
+/* parse_line touches no file and calls no real function; the globals only satisfy the link. */
 
 #include "../../src/config/chaos_io_config.c"
 
@@ -48,7 +40,7 @@ CHAOS_IO_DEFINE_TEST_GLOBALS();
 #include <stdint.h>
 #include <string.h>
 
-/* ---- deterministic PRNG (xorshift64) ------------------------------------ */
+/* ---- fixed-seed xorshift64: failures reproduce bit for bit ---------------- */
 
 static uint64_t g_prng = 0xdeadbeefcafe1234ULL;
 
@@ -62,13 +54,13 @@ static uint64_t prng_next(void)
 
 /* ---- Property 1: round-trip --------------------------------------------- */
 
+/** @brief ERRNO with the `*` prefix at probability 1.0 round-trips exactly. */
 static void test_roundtrip_errno_wildcard(void)
 {
     chaos_io_rule_t rule;
     char line[256];
     int rc;
 
-    /* *:read:EIO:1.0  (wildcard path, 100% probability) */
     snprintf(line, sizeof(line), "*:read:EIO:1.0");
     rc = chaos_io_config_parse_line(line, &rule);
     assert(rc == 1);
@@ -79,13 +71,16 @@ static void test_roundtrip_errno_wildcard(void)
     assert(strcmp(rule.path_prefix, "*") == 0);
 }
 
+/**
+ * @brief ERRNO with a path prefix records the prefix and its length; fractional
+ *        probabilities are compared within +-0.001 to tolerate binary rounding.
+ */
 static void test_roundtrip_errno_path_with_probability(void)
 {
     chaos_io_rule_t rule;
     char line[256];
     int rc;
 
-    /* /var/lib/postgresql:fsync:EIO:0.05 */
     snprintf(line, sizeof(line), "/var/lib/postgresql:fsync:EIO:0.05");
     rc = chaos_io_config_parse_line(line, &rule);
     assert(rc == 1);
@@ -96,7 +91,6 @@ static void test_roundtrip_errno_path_with_probability(void)
     assert(strcmp(rule.path_prefix, "/var/lib/postgresql") == 0);
     assert(rule.path_len == strlen("/var/lib/postgresql"));
 
-    /* wildcard write ENOSPC 20% */
     snprintf(line, sizeof(line), "*:write:ENOSPC:0.2");
     rc = chaos_io_config_parse_line(line, &rule);
     assert(rc == 1);
@@ -106,13 +100,13 @@ static void test_roundtrip_errno_path_with_probability(void)
     assert(rule.probability >= 0.199 && rule.probability <= 0.201);
 }
 
+/** @brief LATENCY takes milliseconds, not a probability, in the fourth field. */
 static void test_roundtrip_latency(void)
 {
     chaos_io_rule_t rule;
     char line[256];
     int rc;
 
-    /* *:write:LATENCY:100 */
     snprintf(line, sizeof(line), "*:write:LATENCY:100");
     rc = chaos_io_config_parse_line(line, &rule);
     assert(rc == 1);
@@ -120,7 +114,6 @@ static void test_roundtrip_latency(void)
     assert(rule.effect == CHAOS_IO_EFFECT_LATENCY);
     assert(rule.latency_ms == 100U);
 
-    /* /data:pread:LATENCY:250 */
     snprintf(line, sizeof(line), "/data:pread:LATENCY:250");
     rc = chaos_io_config_parse_line(line, &rule);
     assert(rc == 1);
@@ -129,13 +122,13 @@ static void test_roundtrip_latency(void)
     assert(rule.operation == CHAOS_IO_OP_PREAD);
 }
 
+/** @brief TORN on a write-class operation is accepted with its probability. */
 static void test_roundtrip_torn(void)
 {
     chaos_io_rule_t rule;
     char line[256];
     int rc;
 
-    /* *:write:TORN:0.1 */
     snprintf(line, sizeof(line), "*:write:TORN:0.1");
     rc = chaos_io_config_parse_line(line, &rule);
     assert(rc == 1);
@@ -144,13 +137,13 @@ static void test_roundtrip_torn(void)
     assert(rule.probability >= 0.099 && rule.probability <= 0.101);
 }
 
+/** @brief CORRUPT on a read-class operation is accepted with its probability. */
 static void test_roundtrip_corrupt(void)
 {
     chaos_io_rule_t rule;
     char line[256];
     int rc;
 
-    /* *:read:CORRUPT:0.3 */
     snprintf(line, sizeof(line), "*:read:CORRUPT:0.3");
     rc = chaos_io_config_parse_line(line, &rule);
     assert(rc == 1);
@@ -159,31 +152,29 @@ static void test_roundtrip_corrupt(void)
     assert(rule.probability >= 0.299 && rule.probability <= 0.301);
 }
 
+/** @brief Probability bounds 0 and 1 are inclusive, in decimal and integer form. */
 static void test_roundtrip_probability_boundaries(void)
 {
     chaos_io_rule_t rule;
     char line[256];
     int rc;
 
-    /* probability 0.0 */
     snprintf(line, sizeof(line), "*:read:EIO:0.0");
     rc = chaos_io_config_parse_line(line, &rule);
     assert(rc == 1);
     assert(rule.probability == 0.0);
 
-    /* probability 1.0 */
     snprintf(line, sizeof(line), "*:read:EIO:1.0");
     rc = chaos_io_config_parse_line(line, &rule);
     assert(rc == 1);
     assert(rule.probability == 1.0);
 
-    /* probability 0 (integer form) */
+    /* Integer forms. */
     snprintf(line, sizeof(line), "*:read:EIO:0");
     rc = chaos_io_config_parse_line(line, &rule);
     assert(rc == 1);
     assert(rule.probability == 0.0);
 
-    /* probability 1 (integer form) */
     snprintf(line, sizeof(line), "*:read:EIO:1");
     rc = chaos_io_config_parse_line(line, &rule);
     assert(rc == 1);
@@ -192,34 +183,34 @@ static void test_roundtrip_probability_boundaries(void)
 
 /* ---- Property 2: blank / comment identity ------------------------------- */
 
+/** @brief Lines without a rule return 0, including comments after leading whitespace. */
 static void test_blank_comment_identity(void)
 {
     chaos_io_rule_t rule;
     char line[256];
 
-    /* empty string */
     snprintf(line, sizeof(line), "%s", "");
     assert(chaos_io_config_parse_line(line, &rule) == 0);
 
-    /* spaces only */
     snprintf(line, sizeof(line), "   ");
     assert(chaos_io_config_parse_line(line, &rule) == 0);
 
-    /* tabs */
     snprintf(line, sizeof(line), "\t\t");
     assert(chaos_io_config_parse_line(line, &rule) == 0);
 
-    /* hash comment */
     snprintf(line, sizeof(line), "# this is a comment");
     assert(chaos_io_config_parse_line(line, &rule) == 0);
 
-    /* hash with leading whitespace */
     snprintf(line, sizeof(line), "   # indented comment");
     assert(chaos_io_config_parse_line(line, &rule) == 0);
 }
 
 /* ---- Property 3: robustness against random input ------------------------ */
 
+/**
+ * @brief Arbitrary bytes (embedded NULs shorten the string, high bytes included) never
+ *        produce an out-of-range return or an inconsistent rule.
+ */
 static void test_robustness(void)
 {
     char buf[512];
@@ -237,10 +228,9 @@ static void test_robustness(void)
 
         rc = chaos_io_config_parse_line(buf, &rule);
 
-        /* Must return one of: 1 (parsed), 0 (blank/comment), -1 (invalid). */
         assert(rc >= -1 && rc <= 1);
 
-        /* When a rule is returned, its fields must satisfy invariants. */
+        /* A returned rule is internally consistent. */
         if (rc == 1)
         {
             assert(rule.operation != CHAOS_IO_OP_INVALID);
@@ -253,43 +243,39 @@ static void test_robustness(void)
 
 /* ---- Property 4: invalid inputs → -1 ----------------------------------- */
 
+/** @brief Structurally or semantically invalid lines return -1 (the file is rejected). */
 static void test_invalid_inputs(void)
 {
     chaos_io_rule_t rule;
     char line[256];
 
-    /* NULL line */
     assert(chaos_io_config_parse_line(NULL, &rule) == -1);
 
-    /* too few fields: missing probability */
+    /* Too few fields. */
     snprintf(line, sizeof(line), "*:write:EIO");
     assert(chaos_io_config_parse_line(line, &rule) == -1);
 
-    /* too few fields: only two */
     snprintf(line, sizeof(line), "*:write");
     assert(chaos_io_config_parse_line(line, &rule) == -1);
 
-    /* unrecognised operation */
+    /* Unknown operation; unknown effect (neither an accepted errno name nor an effect). */
     snprintf(line, sizeof(line), "*:nosuchop:EIO:0.5");
     assert(chaos_io_config_parse_line(line, &rule) == -1);
 
-    /* unrecognised effect (not an errno name and not LATENCY/TORN/CORRUPT) */
     snprintf(line, sizeof(line), "*:write:BADEFFECT:0.5");
     assert(chaos_io_config_parse_line(line, &rule) == -1);
 
-    /* EINVAL is explicitly unsupported by the IO config parser */
+    /* A real errno outside the accepted storage-error list, and probability > 1. */
     snprintf(line, sizeof(line), "*:write:EINVAL:0.5");
     assert(chaos_io_config_parse_line(line, &rule) == -1);
 
-    /* probability > 1.0 */
     snprintf(line, sizeof(line), "*:write:EIO:1.5");
     assert(chaos_io_config_parse_line(line, &rule) == -1);
 
-    /* TORN only valid for write operations, not read */
+    /* TORN needs a write-class operation, CORRUPT a read-class one. */
     snprintf(line, sizeof(line), "*:read:TORN:0.1");
     assert(chaos_io_config_parse_line(line, &rule) == -1);
 
-    /* CORRUPT only valid for read operations, not write */
     snprintf(line, sizeof(line), "*:write:CORRUPT:0.1");
     assert(chaos_io_config_parse_line(line, &rule) == -1);
 }
@@ -298,7 +284,7 @@ static void test_invalid_inputs(void)
 
 int main(void)
 {
-    /* Look at the rule file on every call; the throttle has its own test. */
+    /* Re-check the rule file on every call (no reload throttle); the throttle has its own test. */
     g_chaos_io_check_interval_ns = 0U;
     chaos_io_config_init();
 

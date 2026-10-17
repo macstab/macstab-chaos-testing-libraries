@@ -1,28 +1,27 @@
 /**
  * @file test_net_actions.c
- * @brief Unit tests for NET-domain probabilistic, corruption, latency, and errno helpers.
+ * @brief Unit tests for the libchaos-net effect helpers: probability, rule firing, CORRUPT,
+ *   LATENCY and ERRNO.
  *
- * Subsystem under test: `src/net/chaos_net_actions.c`
+ * @details
+ * Unit under test: `src/net/chaos_net_actions.c`. The suite proves:
+ * - probability: 0.0 and negative values never hit, 1.0 always hits, 0.5 splits the 32-bit
+ *   sample space at 2^31; a draw is reproducible from a seed, and seed 0 behaves like seed 1
+ *   (xorshift must never start from the all-zero state, which it cannot leave);
+ * - CORRUPT flips exactly one bit, at byte `index_sample % size` and bit `bit_sample & 7`,
+ *   and ignores a NULL or empty buffer;
+ * - firing: the `@from`/`@until` window and `@size` gate apply first; LATENCY rules carry no
+ *   probability and fire on every permitted call; other effects then draw against their
+ *   probability; `@first=N` caps the firings; a hit is counted only when the effect fires;
+ * - LATENCY sleeps once for the whole delay (2500 ms is one 2 s + 500 ms request);
+ * - ERRNO sets errno only when an ERRNO rule fires; otherwise errno is untouched.
  *
- * Coverage approach:
- * - Includes production source directly via `#include "../../src/net/chaos_net_actions.c"`
- *   after test_sleep_support.h, which records each sleep request instead of sleeping.
- *   This gives access to all static helper functions without LD_PRELOAD.
+ * Seams: the source is compiled into this file. `test_sleep_support.h` replaces the sleep
+ * syscall used by `chaos_sleep_ms()` with a recorder, so LATENCY is observed without waiting.
+ * `CHAOS_NET_DEFINE_TEST_GLOBALS()` provides the real-function pointers and PRNG state.
  *
- * Properties under test:
- * - Probability sampling: boundary values (0.0, 1.0) and mid-range determinism.
- * - `chaos_net_probability_hit()` reproduces a seeded sample reproducibly.
- * - Buffer corruption: single-bit flip at a deterministic index+bit position.
- * - `chaos_net_corrupt_buffer()` and `chaos_net_corrupt_buffer_sample()` equivalence.
- * - Latency: 2500 ms becomes exactly one sleep of {2 s, 500 ms}.
- * - `chaos_net_rule_should_trigger()` unconditional for LATENCY effect, probability-gated
- *   for ERRNO effect.
- * - Errno application: ECONNREFUSED injected at probability 1.0; skipped at 0.0.
- *
- * What is NOT tested here:
- * - Config file parsing and rule selection.
- * - Actual socket wrapper call paths (tested in test_chaos_net.c).
- * - Thread-safety of `chaos_net_prng_seed_thread()`.
+ * Out of scope: rule parsing (`test_net_config.c`), the socket wrappers (`test_chaos_net.c`)
+ * and PRNG seeding across threads.
  */
 
 #include "../support/test_net_support.h"
@@ -34,21 +33,12 @@ CHAOS_NET_DEFINE_TEST_GLOBALS();
 #include "../../src/net/chaos_net_actions.c"
 
 /**
- * @brief Invariant: probability sampling produces correct 0/1 decisions at boundary and midpoint.
+ * @brief Proves the probability boundaries, reproducible draws from a seed, and that seed 0
+ *   is replaced by 1.
  *
- * Triggering condition: `chaos_net_probability_hit_sample(p, sample)` called with
- *   boundary probabilities and hand-picked sample values.
- *
- * Expected observable behaviour:
- * - p=0.0 always returns 0 regardless of sample.
- * - p=-1.0 (out-of-range) always returns 0.
- * - p=1.0 always returns 1 regardless of sample.
- * - p=0.5 with sample=0 returns 1 (sample < threshold).
- * - p=0.5 with sample=0xffffffff returns 0 (sample >= threshold).
- * - `chaos_net_probability_hit(p)` with a seeded PRNG reproduces the result that
- *   would be obtained by manually drawing the next sample and calling
- *   `chaos_net_probability_hit_sample(p, sample)`.
- * - Seeding with 0 behaves exactly like seeding with 1.
+ * @details Out-of-range probabilities are clamped, never sampled: -1.0 never hits and 1.0
+ * hits even for sample UINT32_MAX. Re-seeding with the same value and calling
+ * `chaos_net_probability_hit()` matches drawing the sample by hand.
  */
 static void test_probability_helpers(void)
 {
@@ -67,7 +57,6 @@ static void test_probability_helpers(void)
         assert(chaos_net_probability_hit(0.25) == expected_hit);
     }
 
-    /* Seed 0 is taken as 1: the generator never starts from the all-zero state. */
     chaos_net_prng_seed_thread(1U);
     {
         const uint32_t from_one = chaos_net_prng_next_u32();
@@ -79,17 +68,11 @@ static void test_probability_helpers(void)
 }
 
 /**
- * @brief Invariant: buffer corruption flips exactly one bit at the expected byte position.
+ * @brief Proves CORRUPT flips one bit at the position the two samples select, and that the
+ *   PRNG-driven form draws the index sample first and the bit sample second.
  *
- * Triggering condition: `chaos_net_corrupt_buffer_sample(buffer, size, index_sample, bit_sample)`.
- *
- * Expected observable behaviour:
- * - NULL or zero-size buffer calls are silently ignored (no crash, no modification).
- * - Buffer `{0, 0, 0}` with index_sample=1 and bit_sample=5 produces `{0, 0x20, 0}`.
- *   (bit 5 of byte 1: 1 << 5 = 0x20).
- * - `chaos_net_corrupt_buffer()` produces the same result as calling
- *   `chaos_net_corrupt_buffer_sample()` with the two next PRNG values after a
- *   common seed.
+ * @details Index sample 1, bit sample 5 on three zero bytes yields `{0, 0x20, 0}`. A NULL or
+ * zero-length buffer is left alone (a recv() of 0 bytes has nothing to corrupt).
  */
 static void test_corrupt_helpers(void)
 {
@@ -120,28 +103,10 @@ static void test_corrupt_helpers(void)
 }
 
 /**
- * @brief Invariant: latency of 2500ms is one sleep of that duration and trigger
- *   logic respects effect type vs probability.
+ * @brief Proves LATENCY applies the qualifiers and counts each delay as a hit.
  *
- * Triggering condition:
- * - `chaos_net_rule_apply_latency(&rule)` with latency_ms=2500 and effect=LATENCY.
- * - `chaos_net_rule_should_trigger()` with various effect/probability combinations.
- *
- * Expected observable behaviour:
- * - NULL rule pointer to `apply_latency`: no crash, no sleep calls.
- * - Zero-initialised rule to `apply_latency`: no crash, no sleep calls (no effect set).
- * - 2500 ms generates exactly one sleep of {2 s, 500 ms}.
- * - `chaos_net_rule_should_trigger(NULL)` returns 0.
- * - LATENCY effect triggers unconditionally (returns 1 regardless of probability).
- * - ERRNO effect with probability=0.0 does not trigger (returns 0).
- * - ERRNO effect with probability=1.0 triggers (returns 1).
- */
-/**
- * @brief Invariant: a LATENCY rule delays only the calls its qualifiers let it fire on,
- *   and counts each delay as a hit.
- *
- * Expected observable behaviour: `@first=1` delays once, then never; a window that
- * has not started and a size gate the call fails do not delay; every delay is a hit.
+ * @details `@first=1` delays once and then never. A `@from` in 2096 does not delay. `@size>100`
+ * skips a 10-byte call and delays a 101-byte one. Two delays, two hits.
  */
 static void test_latency_honours_qualifiers(void)
 {
@@ -178,6 +143,15 @@ static void test_latency_honours_qualifiers(void)
     assert(slot.count == 2U);
 }
 
+/**
+ * @brief Proves LATENCY sleeps once for the whole delay, and that LATENCY rules fire without a
+ *   probability while ERRNO rules draw against theirs.
+ *
+ * @details A NULL rule and a rule of no effect do not sleep. 2500 ms is a single sleep request
+ * of 2 s + 500000000 ns, not a sequence of shorter sleeps. A LATENCY rule with probability 0
+ * still fires: its value field is the delay, not a probability. ERRNO at 0.0 never fires and
+ * at 1.0 always does.
+ */
 static void test_latency_and_trigger_helpers(void)
 {
     chaos_net_rule_t rule;
@@ -208,21 +182,11 @@ static void test_latency_and_trigger_helpers(void)
 }
 
 /**
- * @brief Invariant: errno injection sets the target error code and is gated by probability.
+ * @brief Proves ERRNO writes the rule's errno only when an ERRNO rule fires.
  *
- * Triggering condition:
- * - `chaos_net_rule_apply_errno(&rule)` with effect=ERRNO, errnum=ECONNREFUSED,
- *   and various probability values.
- *
- * Expected observable behaviour:
- * - NULL rule returns 0; errno is unchanged.
- * - Zero-initialised rule (no effect set) returns 0; errno is unchanged.
- * - probability=0.0: returns 0; errno is left at its current value (123).
- * - probability=1.0: returns 1; errno is set to ECONNREFUSED.
- * - A LATENCY rule with probability 1.0 returns 0; errno is unchanged.
- *
- * ECONNREFUSED is chosen as a representative network errno to verify that the
- * specific error code requested by the rule is what actually gets injected.
+ * @details A NULL rule, a rule of no effect, a rule at probability 0.0 and a firing LATENCY
+ * rule all return 0 and leave errno as it was (123): the wrapper relies on errno being
+ * untouched when it goes on to make the real call. At 1.0 errno becomes ECONNREFUSED.
  */
 static void test_errno_application(void)
 {
@@ -245,7 +209,6 @@ static void test_errno_application(void)
     assert(chaos_net_rule_apply_errno(&rule) == 1);
     assert(errno == ECONNREFUSED);
 
-    /* A rule of another effect that would fire sets no errno. */
     rule.effect = CHAOS_NET_EFFECT_LATENCY;
     errno = 123;
     assert(chaos_net_rule_apply_errno(&rule) == 0);
@@ -253,13 +216,11 @@ static void test_errno_application(void)
 }
 
 /**
- * @brief Invariant: a rule's hit counter advances exactly when its effect fires.
+ * @brief Proves a hit is counted only when the effect fires.
  *
- * Triggering condition: should_trigger on a rule with probability 1.0, then 0.0,
- *   then on a rule without a counter.
- *
- * Expected observable behaviour: the count is 1 after the firing call and stays 1
- *   after the call that does not fire; a rule without a counter still fires.
+ * @details The hits file must report firings, not evaluations: probability 1.0 fires and
+ * counts 1, probability 0.0 neither fires nor counts. A rule with no hit slot (a copy made
+ * outside a rule snapshot) still fires.
  */
 static void test_should_trigger_counts_hits(void)
 {
@@ -282,10 +243,14 @@ static void test_should_trigger_counts_hits(void)
 }
 
 /**
- * @brief Invariant: should_trigger honours `@first`, `@from` and `@until`.
+ * @brief Proves `chaos_net_rule_should_trigger()` applies `@first`, `@from`/`@until` and
+ *   `@size`.
  *
- * Expected observable behaviour: `@first=2` fires twice and then never; a window
- *   that ended or has not started yet does not fire; an open window does.
+ * @details `@first=2` fires twice, then stops, and the hit count stays 2. The window is
+ * compared with the wall clock in Unix ms: `@until=1` has passed, `@from=4000000000000`
+ * (year 2096) has not started, and `@from=1` is open. `@size>100` rejects a call without a
+ * byte count (`CHAOS_POLICY_NO_SIZE`) and a call of exactly 100 bytes (strict bound), passes
+ * 101, and `@size<101` added on top rejects 101 again.
  */
 static void test_should_trigger_honours_qualifiers(void)
 {
@@ -312,7 +277,6 @@ static void test_should_trigger_honours_qualifiers(void)
     rule.policy.from_ms = 1;
     assert(chaos_net_rule_should_trigger(&rule) == 1);
 
-    /* A size gate passes only calls with a byte count in range. */
     memset(&rule.policy, 0, sizeof(rule.policy));
     rule.policy.has_size_above = 1U;
     rule.policy.size_above = 100U;

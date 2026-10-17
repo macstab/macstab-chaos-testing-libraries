@@ -1,32 +1,24 @@
 /**
  * @file test_process_actions.c
- * @brief Unit tests for PROCESS-domain probability, latency, errno, and fail-after helpers.
+ * @brief Proves the libchaos-process effect helpers: probability, LATENCY, ERRNO and FAIL_AFTER.
  *
- * Subsystem under test: `src/process/chaos_process_actions.c`
+ * @details
+ * Unit under test: `src/process/chaos_process_actions.c`, the layer that decides whether a
+ * matched rule fires and what it does. Rule matching and the wrappers are out of scope; they are
+ * covered by test_process_config.c and test_chaos_process.c.
  *
- * Coverage approach:
- * - The production source file is included after test_sleep_support.h, which records each
- *   sleep request instead of sleeping and can simulate EINTR, so tests exercise the retry
- *   loop without real sleeps.
- * - The `CHAOS_PROCESS_DEFINE_TEST_GLOBALS()` macro instantiates the real-function-pointer
- *   globals required by the production action helpers.
+ * Isolation:
+ * - The production source is included into this translation unit, so its static helpers and
+ *   the inline policy code (`chaos_policy.h`) run unmodified.
+ * - test_sleep_support.h is included first and replaces the `clock_nanosleep` call inside
+ *   `chaos_sleep_ms()` with a recorder that can fail with EINTR, so LATENCY is checked by its
+ *   requested timespecs and its EINTR retry loop without sleeping.
+ * - `CHAOS_PROCESS_DEFINE_TEST_GLOBALS()` defines the runtime globals the helpers read: the
+ *   per-thread PRNG state and the per-operation FAIL_AFTER counters.
  *
- * Properties under test:
- * - `chaos_process_rule_should_trigger(NULL)` returns false.
- * - Probability boundary values and mid-range PRNG reproducibility.
- * - Latency: 2500 ms → one sleep of {2 s, 500 ms}; EINTR resumes with the remaining time.
- * - Probability=0 for latency: no sleep issued.
- * - `chaos_process_rule_error_number()`: EAGAIN injected at probability=1.0; skipped at 0.0;
- *   NULL rule and NULL errnum output both return false.
- * - FAIL_AFTER: first call with count=1 does not fire (counter decrements to 0);
- *   second call fires (counter already at 0); count=0 fires immediately.
- * - FAIL_AFTER NULL guards: NULL rule, INVALID operation, NULL errnum return false.
- *
- * What is NOT tested here:
- * - Config file parsing and rule selection.
- * - PROCESS wrapper call paths (tested in test_chaos_process.c).
+ * Rules are built in memory with `memset` + field assignment, so every qualifier not set by a
+ * test is zero, which `chaos_policy.h` treats as "no qualifier".
  */
-
 #include "../support/test_process_support.h"
 
 #include "../../src/process/chaos_process_config.h"
@@ -38,10 +30,10 @@ CHAOS_PROCESS_DEFINE_TEST_GLOBALS();
 #include "../../src/process/chaos_process_actions.c"
 
 /**
- * @brief Reset all action-layer test state between test functions.
+ * @brief Zeroes the FAIL_AFTER counters, PRNG state and recorded sleeps.
  *
- * Calls `chaos_process_test_reset_runtime()` to clear the runtime globals, then
- * clears the recorded sleeps.
+ * FAIL_AFTER counters are process-wide and only ever grow, so a test that does not reset them
+ * inherits the call count of the previous one.
  */
 static void reset_action_state(void)
 {
@@ -50,17 +42,12 @@ static void reset_action_state(void)
 }
 
 /**
- * @brief Invariant: probability hit returns correct 0/1 decisions at boundary and mid values.
+ * @brief Proves the probability comparison is `sample < p * 2^32` with exact 0.0 and 1.0 ends.
  *
- * Triggering conditions: `chaos_process_rule_should_trigger(NULL)` and
- *   `chaos_process_probability_hit_sample()` with boundary and mid-range values,
- *   followed by `chaos_process_probability_hit()` with the same seed to verify reproducibility.
- *
- * Expected observable behaviour:
- * - NULL rule: `should_trigger` returns false.
- * - p=0.0, sample=0 → 0; p=1.0, sample=MAX → 1.
- * - p=0.5, sample=0 → 1; p=0.5, sample=MAX → 0.
- * - `probability_hit(0.0)` → 0; `probability_hit(1.0)` → 1 regardless of PRNG state.
+ * The sample-taking variant is driven with the extreme samples 0 and UINT32_MAX: p=0.0 never
+ * hits even for sample 0, p=1.0 always hits even for UINT32_MAX, and p=0.5 splits them. The
+ * PRNG-driven variant is then checked only at p=0.0 and p=1.0, where the result must not depend
+ * on the seeded state. A NULL rule never triggers.
  */
 static void test_probability_helpers(void)
 {
@@ -77,13 +64,11 @@ static void test_probability_helpers(void)
 }
 
 /**
- * @brief Invariant: latency sleeps for exactly the rule's duration and resumes after EINTR.
+ * @brief Proves LATENCY sleeps the rule's duration once and resumes after EINTR.
  *
- * Expected observable behaviour:
- * - 2500 ms → one sleep of {2 s, 500 ms}.
- * - 5 ms with one EINTR → two sleeps, the second for the remaining time.
- * - probability=0.0 → no sleep.
- * - NULL rule, or an ERRNO rule → no sleep.
+ * 2500 ms is split into {2 s, 500000000 ns}, proving the ms-to-timespec conversion carries
+ * whole seconds. One simulated EINTR yields a second sleep call, proving a signal does not cut
+ * the delay short. Probability 0.0, a NULL rule and a rule of another effect issue no sleep.
  */
 static void test_latency_helper(void)
 {
@@ -111,7 +96,6 @@ static void test_latency_helper(void)
     chaos_process_rule_apply_latency(&rule);
     assert(g_test_sleep_calls == 0U);
 
-    /* No rule, or a rule of another effect, never sleeps. */
     rule.probability = 1.0;
     chaos_process_rule_apply_latency(NULL);
     rule.effect = CHAOS_PROCESS_EFFECT_ERRNO;
@@ -120,17 +104,11 @@ static void test_latency_helper(void)
 }
 
 /**
- * @brief Invariant: errno injection respects probability and validates pointer arguments.
+ * @brief Proves ERRNO reports the rule's errno only when the rule fires.
  *
- * Triggering condition: `chaos_process_rule_error_number(&rule, &errnum)` with various
- *   probability values and NULL arguments.
- *
- * Expected observable behaviour:
- * - probability=1.0, errnum=EAGAIN → returns true, `errnum == EAGAIN`.
- * - probability=0.0 → returns false, `errnum` unchanged (still 0).
- * - NULL rule → returns false.
- * - NULL errnum output → returns false.
- * - A FAIL_AFTER rule → returns false, `errnum` unchanged.
+ * At probability 1.0 the helper returns true and writes EAGAIN. When it does not fire
+ * (probability 0.0, NULL rule, NULL output, or a FAIL_AFTER rule) it returns false and leaves
+ * the output untouched, so a wrapper can pass an uninitialised errno slot without reading junk.
  */
 static void test_error_number_helpers(void)
 {
@@ -152,7 +130,6 @@ static void test_error_number_helpers(void)
     assert(!chaos_process_rule_error_number(NULL, &errnum));
     assert(!chaos_process_rule_error_number(&rule, NULL));
 
-    /* A rule of another effect never yields an error number. */
     rule.probability = 1.0;
     rule.effect = CHAOS_PROCESS_EFFECT_FAIL_AFTER;
     assert(!chaos_process_rule_error_number(&rule, &errnum));
@@ -160,18 +137,13 @@ static void test_error_number_helpers(void)
 }
 
 /**
- * @brief Invariant: FAIL_AFTER decrements a per-operation counter and fires once it reaches zero.
+ * @brief Proves FAIL_AFTER lets the first N calls of an operation through, then fails the rest.
  *
- * Triggering condition: `chaos_process_rule_fail_after_error()` called repeatedly on the
- *   same operation with `fail_after_count=1`.
- *
- * Expected observable behaviour:
- * - First call with count=1: counter decrements from 1 to 0, returns false (not yet fired).
- * - Second call: counter is 0, returns true (fires); `errnum == EAGAIN`.
- * - After `reset_action_state()`, count=0: fires immediately on first call.
- * - probability=0.0: never fires regardless of counter.
- * - NULL rule, INVALID operation, NULL errnum: all return false without modifying state.
- * - An operation past the last one, or an ERRNO rule: false; counters untouched.
+ * Each call increments the operation's counter from 0 and fires once the pre-increment value is
+ * at least `fail_after_count`. With count=1 the first call passes and the second fails with
+ * EAGAIN; with count=0 the first call fails. Probability 0.0 never fires. NULL rule, an
+ * out-of-range operation (INVALID, COUNT), NULL output and a non-FAIL_AFTER rule return false
+ * before the counter is touched, which the final counter check proves.
  */
 static void test_fail_after_helper(void)
 {
@@ -200,8 +172,6 @@ static void test_fail_after_helper(void)
     assert(!chaos_process_rule_fail_after_error(&rule, CHAOS_PROCESS_OP_INVALID, &errnum));
     assert(!chaos_process_rule_fail_after_error(&rule, CHAOS_PROCESS_OP_FORK, NULL));
 
-    /* An operation past the last one, or a rule of another effect, never fires and
-     * leaves the counters alone. */
     reset_action_state();
     rule.probability = 1.0;
     errnum = 0;
@@ -213,13 +183,10 @@ static void test_fail_after_helper(void)
 }
 
 /**
- * @brief Invariant: a rule's hit counter advances exactly when its effect fires.
+ * @brief Proves a rule's hit slot counts fired effects only, and a slot is optional.
  *
- * Triggering condition: should_trigger on a rule with probability 1.0, then 0.0,
- *   then on a rule without a counter.
- *
- * Expected observable behaviour: the count is 1 after the firing call and stays 1
- *   after the call that does not fire; a rule without a counter still fires.
+ * The hits file reports these counts, so a probability miss must not count. A rule with no slot
+ * (as built before the hits file is mapped) still fires.
  */
 static void test_should_trigger_counts_hits(void)
 {
@@ -242,10 +209,12 @@ static void test_should_trigger_counts_hits(void)
 }
 
 /**
- * @brief Invariant: should_trigger honours `@first`, `@from` and `@until`.
+ * @brief Proves the trigger decision honours `@first`, `@from`/`@until` and `@size`.
  *
- * Expected observable behaviour: `@first=2` fires twice and then never; a window
- *   that ended or has not started yet does not fire; an open window does.
+ * `@first=2` fires twice, then never, and the slot counts exactly 2. Windows are wall-clock ms:
+ * `@until=1` (1970) has ended and `@from=4000000000000` (year 2096) has not started, so both
+ * block; `@from=1` is open. The size gate is exclusive on both bounds and rejects a call with no
+ * byte count (`CHAOS_POLICY_NO_SIZE`).
  */
 static void test_should_trigger_honours_qualifiers(void)
 {
@@ -272,7 +241,6 @@ static void test_should_trigger_honours_qualifiers(void)
     rule.policy.from_ms = 1;
     assert(chaos_process_rule_should_trigger(&rule) == 1);
 
-    /* A size gate passes only calls with a byte count in range. */
     memset(&rule.policy, 0, sizeof(rule.policy));
     rule.policy.has_size_above = 1U;
     rule.policy.size_above = 100U;
@@ -288,7 +256,11 @@ static void test_should_trigger_honours_qualifiers(void)
 }
 
 /**
- * @brief Invariant: FAIL_AFTER honours the rule's window, `@first` and size gate.
+ * @brief Proves FAIL_AFTER applies the same window, `@first` and `@size` qualifiers as ERRNO.
+ *
+ * FAIL_AFTER bypasses the shared trigger helper and checks the qualifiers itself, so they are
+ * proven separately here. `fail_after_count` is 0, so only the qualifiers decide: an ended
+ * window blocks, `@first=1` fires once, and a failed size gate neither fires nor writes errno.
  */
 static void test_fail_after_honours_qualifiers(void)
 {
@@ -310,7 +282,6 @@ static void test_fail_after_honours_qualifiers(void)
     assert(errnum == EAGAIN);
     assert(chaos_process_rule_fail_after_error(&rule, CHAOS_PROCESS_OP_FORK, &errnum) == 0);
 
-    /* A size gate the call does not pass keeps the rule from firing. */
     memset(&rule.policy, 0, sizeof(rule.policy));
     rule.policy.has_size_above = 1U;
     rule.policy.size_above = 100U;

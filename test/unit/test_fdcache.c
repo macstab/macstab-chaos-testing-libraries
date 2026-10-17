@@ -1,48 +1,25 @@
 /**
  * @file test_fdcache.c
- * @brief Unit tests for the IO-domain file-descriptor path cache.
+ * @brief Proves the libchaos-io fd-to-path cache: argument validation, path exclusion,
+ *        seqlock and generation invalidation, `/proc/self/fd` resolution, and safe
+ *        degradation when the lazily mapped table cannot be created or is contended.
  *
- * Subsystem under test: `src/config/chaos_io_fdcache.c`
+ * @details Unit under test: `src/config/chaos_io_fdcache.c`, compiled in by `#include`.
  *
- * Coverage approach:
- * - The production source file is included directly after replacing two symbols via
- *   `#define`: `snprintf` and `readlink`. This allows precise control over path-format
- *   construction (snprintf) and the `proc` filesystem path resolution (readlink) without
- *   touching the filesystem.
- * - The `snprintf` stub delegates to `vsnprintf` when `g_snprintf_result == 0`; when set
- *   to a non-zero value it returns that value directly, simulating a format error or
- *   truncation before the readlink call.
- * - The `readlink` stub records call counts, copies at most `g_readlink_result` bytes from
- *   `g_readlink_target` into the output buffer, and returns -1 with `g_readlink_errno`
- *   when `g_readlink_result < 0`.
- * - `CHAOS_IO_DEFINE_TEST_GLOBALS()` instantiates the real-function-pointer globals; the
- *   fdcache itself does not dispatch through those pointers, but they are required to
- *   compile the production config module.
+ * Isolation:
+ * - `readlink` and `snprintf` are redefined around the include. The readlink stub
+ *   returns a configured target (or -1 with a configured errno) and counts calls, so the
+ *   suite proves when the cache is hit without touching `/proc`; the snprintf stub can
+ *   force a negative result to cover the format-failure branch.
+ * - The table allocator hooks `g_chaos_io_fdcache_map` / `g_chaos_io_fdcache_unmap` are
+ *   swapped to simulate a failed mapping and a lost publication race.
+ * - Slot sequence counters are written directly to simulate a concurrent writer; real
+ *   multi-threaded races are not exercised here.
+ * - `CHAOS_IO_DEFINE_TEST_GLOBALS()` provides the TLS guard and real-function pointers
+ *   the module links against.
  *
- * Properties under test:
- * - Store and lookup: invalid fd (-1) is rejected; NULL path, NULL buffer, zero buffer
- *   size are rejected; the config-path sentinel (`CHAOS_IO_CONFIG_PATH`) causes the entry
- *   to be silently dropped; paths exceeding `CHAOS_IO_MAX_PATH - 1` bytes are dropped;
- *   buffer smaller than the stored path returns 0; valid store + valid lookup returns 1
- *   with the correct path.
- * - Invalidate: invalid fd (-1) and unknown fd (8) are no-ops; invalidating the stored fd
- *   causes subsequent lookup to return 0.
- * - Resolve with cache hit: if the fd is already cached, `chaos_io_fdcache_resolve` returns
- *   the cached path without calling readlink.
- * - Resolve after invalidation: invalid fd (2) → 0; NULL buffer → 0; too-small buffer → 0.
- * - Resolve with snprintf failure: `g_snprintf_result = -1` causes resolve to return 0 and
- *   readlink to not be called.
- * - Resolve with readlink failure: `g_readlink_result = -1` → 0; TLS re-entrancy guard
- *   `g_chaos_io_tls_guard` must be 0 after the call (guard must be released on error path).
- * - Resolve success: readlink returns the full path; entry is stored; subsequent lookup
- *   returns the path without calling readlink again.
- * - Resolve with proc-internal path: resolved path beginning with `/proc/` is silently
- *   discarded (not stored); subsequent lookup returns 0.
- * - Resolve with buffer too small for the resulting path (4-byte buffer for "/tmp") → 0.
- *
- * What is NOT tested here:
- * - Thread-safety of concurrent store/invalidate/resolve operations.
- * - Wrapper call paths that invoke fdcache on open/close (tested in `test_chaos_io.c`).
+ * Not covered here: wrapper call paths that store and invalidate on open/close
+ * (test_chaos_io.c).
  */
 
 #include "../support/test_support.h"
@@ -52,58 +29,27 @@
 
 CHAOS_IO_DEFINE_TEST_GLOBALS();
 
-/**
- * @brief Path string that the readlink stub copies into the output buffer.
- *
- * Must point to a string of at least `g_readlink_result` bytes. NULL when the stub is
- * configured to return an error.
- */
+/** @brief Link target the readlink stub copies from; NULL while it is set to fail. */
 static const char *g_readlink_target = NULL;
 
-/**
- * @brief Number of bytes the readlink stub copies and returns; -1 triggers an error.
- *
- * Set to `strlen(g_readlink_target)` for a successful resolution. Set to -1 to simulate
- * a readlink failure.
- */
+/** @brief Byte count the readlink stub returns; negative makes it fail. */
 static ssize_t g_readlink_result = -1;
 
-/**
- * @brief errno value set by the readlink stub when returning -1.
- *
- * Defaults to ENOENT. Represents a typical "file descriptor has no proc entry" error.
- */
+/** @brief errno the readlink stub sets on failure (default ENOENT). */
 static int g_readlink_errno = ENOENT;
 
-/**
- * @brief Number of times `chaos_test_readlink` has been called since the last reset.
- *
- * Used to verify that the cache hit path does not call readlink again after a path has
- * already been resolved and stored.
- */
+/** @brief readlink stub calls since the last reset; 0 proves a cache hit. */
 static size_t g_readlink_calls = 0U;
 
-/**
- * @brief When non-zero, the snprintf stub returns this value directly without formatting.
- *
- * Set to -1 to simulate a format error before any readlink call, verifying that the
- * resolve function returns 0 without ever invoking readlink.
- */
+/** @brief Non-zero: the snprintf stub returns it without formatting (-1 forces failure). */
 static int g_snprintf_result = 0;
 
 /**
- * @brief Stub readlink that records calls, copies at most `g_readlink_result` bytes, and
- *   injects configurable errors.
+ * @brief readlink(2) stand-in: copies `g_readlink_result` bytes of `g_readlink_target`
+ *        (no NUL, like readlink) or fails with `g_readlink_errno`.
  *
- * When `g_readlink_result < 0`: sets errno to `g_readlink_errno` and returns -1.
- * Otherwise: copies exactly `g_readlink_result` bytes from `g_readlink_target` into
- * `buffer` (asserts `g_readlink_target != NULL` and that the result does not exceed
- * `strlen(target)`), then returns `g_readlink_result`.
- *
- * @param path    Ignored (the `/proc/self/fd/<fd>` path constructed by the production code).
- * @param buffer  Destination for the resolved path bytes.
- * @param size    Maximum bytes to write; ignored (the stub writes exactly `g_readlink_result`).
- * @return Number of bytes written, or -1 on error.
+ * @details Ignores @p size on purpose: the code under test must reject a result that
+ * fills its buffer, and every buffer passed here is large enough to absorb the copy.
  */
 static ssize_t chaos_test_readlink(const char *path, char *buffer, size_t size)
 {
@@ -123,19 +69,7 @@ static ssize_t chaos_test_readlink(const char *path, char *buffer, size_t size)
     return g_readlink_result;
 }
 
-/**
- * @brief Stub snprintf that either delegates to vsnprintf or returns `g_snprintf_result`.
- *
- * When `g_snprintf_result == 0`: calls `vsnprintf(buffer, size, format, args)` and returns
- * its result (normal formatting behaviour). When non-zero: returns `g_snprintf_result`
- * directly without writing to `buffer`, allowing the test to simulate format failures.
- *
- * @param buffer  Destination buffer.
- * @param size    Buffer capacity.
- * @param format  printf-style format string.
- * @param ...     Format arguments.
- * @return Characters written (or would have been written), or `g_snprintf_result` when forced.
- */
+/** @brief snprintf stand-in: vsnprintf, or `g_snprintf_result` when that is non-zero. */
 static int chaos_test_snprintf(char *buffer, size_t size, const char *format, ...)
 {
     va_list args;
@@ -161,12 +95,7 @@ static int chaos_test_snprintf(char *buffer, size_t size, const char *format, ..
 #undef readlink
 #undef snprintf
 
-/**
- * @brief Reset the readlink and snprintf stub state to defaults.
- *
- * Clears `g_readlink_target`, sets `g_readlink_result` to -1, `g_readlink_errno` to
- * ENOENT, zeroes `g_readlink_calls`, and zeroes `g_snprintf_result`.
- */
+/** @brief Restores the stubs to "readlink fails with ENOENT, snprintf formats". */
 static void chaos_test_reset_readlink_state(void)
 {
     g_readlink_target = NULL;
@@ -177,22 +106,13 @@ static void chaos_test_reset_readlink_state(void)
 }
 
 /**
- * @brief Invariant: store, lookup, and invalidate operations respect all documented
- *   constraints and update cache state correctly.
+ * @brief store/lookup/invalidate contract.
  *
- * Triggering condition: `chaos_io_fdcache_reset()` followed by a sequence of store,
- *   lookup, and invalidate calls with valid and invalid arguments.
- *
- * Expected observable behaviour:
- * - `lookup(-1, ...)`, `lookup(7, NULL, ...)`, `lookup(7, ..., 0)` → 0.
- * - `store(-1, ...)` and `store(7, NULL)` are silent no-ops.
- * - `store(7, CHAOS_IO_CONFIG_PATH)` stores nothing (config-path entries are excluded).
- * - Storing a path of exactly `CHAOS_IO_MAX_PATH` bytes (one byte over the maximum length
- *   for a null-terminated string) → entry dropped; subsequent lookup returns 0.
- * - `store(7, "/tmp/data.bin")` followed by `lookup(7, ..., 4)` (buffer too small) → 0.
- * - `lookup(7, path, sizeof(path))` after a valid store → 1, path="/tmp/data.bin".
- * - `invalidate(-1)` and `invalidate(8)` are no-ops; fd 7 still lookups.
- * - `invalidate(7)` → subsequent lookup returns 0.
+ * @details Lookup rejects fd < 0, a NULL buffer and size 0. Store ignores fd < 0, a NULL
+ * path, excluded paths (`/proc/...`, the rule file) and a path of CHAOS_IO_MAX_PATH bytes
+ * or more (no room for the NUL). Lookup into a buffer too small for the path misses
+ * rather than truncating. Invalidating fd < 0 or another fd leaves the entry; invalidating
+ * its fd makes it miss.
  */
 static void test_store_lookup_and_invalidate(void)
 {
@@ -232,25 +152,14 @@ static void test_store_lookup_and_invalidate(void)
 }
 
 /**
- * @brief Invariant: `chaos_io_fdcache_resolve` returns cached paths without calling
- *   readlink, correctly resolves paths via readlink, discards proc-internal paths,
- *   and handles all failure modes cleanly.
+ * @brief resolve(): cache first, then `/proc/self/fd/<fd>`.
  *
- * Triggering condition: `chaos_io_fdcache_resolve` called with various fd/buffer/size
- *   combinations; cache is manipulated between calls via store and invalidate.
- *
- * Expected observable behaviour:
- * - `resolve(2, ...)` (reserved/stdin-class fd) → 0 immediately.
- * - `resolve(3, NULL, ...)` and `resolve(3, ..., 1)` → 0 (argument validation).
- * - Cached fd 9: `resolve(9, ...)` returns 1 with "/tmp/cached.bin" and `g_readlink_calls == 0`.
- * - After invalidating fd 9, readlink failure (`g_readlink_result = -1`) → 0;
- *   `g_chaos_io_tls_guard == 0` (guard released on error path).
- * - snprintf failure (`g_snprintf_result = -1`) → 0 and readlink not called.
- * - Successful readlink for "/tmp/short.bin": `resolve` → 1; path filled; entry stored
- *   (second lookup returns 1 without calling readlink again).
- * - Resolved path starting with "/proc/self/maps": entry is not stored; subsequent lookup
- *   returns 0.
- * - Buffer size 4 for a 4-character path "/tmp" (plus null terminator > 4) → 0.
+ * @details fd 0-2 are never resolved; a NULL buffer or size < 2 is rejected. A cached fd
+ * is answered without readlink. After invalidation: a readlink failure returns 0 and
+ * releases the TLS re-entrancy guard; a snprintf failure returns 0 before readlink runs;
+ * a successful readlink returns and stores the path, so the next lookup hits. A resolved
+ * excluded path (`/proc/self/maps`) is neither returned nor stored. A link that fills the
+ * whole buffer (4 bytes into 4) is rejected as possibly truncated.
  */
 static void test_resolve_paths(void)
 {
@@ -300,19 +209,19 @@ static void test_resolve_paths(void)
     assert(chaos_io_fdcache_resolve(10, path, 4U) == 0);
 }
 
-/** A table that "another thread" published first, for the lost-race path. */
+/** @brief The table a simulated rival thread publishes first (lost-race path). */
 static chaos_io_fd_cache_entry_t g_test_rival_table[CHAOS_IO_FD_CACHE_SLOTS];
 
-/** Times the stub unmap ran. */
+/** @brief Calls of the counting unmap hook. */
 static int g_test_unmap_calls = 0;
 
-/** Simulates a failed anonymous mapping. */
+/** @brief Map hook that fails, as mmap(2) would under memory pressure. */
 static void *chaos_test_map_fails(void)
 {
     return MAP_FAILED;
 }
 
-/** Maps for real, but lets a rival publish its table first. */
+/** @brief Map hook that maps for real, then publishes the rival table before the CAS. */
 static void *chaos_test_map_loses_race(void)
 {
     void *mapping = chaos_io_fdcache_default_map();
@@ -321,7 +230,7 @@ static void *chaos_test_map_loses_race(void)
     return mapping;
 }
 
-/** Releases the losing mapping through the real unmap and counts the call. */
+/** @brief Unmap hook that counts, then releases the losing mapping for real. */
 static void chaos_test_count_unmap(void *mapping)
 {
     ++g_test_unmap_calls;
@@ -329,16 +238,20 @@ static void chaos_test_count_unmap(void *mapping)
 }
 
 /**
- * @brief Invariant: the lazily mapped table degrades safely under contention and failure.
+ * @brief The lazily mapped table degrades to "no cache" instead of failing.
  *
- * Triggering conditions: the mapping fails, a rival publishes its table first, a slot
- * is held by another writer, and an entry outlives an invalidation.
+ * @details
+ * - Mapping fails: the store is dropped, the table stays NULL, lookups miss, and a later
+ *   call may retry.
+ * - Lost publication race: the loser's mapping is unmapped exactly once and the rival's
+ *   table is used.
+ * - Slot held by a writer (odd sequence): the store is skipped and the lookup misses;
+ *   once the sequence is even again the original entry is returned, proving the skipped
+ *   store wrote nothing.
+ * - Stale resolution: a path resolved under a generation that an invalidation has since
+ *   bumped is stored but never returned, so a racing close() cannot be undone.
  *
- * Expected observable behaviour:
- * - With no table, stores are skipped and lookups miss; nothing crashes.
- * - A lost publication race releases the losing mapping and uses the rival's table.
- * - A slot held by another writer is skipped by stores and missed by lookups.
- * - An entry resolved before an invalidation is never returned after it.
+ * The real table pointer and hooks are restored at the end.
  */
 static void test_lazy_table_contention_and_failure(void)
 {
@@ -378,11 +291,11 @@ static void test_lazy_table_contention_and_failure(void)
 }
 
 /**
- * @brief Invariant: the default mapping reports a failed mmap as MAP_FAILED and
- *   leaves errno as the caller had it.
+ * @brief The default map hook returns MAP_FAILED when mmap fails and preserves errno.
  *
- * Triggering condition: an address-space limit below what the process already uses,
- *   so any new mapping fails with ENOMEM.
+ * @details RLIMIT_AS is lowered to 1 MiB, below what the process already uses, so any new
+ * mapping fails with ENOMEM; the limit is restored before asserting. A mapping after the
+ * restore succeeds.
  */
 static void test_default_map_failure(void)
 {

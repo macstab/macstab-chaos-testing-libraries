@@ -1,54 +1,43 @@
 /**
  * @file test_time_config.c
- * @brief Unit tests for TIME-domain config parsing, selector matching, rule selection,
- *   and reload state machine.
+ * @brief Proves the libchaos-time rule file pipeline: value and selector parsing, rule
+ *   selection by specificity, the reload state machine with its failure paths, the status
+ *   file, the hits file, qualifiers and the atfork reset.
  *
- * Subsystem under test: `src/time/chaos_time_config.c`
+ * @details Unit under test: `src/time/chaos_time_config.c`, included directly so its
+ * `static` functions and globals are reachable.
  *
- * Coverage approach:
- * - Production source is included directly after replacing `open`, `read`, `close`, and
- *   `chaos_time_atomic_cas_u64` with test-controlled stubs, exercising the full config
- *   pipeline without LD_PRELOAD.
- * - `write_config_text()` uses `futimens` to stamp deterministic mtime values so successive
- *   writes always trigger a reload regardless of wall-clock precision.
- * - The existing config file at `CHAOS_TIME_CONFIG_PATH` is backed up and restored.
+ * Isolation seams:
+ * - `CHAOS_CONFIG_FILE_OPEN/READ/CLOSE` are predefined to libc calls, which the `open`,
+ *   `read` and `close` macros then route to stubs. Production uses raw system calls here,
+ *   which no stub could intercept. The stubs inject EINTR, a chosen open errno, ENOENT, or
+ *   a fake fd (8124) whose reads fail with EIO; otherwise they pass through.
+ * - `chaos_time_atomic_cas_u64` is routed to a stub that can lose every CAS, modelling
+ *   another thread winning the reload claim.
+ * - `CHAOS_RACY_WINDOW_MS` is raised to 5000 so a file stays "just written" long enough on
+ *   a slow machine.
+ * - `g_chaos_time_check_interval_ns` is 0 for the whole run, so every call looks at the rule
+ *   file; only the throttle test sets an interval.
  *
- * Properties under test:
- * - Primitive helpers: `is_blank_char`, `config_reset_state`, `trim`, `strip_comment`,
- *   `parse_errno_name` (4 symbolic + numeric "4" + NULL + "bad"),
- *   `parse_probability`, `parse_latency`, `parse_offset` (negative value, NULL args, bad text),
- *   `copy_text_value`, `parse_payload_probability` (bare / `value@p` / empty / p>1.0),
- *   `parse_clock_id` (realtime, monotonic, platform conditionals, numeric "7", "bad-clock"),
- *   `selector_parse` (NULL / "" / "clock_gettime/" / overlong),
- *   `split_rule_fields` (valid / NULL / one-colon / missing second colon),
- *   `selector_matches` (NULL selector), `effect_allowed` (NULL / valid / INVALID),
- *   mtime sentinels (MTIME_MISSING, MTIME_UNKNOWN, MTIME_RELOADING normalization).
- * - Selector matching: `*` (ANY, rank=1), `clock_gettime` (OPERATION, rank=2),
- *   `clock_gettime/monotonic` (CLOCK_ID, rank=3); non-matching clock_id → false;
- *   `nanosleep` and `usleep` selectors; "clock_gettime/", "sleep", "bad-clock" all rejected.
- * - Line and buffer parsing: ERRNO / LATENCY / OFFSET effects; 11 invalid-line categories
- *   (OFFSET on wildcard/usleep, out-of-range p, bad clock, unknown effect, etc.);
- *   buffer with blank/comment lines; no-newline EOF; NULL guards.
- * - Rule selection: clock_gettime/monotonic beats clock_gettime beats * (rank hierarchy);
- *   CLOCK_REALTIME falls back to operation selector; usleep falls back to ANY;
- *   nanosleep LATENCY direct match; NULL guards; `selector_len` tie-break.
- * - Prepare-and-match state machine: no file → false; valid OFFSET rule; same mtime → no reload;
- *   new mtime reloads; `match` after new file; `match_loaded` bypass; bad rule → prepare false;
- *   oversized file → read_file negative; open/read/CAS failures all false.
- * - Buffer limit: `CHAOS_TIME_MAX_RULES + 1` rules → parse_buffer returns negative.
+ * Side effects: the suite writes and deletes the real rule file, status file and hits file
+ * under `/tmp` (`/tmp/.chaos-time.conf`, `.status`, `.hits.<n>`), so it must not run beside
+ * a process using libchaos-time. Tests that start from a user's rule file back it up and
+ * restore it. `write_config_text()` stamps mtimes of a few seconds after the epoch: every
+ * write gets a distinct stamp regardless of filesystem timestamp resolution, and the stamp
+ * is outside the racy window, so loads are final unless a test wants otherwise.
  *
- * What is NOT tested here:
- * - Action helpers (offset math, latency, errno): tested in test_time_actions.c.
- * - Wrapper call paths: tested in test_chaos_time.c.
+ * Out of scope: the effect actions (test_time_actions.c) and the wrappers
+ * (test_chaos_time.c).
  */
 
-/* The rule file is read through these stubs (defined below) instead of raw system calls. */
+/* Read the rule file through libc names, which the macros below route to the stubs;
+ * production uses raw system calls that no stub can intercept. */
 #define CHAOS_CONFIG_FILE_OPEN(path) open((path), O_RDONLY)
 #define CHAOS_CONFIG_FILE_READ(fd, buffer, size) read((fd), (buffer), (size))
 #define CHAOS_CONFIG_FILE_CLOSE(fd) (void)close(fd)
 
-/* A rule file counts as just written for 5 s, not 20 ms: the racily-clean tests
- * restore an earlier mtime and must find it still recent on a slow machine. */
+/* A rule file counts as just written for 5 s instead of 20 ms: the racy-rewrite test
+ * restores the first mtime and must still find it recent on a slow machine. */
 #define CHAOS_RACY_WINDOW_MS 5000
 #include "../support/test_time_support.h"
 
@@ -60,45 +49,28 @@
 
 CHAOS_TIME_DEFINE_TEST_GLOBALS();
 
-/** @brief When non-zero, the open stub returns ENOENT rather than delegating to the real open. */
+/** @brief Non-zero makes the open stub fail with ENOENT (file removed after the stat). */
 static int g_test_config_force_open_fail = 0;
-/**
- * @brief When non-zero, the open stub returns `g_test_config_fake_fd`; subsequent reads on
- *   that fd return EIO.
- */
+/** @brief Non-zero makes the open stub return the fake fd, whose reads fail with EIO. */
 static int g_test_config_force_read_fail = 0;
 
-/** Number of upcoming config reads that fail with EINTR, as a signal would make them. */
+/** @brief Upcoming reads that fail with EINTR, as a signal would make them. */
 static int g_test_config_read_eintr = 0;
 
-/** Number of upcoming config opens that fail with EINTR, as a signal would make them. */
+/** @brief Upcoming opens that fail with EINTR, as a signal would make them. */
 static int g_test_config_open_eintr = 0;
 
-/** When non-zero, the open stub fails with this errno (EACCES, EPERM, ...). */
+/** @brief Non-zero makes every open fail with this errno (EACCES, EPERM, EMFILE). */
 static int g_test_config_open_errno = 0;
-/** @brief When non-zero, the CAS stub always returns 0 (failure). */
+/** @brief Non-zero makes every CAS fail, as if another thread had won the reload claim. */
 static int g_test_config_force_cas_fail = 0;
-/**
- * @brief Sentinel fd returned by the open stub when `g_test_config_force_read_fail` is set.
- *   Chosen to be outside normal fd ranges to avoid aliasing.
- */
+/** @brief Fake fd for the read-failure path; high enough not to alias a descriptor in use. */
 static const int g_test_config_fake_fd = 8124;
 
 /**
- * @brief Stub for `open(2)` / `open(2)` with O_CREAT.
- *
- * Behaviour depends on fault-injection flags:
- * - `g_test_config_open_eintr` positive: consumes one and fails with EINTR.
- * - `g_test_config_open_errno`: returns -1 with that errno.
- * - `g_test_config_force_open_fail`: returns -1 with errno=ENOENT.
- * - `g_test_config_force_read_fail`: returns `g_test_config_fake_fd`.
- * - O_CREAT: extracts mode from va_args and delegates to the real `open`.
- * - Otherwise: delegates without mode argument.
- *
- * @param path   Filesystem path.
- * @param flags  Open flags.
- * @param ...    Optional mode_t when flags include O_CREAT.
- * @return Opened fd, `g_test_config_fake_fd`, or -1.
+ * @brief open seam. Checked in order: a pending EINTR, a forced errno, a forced ENOENT, then
+ *   the fake fd for the read-failure path; otherwise the real open, forwarding the mode
+ *   argument when O_CREAT is set.
  */
 static int chaos_time_test_config_open(const char *path, int flags, ...)
 {
@@ -138,15 +110,7 @@ static int chaos_time_test_config_open(const char *path, int flags, ...)
 }
 
 /**
- * @brief Stub for `read(2)`.
- *
- * When `g_test_config_force_read_fail` is set and @p fd equals `g_test_config_fake_fd`,
- * returns -1 with errno=EIO. Otherwise delegates to the real read.
- *
- * @param fd      File descriptor.
- * @param buffer  Destination buffer.
- * @param count   Maximum bytes to read.
- * @return Bytes read, or -1 with errno=EIO on injected failure.
+ * @brief read seam: a pending EINTR first, then EIO on the fake fd, otherwise the real read.
  */
 static ssize_t chaos_time_test_config_read(int fd, void *buffer, size_t count)
 {
@@ -166,16 +130,7 @@ static ssize_t chaos_time_test_config_read(int fd, void *buffer, size_t count)
     return read(fd, buffer, count);
 }
 
-/**
- * @brief Stub for `close(2)`.
- *
- * When `g_test_config_force_read_fail` is set and @p fd equals `g_test_config_fake_fd`,
- * returns 0 without calling the real close (the fd is not a real kernel fd).
- * Otherwise delegates.
- *
- * @param fd  File descriptor to close.
- * @return 0 on success.
- */
+/** @brief close seam: the fake fd is not a kernel descriptor, so it is not really closed. */
 static int chaos_time_test_config_close(int fd)
 {
     if (g_test_config_force_read_fail != 0 && fd == g_test_config_fake_fd)
@@ -186,16 +141,11 @@ static int chaos_time_test_config_close(int fd)
 }
 
 /**
- * @brief Stub for `chaos_time_atomic_cas_u64`.
+ * @brief CAS seam for the reload claim: fails while `g_test_config_force_cas_fail` is set,
+ *   otherwise a real `__sync_bool_compare_and_swap`.
  *
- * When `g_test_config_force_cas_fail` is non-zero, returns 0 to simulate a lost CAS race,
- * causing the prepare call to skip the update and return false. Otherwise delegates to the
- * real `__sync_bool_compare_and_swap`.
- *
- * @param value     Pointer to the target 64-bit word.
- * @param expected  Value required for success.
- * @param desired   Value to write on success.
- * @return 1 on success, 0 on injected failure or value mismatch.
+ * @details A lost claim makes prepare keep the active snapshot and report whether it holds
+ * rules, so the result depends on what an earlier load left active.
  */
 static int
 chaos_time_test_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint64_t desired)
@@ -217,27 +167,18 @@ chaos_time_test_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint
 #undef read
 #undef open
 
-/**
- * @brief Heap snapshot of a config file for backup and restore.
- */
+/** @brief Saved copy of a user's rule file, restored after a test that overwrites it. */
 typedef struct chaos_time_test_file_backup
 {
-    /** @brief Non-zero if the file existed at backup time. */
+    /** @brief Non-zero if the file existed; zero makes restore delete it instead. */
     int existed;
-    /** @brief Heap-allocated copy of the file contents. */
+    /** @brief File contents (heap; NULL for an empty or missing file). */
     char *data;
-    /** @brief Number of bytes in `data`. */
+    /** @brief Bytes in `data`. */
     size_t size;
 } chaos_time_test_file_backup_t;
 
-/**
- * @brief Read @p path into a heap snapshot stored in @p backup.
- *
- * If the file does not exist, sets `backup->existed = 0` and returns.
- *
- * @param path    Path to back up.
- * @param backup  Output struct to populate; must be zero-initialised by caller.
- */
+/** @brief Copies @p path into @p backup, or records that it does not exist. */
 static void backup_file(const char *path, chaos_time_test_file_backup_t *backup)
 {
     FILE *file;
@@ -273,14 +214,7 @@ static void backup_file(const char *path, chaos_time_test_file_backup_t *backup)
     fclose(file);
 }
 
-/**
- * @brief Restore a file from a heap snapshot created by `backup_file`.
- *
- * Removes the file if it did not exist at backup time; otherwise rewrites it verbatim.
- *
- * @param path    Filesystem path to restore.
- * @param backup  Snapshot to write.
- */
+/** @brief Rewrites @p path from @p backup, or deletes it if it did not exist before. */
 static void restore_file(const char *path, const chaos_time_test_file_backup_t *backup)
 {
     FILE *file;
@@ -297,11 +231,7 @@ static void restore_file(const char *path, const chaos_time_test_file_backup_t *
     assert(fclose(file) == 0);
 }
 
-/**
- * @brief Free heap memory held by a backup snapshot.
- *
- * @param backup  Snapshot to release.
- */
+/** @brief Frees the saved contents and clears @p backup. */
 static void free_backup(chaos_time_test_file_backup_t *backup)
 {
     free(backup->data);
@@ -311,13 +241,11 @@ static void free_backup(chaos_time_test_file_backup_t *backup)
 }
 
 /**
- * @brief Write @p text to `CHAOS_TIME_CONFIG_PATH` with a deterministic mtime.
+ * @brief Writes @p text to the rule file and sets its atime and mtime to @p stamp seconds.
  *
- * Uses `futimens` on the open file descriptor before closing so that successive calls
- * with distinct @p stamp values produce distinct mtime hashes, reliably triggering a reload.
- *
- * @param text   NUL-terminated config text to write.
- * @param stamp  Seconds value used for both atime and mtime.
+ * @details A distinct @p stamp per write guarantees a new change stamp, so the next prepare
+ * reloads even if two writes fall into one filesystem timestamp tick. Stamps near the epoch
+ * lie outside the racy window, so the load is final, not provisional.
  */
 static void write_config_text(const char *text, time_t stamp)
 {
@@ -336,32 +264,25 @@ static void write_config_text(const char *text, time_t stamp)
 }
 
 /**
- * @brief Invariant: all primitive config helpers accept valid input and reject invalid input.
+ * @brief Proves each leaf parser accepts its valid forms and rejects NULL arguments and
+ *   malformed text, so a bad rule fails at parse time instead of injecting a wrong fault.
  *
- * Triggering conditions: direct calls to every leaf parsing helper with valid, boundary,
- *   and invalid arguments.
- *
- * Expected observable behaviour:
- * - `is_blank_char(' '/'\\t')` → true; `is_blank_char('x')` → false.
- * - `config_reset_state(NULL, 1)` does not crash; `reset_state(&state, 0)` zeroes
- *   `rule_count` and `parse_ok` even when the struct was memset to 0xff.
- * - `trim` strips leading/trailing whitespace; NULL → NULL.
- * - `strip_comment` truncates at '#'; NULL is a no-op.
- * - `parse_errno_name`: EINVAL/EPERM/ENOSYS/EAGAIN return correct values; numeric "4" → 4;
- *   NULL → -1; "bad" → -1.
- * - `parse_probability`/`parse_latency`: NULL pointer args → error; valid strings → 0;
- *   out-of-range → error.
- * - `parse_offset("-250", ...)` → 0 return; NULL args → error; "bad" → error.
- * - `copy_text_value`/`parse_payload_probability`: NULL/empty/zero-size → error; valid → 0.
- * - `parse_clock_id`: realtime, monotonic, platform-conditional IDs, numeric "7" → true;
- *   NULL output, NULL name, "bad-clock" → false.
- * - `selector_parse`: NULL / "" / "clock_gettime/" (empty clock part) / overlong → false.
- * - `split_rule_fields("clock_gettime/monotonic:OFFSET:-250", ...)` → all three pointers set.
- * - `selector_matches(NULL, ...)` → false; `effect_allowed(NULL, ...)` → false;
- *   `effect_allowed(&selector, ERRNO/LATENCY)` → true;
- *   `effect_allowed(&selector, INVALID)` → false.
- * - `config_hash_mtime(NULL)` → MTIME_MISSING; sentinel normalization of MTIME_UNKNOWN and
- *   MTIME_RELOADING never returns those sentinel values; `hash_mtime(&zero_stat)` → non-zero.
+ * @details Highlights:
+ * - `config_reset_state(&state, 0)` clears `rule_count` and `parse_ok` over 0xff garbage.
+ * - `parse_errno_name`: EINVAL, EPERM, ENOSYS, EAGAIN and the number "4"; not "bad".
+ * - `parse_offset` accepts exactly +-3155760000000 ms (100 years of 365.25 days) and
+ *   rejects 1 ms more and values beyond int64, which `strtoll` would clamp silently.
+ * - `parse_payload_probability`: "42" (probability defaults), "25@0.25"; not "@0.25" or a
+ *   probability above 1.0.
+ * - `parse_clock_id`: every clock name this platform defines, the number "7"; not
+ *   "bad-clock".
+ * - `selector_parse` rejects "", "clock_gettime/" (empty clock) and a selector longer than
+ *   `CHAOS_TIME_MAX_TEXT` (128).
+ * - `split_rule_fields` needs two colons and all output pointers.
+ * - `effect_allowed` permits ERRNO and LATENCY on any selector, never INVALID.
+ * - `hash_mtime(NULL)` is MTIME_MISSING; normalisation moves each reserved sentinel off its
+ *   own value. It maps MTIME_UNKNOWN to MTIME_RELOADING, so "never returns a sentinel"
+ *   would be false; the test checks only that the input value is not returned.
  */
 static void test_helper_functions(void)
 {
@@ -422,7 +343,8 @@ static void test_helper_functions(void)
     assert(chaos_time_parse_offset("-250", NULL) != 0);
     assert(chaos_time_parse_offset("-250", &(int64_t){0}) == 0);
     assert(chaos_time_parse_offset("bad", &(int64_t){0}) != 0);
-    /* Within 100 years either way; strtoll would clamp beyond int64 silently. */
+    /* Offsets are bounded to 100 years either way; strtoll would clamp beyond int64
+     * silently, so overflow must be detected, not inherited. */
     {
         int64_t offset = 0;
 
@@ -525,20 +447,13 @@ static void test_helper_functions(void)
 }
 
 /**
- * @brief Invariant: selector matching respects kind hierarchy and rejects non-matching clock IDs.
+ * @brief Proves the three selector kinds and their ranks, which drive rule selection:
+ *   `*` matches any operation at rank 1, `clock_gettime` any clock at rank 2, and
+ *   `clock_gettime/monotonic` only CLOCK_MONOTONIC at rank 3.
  *
- * Triggering condition: `chaos_time_selector_parse()` and `chaos_time_selector_matches()`
- *   called for all four selector variants.
- *
- * Expected observable behaviour:
- * - "*" → kind=ANY, matches USLEEP with rank=1.
- * - "clock_gettime" → kind=OPERATION, matches CLOCK_GETTIME with any clock_id at rank=2.
- * - "clock_gettime/monotonic" → kind=CLOCK_ID, matches CLOCK_GETTIME+CLOCK_MONOTONIC at rank=3;
- *   rejects CLOCK_REALTIME.
- * - "nanosleep" → matches NANOSLEEP.
- * - "usleep" → matches USLEEP.
- * - "clock_gettime/" (empty clock part), "sleep" (unknown op), "clock_gettime/bad-clock"
- *   (unknown clock) all fail to parse.
+ * @details Also: `nanosleep` and `usleep` parse to their operations. `sleep` is not an
+ * operation name (the sleep() wrapper uses `nanosleep` rules). An empty or unknown clock is
+ * rejected.
  */
 static void test_selector_matching(void)
 {
@@ -583,26 +498,16 @@ static void test_selector_matching(void)
 }
 
 /**
- * @brief Invariant: line and buffer parsers accept valid rules and reject invalid forms.
+ * @brief Proves the rule grammar `selector:EFFECT:value[@probability]` for ERRNO, LATENCY
+ *   and OFFSET, and that one bad line rejects the whole buffer.
  *
- * Triggering condition: `chaos_time_config_parse_line()` and
- *   `chaos_time_config_parse_buffer()` with representative valid and invalid inputs.
- *
- * Expected observable behaviour:
- * - Comment line → returns 0 (skipped).
- * - `*:ERRNO:EINVAL@0.5` → selector_kind=ANY, effect=ERRNO, errnum=EINVAL, probability=0.5.
- * - `clock_gettime:LATENCY:25` → effect=LATENCY, latency_ms=25, probability=1.0 (default).
- * - `clock_gettime/monotonic:OFFSET:-250@0.75` → kind=CLOCK_ID, effect=OFFSET,
- *   offset_ms=-250, probability=0.75.
- * - 11 invalid forms: bad selector, empty selector, unknown op "sleep", bad errno name,
- *   empty errno (via "@0.5"), out-of-range latency probability, bad offset text,
- *   empty offset (via "@0.25"), OFFSET on "*" (not allowed), OFFSET on "usleep" (not allowed),
- *   unknown effect name.
- * - 4-rule buffer → rule_count=4.
- * - No-newline EOF → 1 rule parsed.
- * - Buffer with bad line → negative.
- * - Comment-only buffer with one rule → rule_count=1.
- * - NULL guards for line and buffer parsers all return negative.
+ * @details parse_line returns 1 for a rule, 0 for a blank or comment line and a negative
+ * value for an error. Probability defaults to 1.0. The 11 rejected lines cover: no colons,
+ * empty selector, unknown operation `sleep`, unknown errno name, empty value before `@`
+ * (ERRNO and OFFSET), probability above 1.0, non-numeric offset, OFFSET on `*` and on
+ * `usleep` (OFFSET applies only to clock reads), and an unknown effect. Buffers: four mixed
+ * rules, a last line without a newline, and blank and comment lines all parse; a bad second
+ * line fails the buffer. All NULL arguments fail.
  */
 static void test_parse_line_and_buffer(void)
 {
@@ -673,12 +578,12 @@ static void test_parse_line_and_buffer(void)
         assert(chaos_time_config_parse_line(invalid_line, &rule) < 0);
     }
     {
-        /* OFFSET is not allowed on the wildcard selector */
+        /* OFFSET needs a clock_gettime selector; `*` also covers the sleep operations. */
         char invalid_line[] = "*:OFFSET:5";
         assert(chaos_time_config_parse_line(invalid_line, &rule) < 0);
     }
     {
-        /* OFFSET is not allowed on usleep (no clock_id) */
+        /* usleep reads no clock, so there is nothing to shift. */
         char invalid_line[] = "usleep:OFFSET:5";
         assert(chaos_time_config_parse_line(invalid_line, &rule) < 0);
     }
@@ -714,21 +619,15 @@ static void test_parse_line_and_buffer(void)
 }
 
 /**
- * @brief Invariant: rule selection honours rank hierarchy and `selector_len` tie-break.
+ * @brief Proves the most specific matching rule of the requested effect wins, independent
+ *   of file order.
  *
- * Triggering condition: `chaos_time_config_select_rule()` against a 4-rule set containing
- *   one ANY rule, one OPERATION rule, one CLOCK_ID rule, and one nanosleep LATENCY rule.
- *
- * Expected observable behaviour:
- * - CLOCK_GETTIME + CLOCK_MONOTONIC with ERRNO effect → clock_gettime/monotonic wins (rank 3),
- *   returns EINTR.
- * - CLOCK_GETTIME + CLOCK_REALTIME with ERRNO effect → operation selector wins (rank 2),
- *   returns EFAULT.
- * - USLEEP with ERRNO effect → ANY wins (rank 1), returns EINVAL.
- * - NANOSLEEP with LATENCY effect → direct OPERATION match, returns latency_ms=20.
- * - NULL rules / NULL output → false.
- * - Tie-break: two rules for CLOCK_GETTIME/CLOCK_REALTIME with selector_len 10 and 12 →
- *   the rule with selector_len=12 wins, returning EPERM.
+ * @details With `*`, `clock_gettime` and `clock_gettime/monotonic` ERRNO rules, a monotonic
+ * read selects the clock rule (EINTR), a realtime read the operation rule (EFAULT) and
+ * usleep the wildcard (EINVAL); a nanosleep LATENCY query finds the LATENCY rule. Equal
+ * rank falls back to the longer selector text (`selector_len`, forced to 10 and 12 here),
+ * whichever is listed first, and a later wildcard never replaces a more specific rule. File
+ * order is not a tie-breaker, so reordering lines does not change behaviour.
  */
 static void test_rule_selection(void)
 {
@@ -785,8 +684,7 @@ static void test_rule_selection(void)
     ));
     assert(rule.errnum == EPERM);
 
-    /* Listed the other way round, the shorter selector of the same rank does not
-     * replace the longer one... */
+    /* Reversed order: a later, shorter selector of the same rank does not win... */
     tie_rules[0] = tie_rules[1];
     tie_rules[1].selector.selector_len = 10U;
     tie_rules[1].errnum = EINVAL;
@@ -795,7 +693,7 @@ static void test_rule_selection(void)
     ));
     assert(rule.errnum == EPERM);
 
-    /* ...nor does a less specific selector listed after a more specific one. */
+    /* ...nor does a later selector of lower rank. */
     assert(chaos_time_config_parse_line(late_any_line, &tie_rules[1]) == 1);
     assert(chaos_time_config_select_rule(
         tie_rules, 2U, CHAOS_TIME_EFFECT_ERRNO, CHAOS_TIME_OP_CLOCK_GETTIME, CLOCK_REALTIME, &rule
@@ -804,21 +702,19 @@ static void test_rule_selection(void)
 }
 
 /**
- * @brief Invariant: the prepare/match pipeline handles all file-system and state-machine paths.
+ * @brief Proves the load cycle end to end: no rule file means no rules, a changed file is
+ *   reloaded by `match` itself, a rejected file disables every rule, and open, read and
+ *   claim failures never yield rules.
  *
- * Triggering condition: `chaos_time_config_prepare()` and `chaos_time_config_match()`
- *   called under various file conditions with fault flags set and cleared between calls.
- *
- * Expected observable behaviour:
- * - No config file → `prepare` returns false; `match` returns false.
- * - Valid OFFSET rule → `prepare` true; `match` returns offset_ms=500.
- * - `match_loaded` returns same; second `prepare` with same mtime → true without reload.
- * - New mtime (nanosleep:ERRNO:EINTR) → `match` updates; errnum=EINTR.
- * - `match` for non-loaded effect → false.
- * - Bad rule → `prepare` false; `match_loaded` false.
- * - Oversized file → `read_file` returns negative; `read_file(NULL)` negative.
- * - Open failure → `prepare` false; read failure (EIO) → false; CAS failure → false.
- * - Config file restored at test end.
+ * @details Sequence:
+ * - No file: prepare and match report nothing.
+ * - An OFFSET rule loads; `match` and `match_loaded` find it; an unchanged stamp keeps it.
+ * - A rewrite with a new stamp is picked up by the next `match`, and the old rule is gone.
+ * - A bad rule leaves no usable snapshot, so even `match_loaded` finds nothing.
+ * - A file of exactly `CHAOS_TIME_MAX_CONFIG_BYTES` is rejected by `read_file` (it might be
+ *   truncated), as is a NULL size output.
+ * - ENOENT on open, EIO on read and a lost reload claim each return false: the active
+ *   snapshot, still the rejected one, holds no rules.
  */
 static void test_prepare_and_match(void)
 {
@@ -893,13 +789,8 @@ static void test_prepare_and_match(void)
 }
 
 /**
- * @brief Invariant: rule buffer parser rejects input that exceeds `CHAOS_TIME_MAX_RULES`.
- *
- * Triggering condition: a dynamically allocated buffer containing exactly
- *   `CHAOS_TIME_MAX_RULES + 1` valid rule lines.
- *
- * Expected observable behaviour: `chaos_time_config_parse_buffer()` returns a negative
- *   value before the rules array would overflow.
+ * @brief Proves `CHAOS_TIME_MAX_RULES` + 1 (257) valid rules reject the buffer instead of
+ *   dropping rules silently or overflowing the rule array.
  */
 static void test_parse_buffer_limit(void)
 {
@@ -921,16 +812,13 @@ static void test_parse_buffer_limit(void)
 }
 
 /**
- * @brief Invariant: a caller that observes a reload in progress uses the current
- *   snapshot and never starts a second, concurrent reload.
+ * @brief Proves a caller that finds a reload in progress uses the current snapshot and does
+ *   not start a second, concurrent reload.
  *
- * Triggering condition: `g_chaos_time_cached_mtime` holds `CHAOS_TIME_MTIME_RELOADING`
- *   (another thread owns the reload) while the observed mtime differs from it.
- *
- * Expected observable behaviour: `prepare()` leaves both the reload marker and the
- *   active snapshot index untouched. A CAS from RELOADING to RELOADING would succeed,
- *   so without an explicit check the caller would reload into the same inactive
- *   snapshot -- and through the same shared read buffer -- as the owning thread.
+ * @details The cached stamp is set to MTIME_RELOADING, as while another thread owns the
+ * claim. prepare must leave the marker and the active index untouched. The check is
+ * explicit because a CAS from RELOADING to RELOADING succeeds: without it the caller would
+ * reload into the same inactive snapshot, through the same shared read buffer, as the owner.
  */
 static void test_reload_in_progress_is_not_joined(void)
 {
@@ -950,12 +838,13 @@ static void test_reload_in_progress_is_not_joined(void)
 }
 
 /**
- * @brief Invariant: a failed config read keeps the active rules and is retried.
+ * @brief Proves a transient read failure (EIO) keeps the active rules and is retried on the
+ *   next call.
  *
- * Triggering condition: the file changes while `read()` fails.
- *
- * Expected observable behaviour: the previously loaded rule set stays active, the
- * cached stamp is not advanced, and the next call loads the new content.
+ * @details A failed read says nothing about the new rules, so the one loaded rule stays
+ * active and prepare still reports rules. The claim is released with the previous stamp,
+ * neither advanced nor left at RELOADING, so the next call reloads and finds both rules
+ * instead of running on stale rules until the file changes again.
  */
 static void test_read_failure_keeps_rules_and_retries(void)
 {
@@ -984,11 +873,8 @@ static void test_read_failure_keeps_rules_and_retries(void)
 }
 
 /**
- * @brief Invariant: the change stamp sees writes within one mtime tick.
- *
- * Triggering condition: stat results that differ only in size or only in inode.
- *
- * Expected observable behaviour: each difference yields a different stamp.
+ * @brief Proves the change stamp covers size and inode as well as mtime, so an append or an
+ *   atomic rename within one mtime tick is still detected.
  */
 static void test_change_stamp_beyond_mtime(void)
 {
@@ -1011,13 +897,15 @@ static void test_change_stamp_beyond_mtime(void)
 }
 
 /**
- * @brief Invariant: a child forked during a reload takes the orphaned claim over.
+ * @brief Proves a reload claim inherited through fork() is released by the atfork handler,
+ *   after which the child reloads; prepare itself never takes over a claim.
  *
- * Triggering condition: the cached stamp is RELOADING but the claim was recorded
- * by another process id, as a forked child sees it.
- *
- * Expected observable behaviour: `prepare()` reloads and publishes the file's rules;
- * a claim recorded by this process is left alone.
+ * @details The handler is called directly. A reload thread of the parent does not exist in
+ * the child, so the handler turns RELOADING into MTIME_UNKNOWN. It also clears the PRNG
+ * state, so a child does not repeat its parent's random decisions, and records the child's
+ * pid as the owner of its hits. A second call with no claim leaves the published stamp
+ * alone. A lost CAS keeps the current snapshot (which holds a rule, so prepare reports
+ * true). With RELOADING set and no fork, prepare leaves the claim to its owner.
  */
 static void test_fork_takes_over_orphaned_reload(void)
 {
@@ -1027,8 +915,8 @@ static void test_fork_takes_over_orphaned_reload(void)
     chaos_time_config_init();
     write_config_text("nanosleep:ERRNO:EINTR\n", 60);
 
-    /* A claim is never taken over, whoever made it: in a vfork child the parent's
-     * reload thread is still running. A fork() child's atfork handler releases it. */
+    /* prepare never takes over a claim: in a vfork child the parent's reload thread is
+     * still running. Only the fork() atfork handler releases it. */
     g_chaos_time_cached_mtime = CHAOS_TIME_MTIME_RELOADING;
     (void)chaos_time_config_prepare();
     assert(g_chaos_time_cached_mtime == CHAOS_TIME_MTIME_RELOADING);
@@ -1042,13 +930,13 @@ static void test_fork_takes_over_orphaned_reload(void)
     chaos_time_config_after_fork();
     assert(g_chaos_time_cached_mtime == chaos_time_config_observed_mtime());
 
-    /* A competing taker-over wins the release: this caller keeps the current snapshot. */
+    /* Another thread wins the claim: this caller keeps the current snapshot. */
     g_chaos_time_cached_mtime = CHAOS_TIME_MTIME_RELOADING;
     g_test_config_force_cas_fail = 1;
     assert(chaos_time_config_prepare());
     g_test_config_force_cas_fail = 0;
 
-    /* The claim belongs to this process: another of its threads is reloading. */
+    /* RELOADING without a fork: another thread of this process owns the reload. */
     g_chaos_time_cached_mtime = CHAOS_TIME_MTIME_RELOADING;
     (void)chaos_time_config_prepare();
     assert(g_chaos_time_cached_mtime == CHAOS_TIME_MTIME_RELOADING);
@@ -1059,12 +947,11 @@ static void test_fork_takes_over_orphaned_reload(void)
 }
 
 /**
- * @brief Invariant: refreshing the config never changes the caller's errno.
+ * @brief Proves prepare preserves the caller's errno, whether its stat fails with ENOENT or
+ *   it reads a file.
  *
- * Triggering condition: `prepare()` with no config file, so its stat(2) fails with
- * ENOENT, and with a file to read.
- *
- * Expected observable behaviour: errno holds the caller's value afterwards.
+ * @details prepare runs inside wrappers whose real call may succeed; leaking the library's
+ * own ENOENT into errno would corrupt the caller's error handling.
  */
 static void test_prepare_preserves_errno(void)
 {
@@ -1087,11 +974,8 @@ static void test_prepare_preserves_errno(void)
 }
 
 /**
- * @brief Invariant: a config read interrupted by a signal is retried, not treated as failure.
- *
- * Triggering condition: the first `read()` fails with EINTR.
- *
- * Expected observable behaviour: the rules are loaded as if nothing had happened.
+ * @brief Proves a read interrupted by a signal (EINTR) is retried in place and the rules load
+ *   as if nothing had happened.
  */
 static void test_interrupted_read_is_retried(void)
 {
@@ -1110,11 +994,12 @@ static void test_interrupted_read_is_retried(void)
 }
 
 /**
- * @brief Invariant: a file that changed while it was read is not used.
+ * @brief Proves `read_file` rejects a file whose stamp after the read differs from the one
+ *   that triggered the reload.
  *
- * Expected observable behaviour: reading with the stamp of the file as it is now
- * succeeds; reading with any other stamp (the file changed after the stat that
- * started the reload) fails, so the reload keeps the previous rules and retries.
+ * @details A writer that rewrote or appended to the file mid-read can leave a copy that is
+ * half old and half new. Passing a stamp that differs by one bit simulates that; the current
+ * stamp succeeds with the full size.
  */
 static void test_read_file_rejects_changed_file(void)
 {
@@ -1129,9 +1014,7 @@ static void test_read_file_rejects_changed_file(void)
     (void)unlink(CHAOS_TIME_CONFIG_PATH);
 }
 
-/**
- * @brief Reads the status file into @p buffer; returns 0 when it does not exist.
- */
+/** @brief Reads the status file into @p buffer (NUL-terminated); 0 when it does not exist. */
 static int read_status_file(char *buffer, size_t size)
 {
     FILE *file = fopen(CHAOS_TIME_STATUS_PATH, "r");
@@ -1148,15 +1031,14 @@ static int read_status_file(char *buffer, size_t size)
 }
 
 /**
- * @brief Invariant: a rejected line is recorded with its number, its text as written
- *   and the reason, and a full rule set followed by comments is still accepted.
+ * @brief Proves a rejected line is reported with its 1-based number (blank and comment lines
+ *   counted), its text as written and the reason, and that the rule limit counts rules, not
+ *   lines.
  *
- * Triggering condition: a buffer whose fourth line is invalid and carries a comment;
- *   then exactly CHAOS_TIME_MAX_RULES valid rules followed by a comment; then one rule more.
- *
- * Expected observable behaviour: the invalid buffer reports line 4, "invalid rule" and
- *   the line before the parser cut the comment off; the full set parses with no error;
- *   the oversized set reports the first rule beyond the limit as "too many rules".
+ * @details "bogus-rule # typo" on line 4 is reported with its comment, since the parser cuts
+ * the comment off in place only after the line was saved. Exactly 256 rules plus a trailing
+ * comment parse with no error. 257 rules fail with "too many rules" on line 257, and the
+ * rule count drops to 0, so no partial rule set is used.
  */
 static void test_parse_buffer_reports_rejected_line(void)
 {
@@ -1199,14 +1081,14 @@ static void test_parse_buffer_reports_rejected_line(void)
 }
 
 /**
- * @brief Invariant: every load reports its outcome in the status file.
+ * @brief Proves every load writes its outcome to the status file in the exact documented
+ *   format, and that without a rule file the status file is removed.
  *
- * Triggering condition: a rule file whose second line is invalid, then a valid rule
- *   file, then no rule file.
- *
- * Expected observable behaviour: state=error naming line 2 and its text, then
- *   state=ok with the rule count, both stamped with this process id; without a rule
- *   file the status file is removed.
+ * @details Outcomes: a bad line 2 gives `state=error` with line, reason and text; a valid
+ * file gives `state=ok` and the rule count; both end with this pid. Whole-file rejections
+ * report line 0 and an empty text: a file of exactly `CHAOS_TIME_MAX_CONFIG_BYTES` ("file
+ * too large"), a NUL byte ("file contains a NUL byte"), a directory (EISDIR on read) and,
+ * unless running as root, a mode-0 file (EACCES on open), both "file unreadable".
  */
 static void test_prepare_reports_status(void)
 {
@@ -1231,7 +1113,7 @@ static void test_prepare_reports_status(void)
     (void)snprintf(expected, sizeof(expected), "state=ok\nrules=1\npid=%ld\n", (long)getpid());
     assert(strcmp(status, expected) == 0);
 
-    /* A file at the size limit is reported, not silently re-read. */
+    /* At the size limit the file may be truncated, so it is rejected and reported. */
     {
         FILE *large = fopen(CHAOS_TIME_CONFIG_PATH, "w");
         size_t index;
@@ -1255,8 +1137,8 @@ static void test_prepare_reports_status(void)
 
     (void)unlink(CHAOS_TIME_CONFIG_PATH);
 
-    /* A NUL byte rejects the file: the parser would stop there and drop every rule
-     * after it, reporting state=ok. */
+    /* The parser would stop at a NUL byte and drop every later rule while reporting
+     * state=ok, so the whole file is rejected. */
     {
         static const char text[] = "# rules\n\0\n";
         FILE *nul = fopen(CHAOS_TIME_CONFIG_PATH, "w");
@@ -1276,8 +1158,8 @@ static void test_prepare_reports_status(void)
     assert(strcmp(status, expected) == 0);
     (void)unlink(CHAOS_TIME_CONFIG_PATH);
 
-    /* A rule file that cannot be read is reported too: a directory (EISDIR on read),
-     * and, unless running as root, a file without read permission (EACCES on open). */
+    /* Unreadable: a directory fails read with EISDIR; a mode-0 file fails open with
+     * EACCES, except for root, which bypasses permission checks. */
     assert(mkdir(CHAOS_TIME_CONFIG_PATH, 0700) == 0);
     assert(chaos_time_config_prepare() == 0);
     assert(read_status_file(status, sizeof(status)));
@@ -1305,9 +1187,7 @@ static void test_prepare_reports_status(void)
     assert(!read_status_file(status, sizeof(status)));
 }
 
-/**
- * @brief Reads this process's hits file into @p buffer; returns 0 when it does not exist.
- */
+/** @brief Reads this process's hits file into @p buffer; 0 when it does not exist. */
 static int read_hits_file(char *buffer, size_t size)
 {
     char path[64];
@@ -1327,15 +1207,18 @@ static int read_hits_file(char *buffer, size_t size)
 }
 
 /**
- * @brief Invariant: every rule of a loaded snapshot counts its hits, the process
- *   reports the counts with the rule text, and a reload keeps the count of a rule
- *   that is still in the file.
+ * @brief Proves hit counting and reporting: each rule has its own slot, the hits file lists
+ *   `count<TAB>rule text`, and a reload keeps the count of a rule whose text is unchanged.
  *
- * Triggering condition: one rule loaded and hit twice; then a second rule added
- *   and hit once.
- *
- * Expected observable behaviour: the hits file lists "2<TAB>rule # a", then also
- *   "1<TAB>rule # b" with the first count unchanged.
+ * @details Write scheduling (`CHAOS_HITS_EAGER` = 64 hits written at once, then at most every
+ * `CHAOS_HITS_INTERVAL_MS` = 100 ms) is driven through the globals:
+ * - A hit that finds the writer busy stays pending; it is not lost.
+ * - Past 64 hits and inside the interval a hit is counted but not written; the exit report
+ *   writes it, and a second exit report has nothing left.
+ * - Past 64 hits with the interval over, a hit is written at once.
+ * - The atfork handler releases a held writer flag, resets a REGRESS decision in progress
+ *   (state 3) to 1, keeps a completed jump (state 2) and restarts the counts at zero.
+ * - An exit report from a pid other than the owner (a vfork child) writes nothing.
  */
 static void test_hits_are_counted_and_reported(void)
 {
@@ -1364,7 +1247,7 @@ static void test_hits_are_counted_and_reported(void)
     assert(read_hits_file(hits, sizeof(hits)));
     assert(strcmp(hits, "2\tnanosleep:ERRNO:EINTR # a\n1\tnanosleep:ERRNO:EINTR # b\n") == 0);
 
-    /* A hit that finds another thread writing is left pending, not lost. */
+    /* Writer busy: the hit stays pending for the writer to pick up. */
     g_chaos_time_hits_writing = 1;
     chaos_hit_record(state->rules[1].hit);
     g_chaos_time_hits_writing = 0;
@@ -1372,7 +1255,7 @@ static void test_hits_are_counted_and_reported(void)
     assert(read_hits_file(hits, sizeof(hits)));
     assert(strcmp(hits, "2\tnanosleep:ERRNO:EINTR # a\n1\tnanosleep:ERRNO:EINTR # b\n") == 0);
 
-    /* Past the eager hits, a hit inside the interval is not written at once... */
+    /* Past the eager hits and inside the interval: counted, not yet written... */
     g_chaos_time_hits_total = CHAOS_HITS_EAGER;
     g_chaos_time_hits_last_ms = chaos_hits_now_ms();
     chaos_hit_record(state->rules[1].hit);
@@ -1380,14 +1263,14 @@ static void test_hits_are_counted_and_reported(void)
     assert(read_hits_file(hits, sizeof(hits)));
     assert(strcmp(hits, "2\tnanosleep:ERRNO:EINTR # a\n1\tnanosleep:ERRNO:EINTR # b\n") == 0);
 
-    /* ...the exit report writes it, and a second one has nothing left to write. */
+    /* ...the exit report writes it; a second one finds nothing pending. */
     chaos_time_config_report_hits(NULL);
     assert(read_hits_file(hits, sizeof(hits)));
     assert(strcmp(hits, "2\tnanosleep:ERRNO:EINTR # a\n3\tnanosleep:ERRNO:EINTR # b\n") == 0);
     assert(g_chaos_time_hits_pending == 0);
     chaos_time_config_report_hits(NULL);
 
-    /* Past the eager hits, a hit once the interval is over is written at once. */
+    /* Past the eager hits with the interval over: written at once. */
     g_chaos_time_hits_last_ms = chaos_hits_now_ms() - CHAOS_HITS_INTERVAL_MS;
     chaos_hit_record(state->rules[1].hit);
     assert(read_hits_file(hits, sizeof(hits)));
@@ -1395,8 +1278,8 @@ static void test_hits_are_counted_and_reported(void)
     assert(g_chaos_time_hits_pending == 0);
     g_chaos_time_hits_total = 0U;
 
-    /* A writer flag held when the process forked is released in the child, which
-     * starts counting from zero. */
+    /* In a fork child the writer thread does not exist: the flag is released and the
+     * child counts its own hits from zero. */
     g_chaos_time_hits_writing = 1;
     state->rules[0].hit->state = 3U; /* a once-only effect deciding in the parent */
     state->rules[1].hit->state = 2U; /* one that already fired */
@@ -1411,7 +1294,7 @@ static void test_hits_are_counted_and_reported(void)
     assert(strcmp(hits, "1\tnanosleep:ERRNO:EINTR # a\n0\tnanosleep:ERRNO:EINTR # b\n") == 0);
     g_chaos_time_hits_total = 0U;
 
-    /* The exit report of a process that only inherited these counts writes nothing. */
+    /* Another pid (a vfork child sharing this memory) must not write the owner's counts. */
     g_chaos_time_hits_pending = 1;
     g_chaos_time_hits_pid = (uint64_t)getpid() + 1U;
     chaos_time_config_report_hits(NULL);
@@ -1425,14 +1308,12 @@ static void test_hits_are_counted_and_reported(void)
 }
 
 /**
- * @brief Invariant: once rules are loaded, the rule file is looked at no more often
- *   than the check interval, and is looked at again once the interval has passed.
+ * @brief Proves that once rules are loaded the rule file is stat'ed at most once per check
+ *   interval (10 s here), and again once the interval has passed.
  *
- * Triggering condition: rules loaded; the rule file removed; prepare called right
- *   after a look, then again with the last look one interval ago.
- *
- * Expected observable behaviour: the first call still sees the loaded rules (no
- *   look), the second sees the file is gone.
+ * @details Each look is a stat system call, the largest part of a wrapper's cost. With the
+ * file removed right after a look, prepare still reports the loaded rules; with the last
+ * look one interval ago, it notices the file is gone.
  */
 static void test_rule_file_check_is_throttled(void)
 {
@@ -1452,12 +1333,12 @@ static void test_rule_file_check_is_throttled(void)
 }
 
 /**
- * @brief Invariant: qualifiers after a rule are parsed into its policy, and a bad
- *   qualifier rejects the line.
+ * @brief Proves the qualifiers `@first`, `@from`, `@until`, `@size>` and `@size<` after a rule
+ *   land in its policy, and that a bad qualifier rejects the line.
  *
- * Expected observable behaviour: every qualifier lands in the policy and the rule
- *   itself still parses; an unknown qualifier, qualifiers without a rule and an
- *   `@until` before its `@from` are rejected as invalid rules.
+ * @details A parsed rule starts with `call_size` = `CHAOS_POLICY_NO_SIZE`. Rejected: an
+ * unknown qualifier (reported with the full line), qualifiers on a line without a rule
+ * (line 2), `@until` not after `@from`, and `@first=0`.
  */
 static void test_rule_qualifiers(void)
 {
@@ -1488,7 +1369,12 @@ static void test_rule_qualifiers(void)
 }
 
 /**
- * @brief Invariant: REGRESS needs a clock_gettime selector and a positive jump.
+ * @brief Proves REGRESS requires a `clock_gettime/<clock>` selector and a positive jump in
+ *   ms, and accepts a probability.
+ *
+ * @details A bare `clock_gettime` selector is rejected: the jump state is per rule, so a rule
+ * across all clocks would arm on one clock and jump on another. Zero, negative and sleep
+ * selectors are rejected.
  */
 static void test_regress_rule(void)
 {
@@ -1511,16 +1397,17 @@ static void test_regress_rule(void)
 }
 
 /**
- * @brief Invariant: a rewrite in place within one mtime tick is still seen, and a
- *        provisional load that reads the file again unchanged keeps its snapshot.
+ * @brief Proves a same-size rewrite in place within one mtime tick is still loaded, and that
+ *   re-reading an unchanged provisional file keeps its snapshot.
  *
- * Triggering condition: a rule file loaded right after it was written, then
- * rewritten in place with the same size and its mtime set back to the first one,
- * so that mtime, size, inode and device all stay as they were.
- *
- * Expected observable behaviour: the load is provisional; reading the unchanged
- * file again keeps the snapshot; the rewrite is loaded; an mtime older than
- * the window ends the provisional state.
+ * @details A file loaded within the racy window of its mtime is provisional: a later write
+ * could keep mtime, size, inode and device identical, so the stamp alone cannot prove the
+ * file unchanged. Each prepare therefore re-reads it and compares a content hash. Sequence:
+ * - Load right after writing: provisional, `rules=1`.
+ * - Re-read with identical bytes: same content hash, snapshot kept, so counts and claims
+ *   survive.
+ * - Same bytes with the first commented out and the mtime restored: loaded, `rules=0`.
+ * - mtime moved to 60 s after the epoch, outside the window: the load is final.
  */
 static void test_racy_rewrite_is_seen(void)
 {
@@ -1542,11 +1429,11 @@ static void test_racy_rewrite_is_seen(void)
     assert(g_chaos_time_config_provisional == 1);
     assert(read_status_file(status, sizeof(status)) && strstr(status, "rules=1\n") != NULL);
 
-    /* Read again, nothing changed: the same snapshot stays. */
+    /* Provisional re-read with identical bytes: the snapshot stays. */
     assert(chaos_time_config_prepare());
     assert(g_chaos_time_config_content == chaos_config_content_hash(rule, sizeof(rule) - 1U));
 
-    /* The same bytes but the first commented out, written in place, same mtime. */
+    /* Same size, first byte now '#', written in place, mtime restored: identical stamp. */
     (void)memcpy(rewritten, rule, sizeof(rule));
     rewritten[0] = '#';
     file = fopen(CHAOS_TIME_CONFIG_PATH, "r+");
@@ -1557,7 +1444,7 @@ static void test_racy_rewrite_is_seen(void)
     assert(chaos_time_config_prepare() == 0);
     assert(read_status_file(status, sizeof(status)) && strstr(status, "rules=0\n") != NULL);
 
-    /* An mtime outside the window: the load is final and not read again. */
+    /* An mtime outside the racy window: the load is final and is not re-read. */
     times[1].tv_sec = 60;
     times[1].tv_nsec = 0L;
     assert(utimensat(AT_FDCWD, CHAOS_TIME_CONFIG_PATH, times, 0) == 0);
@@ -1569,8 +1456,10 @@ static void test_racy_rewrite_is_seen(void)
 }
 
 /**
- * @brief Invariant: hits still pending when their interval is over are written by
- *        the next look at the rule file, not only by the next hit or at exit.
+ * @brief Proves pending hits are written by the next look at the rule file once their
+ *   100 ms interval is over, so a long-running process that stopped hitting still reports.
+ *
+ * @details Inside the interval the look leaves them pending.
  */
 static void test_pending_hits_written_after_interval(void)
 {
@@ -1589,25 +1478,25 @@ static void test_pending_hits_written_after_interval(void)
 }
 
 /**
- * @brief Invariant: the value parsers accept a value exactly at their limit and reject
- *   the first one beyond it, trailing garbage, and non-positive errno numbers.
+ * @brief Proves the value parsers accept a value exactly at their limit and reject the first
+ *   value beyond it, trailing garbage and non-positive errno numbers, leaving the output
+ *   unchanged on failure.
  *
- * Expected observable behaviour:
- * - errno numbers: 2147483647 accepted; 0, -5, 2147483648 and "12x" rejected.
- * - latency: 4294967295 accepted; 4294967296 and "12x" rejected; a bad latency
- *   rejects the line.
- * - clock ids and offsets with trailing garbage are rejected.
- * - a REGRESS rule whose value is not a valid `<ms>@<probability>` is rejected.
- * - a value that fills its buffer exactly (no room for the terminator) is rejected,
- *   one byte shorter is accepted; the same holds for the payload before `@`.
- * - an empty effect or value field rejects the line.
- * - selector matching reports a match the same with or without a rank output;
- *   matching without an output rule matches nothing.
+ * @details Limits:
+ * - errno numbers: 1 to 2147483647 (INT_MAX); 0, -5, 2147483648 and "12x" are rejected.
+ * - latency: up to 4294967295 ms (UINT_MAX); 4294967296 and "12x" are rejected.
+ * - A 4-byte value buffer takes 3 characters plus NUL; 4 characters are rejected, alone
+ *   or before `@`.
+ *
+ * Also: a clock id or offset with trailing garbage, an empty effect or value field, a bad
+ * latency and a REGRESS probability above 1 reject the input. `split_rule_fields` needs every
+ * output pointer. Selector matching gives the same result without a rank output, and
+ * `match` without an output rule finds nothing.
  */
 static void test_parse_boundaries(void)
 {
     char payload[4];
-    /* The parsers trim the text after the number in place, so it must be writable. */
+    /* The parsers trim trailing text in place, so these inputs must be writable arrays. */
     char errno_garbage[] = "12x";
     char latency_garbage[] = "12x";
     char clock_garbage[] = "7x";
@@ -1683,14 +1572,9 @@ static void test_parse_boundaries(void)
 }
 
 /**
- * @brief Invariant: opening the rule file is retried after a signal, a missing
- *   permission is reported as lasting, and other open errors as retryable.
- *
- * Triggering condition: the first open fails with EINTR; then every open fails with
- *   EACCES, EPERM, then EMFILE.
- *
- * Expected observable behaviour: the interrupted open is retried and the file read
- *   (0, its full size); EACCES and EPERM return -3; EMFILE returns -1.
+ * @brief Proves the open-error classification of `read_file`: EINTR is retried, EACCES and
+ *   EPERM return -3 (lasting until the file changes, reported "file unreadable"), and any
+ *   other error such as EMFILE returns -1 (retried on the next check).
  */
 static void test_open_errors(void)
 {
@@ -1716,7 +1600,8 @@ static void test_open_errors(void)
 
 int main(void)
 {
-    /* Look at the rule file on every call; the throttle has its own test. */
+    /* Stat the rule file on every call so each write is seen at once; the throttle has its
+     * own test. */
     g_chaos_time_check_interval_ns = 0U;
     test_parse_buffer_reports_rejected_line();
     test_prepare_reports_status();

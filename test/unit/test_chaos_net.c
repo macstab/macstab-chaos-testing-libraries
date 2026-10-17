@@ -1,54 +1,47 @@
 /**
  * @file test_chaos_net.c
- * @brief Integration-style unit tests for all NET-domain wrapper call paths.
+ * @brief Unit tests for every libchaos-net wrapper: socket setup, data transfer, waits,
+ *   batches, fd calls on sockets, and the fortified glibc variants.
  *
- * Subsystem under test: `src/net/chaos_net_socket.c`, `src/net/chaos_net_extra.c`,
- *   and `src/net/chaos_net_wait.c`.
+ * @details
+ * Units under test: `src/net/chaos_net_socket.c`, `chaos_net_extra.c` and `chaos_net_wait.c`.
+ * The suite proves the wrapper contract, not rule parsing or effect internals:
+ * - forwarding: under the TLS guard, with no rules loaded, with no resolvable endpoint, or
+ *   with no matching rule, every wrapper calls the real function unchanged and leaves errno
+ *   alone; before symbol resolution the `chaos_net_call_real_*()` forwarders reach the kernel
+ *   through raw syscalls instead of a NULL pointer (Linux);
+ * - endpoints: each wrapper matches on the right endpoint (address argument, local end,
+ *   connection with local/peer fallback, socket() arguments, or the descriptors a wait
+ *   watches, found for epoll through `/proc/self/fdinfo/<epfd>`);
+ * - effects: ERRNO fails before the real call; LATENCY delays, then calls through; CORRUPT
+ *   flips a bit only in bytes actually received; TIMEOUT waits out the caller's own timeout
+ *   under the caller's signal mask and reports "nothing ready"; TRICKLE shortens stream
+ *   receives to the chunk size; DUP replays a socket's last payload once, never on the wrong
+ *   socket; RESET arms a zero SO_LINGER before close();
+ * - `@size` sees the call's byte count, summed over iovecs and batch messages, and is unknown
+ *   where the kernel would reject the vector;
+ * - read(), write(), readv(), writev() and close() apply net rules only to sockets;
+ *   `__recv_chk()`, `__recvfrom_chk()`, `__read_chk()`, `__poll_chk()` and `__ppoll_chk()`
+ *   reach the same wrappers (glibc).
  *
- * Coverage approach:
- * - All three production source files are included directly. Endpoint resolution,
- *   config matching, action helpers (latency, errno, corrupt, should_trigger), and
- *   the real-function-pointer globals are replaced with test-local stubs declared in
- *   this file. This allows each test to exercise a specific effect path without LD_PRELOAD.
- * - On Linux the wait path reads `/proc/<pid>/fd/<fd>` to resolve FD paths. The
- *   `open`, `read`, `close`, and `snprintf` symbols inside `chaos_net_wait.c` are
- *   overridden via `#define` before inclusion so that fake-FD injection and all
- *   failure modes are exercised without touching the real filesystem.
- * - `CHAOS_NET_DEFINE_TEST_GLOBALS()` instantiates all real-function-pointer globals.
- * - `reset_wrapper_stubs()` resets all state between sub-tests.
+ * Seams:
+ * - The config, endpoint and effect entry points the wrappers call are defined here as stubs
+ *   driven by flags (`g_stub_*`, `g_errno_trigger`, `g_should_trigger`); the LATENCY stub
+ *   never sleeps and the CORRUPT stubs flip a predictable bit.
+ * - `reset_wrapper_stubs()` points every socket real function at a counting fake with a
+ *   configurable result; `reset_descriptor_stubs()` adds fakes for read, write, readv,
+ *   writev, close and setsockopt.
+ * - Macros defined before the includes replace the socket-type probe
+ *   (`CHAOS_NET_SOCKET_TYPE`), the DUP table mapping, socket identity and close-race hook
+ *   (`CHAOS_NET_DUP_*`), and the TIMEOUT wait (`CHAOS_NET_TIMEOUT_WAIT`), so no test waits
+ *   for real; in the wait source `open`, `read`, `close` and `snprintf` are redirected so the
+ *   fdinfo reader can be fed failures and crafted text.
+ * - Real epoll instances on pipes, socketpairs and a loopback TCP listener are used only
+ *   where the kernel's behaviour itself is under test.
  *
- * Properties under test (portable):
- * - `bind`: passthrough; ERRNO injection returns -1 with errno set; LATENCY calls latency stub.
- * - `listen`: passthrough; ERRNO + LATENCY paths; endpoint resolved via `from_local_fd`.
- * - `accept` / `accept4` (Linux): passthrough; ERRNO injection; LATENCY; ERRNO=EINTR.
- * - `send` / `sendto` / `sendmsg`: passthrough; ERRNO; LATENCY; endpoint via `from_peer_fd` /
- *   `from_sockaddr_fd`.
- * - `recv` / `recvfrom` / `recvmsg`: passthrough; ERRNO; LATENCY; CORRUPT (corrupt stub
- *   increments `g_corrupt_calls` and actually flips byte[0] so assert `buffer[0] != 'd'`).
- * - `socket` / `socketpair`: passthrough; ERRNO; LATENCY; TLS guard bypass.
- * - `shutdown`: passthrough; ERRNO; LATENCY; endpoint via `from_activity_fd`.
- * - `poll` / `ppoll` / `select` / `pselect`: TIMEOUT clears revents/fd-sets and bypasses real
- *   call; ERRNO; LATENCY; passthrough.
- * - Direct helper functions: `chaos_net_apply_pre_call_rule`,
- * `chaos_net_apply_simple_pre_call_rule`, `chaos_net_wait_pre_call`,
- * `chaos_net_wait_clear_pollfds`, `chaos_net_wait_clear_fdsets`, all `chaos_net_call_real_*`
- * wrappers, `chaos_net_corrupt_iovecs`, `chaos_net_wait_match_pollfds`,
- * `chaos_net_wait_match_fdsets`.
- * - Passthrough and additional branches: connect ERRNO=ECONNREFUSED; send ERRNO=EPIPE;
- *   sendmsg ERRNO=EHOSTUNREACH; TLS guard on `socket`.
- *
- * Properties under test (Linux-only):
- * - `sendmmsg`: ERRNO=EHOSTUNREACH; LATENCY; passthrough.
- * - `recvmmsg`: CORRUPT (buffer verified modified); ERRNO=EAGAIN; passthrough; TLS guard bypass.
- * - `epoll_wait` / `epoll_pwait`: real epoll instance with pipe; TIMEOUT zeroes event count;
- *   ERRNO; LATENCY; passthrough.
- * - `chaos_net_corrupt_mmsghdrs`: NULL guard; single mmsg with 2 iovecs; corrupt_calls verified.
- * - `chaos_net_wait_match_epoll`: snprintf-fail path; invalid epfd; read-fail; fill-buffer
- *   overflow; real epfd with endpoint match.
- *
- * What is NOT tested here:
- * - Config file loading, rule persistence, or mtime-based reload.
- * - Constructor symbol resolution or PRNG seeding.
+ * Out of scope: rule loading and selection (`test_net_config.c`), endpoint resolution
+ * (`test_net_endpoint.c`), effect internals (`test_net_actions.c`) and the constructor
+ * (`test_net_runtime.c`).
  */
 
 #include "../support/test_net_support.h"
@@ -63,240 +56,204 @@
 
 CHAOS_NET_DEFINE_TEST_GLOBALS();
 
-/**
- * @brief Rule returned by the config-match stub when `g_stub_match_endpoint != 0`.
- *
- * Tests set `g_stub_rule.effect` and `g_stub_rule.errnum` before calling a wrapper
- * to control which effect path is exercised.
- */
+/** @brief Rule every match stub returns while `g_stub_match_endpoint` is set. */
 static chaos_net_rule_t g_stub_rule;
 
-/** @brief Endpoint returned by all endpoint-resolution stubs when their flag is non-zero. */
+/** @brief Endpoint every enabled endpoint-resolution stub returns. */
 static chaos_net_endpoint_t g_stub_endpoint;
 
-/**
- * @brief Return value for `chaos_net_config_prepare()`.
- *
- * When 0 the wrapper bypasses matching entirely; when 1 matching proceeds.
- */
+/** @brief Non-zero makes the prepare stub report rules loaded; 0 lets wrappers skip matching. */
 static int g_stub_prepare = 0;
 
-/** @brief Size the recv / recvfrom / read stubs were last asked for. */
+/** @brief Length the fake recv was last asked for; shows TRICKLE's shortened request. */
 static size_t g_last_receive_size = 0U;
-/** @brief Entries and bytes of the vector the recvmsg / readv stubs were last given. */
+/** @brief iovec count the fake recvmsg was last given. */
 static size_t g_last_receive_iovlen = 0U;
+/** @brief Total iovec bytes the fake recvmsg was last given. */
 static size_t g_last_receive_iov_bytes = 0U;
 
-/** @brief `call_size` of the rule copy the latency stub was last given. */
+/** @brief `call_size` of the rule the LATENCY stub last saw; checks what `@size` is fed. */
 static uint64_t g_last_call_size = 0U;
 
-/** @brief When non-zero, `chaos_net_config_match_endpoint*` fills @p rule and returns 1. */
+/** @brief Non-zero makes every match stub return `g_stub_rule`. */
 static int g_stub_match_endpoint = 0;
 
-/** @brief Number of upcoming `chaos_net_config_match_endpoint*` calls that match nothing. */
+/** @brief Number of upcoming match calls that miss despite `g_stub_match_endpoint`. */
 static int g_stub_match_misses = 0;
 
-/** @brief When non-zero, `chaos_net_endpoint_from_sockaddr_fd` fills @p endpoint and returns 1. */
+/** @brief Non-zero makes the sockaddr endpoint stub resolve. */
 static int g_stub_endpoint_from_sockaddr = 0;
-/** @brief Destination addresses looked up through the sockaddr stub. */
+/** @brief Calls of the sockaddr endpoint stub, resolved or not. */
 static int g_sockaddr_lookups = 0;
 
-/** @brief When non-zero, `chaos_net_endpoint_from_socket_spec` fills @p endpoint and returns 1. */
+/** @brief Non-zero makes the socket()-arguments endpoint stub resolve. */
 static int g_stub_endpoint_from_socket_spec = 0;
 
-/** @brief When non-zero, `chaos_net_endpoint_from_activity_fd` fills @p endpoint and returns 1. */
+/** @brief Non-zero makes the activity (local, then peer) endpoint stub resolve. */
 static int g_stub_endpoint_from_activity = 0;
 
-/** @brief When non-zero, `chaos_net_endpoint_from_local_fd` fills @p endpoint and returns 1. */
+/** @brief Non-zero makes the local endpoint stub resolve. */
 static int g_stub_endpoint_from_local = 0;
 
-/** @brief When non-zero, `chaos_net_endpoint_from_peer_fd` fills @p endpoint and returns 1. */
+/** @brief Non-zero makes the peer endpoint stub resolve. */
 static int g_stub_endpoint_from_peer = 0;
 
-/** @brief Cumulative count of `chaos_net_rule_apply_latency` stub invocations. */
+/** @brief Calls of the LATENCY stub (no sleep is performed). */
 static int g_latency_calls = 0;
 
-/**
- * @brief Controls whether the errno stub fires.
- *
- * When 0, `chaos_net_rule_apply_errno` always returns 0 even if effect==ERRNO.
- * When 1, it sets errno to `rule->errnum` and returns 1.
- */
+/** @brief Non-zero makes a matched ERRNO rule fire and set its errno. */
 static int g_errno_trigger = 0;
 
-/**
- * @brief Return value for `chaos_net_rule_should_trigger`.
- *
- * Tests that exercise CORRUPT or TIMEOUT set this to 1 before calling the wrapper.
- */
+/** @brief Result of the should-trigger stub (CORRUPT, TIMEOUT, TRICKLE, DUP, RESET); default 0. */
 static int g_should_trigger = 0;
 
-/* Address length the recvfrom stub reports when the buffer was too small for it. */
+/** @brief Address length the fake recvfrom reports for a too-small buffer, as Linux reports
+ *   the full length of a truncated address; 0 disables. */
 static socklen_t g_recvfrom_reported_name = 0;
 
-/** @brief Cumulative count of `chaos_net_corrupt_buffer*` stub invocations. */
+/** @brief Calls of the CORRUPT stubs. */
 static int g_corrupt_calls = 0;
 
-/** @brief Size the last `chaos_net_corrupt_buffer*` stub call was given. */
+/** @brief Length the last CORRUPT call was given; proves only received bytes are corrupted. */
 static size_t g_last_corrupt_size = 0U;
 
-/* --- Wait-path injection flags (Linux-only when guarded) --- */
+/* --- Faults for the epoll fdinfo reader (used on Linux only) --- */
 
-/**
- * @brief When non-zero, the `snprintf` stub inside `chaos_net_wait.c` returns -1.
- *
- * Used to exercise the FD-path formatting failure branch of `chaos_net_wait_match_epoll`.
- */
+/** @brief Non-zero makes snprintf() in the wait source fail, so the fdinfo path is unbuildable. */
 static int g_wait_fail_snprintf = 0;
 
-/**
- * @brief When non-zero, `chaos_net_test_wait_open` returns `g_wait_fake_fd` instead of
- *   opening a real file, and `chaos_net_test_wait_read` / `chaos_net_test_wait_close`
- *   intercept that descriptor.
- */
+/** @brief Non-zero makes open() in the wait source return `g_wait_fake_fd`, served by the fake
+ *   read and close below. */
 static int g_wait_fake_open = 0;
 
-/** @brief When non-zero, `chaos_net_test_wait_open` returns ENOENT=-1. */
+/** @brief Non-zero makes open() in the wait source fail with ENOENT. */
 static int g_wait_force_open_fail = 0;
 
-/** @brief When non-zero and `g_wait_fake_open != 0`, `chaos_net_test_wait_read` returns EIO=-1. */
+/** @brief Non-zero makes reads of the fake fd fail with EIO. */
 static int g_wait_force_read_fail = 0;
 
-/**
- * @brief When non-zero and `g_wait_fake_open != 0`, `chaos_net_test_wait_read` fills the
- *   entire output buffer with `'x'`, triggering the path-too-long detection.
- */
+/** @brief Non-zero makes every read of the fake fd fill the buffer with 'x' and no newline. */
 static int g_wait_fill_buffer = 0;
 
-/**
- * @brief When non-NULL and `g_wait_fake_open != 0`, `chaos_net_test_wait_read` delivers
- *   the contents of this string in streaming chunks.
- */
+/** @brief fdinfo text the fake fd serves, in chunks of at most the requested size. */
 static const char *g_wait_read_text = NULL;
 
-/** @brief Byte offset into `g_wait_read_text` for the next streaming chunk. */
+/** @brief Bytes of `g_wait_read_text` already served. */
 static size_t g_wait_read_offset = 0U;
 
 #ifdef __linux__
-/** @brief Sentinel file descriptor returned by `chaos_net_test_wait_open` for fake opens. */
+/** @brief Fake fdinfo descriptor; far above any fd this test binary opens. */
 static const int g_wait_fake_fd = 7331;
 #endif
 
-/* --- Per-function real-call counters --- */
+/* --- Calls that reached each fake real function --- */
 
-/** @brief Number of times the `bind` stub was called. */
+/** @brief Calls of the fake real bind(). */
 static int g_bind_calls = 0;
-/** @brief Number of times the `listen` stub was called. */
+/** @brief Calls of the fake real listen(). */
 static int g_listen_calls = 0;
-/** @brief Number of times the `connect` stub was called. */
+/** @brief Calls of the fake real connect(). */
 static int g_connect_calls = 0;
-/** @brief Number of times the `accept` / `accept4` stub was called. */
+/** @brief Calls of the fake real accept() and accept4(). */
 static int g_accept_calls = 0;
-/** @brief Number of times the `socket` stub was called. */
+/** @brief Calls of the fake real socket(). */
 static int g_socket_calls = 0;
-/** @brief Number of times the `socketpair` stub was called. */
+/** @brief Calls of the fake real socketpair(). */
 static int g_socketpair_calls = 0;
-/** @brief Number of times the `shutdown` stub was called. */
+/** @brief Calls of the fake real shutdown(). */
 static int g_shutdown_calls = 0;
-/** @brief Number of times the `send` stub was called. */
+/** @brief Calls of the fake real send(). */
 static int g_send_calls = 0;
-/** @brief Number of times the `sendto` stub was called. */
+/** @brief Calls of the fake real sendto(). */
 static int g_sendto_calls = 0;
-/** @brief Number of times the `sendmsg` stub was called. */
+/** @brief Calls of the fake real sendmsg(). */
 static int g_sendmsg_calls = 0;
-/** @brief Number of times the `recv` stub was called. */
+/** @brief Calls of the fake real recv(). */
 static int g_recv_calls = 0;
-/** @brief Number of times the `recvfrom` stub was called. */
+/** @brief Calls of the fake real recvfrom(). */
 static int g_recvfrom_calls = 0;
-/** @brief Number of times the `recvmsg` stub was called. */
+/** @brief Calls of the fake real recvmsg(). */
 static int g_recvmsg_calls = 0;
-/** @brief Number of times the `poll` stub was called. */
+/** @brief Calls of the fake real poll(). */
 static int g_poll_calls = 0;
-/** @brief Number of times the `ppoll` stub was called. */
+/** @brief Calls of the fake real ppoll(). */
 static int g_ppoll_calls = 0;
-/** @brief Number of times the `select` stub was called. */
+/** @brief Calls of the fake real select(). */
 static int g_select_calls = 0;
-/** @brief Number of times the `pselect` stub was called. */
+/** @brief Calls of the fake real pselect(). */
 static int g_pselect_calls = 0;
 #ifdef __linux__
-/** @brief Number of times the `sendmmsg` stub was called. */
+/** @brief Calls of the fake real sendmmsg(). */
 static int g_sendmmsg_calls = 0;
-/** @brief Number of times the `recvmmsg` stub was called. */
+/** @brief Calls of the fake real recvmmsg(). */
 static int g_recvmmsg_calls = 0;
-/** @brief Number of times the `epoll_wait` stub was called. */
+/** @brief Calls of the fake real epoll_wait(). */
 static int g_epoll_wait_calls = 0;
-/** @brief Number of times the `epoll_pwait` stub was called. */
+/** @brief Calls of the fake real epoll_pwait(). */
 static int g_epoll_pwait_calls = 0;
 #endif
 
-/* --- Per-function real-call results --- */
+/* --- Results of each fake real function (defaults restored by reset_wrapper_stubs()) --- */
 
-/** @brief Value returned by the `bind` stub. Default 0 (success). */
+/** @brief Result of the fake real bind(); default 0. */
 static int g_bind_result = 0;
-/** @brief Value returned by the `listen` stub. Default 0 (success). */
+/** @brief Result of the fake real listen(); default 0. */
 static int g_listen_result = 0;
-/** @brief Value returned by the `connect` stub. Default 0 (success). */
+/** @brief Result of the fake real connect(); default 0. */
 static int g_connect_result = 0;
-/** @brief Value returned by the `accept` / `accept4` stub. Default 10 (synthetic fd). */
+/** @brief Result of the fake real accept() and accept4(); default fd 10. */
 static int g_accept_result = 10;
-/** @brief Value returned by the `socket` stub. Default 8 (synthetic fd). */
+/** @brief Result of the fake real socket(); default fd 8. */
 static int g_socket_result = 8;
-/** @brief Value returned by the `socketpair` stub. Default 0 (success). */
+/** @brief Result of the fake real socketpair(); default 0. */
 static int g_socketpair_result = 0;
-/** @brief Value returned by the `shutdown` stub. Default 0 (success). */
+/** @brief Result of the fake real shutdown(); default 0. */
 static int g_shutdown_result = 0;
-/** @brief Byte count returned by the `send` stub. Default 4. */
+/** @brief Result of the fake real send(); default 4 bytes. */
 static ssize_t g_send_result = 4;
-/** @brief Byte count returned by the `sendto` stub. Default 4. */
+/** @brief Result of the fake real sendto(); default 4 bytes. */
 static ssize_t g_sendto_result = 4;
-/** @brief Byte count returned by the `sendmsg` stub. Default 4. */
+/** @brief Result of the fake real sendmsg(); default 4 bytes. */
 static ssize_t g_sendmsg_result = 4;
-/** @brief Byte count returned by the `recv` stub; it also fills the buffer with "data". */
+/** @brief Result of the fake real recv(); default 4 bytes. */
 static ssize_t g_recv_result = 4;
-/** @brief Byte count returned by the `recvfrom` stub; fills buffer with "data". */
+/** @brief Result of the fake real recvfrom(); default 4 bytes. */
 static ssize_t g_recvfrom_result = 4;
-/** @brief Byte count returned by the `recvmsg` stub; fills iov[0] with "data". */
+/** @brief Result of the fake real recvmsg(); default 4 bytes. */
 static ssize_t g_recvmsg_result = 4;
-/** @brief Value returned by the `poll` stub. Default 0. */
+/** @brief Result of the fake real poll(); default 0 (nothing ready). */
 static int g_poll_result = 0;
-/** @brief Value returned by the `ppoll` stub. Default 0. */
+/** @brief Result of the fake real ppoll(); default 0. */
 static int g_ppoll_result = 0;
-/** @brief Value returned by the `select` stub. Default 0. */
+/** @brief Result of the fake real select(); default 0. */
 static int g_select_result = 0;
-/** @brief Value returned by the `pselect` stub. Default 0. */
+/** @brief Result of the fake real pselect(); default 0. */
 static int g_pselect_result = 0;
 #ifdef __linux__
-/** @brief Message-batch count returned by the `sendmmsg` stub. Default 1. */
+/** @brief Result of the fake real sendmmsg(); default 1 message. */
 static int g_sendmmsg_result = 1;
-/** @brief Message-batch count returned by the `recvmmsg` stub. Default 1. */
+/** @brief Result of the fake real recvmmsg(); default 1 message. */
 static int g_recvmmsg_result = 1;
-/** @brief Event count returned by the `epoll_wait` stub. Default 1. */
+/** @brief Result of the fake real epoll_wait(); default 1 event. */
 static int g_epoll_wait_result = 1;
-/** @brief Event count returned by the `epoll_pwait` stub. Default 1. */
+/** @brief Result of the fake real epoll_pwait(); default 1 event. */
 static int g_epoll_pwait_result = 1;
 #endif
 
 /* -------------------------------------------------------------------------
- * Config and action stubs (replace compiled-in config/action modules)
+ * Config, endpoint and effect stubs: the wrapper sources link against these instead of
+ * chaos_net_config.c, chaos_net_endpoint.c and chaos_net_actions.c
  * --------------------------------------------------------------------- */
 
-/**
- * @brief Stub for `chaos_net_config_prepare()`.
- *
- * Returns whether rules are loaded: `g_stub_prepare`, or a matching rule
- * (`g_stub_match_endpoint`). When 0, wrappers skip rule matching entirely.
- */
+/** @brief Prepare stub: rules count as loaded when `g_stub_prepare` is set or a rule matches. */
 int chaos_net_config_prepare(void)
 {
-    /* A rule that matches is a rule that is loaded. */
     return g_stub_prepare || g_stub_match_endpoint;
 }
 
 /**
- * @brief Stub for `chaos_net_config_match_endpoint()`.
- *
- * When `g_stub_match_endpoint != 0` and @p rule is non-NULL, copies `g_stub_rule`
- * into @p rule and returns 1. Returns 0 otherwise.
+ * @brief Match stub: `g_stub_rule` while matching is enabled, minus `g_stub_match_misses`
+ *   initial misses; operation and endpoint are ignored.
  */
 int chaos_net_config_match_endpoint(
     chaos_net_operation_t operation, const chaos_net_endpoint_t *endpoint, chaos_net_rule_t *rule
@@ -317,12 +274,7 @@ int chaos_net_config_match_endpoint(
     return 1;
 }
 
-/**
- * @brief Stub for `chaos_net_config_match_endpoint_loaded()`.
- *
- * Delegates to `chaos_net_config_match_endpoint` using the same flags, so tests
- * that call the "loaded" variant are covered by the same setup.
- */
+/** @brief Match-without-refresh stub: same behaviour as the match stub. */
 int chaos_net_config_match_endpoint_loaded(
     chaos_net_operation_t operation, const chaos_net_endpoint_t *endpoint, chaos_net_rule_t *rule
 )
@@ -331,8 +283,8 @@ int chaos_net_config_match_endpoint_loaded(
 }
 
 /**
- * @brief Stub for `chaos_net_config_match_either_loaded()`: the ends in order,
- *        each through the same stub (rule precedence is test_net_config's).
+ * @brief Both-ends match stub: tries @p first, then @p second, through the match stub. Rule
+ *   precedence between the ends is proven in test_net_config.c.
  */
 int chaos_net_config_match_either_loaded(
     chaos_net_operation_t operation,
@@ -345,12 +297,7 @@ int chaos_net_config_match_either_loaded(
            (second != NULL && chaos_net_config_match_endpoint(operation, second, rule));
 }
 
-/**
- * @brief Stub for `chaos_net_endpoint_from_sockaddr_fd()`.
- *
- * Used by `bind`, `connect`, `sendto`, and `sendmsg` to obtain the remote endpoint.
- * Returns 1 and fills @p endpoint with `g_stub_endpoint` when `g_stub_endpoint_from_sockaddr != 0`.
- */
+/** @brief Sockaddr endpoint stub: counts every lookup; resolves while enabled. */
 int chaos_net_endpoint_from_sockaddr_fd(
     int fd, const struct sockaddr *address, socklen_t address_length, chaos_net_endpoint_t *endpoint
 )
@@ -367,12 +314,7 @@ int chaos_net_endpoint_from_sockaddr_fd(
     return 1;
 }
 
-/**
- * @brief Stub for `chaos_net_endpoint_from_socket_spec()`.
- *
- * Used by `socket` and `socketpair` to describe the created socket kind.
- * Returns 1 and fills @p endpoint when `g_stub_endpoint_from_socket_spec != 0`.
- */
+/** @brief socket()-arguments endpoint stub: resolves while enabled. */
 int chaos_net_endpoint_from_socket_spec(
     int domain, int type, int protocol, chaos_net_endpoint_t *endpoint
 )
@@ -388,15 +330,10 @@ int chaos_net_endpoint_from_socket_spec(
     return 1;
 }
 
-/**
- * @brief Stub for `chaos_net_endpoint_from_activity_fd()`.
- *
- * Used by `shutdown`, `poll`, `ppoll`, `select`, `pselect`, and epoll paths.
- * Returns 1 and fills @p endpoint when `g_stub_endpoint_from_activity != 0`.
- */
-/** @brief When not -1, the only descriptor the activity stub resolves. */
+/** @brief When not -1, the only descriptor the activity stub resolves (one watched fd of many). */
 static int g_stub_activity_only_fd = -1;
 
+/** @brief Activity endpoint stub: resolves while enabled, optionally for one descriptor only. */
 int chaos_net_endpoint_from_activity_fd(int fd, chaos_net_endpoint_t *endpoint)
 {
     if (g_stub_endpoint_from_activity == 0 || endpoint == NULL ||
@@ -408,12 +345,7 @@ int chaos_net_endpoint_from_activity_fd(int fd, chaos_net_endpoint_t *endpoint)
     return 1;
 }
 
-/**
- * @brief Stub for `chaos_net_endpoint_from_local_fd()`.
- *
- * Used by `listen` and `accept` to identify the local socket endpoint.
- * Returns 1 and fills @p endpoint when `g_stub_endpoint_from_local != 0`.
- */
+/** @brief Local endpoint stub: resolves while enabled. */
 int chaos_net_endpoint_from_local_fd(int fd, chaos_net_endpoint_t *endpoint)
 {
     (void)fd;
@@ -425,13 +357,7 @@ int chaos_net_endpoint_from_local_fd(int fd, chaos_net_endpoint_t *endpoint)
     return 1;
 }
 
-/**
- * @brief Stub for `chaos_net_endpoint_from_peer_fd()`.
- *
- * Used by `send`, `sendto`, and `sendmsg` (NULL-address form) to identify the
- * connected peer endpoint. Returns 1 and fills @p endpoint when
- * `g_stub_endpoint_from_peer != 0`.
- */
+/** @brief Peer endpoint stub: resolves while enabled. */
 int chaos_net_endpoint_from_peer_fd(int fd, chaos_net_endpoint_t *endpoint)
 {
     (void)fd;
@@ -443,12 +369,7 @@ int chaos_net_endpoint_from_peer_fd(int fd, chaos_net_endpoint_t *endpoint)
     return 1;
 }
 
-/**
- * @brief Stub for `chaos_net_rule_apply_latency()`.
- *
- * Increments `g_latency_calls`. The assert ensures the rule pointer is non-NULL,
- * matching the production contract.
- */
+/** @brief LATENCY stub: counts calls and records the rule's `call_size`; never sleeps. */
 void chaos_net_rule_apply_latency(const chaos_net_rule_t *rule)
 {
     assert(rule != NULL);
@@ -456,13 +377,8 @@ void chaos_net_rule_apply_latency(const chaos_net_rule_t *rule)
     g_last_call_size = rule->call_size;
 }
 
-/**
- * @brief Stub for `chaos_net_rule_apply_errno()`.
- *
- * Sets `errno` to `rule->errnum` and returns 1 only when all three conditions hold:
- * rule is non-NULL, effect is ERRNO, and `g_errno_trigger != 0`. This allows tests
- * to arm the errno path independently from rule matching.
- */
+/** @brief ERRNO stub: fires an ERRNO rule while `g_errno_trigger` is set, mirroring the real
+ *   effect check. */
 int chaos_net_rule_apply_errno(const chaos_net_rule_t *rule)
 {
     if (rule == NULL || rule->effect != CHAOS_NET_EFFECT_ERRNO || g_errno_trigger == 0)
@@ -474,24 +390,15 @@ int chaos_net_rule_apply_errno(const chaos_net_rule_t *rule)
     return 1;
 }
 
-/**
- * @brief Stub for `chaos_net_rule_should_trigger()`.
- *
- * Returns `g_should_trigger` unconditionally. Tests that exercise CORRUPT or TIMEOUT
- * set this to 1 before calling the wrapper under test.
- */
+/** @brief Should-trigger stub: returns `g_should_trigger` for every rule. */
 int chaos_net_rule_should_trigger(const chaos_net_rule_t *rule)
 {
     (void)rule;
     return g_should_trigger;
 }
 
-/**
- * @brief Stub for `chaos_net_corrupt_buffer_sample()`.
- *
- * Increments `g_corrupt_calls` and actually flips `bytes[index_sample % size]` bit
- * `(bit_sample & 7)`, so assertions like `buffer[0] != 'd'` after recv are valid.
- */
+/** @brief CORRUPT stub: counts calls, records the length, and flips the selected bit like the
+ *   real one, so tests can see which bytes changed. */
 void chaos_net_corrupt_buffer_sample(
     void *buffer, size_t size, uint32_t index_sample, uint32_t bit_sample
 )
@@ -506,27 +413,17 @@ void chaos_net_corrupt_buffer_sample(
     }
 }
 
-/**
- * @brief Stub for `chaos_net_corrupt_buffer()`.
- *
- * Delegates to `chaos_net_corrupt_buffer_sample` with fixed indices 0/0, ensuring
- * byte[0] is always the corrupted position in tests that use this entry-point.
- */
+/** @brief CORRUPT stub without samples: always flips bit 0 of byte 0, a predictable target. */
 void chaos_net_corrupt_buffer(void *buffer, size_t size)
 {
     chaos_net_corrupt_buffer_sample(buffer, size, 0U, 0U);
 }
 
 /* -------------------------------------------------------------------------
- * Real-function stubs: portable socket calls
+ * Fake real functions: count the call and return the configured result
  * --------------------------------------------------------------------- */
 
-/**
- * @brief Stub for the real `bind(2)`.
- *
- * Increments `g_bind_calls` and returns `g_bind_result`. The default result is 0
- * (success).
- */
+/** @brief Fake real bind(). */
 static int chaos_net_test_bind(int sockfd, const struct sockaddr *address, socklen_t address_length)
 {
     (void)sockfd;
@@ -536,11 +433,7 @@ static int chaos_net_test_bind(int sockfd, const struct sockaddr *address, sockl
     return g_bind_result;
 }
 
-/**
- * @brief Stub for the real `listen(2)`.
- *
- * Increments `g_listen_calls` and returns `g_listen_result`.
- */
+/** @brief Fake real listen(). */
 static int chaos_net_test_listen(int sockfd, int backlog)
 {
     (void)sockfd;
@@ -549,11 +442,7 @@ static int chaos_net_test_listen(int sockfd, int backlog)
     return g_listen_result;
 }
 
-/**
- * @brief Stub for the real `connect(2)`.
- *
- * Increments `g_connect_calls` and returns `g_connect_result`.
- */
+/** @brief Fake real connect(). */
 static int
 chaos_net_test_connect(int sockfd, const struct sockaddr *address, socklen_t address_length)
 {
@@ -564,12 +453,7 @@ chaos_net_test_connect(int sockfd, const struct sockaddr *address, socklen_t add
     return g_connect_result;
 }
 
-/**
- * @brief Stub for the real `accept(2)`.
- *
- * Increments `g_accept_calls` and returns `g_accept_result`. Default result is 10,
- * a synthetic accepted-socket fd.
- */
+/** @brief Fake real accept(); returns fd 10 by default. */
 static int chaos_net_test_accept(int sockfd, struct sockaddr *address, socklen_t *address_length)
 {
     (void)sockfd;
@@ -579,12 +463,7 @@ static int chaos_net_test_accept(int sockfd, struct sockaddr *address, socklen_t
     return g_accept_result;
 }
 
-/**
- * @brief Stub for the real `socket(2)`.
- *
- * Increments `g_socket_calls` and returns `g_socket_result`. Default result is 8,
- * a synthetic socket fd.
- */
+/** @brief Fake real socket(); returns fd 8 by default. */
 static int chaos_net_test_socket(int domain, int type, int protocol)
 {
     (void)domain;
@@ -594,13 +473,7 @@ static int chaos_net_test_socket(int domain, int type, int protocol)
     return g_socket_result;
 }
 
-/**
- * @brief Stub for the real `socketpair(2)`.
- *
- * Increments `g_socketpair_calls`, populates `sv[0]=11, sv[1]=12` when non-NULL,
- * and returns `g_socketpair_result`. The fixed fd values let tests assert the
- * pair was delivered through the wrapper without modification.
- */
+/** @brief Fake real socketpair(); stores fds 11 and 12 so tests see the pair passed through. */
 static int chaos_net_test_socketpair(int domain, int type, int protocol, int sv[2])
 {
     (void)domain;
@@ -615,11 +488,7 @@ static int chaos_net_test_socketpair(int domain, int type, int protocol, int sv[
     return g_socketpair_result;
 }
 
-/**
- * @brief Stub for the real `shutdown(2)`.
- *
- * Increments `g_shutdown_calls` and returns `g_shutdown_result`.
- */
+/** @brief Fake real shutdown(). */
 static int chaos_net_test_shutdown(int sockfd, int how)
 {
     (void)sockfd;
@@ -629,12 +498,7 @@ static int chaos_net_test_shutdown(int sockfd, int how)
 }
 
 #ifdef __linux__
-/**
- * @brief Linux-only stub for the real `accept4(2)`.
- *
- * Shares `g_accept_calls` and `g_accept_result` with the portable `accept` stub,
- * so both are counted by the same counter and tested with the same expected value.
- */
+/** @brief Fake real accept4() (Linux); shares accept()'s counter and result. */
 static int
 chaos_net_test_accept4(int sockfd, struct sockaddr *address, socklen_t *address_length, int flags)
 {
@@ -647,11 +511,7 @@ chaos_net_test_accept4(int sockfd, struct sockaddr *address, socklen_t *address_
 }
 #endif
 
-/**
- * @brief Stub for the real `send(2)`.
- *
- * Increments `g_send_calls` and returns `g_send_result`. Default is 4 bytes sent.
- */
+/** @brief Fake real send(); reports 4 bytes by default. */
 static ssize_t chaos_net_test_send(int sockfd, const void *buffer, size_t size, int flags)
 {
     (void)sockfd;
@@ -662,11 +522,7 @@ static ssize_t chaos_net_test_send(int sockfd, const void *buffer, size_t size, 
     return g_send_result;
 }
 
-/**
- * @brief Stub for the real `sendto(2)`.
- *
- * Increments `g_sendto_calls` and returns `g_sendto_result`.
- */
+/** @brief Fake real sendto(). */
 static ssize_t chaos_net_test_sendto(
     int sockfd,
     const void *buffer,
@@ -686,11 +542,7 @@ static ssize_t chaos_net_test_sendto(
     return g_sendto_result;
 }
 
-/**
- * @brief Stub for the real `sendmsg(2)`.
- *
- * Increments `g_sendmsg_calls` and returns `g_sendmsg_result`.
- */
+/** @brief Fake real sendmsg(). */
 static ssize_t chaos_net_test_sendmsg(int sockfd, const struct msghdr *message, int flags)
 {
     (void)sockfd;
@@ -700,13 +552,8 @@ static ssize_t chaos_net_test_sendmsg(int sockfd, const struct msghdr *message, 
     return g_sendmsg_result;
 }
 
-/**
- * @brief Stub for the real `recv(2)`.
- *
- * Increments `g_recv_calls`. When @p buffer is non-NULL and `size >= 4`, fills the
- * first 4 bytes with `"data"` so post-recv corruption tests can detect the change.
- * Returns `g_recv_result`.
- */
+/** @brief Fake real recv(): records the requested length and writes "data" when it fits, so
+ *   CORRUPT and DUP have known bytes to work on. */
 static ssize_t chaos_net_test_recv(int sockfd, void *buffer, size_t size, int flags)
 {
     (void)sockfd;
@@ -720,12 +567,8 @@ static ssize_t chaos_net_test_recv(int sockfd, void *buffer, size_t size, int fl
     return g_recv_result;
 }
 
-/**
- * @brief Stub for the real `recvfrom(2)`.
- *
- * Increments `g_recvfrom_calls` and fills buffer with `"data"` when possible.
- * Returns `g_recvfrom_result`.
- */
+/** @brief Fake real recvfrom(): writes "data", and an AF_INET sender address when the buffer
+ *   holds one, else the configured truncated-address length. */
 static ssize_t chaos_net_test_recvfrom(
     int sockfd,
     void *buffer,
@@ -746,7 +589,6 @@ static ssize_t chaos_net_test_recvfrom(
     }
     else if (address != NULL && address_length != NULL && g_recvfrom_reported_name > 0)
     {
-        /* Like Linux: a cut address still reports its full length. */
         memset(address, 0, *address_length);
         *address_length = g_recvfrom_reported_name;
     }
@@ -757,13 +599,8 @@ static ssize_t chaos_net_test_recvfrom(
     return g_recvfrom_result;
 }
 
-/**
- * @brief Stub for the real `recvmsg(2)`.
- *
- * Increments `g_recvmsg_calls`. When `message->msg_iov[0].iov_len >= 4`, fills
- * `iov[0].iov_base` with `"data"` so corruption tests can assert modification.
- * Returns `g_recvmsg_result`.
- */
+/** @brief Fake real recvmsg(): records the iovec shape, sets MSG_TRUNC and a 7-byte name, and
+ *   writes "data" into the first iovec, so tests see which output fields a wrapper rewrites. */
 static ssize_t chaos_net_test_recvmsg(int sockfd, struct msghdr *message, int flags)
 {
     (void)sockfd;
@@ -789,11 +626,7 @@ static ssize_t chaos_net_test_recvmsg(int sockfd, struct msghdr *message, int fl
     return g_recvmsg_result;
 }
 
-/**
- * @brief Stub for the real `poll(2)`.
- *
- * Increments `g_poll_calls` and returns `g_poll_result`.
- */
+/** @brief Fake real poll(). */
 static int chaos_net_test_poll(struct pollfd *fds, nfds_t nfds, int timeout)
 {
     (void)fds;
@@ -803,11 +636,7 @@ static int chaos_net_test_poll(struct pollfd *fds, nfds_t nfds, int timeout)
     return g_poll_result;
 }
 
-/**
- * @brief Stub for the real `ppoll(2)`.
- *
- * Increments `g_ppoll_calls` and returns `g_ppoll_result`.
- */
+/** @brief Fake real ppoll(). */
 static int chaos_net_test_ppoll(
     struct pollfd *fds, nfds_t nfds, const struct timespec *timeout, const sigset_t *sigmask
 )
@@ -820,11 +649,7 @@ static int chaos_net_test_ppoll(
     return g_ppoll_result;
 }
 
-/**
- * @brief Stub for the real `select(2)`.
- *
- * Increments `g_select_calls` and returns `g_select_result`.
- */
+/** @brief Fake real select(). */
 static int chaos_net_test_select(
     int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout
 )
@@ -838,11 +663,7 @@ static int chaos_net_test_select(
     return g_select_result;
 }
 
-/**
- * @brief Stub for the real `pselect(2)`.
- *
- * Increments `g_pselect_calls` and returns `g_pselect_result`.
- */
+/** @brief Fake real pselect(). */
 static int chaos_net_test_pselect(
     int nfds,
     fd_set *readfds,
@@ -863,12 +684,7 @@ static int chaos_net_test_pselect(
 }
 
 #ifdef __linux__
-/**
- * @brief Linux-only stub for `snprintf` inside `chaos_net_wait.c`.
- *
- * When `g_wait_fail_snprintf != 0`, returns -1 to exercise the formatting-failure
- * branch of `chaos_net_wait_match_epoll`. Otherwise delegates to `vsnprintf`.
- */
+/** @brief snprintf() replacement for the wait source: fails while `g_wait_fail_snprintf` is set. */
 static int chaos_net_test_wait_snprintf(char *buffer, size_t size, const char *format, ...)
 {
     int rc;
@@ -886,13 +702,8 @@ static int chaos_net_test_wait_snprintf(char *buffer, size_t size, const char *f
 }
 
 /**
- * @brief Linux-only stub for `open(2)` inside `chaos_net_wait.c`.
- *
- * Three operating modes:
- * - `g_wait_force_open_fail != 0` — returns -1 / ENOENT unconditionally.
- * - `g_wait_fake_open != 0` — returns the sentinel `g_wait_fake_fd` without
- *   opening a real file; the path and flags arguments are ignored.
- * - Otherwise — forwards to the real `open(2)`, handling `O_CREAT` va_args correctly.
+ * @brief open() replacement for the wait source: ENOENT, the fake fd, or the real open()
+ *   (mode forwarded only with O_CREAT).
  */
 static int chaos_net_test_wait_open(const char *path, int flags, ...)
 {
@@ -923,16 +734,8 @@ static int chaos_net_test_wait_open(const char *path, int flags, ...)
 }
 
 /**
- * @brief Linux-only stub for `read(2)` inside `chaos_net_wait.c`.
- *
- * When `fd == g_wait_fake_fd` and `g_wait_fake_open != 0`, four modes are available:
- * - `g_wait_force_read_fail != 0` — returns EIO=-1 to exercise the read-error path.
- * - `g_wait_fill_buffer != 0` — fills the entire buffer with `'x'`, triggering the
- *   path-too-long detection in the caller.
- * - `g_wait_read_text != NULL` — delivers the text in streaming chunks up to @p count bytes
- *   per call, advancing `g_wait_read_offset`; returns 0 at end-of-string.
- * - Otherwise returns 0 (empty read).
- * For any other fd, delegates to the real `read(2)`.
+ * @brief read() replacement for the wait source. On the fake fd: EIO, a buffer of 'x' with no
+ *   newline, or `g_wait_read_text` in chunks, then EOF. Other fds use the real read().
  */
 static ssize_t chaos_net_test_wait_read(int fd, void *buffer, size_t count)
 {
@@ -966,12 +769,7 @@ static ssize_t chaos_net_test_wait_read(int fd, void *buffer, size_t count)
     return read(fd, buffer, count);
 }
 
-/**
- * @brief Linux-only stub for `close(2)` inside `chaos_net_wait.c`.
- *
- * When `fd == g_wait_fake_fd` and `g_wait_fake_open != 0`, returns 0 without
- * calling the real `close`. Otherwise delegates to the real `close(2)`.
- */
+/** @brief close() replacement for the wait source: the fake fd closes without a syscall. */
 static int chaos_net_test_wait_close(int fd)
 {
     if (fd == g_wait_fake_fd && g_wait_fake_open != 0)
@@ -983,16 +781,11 @@ static int chaos_net_test_wait_close(int fd)
 #endif
 
 /* -------------------------------------------------------------------------
- * Linux-only batch and epoll real-function stubs
+ * Fake real functions: Linux batch and epoll calls
  * --------------------------------------------------------------------- */
 
 #ifdef __linux__
-/**
- * @brief Stub for the real `sendmmsg(2)`.
- *
- * Increments `g_sendmmsg_calls` and returns `g_sendmmsg_result`. Default is 1
- * message sent.
- */
+/** @brief Fake real sendmmsg(); reports 1 message by default. */
 static int chaos_net_test_sendmmsg(
     int sockfd, struct mmsghdr *msgvec, unsigned int vlen, CHAOS_NET_MMSG_FLAGS_TYPE flags
 )
@@ -1005,13 +798,8 @@ static int chaos_net_test_sendmmsg(
     return g_sendmmsg_result;
 }
 
-/**
- * @brief Stub for the real `recvmmsg(2)`.
- *
- * Increments `g_recvmmsg_calls`. When `msgvec[0].msg_hdr.msg_iov[0].iov_len >= 4`,
- * fills it with `"data"` and sets `msgvec[0].msg_len = 4` so corruption tests
- * can detect the modification. Returns `g_recvmmsg_result`.
- */
+/** @brief Fake real recvmmsg(): writes "data" into the first message's first iovec and sets its
+ *   `msg_len` to 4. */
 static int chaos_net_test_recvmmsg(
     int sockfd,
     struct mmsghdr *msgvec,
@@ -1039,11 +827,7 @@ static int chaos_net_test_recvmmsg(
     return g_recvmmsg_result;
 }
 
-/**
- * @brief Stub for the real `epoll_wait(2)`.
- *
- * Increments `g_epoll_wait_calls` and returns `g_epoll_wait_result`.
- */
+/** @brief Fake real epoll_wait(). */
 static int
 chaos_net_test_epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout)
 {
@@ -1055,11 +839,7 @@ chaos_net_test_epoll_wait(int epfd, struct epoll_event *events, int maxevents, i
     return g_epoll_wait_result;
 }
 
-/**
- * @brief Stub for the real `epoll_pwait(2)`.
- *
- * Increments `g_epoll_pwait_calls` and returns `g_epoll_pwait_result`.
- */
+/** @brief Fake real epoll_pwait(). */
 static int chaos_net_test_epoll_pwait(
     int epfd, struct epoll_event *events, int maxevents, int timeout, const sigset_t *sigmask
 )
@@ -1075,23 +855,25 @@ static int chaos_net_test_epoll_pwait(
 #endif
 
 /* -------------------------------------------------------------------------
- * Production source inclusion with symbol overrides
+ * Compile the wrapper sources against the seams above
  * --------------------------------------------------------------------- */
 
-/* Socket type the wrappers see for any descriptor (TRICKLE applies to streams only). */
+/* SO_TYPE every descriptor reports; TRICKLE, DUP and CORRUPT under MSG_TRUNC depend on it. */
 static int g_test_socket_type = SOCK_STREAM;
 
 #define CHAOS_NET_SOCKET_TYPE(fd) ((void)(fd), g_test_socket_type)
 
-/* DUP slot table mapping: 0 maps for real, 1 fails, 2 loses the race to another thread. */
+/* How the DUP slot table is mapped: 0 normally, 1 fails with ENOMEM, 2 maps but another
+ * thread publishes its table first. */
 static int g_dup_map_mode = 0;
 static void *chaos_net_test_dup_map(size_t size);
 static void chaos_net_test_dup_unmap(void *address, size_t size);
-/* Closes the descriptor between a store's close check and its tag when set. */
+/* Non-zero: forget the descriptor between a store's close check and its tag, the window a
+ * concurrent close() can hit. */
 static int g_dup_close_before_tag = 0;
 static void chaos_net_test_dup_before_tag(int fd);
-/* Identity of the socket behind a descriptor: changes with g_dup_socket_epoch, as
- * when the number is reused for another socket; 0 (unknown) while it is 0. */
+/* Socket identity behind a descriptor (production: inode ^ device << 32). Bumping the epoch
+ * models the number being reused for another socket; epoch 0 means "unknown" (fstat failed). */
 static uint64_t g_dup_socket_epoch = 1U;
 #define CHAOS_NET_DUP_SOCKET(fd)                                                                   \
     (g_dup_socket_epoch == 0U ? 0U : (uint64_t)(fd) + (g_dup_socket_epoch << 32))
@@ -1100,6 +882,7 @@ static uint64_t g_dup_socket_epoch = 1U;
 #define CHAOS_NET_DUP_UNMAP(address, size) chaos_net_test_dup_unmap((address), (size))
 #include "../../src/net/chaos_net_socket.c"
 
+/** @brief Hook between the DUP close check and the tag: forgets @p fd once when armed. */
 static void chaos_net_test_dup_before_tag(int fd)
 {
     if (g_dup_close_before_tag)
@@ -1109,9 +892,13 @@ static void chaos_net_test_dup_before_tag(int fd)
     }
 }
 
-/** @brief Counts the unmaps of a table that lost the race. */
+/** @brief Unmaps of a DUP table that lost the publication race. */
 static int g_dup_unmaps = 0;
 
+/**
+ * @brief DUP table mapper: fails in mode 1; in mode 2 maps, then publishes a second, empty
+ *   table as the competing thread would, so the caller's table must be unmapped.
+ */
 static void *chaos_net_test_dup_map(size_t size)
 {
     void *mapped;
@@ -1139,6 +926,7 @@ static void *chaos_net_test_dup_map(size_t size)
     return mapped;
 }
 
+/** @brief DUP table unmapper: counts and unmaps. */
 static void chaos_net_test_dup_unmap(void *address, size_t size)
 {
     ++g_dup_unmaps;
@@ -1146,14 +934,16 @@ static void chaos_net_test_dup_unmap(void *address, size_t size)
 }
 #include "../../src/net/chaos_net_extra.c"
 #ifdef __linux__
-/* Override the three syscall-like I/O symbols and snprintf only for the wait module. */
+/* Redirect file I/O and snprintf for the wait source only: it reads /proc/self/fdinfo to
+ * find the descriptors an epoll instance watches. */
 #define open chaos_net_test_wait_open
 #define read chaos_net_test_wait_read
 #define close chaos_net_test_wait_close
 #undef snprintf
 #define snprintf chaos_net_test_wait_snprintf
 #endif
-/* The wait of a firing TIMEOUT: recorded, and failing with EINTR on request. */
+/* Replaces the raw ppoll a firing TIMEOUT waits with: records duration and signal mask, and
+ * fails with EINTR on request, so no test actually waits. */
 static int g_timeout_wait_calls = 0;
 static int g_timeout_wait_interrupted = 0;
 static const sigset_t *g_timeout_wait_mask = NULL;
@@ -1180,15 +970,16 @@ static long chaos_net_test_timeout_wait(const struct timespec *wait, const sigse
 #endif
 
 /* -------------------------------------------------------------------------
- * State reset
+ * Per-scenario reset
  * --------------------------------------------------------------------- */
 
 /**
- * @brief Reset all runtime globals and test-local state before each test function.
+ * @brief Points every socket real function at its fake (17 portable, 5 more on Linux),
+ *   disables every rule and endpoint stub, and restores counters and default results.
  *
- * Wires all 17 (21 on Linux) `g_chaos_net_real_*` function pointers to the
- * corresponding test stubs, then zeroes all flag, counter, and result variables to
- * their default values. Default results are: accept=10, socket=8, send/recv family=4.
+ * @details Called at the start of every scenario so no setting leaks between them. The six
+ * fd calls (read, write, readv, writev, close, setsockopt) keep the raw-syscall
+ * implementations `chaos_net_test_reset_runtime()` installs.
  */
 static void reset_wrapper_stubs(void)
 {
@@ -1287,23 +1078,16 @@ static void reset_wrapper_stubs(void)
 }
 
 /* -------------------------------------------------------------------------
- * Test functions
+ * Tests
  * --------------------------------------------------------------------- */
 
 /**
- * @brief Invariant: `bind` and `connect` passthrough and ERRNO/LATENCY paths.
+ * @brief Proves bind() and connect() forward without a rule, fail before the real call on
+ *   ERRNO, and delay then call through on LATENCY.
  *
- * Triggering conditions:
- * - `bind` with no matching endpoint → passthrough, `g_bind_calls == 1`.
- * - `bind` with ERRNO=EADDRINUSE → returns -1, errno set, real bind not called.
- * - `connect` with LATENCY rule → latency stub called, real connect called.
- * - `bind` with LATENCY rule → latency stub called, real bind called.
- * - `connect` with no endpoint match → passthrough.
- *
- * Expected observable behaviour:
- * - Passthrough: wrapper returns the stub result and increments the call counter.
- * - ERRNO injection: wrapper returns -1, errno==EADDRINUSE, real bind call count==0.
- * - LATENCY: `g_latency_calls == 1` and real function was still called.
+ * @details Both resolve their endpoint from the address argument. ERRNO returns -1 with
+ * EADDRINUSE and the real bind() never runs, so the fault is indistinguishable from the
+ * kernel's.
  */
 static void test_bind_and_connect_paths(void)
 {
@@ -1347,20 +1131,13 @@ static void test_bind_and_connect_paths(void)
 }
 
 /**
- * @brief Invariant: `listen`, `accept`, `send`, `sendto`, `sendmsg` effect paths.
+ * @brief Proves the ERRNO, LATENCY and pass-through paths of listen(), accept(), accept4(),
+ *   send(), sendto() and sendmsg().
  *
- * Triggering conditions:
- * - `listen` LATENCY via `from_local_fd`; ERRNO=EADDRINUSE.
- * - `accept` ERRNO=EAGAIN (no accept call); passthrough; accept4 passthrough (Linux).
- * - `accept4` ERRNO=EINTR (Linux).
- * - `send` LATENCY via `from_peer_fd`; passthrough.
- * - `sendto` ERRNO=EHOSTUNREACH via `from_sockaddr_fd`; passthrough.
- * - `sendmsg` passthrough (NULL msg_name → from_sockaddr returns 0); LATENCY.
- *
- * Expected observable behaviour:
- * - ERRNO before real call: counter==0, errno set correctly.
- * - LATENCY before real call: latency counter==1, real call counter==1.
- * - Passthrough: wrapper result equals stub result; counter==1.
+ * @details listen() and accept() match on the local endpoint; send() on the connection;
+ * sendto() and sendmsg() with an address on that address. ERRNO (EADDRINUSE, EAGAIN, EINTR,
+ * EHOSTUNREACH) returns -1 without the real call; LATENCY delays and calls through; with no
+ * rule the real result (fd 10, 4 bytes) is returned unchanged.
  */
 static void test_accept_and_send_paths(void)
 {
@@ -1476,18 +1253,12 @@ static void test_accept_and_send_paths(void)
 }
 
 /**
- * @brief Invariant: `recv`, `recvfrom`, `recvmsg` effect paths.
+ * @brief Proves the CORRUPT, LATENCY, ERRNO and pass-through paths of recv(), recvfrom() and
+ *   recvmsg().
  *
- * Triggering conditions:
- * - `recv` CORRUPT → `g_corrupt_calls == 1`; `buffer[0] != 'd'` (byte flipped by stub).
- * - `recv` LATENCY; ERRNO=EAGAIN.
- * - `recvfrom` ERRNO=EAGAIN; passthrough; CORRUPT.
- * - `recvmsg` CORRUPT (msg_buffer verified not equal to "data"); passthrough; LATENCY.
- *
- * Expected observable behaviour:
- * - CORRUPT: real receive still called, then corruption stub fires; byte is modified.
- * - ERRNO: real receive not called (counter==0), errno set.
- * - LATENCY: latency stub called, real receive called.
+ * @details CORRUPT runs after the real receive and flips a bit in the received bytes ("data"
+ * no longer reads back); ERRNO (EAGAIN) returns -1 without the real call; LATENCY delays and
+ * calls through.
  */
 static void test_recv_paths(void)
 {
@@ -1583,17 +1354,13 @@ static void test_recv_paths(void)
 }
 
 /**
- * @brief Invariant: `socket`, `socketpair`, `shutdown` effect paths.
+ * @brief Proves the ERRNO, LATENCY and pass-through paths of socket(), socketpair() and
+ *   shutdown().
  *
- * Triggering conditions:
- * - `socket` ERRNO=EAFNOSUPPORT; LATENCY; passthrough.
- * - `socketpair` ERRNO=EMFILE; LATENCY with sv[0]==11 and sv[1]==12.
- * - `shutdown` ERRNO=ENOTCONN; passthrough; LATENCY.
- *
- * Expected observable behaviour:
- * - ERRNO: real function not called, errno set.
- * - LATENCY: real function called, latency counter incremented.
- * - socketpair passthrough: pair descriptors delivered unchanged.
+ * @details socket() and socketpair() match on the endpoint their arguments describe (no
+ * address exists yet); shutdown() on the connection. ERRNO (EAFNOSUPPORT, EMFILE, ENOTCONN)
+ * returns -1 without the real call; LATENCY delays and the pair (11, 12) or fd 8 is returned
+ * unchanged.
  */
 static void test_socket_and_shutdown_paths(void)
 {
@@ -1672,23 +1439,20 @@ static void test_socket_and_shutdown_paths(void)
 }
 
 /**
- * @brief Invariant: `poll`, `ppoll`, `select`, `pselect` TIMEOUT/LATENCY/ERRNO paths.
+ * @brief Proves TIMEOUT, LATENCY, ERRNO and pass-through for poll(), ppoll(), select() and
+ *   pselect().
  *
- * Triggering conditions (poll and ppoll):
- * - TIMEOUT: `g_should_trigger=1` → `revents` zeroed, real call bypassed.
- * - LATENCY: real call reached, latency stub fires.
- * - ERRNO=EINTR: returns -1, real call bypassed.
- *
- * Triggering conditions (select and pselect):
- * - TIMEOUT: fd-sets cleared, real call bypassed.
- * - LATENCY: real call reached.
- * - ERRNO: returns -1 with errno set.
- *
- * Expected observable behaviour:
- * - TIMEOUT: return 0; revents/fd-set bits cleared; real call counter==0.
- * - ERRNO: return -1; errno set; real call counter==0.
- * - LATENCY: return 0 (stub result); latency counter==1; real call counter==1.
- * - Passthrough: return 0; real call counter==1.
+ * @details
+ * - TIMEOUT waits out the caller's timeout and reports "nothing ready": return 0, revents
+ *   and fd sets cleared, no real call. select() leaves 0 remaining time in its timeval, as
+ *   Linux does after a full timeout. A call without a timeout (-1 or NULL) cannot time out,
+ *   so the real call runs.
+ * - The TIMEOUT wait uses the call's own duration (1.25 s, or 20 ms rounded from poll's
+ *   milliseconds) and the call's signal mask (ppoll), or the thread's mask (poll). A signal
+ *   ends it with -1/EINTR, as it would end the real wait, and leaves revents untouched.
+ * - On Linux the default wait (raw ppoll with no descriptors and the kernel's 8-byte sigset)
+ *   is itself exercised with and without a mask.
+ * - ERRNO returns -1 without the real call; LATENCY delays and calls through.
  */
 static void test_wait_paths(void)
 {
@@ -1711,7 +1475,6 @@ static void test_wait_paths(void)
     assert(poll(fds, 1U, 1) == 0);
     assert(g_poll_calls == 0);
     assert(fds[0].revents == 0);
-    /* A wait without a timeout never times out: the real poll runs. */
     assert(poll(fds, 1U, -1) == 0);
     assert(g_poll_calls == 1);
 
@@ -1754,9 +1517,7 @@ static void test_wait_paths(void)
     assert(select(10, &readfds, NULL, NULL, &tv) == 0);
     assert(g_select_calls == 0);
     assert(!FD_ISSET(9, &readfds));
-    /* The time not slept is left in the timeout, as Linux does: none. */
     assert(tv.tv_sec == 0 && tv.tv_usec == 0);
-    /* Without a timeout: the real select runs. */
     assert(select(10, &readfds, NULL, NULL, NULL) == 0);
     assert(g_select_calls == 1);
 
@@ -1799,8 +1560,6 @@ static void test_wait_paths(void)
     assert(g_ppoll_calls == 0);
     assert(fds[0].revents == 0);
 
-    /* The TIMEOUT waits out the call's timeout under the call's signal mask; a
-     * signal ends it with EINTR, as it ends the real wait, and nothing is cleared. */
     {
         sigset_t mask;
         struct timespec wait = {1, 250000000L};
@@ -1824,8 +1583,6 @@ static void test_wait_paths(void)
         assert(g_poll_calls == 0);
         g_timeout_wait_interrupted = 0;
 #ifdef SYS_ppoll
-        /* The default wait's own call: no descriptors and the kernel's 8-byte
-         * signal set, under a mask or without one. */
         wait.tv_sec = 0;
         wait.tv_nsec = 1000000L;
         assert(syscall(SYS_ppoll, NULL, 0, &wait, &mask, (size_t)8U) == 0);
@@ -1928,19 +1685,17 @@ static void test_wait_paths(void)
 
 #ifdef __linux__
 /**
- * @brief Invariant: `sendmmsg` and `recvmmsg` batch effect paths (Linux-only).
+ * @brief Proves the sendmmsg() and recvmmsg() paths (Linux): ERRNO, LATENCY, CORRUPT,
+ *   pass-through, the TLS guard, and the `@size` of a batch.
  *
- * Triggering conditions:
- * - `sendmmsg` ERRNO=EHOSTUNREACH: returns -1, real call bypassed.
- * - `sendmmsg` LATENCY: latency counter incremented, real call reached.
- * - `recvmmsg` CORRUPT: corruption stub fires, `buffer` is not equal to "data".
- * - `sendmmsg` passthrough; `recvmmsg` passthrough.
- * - `sendmmsg` with TLS guard active: passthrough (guard bypasses matching).
- * - `recvmmsg` ERRNO=EAGAIN: returns -1, errno set, real call bypassed.
- *
- * Expected observable behaviour:
- * - CORRUPT: `g_corrupt_calls == 1` and `buffer[0:4] != "data"`.
- * - TLS guard: `sendmmsg` passes through even with no explicit passthrough setup.
+ * @details
+ * - ERRNO (EHOSTUNREACH, EAGAIN) returns -1 without the real call; CORRUPT changes the
+ *   received bytes; under the TLS guard the call is forwarded untouched.
+ * - `@size` sees the sum of the batch (2 x 2 bytes = 4). Messages beyond
+ *   `CHAOS_NET_MMSG_MAX` (1024, the kernel's limit) are not inspected, so an address on
+ *   message 1024 is never resolved and no rule applies.
+ * - The size is unknown (`CHAOS_POLICY_NO_SIZE`) for more than `CHAOS_NET_IOV_MAX` iovecs,
+ *   a NULL vector, or a sum that overflows; a NULL batch is forwarded.
  */
 static void test_batch_paths(void)
 {
@@ -1991,8 +1746,6 @@ static void test_batch_paths(void)
     assert(g_corrupt_calls == 1);
     assert(memcmp(buffer, "data", 4U) != 0);
 
-    /* `@size` sees the whole batch, the kernel's 1024 messages at most; messages
-     * beyond those are not looked at, and the connection is looked up once. */
     {
         static struct mmsghdr batch[CHAOS_NET_MMSG_MAX + 2U];
         struct iovec two_bytes;
@@ -2059,29 +1812,22 @@ static void test_batch_paths(void)
 #endif
 
 /**
- * @brief Invariant: direct helper functions exercise all branches.
+ * @brief Proves the internal pre-call, wait, fdinfo-scan, fd-set and iovec helpers directly.
  *
- * Triggering conditions:
- * - `chaos_net_apply_pre_call_rule(NULL)` → 0.
- * - `chaos_net_apply_simple_pre_call_rule(NULL)` → 0.
- * - `chaos_net_wait_pre_call(NULL, &timeout)` → 0, `timeout == 0`.
- * - LATENCY rule → `g_latency_calls == 3` across all three helpers.
- * - ERRNO rule with `g_errno_trigger=1` → returns -1 across all three.
- * - TIMEOUT rule with `g_should_trigger=1` → `synthetic_timeout == 1`.
- * - CORRUPT rule → all three return 0, `synthetic_timeout == 0`.
- * - `chaos_net_wait_clear_pollfds(NULL, 0)` → no crash.
- * - `chaos_net_wait_clear_pollfds` with 2 entries → revents zeroed.
- * - `chaos_net_wait_clear_fdsets` with three non-empty sets → all cleared.
- * - All `chaos_net_call_real_*` functions forwarded to test stubs.
- * - `chaos_net_corrupt_iovecs(NULL, …)` → no crash; non-NULL 2-iov vector with
- *   seeded PRNG that produces odd result → corruption on second iov.
- * - `chaos_net_wait_match_pollfds`: NULL fds; fd==-1; valid fd with match.
- * - `chaos_net_wait_match_fdsets`: NULL readfds; empty set; fd not in set; valid match.
- *
- * Expected observable behaviour:
- * - NULL guards: return 0/false without accessing any globals.
- * - All `call_real_*` wrappers invoke the corresponding stub exactly once.
- * - Iov corruption: `g_corrupt_calls >= 1` after seeded PRNG produces odd.
+ * @details
+ * - The three pre-call helpers ignore NULL, delay on LATENCY, fail with the rule's errno on
+ *   ERRNO, and do nothing for an effect applied after the call (CORRUPT).
+ * - TIMEOUT sets the synthetic-timeout flag only for a call with a timeout; with none (-1)
+ *   the rule is not even consulted.
+ * - Timeouts convert to milliseconds rounded up (2 s + 1 ns is 2001 ms; 1 s + 999 us is
+ *   1001 ms), saturate at INT32_MAX, and a value the kernel would refuse with EINVAL
+ *   (negative, or nanoseconds/microseconds out of range) counts as "no timeout" so the real
+ *   call reports the error.
+ * - fdinfo scanning uses only complete `tfd:` lines; a line cut off by the buffer, a
+ *   non-numeric and a negative descriptor do not match.
+ * - Clearing revents and fd sets, every `chaos_net_call_real_*()` forwarder, CORRUPT across
+ *   iovecs with a seeded PRNG, and matching over pollfds (skipping fd -1) and fd sets
+ *   (skipping descriptors not in the set).
  */
 static void test_direct_helper_paths(void)
 {
@@ -2129,17 +1875,14 @@ static void test_direct_helper_paths(void)
     synthetic_timeout = 0;
     assert(chaos_net_wait_pre_call(&rule, 0, &synthetic_timeout) == 0);
     assert(synthetic_timeout == 1);
-    /* No timeout: TIMEOUT does not apply, and the rule is not consulted. */
     g_should_trigger = 0;
     assert(chaos_net_wait_pre_call(&rule, -1, &synthetic_timeout) == 0);
     assert(synthetic_timeout == 0);
     g_should_trigger = 1;
-    /* Milliseconds of a timeout, rounded up; none for NULL; capped. */
     assert(chaos_net_wait_timespec_ms(NULL) == -1 && chaos_net_wait_timeval_ms(NULL) == -1);
     ts.tv_sec = 2;
     ts.tv_nsec = 1;
     assert(chaos_net_wait_timespec_ms(&ts) == 2001);
-    /* A timeout the kernel refuses (EINVAL) is left to the real call, as none. */
     ts.tv_sec = -1;
     assert(chaos_net_wait_timespec_ms(&ts) == -1);
     ts.tv_sec = 0;
@@ -2163,7 +1906,6 @@ static void test_direct_helper_paths(void)
     assert(chaos_net_wait_pre_call(&rule, 0, &synthetic_timeout) == 0);
     assert(synthetic_timeout == 0);
 
-    /* fdinfo text: complete tfd lines are read, a line cut by the buffer is not. */
     {
         char text[64];
 
@@ -2268,26 +2010,13 @@ static void test_direct_helper_paths(void)
 
 #ifdef __linux__
 /**
- * @brief Invariant: Linux-only direct helper paths for batch and epoll operations.
+ * @brief Proves the Linux-only forwarders, CORRUPT across a batch, and every failure path of
+ *   the epoll fdinfo match.
  *
- * Triggering conditions:
- * - `chaos_net_call_real_sendmmsg`, `chaos_net_call_real_recvmmsg`,
- *   `chaos_net_call_real_epoll_wait`, `chaos_net_call_real_epoll_pwait` — each
- *   calls the corresponding stub exactly once and returns the stub result.
- * - `chaos_net_corrupt_mmsghdrs(NULL, 0)` → no crash.
- * - `chaos_net_corrupt_mmsghdrs(recv_messages, 1)` with iov[0].iov_len==0 and
- *   iov[1].iov_len==4 → corruption lands in iov[1]; `g_corrupt_calls == 1`.
- * - `chaos_net_wait_match_epoll(-1, NULL)` → false (NULL rule pointer).
- * - `chaos_net_wait_match_epoll` with snprintf failure → false.
- * - `chaos_net_wait_match_epoll` with invalid epfd → false.
- * - `chaos_net_wait_match_epoll` with read failure → false.
- * - `chaos_net_wait_match_epoll` with fill-buffer overflow → false.
- * - `chaos_net_wait_match_epoll` with real epfd, endpoint match → true.
- *
- * Expected observable behaviour:
- * - `call_real_*`: stub call counters each increment by 1.
- * - `corrupt_mmsghdrs`: `g_corrupt_calls == 1` for the single message.
- * - `wait_match_epoll`: false for all error paths; true for successful match.
+ * @details CORRUPT of a message whose first iovec is empty lands in the second (one call).
+ * The epoll match fails for a NULL rule, an unbuildable fdinfo path, a non-epoll descriptor,
+ * a read error and a buffer with no newline; it succeeds on a real epoll instance watching a
+ * pipe, reading the real `/proc/self/fdinfo`.
  */
 static void test_direct_linux_helper_paths(void)
 {
@@ -2356,25 +2085,13 @@ static void test_direct_linux_helper_paths(void)
 #endif
 
 /**
- * @brief Invariant: additional wrapper branches not covered by primary tests.
+ * @brief Proves the remaining ERRNO and LATENCY combinations of the connection wrappers, and
+ *   that the TLS guard makes socket() forward untouched.
  *
- * Triggering conditions:
- * - `bind` passthrough with explicit reset.
- * - `connect` ERRNO=ECONNREFUSED.
- * - `accept` LATENCY via `from_local_fd`.
- * - `accept4` LATENCY via `from_local_fd` (Linux).
- * - `send` ERRNO=EPIPE via `from_peer_fd`.
- * - `sendto` LATENCY with NULL address via `from_peer_fd`.
- * - `sendmsg` ERRNO=EHOSTUNREACH via `from_peer_fd` (NULL msg_name).
- * - `recv` passthrough.
- * - `recvfrom` LATENCY.
- * - `recvmsg` ERRNO=EAGAIN.
- * - `socket` with TLS guard active → real call, guard reset.
- *
- * Expected observable behaviour:
- * - ECONNREFUSED: `connect` returns -1, errno==ECONNREFUSED, real call count==0.
- * - EPIPE: `send` returns -1, errno==EPIPE, real call count==0.
- * - TLS guard on socket: wrapper passes through regardless of config state.
+ * @details connect() fails with ECONNREFUSED; accept() and accept4() delay; send() fails with
+ * EPIPE; sendto() and sendmsg() without an address match on the connection (LATENCY,
+ * EHOSTUNREACH); recvfrom() delays and recvmsg() fails with EAGAIN. Each ERRNO path leaves
+ * the real call count at 0.
  */
 static void test_wrapper_passthrough_and_additional_branches(void)
 {
@@ -2484,38 +2201,17 @@ static void test_wrapper_passthrough_and_additional_branches(void)
 }
 
 #ifdef __linux__
-/**
- * @brief Invariant: `epoll_wait` and `epoll_pwait` effect paths (Linux-only).
- *
- * Triggering conditions:
- * - `epoll_wait` TIMEOUT: real call bypassed, returns 0.
- * - `epoll_wait` ERRNO=ETIMEDOUT: returns -1.
- * - `epoll_wait` LATENCY: real call reached, returns 1 (stub result).
- * - `epoll_pwait` ERRNO=ETIMEDOUT; TIMEOUT; LATENCY.
- * - Both `epoll_wait` and `epoll_pwait` passthrough.
- *
- * All tests use a real epoll instance created from a pipe so that
- * `chaos_net_wait_match_epoll` can read `/proc/self/fd/<epfd>` entries.
- * The real fds are closed in all paths to avoid leaks.
- *
- * Expected observable behaviour:
- * - TIMEOUT: call count==0, return 0.
- * - ERRNO: call count==0, return -1, errno==ETIMEDOUT.
- * - LATENCY: call count==1, `g_latency_calls==1`, return 1.
- * - Passthrough: call count==1, return 1.
- */
-/**
- * @brief Invariant: the watched descriptors of an epoll instance are read in small
- *   pieces, so a descriptor listed far into its fdinfo, across a piece's boundary,
- *   is still found.
- */
+/* Fake real read(), defined with the descriptor fakes below: an endless stream without a
+ * newline when used as the fdinfo reader. */
 static ssize_t chaos_net_test_next_read(int fd, void *buffer, size_t size);
 
-/** @brief fdinfo text the scripted read stub hands out, and how much is left. */
+/** @brief fdinfo text the scripted read hands out. */
 static const char *g_fdinfo_script = NULL;
+/** @brief Bytes of the fdinfo script still to hand out. */
 static size_t g_fdinfo_left = 0U;
 
-/** @brief Read stub: hands out g_fdinfo_script in pieces of at most 100 bytes. */
+/** @brief Real read() replacement: hands out the fdinfo script at most 100 bytes at a time, so
+ *   lines straddle the reader's chunk boundaries. */
 static ssize_t chaos_net_test_script_read(int fd, void *buffer, size_t size)
 {
     size_t part = g_fdinfo_left < size ? g_fdinfo_left : size;
@@ -2528,6 +2224,16 @@ static ssize_t chaos_net_test_script_read(int fd, void *buffer, size_t size)
     return (ssize_t)part;
 }
 
+/**
+ * @brief Proves the epoll fdinfo reader finds a watched descriptor anywhere in the file, and
+ *   bounds its work.
+ *
+ * @details With 30 watched pipes only the last one resolves to an endpoint, so its `tfd:` line
+ * lies past the first 512-byte chunk; TIMEOUT still fires. A descriptor nobody watches matches
+ * nothing and the real epoll_wait() runs. A 700-byte line (longer than a chunk) is skipped
+ * whole and the `tfd:` line after it is still found. An endless stream without newlines stops
+ * at the 256 KiB scan limit with no match.
+ */
 static void test_epoll_fdinfo_in_pieces(void)
 {
     struct epoll_event event;
@@ -2553,12 +2259,11 @@ static void test_epoll_fdinfo_in_pieces(void)
     g_should_trigger = 1;
     assert(epoll_wait(epfd, events, 1, 0) == 0);
     assert(g_epoll_wait_calls == 0);
-    g_stub_activity_only_fd = 1000; /* watched by nobody */
+    g_stub_activity_only_fd = 1000; /* not watched */
     (void)epoll_wait(epfd, events, 1, 0);
     assert(g_epoll_wait_calls == 1);
     g_stub_activity_only_fd = -1;
 
-    /* A line longer than a piece is skipped whole; the line after it is read. */
     {
         static char script[1200];
 
@@ -2569,7 +2274,6 @@ static void test_epoll_fdinfo_in_pieces(void)
         g_chaos_net_real_read = chaos_net_test_script_read;
         g_stub_activity_only_fd = 12;
         assert(chaos_net_wait_match_epoll(epfd, &g_stub_rule) == 1);
-        /* An endless stream stops at the scan limit. */
         g_chaos_net_real_read = chaos_net_test_next_read;
         assert(chaos_net_wait_match_epoll(epfd, &g_stub_rule) == 0);
         g_stub_activity_only_fd = -1;
@@ -2583,6 +2287,15 @@ static void test_epoll_fdinfo_in_pieces(void)
     (void)close(epfd);
 }
 
+/**
+ * @brief Proves TIMEOUT, ERRNO, LATENCY and pass-through for epoll_wait() and epoll_pwait()
+ *   (Linux).
+ *
+ * @details A real epoll instance watching a pipe is used because the wrappers find the
+ * watched descriptors through `/proc/self/fdinfo/<epfd>`. TIMEOUT returns 0 events without
+ * the real call; ERRNO returns -1/ETIMEDOUT without it; LATENCY delays and returns the real
+ * result (1).
+ */
 static void test_epoll_wrapper_paths(void)
 {
     int pipefd[2];
@@ -2673,22 +2386,22 @@ static void test_epoll_wrapper_paths(void)
 #endif
 
 #if defined(__GLIBC__)
-/** Times the stubbed overflow handler of the fortified variants ran. */
+/** @brief Calls of the `__chk_fail()` replacement. */
 static int g_chk_fail_calls = 0;
 
-/** Stands in for glibc's `__chk_fail()`, which would abort the test. */
+/** @brief Replaces glibc's `__chk_fail()` (which aborts) so the overflow path is observable. */
 static void chaos_net_test_chk_fail(void)
 {
     ++g_chk_fail_calls;
 }
 
 /**
- * @brief Invariant: the fortified receive variants run the receive wrappers.
+ * @brief Proves `__recv_chk()` and `__recvfrom_chk()` (glibc _FORTIFY_SOURCE) go through the
+ *   receive wrappers, and that a length beyond the declared buffer size calls the overflow
+ *   handler without the real call.
  *
- * Triggering condition: `__recv_chk()` / `__recvfrom_chk()` within and beyond the buffer.
- *
- * Expected observable behaviour: within the buffer the real call is reached through
- * the wrapper; beyond it the overflow handler runs and the real call is not made.
+ * @details Without these, a program built with _FORTIFY_SOURCE would call glibc's checked
+ * variants directly and bypass every recv rule.
  */
 static void test_fortified_receive(void)
 {
@@ -2700,14 +2413,14 @@ static void test_fortified_receive(void)
     assert(__recv_chk(5, buffer, 4U, sizeof(buffer), 0) == 4);
     assert(g_recv_calls == 1);
     g_chk_fail_calls = 0;
-    /* A count beyond the declared buffer size trips the check without overflowing. */
+    /* 4 bytes into a buffer declared as 2: the check trips before anything is written. */
     assert(__recv_chk(5, buffer, 4U, 2U, 0) == -1);
     assert(g_chk_fail_calls == 1);
     assert(g_recv_calls == 1);
 
     reset_wrapper_stubs();
-    /* __extension__: NULL converts to glibc's transparent sockaddr union, which
-     * -pedantic only accepts silently for prototypes from system headers. */
+    /* __extension__: NULL converts to glibc's transparent sockaddr union, which -pedantic
+     * accepts silently only for prototypes from system headers. */
     assert(__extension__ __recvfrom_chk(5, buffer, 4U, sizeof(buffer), 0, NULL, NULL) == 4);
     assert(g_recvfrom_calls == 1);
     g_chk_fail_calls = 0;
@@ -2719,12 +2432,14 @@ static void test_fortified_receive(void)
 }
 #endif
 
-/** Calls made through the stubbed next read/write/readv/writev/close. */
+/** @brief Calls of the fake real read, write, readv, writev and close. */
 static int g_descriptor_calls = 0;
-/** Calls made through the stubbed setsockopt, and the linger it was given. */
+/** @brief Calls of the fake real setsockopt. */
 static int g_setsockopt_calls = 0;
+/** @brief SO_LINGER value the fake setsockopt last received. */
 static struct linger g_setsockopt_linger;
 
+/** @brief Fake real read(): records the length and returns "data" (4 bytes) when it fits. */
 static ssize_t chaos_net_test_next_read(int fd, void *buffer, size_t size)
 {
     (void)fd;
@@ -2738,6 +2453,7 @@ static ssize_t chaos_net_test_next_read(int fd, void *buffer, size_t size)
     return 0;
 }
 
+/** @brief Fake real write(): reports everything written. */
 static ssize_t chaos_net_test_next_write(int fd, const void *buffer, size_t size)
 {
     (void)fd;
@@ -2746,6 +2462,10 @@ static ssize_t chaos_net_test_next_write(int fd, const void *buffer, size_t size
     return (ssize_t)size;
 }
 
+/**
+ * @brief Fake real readv() and writev(): records the vector shape and reports the first
+ *   iovec's length; more than `CHAOS_NET_IOV_MAX` entries fail with EINVAL as in the kernel.
+ */
 static ssize_t chaos_net_test_next_readv(int fd, const struct iovec *iov, int iovcnt)
 {
     int index;
@@ -2754,7 +2474,7 @@ static ssize_t chaos_net_test_next_readv(int fd, const struct iovec *iov, int io
     ++g_descriptor_calls;
     if (iovcnt > CHAOS_NET_IOV_MAX)
     {
-        errno = EINVAL; /* like the kernel, before looking at the vector */
+        errno = EINVAL; /* before touching the vector, as the kernel */
         return -1;
     }
     g_last_receive_iovlen = (size_t)iovcnt;
@@ -2766,6 +2486,7 @@ static ssize_t chaos_net_test_next_readv(int fd, const struct iovec *iov, int io
     return (ssize_t)iov[0].iov_len;
 }
 
+/** @brief Fake real close(). */
 static int chaos_net_test_next_close(int fd)
 {
     (void)fd;
@@ -2773,6 +2494,7 @@ static int chaos_net_test_next_close(int fd)
     return 0;
 }
 
+/** @brief Fake real setsockopt(): accepts only SO_LINGER and records the value. */
 static int
 chaos_net_test_next_setsockopt(int fd, int level, int name, const void *value, socklen_t length)
 {
@@ -2783,7 +2505,7 @@ chaos_net_test_next_setsockopt(int fd, int level, int name, const void *value, s
     return 0;
 }
 
-/** Resets the stubs and wires the descriptor calls to the counting stubs. */
+/** @brief reset_wrapper_stubs() plus fakes for the six fd calls, with their counters cleared. */
 static void reset_descriptor_stubs(void)
 {
     reset_wrapper_stubs();
@@ -2799,18 +2521,16 @@ static void reset_descriptor_stubs(void)
 }
 
 /**
- * @brief Invariant: read/write/readv/writev/close act on sockets with net rules only.
+ * @brief Proves read(), write(), readv(), writev() and close() apply net rules to sockets only.
  *
- * Triggering conditions: no rules, a non-socket descriptor, the internal guard, and
- * sockets with recv/send/close rules of every allowed effect.
- *
- * Expected observable behaviour:
- * - Without rules, for a non-socket, or inside the library, the call is forwarded
- *   unchanged to the next definition in the chain.
- * - recv rules apply to read/readv (latency, errno, corruption), send rules to
- *   write/writev (latency, errno).
- * - close: RESET arms a zero linger before the close, LATENCY delays it, and an
- *   errno is reported only after the descriptor was really closed.
+ * @details
+ * - Without rules, on a non-socket descriptor, or under the TLS guard the call goes to the
+ *   real function unchanged: these wrappers sit in front of every file I/O in the process.
+ * - recv rules apply to read() and readv() (LATENCY, ERRNO, CORRUPT); send rules to write()
+ *   and writev() (LATENCY, ERRNO).
+ * - close(): RESET sets a zero SO_LINGER first so the close sends an RST; LATENCY delays it;
+ *   ERRNO reports the error only after the descriptor was really closed, because a close()
+ *   that returns -1 must not leak the descriptor.
  */
 static void test_descriptor_calls_on_sockets(void)
 {
@@ -2820,7 +2540,7 @@ static void test_descriptor_calls_on_sockets(void)
     iov.iov_base = buffer;
     iov.iov_len = sizeof(buffer);
 
-    /* No rules: forwarded without a socket lookup. */
+    /* No rules loaded: forwarded before any socket lookup. */
     reset_descriptor_stubs();
     assert(read(5, buffer, sizeof(buffer)) == 4);
     assert(write(5, buffer, 4U) == 4);
@@ -2829,7 +2549,7 @@ static void test_descriptor_calls_on_sockets(void)
     assert(close(5) == 0);
     assert(g_descriptor_calls == 5);
 
-    /* Rules exist, but the descriptor is not a socket (endpoint lookup fails). */
+    /* Rules loaded, but no endpoint resolves (not a socket): forwarded. */
     reset_descriptor_stubs();
     g_stub_prepare = 1;
     g_stub_match_endpoint = 1;
@@ -2841,7 +2561,7 @@ static void test_descriptor_calls_on_sockets(void)
     assert(close(5) == 0);
     assert(g_descriptor_calls == 3);
 
-    /* Inside the library: forwarded. */
+    /* TLS guard set (the library's own I/O): forwarded. */
     reset_descriptor_stubs();
     g_stub_prepare = 1;
     g_stub_endpoint_from_local = 1;
@@ -2852,7 +2572,7 @@ static void test_descriptor_calls_on_sockets(void)
     assert(read(5, buffer, sizeof(buffer)) == 4);
     g_chaos_net_tls_guard = 0;
 
-    /* recv rules on read and readv. */
+    /* recv rules apply to read() and readv(). */
     reset_descriptor_stubs();
     g_stub_prepare = 1;
     g_stub_endpoint_from_local = 1;
@@ -2878,7 +2598,7 @@ static void test_descriptor_calls_on_sockets(void)
     assert(g_corrupt_calls == 1);
     assert(readv(5, &iov, 1) == (ssize_t)sizeof(buffer));
 
-    /* send rules on write and writev. */
+    /* send rules apply to write() and writev(). */
     reset_descriptor_stubs();
     g_stub_prepare = 1;
     g_stub_endpoint_from_peer = 1;
@@ -2895,7 +2615,7 @@ static void test_descriptor_calls_on_sockets(void)
     assert(writev(5, &iov, 1) == (ssize_t)sizeof(buffer));
     assert(g_latency_calls == 2);
 
-    /* close rules. */
+    /* close rules: RESET arms SO_LINGER {1, 0}; ERRNO closes for real, then fails. */
     reset_descriptor_stubs();
     g_stub_prepare = 1;
     g_stub_endpoint_from_activity = 1;
@@ -2927,10 +2647,9 @@ static void test_descriptor_calls_on_sockets(void)
 
 #if defined(__GLIBC__)
 /**
- * @brief Invariant: the fortified read, poll and ppoll variants run the wrappers.
- *
- * Expected observable behaviour: within bounds the wrapper forwards to the next
- * implementation; beyond them the overflow handler runs and nothing is forwarded.
+ * @brief Proves `__read_chk()`, `__poll_chk()` and `__ppoll_chk()` (glibc _FORTIFY_SOURCE) go
+ *   through the wrappers, and that a length beyond the declared object size calls the
+ *   overflow handler without the real call.
  */
 static void test_fortified_read_and_poll(void)
 {
@@ -2972,8 +2691,9 @@ static void test_fortified_read_and_poll(void)
 #endif
 
 /**
- * @brief Invariant: byte counts for `@size` gates cover every iovec and treat a
- *   missing vector or message as "no size".
+ * @brief Proves the `@size` byte count of a vector or message is the sum of all its iovecs,
+ *   and unknown (`CHAOS_POLICY_NO_SIZE`) for NULL, a negative count, or more than
+ *   `CHAOS_NET_IOV_MAX` entries, which the kernel rejects before reading them.
  */
 static void test_size_of_vectors_and_messages(void)
 {
@@ -2992,15 +2712,14 @@ static void test_size_of_vectors_and_messages(void)
     assert(chaos_net_iovec_size(iov, -1) == CHAOS_POLICY_NO_SIZE);
     assert(chaos_net_message_size(&message) == 7U);
     assert(chaos_net_message_size(NULL) == CHAOS_POLICY_NO_SIZE);
-    /* An array longer than the kernel takes is not walked (nor its count narrowed). */
     assert(chaos_net_iovec_size(iov, CHAOS_NET_IOV_MAX + 1) == CHAOS_POLICY_NO_SIZE);
     message.msg_iovlen = (size_t)CHAOS_NET_IOV_MAX + 1U;
     assert(chaos_net_message_size(&message) == CHAOS_POLICY_NO_SIZE);
 }
 
 /**
- * @brief Invariant: send and receive wrappers hand the call's byte count to the
- *   matched rule, so `@size` gates see it.
+ * @brief Proves send(), recv(), sendmsg() and recvmsg() hand the call's byte count (9, 12,
+ *   and 5 + 6 = 11) to the matched rule, so `@size` gates see it.
  */
 static void test_wrappers_record_call_size(void)
 {
@@ -3034,13 +2753,15 @@ static void test_wrappers_record_call_size(void)
 }
 
 /**
- * @brief Invariant: TRICKLE shortens every receive form to the rule's chunk size and
- *   leaves shorter requests, other effects and non-firing rules alone.
+ * @brief Proves TRICKLE shortens every receive form to the rule's chunk size, and leaves
+ *   alone what it must not shorten.
  *
- * Expected observable behaviour: recv, recvfrom and read ask for at most 3 bytes;
- *   recvmsg and readv pass a vector of at most 3 bytes in total, cut inside the
- *   entry that crosses the limit; recvmsg copies the kernel's flags and name length
- *   back into the caller's header; an over-long vector is passed unchanged.
+ * @details recv(), recvfrom() and read() ask for at most 3 bytes; recvmsg() and readv() pass
+ * a vector of at most 3 bytes, cut inside the entry that crosses the limit (2 + 1). recvmsg()
+ * runs on a copy of the caller's header: the caller's `msg_iov` and `msg_iovlen` stay as
+ * given, and the kernel's `msg_flags` and `msg_namelen` are copied back. Unchanged: a request
+ * already within the chunk, MSG_WAITALL (the caller asked for the whole count), a vector of
+ * more than `CHAOS_NET_TRICKLE_MAX_IOV` entries, and a rule that does not fire.
  */
 static void test_trickle_shortens_receives(void)
 {
@@ -3075,7 +2796,6 @@ static void test_trickle_shortens_receives(void)
     assert(g_last_receive_size == 3U);
     rc = recv(4, buffer, 2U, 0);
     assert(g_last_receive_size == 2U);
-    /* MSG_WAITALL asks for the whole count: not shortened. */
     rc = recv(4, buffer, sizeof(buffer), MSG_WAITALL);
     assert(g_last_receive_size == sizeof(buffer));
     rc = recvfrom(4, buffer, sizeof(buffer), 0, NULL, NULL);
@@ -3108,13 +2828,24 @@ static void test_trickle_shortens_receives(void)
 }
 
 /**
- * @brief Invariant: DUP keeps each socket's last payload and delivers it once more
- *   when the rule fires, then reads the socket again.
+ * @brief Proves DUP keeps each socket's last payload and delivers it once more when the rule
+ *   fires, and receives for real whenever a replay could be wrong.
  *
- * Expected observable behaviour: a firing DUP replays the kept bytes without a real
- *   receive, once; MSG_PEEK, a rule that does not fire, a closed or colliding
- *   descriptor and a failed table mapping all receive for real; the sender address
- *   is replayed for recvfrom and recvmsg; payloads beyond 4 KiB are replayed cut.
+ * @details
+ * - Table: a failed mapping disables DUP (every receive real, errno untouched); losing the
+ *   publication race uses the winner's table and unmaps ours.
+ * - A firing DUP replays the kept bytes without a real receive, exactly once.
+ * - Real receives: MSG_PEEK; MSG_WAITALL (a short kept payload would answer short); a rule
+ *   that does not fire; a descriptor whose slot (`fd % 64`) another descriptor took; a
+ *   descriptor now naming another socket (dup2() or a close libchaos-net did not see); an
+ *   unknown socket identity; and the call after a failed receive.
+ * - recvfrom() and recvmsg() replay the sender address; a payload without one replays with no
+ *   name and no control data.
+ * - A kept datagram replayed into a smaller buffer reports MSG_TRUNC, as the kernel does; a
+ *   stream payload does not.
+ * - A stream payload over `CHAOS_NET_DUP_MAX_BYTES` (4096) is kept truncated; a datagram over
+ *   it is not kept, since a truncated datagram would be a different message.
+ * - read() and readv() replay too; close() drops the kept payload.
  */
 static void test_dup_replays_the_last_payload(void)
 {
@@ -3132,7 +2863,6 @@ static void test_dup_replays_the_last_payload(void)
     g_stub_rule.effect = CHAOS_NET_EFFECT_DUP;
     g_should_trigger = 1;
 
-    /* The table cannot be mapped: every receive is real, and errno is the caller's. */
     g_chaos_net_dup_slots = NULL;
     g_dup_map_mode = 1;
     errno = 4242;
@@ -3141,13 +2871,11 @@ static void test_dup_replays_the_last_payload(void)
     rc = recv(4, buffer, sizeof(buffer), 0);
     assert(g_recv_calls == 2);
 
-    /* Another thread maps the table first: its table is used, ours unmapped. */
     g_dup_map_mode = 2;
     rc = recv(4, buffer, sizeof(buffer), 0);
     assert(g_dup_unmaps == 1);
     g_dup_map_mode = 0;
 
-    /* Replayed once, without a real receive. */
     memset(buffer, 0, sizeof(buffer));
     rc = recv(4, buffer, sizeof(buffer), 0);
     assert(rc == 4 && memcmp(buffer, "data", 4U) == 0);
@@ -3155,8 +2883,6 @@ static void test_dup_replays_the_last_payload(void)
     rc = recv(4, buffer, sizeof(buffer), 0);
     assert(g_recv_calls == 4);
 
-    /* MSG_PEEK and a rule that does not fire receive for real; so does MSG_WAITALL,
-     * which a kept payload shorter than the buffer would answer short. */
     rc = recv(4, buffer, sizeof(buffer), MSG_PEEK);
     assert(g_recv_calls == 5);
     rc = recv(4, buffer, sizeof(buffer), MSG_WAITALL);
@@ -3167,20 +2893,17 @@ static void test_dup_replays_the_last_payload(void)
     assert(g_recv_calls == 6);
     g_should_trigger = 1;
 
-    /* A colliding descriptor takes the slot; descriptor 4 then receives for real... */
+    /* fd 68 shares fd 4's slot: it takes it over, and neither replays the other's payload. */
     rc = recv(4 + CHAOS_NET_DUP_SLOTS, buffer, sizeof(buffer), 0);
     rc = recv(4, buffer, sizeof(buffer), 0);
     assert(g_recv_calls == 8);
-    /* ...and keeps its own payload, so the other descriptor receives for real too. */
     rc = recv(4 + CHAOS_NET_DUP_SLOTS, buffer, sizeof(buffer), 0);
     assert(g_recv_calls == 9);
 
-    /* The number names another socket now (dup2, a close net did not see): the
-     * kept payload is dropped, not replayed there. */
     {
         int calls;
 
-        do /* until a real receive has kept a payload for descriptor 4 */
+        do /* until a real receive has stored a payload for fd 4 */
         {
             calls = g_recv_calls;
             rc = recv(4, buffer, sizeof(buffer), 0);
@@ -3189,7 +2912,6 @@ static void test_dup_replays_the_last_payload(void)
         calls = g_recv_calls;
         rc = recv(4, buffer, sizeof(buffer), 0);
         assert(g_recv_calls == calls + 1);
-        /* An unknown socket keeps nothing: every receive is real. */
         g_dup_socket_epoch = 0U;
         rc = recv(4, buffer, sizeof(buffer), 0);
         rc = recv(4, buffer, sizeof(buffer), 0);
@@ -3197,7 +2919,6 @@ static void test_dup_replays_the_last_payload(void)
         g_dup_socket_epoch = 1U;
     }
 
-    /* A failed receive keeps nothing. */
     {
         const int calls = g_recv_calls;
 
@@ -3208,7 +2929,6 @@ static void test_dup_replays_the_last_payload(void)
         assert(g_recv_calls == calls + 2);
     }
 
-    /* recvfrom keeps and replays the sender address. */
     from_length = (socklen_t)sizeof(from);
     rc = recvfrom(6, buffer, sizeof(buffer), 0, (struct sockaddr *)&from, &from_length);
     memset(&from, 0, sizeof(from));
@@ -3219,7 +2939,6 @@ static void test_dup_replays_the_last_payload(void)
     rc = recvfrom(6, buffer, sizeof(buffer), MSG_PEEK, NULL, NULL);
     assert(g_recvfrom_calls == 2);
 
-    /* recvmsg: a payload without a sender replays with no name and no control data. */
     iov[0].iov_base = buffer;
     iov[0].iov_len = 2U;
     iov[1].iov_base = buffer + 2;
@@ -3242,8 +2961,6 @@ static void test_dup_replays_the_last_payload(void)
     rc = recvmsg(7, &message, MSG_PEEK);
     assert(g_recvmsg_calls == 2);
 
-    /* A kept datagram replayed into smaller buffers is reported cut (MSG_TRUNC),
-     * as the kernel reports it; a stream's is not a message and is not. */
     {
         struct iovec small;
 
@@ -3261,14 +2978,12 @@ static void test_dup_replays_the_last_payload(void)
         assert(rc == 2 && message.msg_flags == 0);
     }
 
-    /* Payloads beyond the limit are kept cut. */
     g_recv_result = (ssize_t)sizeof(big);
     rc = recv(8, big, sizeof(big), 0);
     g_recv_result = 4;
     rc = recv(8, big, sizeof(big), 0);
     assert(rc == (long)CHAOS_NET_DUP_MAX_BYTES);
 
-    /* A datagram beyond the limit is not kept: cut, it would be another message. */
     {
         const int calls = g_recv_calls;
 
@@ -3281,7 +2996,6 @@ static void test_dup_replays_the_last_payload(void)
         g_test_socket_type = SOCK_STREAM;
     }
 
-    /* read and readv on a socket; close drops the kept payload. */
     reset_descriptor_stubs();
     g_stub_prepare = 1;
     g_stub_endpoint_from_local = 1;
@@ -3306,10 +3020,15 @@ static void test_dup_replays_the_last_payload(void)
 }
 
 /**
- * @brief Invariant: TRICKLE leaves datagram sockets and requests no longer than the
- *   chunk alone (and does not count them), DUP never waits for a busy slot, close
- *   drops a slot without the lock, and a cut sender address is kept only as far as
- *   the caller's buffer reached.
+ * @brief Proves the TRICKLE and DUP edge cases: datagrams, short requests, busy slots, close
+ *   of a colliding descriptor, and a truncated sender address.
+ *
+ * @details TRICKLE leaves datagram sockets alone (shortening would truncate the datagram) and
+ * does not even evaluate a rule for a request within the chunk, so no hit is counted. DUP
+ * never waits for a busy slot: the call receives for real and the earlier payload is replayed
+ * on the next call. Closing another descriptor of the same slot keeps the payload; closing
+ * its own drops it. A sender address truncated by the caller's 4-byte buffer is kept only as
+ * those 4 bytes, although the kernel reported the full length.
  */
 static void test_trickle_and_dup_edges(void)
 {
@@ -3329,11 +3048,10 @@ static void test_trickle_and_dup_edges(void)
     rc = recv(4, buffer, sizeof(buffer), 0);
     assert(g_last_receive_size == sizeof(buffer));
     g_test_socket_type = SOCK_STREAM;
-    g_should_trigger = 0; /* would refuse if asked: a short request never asks */
+    g_should_trigger = 0; /* a short request must not consult the rule */
     rc = recv(4, buffer, 3U, 0);
     assert(g_last_receive_size == 3U);
 
-    /* DUP: a busy slot skips DUP for the call instead of waiting. */
     reset_wrapper_stubs();
     g_stub_endpoint_from_local = 1;
     g_stub_match_endpoint = 1;
@@ -3346,13 +3064,11 @@ static void test_trickle_and_dup_edges(void)
     assert(g_recv_calls == 2);
     g_chaos_net_dup_slots[10 % CHAOS_NET_DUP_SLOTS].lock = 0;
 
-    /* The payload kept by the first call is still there and is replayed now. */
     rc = recv(10, buffer, sizeof(buffer), 0);
     assert(g_recv_calls == 2);
     rc = recv(10, buffer, sizeof(buffer), 0);
     assert(g_recv_calls == 3);
 
-    /* close of another descriptor in the same slot leaves the payload; its own drops it. */
     chaos_net_dup_forget(10 + CHAOS_NET_DUP_SLOTS);
     rc = recv(10, buffer, sizeof(buffer), 0);
     assert(g_recv_calls == 3);
@@ -3362,7 +3078,6 @@ static void test_trickle_and_dup_edges(void)
     rc = recv(10, buffer, sizeof(buffer), 0);
     assert(g_recv_calls == 5);
 
-    /* A cut sender address is kept only as far as the caller's buffer reached. */
     g_recvfrom_reported_name = (socklen_t)sizeof(struct sockaddr_in6);
     from_length = (socklen_t)sizeof(small_name);
     rc = recvfrom(11, buffer, sizeof(buffer), 0, (struct sockaddr *)small_name, &from_length);
@@ -3375,19 +3090,23 @@ static void test_trickle_and_dup_edges(void)
 }
 
 /**
- * @brief Invariant: DUP receives for real when nothing should be kept or replayed,
- *   never keeps a payload for a descriptor closed while it was received, and a
- *   fork() child can use slots other threads held at the fork.
+ * @brief Proves DUP receives for real when a payload must not be kept or replayed, never
+ *   keeps a payload of a descriptor closed during the receive, and that the fork child
+ *   handler releases slot locks.
  *
- * Expected observable behaviour: MSG_TRUNC, MSG_OOB, an empty or missing buffer and
- *   an over-long iovec array call the real receive every time; a payload stored
- *   after a close of its slot is not replayed; the atfork handler releases locks.
+ * @details
+ * - Always real: MSG_TRUNC, MSG_OOB, a zero-length or NULL buffer, an empty vector, and a
+ *   vector longer than `CHAOS_NET_IOV_MAX`.
+ * - A store whose slot generation changed since the receive began (a close in between) is
+ *   discarded; the next receive's payload is kept as usual. A close between the store's
+ *   generation check and its tag is caught by the re-check after tagging.
+ * - Locks held by parent threads, which do not exist in the child, are released.
  */
 static void test_dup_skips_and_close_races(void)
 {
     char buffer[16];
     struct iovec iov;
-    /* Hidden from the compiler, which knows the calls below are invalid. */
+    /* volatile: hides the deliberately invalid arguments from compile-time diagnostics. */
     void *volatile no_buffer = NULL;
     volatile int too_many = CHAOS_NET_IOV_MAX + 1;
     unsigned generation;
@@ -3408,7 +3127,6 @@ static void test_dup_skips_and_close_races(void)
     rc = recvfrom(12, no_buffer, sizeof(buffer), 0, NULL, NULL);
     assert(g_recvfrom_calls == 1);
 
-    /* A close while the payload was being received: nothing is kept... */
     iov.iov_base = buffer;
     iov.iov_len = sizeof(buffer);
     memcpy(buffer, "data", 4U);
@@ -3417,26 +3135,22 @@ static void test_dup_skips_and_close_races(void)
     chaos_net_dup_store(13, &iov, 1, 4, NULL, 0, generation);
     rc = recv(13, buffer, sizeof(buffer), 0);
     assert(g_recv_calls == 6);
-    /* ...while one received after the close is kept as usual. */
     rc = recv(13, buffer, sizeof(buffer), 0);
     assert(g_recv_calls == 6);
     assert(chaos_net_dup_generation(-1) == 0U);
 
-    /* A close after the store's check but before its tag: the re-check drops it. */
     g_dup_close_before_tag = 1;
     rc = recv(16, buffer, sizeof(buffer), 0);
     assert(g_recv_calls == 7);
     rc = recv(16, buffer, sizeof(buffer), 0);
     assert(g_recv_calls == 8);
-    rc = recv(16, buffer, sizeof(buffer), 0); /* kept by the last one: replayed */
+    rc = recv(16, buffer, sizeof(buffer), 0); /* replays the previous payload */
     assert(g_recv_calls == 8);
 
-    /* A lock held by a thread that does not exist in the fork() child is released. */
     g_chaos_net_dup_slots[14 % CHAOS_NET_DUP_SLOTS].lock = 1;
     chaos_net_dup_after_fork();
     assert(g_chaos_net_dup_slots[14 % CHAOS_NET_DUP_SLOTS].lock == 0);
 
-    /* readv: an empty vector and one longer than the kernel takes are real. */
     reset_descriptor_stubs();
     g_stub_prepare = 1;
     g_stub_endpoint_from_local = 1;
@@ -3444,20 +3158,19 @@ static void test_dup_skips_and_close_races(void)
     g_stub_rule.effect = CHAOS_NET_EFFECT_DUP;
     g_should_trigger = 1;
     rc = readv(15, &iov, 0);
-    rc = readv(15, &iov, too_many); /* the kernel rejects it before reading it */
+    rc = readv(15, &iov, too_many); /* kernel rejects with EINVAL */
     rc = read(15, no_buffer, sizeof(buffer));
     assert(g_descriptor_calls == 3);
     (void)rc;
 }
 
 /**
- * @brief Invariant: send and receive rules match either end of a connected socket:
- *   a receive tries its local end, then its peer; a send its peer, then its local end.
+ * @brief Proves send and receive rules match either end of a connection: receives try the
+ *   local end, then the peer; sends the peer, then the local end.
  *
- * Expected observable behaviour: with only the peer known a recv rule applies (a
- * client's rule for its server), with only the local end a send rule applies (a
- * server's rule for its own port); with neither end, or without rules, the real
- * calls run.
+ * @details With only the peer resolvable a recv rule applies (a client's rule naming its
+ * server); with only the local end a send rule applies (a server's rule naming its own port).
+ * With neither end, or no rule, the real calls run.
  */
 static void test_rules_match_either_end(void)
 {
@@ -3489,11 +3202,13 @@ static void test_rules_match_either_end(void)
 }
 
 /**
- * @brief Invariant: CORRUPT flips a bit only in bytes the receive wrote.
+ * @brief Proves CORRUPT touches only bytes the receive actually wrote into the buffer.
  *
- * Expected observable behaviour: with MSG_TRUNC a datagram receive returns more
- *   than the buffer holds, and the corruption stays within the buffer; a stream
- *   receive with MSG_TRUNC writes nothing, and nothing is corrupted (or counted).
+ * @details With MSG_TRUNC a datagram receive returns the datagram's full length (60000) even
+ * when the buffer holds 4 bytes; corruption stays within those 4 bytes (or the 8-byte vector
+ * for recvmsg()), never past the caller's buffer. recvmsg() without a message corrupts
+ * nothing. A stream receive with MSG_TRUNC discards the data, so nothing is corrupted and the
+ * rule is not evaluated.
  */
 static void test_corrupt_stays_in_the_buffer(void)
 {
@@ -3508,7 +3223,6 @@ static void test_corrupt_stays_in_the_buffer(void)
     g_stub_rule.effect = CHAOS_NET_EFFECT_CORRUPT;
     g_should_trigger = 1;
 
-    /* A 60000-byte datagram into a 4-byte buffer: only the 4 bytes may change. */
     g_test_socket_type = SOCK_DGRAM;
     g_recv_result = 60000;
     assert(recv(5, buffer, 4U, MSG_TRUNC) == 60000);
@@ -3517,7 +3231,6 @@ static void test_corrupt_stays_in_the_buffer(void)
     assert(recvfrom(5, buffer, 4U, MSG_TRUNC, NULL, NULL) == 60000);
     assert(g_corrupt_calls == 2 && g_last_corrupt_size == 4U);
 
-    /* recvmsg aims inside the vector, so a too-long result still corrupts it. */
     iov.iov_base = vector_bytes;
     iov.iov_len = sizeof(vector_bytes);
     memset(&message, 0, sizeof(message));
@@ -3526,12 +3239,11 @@ static void test_corrupt_stays_in_the_buffer(void)
     g_recvmsg_result = 60000;
     assert(recvmsg(5, &message, MSG_TRUNC) == 60000);
     assert(g_corrupt_calls == 3 && g_last_corrupt_size == sizeof(vector_bytes));
-    assert(recvmsg(5, NULL, 0) == 60000); /* no message: nothing to corrupt */
+    assert(recvmsg(5, NULL, 0) == 60000); /* no buffer to corrupt */
     assert(g_corrupt_calls == 3);
 
-    /* A stream receive with MSG_TRUNC discards the data: nothing is corrupted. */
     g_test_socket_type = SOCK_STREAM;
-    g_should_trigger = 0; /* would refuse if asked: the rule is not even asked */
+    g_should_trigger = 0; /* the rule must not be consulted */
     assert(recv(5, buffer, 4U, MSG_TRUNC) == 60000);
     assert(recvfrom(5, buffer, 4U, MSG_TRUNC, NULL, NULL) == 60000);
     assert(recvmsg(5, &message, MSG_TRUNC) == 60000);
@@ -3542,8 +3254,8 @@ static void test_corrupt_stays_in_the_buffer(void)
 }
 
 /**
- * @brief Arms every endpoint lookup and an always-firing ERRNO rule: any wrapper that
- *   consulted the rules would fail with ECONNRESET.
+ * @brief Enables every endpoint lookup and an always-firing ECONNRESET rule, so any wrapper
+ *   that consults the rules fails visibly.
  */
 static void arm_errno_rule_everywhere(void)
 {
@@ -3561,14 +3273,13 @@ static void arm_errno_rule_everywhere(void)
 }
 
 /**
- * @brief Invariant: inside the library (the reentrancy guard set), every wrapper
- *   forwards its call unchanged, whatever rule would match.
+ * @brief Proves that under the TLS guard every wrapper forwards unchanged, whatever rule would
+ *   match.
  *
- * Triggering condition: an always-firing ERRNO rule that every endpoint lookup
- *   matches, and the guard set, as while the library itself makes a call.
- *
- * Expected observable behaviour: each wrapper returns the real call's result, each
- *   real call runs once, errno is untouched and no effect is applied.
+ * @details The guard is set while the library makes its own calls (reading the rule file,
+ * writing the hits file); applying rules there would recurse or fault the library itself.
+ * With the always-firing rule armed, each wrapper returns the real result, each real call
+ * runs once, errno stays 0, no delay is applied, and no destination address is even resolved.
  */
 static void test_wrappers_forward_inside_library(void)
 {
@@ -3641,26 +3352,21 @@ static void test_wrappers_forward_inside_library(void)
     assert(g_accept_calls == 1);
 #endif
     assert(g_latency_calls == 0);
-    /* Nothing was looked up for calls the library makes itself. */
     assert(g_sockaddr_lookups == 0);
     reset_wrapper_stubs();
 }
 
 /**
- * @brief Invariant: a socket whose endpoint is known but matches no rule is left
- *   alone, and a connected socket is matched on its other end when the first end
- *   matches nothing.
+ * @brief Proves a resolvable endpoint that matches no rule is forwarded, and a connection is
+ *   matched on its other end when the first matches nothing.
  *
- * Triggering condition: rules loaded and every endpoint lookup succeeding, while the
- *   rule lookup matches nothing (or only from its second call on).
- *
- * Expected observable behaviour:
- * - Without a matching rule every wrapper forwards its call, including sendto,
- *   sendmsg and sendmmsg with an explicit destination, and close.
- * - A destination whose endpoint cannot be resolved is forwarded too; sendmsg
- *   without a message header is matched by the connection.
- * - recv matches its peer after its local end matched nothing, send its local end
- *   after its peer; with neither end matching, the real calls run.
+ * @details
+ * - With the match stub missing every call, every wrapper forwards, including sendto(),
+ *   sendmsg() and sendmmsg() with an explicit destination, and close().
+ * - A destination whose endpoint cannot be resolved is forwarded; sendmsg() without a header
+ *   falls back to the connection's endpoints and the rule applies.
+ * - recv() matches its peer after its local end misses, send() its local end after its peer;
+ *   with both missing the real calls run.
  */
 static void test_unmatched_endpoints_are_forwarded(void)
 {
@@ -3705,7 +3411,6 @@ static void test_unmatched_endpoints_are_forwarded(void)
     assert(g_socket_calls == 1 && g_socketpair_calls == 1 && g_shutdown_calls == 1);
     assert(g_sendto_calls == 1 && g_sendmsg_calls == 1 && g_descriptor_calls == 1);
 
-    /* An explicit destination whose endpoint cannot be resolved. */
     g_stub_match_misses = 0;
     g_stub_endpoint_from_sockaddr = 0;
     assert(
@@ -3719,18 +3424,15 @@ static void test_unmatched_endpoints_are_forwarded(void)
     assert(g_sendto_calls == 2 && g_sendmsg_calls == 2);
     assert(errno == 0);
 
-    /* sendmsg without a message header goes by the connection. */
     errno = 0;
     assert(sendmsg(3, NULL, 0) == -1 && errno == ECONNRESET);
     assert(g_sendmsg_calls == 2);
 
-    /* The first end matches nothing, the other one does. */
     g_stub_match_misses = 1;
     assert(recv(3, buffer, sizeof(buffer), 0) == -1 && errno == ECONNRESET);
     g_stub_match_misses = 1;
     errno = 0;
     assert(send(3, "x", 1U, 0) == -1 && errno == ECONNRESET);
-    /* Neither end matches. */
     g_stub_match_misses = 2;
     errno = 0;
     assert(recv(3, buffer, sizeof(buffer), 0) == 4);
@@ -3742,17 +3444,14 @@ static void test_unmatched_endpoints_are_forwarded(void)
 }
 
 /**
- * @brief Invariant: a rule whose probability does not fire leaves the call alone.
+ * @brief Proves a matched rule that does not fire leaves the call exactly as the real
+ *   function returned it.
  *
- * Triggering condition: matching ERRNO, CORRUPT and TIMEOUT rules whose sample
- *   misses (the errno and trigger stubs refuse).
- *
- * Expected observable behaviour:
- * - ERRNO: the real receive runs and its result and data are returned.
- * - CORRUPT: the received bytes are returned as received, nothing is corrupted;
- *   a failed or empty recvmmsg batch is not corrupted either.
- * - TIMEOUT: the real poll runs.
- * - A TIMEOUT that fires without a flag to report it still waits and returns 0.
+ * @details ERRNO not firing: the real receive's result and data are returned and errno stays
+ * 0; the pre-call helpers report nothing. CORRUPT not firing: every receive form returns the
+ * bytes as received. A failed (-1) or empty (0) recvmmsg() batch is not corrupted and the
+ * rule is not evaluated, even when it would fire. TIMEOUT not firing: the real poll() runs.
+ * A firing TIMEOUT with a NULL flag pointer still returns 0, and LATENCY ignores the flag.
  */
 static void test_rules_that_do_not_fire(void)
 {
@@ -3774,7 +3473,6 @@ static void test_rules_that_do_not_fire(void)
     message.msg_iov = &iov;
     message.msg_iovlen = 1U;
 
-    /* ERRNO whose sample misses. */
     arm_errno_rule_everywhere();
     g_errno_trigger = 0;
     errno = 0;
@@ -3793,7 +3491,6 @@ static void test_rules_that_do_not_fire(void)
     assert(chaos_net_wait_pre_call(&rule, 0, &synthetic_timeout) == 0);
     assert(synthetic_timeout == 0 && errno == 0);
 
-    /* CORRUPT whose sample misses. */
     g_stub_rule.effect = CHAOS_NET_EFFECT_CORRUPT;
     g_should_trigger = 0;
     (void)memset(buffer, 0, sizeof(buffer));
@@ -3811,7 +3508,6 @@ static void test_rules_that_do_not_fire(void)
     mmsg.msg_hdr.msg_iovlen = 1U;
     assert(recvmmsg(3, &mmsg, 1U, 0, NULL) == 1);
     assert(memcmp(mmsg_bytes, "data", 4U) == 0);
-    /* A failed or empty batch has nothing to corrupt, and the rule is not asked. */
     g_should_trigger = 1;
     g_recvmmsg_result = -1;
     assert(recvmmsg(3, &mmsg, 1U, 0, NULL) == -1);
@@ -3821,7 +3517,6 @@ static void test_rules_that_do_not_fire(void)
 #endif
     assert(g_corrupt_calls == 0);
 
-    /* TIMEOUT whose sample misses: the real poll runs. */
     g_stub_rule.effect = CHAOS_NET_EFFECT_TIMEOUT;
     fds[0].fd = 3;
     fds[0].events = POLLIN;
@@ -3830,7 +3525,6 @@ static void test_rules_that_do_not_fire(void)
     assert(poll(fds, 1U, 0) == 1);
     assert(g_poll_calls == 1);
 
-    /* A firing TIMEOUT with nowhere to report it. */
     g_should_trigger = 1;
     rule.effect = CHAOS_NET_EFFECT_TIMEOUT;
     assert(chaos_net_wait_pre_call(&rule, 0, NULL) == 0);
@@ -3841,14 +3535,12 @@ static void test_rules_that_do_not_fire(void)
 }
 
 /**
- * @brief Invariant: the wait wrappers find a rule through whichever set names the
- *   descriptor, and forward when no watched descriptor matches.
+ * @brief Proves select() finds a rule through whichever fd set names the descriptor, and the
+ *   wait wrappers forward when no watched descriptor matches or no rules are loaded.
  *
- * Expected observable behaviour:
- * - select() watching a socket only for exceptions, or only for writes, applies its rule.
- * - poll() and select() with rules loaded but no watched descriptor matching, and
- *   with no rules loaded, forward the call.
- * - A negative tv_nsec counts as an expired timeout; clearing sets skips NULL ones.
+ * @details A socket watched only for exceptions, or only for writes, still gets its rule.
+ * pollfd entries with fd -1 are skipped. A negative `tv_nsec` is invalid and counts as "no
+ * timeout", leaving the error to the real call. Clearing fd sets skips NULL sets.
  */
 static void test_wait_sets_and_unmatched_descriptors(void)
 {
@@ -3869,7 +3561,6 @@ static void test_wait_sets_and_unmatched_descriptors(void)
     assert(select(4, NULL, &writefds, NULL, NULL) == -1 && errno == ECONNRESET);
     assert(g_select_calls == 0);
 
-    /* Rules loaded, but no watched descriptor matches one. */
     g_stub_match_endpoint = 0;
     fds[0].fd = -1;
     fds[0].events = POLLIN;
@@ -3879,7 +3570,6 @@ static void test_wait_sets_and_unmatched_descriptors(void)
     assert(!chaos_net_wait_match_pollfds(fds, 2U, &rule));
     assert(!chaos_net_wait_match_fd_loaded(3, &rule));
     assert(select(4, NULL, NULL, &exceptfds, NULL) == 0);
-    /* No rules loaded. */
     g_stub_prepare = 0;
     assert(!chaos_net_wait_match_pollfds(fds, 2U, &rule));
     assert(!chaos_net_wait_match_fdsets(4, NULL, NULL, &exceptfds, &rule));
@@ -3897,7 +3587,7 @@ static void test_wait_sets_and_unmatched_descriptors(void)
     reset_wrapper_stubs();
 }
 
-/** @brief readv stub that accepts an empty (NULL) vector: reads nothing. */
+/** @brief Fake real readv() that accepts a NULL vector and reads nothing. */
 static ssize_t chaos_net_test_empty_readv(int fd, const struct iovec *iov, int iovcnt)
 {
     (void)fd;
@@ -3908,21 +3598,23 @@ static ssize_t chaos_net_test_empty_readv(int fd, const struct iovec *iov, int i
 }
 
 /**
- * @brief Invariant: the receive helpers stay inside the bytes a call delivered,
- *   skip empty vector entries, and keep or replay DUP payloads across any vector
- *   shape.
+ * @brief Proves the receive helpers stay within the bytes a call delivered, skip empty iovec
+ *   entries, and keep and replay DUP payloads across any vector shape.
  *
- * Expected observable behaviour:
- * - CORRUPT on a vector skips a leading empty entry and changes the next one; nothing
- *   is corrupted for an empty vector or no bytes; recvmmsg corruption skips empty
- *   messages and entries.
- * - A datagram received with MSG_TRUNC fills at most its buffer.
- * - TRICKLE does not shorten a receive of unknown size; a limit beyond the vector
- *   keeps every entry whole.
- * - DUP keeps a payload received through an empty entry, replays it across several
- *   buffers (stopping before the last one), drops a sender address too long to keep,
- *   and replays without one when the caller gives no length; recvfrom and recvmsg
- *   without an address, or recvfrom with an address but no length, replay too.
+ * @details
+ * - CORRUPT across a vector skips a leading empty entry; nothing is corrupted for a zero
+ *   count or zero bytes. recvmmsg() corruption skips messages with no length, no vector, no
+ *   entries, or only empty entries.
+ * - A datagram received with MSG_TRUNC counts at most its buffer; errors and 0 count nothing.
+ * - TRICKLE does not apply to a receive of unknown size; a limit beyond the vector keeps every
+ *   entry whole.
+ * - DUP keeps a payload received through an empty first entry and replays it across buffers
+ *   of 2 + 2 bytes, leaving the fourth untouched. A sender address longer than
+ *   `sockaddr_storage` is not kept (length 0); a replay with an address buffer but no length
+ *   leaves the address alone; recvfrom() and recvmsg() without an address keep and replay.
+ * - CORRUPT on a vector over `CHAOS_NET_IOV_MAX` (unknown size) corrupts nothing.
+ * - readv() with TRICKLE and a NULL vector is forwarded as given.
+ * - Forgetting a descriptor before the DUP table exists is a no-op.
  */
 static void test_receive_helpers_and_vector_shapes(void)
 {
@@ -3960,13 +3652,13 @@ static void test_receive_helpers_and_vector_shapes(void)
     (void)memcpy(second, "data", 4U);
     (void)memset(mmsg, 0, sizeof(mmsg));
     chaos_net_corrupt_mmsghdrs(mmsg, 0U);
-    chaos_net_corrupt_mmsghdrs(mmsg, 1U); /* msg_len 0 */
+    chaos_net_corrupt_mmsghdrs(mmsg, 1U); /* msg_len 0: skipped */
     mmsg[0].msg_len = 4U;
-    chaos_net_corrupt_mmsghdrs(mmsg, 1U); /* no vector */
+    chaos_net_corrupt_mmsghdrs(mmsg, 1U); /* no vector: skipped */
     mmsg[0].msg_hdr.msg_iov = iov;
-    chaos_net_corrupt_mmsghdrs(mmsg, 1U); /* msg_iovlen 0 */
+    chaos_net_corrupt_mmsghdrs(mmsg, 1U); /* msg_iovlen 0: skipped */
     mmsg[0].msg_hdr.msg_iovlen = 1U;
-    chaos_net_corrupt_mmsghdrs(mmsg, 1U); /* only an empty entry */
+    chaos_net_corrupt_mmsghdrs(mmsg, 1U); /* only an empty entry: skipped */
     assert(g_corrupt_calls == 1);
     mmsg[0].msg_hdr.msg_iovlen = 2U;
     chaos_net_corrupt_mmsghdrs(mmsg, 1U);
@@ -3992,7 +3684,6 @@ static void test_receive_helpers_and_vector_shapes(void)
     assert(chaos_net_limit_iovecs(iov, 2, 100U, limited) == 2);
     assert(limited[0].iov_len == 3U && limited[1].iov_len == 4U);
 
-    /* DUP: kept through an empty entry, replayed across the first buffers of four. */
     (void)memcpy(second, "data", 4U);
     iov[0].iov_len = 0U;
     iov[1].iov_len = sizeof(second);
@@ -4018,18 +3709,15 @@ static void test_receive_helpers_and_vector_shapes(void)
         chaos_net_dup_replay(&rule, 30, iov, 4, (struct sockaddr *)name, &name_length, NULL) == 4
     );
     assert(memcmp(buffer, "da", 2U) == 0 && memcmp(third, "ta", 2U) == 0);
-    assert(strcmp(first, "aaa") == 0); /* the payload ended before the last buffer */
-    /* A negative descriptor has no slot. */
+    assert(strcmp(first, "aaa") == 0); /* payload ended before buffer 4 */
     assert(chaos_net_dup_replay(&rule, -1, iov, 4, NULL, NULL, NULL) == -1);
-    assert(name_length == 0); /* the address was too long to keep */
+    assert(name_length == 0); /* address too long to keep */
 
-    /* A replay with an address buffer but no length leaves the address alone. */
     iov[1].iov_len = sizeof(buffer);
     generation = chaos_net_dup_generation(31);
     chaos_net_dup_store(31, &iov[1], 1, 4, NULL, 0, generation);
     assert(chaos_net_dup_replay(&rule, 31, &iov[1], 1, (struct sockaddr *)name, NULL, NULL) == 4);
 
-    /* recvfrom and recvmsg without an address keep and replay the payload. */
     g_stub_endpoint_from_local = 1;
     g_stub_match_endpoint = 1;
     g_stub_rule.effect = CHAOS_NET_EFFECT_DUP;
@@ -4037,7 +3725,6 @@ static void test_receive_helpers_and_vector_shapes(void)
     (void)memset(buffer, 0, sizeof(buffer));
     assert(recvfrom(32, buffer, sizeof(buffer), 0, NULL, NULL) == 4);
     assert(memcmp(buffer, "data", 4U) == 0 && g_recvfrom_calls == 1);
-    /* An address buffer without a length: the payload is kept and replayed alone. */
     (void)memset(&from, 0, sizeof(from));
     assert(recvfrom(35, buffer, sizeof(buffer), 0, (struct sockaddr *)&from, NULL) == 4);
     assert(recvfrom(35, buffer, sizeof(buffer), 0, (struct sockaddr *)&from, NULL) == 4);
@@ -4052,8 +3739,6 @@ static void test_receive_helpers_and_vector_shapes(void)
     assert(recvmsg(33, &message, 0) == 4);
     assert(g_recvmsg_calls == 1 && message.msg_namelen == 0);
 
-    /* CORRUPT on a vector longer than the kernel takes: its size is unknown, and
-     * nothing is aimed at it. */
     g_stub_rule.effect = CHAOS_NET_EFFECT_CORRUPT;
     too_many[0].iov_base = buffer;
     too_many[0].iov_len = sizeof(buffer);
@@ -4063,7 +3748,6 @@ static void test_receive_helpers_and_vector_shapes(void)
     assert(recvmsg(33, &message, 0) == 4);
     assert(g_corrupt_calls == 0);
 
-    /* readv with TRICKLE and no vector is forwarded as it is. */
     reset_descriptor_stubs();
     g_stub_prepare = 1;
     g_stub_endpoint_from_local = 1;
@@ -4075,7 +3759,6 @@ static void test_receive_helpers_and_vector_shapes(void)
     assert(readv(34, NULL, 0) == 0);
     assert(g_descriptor_calls == 1 && g_last_receive_iovlen == 0U);
 
-    /* close before any payload was kept: nothing to drop. */
     {
         chaos_net_dup_slot_t *const table = g_chaos_net_dup_slots;
 
@@ -4087,7 +3770,7 @@ static void test_receive_helpers_and_vector_shapes(void)
 }
 
 #ifdef __linux__
-/** @brief Milliseconds on the monotonic clock. */
+/** @brief CLOCK_MONOTONIC in ms, to check that a real wait really waited. */
 static long long unresolved_now_ms(void)
 {
     struct timespec now;
@@ -4097,13 +3780,18 @@ static long long unresolved_now_ms(void)
 }
 
 /**
- * @brief Invariant: a call that arrives before the real symbols are resolved
- *        reaches the kernel instead of calling through a NULL pointer.
+ * @brief Proves that with every real-function pointer NULL (a call before symbol resolution
+ *   finished) each `chaos_net_call_real_*()` forwarder reaches the kernel through a raw
+ *   syscall instead of calling through NULL (Linux).
  *
- * Every `g_chaos_net_real_*` pointer the wrappers call through is NULL, and each
- * `chaos_net_call_real_*` helper is driven on real descriptors: sockets are
- * really created, connected and accepted, bytes really travel, the wait calls
- * really report readiness and really wait out their timeout.
+ * @details Everything runs on real descriptors so the kernel's behaviour is observed, not
+ * assumed: stream I/O over a socketpair (send/recv, sendto/recvfrom, read/write,
+ * readv/writev, sendmsg/recvmsg); poll() and select() with a 20 ms timeout really wait at
+ * least 15 ms and select() leaves 0 remaining time; ppoll() and pselect() leave their
+ * timespec unchanged; epoll_wait() and epoll_pwait() report readiness; shutdown(SHUT_WR)
+ * gives the peer EOF; a second close() fails with EBADF; sendmmsg()/recvmmsg() move two
+ * datagrams; and a loopback TCP listener accepts through accept() and accept4(), with
+ * setsockopt(SO_LINGER) verified through getsockopt().
  */
 static void test_unresolved_symbols_reach_the_kernel(void)
 {
@@ -4145,7 +3833,6 @@ static void test_unresolved_symbols_reach_the_kernel(void)
     g_chaos_net_real_writev = NULL;
     g_chaos_net_real_close = NULL;
 
-    /* Byte streams over a socket pair. */
     assert(chaos_net_call_real_socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
     assert(chaos_net_call_real_send(pair[0], "ab", 2U, 0) == 2);
     (void)memset(buffer, 0, sizeof(buffer));
@@ -4181,7 +3868,6 @@ static void test_unresolved_symbols_reach_the_kernel(void)
     assert(chaos_net_call_real_recvmsg(pair[1], &message, 0) == 2);
     assert(memcmp(buffer, "pq", 2U) == 0);
 
-    /* The wait calls: a real timeout first, then real readiness. */
     watched.fd = pair[1];
     watched.events = POLLIN;
     watched.revents = 0;
@@ -4234,7 +3920,6 @@ static void test_unresolved_symbols_reach_the_kernel(void)
     assert(chaos_net_call_real_epoll_pwait(epfd, events, 1, 1000, &mask) == 1);
     assert(chaos_net_call_real_close(epfd) == 0);
 
-    /* shutdown: the peer reads end of stream once the pending byte is gone. */
     assert(chaos_net_call_real_recv(pair[1], buffer, sizeof(buffer), 0) == 1);
     assert(chaos_net_call_real_shutdown(pair[0], SHUT_WR) == 0);
     assert(chaos_net_call_real_recv(pair[1], buffer, sizeof(buffer), 0) == 0);
@@ -4243,7 +3928,6 @@ static void test_unresolved_symbols_reach_the_kernel(void)
     errno = 0;
     assert(chaos_net_call_real_close(pair[1]) == -1 && errno == EBADF);
 
-    /* Datagrams in batches. */
     assert(chaos_net_call_real_socketpair(AF_UNIX, SOCK_DGRAM, 0, datagrams) == 0);
     (void)memset(messages, 0, sizeof(messages));
     message_iov[0].iov_base = one;
@@ -4266,7 +3950,6 @@ static void test_unresolved_symbols_reach_the_kernel(void)
     assert(chaos_net_call_real_close(datagrams[0]) == 0);
     assert(chaos_net_call_real_close(datagrams[1]) == 0);
 
-    /* A TCP connection on the loopback, accepted both ways. */
     listener = chaos_net_call_real_socket(AF_INET, SOCK_STREAM, 0);
     assert(listener >= 0);
     chaos_net_test_set_ipv4(&address, "127.0.0.1", 0U);

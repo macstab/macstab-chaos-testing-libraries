@@ -1,34 +1,23 @@
 /**
  * @file test_time_actions.c
- * @brief Unit tests for TIME-domain probability, latency, errno, and time-offset helpers.
+ * @brief Proves the libchaos-time effect actions: the probability gate and qualifiers,
+ *   LATENCY sleeping, ERRNO injection, OFFSET and REGRESS clock arithmetic, and the
+ *   deadline conversion used by absolute sleeps.
  *
- * Subsystem under test: `src/time/chaos_time_actions.c`
+ * @details Unit under test: `src/time/chaos_time_actions.c`, included directly so its
+ * `static` helpers (`chaos_time_add_offset_ms()`) are callable.
  *
- * Coverage approach:
- * - The production source file is included directly after providing local stubs for `usleep`
- *   and `nanosleep`. The usleep stub records chunk durations; the nanosleep stub can simulate
- *   a configurable number of EINTR interrupts before succeeding.
- * - The `CHAOS_TIME_DEFINE_TEST_GLOBALS()` macro instantiates the real-function-pointer globals
- *   required by the production action helpers.
+ * Isolation: `CHAOS_TIME_DEFINE_TEST_GLOBALS()` provides the real-function pointers, all
+ * NULL. Each latency case installs only the sleep stub it needs, which selects the path:
+ * production prefers the real `usleep` and falls back to the real `nanosleep` only when
+ * `usleep` is unresolved. The `usleep` stub records each chunk instead of sleeping; the
+ * `nanosleep` stub records the request and can fail with EINTR a set number of times or with
+ * any other errno. Rule structs are built in memory, so no rule file is involved. Qualifier
+ * windows use wall-clock bounds far in the past (1 ms after the epoch) or future (4e12 ms,
+ * around 2096), so the result does not depend on when the test runs.
  *
- * Properties under test:
- * - Probability boundary values: 0.0 always false, 1.0 always true, midpoint determinism.
- * - `chaos_time_rule_should_trigger(NULL)` returns false.
- * - Latency decomposition: 2500 ms → three usleep intervals (1s + 1s + 0.5s).
- * - Sub-second latency (1 ms) → nanosleep called with tv_nsec=1000000; no usleep calls.
- * - EINTR retry: 1 ms with `g_nanosleep_eintr_count=1` → nanosleep called twice.
- * - probability=0.0 for latency → no sleep calls issued.
- * - errno injection: EINVAL at probability=1.0 sets errno; NULL rule returns false.
- * - Offset application: positive 1500ms advances {10s, 250ms} to {11s, 750ms}.
- * - Offset application: negative -1500ms retreats {2s, 100ms} to {0s, 600ms}.
- * - Offset clamps to zero: -500ms applied to {0s, 100ms} yields {0s, 0ns}.
- * - `chaos_time_add_offset_ms`: zero delta is a no-op; NULL pointer is a no-op.
- * - `chaos_time_add_offset_ms` with carry: {1s, 900ms} + 200ms → {2s, 100ms}.
- * - NULL rule or NULL value pointer to `apply_offset` is a no-op (no crash, no modification).
- *
- * What is NOT tested here:
- * - Config file parsing and rule selection.
- * - TIME wrapper call paths (tested in test_chaos_time.c).
+ * Out of scope: rule parsing and selection (test_time_config.c) and the wrappers
+ * (test_chaos_time.c).
  */
 
 #include "../support/test_time_support.h"
@@ -37,35 +26,21 @@
 
 CHAOS_TIME_DEFINE_TEST_GLOBALS();
 
-/**
- * @brief Captured usleep durations from the test-local sleep stub.
- *
- * Populated in call order during latency decomposition tests.
- */
+/** @brief `usleep` stub arguments in call order; the stub asserts if more than 8 arrive. */
 static useconds_t g_sleep_chunks[8];
-/** @brief Number of usleep calls recorded since the last reset. */
+/** @brief Entries used in `g_sleep_chunks`. */
 static size_t g_sleep_count = 0U;
-/** @brief Number of nanosleep stub calls made since the last reset. */
+/** @brief Calls to the `nanosleep` stub, including failed ones. */
 static int g_nanosleep_calls = 0;
-/**
- * @brief Number of EINTR responses remaining before nanosleep succeeds.
- *
- * Decrements on each EINTR-simulating call. When zero, the stub returns success.
- * Tests set this before calling the action under test.
- */
+/** @brief Further `nanosleep` stub calls to fail with EINTR before any other outcome. */
 static int g_nanosleep_eintr_count = 0;
-/** @brief When non-zero, the nanosleep stub fails with this errno (not retried unless EINTR). */
+/** @brief Non-zero makes the `nanosleep` stub fail with this errno once EINTRs are used up. */
 static int g_nanosleep_error = 0;
-/** @brief The `request` argument captured by the most recent nanosleep stub call. */
+/** @brief Request passed to the latest `nanosleep` stub call. */
 static struct timespec g_last_nanosleep_request;
 
 /**
- * @brief Test-local usleep stub that records durations instead of sleeping.
- *
- * Asserts that the call array has not overflowed. Returns 0 always.
- *
- * @param usec  Sleep duration in microseconds, recorded at `g_sleep_chunks[g_sleep_count]`.
- * @return 0 (success, never fails).
+ * @brief Real-`usleep` stand-in: records @p usec (microseconds) and returns 0 without sleeping.
  */
 static int chaos_time_test_usleep(useconds_t usec)
 {
@@ -75,16 +50,12 @@ static int chaos_time_test_usleep(useconds_t usec)
 }
 
 /**
- * @brief Test-local nanosleep stub that can simulate multiple EINTR interrupts.
+ * @brief Real-`nanosleep` stand-in with scripted failures; never sleeps.
  *
- * Increments `g_nanosleep_calls` and captures the request into `g_last_nanosleep_request`.
- * When `g_nanosleep_eintr_count > 0`, decrements the counter, fills @p remaining with the
- * full @p request (as a real EINTR would), and returns -1 with errno=EINTR. Otherwise
- * zeros @p remaining and returns 0 (success).
- *
- * @param request    Requested sleep duration; must be non-NULL.
- * @param remaining  Output for time remaining on EINTR; may be NULL.
- * @return 0 on success, -1 with errno=EINTR on simulated interrupt.
+ * Records the call and its request. While `g_nanosleep_eintr_count` is positive it fails
+ * with EINTR and reports the whole request as remaining, which is what production passes
+ * back on the retry. Next, a non-zero `g_nanosleep_error` fails with that errno. Otherwise
+ * it succeeds with nothing remaining.
  */
 static int chaos_time_test_nanosleep(const struct timespec *request, struct timespec *remaining)
 {
@@ -118,10 +89,8 @@ static int chaos_time_test_nanosleep(const struct timespec *request, struct time
 #include "../../src/time/chaos_time_actions.c"
 
 /**
- * @brief Reset all action-layer test state between test functions.
- *
- * Calls `chaos_time_test_reset_runtime()` to clear runtime globals, then zeroes all
- * local sleep-tracking counters, EINTR flags, and the captured nanosleep request.
+ * @brief Unresolves every real function and clears the stub records and failure switches,
+ *   so each case installs exactly the sleep path it tests.
  */
 static void reset_action_state(void)
 {
@@ -141,16 +110,12 @@ static void reset_action_state(void)
 }
 
 /**
- * @brief Invariant: probability sampling produces correct 0/1 decisions at boundary and midpoint.
+ * @brief Proves the probability gate fires when `sample < probability * 2^32`, with 0.0 never
+ *   and 1.0 always firing, and that a NULL rule never triggers.
  *
- * Triggering condition: `chaos_time_probability_hit_sample(p, sample)` with boundary and
- *   mid-range values, and `chaos_time_rule_should_trigger(NULL)`.
- *
- * Expected observable behaviour:
- * - p=0.0, any sample → 0.
- * - p=1.0, sample=MAX → 1.
- * - p=0.5, sample=0 → 1; p=0.5, sample=MAX → 0.
- * - `should_trigger(NULL)` → false.
+ * @details The sample is passed explicitly, so the PRNG is not involved. 0.0 with sample 0
+ * and 1.0 with sample 0xffffffff are the extremes the threshold comparison alone would get
+ * wrong; the guards before it must decide them.
  */
 static void test_probability_helpers(void)
 {
@@ -162,22 +127,17 @@ static void test_probability_helpers(void)
 }
 
 /**
- * @brief Invariant: latency decomposition, sub-second nanosleep path, and EINTR retry.
+ * @brief Proves LATENCY sleeps the configured time through the real sleep functions, in
+ *   chunks of at most 1 s, and never alters the caller's errno.
  *
- * Triggering conditions:
- * - `chaos_time_rule_apply_latency(&rule)` with latency_ms=2500 and the usleep stub.
- * - `chaos_time_rule_apply_latency(&rule)` with latency_ms=1 and the nanosleep stub.
- * - Same 1 ms call with `g_nanosleep_eintr_count=1` set before the call.
- * - `chaos_time_rule_apply_latency(&rule)` with probability=0.0 and latency_ms=100.
- *
- * Expected observable behaviour:
- * - 2500 ms → `g_sleep_count == 3`: chunks 1 000 000 + 1 000 000 + 500 000 µs.
- * - 1 ms → `g_sleep_count == 0`, `g_nanosleep_calls == 1`,
- *   `g_last_nanosleep_request.tv_nsec == 1000000`.
- * - 1 ms with one EINTR → `g_nanosleep_calls == 2`.
- * - 1 ms with nanosleep failing EINVAL → one call, no retry; errno untouched.
- * - No real usleep or nanosleep → no sleep; NULL rule or ERRNO rule → no sleep.
- * - probability=0.0 → both counters remain 0.
+ * @details Cases, each after a reset so only the named stub is resolved:
+ * - `usleep` path: 2500 ms becomes three chunks of 1 000 000, 1 000 000 and 500 000 us. The
+ *   1 s cap exists because POSIX guarantees `useconds_t` only up to 1 000 000.
+ * - `nanosleep` fallback (no `usleep`): 1 ms becomes one request of {0 s, 1 000 000 ns}.
+ * - One EINTR is retried, giving two calls, so a signal does not shorten the delay.
+ * - Probability 0.0, a NULL rule and an ERRNO rule do not sleep.
+ * - A non-EINTR failure (EINVAL) ends the chunk after one call; errno keeps its sentinel.
+ * - With neither real sleep function resolved the delay is skipped, not a crash.
  */
 static void test_latency_helper(void)
 {
@@ -226,15 +186,15 @@ static void test_latency_helper(void)
     chaos_time_rule_apply_latency(&rule);
     assert(g_sleep_count == 0U);
 
-    /* No rule, or a rule of another effect, never sleeps. */
+    /* Only a LATENCY rule sleeps. */
     rule.probability = 1.0;
     chaos_time_rule_apply_latency(NULL);
     rule.effect = CHAOS_TIME_EFFECT_ERRNO;
     chaos_time_rule_apply_latency(&rule);
     assert(g_sleep_count == 0U);
 
-    /* A nanosleep failure other than EINTR ends the chunk instead of retrying it; the
-     * caller's errno survives. */
+    /* Only EINTR is retried; any other failure would loop forever if retried. The delay is
+     * injected, so the errno it leaves must not reach the caller. */
     reset_action_state();
     g_chaos_time_real_nanosleep = chaos_time_test_nanosleep;
     g_nanosleep_error = EINVAL;
@@ -245,7 +205,7 @@ static void test_latency_helper(void)
     assert(g_nanosleep_calls == 1);
     assert(errno == 4242);
 
-    /* With neither real sleep function resolved, the delay is skipped. */
+    /* Neither real sleep function resolved: skip the delay rather than call NULL. */
     reset_action_state();
     errno = 4242;
     chaos_time_rule_apply_latency(&rule);
@@ -255,27 +215,17 @@ static void test_latency_helper(void)
 }
 
 /**
- * @brief Invariant: errno injection, time offset application, and NULL guards.
+ * @brief Proves ERRNO sets errno only when it fires, and that OFFSET shifts a timespec by a
+ *   signed millisecond delta with correct carry, borrow and clamping at zero.
  *
- * Triggering conditions:
- * - `chaos_time_rule_apply_errno(&rule)` with EINVAL at probability=1.0.
- * - `chaos_time_rule_apply_offset(&rule, &value)` with positive and negative offsets.
- * - `chaos_time_add_offset_ms()` with zero, NULL, and carry cases.
- * - NULL rule and NULL value passed to apply_offset.
- *
- * Expected observable behaviour:
- * - probability=1.0, errnum=EINVAL → returns true; errno==EINVAL.
- * - NULL rule → returns false.
- * - +1500ms on {10s, 250ms} → {11s, 750ms} (carry from ms fraction).
- * - -1500ms on {2s, 100ms} → {0s, 600ms} (borrow into seconds).
- * - -500ms on {0s, 100ms} → {0s, 0ns} (clamped at zero, not negative).
- * - `add_offset_ms(&value, 0)` → unchanged {3s, 400ms}.
- * - `add_offset_ms(NULL, 500)` → no crash, original value unchanged.
- * - `add_offset_ms({1s, 900ms}, 200)` → {2s, 100ms} (nanosecond carry).
- * - `apply_offset(NULL, &value)` → no crash; value unchanged.
- * - `apply_offset(&rule, NULL)` → no crash.
- * - errno: probability=0.0 or a LATENCY rule → false, errno untouched.
- * - offset: probability=0.0 or a REGRESS rule → value unchanged.
+ * @details ERRNO at probability 1.0 sets EINVAL and reports a hit; a NULL rule, probability
+ * 0.0 or a LATENCY rule report none and leave errno at its sentinel. OFFSET arithmetic:
+ * - +1500 ms on {10 s, 250 ms} gives {11 s, 750 ms}; -1500 ms on {2 s, 100 ms} gives
+ *   {0 s, 600 ms}, borrowing across the second boundary.
+ * - -500 ms on {0 s, 100 ms} clamps to {0, 0}: a negative timespec is invalid in POSIX.
+ * - A zero delta and a NULL target leave the value alone; {1 s, 900 ms} + 200 ms carries to
+ *   {2 s, 100 ms}.
+ * - A NULL rule, a NULL value, probability 0.0 and a REGRESS rule shift nothing.
  */
 static void test_errno_and_offset_helpers(void)
 {
@@ -292,7 +242,7 @@ static void test_errno_and_offset_helpers(void)
     assert(errno == EINVAL);
     assert(!chaos_time_rule_apply_errno(NULL));
 
-    /* A rule that does not fire, or one of another effect, leaves errno alone. */
+    /* No hit, no errno change: the real call's errno must survive. */
     errno = 4242;
     rule.probability = 0.0;
     assert(!chaos_time_rule_apply_errno(&rule));
@@ -351,7 +301,7 @@ static void test_errno_and_offset_helpers(void)
     assert(value.tv_nsec == 0L);
     chaos_time_rule_apply_offset(&rule, NULL);
 
-    /* An offset that does not fire, or a rule of another effect, shifts nothing. */
+    /* Only a firing OFFSET rule shifts; REGRESS has its own action. */
     rule.probability = 0.0;
     chaos_time_rule_apply_offset(&rule, &value);
     rule.probability = 1.0;
@@ -362,13 +312,12 @@ static void test_errno_and_offset_helpers(void)
 }
 
 /**
- * @brief Invariant: a rule's hit counter advances exactly when its effect fires.
+ * @brief Proves a rule's hit slot counts exactly the decisions that fire, and that a rule
+ *   without a slot still fires.
  *
- * Triggering condition: should_trigger on a rule with probability 1.0, then 0.0,
- *   then on a rule without a counter.
- *
- * Expected observable behaviour: the count is 1 after the firing call and stays 1
- *   after the call that does not fire; a rule without a counter still fires.
+ * @details The hits file reports this count, so a call the probability gate rejects must
+ * not be counted. With `hit == NULL` nothing is counted and `@first` is not enforced, but the
+ * rule still fires.
  */
 static void test_should_trigger_counts_hits(void)
 {
@@ -391,10 +340,13 @@ static void test_should_trigger_counts_hits(void)
 }
 
 /**
- * @brief Invariant: should_trigger honours `@first`, `@from` and `@until`.
+ * @brief Proves the trigger decision honours the qualifiers `@first`, `@from`, `@until` and
+ *   `@size`.
  *
- * Expected observable behaviour: `@first=2` fires twice and then never; a window
- *   that ended or has not started yet does not fire; an open window does.
+ * @details `@first=2` fires twice, then never, and the count stops at 2. A window that ended
+ * (`@until` 1 ms after the epoch) or has not started (`@from` around 2096) does not fire; an
+ * open one does. `@size>100` rejects a call that carries no size (`CHAOS_POLICY_NO_SIZE`)
+ * and 100 itself, passes 101, and `@size<101` then rejects 101: both bounds are exclusive.
  */
 static void test_should_trigger_honours_qualifiers(void)
 {
@@ -421,7 +373,7 @@ static void test_should_trigger_honours_qualifiers(void)
     rule.policy.from_ms = 1;
     assert(chaos_time_rule_should_trigger(&rule) == 1);
 
-    /* A size gate passes only calls with a byte count in range. */
+    /* Both @size bounds are exclusive; a call without a size never passes a size gate. */
     memset(&rule.policy, 0, sizeof(rule.policy));
     rule.policy.has_size_above = 1U;
     rule.policy.size_above = 100U;
@@ -437,9 +389,19 @@ static void test_should_trigger_honours_qualifiers(void)
 }
 
 /**
- * @brief Invariant: REGRESS leaves the first read real, jumps back on a later read
- *   where it fires, and stays shifted after that; without a slot, or with a slot
- *   that now belongs to another rule, it does nothing.
+ * @brief Proves REGRESS steps the clock back once and keeps it back: the first read stays
+ *   real, a later read that passes the gate jumps back by `offset_ms`, and every read after
+ *   that stays shifted without consulting the gate again.
+ *
+ * @details The state lives in the hit slot (0 unseen, 1 seen, 3 deciding, 2 jumped), so the
+ * test drives it directly:
+ * - Without a slot nothing happens; the first read with one only moves 0 to 1.
+ * - A failed gate keeps state 1; a passing one shifts 100 s to 95 s, sets state 2 and counts
+ *   one hit. Later reads at probability 0.0 stay shifted (101 s reads 96 s), uncounted.
+ * - A closed `@until` window shifts nothing even after the jump.
+ * - State 3 (another thread deciding) leaves this read real and the state untouched.
+ * - A slot whose generation no longer matches (reassigned on reload) shifts nothing.
+ * - An OFFSET rule, a NULL rule and a NULL value are ignored.
  */
 static void test_regress_goes_back_once(void)
 {
@@ -475,21 +437,21 @@ static void test_regress_goes_back_once(void)
     chaos_time_rule_apply_regress(&rule, &value);
     assert(value.tv_sec == 96 && slot.count == 1U);
 
-    /* A closed window shifts nothing, even after the jump. */
+    /* The window gates every read, including those after the jump. */
     rule.policy.until_ms = 1;
     value.tv_sec = 101;
     chaos_time_rule_apply_regress(&rule, &value);
     assert(value.tv_sec == 101);
     rule.policy.until_ms = 0;
 
-    /* Another thread deciding the jump: this read is not shifted yet. */
+    /* State 3: another thread owns the decision, so this read is not shifted yet. */
     slot.state = 3U;
     rule.probability = 1.0;
     chaos_time_rule_apply_regress(&rule, &value);
     assert(value.tv_sec == 101 && slot.state == 3U);
     slot.state = 2U;
 
-    /* A slot handed to another rule since this copy was taken shifts nothing. */
+    /* Generation mismatch: a reload gave the slot to another rule after this copy was taken. */
     slot.generation = 1U;
     value.tv_sec = 101;
     chaos_time_rule_apply_regress(&rule, &value);
@@ -505,13 +467,16 @@ static void test_regress_goes_back_once(void)
 }
 
 /**
- * @brief Invariant: an absolute deadline is converted back by the shift every read
- *   carries, and only by that.
+ * @brief Proves an absolute sleep deadline, computed from shifted clock reads, is converted
+ *   back to real time by exactly the shift every read carries.
  *
- * Expected observable behaviour: OFFSET +2000 ms at probability 1 moves {100 s} to
- * {98 s}; at probability below 1, with `@first`, with `@size` or outside its window
- * it does not. REGRESS 5000 ms moves it 5 s later once it has jumped (state 2), not
- * before, nor with an outdated slot. Both together add up. No rule: unchanged.
+ * @details The program saw now + O under OFFSET and now - R after a REGRESS jump, so the
+ * real deadline is O earlier and R later. Only a shift applied to every read is certain:
+ * - OFFSET +2000 ms at probability 1.0 moves {100 s} to {98 s}. Probability 0.5, `@first`,
+ *   either `@size` bound or a closed window mean some reads were real, so nothing changes.
+ * - REGRESS 5000 ms adds 5 s only in state 2 (jumped), with a current slot and an open
+ *   window: 98 s becomes 103 s. Both rules together add up: 103 s becomes 106 s.
+ * - No rule, a REGRESS without a slot or rules of the wrong effect change nothing.
  */
 static void test_unshift_deadline(void)
 {
@@ -567,7 +532,7 @@ static void test_unshift_deadline(void)
     assert(chaos_time_rule_unshift_deadline(&offset, &regress, &deadline) == 1);
     assert(deadline.tv_sec == 106);
 
-    /* Wrong effects or a REGRESS without a slot change nothing. */
+    /* Each argument is checked for its own effect; a REGRESS needs its slot's state. */
     regress.hit = NULL;
     offset.effect = CHAOS_TIME_EFFECT_REGRESS;
     assert(chaos_time_rule_unshift_deadline(&offset, &regress, &deadline) == 0);

@@ -1,30 +1,22 @@
 /**
  * @file test_memory_actions.c
- * @brief Unit tests for memory-domain probability sampling, latency application, and
- *   errno injection helpers.
+ * @brief Proves the libchaos-memory trigger gate and the LATENCY and ERRNO effects in isolation.
  *
- * Subsystem under test: `src/memory/chaos_memory_actions.c`
+ * @details
+ * Unit under test: `src/memory/chaos_memory_actions.c`, compiled into this binary by `#include`.
  *
- * Coverage approach:
- * - The production source file is included after test_sleep_support.h, which records each
- *   sleep request instead of sleeping and can simulate EINTR.
- * - `CHAOS_MEMORY_DEFINE_TEST_GLOBALS()` instantiates all real-function-pointer globals
- *   required by the production action helpers.
- * - `reset_action_state()` resets the PRNG and function-pointer globals (via
- *   `chaos_memory_test_reset_runtime()`) and clears all sleep tracking state.
+ * Isolation:
+ * - test_sleep_support.h is included first and defines `CHAOS_SLEEP_SYSCALL`, so the
+ *   `clock_nanosleep` system call behind chaos_sleep_ms() is replaced by a stub that records each
+ *   request and can fail the next N calls with EINTR, leaving 1 ms remaining. No test sleeps.
+ * - `CHAOS_MEMORY_DEFINE_TEST_GLOBALS()` defines the real-function pointers (all NULL), the TLS
+ *   reentrancy guard and PRNG state, and a no-op chaos_memory_ensure_symbols(), so the actions
+ *   link without the wrapper translation units.
+ * - Tests choose probability 0.0 or 1.0, which chaos_memory_probability_hit_sample() decides
+ *   without consulting the PRNG; the sampled midpoint case passes the sample explicitly.
  *
- * Properties under test:
- * - `chaos_memory_probability_hit_sample`: boundary values 0.0 and 1.0; midpoint 0.5 with
- *   sample=0 (hit) and sample=UINT32_MAX (miss).
- * - `chaos_memory_rule_should_trigger(NULL)` → false.
- * - Latency: 2500 ms → one sleep of {2 s, 500 ms}; EINTR resumes with the remaining time.
- * - Latency with probability=0.0: no sleep even when `latency_ms > 0`.
- * - `chaos_memory_rule_apply_errno`: probability=1.0 sets errno to ENOMEM and returns true;
- *   NULL rule → false.
- *
- * What is NOT tested here:
- * - Memory wrapper call paths that invoke action helpers at interception time.
- * - Config file parsing and rule selection (tested in `test_memory_config.c`).
+ * Not covered here: the wrappers that call these helpers (test_chaos_memory.c) and rule
+ * parsing and selection (test_memory_config.c).
  */
 
 #include "../support/test_memory_support.h"
@@ -37,12 +29,7 @@ CHAOS_MEMORY_DEFINE_TEST_GLOBALS();
 
 #include "../../src/memory/chaos_memory_actions.c"
 
-/**
- * @brief Reset all per-test action state to well-known defaults.
- *
- * Calls `chaos_memory_test_reset_runtime()` to zero PRNG and function-pointer globals,
- * then clears the recorded sleeps.
- */
+/** @brief Restores the runtime globals and the sleep stub so tests cannot leak into each other. */
 static void reset_action_state(void)
 {
     chaos_memory_test_reset_runtime();
@@ -50,18 +37,12 @@ static void reset_action_state(void)
 }
 
 /**
- * @brief Invariant: probability sampling produces the correct binary decision at all
- *   boundary values; `should_trigger(NULL)` is safe.
+ * @brief Proves the probability decision at its edges and that a NULL rule never fires.
  *
- * Triggering condition: `chaos_memory_probability_hit_sample` with p=0.0/1.0/0.5 and
- *   sample=0/UINT32_MAX; `chaos_memory_rule_should_trigger(NULL)`.
- *
- * Expected observable behaviour:
- * - `probability_hit_sample(0.0, 0)` → false.
- * - `probability_hit_sample(1.0, UINT32_MAX)` → true.
- * - `probability_hit_sample(0.5, 0)` → true (0 < threshold).
- * - `probability_hit_sample(0.5, UINT32_MAX)` → false (UINT32_MAX ≥ threshold).
- * - `rule_should_trigger(NULL)` → false (NULL guard).
+ * @details Probability 0.0 never fires and 1.0 always fires, whatever the sample, because both
+ * are short-circuited before the threshold arithmetic. At 0.5 the threshold is 2^31: sample 0
+ * lies below it (fires) and sample 0xffffffff lies above it (does not), which pins the
+ * comparison direction `sample < probability * 2^32`.
  */
 static void test_probability_helpers(void)
 {
@@ -73,14 +54,13 @@ static void test_probability_helpers(void)
 }
 
 /**
- * @brief Invariant: latency sleeps for exactly the rule's duration, resumes after EINTR,
- *   and skips the sleep when probability is 0.
+ * @brief Proves LATENCY sleeps the full configured delay exactly once per firing.
  *
- * Expected observable behaviour:
- * - LATENCY, probability=1.0, latency_ms=2500: one sleep of {2 s, 500 ms}.
- * - Same with one EINTR: a second sleep for the remaining time; errno untouched.
- * - probability=0.0, latency_ms=100: no sleep.
- * - NULL rule, or an ERRNO rule: no sleep.
+ * @details
+ * - 2500 ms becomes one request of {2 s, 500000000 ns}: milliseconds are split, not truncated.
+ * - After one EINTR the sleep is reissued with the stub's 1 ms remainder, and errno keeps the
+ *   caller's sentinel 4242: an injected delay must neither end early nor leak EINTR.
+ * - Probability 0.0, a NULL rule and a rule of another effect issue no request.
  */
 static void test_latency_helper(void)
 {
@@ -110,7 +90,6 @@ static void test_latency_helper(void)
     chaos_memory_rule_apply_latency(&rule);
     assert(g_test_sleep_calls == 0U);
 
-    /* No rule, or a rule of another effect, never sleeps. */
     rule.probability = 1.0;
     chaos_memory_rule_apply_latency(NULL);
     rule.effect = CHAOS_MEMORY_EFFECT_ERRNO;
@@ -119,18 +98,12 @@ static void test_latency_helper(void)
 }
 
 /**
- * @brief Invariant: `chaos_memory_rule_apply_errno` sets errno and returns true with
- *   probability=1.0, and returns false for a NULL rule.
+ * @brief Proves ERRNO stores the rule's errnum and reports a firing, and otherwise leaves errno.
  *
- * Triggering condition: a rule with ERRNO effect, errnum=ENOMEM, probability=1.0; then
- *   `apply_errno(NULL)`.
- *
- * Expected observable behaviour:
- * - `apply_errno(&rule)` with probability=1.0: returns true; `errno == ENOMEM`.
- *   ENOMEM is the canonical allocation-failure code for memory interceptors and is used here
- *   to verify that the specific error code from the rule is what actually gets injected.
- * - `apply_errno(NULL)` → false (NULL guard).
- * - probability=0.0, or a LATENCY rule → false; errno untouched.
+ * @details A firing ENOMEM rule returns 1 with errno == ENOMEM; the wrapper turns that into
+ * MAP_FAILED or -1. A NULL rule, probability 0.0 and a LATENCY rule return 0 and keep the
+ * sentinel 4242, because a wrapper that falls through to the real function must not see a
+ * stale injected errno.
  */
 static void test_errno_helper(void)
 {
@@ -146,7 +119,6 @@ static void test_errno_helper(void)
     assert(errno == ENOMEM);
     assert(!chaos_memory_rule_apply_errno(NULL));
 
-    /* A rule that does not fire, or one of another effect, leaves errno alone. */
     errno = 4242;
     rule.probability = 0.0;
     assert(!chaos_memory_rule_apply_errno(&rule));
@@ -157,13 +129,11 @@ static void test_errno_helper(void)
 }
 
 /**
- * @brief Invariant: a rule's hit counter advances exactly when its effect fires.
+ * @brief Proves a hit is counted only when the rule fires, and a rule without a slot still fires.
  *
- * Triggering condition: should_trigger on a rule with probability 1.0, then 0.0,
- *   then on a rule without a counter.
- *
- * Expected observable behaviour: the count is 1 after the firing call and stays 1
- *   after the call that does not fire; a rule without a counter still fires.
+ * @details The zeroed slot's generation matches the rule's zero `hit_generation`, so the slot
+ * counts as current. A NULL slot models a rule copy outside a snapshot: it must fire without
+ * dereferencing anything.
  */
 static void test_should_trigger_counts_hits(void)
 {
@@ -186,10 +156,14 @@ static void test_should_trigger_counts_hits(void)
 }
 
 /**
- * @brief Invariant: should_trigger honours `@first`, `@from` and `@until`.
+ * @brief Proves the gate applies the `@first`, `@from`, `@until` and `@size` qualifiers.
  *
- * Expected observable behaviour: `@first=2` fires twice and then never; a window
- *   that ended or has not started yet does not fire; an open window does.
+ * @details
+ * - `@first=2` claims two firings and then refuses; the count stops at 2 with it.
+ * - `@until` 1 ms after the epoch has already ended; `@from` 4000000000000 ms (year 2096) has not
+ *   begun; `@from` 1 ms is open. The real clock is used, so the bounds are chosen far from now.
+ * - `@size>100` rejects a call without a byte count (`CHAOS_POLICY_NO_SIZE`) and 100 itself
+ *   (bounds are exclusive), passes 101, and `@size<101` then excludes 101 as well.
  */
 static void test_should_trigger_honours_qualifiers(void)
 {
@@ -216,7 +190,6 @@ static void test_should_trigger_honours_qualifiers(void)
     rule.policy.from_ms = 1;
     assert(chaos_memory_rule_should_trigger(&rule) == 1);
 
-    /* A size gate passes only calls with a byte count in range. */
     memset(&rule.policy, 0, sizeof(rule.policy));
     rule.policy.has_size_above = 1U;
     rule.policy.size_above = 100U;

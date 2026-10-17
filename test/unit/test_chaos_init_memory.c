@@ -1,19 +1,29 @@
 /**
  * @file test_chaos_init_memory.c
- * @brief Unit tests for chaos-init's memory decisions.
+ * @brief Proves chaos-init maps memory system calls onto libchaos-memory rules and
+ *        turns them into the right SECCOMP-mode verdict.
  *
- * Subsystem under test: `src/init/chaos_init_memory.c` (with the memory rule core
- * it includes, `chaos_init_proc.c` and `chaos_init_tracee.c`).
+ * @details Unit under test: `chaos_init_memory_decide()` in `src/init/chaos_init_memory.c`,
+ * compiled in by `#include` together with the libchaos-memory rule core it embeds,
+ * `chaos_init_proc.c` (/proc lookups) and `chaos_init_tracee.c` (per-process hit slots).
  *
- * Coverage approach: calls are built as a notification carries them, with this
- * test process as the caller; everything memory matches on is in the arguments.
+ * Isolation: no supervisor, no seccomp filter and no tracee. Each call is a
+ * `chaos_init_call_t` filled the way a seccomp notification fills it, with this test
+ * process as the caller (`tid = getpid()`), so the real /proc lookup resolves it to a
+ * live process. Memory rules match on arguments only (operation, mmap flags for
+ * anon/file, `args[1]` as the length for `@size`), so no tracee memory has to be read.
+ * The rule file is replaced by an atomic rename(2), and
+ * `g_chaos_memory_check_interval_ns = 0` makes every decision re-check it.
  *
- * Properties under test:
- * - each memory call reaches its operation, mmap with its anon/file kind;
- * - LATENCY delays, ERRNO fails, both together delay and then fail;
- * - `@size` sees the length; other system calls are not memory's.
- * - a process that ended after its call matched is not counted, and its call runs;
- * - counts follow rule texts, also across two reloads between the process's calls.
+ * Properties proven:
+ * - mmap, munmap, mprotect and madvise reach their operation; mmap is anon or file by
+ *   MAP_ANONYMOUS; any other system call returns 0 (not memory's);
+ * - LATENCY gives DELAY, ERRNO gives FAIL, both on one call give DELAY carrying the errno;
+ * - `@size` compares against the call's length;
+ * - a caller whose process cannot be resolved is not counted and its call passes;
+ * - hit counts follow the rule text across reloads, also when the config core hands back
+ *   the same snapshot buffer after two reloads (the mtime still marks a new load);
+ * - a hit writes the caller's hits file (`/tmp/.chaos-memory.hits.<pid>`).
  */
 
 #include "../../src/init/chaos_init_memory.c"
@@ -23,6 +33,12 @@
 #include <assert.h>
 #include <sys/mman.h>
 
+/**
+ * @brief Decides a memory call made by this process and asserts memory owns it.
+ *
+ * @details The verdict is pre-set to FAIL so that a PASS result proves the decision
+ * wrote the verdict rather than leaving stale state.
+ */
 static chaos_init_verdict_t decide(int nr, uint64_t length, uint64_t flags)
 {
     chaos_init_call_t call;
@@ -39,6 +55,7 @@ static chaos_init_verdict_t decide(int nr, uint64_t length, uint64_t flags)
     return verdict;
 }
 
+/** @brief Replaces the rule file by rename(2), so a reload never sees a partial file. */
 static void write_rules(const char *rules)
 {
     FILE *file = fopen("/tmp/.chaos-memory.conf.new", "w");
@@ -71,7 +88,9 @@ int main(void)
                 "mprotect:LATENCY:5\n"
                 "madvise:ERRNO:EAGAIN\n");
 
-    /* mmap by kind, with the length for @size; LATENCY and ERRNO together. */
+    /* mmap by kind and length: 100 bytes matches nothing, 4096 trips `@size>4095` only,
+     * 1 MiB also trips the LATENCY rule (DELAY that then fails), a file mapping (no
+     * MAP_ANONYMOUS) only the file LATENCY rule. */
     assert(decide(__NR_mmap, 100U, anon).action == CHAOS_INIT_PASS);
     verdict = decide(__NR_mmap, 4096U, anon);
     assert(verdict.action == CHAOS_INIT_FAIL && verdict.error == ENOMEM);
@@ -82,7 +101,7 @@ int main(void)
     verdict = decide(__NR_mmap, 4096U, MAP_PRIVATE);
     assert(verdict.action == CHAOS_INIT_DELAY && verdict.delay_ms == 7U && verdict.error == 0);
 
-    /* The other operations. */
+    /* munmap, mprotect and madvise each reach their own operation's rule. */
     verdict = decide(__NR_munmap, 4096U, 0U);
     assert(verdict.action == CHAOS_INIT_FAIL && verdict.error == EINVAL);
     verdict = decide(__NR_mprotect, 4096U, 0U);
@@ -90,7 +109,8 @@ int main(void)
     verdict = decide(__NR_madvise, 4096U, 0U);
     assert(verdict.action == CHAOS_INIT_FAIL && verdict.error == EAGAIN);
 
-    /* A process that ended after its call matched is not counted, and its call runs. */
+    /* Fail-open for a vanished caller: tid 999999999 has no /proc entry, so no hit slot
+     * exists; the matching munmap rule must not fire and the verdict resets to PASS. */
     memset(&other, 0, sizeof(other));
     other.tid = 999999999;
     other.nr = __NR_munmap;
@@ -98,9 +118,10 @@ int main(void)
     verdict.action = CHAOS_INIT_FAIL;
     assert(chaos_init_memory_decide(&other, &verdict) == 1 && verdict.action == CHAOS_INIT_PASS);
 
-    /* The rule file changes twice between two calls the process makes, the second
-     * change bringing back the snapshot buffer of the first: the new text still
-     * starts at zero instead of taking the count of the one it replaced. */
+    /* Two reloads between calls: the second reload reuses the snapshot buffer of the
+     * first, so state pointer equality alone would miss it. The new `@first=1` text
+     * must start from zero hits, not inherit the exhausted count of the text it
+     * replaced at the same index. */
     write_rules("madvise:ERRNO:EAGAIN @first=1\n");
     verdict = decide(__NR_madvise, 4096U, 0U);
     assert(verdict.action == CHAOS_INIT_FAIL && verdict.error == EAGAIN);

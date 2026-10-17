@@ -1,35 +1,25 @@
 /**
  * @file test_process_runtime.c
- * @brief Unit tests for the PROCESS-domain constructor: symbol resolution, seed material,
- *   and function-pointer table wiring.
+ * @brief Proves the libchaos-process constructor: real-function resolution, seeding, rule load.
  *
- * Subsystem under test: `src/process/chaos_process.c` (the `chaos_process_init()` constructor).
+ * @details
+ * Unit under test: `src/process/chaos_process.c`. It must resolve every real function via
+ * `dlsym(RTLD_NEXT)` (aborting for a mandatory one that is missing, tolerating an optional
+ * one), seed the PRNG from `/dev/urandom` with a deterministic fallback, and load the rule file
+ * at start-up. Rule matching and the wrappers are covered elsewhere.
  *
- * Coverage approach:
- * - All intercepted symbols (pthread_create, fork, posix_spawn, posix_spawnp, execve,
- *   execveat, waitpid, wait4, waitid) are mapped to local stubs via a test-controlled
- *   `dlsym` stub.
- * - `dlerror`, `abort`, and (on Linux) `syscall` are overridden via `#define` before
- *   `chaos_process.c` is included, exercising the constructor without LD_PRELOAD.
- * - On Linux, the raw-syscall stub delivers a deterministic 8-byte seed value
- *   (0x1122334455667788) to verify the exact stored `process_seed`.
- * - The abort path is intercepted via `setjmp`/`longjmp` to verify fatal-error behaviour.
- *
- * Properties under test:
- * - `chaos_process_resolve_symbol()`: pointer wired correctly; `dlerror()` called once.
- * - `chaos_process_read_seed_material()` (Linux): returns 0x1122334455667788; exactly
- *   one openat, one read, one close raw syscall.
- * - `chaos_process_read_seed_material()` (non-Linux): returns a non-zero value.
- * - Abort path: unresolvable symbol triggers `abort()`.
- * - Linux seed fallback: open failure → PID-based fallback; short read → same fallback.
- * - `chaos_process_init()`: all nine real-function-pointer globals wired; config_init called
- *   once; process_seed and tls_prng_state non-zero.
- *
- * What is NOT tested here:
- * - Config file loading or rule matching.
- * - PROCESS wrapper call paths (tested in test_chaos_process.c).
+ * Isolation:
+ * - `dlsym`, `dlerror`, `abort` and, on Linux, `syscall` are redefined as macros to local stubs
+ *   before the production source is included, so the constructor runs as plain code with no
+ *   LD_PRELOAD and no dynamic linker involvement.
+ * - The `dlsym` stub maps each of the 13 resolved symbol names to a distinct stub, so pointer
+ *   equality proves which symbol landed in which slot.
+ * - The `syscall` stub fakes `/dev/urandom`: fd 9, seed 0x1122334455667788, with switches for a
+ *   failed open and a short read.
+ * - The `abort` stub `longjmp`s back to the test, so the fatal path is observable in-process.
+ * - `chaos_process_config_init()` and `chaos_process_config_prepare()` are counting stubs; the
+ *   config module is not linked.
  */
-
 #include "../support/test_process_support.h"
 
 #include "../../src/process/chaos_process_config.h"
@@ -37,35 +27,33 @@
 #include <setjmp.h>
 #include <stdarg.h>
 
-/** @brief Number of times `chaos_process_config_init()` stub was called. */
+/** @brief Calls to the `chaos_process_config_init()` stub. */
 static int g_config_init_calls = 0;
 
-/** @brief Number of times the `chaos_process_config_prepare()` stub was called. */
+/** @brief Calls to the `chaos_process_config_prepare()` stub. */
 static int g_config_prepare_calls = 0;
-/** @brief Number of times the `dlerror` stub was called. */
+/** @brief Calls to the `dlerror` stub; proves the clear-then-check error discipline. */
 static int g_dlerror_calls = 0;
 /** @brief Error string returned by the `dlerror` stub; NULL means no error. */
 static const char *g_dlerror_text = NULL;
-/** @brief `setjmp` buffer used to return from an expected `abort()`. */
+/** @brief Return point for an expected `abort()`. */
 static jmp_buf g_abort_env;
-/** @brief Non-zero when the test expects `abort()` to be called. */
+/** @brief Non-zero while an `abort()` is expected; otherwise abort fails the test. */
 static int g_expect_abort = 0;
 #ifdef __linux__
-/** @brief SYS_openat dispatch count. */
+/** @brief Calls of `syscall(SYS_openat, ...)`. */
 static int g_syscall_open_calls = 0;
-/** @brief SYS_read dispatch count. */
+/** @brief Calls of `syscall(SYS_read, ...)`. */
 static int g_syscall_read_calls = 0;
-/** @brief SYS_close dispatch count. */
+/** @brief Calls of `syscall(SYS_close, ...)`. */
 static int g_syscall_close_calls = 0;
-/** @brief When non-zero, causes SYS_openat to return -1. */
+/** @brief Non-zero makes SYS_openat fail with -1, as with no `/dev/urandom` in a sandbox. */
 static int g_force_open_fail = 0;
-/** @brief When non-zero, causes SYS_read to return sizeof(seed)-1 (short read). */
+/** @brief Non-zero makes SYS_read return 7 of 8 bytes (a short read). */
 static int g_force_short_read = 0;
 #endif
 
-/**
- * @brief Reset all test-local and runtime globals before each test function.
- */
+/** @brief Clears runtime globals and every stub counter and switch before a test. */
 static void reset_test_state(void)
 {
     chaos_process_test_reset_runtime();
@@ -83,7 +71,7 @@ static void reset_test_state(void)
 #endif
 }
 
-/** @brief Stub for `pthread_create(3)`. Returns 0 (success) without creating a thread. */
+/** @brief Real-function stand-in for `pthread_create(3)`; its address is the assertion. */
 static int stub_pthread_create(
     pthread_t *thread,
     const pthread_attr_t *attributes,
@@ -98,22 +86,13 @@ static int stub_pthread_create(
     return 0;
 }
 
-/**
- * @brief Stub for `fork(2)`. Returns a fixed child PID (123) without creating a process.
- *
- * @return 123 (simulated child PID as seen by the parent).
- */
+/** @brief Real-function stand-in for `fork(2)`; returns 123 without forking. */
 static pid_t stub_fork(void)
 {
     return 123;
 }
 
-/**
- * @brief Stub for `posix_spawn(3)`. Writes a fixed PID (234) and returns 0.
- *
- * @param pid  Receives the simulated child PID when non-NULL.
- * @return 0 (success).
- */
+/** @brief Real-function stand-in for `posix_spawn(3)`; stores pid 234 and returns 0. */
 static int stub_posix_spawn(
     pid_t *pid,
     const char *path,
@@ -135,12 +114,7 @@ static int stub_posix_spawn(
     return 0;
 }
 
-/**
- * @brief Stub for `posix_spawnp(3)`. Writes a fixed PID (345) and returns 0.
- *
- * @param pid  Receives the simulated child PID when non-NULL.
- * @return 0 (success).
- */
+/** @brief Real-function stand-in for `posix_spawnp(3)`; stores pid 345 and returns 0. */
 static int stub_posix_spawnp(
     pid_t *pid,
     const char *file,
@@ -162,7 +136,7 @@ static int stub_posix_spawnp(
     return 0;
 }
 
-/** @brief Stub for `execve(2)`. Returns 0 without replacing the process image. */
+/** @brief Real-function stand-in for `execve(2)`; returns 0 without exec. */
 static int stub_execve(const char *path, char *const argv[], char *const envp[])
 {
     (void)path;
@@ -171,7 +145,7 @@ static int stub_execve(const char *path, char *const argv[], char *const envp[])
     return 0;
 }
 
-/** @brief Stub for `execveat(2)`. Returns 0 without replacing the process image. */
+/** @brief Real-function stand-in for `execveat(2)`; returns 0 without exec. */
 static int
 stub_execveat(int directory_fd, const char *path, char *const argv[], char *const envp[], int flags)
 {
@@ -183,7 +157,7 @@ stub_execveat(int directory_fd, const char *path, char *const argv[], char *cons
     return 0;
 }
 
-/** @brief Stub for `wait4(2)`. Returns @p pid unchanged. */
+/** @brief Real-function stand-in for `wait4(2)`; returns @p pid. */
 static pid_t stub_wait4(pid_t pid, int *status, int options, struct rusage *usage)
 {
     (void)status;
@@ -192,7 +166,7 @@ static pid_t stub_wait4(pid_t pid, int *status, int options, struct rusage *usag
     return pid;
 }
 
-/** @brief Stub for `execvpe(3)`. Returns -1. */
+/** @brief Real-function stand-in for `execvpe(3)`; returns -1. */
 static int stub_execvpe(const char *file, char *const argv[], char *const envp[])
 {
     (void)file;
@@ -201,7 +175,7 @@ static int stub_execvpe(const char *file, char *const argv[], char *const envp[]
     return -1;
 }
 
-/** @brief Stub for `fexecve(3)`. Returns -1. */
+/** @brief Real-function stand-in for `fexecve(3)`; returns -1. */
 static int stub_fexecve(int fd, char *const argv[], char *const envp[])
 {
     (void)fd;
@@ -210,14 +184,14 @@ static int stub_fexecve(int fd, char *const argv[], char *const envp[])
     return -1;
 }
 
-/** @brief Stub for `system(3)`. Returns 0. */
+/** @brief Real-function stand-in for `system(3)`; returns 0. */
 static int stub_system(const char *command)
 {
     (void)command;
     return 0;
 }
 
-/** @brief Stub for `popen(3)`. Returns NULL. */
+/** @brief Real-function stand-in for `popen(3)`; returns NULL. */
 static FILE *stub_popen(const char *command, const char *mode)
 {
     (void)command;
@@ -225,7 +199,7 @@ static FILE *stub_popen(const char *command, const char *mode)
     return NULL;
 }
 
-/** @brief Stub for `waitid(2)`. Returns 0. */
+/** @brief Real-function stand-in for `waitid(2)`; returns 0. */
 static int stub_waitid(idtype_t type, id_t id, siginfo_t *info, int options)
 {
     (void)type;
@@ -235,7 +209,7 @@ static int stub_waitid(idtype_t type, id_t id, siginfo_t *info, int options)
     return 0;
 }
 
-/** @brief Stub for `waitpid(2)`. Returns @p pid unchanged. */
+/** @brief Real-function stand-in for `waitpid(2)`; returns @p pid. */
 static pid_t stub_waitpid(pid_t pid, int *status, int options)
 {
     (void)status;
@@ -243,19 +217,13 @@ static pid_t stub_waitpid(pid_t pid, int *status, int options)
     return pid;
 }
 
-/**
- * @brief Stub for `chaos_process_config_init()`.
- *
- * Increments the call counter to verify the constructor calls it exactly once.
- */
+/** @brief Replaces the config module's initialiser; counts calls. */
 void chaos_process_config_init(void)
 {
     ++g_config_init_calls;
 }
 
-/**
- * @brief Stub for `chaos_process_config_prepare()`: counts the start-up load.
- */
+/** @brief Replaces the start-up rule load; counts calls and reports success. */
 int chaos_process_config_prepare(void)
 {
     ++g_config_prepare_calls;
@@ -263,10 +231,10 @@ int chaos_process_config_prepare(void)
 }
 
 /**
- * @brief Stub for `dlerror()`.
+ * @brief Replaces `dlerror()`: counts calls and returns `g_dlerror_text`.
  *
- * Returns `g_dlerror_text` and increments `g_dlerror_calls`. The call count
- * verifies that the production resolver calls `dlerror()` once per symbol.
+ * The resolver clears the error with one call before `dlsym` and checks it with a second only
+ * when `dlsym` returns NULL, so a successful resolution costs exactly one call.
  */
 static char *chaos_process_test_dlerror(void)
 {
@@ -275,11 +243,10 @@ static char *chaos_process_test_dlerror(void)
 }
 
 /**
- * @brief Stub for `dlsym(RTLD_NEXT, symbol)`.
+ * @brief Replaces `dlsym(RTLD_NEXT, symbol)`: maps the 13 resolved names to their stubs.
  *
- * Maps each of the nine expected symbol names to the corresponding stub function
- * via `CHAOS_PROCESS_TEST_DLSYM_RESULT`. Returns NULL for unrecognised symbols,
- * which causes the production resolver to call `dlerror` and then `abort`.
+ * Any other name returns NULL. The mandatory resolver then aborts only if `dlerror()` also
+ * reports an error, mirroring how a real NULL symbol value is told apart from a missing one.
  */
 static void *chaos_process_test_dlsym(void *handle, const char *symbol)
 {
@@ -318,11 +285,11 @@ static void *chaos_process_test_dlsym(void *handle, const char *symbol)
 
 #ifdef __linux__
 /**
- * @brief Stub for `syscall(2)` used by the constructor to read `/dev/urandom`.
+ * @brief Replaces `syscall(2)`, which the seeder uses so it cannot re-enter wrappers.
  *
- * Delivers seed `0x1122334455667788` on a successful SYS_read. Returns -1 for
- * SYS_openat when `g_force_open_fail != 0`. Returns `sizeof(seed)-1` for SYS_read
- * when `g_force_short_read != 0` (triggering the PID-based fallback path).
+ * SYS_openat returns fd 9 (or -1 under `g_force_open_fail`). SYS_read asserts fd 9 and an
+ * 8-byte request, writes 0x1122334455667788 and returns 8 (or 7 under `g_force_short_read`).
+ * SYS_close succeeds. Counters let tests prove no read or close follows a failed open.
  */
 static long chaos_process_test_syscall(long number, ...)
 {
@@ -369,11 +336,7 @@ static long chaos_process_test_syscall(long number, ...)
 #endif
 
 /**
- * @brief Stub for `abort()`.
- *
- * When `g_expect_abort != 0`, uses `longjmp` to return to the test's `setjmp`
- * frame. An unexpected abort triggers `assert(!"unexpected abort")` to produce a
- * clear failure rather than silently hanging.
+ * @brief Replaces `abort()`: `longjmp`s to the test when expected, otherwise fails an assert.
  */
 static void chaos_process_test_abort(void)
 {
@@ -384,9 +347,8 @@ static void chaos_process_test_abort(void)
     assert(!"unexpected abort");
 }
 
-/* -------------------------------------------------------------------------
- * Symbol overrides and production source inclusion
- * --------------------------------------------------------------------- */
+/* The macros below must precede the include so every call site in the production source binds
+ * to the stubs; they are undone afterwards so the tests themselves use the real names. */
 
 #define dlsym chaos_process_test_dlsym
 #define dlerror chaos_process_test_dlerror
@@ -402,21 +364,13 @@ static void chaos_process_test_abort(void)
 #undef dlerror
 #undef dlsym
 
-/* -------------------------------------------------------------------------
- * Test functions
- * --------------------------------------------------------------------- */
-
 /**
- * @brief Invariant: `chaos_process_resolve_symbol()` wires a pointer and reads a valid seed.
+ * @brief Proves symbol resolution fills only unset pointers and the seed comes from urandom.
  *
- * Triggering condition: `chaos_process_resolve_symbol(&fork_fn, "fork")` with clean state.
- *
- * Expected observable behaviour:
- * - `fork_fn` is set to `stub_fork`.
- * - `g_dlerror_calls == 1`.
- * - On Linux: `chaos_process_read_seed_material()` returns 0x1122334455667788; exactly
- *   one of each raw syscall is issued.
- * - Non-Linux: returns a non-zero value.
+ * Resolving "fork" stores `stub_fork` after one `dlerror()` clear. Resolving into the now set
+ * pointer is a no-op even for a name `dlsym` cannot find, which is what lets a test harness
+ * pre-wire real functions. On Linux the seed is the 8 bytes read through exactly one
+ * openat/read/close; elsewhere it is the non-zero constant-XOR-pid fallback.
  */
 static void test_resolve_symbol_and_seed_helpers(void)
 {
@@ -427,7 +381,6 @@ static void test_resolve_symbol_and_seed_helpers(void)
     assert(fork_fn == stub_fork);
     assert(g_dlerror_calls == 1);
 
-    /* A pointer that is already wired is left alone: no dlsym, no dlerror. */
     chaos_process_resolve_symbol(&fork_fn, "missing-symbol");
     assert(fork_fn == stub_fork);
     assert(g_dlerror_calls == 1);
@@ -443,13 +396,11 @@ static void test_resolve_symbol_and_seed_helpers(void)
 }
 
 /**
- * @brief Invariant: `chaos_process_resolve_symbol()` calls `abort()` for a missing symbol.
+ * @brief Proves a missing mandatory symbol aborts the process.
  *
- * Triggering condition: `g_dlerror_text = "missing"` with an unrecognised symbol name
- *   causes the production resolver to call `abort()`.
- *
- * Expected observable behaviour: `longjmp` transfers control out of the setjmp block;
- *   the assertion on the next line is never reached.
+ * Aborting at load is preferred to a NULL real function that would SIGSEGV later inside a
+ * wrapper. `dlsym` returns NULL and `dlerror()` reports "missing"; the abort stub `longjmp`s
+ * out, so reaching the assertion after the call means abort was not called.
  */
 static void test_resolve_symbol_abort_path(void)
 {
@@ -468,16 +419,12 @@ static void test_resolve_symbol_abort_path(void)
 
 #ifdef __linux__
 /**
- * @brief Invariant: `chaos_process_try_resolve_symbol()` clears the dlerror state
- *        and stores NULL when the symbol is absent.
+ * @brief Proves a missing optional symbol leaves NULL, clears dlerror, and never aborts.
  *
- * Triggering condition: stub `dlsym` returns NULL for any unrecognised symbol;
- *   `g_dlerror_text` may be set or NULL — the `try` variant does not abort.
- *
- * Expected observable behaviour: an unset target stays NULL after the call,
- *   and the second `dlerror()` call (the "clear" call inside the NULL branch)
- *   has incremented `g_dlerror_calls` from 1 to 2; an already wired target is
- *   left untouched without calling dlsym.
+ * Optional symbols can be absent: `execveat`, `execvpe` and `fexecve` on musl, `pthread_create`
+ * before glibc 2.34 when libpthread is not loaded. The resolver must store NULL and consume
+ * the pending error with a second `dlerror()` (2 calls), so a later unrelated `dlerror()`
+ * caller does not see it. A pre-wired pointer is kept and costs no `dlerror()` call.
  */
 static void test_try_resolve_symbol_missing(void)
 {
@@ -490,7 +437,6 @@ static void test_try_resolve_symbol_missing(void)
     assert(execveat_fn == NULL);
     assert(g_dlerror_calls == 2);
 
-    /* An already wired pointer is never replaced. */
     reset_test_state();
     chaos_process_try_resolve_symbol(&wired, "this-symbol-does-not-exist");
     assert(wired == (chaos_process_execveat_fn)(uintptr_t)0xdead);
@@ -498,13 +444,10 @@ static void test_try_resolve_symbol_missing(void)
 }
 
 /**
- * @brief Invariant: seed fallback paths produce PID-based seeds when /dev/urandom fails.
+ * @brief Proves the seed falls back to `0x6a09e667f3bcc909 ^ getpid()` when urandom fails.
  *
- * Triggering conditions:
- * - `g_force_open_fail = 1`: SYS_openat returns -1; no read or close attempted.
- * - `g_force_short_read = 1`: SYS_read returns `sizeof(seed)-1`; close is still called.
- *
- * Expected observable behaviour: both paths return `0x6a09e667f3bcc909 XOR getpid()`.
+ * A failed open issues no read and no close. A short read (7 of 8 bytes) discards the partial
+ * seed but still closes the fd, so the fallback path does not leak a descriptor.
  */
 static void test_seed_fallback_paths(void)
 {
@@ -527,15 +470,12 @@ static void test_seed_fallback_paths(void)
 #endif
 
 /**
- * @brief Invariant: `chaos_process_init()` wires all nine function pointers and seeds the PRNG.
+ * @brief Proves the constructor wires all 13 real functions, seeds the PRNG and loads rules.
  *
- * Triggering condition: `chaos_process_init()` called after `reset_test_state()`.
- *
- * Expected observable behaviour:
- * - All nine `g_chaos_process_real_*` globals equal their stub counterparts.
- *   On Linux, `execveat` is included; on non-Linux it is omitted from the check.
- * - `g_config_init_calls` increments by 1.
- * - `g_chaos_process_process_seed != 0` and `g_chaos_process_tls_prng_state != 0`.
+ * The run-once state is reset first so the constructor resolves again into the pointers
+ * `reset_test_state()` cleared. `execveat` is resolved on Linux only, so it is checked only
+ * there. The config module is initialised and the rule file loaded exactly once each, and both
+ * the process seed and the calling thread's PRNG state are non-zero.
  */
 static void test_constructor_init(void)
 {
@@ -563,7 +503,7 @@ static void test_constructor_init(void)
     assert(g_chaos_process_real_system == stub_system);
     assert(g_chaos_process_real_popen == stub_popen);
     assert(g_config_init_calls == config_calls_before + 1);
-    /* The constructor loads the rules at once so a bad rule file is reported. */
+    /* Loading at start-up reports a bad rule file before the first intercepted call. */
     assert(g_config_prepare_calls == prepare_calls_before + 1);
     assert(g_chaos_process_process_seed != 0U);
     assert(g_chaos_process_tls_prng_state != 0U);

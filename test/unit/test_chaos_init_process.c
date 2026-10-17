@@ -1,26 +1,39 @@
 /**
  * @file test_chaos_init_process.c
- * @brief Unit tests for chaos-init's process decisions.
+ * @brief Proves chaos-init maps process-lifecycle system calls onto libchaos-process
+ *        rules, including per-process FAIL_AFTER state across forks and reloads.
  *
- * Subsystem under test: `src/init/chaos_init_process.c` (with the process rule
- * core it includes, `chaos_init_proc.c` and `chaos_init_tracee.c`).
+ * @details Unit under test: `chaos_init_process_decide()` in
+ * `src/init/chaos_init_process.c`, compiled in by `#include` with the libchaos-process
+ * rule core, `chaos_init_proc.c` and `chaos_init_tracee.c`.
  *
- * Coverage approach: calls are built as a notification carries them, with this
- * test process (and a forked child that sleeps) as the caller; clone3's argument
- * structure is this process's memory. The process lookup can be made to fail.
+ * Isolation: no supervisor and no seccomp filter. Calls are `chaos_init_call_t` values
+ * filled as a notification fills them. The caller is this process, or a forked child
+ * parked in pause(2) so it has a real /proc entry and a real parent link (the fork
+ * inheritance logic resolves the parent through `/proc/<pid>/status`). clone3's
+ * `struct clone_args` lives in this process, which is the caller, so the real
+ * process_vm_readv(2) path reads it.
  *
- * Properties under test:
- * - clone is a thread, a spawn (CLONE_VFORK) or a fork by its flags, clone3 too;
- *   fork, vfork, execve, execveat, wait4 and waitid reach their operations;
- * - the application's own start is never faulted, retries from chaos-init's image
- *   included; execs of the application's image are;
- * - LATENCY delays, ERRNO fails, both together delay and then fail;
- * - FAIL_AFTER counts per process and starts over after a reload; a fork child
- *   starts with its parent's counts at the fork, once; a new process that gets
- *   an ended one's entry starts from 0, and so does the child of a fork made
- *   under an earlier rule load;
- * - a rule whose probability is 0, or a process that ended, gets neither a delay
- *   nor an error.
+ * Seam: `CHAOS_INIT_PROCESS_OF` is defined before the include to wrap the real
+ * `chaos_init_process_of()`. `g_fail_process` makes every lookup fail (the caller
+ * vanished); `g_start_offset` shifts the start/image fingerprint, which the tracee table
+ * reads as a different process on the same pid (pid reuse, or a new image after execve).
+ *
+ * Properties proven:
+ * - clone maps by flags: CLONE_THREAD is pthread_create, CLONE_VFORK is posix_spawn,
+ *   anything else is fork; clone3 reads the same flags from its argument structure and
+ *   an unreadable structure counts as fork; fork, vfork, execve, execveat, wait4 and
+ *   waitid reach their operations;
+ * - the application's first execve, and retries of it from chaos-init's own image, are
+ *   never faulted; once the image changes, execve is faulted;
+ * - LATENCY gives DELAY, ERRNO gives FAIL, both on one call give DELAY carrying the errno;
+ * - FAIL_AFTER counts per process and restarts from 0 after a reload; a fork child
+ *   inherits its parent's counts at the fork, and only the first child takes them; a
+ *   new process on a reused entry starts from 0, as does the child of a fork made under
+ *   an earlier rule load;
+ * - probability 0, or a caller that cannot be resolved, yields neither delay nor errno;
+ * - a posix_spawnp rule rejects the whole rule file in SECCOMP mode (status file names
+ *   the line), because the PATH search happens in libc and is invisible here.
  */
 
 #include <stdint.h>
@@ -48,6 +61,10 @@ static int test_process_of(pid_t tid, pid_t *tgid, uint64_t *start)
 #include <signal.h>
 #include <sys/wait.h>
 
+/**
+ * @brief Decides a process call by @p tid with first argument @p a0; asserts process
+ *        owns it. The verdict is pre-set to FAIL so a PASS proves it was written.
+ */
 static chaos_init_verdict_t decide_for(pid_t tid, int nr, uint64_t a0)
 {
     chaos_init_call_t call;
@@ -73,6 +90,7 @@ static int fails(chaos_init_verdict_t verdict, int error)
     return verdict.action == CHAOS_INIT_FAIL && verdict.error == error;
 }
 
+/** @brief Replaces the rule file by rename(2), so a reload never sees a partial file. */
 static void write_rules(const char *rules)
 {
     FILE *file = fopen("/tmp/.chaos-process.conf.new", "w");
@@ -106,9 +124,12 @@ int main(void)
                 "execveat:LATENCY:3\n"
                 "waitpid:FAIL_AFTER:EINTR,1\n");
 
-    /* The application's own exec starts it, and so does a retry from the same
-     * image after it failed (a script without #! run through /bin/sh); once the
-     * application's image is in, the next one is faulted. */
+    /* chaos_init_process_start(getpid()) declared this process the application. Its
+     * first execve is its own start and must pass, and so must a retry from the same
+     * image (execve of a script without #! fails, then libc reruns it via /bin/sh).
+     * Shifting the fingerprint simulates the application image having loaded: from then
+     * on execve is faulted, also after the fingerprint returns, because the start
+     * exemption is spent. */
     assert(decide(__NR_execve, 0U).action == CHAOS_INIT_PASS);
     assert(decide(__NR_execve, 0U).action == CHAOS_INIT_PASS);
     g_start_offset = 7U;
@@ -118,7 +139,8 @@ int main(void)
     verdict = decide(__NR_execveat, 0U);
     assert(verdict.action == CHAOS_INIT_DELAY && verdict.delay_ms == 3U && verdict.error == 0);
 
-    /* clone by its flags, clone3 by the flags in its argument structure. */
+    /* clone maps by flags; clone3 reads the flags from its argument structure in the
+     * caller's memory, and a NULL (unreadable) structure falls back to fork. */
     assert(fails(decide(__NR_clone, CLONE_VM | CLONE_THREAD | CLONE_SIGHAND), EAGAIN));
     assert(fails(decide(__NR_clone, CLONE_VM | CLONE_VFORK | SIGCHLD), EPERM));
     verdict = decide(__NR_clone, SIGCHLD);
@@ -140,7 +162,9 @@ int main(void)
     assert(fails(decide(__NR_vfork, 0U), EPERM));
 #endif
 
-    /* FAIL_AFTER: the first wait passes, then waits fail, per process. */
+    /* FAIL_AFTER,1: the first wait passes, later ones fail; wait4 and waitid share the
+     * waitpid counter. The parked child has its own counter, so its first wait passes
+     * although this process's counter is exhausted. */
     assert(decide(__NR_wait4, 0U).action == CHAOS_INIT_PASS);
     assert(fails(decide(__NR_waitid, 0U), EINTR));
     child = fork();
@@ -154,13 +178,14 @@ int main(void)
     assert(fails(decide_for(child, __NR_wait4, 0U), EINTR));
     assert(kill(child, SIGKILL) == 0 && waitpid(child, NULL, 0) == child);
 
-    /* A reload starts the counters over. */
+    /* A reload (new text, so a new load) restarts this process's counters from 0. */
     write_rules("waitpid:FAIL_AFTER:EINTR,1 # reloaded\n");
     assert(decide(__NR_wait4, 0U).action == CHAOS_INIT_PASS);
     assert(fails(decide(__NR_wait4, 0U), EINTR));
 
-    /* A fork child starts with the counts its parent had at the fork, as the
-     * library's child inherits them; the fork's counts go to one child only. */
+    /* A fork child starts with its parent's counts at the fork, as an LD_PRELOAD child
+     * inherits them with its memory. One decided fork has one child: `forked` takes the
+     * counts (first wait fails), `later` was never decided as a fork and starts at 0. */
     {
         pid_t forked;
         pid_t later;
@@ -186,8 +211,8 @@ int main(void)
         assert(kill(later, SIGKILL) == 0 && waitpid(later, NULL, 0) == later);
     }
 
-    /* The counts of a fork made before a reload are not handed on: the child
-     * starts from 0 under the new rules, as its parent does. */
+    /* Counts of a fork decided under an earlier load are not handed on: after the
+     * reload the child starts from 0, as its parent does. */
     {
         pid_t forked;
 
@@ -208,13 +233,15 @@ int main(void)
         (void)unlink(hits);
     }
 
-    /* A new process in an ended one's entry does not get its counts. */
+    /* Pid reuse: a shifted fingerprint on the same pid is a new process, which gets a
+     * fresh entry and counts from 0 instead of the old holder's exhausted counter. */
     g_start_offset = 1U;
     assert(decide(__NR_wait4, 0U).action == CHAOS_INIT_PASS);
     assert(fails(decide(__NR_wait4, 0U), EINTR));
     g_start_offset = 0U;
 
-    /* A process that ended is not counted, and its call runs. */
+    /* Fail-open for a vanished caller: with the lookup failing, no hit slot exists, so
+     * FAIL_AFTER, ERRNO and LATENCY all pass the call through uncounted. */
     g_fail_process = 1;
     assert(decide(__NR_wait4, 0U).action == CHAOS_INIT_PASS);
     write_rules("fork:ERRNO:ENOMEM\n");
@@ -223,12 +250,14 @@ int main(void)
     assert(decide(__NR_clone, SIGCHLD).action == CHAOS_INIT_PASS);
     g_fail_process = 0;
 
-    /* A rule whose probability is 0 never fires: no delay, no error. */
+    /* Probability 0 never fires: neither the delay nor the errno leaks into the verdict. */
     write_rules("fork:LATENCY:10@0.0\nfork:ERRNO:ENOMEM@0.0\n");
     verdict = decide(__NR_clone, SIGCHLD);
     assert(verdict.action == CHAOS_INIT_PASS && verdict.error == 0);
 
-    /* posix_spawnp cannot be told from posix_spawn: its rule rejects the file. */
+    /* posix_spawnp is indistinguishable from posix_spawn at the system call level, so
+     * such a rule could never fire; the whole file is rejected (the fork rule on line 1
+     * does not apply) and the status file names line 2. A `*` selector still matches. */
     write_rules("fork:ERRNO:ENOMEM\nposix_spawnp:ERRNO:EPERM\n");
     assert(decide(__NR_clone, SIGCHLD).action == CHAOS_INIT_PASS);
     {
