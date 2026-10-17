@@ -1,76 +1,62 @@
 /**
  * @file chaos_bench.h
- * @brief Public API of the chaos-testing-libraries benchmark harness.
+ * @brief Public API of the benchmark harness: descriptor registration and
+ *        optimizer barriers for benchmark kernels.
  *
  * @details
- * A JMH-class benchmark harness, in C, for the LD_PRELOAD `.so` libraries in
- * this repository.  The harness is intentionally minimal in surface and
- * uncompromising in measurement discipline: it owns the timer, the
- * dead-code-elimination defenses, the percentile statistics, and the
- * environment capture, and delegates *isolation* (CPU pinning, governor,
- * IRQ steering) to a wrapper layer (Docker on Tier 1 — every developer
- * machine; bare-metal Linux on Tier 2 — release-grade host).
+ * The harness measures the per-call cost of the `libchaos-<lib>` wrappers (pass-through, rule
+ * match without firing, rule firing) against an unpreloaded baseline. It owns the timer, the
+ * dead-code-elimination barriers, the percentile statistics, host-environment capture and the
+ * JSON envelope. Isolation (CPU pinning, governor, IRQ steering, LD_PRELOAD) is the caller's
+ * job: `run-bench.sh` in Docker on a developer machine, or a tuned bare-metal Linux host.
  *
  * **Operational model.**
- * One process executes one benchmark, start to finish.  A wrapper script
- * (`run-bench.sh`) invokes the binary once per benchmark name so each run
- * gets a fresh address space, a virgin branch predictor, and uncontaminated
- * cache / TLB state.  There is no in-process scheduler.  Concurrent
- * benchmarks are out of scope for Stage 1 — a benchmark function executes
- * on a single thread per process invocation.
+ * One process runs one benchmark. `run-bench.sh` executes the binary once per benchmark name
+ * so each run starts with a fresh address space and cold predictor, cache and TLB state, and
+ * so a crashing kernel cannot contaminate the next one. There is no in-process scheduler; the
+ * iteration callback runs on the main thread only.
  *
- * **Mode advertisement.**
- * The harness inspects the host at startup and publishes its execution mode
- * in the JSON envelope:
- *  - `OFFICIAL` — every isolation precondition holds (governor=performance,
- *    `isolcpus` contains the bound CPU, no SMT sibling co-tenant, …).
- *  - `ADVISORY` — at least one precondition failed; results are still
- *    computed and reported, but the JSON carries explicit warnings and
- *    must not be cited as authoritative.
+ * **Execution mode.**
+ * At startup the runner checks host isolation (chaos_bench_isolation.c) and tags the JSON
+ * envelope:
+ *  - `OFFICIAL`: every check passed: governor `performance`, a non-empty
+ *    `/sys/devices/system/cpu/isolated`, no `/.dockerenv`, SMT off on cpu0 and, on x86, the
+ *    `constant_tsc` and `nonstop_tsc` CPU flags.
+ *  - `ADVISORY`: at least one check failed. Numbers are still computed and the envelope lists
+ *    each failure; they are fit for same-host A/B comparison, not for citation.
  *
- * Tier 1 (Docker on a developer machine) is intrinsically `ADVISORY`
- * because the kernel scheduler, frequency governor, and IRQ affinity are
- * controlled by the host OS, not by the container.  Tier 2 (a host with
- * `isolcpus`/`nohz_full`/`rcu_nocbs` at boot, governor pinned, IRQs
- * steered) elevates the same harness to `OFFICIAL`.  The harness itself
- * is identical across tiers.
+ * Docker on a developer machine is always `ADVISORY` because the container cannot control the
+ * host's scheduler, governor or IRQ affinity. The harness binary is identical in both settings.
  *
- * **What the harness defends against.**
- * 1. Dead-code elimination, constant folding, and hoisting by the
- *    optimizer — see @ref CHAOS_BENCH_DO_NOT_OPTIMIZE and
- *    @ref CHAOS_BENCH_CLOBBER_MEMORY.
- * 2. Timer skew and reordering — see @ref chaos_bench_timer.h
- *    (rdtscp/cntvct serialized read with full memory clobber).
- * 3. Cold-call effects (TLS init, lazy PLT resolution, page faults) —
- *    handled by configurable warmup iterations.
- * 4. Sub-µs-op timer-overhead tax — handled by batching: the harness can
- *    measure groups of N ops per timing window when single-op cost falls
- *    below the timer cost threshold.
+ * **Measurement hazards the harness handles.**
+ * 1. Dead-code elimination, constant folding and loop-invariant hoisting:
+ *    @ref CHAOS_BENCH_DO_NOT_OPTIMIZE and @ref CHAOS_BENCH_CLOBBER_MEMORY.
+ * 2. Timer reordering: serializing `rdtscp`+`lfence` (x86) or `isb; mrs cntvct_el0; isb`
+ *    (aarch64) reads with a compiler memory clobber (chaos_bench_timer.c).
+ * 3. Cold-call effects (lazy PLT binding, first TLS access, first rule-file load, page
+ *    faults): a warmup loop of `--warmup` iterations (default 10000) before measurement.
+ * 4. Timer-read cost dominating sub-100 ns operations: `--batch=N` times N calls per timing
+ *    window and reports the per-call quotient. Batching is manual, never automatic.
  *
- * **What the harness does NOT do (delegated to the wrapper).**
- * - CPU pinning (`taskset` / `--cpuset-cpus` / `sched_setaffinity`).
- * - Governor configuration (`cpupower` / `/sys/.../scaling_governor`).
+ * **Delegated to the caller.**
+ * - CPU pinning (`taskset`, `--cpuset-cpus`, `sched_setaffinity`).
+ * - Governor configuration (`cpupower`, `/sys/.../scaling_governor`).
  * - SMT-sibling shutdown (`/sys/devices/system/cpu/cpu*\/online`).
- * - IRQ affinity changes (`/proc/irq/\*\/smp_affinity`).
- * - Drop-caches between trials (`/proc/sys/vm/drop_caches`).
- * - LD_PRELOAD setup (the wrapper sets it before exec).
+ * - IRQ affinity (`/proc/irq/\*\/smp_affinity`).
+ * - Dropping caches between trials (`/proc/sys/vm/drop_caches`).
+ * - Setting LD_PRELOAD before exec.
  *
- * **Stage scope.**
- * Stage 1 (this version) covers: TSC-based timing on x86_64 / aarch64,
- * percentile statistics, environment capture, advisory/official mode
- * detection, JSON output, and one subsystem (`libchaos-time`) end-to-end.
- * Stage 2 will add `perf_event_open` PMU sampling, bootstrap confidence
- * intervals, KS/Wilcoxon A/B testing, and a Python orchestration driver.
- * Stage 3 covers the remaining five subsystems plus multi-thread sweeps
- * and the reload-contention benchmark.
+ * Cross-run statistics (Wilcoxon rank-sum test, bootstrap confidence interval on the median
+ * delta) live in `driver/chaos_bench_driver.py`, which aggregates several envelopes per
+ * benchmark; this harness reports one run.
  *
- * **Thread-safety.** The registration API (`chaos_bench_register`,
- * @ref CHAOS_BENCH) is constructor-only and not callable after `main`;
- * benchmark iteration functions run single-threaded.
+ * **Thread-safety.** `chaos_bench_register` and @ref CHAOS_BENCH are for ELF constructors
+ * only. Nothing enforces this, but the registry has no locking. Benchmark callbacks run
+ * single-threaded.
  *
- * **Stability.** The names declared in this header are part of the
- * benchmark binary's source contract.  Field reordering of public structs
- * is a breaking change.
+ * **Stability.** The names in this header are the source contract for benchmark kernels.
+ * Reordering the fields of @ref chaos_bench_descriptor_t breaks @ref CHAOS_BENCH, which
+ * initialises the struct positionally.
  */
 
 #ifndef CHAOS_BENCH_H
@@ -84,18 +70,17 @@ extern "C" {
 #endif
 
 /**
- * @brief Measurement mode for a benchmark, mirroring JMH's `@BenchmarkMode`.
+ * @brief Measurement mode, named after JMH's `@BenchmarkMode`.
  *
- * @details
- * - `AVG_TIME`     — fixed iteration count; reports per-op nanoseconds.
- *   The default and most common mode for hot-path microbenchmarks.
- * - `THROUGHPUT`   — fixed wall-clock window; reports ops/second.  Useful
- *   for scaling sweeps where iteration count varies with system speed.
- * - `SAMPLE_TIME`  — same as `AVG_TIME` but every per-iteration sample is
- *   stored individually (rather than batched-and-averaged), enabling full
- *   percentile and CDF analysis.  Memory-bounded by `measurement_iterations`.
- * - `SINGLE_SHOT`  — measures exactly one invocation.  Used for cold-path
- *   measurements (first dlsym, first config read, first TLS init).
+ * @details The runner records one sample per timing window in every mode; the modes differ
+ * only as listed below. The mode name is echoed in the envelope's `config.mode`.
+ * - `AVG_TIME` (default): `--iters` timing windows; statistics over all samples.
+ * - `THROUGHPUT`: accepted by `--mode` but not implemented as a time-boxed loop; the runner
+ *   measures it exactly like `AVG_TIME`. It is absent from the `--help` text.
+ * - `SAMPLE_TIME`: measured exactly like `AVG_TIME`; kept for JMH naming parity.
+ * - `SINGLE_SHOT`: one timing window (still `--batch` calls), one sample. For cold-path
+ *   costs, run with `--warmup=0`. The envelope still reports the requested `--iters` as
+ *   `measurement_iters`; `stats.samples` is 1.
  */
 typedef enum chaos_bench_mode
 {
@@ -106,56 +91,53 @@ typedef enum chaos_bench_mode
 } chaos_bench_mode_t;
 
 /**
- * @brief Optional per-benchmark setup callback.
+ * @brief Optional setup callback, run once before warmup.
  *
- * @details Invoked once after the user-state buffer is allocated and before
- * the warmup loop begins.  Permitted to allocate and to mutate
- * @p user_state.  Aborts the benchmark on failure (the descriptor's setup
- * is expected to be infallible; signal failure via `abort()` if a
- * precondition cannot be satisfied).
+ * @details Called after the zero-initialised state buffer is allocated and after the
+ * scenario rule file is installed, before the sample buffer is allocated and before warmup.
+ * It may allocate, open descriptors and write @p user_state. It has no error return: a setup
+ * that cannot establish its precondition must `abort()`, because measuring a half-initialised
+ * kernel produces plausible but wrong numbers.
  *
- * @param[in,out] user_state  Pointer to the descriptor's pre-allocated
- *                            per-benchmark state buffer; never NULL.
+ * @param[in,out] user_state  The descriptor's state buffer (`state_size` bytes, at least 1);
+ *                            never NULL.
  */
 typedef void (*chaos_bench_setup_fn)(void *user_state);
 
 /**
- * @brief Per-iteration callback executed inside the timed loop.
+ * @brief Iteration callback, the measured operation.
  *
- * @details Must be lightweight and reproducible.  The benchmark author is
- * responsible for marking inputs and outputs with @ref
- * CHAOS_BENCH_DO_NOT_OPTIMIZE so the optimizer cannot elide the work.
- * The harness measures the wall-clock cost of one call to this function
- * (or, for batched measurements, the cost of `batch_size` calls amortized).
+ * @details Called through a function pointer, so the call itself is never inlined into the
+ * timing loop and its cost (a few ns) is part of every sample, identically for baseline and
+ * preloaded runs. Each call must do the same work; route results through
+ * @ref CHAOS_BENCH_DO_NOT_OPTIMIZE so the compiler cannot elide them. One sample is the cost
+ * of `batch_size` consecutive calls divided by `batch_size`.
  *
- * @param[in,out] user_state  Pointer to the per-benchmark state; never NULL.
+ * @param[in,out] user_state  The descriptor's state buffer; never NULL.
  */
 typedef void (*chaos_bench_iter_fn)(void *user_state);
 
 /**
- * @brief Optional per-benchmark teardown callback.
+ * @brief Optional teardown callback.
  *
- * @details Invoked after the measurement loop completes (and before the
- * statistics phase).  The state buffer is freed by the harness immediately
- * afterwards; this callback exists for releasing resources external to
- * @p user_state (file descriptors, mappings, child processes).
+ * @details Called after the measurement loop and after statistics are computed, before the
+ * JSON envelope is written. The harness frees the state buffer itself right afterwards, so
+ * teardown only releases resources the state refers to (descriptors, mappings, child
+ * processes). Not called if the sample-buffer allocation after setup fails (exit code 6).
  *
- * @param[in,out] user_state  Pointer to the per-benchmark state; never NULL.
+ * @param[in,out] user_state  The descriptor's state buffer; never NULL.
  */
 typedef void (*chaos_bench_teardown_fn)(void *user_state);
 
 /**
- * @brief Static descriptor identifying one benchmark, registered at
- *        constructor time via @ref CHAOS_BENCH.
+ * @brief Static descriptor for one benchmark, emitted and registered by @ref CHAOS_BENCH.
  *
- * @details A benchmark binary contains an unbounded number of these
- * descriptors, one per @ref CHAOS_BENCH macro expansion.  At image load
- * time the per-descriptor constructor links each into a global linked
- * list; the runner's `main` walks the list to find the requested name.
+ * @details Each @ref CHAOS_BENCH expansion defines one descriptor plus an ELF constructor
+ * that links it into the global registry before `main`. A binary may register at most
+ * `CHAOS_BENCH_MAX_REGISTERED` (256) descriptors; registration aborts beyond that.
  *
- * Fields are populated by the macro and must not be mutated thereafter.
- * The `next` field is reserved for the registry; benchmark code must
- * leave it as-NULL.
+ * The macro fills every field; benchmark code must not modify the descriptor afterwards.
+ * `next` belongs to the registry and must start as NULL.
  */
 typedef struct chaos_bench_descriptor
 {
@@ -169,55 +151,53 @@ typedef struct chaos_bench_descriptor
 } chaos_bench_descriptor_t;
 
 /**
- * @brief Appends a descriptor to the global registry.
+ * @brief Prepends @p desc to the global registry.
  *
- * @details Called from the per-benchmark constructor emitted by
- * @ref CHAOS_BENCH.  Operates on a singly-linked list with insertion at
- * the head; ordering across translation units is unspecified (matches
- * constructor ordering, which is unspecified by the language standard).
+ * @details Called by the constructor that @ref CHAOS_BENCH emits. Head insertion keeps
+ * registration O(1); the resulting order follows constructor order, which neither C nor the
+ * linker specifies across translation units, so nothing may depend on it (`--list` output
+ * order included).
  *
- * @param[in,out] desc  Caller-owned, statically allocated descriptor.
- *                      The harness retains the pointer for the lifetime
- *                      of the process.  Must not be NULL.
+ * Aborts with a message on stderr if @p desc is NULL, if `desc->iter` is NULL, or if 256
+ * descriptors are already registered: each is a build defect that must not yield a binary
+ * that silently skips benchmarks.
+ *
+ * @param[in,out] desc  Statically allocated descriptor. The registry keeps the pointer for the
+ *                      lifetime of the process and writes `desc->next`.
  */
 void chaos_bench_register(chaos_bench_descriptor_t *desc);
 
 /**
- * @brief Compiler-fence intrinsic: marks @p p as live to the optimizer.
+ * @brief Optimizer barrier: forces the value @p p to be materialised.
  *
- * @details Equivalent to Google Benchmark's `DoNotOptimize`.  The inline
- * asm declares @p p as both an input and a memory-clobber, which forbids
- * the optimizer from:
- * 1. Eliminating the computation that produced @p p (DCE).
- * 2. Hoisting the use of @p p outside the surrounding loop.
- * 3. Reordering memory operations across the barrier.
+ * @details Same technique as Google Benchmark's `DoNotOptimize`. The empty asm takes @p p as
+ * an input operand, so the compiler must compute it (no dead-code elimination of the producing
+ * call), and declares a `"memory"` clobber, so the compiler must assume the asm reads and
+ * writes any memory (no hoisting or sinking of loads and stores across it).
  *
- * The constraint `"r,m"` permits the operand to live in a register or in
- * memory, so the compiler is free to choose its own placement; the asm
- * itself emits no instructions.  The `"memory"` clobber forces the
- * compiler to consider any prior store as observed.
+ * The `"r,m"` alternative constraint lets the compiler keep the operand in a register or in
+ * memory, whichever is cheaper; the asm emits no instructions, so the barrier costs nothing at
+ * run time beyond the work it preserves.
  *
- * @param p  Address of the value being kept live.  Macro takes the
- *           address of its argument internally.
+ * @param p  An lvalue or rvalue whose computation must survive, passed by value (for example
+ *           `s->rc`). The macro does not take its address.
  */
 #define CHAOS_BENCH_DO_NOT_OPTIMIZE(p) \
     do { __asm__ volatile("" : : "r,m"(p) : "memory"); } while (0)
 
 /**
- * @brief Compiler-fence intrinsic: clobbers all memory state.
+ * @brief Optimizer barrier: assumes all memory may have been read and written.
  *
- * @details Equivalent to Google Benchmark's `ClobberMemory`.  Forces the
- * compiler to assume every memory location may have been read or written
- * by the asm block.  Use *between* timed iterations to defeat
- * loop-invariant code motion and partial constant folding that
- * @ref CHAOS_BENCH_DO_NOT_OPTIMIZE alone may not reach.
+ * @details Same technique as Google Benchmark's `ClobberMemory`. Emits no instructions. Use
+ * it where a kernel's stores must be treated as observed, or between steps that the compiler
+ * could otherwise merge or move across loop iterations; @ref CHAOS_BENCH_DO_NOT_OPTIMIZE only
+ * anchors a single value. The runner itself places one on both sides of every timing window.
  */
 #define CHAOS_BENCH_CLOBBER_MEMORY() \
     do { __asm__ volatile("" : : : "memory"); } while (0)
 
 /**
- * @brief Registers one benchmark by emitting a descriptor and its
- *        constructor entry.
+ * @brief Defines and registers one benchmark.
  *
  * @details
  * Usage:
@@ -226,22 +206,21 @@ void chaos_bench_register(chaos_bench_descriptor_t *desc);
  *                 my_state_t, my_setup, my_iter, my_teardown);
  * @endcode
  *
- * The macro emits two static symbols: a `chaos_bench_descriptor_t`
- * named `chaos_bench_desc_<name>` and a constructor function named
- * `chaos_bench_ctor_<name>`.  At image load time the constructor is
- * invoked and registers the descriptor with the harness.
+ * Expands to a file-scope `static chaos_bench_descriptor_t chaos_bench_desc_<name>` and a
+ * `static` constructor `chaos_bench_ctor_<name>` that passes it to `chaos_bench_register`.
+ * Both are `static`, so equal names in different translation units do not collide at link
+ * time; `chaos_bench_registry_find` then returns whichever registered last.
  *
- * @param category_lit  Subsystem string literal (no quotes — the macro
- *                      adds them).  Conventional values: `"io"`, `"net"`,
- *                      `"dns"`, `"time"`, `"memory"`, `"process"`.
- * @param name_lit      Benchmark identifier — a valid C identifier.  Used
- *                      verbatim as the JSON `benchmark` field and as the
- *                      `--benchmark=` CLI value.
- * @param state_type    C type of the per-benchmark state struct.  May be
- *                      `int` or any small placeholder if state is unused;
- *                      the harness allocates `sizeof(state_type)` bytes.
+ * @param category_lit  Subsystem tag as a quoted string expression, e.g. `"time"`. The macro
+ *                      does not stringify it. Values used by the kernels: `"io"`, `"net"`,
+ *                      `"dns"`, `"time"`, `"memory"`, `"process"`, `"meta"`.
+ * @param name_lit      Benchmark identifier, a bare C identifier. Stringified as the JSON
+ *                      `benchmark.name` and matched against `--benchmark=`.
+ * @param state_type    Type of the per-benchmark state; the runner allocates
+ *                      `sizeof(state_type)` zeroed bytes. Use any small type (e.g. `int`)
+ *                      when no state is needed.
  * @param setup_fn      Setup callback or NULL.
- * @param iter_fn       Iteration callback (must be non-NULL).
+ * @param iter_fn       Iteration callback; must not be NULL (registration aborts).
  * @param teardown_fn   Teardown callback or NULL.
  */
 #define CHAOS_BENCH(category_lit, name_lit, state_type, setup_fn, iter_fn, teardown_fn) \

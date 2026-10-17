@@ -13,19 +13,26 @@
 
 ---
 
-`libchaos-process` is the dedicated process-lifecycle preload library in this
-repository. Repository-wide ownership and composition rules live in
-[`docs/SYSTEM.md`](SYSTEM.md). Platform-layer internals (ELF link-map ordering,
-PLT/GOT cold/hot paths, AT_SECURE, glibc/musl matrix) are in
-[`docs/PLATFORM.md`](PLATFORM.md).
+`libchaos-process` is the LD_PRELOAD library that fails and delays thread creation,
+process creation, program execution and child reaping in a dynamically linked process.
+It decides before the real call: an injected failure never creates a thread or process,
+never replaces the image, never reaps a child. Repository-wide ownership and composition
+rules are in [`docs/SYSTEM.md`](SYSTEM.md); loader-level internals (link map, PLT/GOT,
+`AT_SECURE`, glibc/musl matrix) are in [`docs/PLATFORM.md`](PLATFORM.md).
 
-Current implementation status:
+| | |
+|---|---|
+| Wrappers with a selector | `pthread_create()`, `fork()`, `posix_spawn()`, `posix_spawnp()`, `execve()`, `execveat()` (Linux), `waitpid()` |
+| Wrappers under another call's rules | `wait()`, `wait3()`, `wait4()`, `waitid()` (waitpid); `execv()`, `execvp()`, `execvpe()`, `execl()`, `execle()`, `execlp()` (execve); `fexecve()` (execveat, Linux); `system()`, `popen()` (posix_spawn) |
+| Effects | ERRNO, LATENCY, FAIL_AFTER |
+| Qualifiers | `@first`, `@from`, `@until`, `@size` (accepted; `@size` never matches, §10.4) |
+| Rule file | `/tmp/.chaos-process.conf` |
+| Status file | `/tmp/.chaos-process.status` |
+| Hits file | `/tmp/.chaos-process.hits.<n>` |
+| Verification | unit tests with a 100.00 % line-coverage gate on `src/process/*.c`; runtime suites `test/runtime/test_process_glibc.sh` and `test_process_alpine.sh` (glibc and musl, amd64 and arm64) |
 
-- interposed symbols: `pthread_create()`, `fork()`, `posix_spawn()`,
-  `posix_spawnp()`, `execve()`, `execveat()`, `waitpid()`
-- config path: `/tmp/.chaos-process.conf`
-- unit-tested; strict `100.00%` line coverage gate on `src/process/*.c`
-- runtime probe implemented for glibc/musl and amd64/arm64 validation
+SECCOMP mode (`chaos-init`) applies the same rules at the system-call layer, with
+differences listed in [SECCOMP.md §5](SECCOMP.md#5-how-calls-map-to-the-libraries-operations).
 
 ---
 
@@ -34,226 +41,177 @@ Current implementation status:
 1. [clone(2) Flag Taxonomy](#1-clone2-flag-taxonomy)
 2. [pthread_create Internal Flow](#2-pthread_create-internal-flow)
 3. [fork() Mechanics and CoW Semantics](#3-fork-mechanics-and-cow-semantics)
-4. [posix_spawn: glibc vs musl Divergence](#4-posix_spawn-glibc-vs-musl-divergence)
+4. [posix_spawn: glibc and musl](#4-posix_spawn-glibc-and-musl)
 5. [vfork Hazards and Non-Coverage](#5-vfork-hazards-and-non-coverage)
 6. [execve, execveat, and the exec Family Matrix](#6-execve-execveat-and-the-exec-family-matrix)
-7. [waitpid, waitid, and the wait Family Gap](#7-waitpid-waitid-and-the-wait-family-gap)
-8. [EINTR Contract per POSIX.1-2017 §2.4.3](#8-eintr-contract-per-posix1-2017-243)
+7. [waitpid, waitid, and the wait Family](#7-waitpid-waitid-and-the-wait-family)
+8. [EINTR Contract](#8-eintr-contract)
 9. [FAIL_AFTER Semantics and Counter Implementation](#9-fail_after-semantics-and-counter-implementation)
 10. [DSL Grammar and Rule Semantics](#10-dsl-grammar-and-rule-semantics)
 11. [Per-Hook Call Flows](#11-per-hook-call-flows)
 12. [Reentrancy Guard and TLS State](#12-reentrancy-guard-and-tls-state)
 13. [PRNG Model](#13-prng-model)
 14. [Config Reload Protocol](#14-config-reload-protocol)
-15. [Non-Coverage: clone/clone3, vfork, kill, pthread_kill, waitid](#15-non-coverage-cloneclone3-vfork-kill-pthread_kill-waitid)
+15. [Non-Coverage: clone/clone3, vfork, kill, pthread_kill](#15-non-coverage-cloneclone3-vfork-kill-pthread_kill)
 16. [glibc vs musl Divergence per Symbol](#16-glibc-vs-musl-divergence-per-symbol)
-17. [Execution Boundary Summary](#17-execution-boundary-summary)
+17. [Execution Boundary Summary and Limits](#17-execution-boundary-summary-and-limits)
 
 ---
 
 ## 1. clone(2) Flag Taxonomy
 
-`clone(2)` is the Linux primitive underlying all process and thread creation.
-`fork()`, `pthread_create()`, `posix_spawn()`, and `vfork()` are all libc wrappers
-that call `clone()` (or `clone3()`, Linux 5.3+) with specific flag combinations.
-Understanding these flags is prerequisite to understanding what each wrapper
-interposition intercepts and what it does not.
+Every thread and process on Linux is created by `clone(2)` or `clone3(2)`; the flags
+decide what the new task shares. The library intercepts the libc functions above
+`clone`, never `clone` itself (§15). The flags matter here for two reasons: they explain
+why one libc function cannot be faulted through another, and SECCOMP mode classifies
+`clone` calls by them.
 
 ### 1.1 Key clone Flags
 
-| Flag                  | Hex       | Meaning                                                                   |
-|-----------------------|-----------|---------------------------------------------------------------------------|
-| `CLONE_VM`            | 0x00000100| Share virtual memory (thread semantics)                                    |
-| `CLONE_FS`            | 0x00000200| Share filesystem state (cwd, umask, root)                                  |
-| `CLONE_FILES`         | 0x00000400| Share file descriptor table                                                |
-| `CLONE_SIGHAND`       | 0x00000800| Share signal handlers                                                      |
-| `CLONE_PIDFD`         | 0x00001000| Return pidfd instead of pid (Linux 5.2)                                    |
-| `CLONE_PTRACE`        | 0x00002000| Attach ptrace to child                                                     |
-| `CLONE_VFORK`         | 0x00004000| Parent blocked until child calls exec/exit (vfork semantics)               |
-| `CLONE_PARENT`        | 0x00008000| New task is a sibling not a child                                          |
-| `CLONE_THREAD`        | 0x00010000| Thread in same thread group (NPTL)                                         |
-| `CLONE_NEWNS`         | 0x00020000| New mount namespace                                                        |
-| `CLONE_SYSVSEM`       | 0x00040000| Share SysV semaphore undo values                                           |
-| `CLONE_SETTLS`        | 0x00080000| Set TLS segment (arg5 is `struct user_desc` on x86 or tls_ptr on others)  |
-| `CLONE_PARENT_SETTID` | 0x00100000| Store child TID in parent's memory before wakeup                          |
-| `CLONE_CHILD_CLEARTID`| 0x00200000| Zero child TID on exit; wake futex (NPTL thread join)                     |
-| `CLONE_CHILD_SETTID`  | 0x01000000| Store child TID in child's own memory                                     |
-| `CLONE_NEWCGROUP`     | 0x02000000| New cgroup namespace (Linux 4.6)                                          |
-| `CLONE_NEWUTS`        | 0x04000000| New UTS (hostname/domainname) namespace                                    |
-| `CLONE_NEWIPC`        | 0x08000000| New IPC namespace                                                          |
-| `CLONE_NEWUSER`       | 0x10000000| New user namespace                                                         |
-| `CLONE_NEWPID`        | 0x20000000| New PID namespace                                                          |
-| `CLONE_NEWNET`        | 0x40000000| New network namespace                                                      |
-| `CLONE_IO`            | 0x80000000| Share I/O context                                                          |
+| Flag                   | Value        | Meaning                                                                 |
+|------------------------|--------------|-------------------------------------------------------------------------|
+| `CLONE_VM`             | `0x00000100` | Share the address space                                                 |
+| `CLONE_FS`             | `0x00000200` | Share cwd, root, umask                                                  |
+| `CLONE_FILES`          | `0x00000400` | Share the descriptor table                                              |
+| `CLONE_SIGHAND`        | `0x00000800` | Share signal handlers                                                   |
+| `CLONE_PIDFD`          | `0x00001000` | Also return a pidfd (Linux 5.2)                                         |
+| `CLONE_VFORK`          | `0x00004000` | Suspend the parent until the child execs or exits                       |
+| `CLONE_THREAD`         | `0x00010000` | Same thread group (a thread, not a process)                             |
+| `CLONE_SYSVSEM`        | `0x00040000` | Share System V semaphore undo lists                                     |
+| `CLONE_SETTLS`         | `0x00080000` | Set the thread pointer                                                  |
+| `CLONE_PARENT_SETTID`  | `0x00100000` | Store the child TID in the parent                                       |
+| `CLONE_CHILD_CLEARTID` | `0x00200000` | Clear the child TID and wake its futex on exit (thread join)            |
+| `CLONE_CHILD_SETTID`   | `0x01000000` | Store the child TID in the child                                        |
+| `CLONE_NEW*`           | various      | New namespaces (mount, cgroup, UTS, IPC, user, PID, network)            |
 
 ### 1.2 Flag Combinations by API
 
-| API              | Effective clone flags (dominant path)                                         |
-|------------------|-------------------------------------------------------------------------------|
-| `fork()`         | `SIGCHLD` only (copy everything, POSIX process semantics)                    |
-| `vfork()`        | `CLONE_VFORK \| CLONE_VM \| SIGCHLD`                                          |
-| `pthread_create` | `CLONE_VM \| CLONE_FS \| CLONE_FILES \| CLONE_SIGHAND \| CLONE_THREAD \| CLONE_SYSVSEM \| CLONE_SETTLS \| CLONE_PARENT_SETTID \| CLONE_CHILD_CLEARTID \| CLONE_DETACHED \| SIGCHLD` (glibc NPTL) |
-| `posix_spawn`    | glibc: `CLONE_VFORK \| CLONE_VM \| SIGCHLD` then `execve`. musl: `fork()`+`execve`. |
+| API              | clone flags (glibc and musl)                                                            | SECCOMP mode classifies as |
+|------------------|-----------------------------------------------------------------------------------------|----------------------------|
+| `pthread_create` | `CLONE_VM \| CLONE_FS \| CLONE_FILES \| CLONE_SIGHAND \| CLONE_THREAD \| CLONE_SYSVSEM \| CLONE_SETTLS \| CLONE_PARENT_SETTID \| CLONE_CHILD_CLEARTID`, no exit signal | pthread_create |
+| `fork`           | glibc: `CLONE_CHILD_SETTID \| CLONE_CHILD_CLEARTID \| SIGCHLD`; musl: `SYS_fork` where it exists, else `SIGCHLD` | fork |
+| `vfork`          | `CLONE_VM \| CLONE_VFORK \| SIGCHLD` (or `SYS_vfork`)                                   | posix_spawn                |
+| `posix_spawn`    | `CLONE_VM \| CLONE_VFORK \| SIGCHLD`, then `execve` in the child                         | posix_spawn                |
 
-Note that `clone3()` (Linux 5.3+) consolidates these via a `struct clone_args`
-struct rather than a flags word, adding `exit_signal`, `stack_size`, and pidfd
-semantics. glibc 2.35+ uses `clone3` for `pthread_create` when the kernel
-supports it. The observable libc-symbol interface (`pthread_create`) is identical
-regardless.
+`clone3()` passes the flags in `struct clone_args`; libc may use it when the kernel
+supports it. The libc function the program calls, and therefore the wrapper, is the same
+either way.
 
-Reference: `clone(2)` Linux man-pages; NPTL source glibc `nptl/pthread_create.c`;
-Ulrich Drepper, "The Native POSIX Thread Library for Linux" (2003).
+Reference: `clone(2)`; glibc `nptl/pthread_create.c`, `sysdeps/unix/sysv/linux/spawni.c`;
+musl `src/thread/pthread_create.c`, `src/process/posix_spawn.c`.
 
 ---
 
 ## 2. pthread_create Internal Flow
 
-glibc NPTL's `pthread_create()` (glibc source: `nptl/pthread_create.c`):
-
 ```
-pthread_create(thread, attr, start_routine, arg)
-  ├─ __pthread_create_2_1()              (versioned symbol @@GLIBC_2.1)
-  ├─ allocate_stack()                    allocates thread stack + guard via mmap
-  │    ├─ mmap(NULL, stacksize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
-  │    └─ mprotect(guard_page, PROT_NONE)  installs stack guard
-  ├─ _dl_allocate_tls()                  allocates TLS for new thread
-  ├─ clone(clone_flags, stack_top, ...)  creates the kernel task
-  │    clone_flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
-  │                  CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS |
-  │                  CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD
-  ├─ (child) thread_start()
-  │    └─ start_routine(arg)
-  └─ return 0 on success, error number on failure
+pthread_create(thread, attr, start, arg)          ← wrapper decides here
+  ├─ allocate the stack (mmap + guard page) and TLS
+  ├─ clone(CLONE_VM | CLONE_THREAD | ..., stack)
+  ├─ (child) start(arg)
+  └─ return 0, or a positive error number
 ```
 
-**Injection point:** `libchaos-process` intercepts `pthread_create()` at the
-PLT entry. The wrapper fires before `allocate_stack()` runs. A synthetic failure
-at this point prevents the `mmap()` for the stack from being called, so there is
-no stack-allocation-then-abandon scenario.
+- **Injection point.** The wrapper decides before the real `pthread_create` runs: an
+  injected failure allocates no stack and creates no task.
+- **Return convention.** `pthread_create()` returns the error number and does not set
+  `errno`. The wrapper does the same: an injected failure returns the configured value
+  and leaves `errno` untouched. Callers that test `errno` instead of the return value are
+  wrong under POSIX and are exposed by this rule.
+- **No cascade through libchaos-memory.** libc allocates the stack with its internal
+  `mmap`, which never reaches an exported symbol, so `libchaos-memory`'s `mmap` rules do
+  not fail thread creation under LD_PRELOAD. In SECCOMP mode they do: there the stack
+  `mmap` is a system call like any other.
+- **libpthread before glibc 2.34.** `pthread_create` lives in libpthread there. The
+  symbol is resolved on demand, without aborting, so programs that never load libpthread
+  start normally; a program that `dlopen()`s it later is served then. If it still does
+  not resolve, the wrapper returns `EAGAIN`: a thread needs libc's own setup, and there is
+  no system call to fall back to.
 
-**Return convention:** On failure, `pthread_create()` returns the positive error
-number directly. It does not set `errno`. Callers that check `errno` instead of
-the return value are buggy under POSIX.1-2017 §2.9.1. The library matches this
-convention: synthetic failure returns the configured error number, not -1.
-
-**Cascade observation:** Because `pthread_create` internally calls `mmap` (for the
-stack), if `libchaos-memory` is also loaded and `mmap/anon:ERRNO:ENOMEM` fires
-during `allocate_stack()`, the failure will surface as `ENOMEM` from the real
-`pthread_create()` — not from the `libchaos-process` wrapper. Both injection
-points are valid but produce failures at different depths.
+Useful errors: `EAGAIN` (thread or process limit, `RLIMIT_NPROC`,
+`kernel.threads-max`), `ENOMEM`, `EINVAL`, `EPERM` (scheduling attributes).
 
 ---
 
 ## 3. fork() Mechanics and CoW Semantics
 
-`fork(2)` creates an exact copy of the calling process. The Linux kernel
-implementation (`kernel/fork.c`, `copy_process()`) performs:
+`fork()` duplicates the calling process. The kernel (`kernel/fork.c`, `copy_process()`)
+copies the task, marks writable private mappings copy-on-write, duplicates the
+descriptor table and signal dispositions, and returns the child PID to the parent and 0
+to the child. libc runs `pthread_atfork` prepare handlers before the system call and the
+parent/child handlers after it.
 
-1. Allocates new `task_struct`.
-2. Copies (CoW) all VMAs via `copy_mm()` → `dup_mm()` → `copy_page_range()`.
-   Each writable VMA becomes CoW on both parent and child; actual page copies
-   are deferred to first write (demand paging).
-3. Copies file descriptor table via `copy_files()`.
-4. Copies signal handlers via `copy_sighand()`.
-5. Sets child's PID, PPID, PGID.
-6. Returns child PID to parent, 0 to child.
+- **Injection point.** LATENCY, ERRNO and FAIL_AFTER are evaluated in the parent before
+  the real `fork()`. An injected failure returns -1 with `errno` set: no system call, no
+  atfork handler, no child.
+- **The child.** The child of a real fork starts with the library state the parent had,
+  then the library's atfork child handler gives it its own: FAIL_AFTER counters, hit
+  counts and `@first` claims start at 0, the PRNG reseeds from the child's TID, and the
+  child writes its own hits file (§14).
+- **Not resolved yet.** A `fork()` that arrives while the real pointer is still NULL (a
+  call from inside symbol resolution) fails with `ENOSYS`: a bare `clone` would skip
+  libc's atfork handlers and caches.
 
-**glibc implementation:** glibc wraps `clone(SIGCHLD, ...)` and then calls
-`_dl_fork_*` callbacks and the `pthread_atfork` handlers in the correct order
-(prefork handlers in reverse registration order, postfork-parent and
-postfork-child in forward order).
-
-**NPTL fork-safety:** glibc 2.3+ acquires a set of internal locks before calling
-clone (malloc lock, IO lock, resolver lock) to ensure the child inherits a
-consistent allocator state. These locks are released in the `_dl_fork_*` path.
-A synthetic fork failure (`fork:ERRNO:EAGAIN`) fired before the real `clone()`
-call means those locks are never acquired or released in the abnormal path — which
-is the intended observable (the application's fork-failure path is exercised).
-
-**Injection point:** `libchaos-process` wraps `fork()`. The wrapper fires before
-any glibc-internal lock acquisition. Synthetic failure returns -1 + `errno`.
+Useful errors: `EAGAIN` (`RLIMIT_NPROC`, `pid_max`, cgroup `pids.max`), `ENOMEM`.
 
 ---
 
-## 4. posix_spawn: glibc vs musl Divergence
+## 4. posix_spawn: glibc and musl
 
-`posix_spawn(3)` (POSIX.1-2001) spawns a new process from a file path with
-optional file-action and attribute configuration.
+`posix_spawn(3)` creates a child, applies file actions and attributes, and executes a
+program, in one call.
 
-### 4.1 glibc Implementation
+### 4.1 Implementation
 
-glibc 2.24+ implements `posix_spawn` as:
+Both glibc (`__spawnix`) and musl (`__posix_spawnx`) create the child with
+`clone(CLONE_VM | CLONE_VFORK | SIGCHLD)`: the child runs on its own stack in the
+parent's address space while the parent is suspended, applies the file actions with
+direct system calls, and calls `execve`. The parent resumes when the child execs or
+exits, and reports an exec failure as the return value.
 
-```
-posix_spawn(pid, path, file_actions, attrp, argv, envp)
-  ├─ clone(CLONE_VM | CLONE_VFORK | SIGCHLD, ...)   // vfork semantics
-  ├─ (child) apply file_actions                      // dup2, close, open
-  ├─ (child) apply attrp                             // sched, sigmask, pgroup
-  ├─ (child) execve(path, argv, envp)
-  └─ (parent) unblocked when child execs or exits
-```
+### 4.2 Consequences for Rules
 
-The `CLONE_VFORK | CLONE_VM` combination means the parent's address space is
-shared (not copied) and the parent is blocked. The child must not use the parent's
-heap before `execve` — only async-signal-safe functions (POSIX.1-2017 §2.4.3
-Table 2-2) are allowed in the interstitial window. glibc uses only direct
-syscalls in this window.
-
-Reference: glibc `sysdeps/unix/sysv/linux/spawni.c`, `__spawnix()`.
-
-### 4.2 musl Implementation
-
-musl implements `posix_spawn` via a straightforward `fork()` + `execve()` path
-(musl `src/process/posix_spawn.c`, `__posix_spawnx()`). No `CLONE_VFORK` is
-used. The child uses an `execfd` from `open()` to avoid path re-lookup.
-
-Consequence for injection:
-
-- **glibc:** Injecting `posix_spawn:ERRNO:ENOENT` fails at the wrapper entry
-  (before clone). The vfork window never opens.
-- **musl:** Same; the wrapper entry is before `fork()`. The real `fork()` is never
-  called.
-- **Cascade:** If `libchaos-process` is loaded without injecting `posix_spawn`
-  but `fork:ERRNO:EAGAIN` is active, the glibc path (using `clone` directly, not
-  `fork()`) is **not** affected because glibc's `posix_spawn` does not call the
-  libc `fork()` symbol — it calls `clone()` directly. musl's path **is** affected
-  because it calls `fork()`.
-
-This is a material semantic difference between glibc and musl for multi-rule
-configs. The DSL does not currently model this cross-symbol cascade. Document your
-target libc when using simultaneous `fork` + `posix_spawn` rules.
+- **Injection point.** The wrapper decides before the real `posix_spawn`; the vfork
+  window never opens. An injected failure is returned as the error number, `errno`
+  untouched, as `posix_spawn()` specifies.
+- **A `fork` rule never fails `posix_spawn()`.** Neither libc calls `fork()`; the clone
+  happens inside libc. Write `posix_spawn` rules for spawn paths.
+- **An `execve` rule never fails the exec inside `posix_spawn()`** under LD_PRELOAD: the
+  child calls libc's internal `execve`. In SECCOMP mode it does, because the child's
+  `execve` is a system call ([SECCOMP.md §5](SECCOMP.md#5-how-calls-map-to-the-libraries-operations)).
+- **`system()` and `popen()`** run their shell through libc's internal posix_spawn
+  (glibc 2.29+, musl), so they follow the `posix_spawn` rules (§6.1).
+- When the real `posix_spawn`/`posix_spawnp` did not resolve, the wrapper returns
+  `ENOSYS` (there is no single system call to fall back to).
 
 ### 4.3 posix_spawnp
 
-`posix_spawnp` differs only in path-search semantics (searches `PATH`, analogous
-to `execvp`). The glibc and musl implementation paths are identical to
-`posix_spawn` except the path-resolution step. The library wraps both symbols
-independently; rules for `posix_spawn` do not match `posix_spawnp` calls and
-vice versa.
+`posix_spawnp()` differs only in the `PATH` search. It has its own selector and its own
+FAIL_AFTER counter: `posix_spawn` rules do not match `posix_spawnp` calls and vice versa.
+
+Useful errors: `ENOENT`, `EACCES`, `ENOEXEC`, `ENOMEM`, `EAGAIN`, `E2BIG`.
 
 ---
 
 ## 5. vfork Hazards and Non-Coverage
 
-`vfork(2)` is a POSIX-deprecated mechanism (withdrawn in POSIX.1-2008, restored
-informatively in POSIX.1-2018 as "an obsolescent feature"). It uses `CLONE_VFORK |
-CLONE_VM`: the parent is suspended and shares the child's address space until the
-child calls `execve()` or `_exit()`.
+`vfork()` suspends the parent and lets the child run in the parent's address space until
+it calls `execve()` or `_exit()`. POSIX.1-2008 removed it.
 
-**Why not interposed:**
+`vfork()` is not wrapped:
 
-1. The window between `vfork()` return in the child and `execve()`/`_exit()` is
-   subject to async-signal-safe requirements. Installing a LATENCY hook (which
-   calls `nanosleep()`) in that window violates the safety contract.
-2. Any heap access in the child before `exec` corrupts the parent's heap because
-   the address space is shared (no CoW). The wrapper itself would allocate on
-   the heap (config check, rule match) and corrupt the parent.
-3. Modern code should use `posix_spawn` (which is properly interposed here) or
-   `clone(CLONE_VFORK|CLONE_VM)` directly. `vfork()` is a historical artefact.
+1. Between `vfork()` returning in the child and `execve()`/`_exit()`, the child may only
+   call async-signal-safe functions and must not return from the calling frame. The
+   rule lookup (`stat()`, a reload into static buffers) and the hit report do not belong
+   in that window.
+2. A wrapper frame that returned in the child would corrupt the parent's stack, which the
+   child shares.
+3. `posix_spawn()` provides the vfork-style spawn; it is wrapped and decided before its
+   clone.
 
-If you need to test the `posix_spawn` vfork-clone path on glibc, use the
-`posix_spawn` selector. The wrapper fires before the clone, not inside the
-vfork window.
+The library tolerates vfork children it did not create: they share the parent's memory,
+run no atfork handler, see a reload claimed by the parent as busy, and never write a hits
+file (the hits writer checks `getpid()`).
 
 ---
 
@@ -261,441 +219,460 @@ vfork window.
 
 ### 6.1 exec Family
 
-POSIX.1-2017 specifies a family of `exec*` functions; all are libc wrappers that
-eventually call `execve(2)` or `execveat(2)`:
+| Function   | Search        | Arguments      | Wrapper behaviour                                                         | Rules of   |
+|------------|---------------|----------------|---------------------------------------------------------------------------|------------|
+| `execve`   | no            | array + env    | rules, then real `execve`                                                 | `execve`   |
+| `execv`    | no            | array          | `execve(path, argv, environ)`                                             | `execve`   |
+| `execle`   | no            | varargs + env  | arguments collected into a stack array, then `execve()`                   | `execve`   |
+| `execl`    | no            | varargs        | arguments collected, then `execv()`                                       | `execve`   |
+| `execvpe`  | `PATH`        | array + env    | `execve` rules, then real `execvpe` (libc's own search)                   | `execve`   |
+| `execvp`   | `PATH`        | array          | `execvpe(file, argv, environ)`                                            | `execve`   |
+| `execlp`   | `PATH`        | varargs        | arguments collected, then `execvp()`                                      | `execve`   |
+| `execveat` | dirfd + path  | array + env    | rules, then real `execveat` (Linux only)                                  | `execveat` |
+| `fexecve`  | descriptor    | array + env    | `execveat` rules (Linux only), then real `fexecve`                        | `execveat` |
+| `system`   | shell         | command        | `system(NULL)` forwarded; else `posix_spawn` rules, then real `system`    | `posix_spawn` |
+| `popen`    | shell         | command, mode  | `posix_spawn` rules, then real `popen`                                    | `posix_spawn` |
 
-| Symbol          | Path search | argv/envp   | Libc wrapper → syscall      |
-|-----------------|-------------|-------------|-----------------------------|
-| `execl`         | No          | varargs     | → `execve`                  |
-| `execv`         | No          | `char*[]`   | → `execve`                  |
-| `execle`        | No          | varargs+env | → `execve`                  |
-| `execve`        | No          | `char*[]`+env| syscall directly            |
-| `execlp`        | PATH        | varargs     | → `execvp` → `execve`       |
-| `execvp`        | PATH        | `char*[]`   | → `execve`                  |
-| `execvpe`       | PATH        | `char*[]`+env| GNU extension → `execvp`   |
-| `fexecve`       | fd          | `char*[]`+env| → `execveat` (Linux 3.19+) |
-| `execveat`      | dirfd+path  | `char*[]`+env| syscall (Linux 3.19+)      |
-
-`libchaos-process` intercepts `execve` and `execveat` at the PLT. The other
-variants (`execl`, `execlp`, `execvp`, `fexecve`) all call through `execve` or
-`execveat` via the PLT, so they are covered transitively.
+- glibc and musl implement every variant on their internal `execve`/`execveat` and
+  `posix_spawn`, which never reach the exported symbols; each variant therefore has its
+  own wrapper.
+- Each call is decided **once**: the forwarding wrappers call this library's own exported
+  `execve`/`execv`/`execvpe`, and the real functions run with the guard raised.
+- All members of a row group share the operation's FAIL_AFTER counter: an `execvp()`
+  advances the `execve` counter.
+- Failure report: -1 with `errno` (`system()`), NULL with `errno` (`popen()`).
+- `execvpe`, `fexecve`, `system` and `popen` that did not resolve fail with `ENOSYS`.
 
 ### 6.2 execveat Portability
 
-`execveat(2)` (Linux 3.19+, glibc 2.34+ wrapper) allows executing relative to
-a directory fd. It is not in POSIX.1-2017. Musl does not always export it as a
-named public libc symbol (musl versions before the explicit wrapper integration);
-in those cases the library falls back to `ENOSYS` if the wrapper is somehow
-called:
+`execveat(2)` (Linux 3.19) executes relative to a directory descriptor; glibc exports a
+wrapper from 2.34, musl does not consistently export one. The wrapper is exported on
+Linux in either case. The real symbol is looked up without aborting; when it is absent,
+the call-through issues `syscall(SYS_execveat, …)` directly (`ENOSYS` only where the
+headers lack `SYS_execveat`).
 
-```c
-// From chaos_process_hooks.c:
-if (g_chaos_process_real_execveat == NULL) {
-    errno = ENOSYS;
-    return -1;
-}
-```
+### 6.3 exec After an Injected Failure
 
-In practice, code that needs `execveat` and is running on a musl environment that
-doesn't export it will fail to link or will call the syscall directly — bypassing
-the interposition surface. The guard avoids a NULL dereference.
+An injected failure returns -1 with `errno` set; the real `execve` is never called and the
+process keeps its image, with the library loaded. This models an exec the kernel refused
+(`EACCES` on a `noexec` mount, `ENOENT`, `ETXTBSY`, `E2BIG`). The library cannot fake a
+successful exec.
 
-### 6.3 exec After Synthetic Failure
+A LATENCY before a successful exec delays the new program's start by that much, visible
+to a parent that measures it. On success the kernel discards the image: no destructor
+runs, so hits not yet written are lost unless the eager phase (first 64 hits) or the
+100 ms interval wrote them (§14). The new program loads the library again only if its
+environment still carries `LD_PRELOAD`; its hits file does not overwrite the replaced
+image's (§14).
 
-`execve()` and `execveat()` replace the calling process image on success. A
-synthetic failure (`execve:ERRNO:EACCES`) returns -1 to the caller without
-calling the real `execve()`. The process image is therefore not replaced. This
-models the scenario "exec was denied by the kernel" — the correct chaos for
-testing privilege-checking or sandbox-escape resistance logic.
-
-The library does not fabricate a successful image replacement. There is no
-"fake exec succeeded but we're still running the old image" semantics — that would
-require a ptrace-level intercept.
+Useful errors: `EACCES`, `ENOENT`, `ENOEXEC`, `ENOMEM`, `E2BIG`, `ETXTBSY`, `ELOOP`,
+`EPERM` (`no_new_privs` with a set-user-ID file).
 
 ---
 
-## 7. waitpid, waitid, and the wait Family Gap
+## 7. waitpid, waitid, and the wait Family
 
 ### 7.1 The wait Family
 
-| Symbol    | POSIX       | Returns          | Status info                  | idtype_t support   |
-|-----------|-------------|------------------|------------------------------|--------------------|
-| `wait`    | POSIX       | pid_t            | `int *status`                | only children      |
-| `waitpid` | POSIX       | pid_t            | `int *status` + options      | specific pid/group |
-| `waitid`  | POSIX.1-2001| 0                | `siginfo_t *infop` (richer)  | P_PID/P_PGID/P_ALL |
-| `wait3`   | BSD         | pid_t            | `int *status` + rusage       | only children      |
-| `wait4`   | BSD/Linux   | pid_t            | `int *status` + pid + rusage | specific pid       |
+| Function  | Wrapper behaviour                                                | Status output             |
+|-----------|------------------------------------------------------------------|---------------------------|
+| `waitpid` | rules, then real `waitpid`                                       | `int *status`             |
+| `wait`    | `waitpid(-1, status, 0)`                                         | `int *status`             |
+| `wait4`   | rules, then real `wait4` (`rusage` still filled)                 | `int *status`, `rusage`   |
+| `wait3`   | `wait4(-1, status, options, rusage)`                             | `int *status`, `rusage`   |
+| `waitid`  | rules, then real `waitid` (`siginfo_t` still filled)             | `siginfo_t *`             |
 
-`libchaos-process` intercepts `waitpid()` only. `wait()`, `waitid()`, `wait3()`,
-`wait4()` are not currently interposed.
+glibc and musl implement each with its own system call (`wait4` or `waitid`), not through
+`waitpid()`, so each has a wrapper. There is no separate selector: all five follow the
+`waitpid` rules and share its FAIL_AFTER counter. An injected failure returns -1 with
+`errno` set and reaps nothing. While a real pointer is unresolved, the wrappers issue
+`SYS_wait4` or `SYS_waitid` (with a NULL `rusage`) directly.
 
-### 7.2 waitid Gap
+### 7.2 waitid
 
-`waitid(2)` (POSIX.1-2001, Linux 2.6.9) provides richer status via `siginfo_t`:
-`si_code` (CLD_EXITED / CLD_KILLED / CLD_DUMPED / CLD_STOPPED / CLD_TRAPPED /
-CLD_CONTINUED), `si_status` (exit code or signal number), `si_pid`, `si_uid`,
-`si_utime`, `si_stime`. It also supports `WNOWAIT` (peek without consuming the
-state) and `P_PIDFD` (Linux 5.4+, wait by pidfd).
+`waitid(2)` reports through `siginfo_t` (`si_code`: `CLD_EXITED`, `CLD_KILLED`,
+`CLD_DUMPED`, `CLD_STOPPED`, `CLD_TRAPPED`, `CLD_CONTINUED`), supports `WNOWAIT` and, from
+Linux 5.4, `P_PIDFD`. It is covered by the `waitpid` rules (§7.1).
 
-Applications using `waitid` in preference to `waitpid` (more portable status
-detail, `P_PIDFD` support) are not covered by the current interposition surface.
-This is a known gap; see §15.
+### 7.3 EINTR and LATENCY on waitpid
 
-### 7.3 EINTR on waitpid
+`waitpid:ERRNO:EINTR` returns -1 with `EINTR` without waiting. The child is still there;
+a caller that does not retry leaves a zombie. `waitpid:ERRNO:ECHILD` exercises "no such
+child" handling.
 
-`waitpid` with `options = 0` blocks until a child changes state. A signal
-delivered during the wait causes the kernel to return `EINTR`. POSIX.1-2017
-§2.4.3 mandates that SA_RESTART-flagged signals cause automatic restart unless
-the signal disposition specifies `SA_INTERRUPT`. See §8 for the full EINTR contract.
-
-`waitpid:ERRNO:EINTR` injects this observable: the call returns -1 with
-`errno = EINTR` without actually waiting for a child. The process still has
-children that it must eventually wait for; failing to wait after an injected EINTR
-will eventually cause zombie accumulation. Test code must either retry or use
-`WNOHANG`.
+LATENCY is added before the real wait, which may block on its own: the caller observes
+the delay plus the wait. A caller polling with `WNOHANG` against a deadline can expire
+during the injected delay before the real call looks at an already exited child.
 
 ---
 
-## 8. EINTR Contract per POSIX.1-2017 §2.4.3
+## 8. EINTR Contract
 
-POSIX.1-2017 §2.4.3 "Signal Actions" specifies the interaction between signals
-and blocking functions. This is the most commonly misunderstood aspect of EINTR
-injection.
+A blocking call interrupted by a signal handler either returns `EINTR` or is restarted
+by the kernel, depending on the call and on `SA_RESTART` (`signal(7)`, "Interruption of
+system calls and library functions by signal handlers").
 
 ### 8.1 The Restartable / Non-Restartable Split
 
-A blocking syscall interrupted by a signal may:
-
-1. Return `EINTR` — the function was interrupted and the application must retry.
-2. Be automatically restarted by the kernel if `SA_RESTART` was set when the
-   signal handler was installed (Linux: `sigaction(2)` with `SA_RESTART`).
-
-Not all syscalls are restartable. POSIX.1-2017 Table 2-6 lists which are.
-Relevant to this library:
-
-| Function      | SA_RESTART effect  | Notes                                              |
-|---------------|--------------------|----------------------------------------------------|
-| `waitpid`     | Restarted          | Unless `WNOHANG` is set                            |
-| `nanosleep`   | NOT restarted      | Always returns EINTR; remaining time in *rem       |
-| `fork`        | Not applicable     | Does not block                                     |
-| `pthread_create` | Not applicable  | Does not block in the library sense                |
+| Call             | With `SA_RESTART`         | Without                    | Notes                                         |
+|------------------|---------------------------|----------------------------|-----------------------------------------------|
+| `wait`, `waitpid`, `wait3`, `wait4`, `waitid` | restarted | `EINTR`          | `WNOHANG` never blocks                        |
+| `nanosleep`, `clock_nanosleep` | never restarted | `EINTR`                  | unslept time in `*rem`                        |
+| `fork`, `pthread_create`, `posix_spawn`, `execve` | — | —                    | do not block on signals                       |
 
 ### 8.2 Consequence for Injection
 
-When the library injects `EINTR` on `waitpid`, it bypasses the kernel's
-`SA_RESTART` logic — there is no real signal, so SA_RESTART never fires. The
-application sees `EINTR` unconditionally regardless of its signal disposition.
-This is the correct chaos: it tests the application's EINTR-handling code path,
-which is exercised only when `SA_RESTART` is not set or when the signal is
-non-restartable.
+An injected `EINTR` bypasses the kernel's restart logic: there is no signal, so
+`SA_RESTART` never applies, and the caller sees `EINTR` whatever its signal dispositions.
+`waitpid:ERRNO:EINTR@0.1` makes 10 % of wait calls return `EINTR` even in a program whose
+handlers all use `SA_RESTART`, which exposes code that relies on restart instead of a
+retry loop. That code fails in production when a handler without `SA_RESTART` is
+installed later, for example by a library.
 
-When injecting `waitpid:ERRNO:EINTR@0.1`, 10% of waitpid calls will return `EINTR`
-even if the application installed all handlers with `SA_RESTART`. This reveals
-code that relies on SA_RESTART to silently swallow EINTR without any
-application-level retry loop — a latent bug that becomes visible only on certain
-signal-delivery races in production.
+### 8.3 nanosleep EINTR
 
-### 8.3 nanosleep EINTR Handling
-
-From the POSIX.1-2017 §2.4.3 contract and the `nanosleep(2)` man-page:
-
-> If `nanosleep()` is interrupted by a signal, it shall return a value of -1 and
-> set errno to EINTR. The `*rem` argument shall be updated to contain the amount
-> of time remaining.
-
-The library models "interrupted before any sleep elapsed":
-
-```c
-if (remaining != NULL) {
-    *remaining = *requested;   // full requested interval returned as remaining
-}
-errno = EINTR;
-return -1;
-```
-
-This is the correct conservative model for injection before the real call runs.
-The application's retry loop should re-issue `nanosleep(remaining, &remaining)`,
-which is standard POSIX idiom.
+`libchaos-time` models an interrupted `nanosleep` as interrupted before any time elapsed:
+the full request is written to `*rem`
+([TIME.md §6.2](TIME.md#62-injected-eintr)).
 
 ---
 
 ## 9. FAIL_AFTER Semantics and Counter Implementation
 
-`FAIL_AFTER:EAGAIN,N` allows the first `N` calls to succeed, then fails subsequent
-calls with the configured error. This models resource exhaustion: a thread pool
-accepts new threads up to its limit, then returns `EAGAIN`.
+`FAIL_AFTER:<errno>,N` lets the first `N` calls of the operation pass, then fails the
+following ones with `<errno>`. It models exhaustion: a pool that creates threads up to a
+limit, then gets `EAGAIN`.
 
 ### 9.1 Counter Storage
 
-Counters are per-operation, stored in a shared array indexed by operation enum:
+One counter per operation, process-wide, in the library's data segment:
 
 ```c
-extern volatile uint64_t g_chaos_process_fail_after_counters[];
+extern volatile uint64_t g_chaos_process_fail_after_counters[CHAOS_PROCESS_OP_COUNT];
 ```
 
-Each element is incremented with `__sync_fetch_and_add()` (full barrier, atomic
-increment, returns old value):
-
-```c
-static inline uint64_t chaos_process_atomic_fetch_add_u64(volatile uint64_t *value,
-                                                           uint64_t delta)
-{
-    return (uint64_t)__sync_fetch_and_add(value, delta);
-}
-```
+Indices: 0 `pthread_create`, 1 `fork`, 2 `posix_spawn`, 3 `posix_spawnp`, 4 `execve`,
+5 `execveat`, 6 `waitpid`. Each evaluation is one `__sync_fetch_and_add(…, 1)` (full
+barrier), and the value **before** the increment is compared.
 
 ### 9.2 Semantics
 
-Given rule `pthread_create:FAIL_AFTER:EAGAIN,128`:
+Given `pthread_create:FAIL_AFTER:EAGAIN,128`:
 
-1. Counter starts at 0.
-2. Each `pthread_create` call increments the counter (post-increment: old value
-   is compared against the threshold).
-3. While `old_value < 128`: call succeeds (counter was below threshold before
-   this call).
-4. At `old_value == 128` and beyond: call fails with `EAGAIN`.
+1. The counter starts at 0.
+2. A call that reaches the FAIL_AFTER step increments it.
+3. Pre-increment value `< 128`: the call passes (calls 1 to 128).
+4. Pre-increment value `≥ 128`: the call fails with `EAGAIN` (call 129 onwards), subject
+   to the gates below.
 
-The counter is per-operation (all `pthread_create` calls share one counter),
-not per-thread. Multiple threads calling `pthread_create` concurrently increment
-the same counter atomically; the N-th global call (not the N-th call on any
-particular thread) triggers failure.
+Precise rules:
 
-### 9.3 Counter Reset on Config Reload
+- **What advances the counter.** Only a call for which a FAIL_AFTER rule matches the
+  operation and no ERRNO rule fired first. With `N = 0` the first such call fails.
+- **One counter per operation, not per rule.** A `*:FAIL_AFTER:EAGAIN,3` rule gives each
+  operation its own 3 passing calls. The derived wrappers share the counter of the
+  operation whose rules they follow (§6.1, §7.1).
+- **Gates after the threshold, in order:** probability, then `@from`/`@until`, then
+  `@first`. The counter advances on every evaluated call, also when a gate then says no:
+  outside a time window the budget is still being used up. With probability `p` below 1,
+  calls past the threshold fail with probability `p`. `@first=K` caps the injected
+  failures at `K` per process.
+- **Concurrency.** Threads share the counter; the `N+1`-th call overall fails, not the
+  `N+1`-th call of any thread.
+- **Overflow.** Not guarded; 2^64 calls are out of reach.
+- **Hit.** Each injected failure counts one hit.
 
-Counters reset to zero when the config is reloaded. This means:
-- Writing a new config file with a changed rule resets the budget.
-- Writing the same config file with a modified mtime also resets the budget.
-- If you want a "single-shot" exhaustion test, write the config, run the test
-  until the N-th call fails, then remove the config to restore normal operation.
+### 9.3 Counter Reset
+
+The counters are reset to 0:
+
+- on every reload that publishes a new snapshot: a change of the rule file's content,
+  mtime, size or inode (a `touch` is enough), its removal, or a rejected file;
+- not by a provisional re-read that finds the same content (§14);
+- in the child of a `fork()` (atfork child handler): FAIL_AFTER counts per process, like
+  `@first`;
+- implicitly after a successful `execve`: the new image loads the library afresh.
+
+For a single-shot exhaustion test, write the rule file, run until the `N+1`-th call
+fails, then remove the file. SECCOMP mode inherits the parent's counts into a forked
+child instead of resetting them ([SECCOMP.md §1](SECCOMP.md#1-model)).
 
 ### 9.4 Interaction with ERRNO and LATENCY
 
-Rule ordering within an operation:
+Per call, in this order:
 
-1. LATENCY fires first (unconditional pre-call delay, if rule matches).
-2. ERRNO fires second (probabilistic pre-call failure).
-3. FAIL_AFTER fires third (counter-gated failure).
-4. If none fired: real call executes.
+1. LATENCY: if a LATENCY rule fires, sleep (§11).
+2. ERRNO: if an ERRNO rule fires, fail; FAIL_AFTER is not evaluated and its counter does
+   not advance.
+3. FAIL_AFTER: increment, compare, gate; fail if all pass.
+4. Otherwise the real call.
 
-A call matching both `ERRNO@0.5` and `FAIL_AFTER,128` can fail either way; the
-probability-weighted ERRNO check runs before the counter check. This is a fine
-point: in a high-concurrency scenario, the counter may advance past the threshold
-for some threads before the ERRNO probability fires for others — the interleaving
-is deterministic per call but non-deterministic in the concurrency order.
+A call can be delayed and then failed. It is never failed twice.
 
 ---
 
 ## 10. DSL Grammar and Rule Semantics
 
-### 10.1 Full ABNF (RFC 5234)
+### 10.1 Grammar (RFC 5234 ABNF)
 
 ```abnf
-rule-line       = selector ":" effect ":" value [ "@" probability ] CRLF / LF
-selector        = "*"
-                / "pthread_create"
-                / "fork"
-                / "posix_spawn"
-                / "posix_spawnp"
-                / "execve"
-                / "execveat"
-                / "waitpid"
-effect          = "ERRNO" / "LATENCY" / "FAIL_AFTER"
-value           = errno-pair / latency-ms
-errno-pair      = errno-name [ "," count ]   ; count used only for FAIL_AFTER
-errno-name      = 1*ALPHA *( ALPHA / DIGIT / "_" )
-latency-ms      = 1*DIGIT
-count           = 1*DIGIT
-probability     = "0." 1*DIGIT / "1.0" / "1"
+line          = [ rule *( 1*WSP qualifier ) ] [ comment ] LF
+rule          = selector *WSP ":" *WSP effect *WSP ":" *WSP value
+selector      = "*" / "pthread_create" / "fork" / "posix_spawn" / "posix_spawnp"
+              / "execve" / "execveat" / "waitpid"
+effect        = "ERRNO" / "LATENCY" / "FAIL_AFTER"
+value         = payload [ "@" probability ]        ; no blank before "@"
+payload       = errno                              ; ERRNO
+              / latency-ms                         ; LATENCY
+              / errno *WSP "," *WSP count          ; FAIL_AFTER
+errno         = "EAGAIN" / "ENOMEM" / "EACCES" / "ENOENT" / "EINTR" / "ECHILD"
+              / "EPERM" / "ESRCH" / "EBUSY" / "EINVAL" / "ENOSYS" / "EMFILE"
+              / "ENFILE" / "E2BIG"
+              / 1*DIGIT                            ; 1 .. 2147483647
+latency-ms    = 1*DIGIT                            ; 0 .. 4294967295
+count         = 1*DIGIT                            ; 0 .. 18446744073709551615
+probability   = "0" / "1" / "0." 1*DIGIT / "1." 1*"0"
+qualifier     = "@first=" 1*18DIGIT                ; > 0
+              / "@from=" 1*18DIGIT / "@until=" 1*18DIGIT   ; Unix ms, until > from
+              / "@size>" 1*18DIGIT / "@size<" 1*18DIGIT
+comment       = "#" *( %x01-09 / %x0B-FF )
 ```
 
-`FAIL_AFTER` value format: `ERRNO_NAME,N` where N is the number of successful
-calls before failure begins. Example: `pthread_create:FAIL_AFTER:EAGAIN,128`.
+- Selectors, effect names and errno names are case-sensitive; blanks around fields are
+  trimmed; everything from the first `#` is a comment.
+- The probability is attached with `@` and no blank: `fork:ERRNO:EAGAIN@0.1`,
+  `pthread_create:FAIL_AFTER:EAGAIN,128@0.5`. As a separate word it is parsed as a
+  qualifier, is unknown, and rejects the rule file.
+- A FAIL_AFTER count must start with a digit: `-1` is rejected rather than read as
+  2^64−1 by `strtoull`. Out-of-range counts are rejected.
+- The probability parser is locale-independent; a missing probability means 1.
+- A line with qualifiers but no rule rejects the rule file.
 
-### 10.2 Valid errno Values per Symbol
+### 10.2 Precedence
 
-`pthread_create()`: `EAGAIN` (resource limit, OS thread limit), `EINVAL`
-(invalid attr), `EPERM` (no CAP_SYS_ADMIN for realtime scheduling attr).
+For each effect one rule is selected: an operation selector (rank 2) beats `*` (rank 1);
+equal rank, the longer selector text wins; still equal, the first rule in the file wins.
+LATENCY, ERRNO and FAIL_AFTER are selected independently.
 
-`fork()`: `EAGAIN` (resource limit: max PID, RLIMIT_NPROC exceeded), `ENOMEM`
-(kernel allocation failure).
+### 10.3 Useful errno Values per Operation
 
-`posix_spawn()` / `posix_spawnp()`: `EINVAL` (bad attrp), `ENOENT` (path not
-found), `ENOMEM`, `EAGAIN` — any `execve` error can surface via spawn.
+| Operation        | errno                                                                       |
+|------------------|-----------------------------------------------------------------------------|
+| `pthread_create` | `EAGAIN`, `ENOMEM`, `EINVAL`, `EPERM`                                       |
+| `fork`           | `EAGAIN`, `ENOMEM`, `ENOSYS`                                                |
+| `posix_spawn(p)` | `ENOENT`, `EACCES`, `ENOEXEC`, `ENOMEM`, `EAGAIN`, `E2BIG`, `EINVAL`        |
+| `execve(at)`     | `EACCES`, `ENOENT`, `ENOEXEC`, `ENOMEM`, `E2BIG`, `ETXTBSY`, `ELOOP`, `EPERM` |
+| `waitpid`        | `ECHILD`, `EINTR`, `EINVAL`                                                 |
 
-`execve()` / `execveat()`: `EACCES` (permission, `noexec` mount), `ENOENT`,
-`ENOEXEC` (bad ELF/magic), `ENOMEM`, `E2BIG` (argv+envp too large), `ETXTBSY`
-(binary open for write), `ELOOP` (symlink loop in interpreter), `EPERM`
-(`no_new_privs` + setuid binary, Linux 3.5+).
+The library does not check that an errno is plausible for the call.
 
-`waitpid()`: `ECHILD` (no children or not waitable), `EINTR` (signal while
-waiting), `EINVAL` (bad options).
+### 10.4 Qualifiers
+
+`@first`, `@from`, `@until` and `@size` behave as in every library (`chaos_policy.h`).
+Process calls carry no byte count, so **a rule with `@size` parses but never fires**.
+
+### 10.5 Failure Behaviour of the Rule File
+
+Parsing is all-or-nothing and fails open: one invalid line, more than 256 rules, a file of
+262144 bytes or more, an unreadable file (`EACCES`, `EPERM`, a directory) or a NUL byte
+leaves the library with no rules and writes `state=error` with `line=`, `reason=` and
+`text=` to the status file. A transient read error, or a file changed while it was read,
+keeps the previous snapshot and retries on the next look. Without a rule file the status
+file is removed.
 
 ---
 
 ## 11. Per-Hook Call Flows
 
+Every wrapper first calls `chaos_process_ensure_symbols()` (§12). "Bypass" forwards to
+the real function with the guard raised. Each rule lookup may reload the rule file (§14).
+LATENCY sleeps with `chaos_sleep_ms()`: a raw `clock_nanosleep(CLOCK_MONOTONIC)` system
+call, restarted on `EINTR` with the remaining time, `errno` preserved. It passes through
+no interposed symbol, so neither `libchaos-time` nor a time rule can shorten or lengthen
+it, and it is not a cancellation point.
+
 ### 11.1 pthread_create()
 
 ```
 wrapper entry
-  ├─ chaos_process_enter_internal()     TLS guard check
-  ├─ chaos_process_check_config()       mtime-CAS reload
-  ├─ LATENCY rule match
-  ├─ ERRNO rule match                   returns error number directly (not -1)
-  ├─ FAIL_AFTER rule match              returns error number directly (not -1)
-  ├─ real_pthread_create(thread, attr, fn, arg)
-  └─ chaos_process_leave_internal()
+  ├─ guard set                   → bypass
+  ├─ LATENCY rule                → sleep
+  ├─ ERRNO rule                  → return the error number (errno untouched)
+  ├─ FAIL_AFTER rule             → return the error number (errno untouched)
+  └─ real pthread_create(thread, attr, start, arg)
 ```
 
 ### 11.2 fork()
 
 ```
 wrapper entry
-  ├─ chaos_process_enter_internal()
-  ├─ chaos_process_check_config()
-  ├─ LATENCY rule match
-  ├─ ERRNO rule match                   returns -1, errno set
-  ├─ FAIL_AFTER rule match              returns -1, errno set
-  ├─ real_fork()
-  └─ chaos_process_leave_internal()
+  ├─ guard set                   → bypass
+  ├─ LATENCY rule                → sleep
+  ├─ ERRNO rule                  → errno = value, return -1
+  ├─ FAIL_AFTER rule             → errno = value, return -1
+  └─ real fork()                 (atfork handlers run; the child resets its state, §3)
 ```
 
 ### 11.3 posix_spawn() / posix_spawnp()
 
-Same flow as pthread_create. Returns error number directly (not -1) per POSIX.
+Same flow as `pthread_create`, each with its own operation: an injected failure is
+returned as the error number, `errno` untouched.
 
-### 11.4 execve()
-
-```
-wrapper entry
-  ├─ chaos_process_enter_internal()
-  ├─ chaos_process_check_config()
-  ├─ LATENCY rule match
-  ├─ ERRNO rule match                   returns -1, errno set
-  ├─ FAIL_AFTER rule match              returns -1, errno set
-  ├─ real_execve(path, argv, envp)      does not return on success
-  └─ chaos_process_leave_internal()     only reached on real execve failure
-```
-
-### 11.5 execveat()
-
-Same flow as execve. Includes NULL-guard on real_execveat pointer.
-
-### 11.6 waitpid()
+### 11.4 execve() / execveat()
 
 ```
 wrapper entry
-  ├─ chaos_process_enter_internal()
-  ├─ chaos_process_check_config()
-  ├─ LATENCY rule match
-  ├─ ERRNO rule match                   returns -1, errno set
-  ├─ FAIL_AFTER rule match              returns -1, errno set
-  ├─ real_waitpid(pid, status, options)
-  └─ chaos_process_leave_internal()
+  ├─ guard set                   → bypass
+  ├─ LATENCY rule                → sleep
+  ├─ ERRNO rule                  → errno = value, return -1
+  ├─ FAIL_AFTER rule             → errno = value, return -1
+  └─ real execve(path, argv, envp)    does not return on success
 ```
+
+`execveat()` is the same with its own operation; an unresolved real `execveat` becomes a
+direct `SYS_execveat` (§6.2).
+
+### 11.5 waitpid() and the wait Family
+
+```
+wrapper entry
+  ├─ guard set                   → bypass
+  ├─ waitpid rules: LATENCY → sleep; ERRNO or FAIL_AFTER → errno = value, return -1
+  └─ real waitpid / wait4 / waitid
+```
+
+`wait()` and `wait3()` call the `waitpid()` and `wait4()` wrappers (§7.1).
 
 ---
 
 ## 12. Reentrancy Guard and TLS State
 
-Identical architecture to `libchaos-memory`; see `docs/MEMORY.md` §14 for
-the full analysis. The process library uses:
+Same design as `libchaos-memory` ([MEMORY.md §14](MEMORY.md#14-reentrancy-guard-and-tls-state)):
 
 ```c
-extern __thread int g_chaos_process_tls_guard;
-extern __thread uint64_t g_chaos_process_tls_prng_state;
+extern __thread int g_chaos_process_tls_guard;          /* non-zero: inside the library */
+extern __thread uint64_t g_chaos_process_tls_prng_state; /* 0: not seeded yet */
 ```
 
-The LATENCY path calls `real_nanosleep` (a cached pointer to the real `nanosleep`,
-not the interposed symbol). Config reload calls `open`/`read`/`stat` — if
-`libchaos-io` is simultaneously loaded, the TLS guard from that library fires
-instead; the process library's guard does not prevent `libchaos-io` reentrancy.
-The guard is per-library, not cross-library. Libraries do not share guard state.
+- Every real call runs between `chaos_process_enter_internal()` and
+  `chaos_process_leave_internal(previous)`; leave restores the saved value, so nested
+  sections never clear the outer guard early. A wrapper entered with the guard set
+  forwards without consulting rules.
+- The guard is per library and does not suppress other libraries. Rule files, status
+  files and hits files are read and written with raw system calls (`chaos_status.h`), so
+  `libchaos-io` rules never apply to this library's own file access.
+- Symbols are resolved once with `chaos_once()` (not `pthread_once()`, which lives in
+  libpthread before glibc 2.34), from the constructor or the first wrapper call,
+  whichever comes first. A lookup `dlerror()` reports as failed calls `abort()`, except
+  for `pthread_create`, `execveat`, `execvpe` and `fexecve`, which may be absent and are
+  looked up without aborting. Fallbacks for a NULL pointer: §2 (`EAGAIN`), §3 (`ENOSYS`),
+  §4.2 (`ENOSYS`), §6 (`SYS_execve`, `SYS_execveat`, `ENOSYS`), §7.1 (`SYS_wait4`,
+  `SYS_waitid`).
 
 ---
 
 ## 13. PRNG Model
 
-The xorshift64* PRNG is identical to the one in `libchaos-memory` and
-`libchaos-time`. See `docs/MEMORY.md` §15 for the full analysis (SplitMix64
-constants, per-thread seeding, GoldenRatio finaliser). The `chaos_process_prng_mix`
-and `chaos_process_prng_next_u32` functions are structurally identical across all
-three libraries — same constants, same shift schedule, same zero-state guard.
+xorshift64* per thread, identical across the libraries
+([MEMORY.md §15](MEMORY.md#15-prng-model)): process seed from 8 bytes of `/dev/urandom`
+read with raw system calls in the constructor (fallback `0x6a09e667f3bcc909 ^ getpid()`);
+thread seed `SplitMix64(process seed ^ gettid() ^ &local) | 1`; step
+`>>12, <<25, >>27`, output the upper 32 bits of `x * 0x2545f4914f6cdd1d`; fire when
+`sample < p * 2^32`. The atfork child handler zeroes the forking thread's state so
+pre-fork workers do not decide alike.
 
 ---
 
 ## 14. Config Reload Protocol
 
-Identical two-snapshot CAS design. See `docs/MEMORY.md` §16 for the full protocol.
-The `g_chaos_process_*` state machine uses `CHAOS_PROCESS_MTIME_MISSING`,
-`CHAOS_PROCESS_MTIME_RELOADING`, and `CHAOS_PROCESS_MTIME_UNKNOWN` sentinels with
-the same values (`0x0`, `0xfffffffffffffffe`, `0xffffffffffffffff`).
+Same two-snapshot design as the other libraries
+([MEMORY.md §16](MEMORY.md#16-config-reload-protocol--two-snapshot-cas)), with
+`CHAOS_PROCESS_MTIME_MISSING` (`0x0`), `CHAOS_PROCESS_MTIME_RELOADING`
+(`0xfffffffffffffffe`) and `CHAOS_PROCESS_MTIME_UNKNOWN` (`0xffffffffffffffff`).
+
+- The rule file is looked at no more than once per 1 ms per process, timed with the vDSO
+  `CLOCK_MONOTONIC` (every lookup where there is no vDSO clock). The constructor loads it
+  once, so a bad file is reported at start-up.
+- The change stamp hashes mtime (s, ns), size, inode and device; a file stamped within
+  20 ms of now is re-read on the next look and kept, counters included, if its content is
+  unchanged.
+- One thread reloads (CAS of the stamp to `RELOADING`); others keep the active snapshot.
+  Publishing resets the FAIL_AFTER counters (§9.3), then flips the index and stores the
+  stamp behind full barriers. Rules with unchanged text keep their hit slot and `@first`
+  claims.
+- Readers copy a rule under the snapshot's sequence counter and discard a torn copy.
+- A reload leaves the caller's `errno` untouched.
+- In a forked child the atfork handler releases an inherited `RELOADING` claim, resets
+  FAIL_AFTER counters, hit counts and `@first` claims, reseeds the PRNG and picks the
+  child's own hits file.
+
+**Hits file** `/tmp/.chaos-process.hits.<n>`: one `count<TAB>rule text` line per rule;
+`<n>` is the pid, or `pid × 10^9 + salt` when a file of that pid exists (for example the
+one of the image an `execve` replaced). Written on each of the first 64 hits, then at most
+every 100 ms, on the next rule-file look after that interval, and at normal exit (not
+after a successful `execve`).
 
 ---
 
-## 15. Non-Coverage: clone/clone3, vfork, kill, pthread_kill, waitid
+## 15. Non-Coverage: clone/clone3, vfork, kill, pthread_kill
 
-| Symbol        | Rationale for non-coverage                                                |
-|---------------|---------------------------------------------------------------------------|
-| `clone(2)`    | Not a public POSIX/glibc symbol; typically `SYS_clone` directly or via `__clone` internal. Adding it requires arch-specific calling convention handling (different register/stack layouts per arch for the new stack). |
-| `clone3(2)`   | Linux 5.3+; syscall-only, not a libc symbol. `struct clone_args` ABI is also evolving. |
-| `vfork(2)`    | See §5. Safety contract violations in the injection window.               |
-| `kill(2)`     | Signal semantics orthogonal to the process-creation/destruction focus. Signal injection requires a different abstraction (signal interposition via `sigaction`/`raise` wrappers) with entirely different effect taxonomy. |
-| `pthread_kill`| Same rationale as `kill`. Signal delivery to threads is a signal-domain problem. |
-| `waitid(2)`   | Gap acknowledged. `waitid` offers `siginfo_t` status and `P_PIDFD` that `waitpid` cannot express. Candidate for next process-surface expansion. |
-| `wait(2)`     | Wrapper around `waitpid(-1, status, 0)` in glibc; covered transitively when `waitpid` is the implementation. But the libc symbol `wait` itself is not interposed. |
-| `wait3/wait4` | BSD-heritage symbols; `wait4` calls `waitpid` internally on Linux. Not interposed directly. |
+| Function       | Why not wrapped                                                                                       |
+|----------------|-------------------------------------------------------------------------------------------------------|
+| `clone(2)`     | The libc wrapper's child runs a function on a caller-supplied stack, with arch-specific register and stack conventions; libc's own users call it internally, so a wrapper would see only direct callers. SECCOMP mode sees every `clone`. |
+| `clone3(2)`    | No libc wrapper in glibc or musl for applications; system call only.                                  |
+| `vfork(2)`     | §5.                                                                                                   |
+| `kill(2)`, `tgkill(2)`, `pthread_kill(3)` | Signal delivery, not lifecycle; would need a separate effect model.                         |
 
 ---
 
 ## 16. glibc vs musl Divergence per Symbol
 
-| Symbol             | glibc                                      | musl                                          |
-|--------------------|--------------------------------------------|-----------------------------------------------|
-| `pthread_create`   | NPTL, uses `clone` with CLONE_THREAD flags | musl thread model, uses `clone` directly       |
-| `fork`             | `__libc_fork`, calls `clone(SIGCHLD,...)`  | `__fork`, calls `clone(SIGCHLD,...)`           |
-| `posix_spawn`      | vfork+exec via `__spawnix` (CLONE_VFORK)  | fork+exec via `__posix_spawnx`                |
-| `execveat`         | glibc 2.34+ exposes wrapper               | Not always exported as public symbol in older musl |
-| `waitpid`          | Calls `wait4(-,-,-,NULL)` syscall          | Direct `SYS_wait4` call                       |
-| `pthread_create` errno | Returns positive int (not -1)         | Same (POSIX requirement)                      |
-| `FAIL_AFTER` counter  | Per-operation, shared across threads    | Same (atomic, architecture-independent)       |
+| Symbol             | glibc                                                       | musl                                         |
+|--------------------|-------------------------------------------------------------|----------------------------------------------|
+| `pthread_create`   | in libc from 2.34, libpthread before (resolved on demand, §2) | in libc                                    |
+| `fork`             | `clone(CLONE_CHILD_SETTID \| CLONE_CHILD_CLEARTID \| SIGCHLD)` | `SYS_fork`, or `clone(SIGCHLD)` where no fork syscall exists |
+| `posix_spawn(p)`   | `__spawnix`: `clone(CLONE_VM \| CLONE_VFORK)`               | `__posix_spawnx`: `clone(CLONE_VM \| CLONE_VFORK)` |
+| `system`, `popen`  | internal posix_spawn (2.29+)                                | internal posix_spawn                         |
+| `execveat`         | exported from 2.34                                          | not consistently exported; wrapper falls back to `SYS_execveat` |
+| `waitpid`          | `wait4` system call                                         | `wait4` system call                          |
 
-**posix_spawn cascade gap** (glibc vs musl):
-
-On glibc, `posix_spawn` uses `clone(CLONE_VFORK|CLONE_VM)` and does not call
-the libc `fork()` symbol. A rule `fork:ERRNO:EAGAIN` does not fire when
-`posix_spawn` is called on glibc.
-
-On musl, `posix_spawn` calls `fork()`. The rule `fork:ERRNO:EAGAIN` fires for
-musl's `posix_spawn` path.
-
-This cross-symbol cascade is not modelled in the DSL selector grammar. Configure
-`posix_spawn:ERRNO:EAGAIN` explicitly when targeting musl, rather than relying
-on a `fork` rule to cover it.
+Neither libc routes `posix_spawn()`, `system()` or `popen()` through the exported
+`fork()`, and neither routes the exec family through the exported `execve()`; the
+wrappers exist because of that, and the behaviour is the same on both.
 
 ---
 
-## 17. Execution Boundary Summary
+## 17. Execution Boundary Summary and Limits
 
-`libchaos-process` operates at the libc process/thread contract boundary.
+`libchaos-process` operates at the libc process and thread boundary of one process.
 
-Covered by interposition:
+Covered:
 
-- `pthread_create()` → thread resource exhaustion, thread-pool saturation testing
-- `fork()` → process table exhaustion, fork-bomb prevention testing
-- `posix_spawn()` / `posix_spawnp()` → subprocess spawn failure, PATH resolution
-  failure
-- `execve()` / `execveat()` → privilege denial, noexec-mount simulation
-- `waitpid()` → zombie accumulation testing, EINTR-handling robustness
+- `pthread_create()`: thread exhaustion, pool saturation
+- `fork()`: process-table exhaustion
+- `posix_spawn()`, `posix_spawnp()`, `system()`, `popen()`: spawn failure
+- `execve()`, `execveat()`, the exec family: exec denied (`noexec`, permissions, missing file)
+- `waitpid()` and the wait family: `EINTR` and `ECHILD` handling, zombie accumulation
 
 Not covered:
 
-- Raw `clone()` / `clone3()` syscalls (bypasses PLT)
-- `vfork()` (safety contract violation in injection window)
-- `kill()`, `pthread_kill()`, `tgkill()` (signal domain, orthogonal)
-- `waitid()` (not yet interposed)
-- Statically linked binaries (no PLT)
-- Go/Rust/Zig runtimes that use `SYS_clone`/`SYS_clone3` directly
+- raw `clone()`/`clone3()` system calls and runtimes that issue them (Go, Rust without
+  libc, Zig); SECCOMP mode covers those
+- `vfork()` (§5)
+- `kill()`, `tgkill()`, `pthread_kill()`
+- libc-internal process creation (the clone inside `posix_spawn`, threads libc creates)
+- statically linked binaries (SECCOMP mode covers them)
+
+Limits:
+
+| Limit                          | Value                                  |
+|--------------------------------|----------------------------------------|
+| Rules per file                 | 256                                    |
+| Rule file size                 | < 262144 bytes (256 KiB)               |
+| Rule text in status/hits files | 200 bytes                              |
+| LATENCY                        | 0 .. 4294967295 ms                     |
+| FAIL_AFTER count               | 0 .. 2^64−1                            |
+| Rule-file look interval        | ≥ 1 ms per process                     |
 
 ---
 

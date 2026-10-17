@@ -5,12 +5,13 @@
 '                Macstab GmbH · Hamburg, Germany
 '                https://macstab.com
 '
-' DSL rule evaluation pipeline: from raw config line to
-' applied effect. Shows selector resolution, specificity
-' ordering, effect taxonomy, and the (S × E × P) algebra.
+' DSL rule evaluation pipeline: from a rule-file line to the applied
+' effect. Shows the two grammar shapes, all-or-nothing parsing, selector
+' resolution, specificity ordering, the firing gates and the effect order.
 '
-' Reference: docs/DSL.md
-'            docs/MEMORY.md §15 (PRNG), docs/MEMORY.md §3 (grammar)
+' Reference: docs/DSL.md §2 (grammar), §8 (composition), §9 (identity laws),
+'            §10 (specificity order)
+'            src/common/chaos_policy.h, src/*/chaos_*_config.h
 '
 title DSL Rule Evaluation Pipeline — Selector × Effect × Activation Policy
 
@@ -23,123 +24,104 @@ skinparam arrowColor #2C3E50
 
 start
 
-:Config text line;
+:Rule file line;
 note right
-  Grammar (RFC 5234 ABNF):
-    selector ":" effect ":" value [ "@" probability ]
-  Examples:
+  four-field (io, net):
+    /data:write:EIO:0.05
+    tcp4://10.0.0.15:5432:connect:LATENCY:100
+  three-field (dns, time, process, memory):
     mmap/anon:ERRNO:ENOMEM@0.01
     clock_gettime/monotonic:OFFSET:-500
     pthread_create:FAIL_AFTER:EAGAIN,128
-    tcp4://10.0.0.15:5432:connect:LATENCY:100
+  qualifiers: @first=N @from=T @until=T @size>N @size<N
 end note
 
-:Parse selector;
+:Extract qualifiers, parse selector, effect, value;
 note right
-  Selector classes by library:
-  IO:   path prefix (/data/wal)
-  NET:  endpoint (tcp4://host:port)
-  DNS:  dns://name, rdns://addr
-  TIME: symbol (clock_gettime/monotonic)
-  MEM:  symbol (mmap/anon)
-  PROC: symbol (pthread_create)
+  Any invalid line, > 256 rules, >= 256 KiB,
+  NUL byte: no rules at all (fail-open),
+  status file names the reason.
 end note
 
-:Parse effect;
-note right
-  Effect taxonomy:
-  A — Pre-call failure (ERRNO, FAIL_AFTER)
-  B — Pre-call latency (LATENCY)
-  C — Post-call result mutation (OFFSET)
-  D — Post-call result-set transform (CORRUPT,
-      FILTER_FAMILY, SHUFFLE, LIMIT — DNS/IO)
-  E — Counter-driven (FAIL_AFTER count gate)
-end note
-
-:Parse activation policy\n(probability @P, FAIL_AFTER N);
-note right
-  Probability: [0.0, 1.0]
-    0.0 = never fire
-    1.0 = always fire
-    0.05 = fire 5% of calls (PRNG gated)
-  FAIL_AFTER N: fire after N successful calls
-end note
-
-:Store rule in snapshot\n(inactive buffer);
+:Publish snapshot (two-snapshot CAS reload);
 
 ' --- Call time ---
 
-:Interposed symbol called;
+:Interposed function called;
 
-:Resolve concrete selector\nfor this call instance;
+if (Guard set (library's own call)?) then (yes)
+  :Real function;
+  stop
+endif
+
+:Refresh snapshot (stat at most every 1 ms);
+
+:Resolve the call's selector key;
 note right
-  IO: fd → /proc/self/fd path
-  NET: sockaddr → normalized endpoint
-  TIME: clockid → clock name
-  MEM: MAP_ANONYMOUS bit test
-  PROC: always the symbol name
+  io:   path (fd → /proc/self/fd, links resolved)
+  net:  endpoint from sockaddr / socket
+  dns:  host name or address
+  time: function + clock id
+  mem:  function + MAP_ANONYMOUS bit
+  proc: function
 end note
 
-:Selector specificity ordering\n(most specific wins);
+:Select most specific rule
+(io, net: one per call,
+ others: one per effect);
 note right
+  io:   longest prefix, first in file on tie
+  others: highest rank, longer text, first in file
   mmap/anon > mmap > *
-  dns://api.example.com > dns://*.example.com > dns://* > *
-  tcp4://10.0.0.15:5432 > tcp4://*:5432 > *
+  dns:~//api.example.com > dns:~//*.example.com > dns:~//* > *
+  tcp4:~//10.0.0.15:5432 > tcp4:~//*:5432 > *
   clock_gettime/monotonic > clock_gettime > *
 end note
 
-if (Any rule matched?) then (yes)
-  :Apply LATENCY (effect B)\nbefore real call;
-  note right
-    real_nanosleep(latency_ms * 1e6)
-    Reentrancy guard set → bypass own wrapper
-  end note
-
-  if (ERRNO rule matched?) then (yes)
-    :Sample PRNG\nu32 / UINT32_MAX ≤ probability?;
-    if (Probability gate fires?) then (yes)
-      :Return synthetic errno\n(pre-call failure);
-      note right
-        IO/NET/TIME: return -1, errno = errnum
-        pthread_create, posix_spawn: return errnum directly
-        FAIL_AFTER: return errnum after N-th call
-      end note
-      stop
-    endif
-  endif
-
-  :Call real libc symbol;
-  note right
-    real_symbol(args) — resolved via
-    dlsym(RTLD_NEXT, name) at library load time
-  end note
-
-  if (Post-call mutation rule?) then (yes)
-    :Apply post-call mutation\n(effect C or D);
+if (Rule selected?) then (yes)
+  :Gate: @from/@until window, @size,
+  probability draw sample < p · 2^32
+  (not for io/net LATENCY), @first claim;
+  if (LATENCY fires?) then (yes)
+    :Sleep latency ms;
     note right
-      OFFSET: ts += offset_ms (TIME)
-      CORRUPT: flip one bit in read buffer (IO, NET recv)
-      FILTER_FAMILY/SHUFFLE/LIMIT: mutate addrinfo list (DNS)
+      chaos_sleep_ms(): raw clock_nanosleep
+      (CLOCK_MONOTONIC), EINTR restarted;
+      libchaos-time: real usleep/nanosleep
     end note
   endif
-
-  :Return result to application;
-else (no match → passthrough)
-  :Call real libc symbol;
-  :Return result unchanged;
+  if (ERRNO / EAI_* / FAIL_AFTER fires?) then (yes)
+    :Return synthetic failure;
+    note right
+      io/net/mem/time, fork/exec/wait: -1 (mmap: MAP_FAILED), errno set
+      pthread_create, posix_spawn: error number returned
+      posix_fallocate, posix_madvise: error number returned
+      getaddrinfo/getnameinfo: EAI_* code
+    end note
+    stop
+  endif
+  :Real function
+  (TORN: shortened count,
+   OVERRIDE: IP literals instead of the resolver);
+  :Post-call effects
+  (CORRUPT, OFFSET, REGRESS,
+   FILTER_FAMILY, SHUFFLE, LIMIT);
+  :Return result;
+else (no)
+  :Real function, result unchanged;
 endif
 
 stop
 
-note as legend
-  (S × E × P) Identity Laws (from docs/DSL.md):
-  1. ∀ s ∈ S: "*" ∈ S (wildcard always in selector set)
-  2. Specificity is a total order on selectors
-  3. LATENCY and ERRNO are orthogonal (both may apply to same call)
-  4. OFFSET only valid post-call; ERRNO only valid pre-call
-  5. FAIL_AFTER counter is per-symbol, not per-thread
-  6. Probability=0.0 makes a rule a no-op (but it still matches for ordering)
-  7. Passthrough is the identity: real(args) == wrapped(args) when no rule fires
-end note
+legend
+  (S × E × P) laws (§9 and §10 of DSL.md):
+  1. "*" is a selector in every library and the least specific one
+  2. Specificity is a strict partial order on selectors (§10.3)
+  3. io, net: one rule per call; dns, time, process, memory: one rule per effect
+  4. OFFSET, REGRESS, CORRUPT only post-call; ERRNO, EAI_*, FAIL_AFTER only pre-call
+  5. FAIL_AFTER counts per operation, shared by all threads; every published reload resets it
+  6. Probability 0 never fires but is still selected (it shadows weaker rules)
+  7. No rule selected: wrapped(args) == real(args)
+endlegend
 
 @enduml

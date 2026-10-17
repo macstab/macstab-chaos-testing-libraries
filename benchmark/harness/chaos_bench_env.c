@@ -1,53 +1,47 @@
 /**
  * @file chaos_bench_env.c
- * @brief Best-effort capture of host and build environment for the JSON
- *        envelope.
+ * @brief Captures host and build provenance for the JSON envelope.
  *
  * @details
- * Provenance is the difference between a number and a *reproducible*
- * number.  This module reads the ambient state — kernel version, CPU
- * model and feature flags, governor, isolated CPUs, THP setting,
- * container marker, libc identity, and the build's compile flags and
- * git SHA — and stores it in a `chaos_bench_env_t` struct.  The runner
- * emits the entire struct verbatim into every JSON output, so a result
- * file can be reproduced months later given only the JSON.
+ * A benchmark number without its environment cannot be reproduced or compared. This module
+ * records the kernel release and build banner, CPU model and flags, cpu0 governor, isolated
+ * CPUs, THP mode, SMT state, Docker marker, libc family, LD_PRELOAD, and the harness's git
+ * SHA and CFLAGS into a @ref chaos_bench_env_t. The JSON writer emits all of it (except the
+ * internal `*_truncated` flags) in the `environment` section, and the isolation check and
+ * timer selection read from it.
  *
- * **Failure model.**
- * Every read is best-effort: a missing or unreadable file produces an
- * empty string, never a fatal error.  This module never aborts.  The
- * downstream isolation check distinguishes empty-because-missing from
- * empty-because-permissions only when the difference is observable
- * (e.g. ENOENT vs EACCES); for the JSON envelope the value is "".
+ * **Failure behaviour.**
+ * Every read is best-effort: a missing or unreadable file leaves an empty string (or 0); the
+ * module never fails and never aborts. ENOENT and EACCES are not distinguished, so an empty
+ * governor means "no cpufreq" or "not readable" alike.
  *
- * **Sources, in order of robustness.**
- *  - `/proc/sys/kernel/osrelease` — single line, one shot.  Always
- *    present on Linux.
- *  - `/proc/version` — full kernel build banner.  Always present.
- *  - `/proc/cpuinfo` — multi-line, format mildly platform-dependent.
- *    We pull `model name` and `flags` for the first CPU only; subsequent
- *    CPUs are assumed homogeneous.  On heterogeneous (big.LITTLE) ARM
- *    SoCs this is incorrect; the wrapper script must avoid pinning across
- *    a P-core / E-core boundary if it cares about this.
- *  - `/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor` — single
- *    line.  Absent on systems without cpufreq (rare).
- *  - `/sys/devices/system/cpu/isolated` — single line, comma-separated
- *    or empty.  Always present on Linux >= 4.x.
- *  - `/sys/kernel/mm/transparent_hugepage/enabled` — single line with
- *    bracketed selection.  Always present when THP is compiled in.
- *  - `/.dockerenv` — sentinel for Docker; presence ⇒ containerized.
- *    Other container runtimes (podman, containerd, runsc, k8s) have
- *    different sentinels; we conservatively treat absence as
- *    "non-containerized" and let the user note runtime in their JSON
- *    consumer.
+ * **Sources.**
+ *  - `/proc/sys/kernel/osrelease`: kernel release, one line.
+ *  - `/proc/version`: full kernel build banner.
+ *  - `/proc/cpuinfo`: first 16 KiB only. `model name` (x86) or `Processor` (older arm64
+ *    kernels) and `flags` (x86) or `Features` (arm64) are taken from the first matching line,
+ *    i.e. the first CPU; all CPUs are assumed identical. On heterogeneous (big.LITTLE,
+ *    P-core/E-core) systems this can describe a different core than the pinned one.
+ *  - `/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor`: absent without cpufreq, and
+ *    commonly inside VMs and containers.
+ *  - `/sys/devices/system/cpu/isolated`: CPU list from `isolcpus=`, empty if none.
+ *  - `/sys/kernel/mm/transparent_hugepage/enabled`: THP mode, selected value in brackets.
+ *  - `/sys/devices/system/cpu/cpu0/topology/thread_siblings_list`: SMT is on if it lists
+ *    more than one CPU.
+ *  - `/.dockerenv`: Docker marker. Other runtimes (podman, containerd, gVisor, Kubernetes)
+ *    are not detected and are reported as non-containerised.
+ *  - Dynamic loader paths: libc family (see @ref chaos_bench_libc_detect).
+ *  - `getenv("LD_PRELOAD")`: the preload list this process was started with.
  *
  * **Build-time provenance.**
- * Two preprocessor symbols carry build-time provenance:
- *  - `CHAOS_BENCH_GIT_SHA` — set by the Makefile from `git rev-parse HEAD`.
- *  - `CHAOS_BENCH_CFLAGS`  — set by the Makefile from the actual
- *                            CFLAGS used to compile the harness.
- * Both are surfaced verbatim in the JSON.  If neither is defined the
- * JSON emits empty strings; this preserves the property that the source
- * tree compiles standalone without the Makefile.
+ *  - `CHAOS_BENCH_GIT_SHA`: `Makefile.bench` sets it from `git rev-parse --short HEAD`
+ *    (`unknown` outside a git checkout).
+ *  - `CHAOS_BENCH_CFLAGS`: `Makefile.bench` sets it to the base CFLAGS string
+ *    (`BENCH_CFLAGS_RAW`).
+ * Both default to "" so the harness compiles without the Makefile.
+ *
+ * **Thread-safety.** Uses `getenv` and stdio; call once from the main thread before the
+ * timed loop.
  */
 
 #include "chaos_bench_internal.h"
@@ -67,12 +61,13 @@
 #endif
 
 /**
- * @brief Reads up to @p capacity-1 bytes from @p path into @p buffer.
+ * @brief Reads up to @p capacity-1 bytes of @p path into @p buffer, NUL-terminated.
  *
- * @details Trailing newline is stripped.  On open or read failure the
- * buffer is set to "" and 0 is returned.  Truncation past @p capacity-1
- * is signalled via the return: 1 = full read, 0 = empty/failure, 2 =
- * truncated.
+ * @details Strips trailing `\n`/`\r`. Truncation is inferred from EOF not having been
+ * reached, so a file of exactly @p capacity-1 bytes is also reported as truncated.
+ *
+ * @return 1 read completely; 2 truncated; 0 open failed, file empty, or @p capacity is 0
+ *         (@p buffer is then "" unless @p capacity is 0).
  */
 static int chaos_bench_read_text(const char *path, char *buffer, size_t capacity)
 {
@@ -97,7 +92,7 @@ static int chaos_bench_read_text(const char *path, char *buffer, size_t capacity
         buffer[0] = '\0';
         return 0;
     }
-    /* Strip trailing newline(s). */
+    /* /proc and /sys values end in a newline that must not reach the JSON strings. */
     while (n > 0U && (buffer[n - 1U] == '\n' || buffer[n - 1U] == '\r'))
     {
         --n;
@@ -107,12 +102,12 @@ static int chaos_bench_read_text(const char *path, char *buffer, size_t capacity
 }
 
 /**
- * @brief Extracts the value following `key:` from /proc/cpuinfo-format text.
+ * @brief Copies the value of the first `<key> : <value>` line in @p text to @p out.
  *
- * @details `/proc/cpuinfo` lines have the shape `<key>\s+:\s+<value>`.
- * We scan @p text for the first line whose prefix (up to ':') matches
- * @p key (case-sensitive, trimmed), then copy the value into @p out.
- * Subsequent CPU stanzas are ignored.
+ * @details Matches lines of the form `<ws><key><ws>:<ws><value>`, case-sensitively; leading
+ * blanks and tabs around key and colon are skipped. Only the first match is used, so later
+ * CPU stanzas are ignored. The value is truncated to @p capacity-1 bytes. @p out is "" if no
+ * line matches.
  */
 static void chaos_bench_proc_cpuinfo_field(
     const char *text, const char *key, char *out, size_t capacity
@@ -127,7 +122,7 @@ static void chaos_bench_proc_cpuinfo_field(
         const char *eol = strchr(cursor, '\n');
         size_t      line_len = (eol != NULL) ? (size_t)(eol - cursor) : strlen(cursor);
 
-        /* Trim leading whitespace then compare. */
+        /* Skip leading blanks and tabs before comparing the key. */
         const char *p = cursor;
         while (p < cursor + line_len && (*p == ' ' || *p == '\t')) ++p;
         if ((size_t)(cursor + line_len - p) >= key_len &&
@@ -151,10 +146,10 @@ static void chaos_bench_proc_cpuinfo_field(
 }
 
 /**
- * @brief Returns 1 if the substring @p needle (whitespace-bounded) appears
- *        in the space-delimited list @p haystack.
+ * @brief Returns 1 if @p needle is one whole token of the blank- or tab-separated list
+ *        @p haystack, else 0.
  *
- * @details Used to test for a CPU flag in the /proc/cpuinfo `flags` line.
+ * @details Whole-token matching keeps `tsc` from matching `constant_tsc`.
  */
 static int chaos_bench_flag_present(const char *haystack, const char *needle)
 {
@@ -176,7 +171,8 @@ static int chaos_bench_flag_present(const char *haystack, const char *needle)
 }
 
 /**
- * @brief Returns 1 if @p path exists, regardless of permission.
+ * @brief Returns 1 if `stat(2)` on @p path succeeds, else 0 (search permission on the
+ *        parent directories is still required).
  */
 static int chaos_bench_path_exists(const char *path)
 {
@@ -185,12 +181,14 @@ static int chaos_bench_path_exists(const char *path)
 }
 
 /**
- * @brief Best-effort detection of glibc vs musl.
+ * @brief Writes "glibc", "musl" or "unknown" to @p out, based on which dynamic loader exists.
  *
- * @details glibc exposes `gnu_get_libc_version()`; musl does not.  We
- * detect glibc by checking the loader path: `/lib*\/ld-linux*` is glibc;
- * `/lib/ld-musl-*` is musl.  The check is heuristic and may fail on
- * exotic distros.
+ * @details Probes the x86_64 and aarch64 glibc loaders (`ld-linux-x86-64.so.2`,
+ * `ld-linux-aarch64.so.1` under `/lib` and `/lib64`) first, then the musl loaders
+ * (`/lib/ld-musl-{x86_64,aarch64}.so.1`). A link-time check such as
+ * `gnu_get_libc_version()` would not build on musl, hence the filesystem heuristic. It
+ * reports the libc installed on the host image, not necessarily the one this binary uses: a
+ * musl image with a glibc compatibility loader reports "glibc".
  */
 static void chaos_bench_libc_detect(char *out, size_t capacity)
 {
@@ -244,7 +242,7 @@ void chaos_bench_env_capture(chaos_bench_env_t *out_env)
     );
     if (out_env->cpu_model[0] == '\0')
     {
-        /* aarch64 uses a different field name. */
+        /* Older arm64 kernels report the model as "Processor"; newer ones have no model line. */
         chaos_bench_proc_cpuinfo_field(
             cpuinfo, "Processor",
             out_env->cpu_model, sizeof(out_env->cpu_model)
@@ -256,7 +254,7 @@ void chaos_bench_env_capture(chaos_bench_env_t *out_env)
     );
     if (out_env->cpu_flags_blob[0] == '\0')
     {
-        /* aarch64 uses 'Features' instead of 'flags'. */
+        /* arm64 lists CPU features as "Features" instead of "flags". */
         chaos_bench_proc_cpuinfo_field(
             cpuinfo, "Features",
             out_env->cpu_flags_blob, sizeof(out_env->cpu_flags_blob)
@@ -285,8 +283,8 @@ void chaos_bench_env_capture(chaos_bench_env_t *out_env)
         out_env->thp_enabled, sizeof(out_env->thp_enabled)
     );
 
-    /* SMT detection: cpu0/topology/thread_siblings_list contains the list of
-     * sibling thread CPUs; if it includes more than one entry SMT is on. */
+    /* cpu0's sibling list is a single CPU number unless SMT is on, in which case it holds
+     * a ',' or '-' separated list. Unreadable leaves smt_active 0. */
     {
         char siblings[64];
         if (chaos_bench_read_text(

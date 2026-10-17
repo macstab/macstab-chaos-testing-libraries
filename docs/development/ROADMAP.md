@@ -13,495 +13,340 @@
 
 ---
 
-This repository currently ships implemented `libchaos-io`, `libchaos-net`,
-`libchaos-dns`, `libchaos-time`, `libchaos-process`, and `libchaos-memory`
-libraries.
+The repository ships six libraries (`libchaos-io`, `libchaos-net`,
+`libchaos-dns`, `libchaos-time`, `libchaos-memory`, `libchaos-process`) and
+the SECCOMP-mode supervisor `chaos-init`. This roadmap records what was
+planned, what is implemented (checked against `src/`), and what remains.
 
-The roadmap below answers two separate questions:
+It answers two questions:
 
-1. What should be added to `libchaos-io` itself?
-2. What chaos surfaces matter, but should live in separate libraries so this
-   repository does not lose its small, auditable shape?
+1. What belongs in `libchaos-io` itself?
+2. Which chaos surfaces belong in separate libraries, so that no library
+   loses its small, auditable shape?
+
+Status markers: `[x]` implemented and verified in `src/`; `[ ]` open.
 
 ## Constraints
 
-Every planned change in this repository must preserve these constraints:
+Every change must keep:
 
-- Linux `LD_PRELOAD` library model
-- C99 implementation
-- very small source footprint and shared-object size
-- no public SDK
-- explicit control flow over generic abstractions
-- full unit coverage for changed source files
-- runtime verification on glibc and musl
-- supported build outputs for:
-  - glibc amd64
-  - glibc arm64
-  - musl amd64
-  - musl arm64
+- the Linux `LD_PRELOAD` model (and, for SECCOMP mode, a static `chaos-init`)
+- C99, `-Wall -Wextra -Werror -pedantic`
+- a small source footprint and object size (`-Os`, stripped)
+- no public SDK or C API
+- explicit control flow over generic abstraction
+- 100.00 % line coverage per source file
+- runtime verification on glibc and musl, amd64 and arm64, for the release
+  tuples glibc-amd64, glibc-arm64, musl-amd64, musl-arm64
 
 ## Cross-Target Completion Gate
 
-Every roadmap step below is incomplete until all of the following are true:
+A step is complete only when:
 
-- the code builds for glibc amd64
-- the code builds for glibc arm64
-- the code builds for musl amd64
-- the code builds for musl arm64
-- runtime behavior is verified on glibc and musl
-- runtime behavior is verified on amd64 and arm64 through CI or equivalent
-  runner coverage
+- it builds for all four tuples
+- its runtime behaviour is verified on glibc and musl
+- its runtime behaviour is verified on amd64 and arm64
 
-Local development is not enough to close a step when it only proves the host
-architecture. The musl/glibc amd64/arm64 matrix must be treated as a release
-gate, not as a follow-up task.
+Since `matrix.yml`, CI enforces this on every branch push: each tuple is
+built and runtime-tested on a runner of its own architecture
+(`ubuntu-24.04`, `ubuntu-24.04-arm`). Host-local success never closes a step.
 
 ## Historical Failure Pattern
 
-The local git history shows why this gate exists:
+In the pre-publication history (not an ancestor of the current branch), root
+commit `99de3e4` (2026-04-05) contained the first `libchaos-io`
+implementation, and commit `0819122` (2026-04-06) added Alpine musl runtime
+verification. No `src/` file changed between them (`git diff --stat 99de3e4
+0819122 -- src` is empty): musl correctness had been assumed, not shown.
 
-- commit `99de3e4` on April 5, 2026 introduced the initial implementation
-- commit `0819122` on April 6, 2026 added Alpine musl runtime verification later
-- no `src/` implementation files changed between those two commits
+Rules derived from it:
 
-That means "builds here" and "passes host-local tests" were previously allowed
-to stand in for "implementation is valid everywhere". This repository must not
-repeat that mistake.
-
-For every step below:
-
-- do not treat host-only verification as implementation validity
-- do not treat build-only verification as runtime validity
-- do not split implementation and cross-target proof into separate "later"
-  cleanup work
-- do not mark a wrapper complete until its behavior is proven on the required
-  libc and architecture matrix
+- host-only verification is not implementation validity
+- build-only verification is not runtime validity
+- implementation and cross-target proof land together, not as later cleanup
+- a wrapper is complete only when proven on the full libc and architecture matrix
 
 ## Current Status
 
-Implemented in `libchaos-io`:
+### `libchaos-io`
 
-- `open`
-- `openat`
-- `close`
-- `read`
-- `readv`
-- `write`
-- `writev`
-- Linux `sendfile`
-- Linux `copy_file_range`
-- `pread`
-- `preadv`
-- `pwrite`
-- `pwritev`
-- `fsync`
-- `fdatasync`
+Implemented wrappers: `open`, `open64`, `openat`, `openat64`, `__open_2`,
+`__open64_2`, `__openat_2`, `__openat64_2`, `creat`, `creat64`, `read`,
+`readv`, `__read_chk`, `write`, `writev`, `pread`, `pread64`, `__pread_chk`,
+`__pread64_chk`, `preadv`, `preadv64`, `pwrite`, `pwrite64`, `pwritev`,
+`pwritev64`, `sendfile`, `sendfile64`, `copy_file_range`, `fsync`,
+`fdatasync`, `ftruncate`, `ftruncate64`, `truncate`, `truncate64`,
+`fallocate`, `fallocate64`, `posix_fallocate`, `posix_fallocate64`,
+`unlink`, `unlinkat`, `rmdir`, `remove`, `rename`, `renameat`, `renameat2`,
+`close`, `close_range`, `closefrom`, `closedir`, `pclose`, `dup2`, `dup3`,
+and stdio (`fopen`, `fopen64`, `freopen`, `freopen64`, `fclose`, `fread`,
+`fwrite`, `fgets`, `fputs`, `fgetc`, `getc`, `fputc`, `putc`, `getline`,
+`getdelim`, `__getdelim`, `fprintf`, `vfprintf`, `fflush`, `__fread_chk`,
+`__fgets_chk`, `__fprintf_chk`, `__vfprintf_chk`).
 
-Current effects:
+Effects: `ERRNO`, `LATENCY`, `TORN` (write class), `CORRUPT` (read class).
 
-- `ERRNO`
-- `LATENCY`
-- `TORN` for write-style calls
-- `CORRUPT` for read-style calls
+Known gaps:
 
-Known gap:
+- data moved by `splice`, or through `mmap`ed pages, bypasses the write
+  wrappers (`cp` variants may use `splice`)
+- `scanf` family and `*_unlocked` stdio are not wrapped
 
-- `cp` and similar tools may still move data with `splice()`, which bypasses
-  the current write hooks.
+### `libchaos-net`
 
-Local verification snapshot for the current implementation:
+Implemented operations and the symbols behind them:
 
-- passed: Linux amd64 Docker unit run
-- passed: Linux arm64 Docker unit run
-- passed: Linux amd64 Docker coverage run
-- passed: Linux arm64 Docker coverage run
-- passed: glibc amd64 Docker runtime
-- passed: glibc arm64 Docker runtime
-- passed: musl amd64 Docker runtime
-- passed: musl arm64 Docker runtime
-- passed: Linux amd64 Docker integration run for `openat`, `readv`, `writev`,
-  `preadv`, `pwritev`, `sendfile`, and `copy_file_range`
+| Operation | Symbols |
+| --- | --- |
+| `socket` | `socket`, `socketpair` |
+| `bind` | `bind` |
+| `listen` | `listen` |
+| `connect` | `connect` |
+| `accept` | `accept`, `accept4` |
+| `shutdown` | `shutdown` |
+| `poll` | `poll`, `__poll_chk`, `ppoll`, `__ppoll_chk`, `select`, `pselect`, `epoll_wait`, `epoll_pwait` |
+| `send` | `send`, `sendto`, `sendmsg`, `sendmmsg`, and `write`/`writev` on sockets |
+| `recv` | `recv`, `__recv_chk`, `recvfrom`, `__recvfrom_chk`, `recvmsg`, `recvmmsg`, and `read`/`readv`/`__read_chk` on sockets |
+| `close` | `close` on sockets |
 
-This means the implementation is materially ahead of the roadmap, but the
-current `openat`, vectored I/O, `sendfile`, and `copy_file_range` work is
-locally proven across the required libc and architecture matrix.
+Effects: `ERRNO`, `LATENCY`, `CORRUPT` (recv), `TIMEOUT` (poll), `RESET`
+(close), `TRICKLE` (recv on stream sockets), `DUP` (recv).
 
-Implemented in `libchaos-net`:
+Known gaps:
 
-- `socket`
-  - backed by `socket()` and `socketpair()`
-- `bind`
-- `listen`
-- `connect`
-- `accept`
-  - backed by `accept()` and Linux `accept4()`
-- `shutdown`
-  - backed by `shutdown()`
-- `poll`
-  - backed by `poll()`, `ppoll()`, `select()`, `pselect()`, and Linux
-    `epoll_wait()` plus `epoll_pwait()`
-- `send`
-  - backed by `send()`, `sendto()`, `sendmsg()`, and Linux `sendmmsg()`
-- `recv`
-  - backed by `recv()`, `recvfrom()`, `recvmsg()`, and Linux `recvmmsg()`
-- `dns`
-  - backed by `getaddrinfo()`
+- epoll matching reads `/proc/self/fdinfo/<epfd>` per wait (at most
+  256 KiB); when unreadable the wait passes through
+- DNS moved to `libchaos-dns`; `libchaos-net` has no `dns` operation and no
+  `GAI` effect
 
-Current `libchaos-net` effects:
+### `libchaos-dns`
 
-- `ERRNO`
-- `LATENCY`
-- `CORRUPT` for receive-side buffers
-- `TIMEOUT` for readiness waits
-- `GAI` for `getaddrinfo()`
+Implemented: `getaddrinfo`, `freeaddrinfo`, `getnameinfo`, `gethostbyname`,
+`gethostbyname_r`, `gethostbyname2`, `gethostbyname2_r`, `gethostbyaddr`,
+`gethostbyaddr_r`. Effects: `GAI`, `LATENCY`, `REWRITE`, `SERVICE`,
+`OVERRIDE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT`.
 
-Current `libchaos-net` verification snapshot:
+### `libchaos-time`
 
-- passed: Linux amd64 Docker unit run
-- passed: Linux arm64 Docker unit run
-- passed: Linux amd64 Docker coverage run
-- passed: Linux arm64 Docker coverage run
-- passed: glibc amd64 Docker runtime
-- passed: glibc arm64 Docker runtime
-- passed: musl amd64 Docker runtime
-- passed: musl arm64 Docker runtime
+Implemented: `clock_gettime`, `gettimeofday`, `time`, `timespec_get`,
+`nanosleep`, `clock_nanosleep`, `sleep`, `usleep`. Effects: `ERRNO`,
+`LATENCY`, `OFFSET`, `REGRESS`.
 
-Current `libchaos-net` gaps:
+### `libchaos-memory`
 
-- `libchaos-net` deliberately does not own `read()`, `write()`, or `close()`
-  so it can compose with `libchaos-io`
-- Linux `epoll_*` matching is intentionally best-effort and derived from
-  `/proc/self/fdinfo/<epfd>` instead of an owned membership cache
+Implemented: `mmap`, `mmap64`, `munmap`, `mprotect`, `madvise`,
+`posix_madvise`. Effects: `ERRNO`, `LATENCY`.
 
-Implemented in `libchaos-process`:
+### `libchaos-process`
 
-- `pthread_create`
-- `fork`
-- `posix_spawn`
-- `posix_spawnp`
-- `execve`
-- `execveat`
-- `waitpid`
+Implemented: `pthread_create`, `fork`, `posix_spawn`, `posix_spawnp`,
+`system`, `popen`, `execve`, `execveat`, `execv`, `execvp`, `execvpe`,
+`execl`, `execle`, `execlp`, `fexecve`, `waitpid`, `wait`, `wait3`, `wait4`,
+`waitid`. Effects: `ERRNO`, `LATENCY`, `FAIL_AFTER`.
 
-Current `libchaos-process` effects:
+Known gaps:
 
-- `ERRNO`
-- `LATENCY`
-- `FAIL_AFTER`
+- selectors are `*` or an operation name; there is no selector by program
+  path, argument or pid
+- `kill`, `pthread_kill`, `clone*` and `vfork` are not interposed
+- `execveat`, `execvpe` and `fexecve` work only where the libc exports them;
+  otherwise the wrapper reports `ENOSYS`
 
-Current `libchaos-process` verification snapshot:
+### Implemented beyond the original plan
 
-- passed: `make unit`
-- passed: `make coverage`
-- passed: glibc amd64 Docker runtime
-- passed: glibc arm64 Docker runtime
-- passed: musl amd64 Docker runtime
-- passed: musl arm64 Docker runtime
-
-Current `libchaos-process` gaps:
-
-- selectors are symbol-only today
-- `waitid()`, `kill()`, `pthread_kill()`, `clone*()`, and `vfork()` remain
-  future work
-- `execveat()` depends on the current libc exporting that symbol; some musl
-  environments do not
+- [x] rule qualifiers `@first`, `@from`, `@until`, `@size` in every library
+- [x] status file `/tmp/.chaos-<lib>.status` after every load
+- [x] per-process hits files `/tmp/.chaos-<lib>.hits.<n>`
+- [x] glibc alternate entry points (`*64`, `__*_chk`), runtime-tested by `test_variants_glibc.sh`
+- [x] io/net sharing of `read`/`write`/`readv`/`writev`/`close` by descriptor kind, runtime-tested by `test_sharing_glibc.sh`
+- [x] SECCOMP mode: `chaos-init` applies io, net, memory and process rules to static and Go binaries (see [SECCOMP.md](../SECCOMP.md))
+- [x] rule-file check throttled to once per millisecond (vDSO clock)
 
 ## Phase 1: Close The Biggest Real-World Gaps
 
-These items deliver the best coverage gain without changing the current config
-model or inflating the library too much.
+Coverage gains without changing the config model.
 
 - [x] Add `openat`
-  - Existing `open` rule semantics are reused.
-  - Absolute paths, `AT_FDCWD`, and directory-fd relative paths are supported.
-  - Successful calls seed the fd cache with the resolved path.
+  - Reuses `open` rule semantics.
+  - Absolute paths, `AT_FDCWD` and directory-fd-relative paths are resolved before matching.
+  - A successful call seeds the fd cache with the resolved path.
 - [x] Add Linux `sendfile`
-  - Treated as a destination-side `write` operation.
-  - Supports `ERRNO`, `LATENCY`, and `TORN`.
+  - Destination-side `write`; `ERRNO`, `LATENCY`, `TORN`.
 - [x] Add a glibc Docker runtime test matching the Alpine musl test
-  - The dedicated glibc runtime script exists and is part of the repo.
-- [x] Extend unit tests for every new wrapper branch and failure path
-  - `openat`, Linux `sendfile`, and the `TORN` contract regression are covered.
-- [x] Document the exact matching semantics for `openat` and Linux `sendfile`
-  - `README`, architecture notes, and engineering notes are updated.
+  - `test/runtime/test_glibc.sh`.
+- [x] Unit tests for every new wrapper branch and failure path
+  - `openat`, `sendfile` and the `TORN` contract regression are covered.
+- [x] Document the matching semantics for `openat` and `sendfile`
 
-Phase 1 release-gate closure is still separate and remains open:
+Cross-target gate for Phase 1:
 
-- [x] Close the cross-target gate for `openat`
-  - Reuse existing `open` rule semantics.
-  - Support absolute paths, `AT_FDCWD`, and directory-fd relative paths.
-  - Cache the resolved path for the returned fd after success.
-  - Complete glibc/musl amd64/arm64 runtime proof now passes locally.
-  - Cross-target completion gate applies.
-- [x] Close the cross-target gate for Linux `sendfile`
-  - Treat it as a destination-side `write` operation.
-  - Support `ERRNO`, `LATENCY`, and `TORN`.
-  - Complete glibc/musl amd64/arm64 runtime proof now passes locally.
-  - Cross-target completion gate applies.
-- [x] Close the cross-target gate for the glibc Docker runtime test.
-  - A matching glibc runtime test is already landed.
-  - Local amd64 and arm64 runtime proof now pass.
-  - Cross-target completion gate applies.
-- [x] Close the cross-target gate for unit coverage of the Phase 1 wrappers.
-  - Unit branches for `openat`, Linux `sendfile`, and the `TORN` fix are
-    already landed.
-  - Linux amd64 and arm64 unit plus coverage execution in Docker pass.
-  - Cross-target completion gate applies.
-- [x] Close the cross-target gate for Phase 1 documentation.
-  - `README`, architecture notes, and engineering notes already describe
-    `openat` and Linux `sendfile` semantics.
-  - Cross-target completion gate applies.
+- [x] `openat` on glibc/musl, amd64/arm64
+- [x] `sendfile` on glibc/musl, amd64/arm64
+- [x] glibc runtime test on amd64 and arm64
+- [x] unit and coverage runs for the Phase 1 wrappers
+- [x] Phase 1 documentation
 
 ## Phase 2: Finish Modern File Copy And Buffered I/O Coverage
 
-These additions keep the same logical fault model while covering more real
-applications.
+Same fault model, more real applications.
 
 - [x] Add `copy_file_range`
-  - Treat it as a destination-side `write` operation.
-  - Support `ERRNO`, `LATENCY`, and `TORN`.
-  - Local glibc/musl amd64/arm64 runtime proof now passes.
-  - Cross-target completion gate applies.
-- [x] Extend native Linux integration tests for `copy_file_range`
-  - Linux amd64 Docker integration proof passes locally.
-  - Cross-target completion gate applies.
-- [x] Extend Docker runtime tests for `copy_file_range` on both libc families
-  - glibc and musl amd64/arm64 runtime proof now passes locally.
-  - Cross-target completion gate applies.
-- [x] Extend native Linux integration tests for vectored I/O
-  - Linux amd64 Docker integration proof for `readv`, `writev`, `preadv`, and
-    `pwritev` now passes locally.
-  - Cross-target completion gate applies.
-- [x] Extend Docker runtime tests for vectored I/O on both libc families
-  - glibc and musl amd64/arm64 runtime proof for `readv`, `writev`, `preadv`,
-    and `pwritev` now passes locally.
-  - Cross-target completion gate applies.
-- [x] Add `readv`
-  - Reuses `read` semantics across the concatenated iovec byte stream.
-  - Local glibc/musl amd64/arm64 runtime proof now passes.
-  - Cross-target completion gate applies.
-- [x] Add `writev`
-  - Reuses `write` semantics across the concatenated iovec byte stream.
-  - Local glibc/musl amd64/arm64 runtime proof now passes.
-  - Cross-target completion gate applies.
-- [x] Add `preadv`
-  - Reuses `pread` semantics across the concatenated iovec byte stream.
-  - Local glibc/musl amd64/arm64 runtime proof now passes.
-  - Cross-target completion gate applies.
-- [x] Add `pwritev`
-  - Reuses `pwrite` semantics across the concatenated iovec byte stream.
-  - Local glibc/musl amd64/arm64 runtime proof now passes.
-  - Cross-target completion gate applies.
+  - Destination-side `write`; `ERRNO`, `LATENCY`, `TORN`.
+- [x] Native Linux integration tests for `copy_file_range`
+- [x] Docker runtime tests for `copy_file_range` on both libc families
+- [x] Native Linux integration tests for vectored I/O
+- [x] Docker runtime tests for vectored I/O on both libc families
+- [x] Add `readv` — `read` semantics over the concatenated iovec byte stream
+- [x] Add `writev` — `write` semantics over the concatenated iovec byte stream
+- [x] Add `preadv` — `pread` semantics over the concatenated iovec byte stream
+- [x] Add `pwritev` — `pwrite` semantics over the concatenated iovec byte stream
+- [x] Buffered I/O: stdio read and write wrappers (`fread`, `fwrite`, `fgets`,
+  `fprintf`, ...), with `ERRNO` raising the stream's error indicator
 
 ## Phase 3: File Lifecycle And Capacity Operations
 
-These operations are valuable, but they likely require expanding the config
-surface with new logical operations rather than silently reusing unrelated ones.
+New logical operations rather than reuse of unrelated ones.
 
-- [x] Define the config contract for these operations before implementation.
-  - Added logical operations: `truncate`, `allocate`, `unlink`,
-    `rename_from`, and `rename_to`.
-  - Only `ERRNO` and `LATENCY` apply in this phase.
-  - Cross-target completion gate passed locally in Docker across glibc/musl and
-    amd64/arm64.
-- [x] Add `ftruncate`
-  - Implemented with logical `truncate` matching on the target fd path.
-  - Cross-target completion gate passed locally in Docker across glibc/musl and
-    amd64/arm64.
-- [x] Add `fallocate`
-  - Implemented as a Linux-only wrapper with logical `allocate` matching on the
-    target fd path.
-  - Cross-target completion gate passed locally in Docker across glibc/musl and
-    amd64/arm64.
-- [x] Add `renameat`
-  - Implemented with explicit `rename_from` and `rename_to` matching and
-    successful-cache reset behavior.
-  - Cross-target completion gate passed locally in Docker across glibc/musl and
-    amd64/arm64.
-- [x] Add `unlinkat`
-  - Implemented with logical `unlink` matching and successful-cache reset
-    behavior.
-  - Cross-target completion gate passed locally in Docker across glibc/musl and
-    amd64/arm64.
-- [x] Add unit and runtime tests for each new operation/effect combination.
-  - Docker proof now passes for unit amd64/arm64, coverage amd64/arm64, glibc
-    runtime amd64/arm64, musl runtime amd64/arm64, and Linux amd64 integration.
-  - Cross-target completion gate applies.
+- [x] Define the config contract
+  - Operations `truncate`, `allocate`, `unlink`, `rename_from`, `rename_to`;
+    only `ERRNO` and `LATENCY` apply.
+- [x] Add `ftruncate` (and `truncate`) — `truncate` on the target path
+- [x] Add `fallocate` (and `posix_fallocate`) — `allocate` on the target path
+- [x] Add `renameat` (and `rename`, `renameat2`) — `rename_from`/`rename_to`;
+  a successful rename resets the fd cache
+- [x] Add `unlinkat` (and `unlink`, `rmdir`, `remove`) — `unlink`; a
+  successful unlink resets the fd cache
+- [x] Unit and runtime tests for every operation/effect combination
 
-Notes:
-
-- `ftruncate` and `fallocate` are useful for realistic storage and capacity
-  failures.
+`ftruncate` and `fallocate` model storage and capacity failures; `renameat`
+and `unlinkat` model atomic replace, compaction, WAL rotation and cleanup.
 
 ## libchaos-net Phase 1: Endpoint-Based Network Surface
 
-- [x] Add a dedicated `/tmp/.chaos-net.conf` grammar with endpoint selectors.
-  - Implemented selectors: `*`, `tcp4`, `tcp6`, `udp4`, `udp6`, `unix`, and
-    `dns`.
-  - Cross-target runtime gate passed locally on glibc/musl and amd64/arm64.
-- [x] Add endpoint-based matching instead of fd-number matching.
-  - Matching now uses peer, local, or DNS identities depending on the logical
-    operation.
-  - Cross-target runtime gate passed locally on glibc/musl and amd64/arm64.
-- [x] Add the first socket wrapper set.
-  - Implemented operations: `bind`, `listen`, `connect`, `accept`,
-    `send`, `recv`, and `dns`.
-  - `accept` is backed by `accept()` and Linux `accept4()`.
-  - `send` is backed by `send()`, `sendto()`, and `sendmsg()`.
-  - `recv` is backed by `recv()`, `recvfrom()`, and `recvmsg()`.
-  - `dns` is backed by `getaddrinfo()`.
-  - Cross-target runtime gate passed locally on glibc/musl and amd64/arm64.
-- [x] Add the first network effect set.
-  - Implemented effects: `ERRNO`, `LATENCY`, `CORRUPT`, and `GAI`.
-  - `CORRUPT` is receive-only.
-  - `GAI` is DNS-only.
-  - Cross-target runtime gate passed locally on glibc/musl and amd64/arm64.
-- [x] Add the remaining planned network wrapper surface.
-  - Implemented operations now also include `socket`, `shutdown`, and `poll`.
-  - `socket` is backed by `socket()` and `socketpair()`.
-  - `poll` is backed by `poll()`, `ppoll()`, `select()`, `pselect()`, and
-    Linux `epoll_wait()` plus `epoll_pwait()`.
-  - `send` now also covers Linux `sendmmsg()`.
-  - `recv` now also covers Linux `recvmmsg()`.
-  - Cross-target runtime gate passed locally on glibc/musl and amd64/arm64.
-- [x] Add the remaining planned network effect set.
-  - Implemented effect: `TIMEOUT` for readiness waits.
-  - Cross-target runtime gate passed locally on glibc/musl and amd64/arm64.
-- [x] Add Docker runtime probes for `libchaos-net`.
-  - Dedicated glibc and Alpine runtime scripts now exist.
-  - Cross-target runtime gate passed locally on glibc/musl and amd64/arm64.
-- [x] Promote changed `libchaos-net` sources into the strict `100.00%` source
-  coverage gate.
-  - `check_coverage.sh` now asserts `src/net/*.c` at `100.00%` line coverage.
-  - Linux amd64 and arm64 Docker coverage runs pass.
-- `renameat` and `unlinkat` matter for atomic replace patterns, compaction, WAL
-  rotation, and cleanup behavior.
+- [x] Dedicated `/tmp/.chaos-net.conf` grammar with endpoint selectors
+  - Selectors: `*`, `tcp4`, `tcp6`, `udp4`, `udp6`, `unix`. (The original
+    `dns` selector moved to `libchaos-dns`.)
+- [x] Endpoint-based matching instead of descriptor-number matching
+  - Peer or local identity depending on the operation.
+- [x] First socket wrapper set
+  - `bind`, `listen`, `connect`, `accept` (`accept`, `accept4`), `send`
+    (`send`, `sendto`, `sendmsg`), `recv` (`recv`, `recvfrom`, `recvmsg`).
+  - The original `dns` operation (`getaddrinfo`) moved to `libchaos-dns`.
+- [x] First network effect set
+  - `ERRNO`, `LATENCY`, `CORRUPT` (recv only). The original `GAI` effect moved
+    to `libchaos-dns`.
+- [x] Remaining planned wrapper surface
+  - `socket` (`socket`, `socketpair`), `shutdown`, `poll` (`poll`, `ppoll`,
+    `select`, `pselect`, `epoll_wait`, `epoll_pwait`); `sendmmsg`, `recvmmsg`.
+- [x] Remaining planned effect set: `TIMEOUT` for readiness waits
+- [x] Docker runtime probes for `libchaos-net` on glibc and Alpine
+- [x] `src/net/*.c` inside the 100.00 % per-file coverage gate
+- [x] Generic descriptor calls on sockets: `read`/`readv` as `recv`,
+  `write`/`writev` as `send`, `close` as `close`, shared with `libchaos-io`
+  by descriptor kind (supersedes the earlier "net does not own read/write/close")
+- [x] Receive and teardown effects: `RESET`, `TRICKLE`, `DUP`
 
 ## Phase 4: Mapped File I/O
 
-This is high value for databases, but it is not a small extension of the
-current wrapper model.
+High value for databases (SQLite, LMDB), but not a small extension of the
+wrapper model.
 
 - [ ] Design mapped-I/O semantics before implementation.
-  - Cross-target completion gate applies.
-- [ ] Evaluate `mmap`
-  - Cross-target completion gate applies.
+- [x] Evaluate `mmap`
+  - The mapping boundary is covered by `libchaos-memory`: `mmap/file` and
+    `mmap/anon` selectors with `ERRNO` and `LATENCY`. Faults on the data of
+    mapped pages remain undesigned.
 - [ ] Evaluate `msync`
-  - Cross-target completion gate applies.
-- [ ] Decide how mapped writes should relate to `TORN`, `ERRNO`, and durability
-  failures.
-  - Cross-target completion gate applies.
+- [ ] Decide how mapped writes relate to `TORN`, `ERRNO` and durability failures.
 
-Notes:
-
-- SQLite and LMDB style workloads make this valuable.
-- The failure model is different enough that this phase should not be mixed into
-  earlier wrapper work.
+The failure model differs enough that this phase stays separate from the
+earlier wrapper work. Cross-target completion gate applies.
 
 ## Deferred Inside `libchaos-io`
 
-These are useful but not in the first execution path.
+- [ ] Evaluate `openat2` — Linux-specific and ABI-sensitive (`struct open_how`);
+  after `openat` is settled.
+- [ ] Evaluate `statfs` — can fake visible disk pressure, but does not replace
+  real write or sync failures.
 
-- [ ] Evaluate `openat2`
-  - Cross-target completion gate applies.
-- [ ] Evaluate `statfs`
-  - Cross-target completion gate applies.
-
-Notes:
-
-- `openat2` is Linux-specific and ABI-sensitive; it should come only after
-  `openat` is solid.
-- `statfs` can fake visible disk pressure, but it does not replace real write or
-  sync failures.
+Cross-target completion gate applies.
 
 ## Not Planned For `libchaos-io`
 
-The following areas are worth pursuing, but they should not be added to
-`libchaos-io` itself. Folding them into this library would increase code size,
-semantic complexity, and cross-libc risk too much.
+These surfaces belong in separate libraries; folding them into `libchaos-io`
+would grow size, semantic complexity and cross-libc risk.
 
 ### Network Chaos
 
-Candidate future library: `libchaos-net`
+Shipped as `libchaos-net` (sockets) and `libchaos-dns` (resolver):
 
-- `connect`
-- `accept`
-- `send`
-- `recv`
-- `sendmsg`
-- `recvmsg`
-- `getaddrinfo`
-- `poll`
-- `epoll_wait`
-YOU 
+- [x] `connect`
+- [x] `accept`
+- [x] `send`
+- [x] `recv`
+- [x] `sendmsg`
+- [x] `recvmsg`
+- [x] `getaddrinfo` (in `libchaos-dns`)
+- [x] `poll`
+- [x] `epoll_wait`
+
 ### Time Chaos
 
-Current shipped library: `libchaos-time`
+Shipped as `libchaos-time`:
 
-- `clock_gettime`
-- `nanosleep`
-- `usleep`
-
-Candidate future time hooks:
-
-- `clock_nanosleep`
-- `gettimeofday`
+- [x] `clock_gettime`
+- [x] `nanosleep`
+- [x] `usleep`
+- [x] `clock_nanosleep` (under the `nanosleep` rules)
+- [x] `gettimeofday` (under the `clock_gettime/realtime` rules)
 
 ### Memory Chaos
 
-Current shipped library: `libchaos-memory`
+Shipped as `libchaos-memory`:
 
-- `mmap`
-- `munmap`
-- `madvise`
-- `mprotect`
-
-Candidate future memory hooks:
-
-- `mmap64`
-- `mremap`
-- `brk`
-- `sbrk`
+- [x] `mmap`
+- [x] `munmap`
+- [x] `madvise`
+- [x] `mprotect`
+- [x] `mmap64` (alias on 64-bit glibc)
+- [ ] `mremap`
+- [ ] `brk`
+- [ ] `sbrk`
 
 ### Process Chaos
 
-Candidate future library: `libchaos-proc`
+Shipped as `libchaos-process` (planned under the name `libchaos-proc`):
 
-- `fork`
-- `clone`
+- [x] `fork`
+- [ ] `clone`
+- [ ] `vfork` (a wrapper must not sleep in the child, which shares the parent's stack)
+- [ ] `kill`, `pthread_kill`
 
 ## CI And Verification Roadmap
 
-- [ ] Keep unit tests as the primary branch-complete correctness gate.
-  - Cross-target completion gate applies.
-- [ ] Keep native Linux integration tests for end-to-end local verification.
-  - Cross-target completion gate applies.
-- [ ] Keep musl Docker runtime verification.
-  - Cross-target completion gate applies.
-- [ ] Close the cross-target gate for glibc Docker runtime verification.
-  - The runtime test exists and passes on arm64 locally.
-  - The remaining local gap is amd64 runtime proof on a Docker host with enough
-    free space.
-  - Cross-target completion gate applies.
-- [ ] Run runtime tests on both amd64 and arm64 CI runners.
-  - Cross-target completion gate applies.
-- [ ] Report artifact sizes for every dist build.
-  - Cross-target completion gate applies.
-- [ ] Add a size budget only after the current artifact sizes are stable.
-  - Cross-target completion gate applies.
+- [x] Unit tests as the primary branch-complete correctness gate
+  (`make unit`, `make coverage` at 100.00 % per file; ASan and UBSan runs)
+- [x] Native Linux integration tests (`ci.yml`, every glibc runtime suite)
+- [x] musl Docker runtime verification (`matrix.yml`, Alpine suites)
+- [x] glibc Docker runtime verification on amd64 and arm64 (`matrix.yml`)
+- [x] Runtime tests on both amd64 and arm64 CI runners
+- [x] glibc symbol-version floor (`check_glibc_baseline.sh`, `GLIBC_2.17`, release gate)
+- [x] Report artifact sizes for every dist build (`ls -lah` of every
+  `dist/libchaos-*.so` in `matrix.yml`; job log only)
+- [ ] Add a size budget once artifact sizes are stable
 
 ## Execution Order
 
-Recommended implementation order:
+1. [x] `openat`
+2. [x] `sendfile`
+3. [x] glibc Docker runtime test
+4. [x] `copy_file_range`
+5. [x] `readv` / `writev` / `preadv` / `pwritev`
+6. [x] file lifecycle and capacity operations
+7. [ ] mapped file I/O design
+8. [x] sibling libraries for network, DNS, time, memory and process chaos
 
-1. `openat` with the cross-target completion gate enforced
-2. `sendfile` with the cross-target completion gate enforced
-3. glibc Docker runtime test with the cross-target completion gate enforced
-4. `copy_file_range` with the cross-target completion gate enforced
-5. `readv` / `writev` / `preadv` / `pwritev` with the cross-target completion gate enforced
-6. file lifecycle and capacity operations with the cross-target completion gate enforced
-7. mapped file I/O design with the cross-target completion gate enforced
-8. separate sibling libraries for network, time, memory, and process chaos, each with their own cross-target completion gate
+Each step carries its own cross-target completion gate.
 
 ---
 

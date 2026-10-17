@@ -1,5 +1,8 @@
-/* process use-case 2 — fork a child that execve()s /bin/true, and keep running.
- * With execve:ERRNO:EACCES the exec is denied, the child exits non-zero, the PARENT lives. */
+/* Demo proc2: fork a child that execve()s /bin/true, wait for it, report. Under
+ * libchaos-process with `execve:ERRNO:EACCES` the exec fails, the child exits with status
+ * 13 (EACCES) and the parent keeps running: a denied subprocess must not take the caller
+ * down. The child's own printf line is buffered when stdout is a pipe and _exit() discards
+ * it, so under `docker compose run -T` only the parent's line appears. */
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>

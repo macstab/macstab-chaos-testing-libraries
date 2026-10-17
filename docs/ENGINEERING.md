@@ -13,20 +13,14 @@
 
 ---
 
-This document records repository-wide engineering rules and release discipline.
-It still uses `libchaos-io` as the most detailed concrete example, but the
-same expectations now apply across `libchaos-net`, `libchaos-dns`,
-`libchaos-time`, `libchaos-memory`, and `libchaos-process`.
-Subsystem-specific current-state details live in
-[`docs/NETWORK.md`](NETWORK.md),
-DNS-specific current-state details live in
-[`docs/DNS.md`](DNS.md),
-and time-specific current-state details live in
-[`docs/TIME.md`](TIME.md),
-and memory-specific current-state details live in
-[`docs/MEMORY.md`](MEMORY.md),
-and process-specific current-state details live in
-[`docs/PROCESS.md`](PROCESS.md).
+This document holds the repository-wide engineering rules: how the code is
+organised, which invariants every change must keep, how it is tested and
+built, and why. `libchaos-io` is the most detailed example; the same rules
+apply to every library. The system-level contract is in
+[SYSTEM.md](SYSTEM.md); per-library behaviour is in [IO.md](IO.md),
+[NETWORK.md](NETWORK.md), [DNS.md](DNS.md), [TIME.md](TIME.md),
+[MEMORY.md](MEMORY.md) and [PROCESS.md](PROCESS.md); SECCOMP mode in
+[SECCOMP.md](SECCOMP.md).
 
 ## Table of Contents
 
@@ -40,702 +34,515 @@ and process-specific current-state details live in
 - [Extending The Library Safely](#extending-the-library-safely)
 - [ABI Commitments](#abi-commitments)
 - [Build Flag Rationale](#build-flag-rationale)
+- [Verified Doc Examples](#verified-doc-examples)
 - [Maintenance Bar](#maintenance-bar)
 
 ## Scope
 
-This repository ships deliberately small `LD_PRELOAD` libraries for Linux fault
-injection. They are not general observability agents, not daemons, and not
-full policy engines. Each library exists to do one job well: intercept a
-narrow libc-facing surface and make it fail, slow down, or otherwise misbehave
-under explicit rules.
+Each library intercepts one narrow libc surface and makes it fail, stall or
+misbehave under explicit rules. None is an observability agent, a daemon or a
+policy engine.
 
-The project is optimized for:
+Optimised for: small objects (`-Os`, stripped), deterministic behaviour under
+test, wrappers that can be audited line by line, explicit failure semantics.
 
-- small shared-library outputs
-- deterministic behavior under test
-- easy auditing of wrapper behavior
-- explicit failure semantics
+Not optimised for: feature breadth, plugin systems, runtime configuration
+APIs, abstraction for its own sake.
 
-The project is not optimized for:
+Quality bar, identical for all six libraries and `chaos-init`
+(`.github/workflows/ci.yml`, `matrix.yml`, `release.yml`):
 
-- feature breadth
-- plugin systems
-- runtime configuration APIs
-- abstract framework design
-
-Current maturity boundary:
-
-- `libchaos-io` is at the repository's full bar: strict source-line coverage
-  gate plus Docker runtime validation
-- `libchaos-net` is now at the same bar: strict source-line coverage gate plus
-  Docker runtime validation
-- `libchaos-dns` is now inside the repository QA gate: enforced source-line
-  coverage floor plus Docker runtime validation
-- `libchaos-time` is now at the same bar: strict source-line coverage gate plus
-  Docker runtime validation
-- `libchaos-memory` is now at the same bar: strict source-line coverage gate
-  plus Docker runtime validation
-- `libchaos-process` is now at the same bar: strict source-line coverage gate
-  plus Docker runtime validation
-
-Repository-wide release discipline now also includes a `clang-format` check for
-all shipped C sources and tests. Formatting is part of the quality gate, not a
-best-effort cleanup step.
+- 100.00 % line coverage per source file (`test/runtime/check_coverage.sh`;
+  `src/init/chaos_init.c`, the supervisor's `main` loop, is exercised by the
+  runtime suites `test_init.sh` and `test_seccomp.sh` instead)
+- unit tests under ASan and UBSan; the clang static analyzer
+- `clang-format` conformance of `src/` and `test/` (`make fmt-check`)
+- runtime suites on glibc and musl, amd64 and arm64, each on a runner of its
+  own architecture
+- glibc symbol versions no newer than `GLIBC_2.17`
+  (`test/runtime/check_glibc_baseline.sh`, run on the release `dist/` objects)
 
 ## How To Read The Code
 
-If you are new to the repository, read each subsystem in the order listed below.
-Each file is listed with a one-line description of its role.
+Read each library in the order below. Every library has the same four layers:
+start-up and real functions, rule file and snapshots, effects, wrappers.
+Shared mechanisms live in header-only `src/common/` (see
+[SYSTEM.md §6](SYSTEM.md#shared-internal-scaffold)).
 
 ### `libchaos-io`
 
-1. [`src/core/chaos_io.c`](../src/core/chaos_io.c) — shared runtime core: constructor, symbol resolution, common fd-rule helper
-2. [`src/core/chaos_io_wrappers.h`](../src/core/chaos_io_wrappers.h) — shared entry-point declarations
-3. [`src/wrappers/chaos_io_open.c`](../src/wrappers/chaos_io_open.c) — path-first wrappers, openat resolution, fd-cache seeding
-4. [`src/wrappers/chaos_io_rw.c`](../src/wrappers/chaos_io_rw.c) — read/write wrappers, iovec trimming, sendfile, copy_file_range
-5. [`src/wrappers/chaos_io_fsops.c`](../src/wrappers/chaos_io_fsops.c) — ftruncate, fallocate, unlinkat, renameat; fd-cache invalidation
-6. [`src/wrappers/chaos_io_sync.c`](../src/wrappers/chaos_io_sync.c) — close, fsync, fdatasync; post-success-only invalidation
-7. [`src/config/chaos_io_config.c`](../src/config/chaos_io_config.c) — two-snapshot CAS reload, rule parser, operation/effect dispatch
-8. [`src/effects/chaos_io_actions.c`](../src/effects/chaos_io_actions.c) — probability sampling, latency sleep, buffer corruption, torn-write sizing
-9. [`src/config/chaos_io_fdcache.c`](../src/config/chaos_io_fdcache.c) — 32-slot direct-mapped fd→path cache, /proc/self/fd readlink on miss
+1. [`src/core/chaos_io.c`](../src/core/chaos_io.c) — constructor, lazy real-function table (`chaos_io_ensure_symbols`), seed, the shared fd-rule lookup
+2. [`src/core/chaos_io_internal.h`](../src/core/chaos_io_internal.h) — limits, real-function types, recursion guard, PRNG
+3. [`src/core/chaos_io_wrappers.h`](../src/core/chaos_io_wrappers.h) — helpers shared across wrapper units
+4. [`src/wrappers/chaos_io_open.c`](../src/wrappers/chaos_io_open.c) — `open`/`openat` families, `at`-path resolution, fd-cache seeding
+5. [`src/wrappers/chaos_io_rw.c`](../src/wrappers/chaos_io_rw.c) — `read`/`write` families, vectored I/O, `sendfile`, `copy_file_range`
+6. [`src/wrappers/chaos_io_fsops.c`](../src/wrappers/chaos_io_fsops.c) — truncate, allocate, unlink, rename families
+7. [`src/wrappers/chaos_io_sync.c`](../src/wrappers/chaos_io_sync.c) — `close`, `dup2`/`dup3`, `close_range`, `closefrom`, `fsync`, `fdatasync`
+8. [`src/wrappers/chaos_io_stdio.c`](../src/wrappers/chaos_io_stdio.c) — stdio streams
+9. [`src/config/chaos_io_config.c`](../src/config/chaos_io_config.c) — reload, parser, longest-prefix selection
+10. [`src/effects/chaos_io_actions.c`](../src/effects/chaos_io_actions.c) — probability, latency, corruption, torn-write sizing
+11. [`src/config/chaos_io_fdcache.c`](../src/config/chaos_io_fdcache.c) — process-wide 32-slot fd→path cache
 
 ### `libchaos-net`
 
-1. [`src/net/chaos_net.c`](../src/net/chaos_net.c) — constructor: symbol resolution, PRNG seed, initial config load
-2. [`src/net/chaos_net_config.c`](../src/net/chaos_net_config.c) — two-snapshot CAS reload, rule parser, endpoint-rank match selection
-3. [`src/net/chaos_net_endpoint.c`](../src/net/chaos_net_endpoint.c) — sockaddr→endpoint translation: IPv4/IPv6 parsing, UNIX socket exclusion, accept/accept4 direction (output sockaddr, uses getsockname)
-4. [`src/net/chaos_net_socket.c`](../src/net/chaos_net_socket.c) — connect/accept/send/recv wrappers
-5. [`src/net/chaos_net_wait.c`](../src/net/chaos_net_wait.c) — select/poll/epoll wrappers, multi-fd scan, /proc/self/fdinfo epoll member lookup
-6. [`src/net/chaos_net_actions.c`](../src/net/chaos_net_actions.c) — probability sampling, latency sleep, corruption draws, usleep chunking
+1. [`src/net/chaos_net.c`](../src/net/chaos_net.c) — constructor, real functions, seed
+2. [`src/net/chaos_net_config.c`](../src/net/chaos_net_config.c) — reload, parser, endpoint-rank selection
+3. [`src/net/chaos_net_endpoint.c`](../src/net/chaos_net_endpoint.c) — selector parsing; endpoints from `sockaddr`, `getsockname`/`getpeername`, `SO_TYPE`
+4. [`src/net/chaos_net_socket.c`](../src/net/chaos_net_socket.c) — `connect`, `accept`, `send*`/`recv*`, and `read`/`write`/`readv`/`writev`/`close` on sockets; `TRICKLE`, `DUP`, `RESET`
+5. [`src/net/chaos_net_extra.c`](../src/net/chaos_net_extra.c) — `socket`, `socketpair`, `shutdown`, `sendmmsg`, `recvmmsg`
+6. [`src/net/chaos_net_wait.c`](../src/net/chaos_net_wait.c) — `poll`, `ppoll`, `select`, `pselect`, `epoll_wait`, `epoll_pwait`; epoll membership from `/proc/self/fdinfo`
+7. [`src/net/chaos_net_actions.c`](../src/net/chaos_net_actions.c) — probability, latency, corruption
 
 ### `libchaos-dns`
 
-1. [`src/dns/chaos_dns.c`](../src/dns/chaos_dns.c) — constructor: symbol resolution, PRNG seed (raw /dev/urandom syscall), initial config load
-2. [`src/dns/chaos_dns_config.c`](../src/dns/chaos_dns_config.c) — two-snapshot CAS reload, DNS rule parser, suffix-depth match selection
-3. [`src/dns/chaos_dns_actions.c`](../src/dns/chaos_dns_actions.c) — getaddrinfo transform pipeline (FILTER_FAMILY → SHUFFLE → LIMIT), latency, EAI injection, REWRITE, SERVICE, OVERRIDE
-4. [`src/dns/chaos_dns_lookup.c`](../src/dns/chaos_dns_lookup.c) — getaddrinfo and getnameinfo wrapper bodies
+1. [`src/dns/chaos_dns.c`](../src/dns/chaos_dns.c) — constructor, real functions, seed
+2. [`src/dns/chaos_dns_config.c`](../src/dns/chaos_dns_config.c) — reload, parser, exact/suffix/any ranking
+3. [`src/dns/chaos_dns_lookup.c`](../src/dns/chaos_dns_lookup.c) — `getaddrinfo`, `getnameinfo`, `gethostby*` wrappers
+4. [`src/dns/chaos_dns_actions.c`](../src/dns/chaos_dns_actions.c) — latency, `EAI_*`, rewrites, `FILTER_FAMILY` → `SHUFFLE` → `LIMIT`
+5. [`src/dns/chaos_dns_owned.c`](../src/dns/chaos_dns_owned.c) — `OVERRIDE` result lists and their release through `freeaddrinfo`
 
 ### `libchaos-time`
 
-1. [`src/time/chaos_time.c`](../src/time/chaos_time.c) — constructor: symbol resolution, PRNG seed, initial config load
-2. [`src/time/chaos_time_config.c`](../src/time/chaos_time_config.c) — two-snapshot CAS reload, time rule parser
-3. [`src/time/chaos_time_actions.c`](../src/time/chaos_time_actions.c) — latency sleep chunks, OFFSET apply (signed nanosecond arithmetic, negative-clamp, CLOCK_MONOTONIC non-monotonicity), probability sampling
-4. [`src/time/chaos_time_hooks.c`](../src/time/chaos_time_hooks.c) — clock_gettime, clock_getres, nanosleep, usleep wrappers
+1. [`src/time/chaos_time.c`](../src/time/chaos_time.c) — constructor, real functions, seed, first load
+2. [`src/time/chaos_time_config.c`](../src/time/chaos_time_config.c) — reload, parser, clock selectors
+3. [`src/time/chaos_time_actions.c`](../src/time/chaos_time_actions.c) — probability, latency, `OFFSET` arithmetic (clamped at `{0, 0}`), `REGRESS` state
+4. [`src/time/chaos_time_hooks.c`](../src/time/chaos_time_hooks.c) — `clock_gettime`, `gettimeofday`, `time`, `timespec_get`, `nanosleep`, `clock_nanosleep`, `sleep`, `usleep`
 
 ### `libchaos-memory`
 
-1. [`src/memory/chaos_memory.c`](../src/memory/chaos_memory.c) — constructor: symbol resolution, PRNG seed, initial config load
-2. [`src/memory/chaos_memory_config.c`](../src/memory/chaos_memory_config.c) — two-snapshot CAS reload, memory rule parser
-3. [`src/memory/chaos_memory_actions.c`](../src/memory/chaos_memory_actions.c) — ERRNO injection, LATENCY, DELAY; why CORRUPT/OFFSET are absent from mmap
-4. [`src/memory/chaos_memory_hooks.c`](../src/memory/chaos_memory_hooks.c) — mmap, mprotect, munmap, madvise wrappers; MAP_ANONYMOUS detection (flags & 0x20), glibc MMAP_THRESHOLD note
+1. [`src/memory/chaos_memory.c`](../src/memory/chaos_memory.c) — constructor, real functions, seed
+2. [`src/memory/chaos_memory_config.c`](../src/memory/chaos_memory_config.c) — reload, parser, `mmap/anon` and `mmap/file` selectors
+3. [`src/memory/chaos_memory_actions.c`](../src/memory/chaos_memory_actions.c) — `ERRNO` and `LATENCY`
+4. [`src/memory/chaos_memory_hooks.c`](../src/memory/chaos_memory_hooks.c) — `mmap`/`mmap64`, `mprotect`, `madvise`/`posix_madvise`, `munmap`
 
 ### `libchaos-process`
 
-1. [`src/process/chaos_process.c`](../src/process/chaos_process.c) — constructor: symbol resolution, PRNG seed; `chaos_process_try_resolve_symbol` for musl's missing execveat
-2. [`src/process/chaos_process_config.c`](../src/process/chaos_process_config.c) — two-snapshot CAS reload, process rule parser
-3. [`src/process/chaos_process_actions.c`](../src/process/chaos_process_actions.c) — ERRNO injection, LATENCY (with vfork POSIX async-signal-safe hazard note), FAIL_AFTER counter logic (pre-increment, shared across threads, reset on reload)
-4. [`src/process/chaos_process_hooks.c`](../src/process/chaos_process_hooks.c) — pthread_create, fork, posix_spawn, execve, execveat, waitpid wrappers; posix_spawn glibc/musl cascade gap; exec process-image replacement (library is gone after successful exec)
+1. [`src/process/chaos_process.c`](../src/process/chaos_process.c) — constructor, real functions (`chaos_process_try_resolve_symbol` for symbols a libc may lack), seed, `FAIL_AFTER` counters
+2. [`src/process/chaos_process_config.c`](../src/process/chaos_process_config.c) — reload, parser; resets `FAIL_AFTER` counters when the rules change
+3. [`src/process/chaos_process_actions.c`](../src/process/chaos_process_actions.c) — probability, latency, `FAIL_AFTER`
+4. [`src/process/chaos_process_hooks.c`](../src/process/chaos_process_hooks.c) — `pthread_create`, `fork`, `posix_spawn*`, `system`, `popen`, the `exec*` family, the `wait*` family
+
+### `chaos-init`
+
+1. [`src/init/chaos_init.c`](../src/init/chaos_init.c) — PID 1: fork, filter handover, status, notification loop, signal forwarding, reaping
+2. [`src/init/chaos_init_core.c`](../src/init/chaos_init_core.c) — argument parsing, BPF filter, kernel-version checks, exit codes (no system calls)
+3. [`src/init/chaos_init_delay.c`](../src/init/chaos_init_delay.c) — queue of calls held back by `LATENCY`
+4. [`src/init/chaos_init_proc.c`](../src/init/chaos_init_proc.c) — reading a tracee's memory, descriptors and identity
+5. [`src/init/chaos_init_tracee.c`](../src/init/chaos_init_tracee.c) — per-tracee hits, `@first` claims, windows
+6. `src/init/chaos_init_{io,net,memory,process}.c` — each library's rules applied to notified system calls
 
 ## File Responsibilities
 
 ### [`src/core/chaos_io.c`](../src/core/chaos_io.c)
 
-This file owns shared runtime state and lifecycle setup.
+Owns process-global state and start-up.
 
-Use it when:
+Change it to: add or resolve a real function; change constructor order;
+change the recursion-guard boundary; change the shared fd-rule lookup
+(`chaos_io_match_fd_rule`: refresh → resolve fd → select).
 
-- adding or resolving a downstream libc symbol
-- changing recursion-guard boundaries
-- changing constructor ordering
-- changing shared fd-backed rule lookup behavior
-- changing startup behavior
+Do not put wrapper flow, probability math or fd-cache policy here.
 
-Do not use it for:
+Invariants:
 
-- wrapper-specific call flow
-- probability math
-- fd-cache policies
-
-The main invariant is simple: shared runtime helpers should stay small, typed,
-and obviously safe under preload recursion.
+- Every wrapper calls `chaos_io_ensure_symbols()` before touching a real
+  function pointer. The constructor may run after another library's
+  constructor has already called a wrapper.
+- A mandatory symbol that cannot be resolved aborts; an optional one
+  (`close_range`, `closefrom`, `renameat2`, `__vfprintf_chk`, `__fread_chk`,
+  `__fgets_chk`) stays NULL and its wrapper reports `ENOSYS`.
+- Descriptors 0–2 are never matched.
 
 ### [`src/wrappers/chaos_io_open.c`](../src/wrappers/chaos_io_open.c)
 
-This file owns path-first wrappers and open-path resolution.
+Owns the path-first wrappers. `open` and `openat` (and their `64`, `__*_2`
+and `creat` variants) share varargs handling, path resolution and fd-cache
+seeding; keep them together.
 
-Use it when:
-
-- adding or changing `open()` behavior
-- adding or changing `openat()` behavior
-- changing varargs forwarding for open-style calls
-- changing pre-open path resolution and fd-cache seeding
-
-Keep the `open()` and `openat()` wrappers together. They share ABI handling,
-rule matching, and post-open cache population.
+`mode_t` is read from the varargs as `int` (default promotion) only when
+`O_CREAT` or `O_TMPFILE` is set, and passed as a third argument only then.
 
 ### [`src/wrappers/chaos_io_rw.c`](../src/wrappers/chaos_io_rw.c)
 
-This file owns read- and write-side wrappers.
+Owns read- and write-class wrappers.
 
-Use it when:
-
-- adding a new fd-backed data-path wrapper
-- changing when read corruption is applied
-- changing when torn writes are applied
-- changing Linux `sendfile()` or `copy_file_range()` behavior
-
-The invariant here is operational symmetry: read-style wrappers should stay
-read-like, write-style wrappers should stay write-like, and Linux
-`sendfile()` plus `copy_file_range()` must remain explicitly destination-side.
+Invariant: read-class wrappers may delay, fail, or corrupt returned bytes;
+write-class wrappers may delay, fail, or shorten the request. `sendfile` and
+`copy_file_range` are write-class on the destination descriptor only, with no
+`CORRUPT` (the data never enters user space). The caller's iovec array is read
+only after a rule matched, never past `IOV_MAX` entries, and through a checked
+copy (`process_vm_readv` on the own process), so an invalid array still fails
+in the kernel with `EINVAL` or `EFAULT` instead of crashing the wrapper.
 
 ### [`src/wrappers/chaos_io_fsops.c`](../src/wrappers/chaos_io_fsops.c)
 
-This file owns size-change and path-identity wrappers.
-
-Use it when:
-
-- adding or changing `ftruncate()` behavior
-- adding or changing Linux `fallocate()` behavior
-- adding or changing `unlinkat()` behavior
-- adding or changing `renameat()` behavior
-- changing how successful path-identity changes invalidate the fd cache
-
-Keep the policy narrow here. These wrappers support only errno injection and
-latency. If they start growing torn-write or corruption semantics, the config
-model is drifting.
+Owns size-change and path-identity wrappers: `ftruncate`, `truncate`,
+`fallocate`, `posix_fallocate`, `unlinkat`, `unlink`, `rmdir`, `remove`,
+`renameat`, `renameat2`, `rename`. Only `ERRNO` and `LATENCY` apply. A
+successful unlink or rename resets the whole fd cache: a rename changes what
+previously resolved paths mean, and selective invalidation would require
+knowing every path resolved under the old name.
 
 ### [`src/wrappers/chaos_io_sync.c`](../src/wrappers/chaos_io_sync.c)
 
-This file owns close and persistence-boundary wrappers.
+Owns `close`, `fsync`, `fdatasync` and the descriptor-recycling calls
+(`dup2`, `dup3`, `close_range`, `closefrom`, `closedir`, `pclose`). `fsync`
+and `fdatasync` take `ERRNO` and `LATENCY` only. Keep these wrappers free of
+effect-specific policy.
 
-Use it when:
+### [`src/wrappers/chaos_io_stdio.c`](../src/wrappers/chaos_io_stdio.c)
 
-- changing `close()` semantics
-- changing sync-wrapper behavior
-- changing how fd-cache invalidation relates to successful close
-
-Keep these wrappers boring. If they grow effect-specific policy beyond latency
-and errno injection, the design is probably drifting.
+Owns stdio. glibc and musl read and write a `FILE` with internal system calls,
+never through `read`/`write`, so stdio needs its own wrappers to be faulted at
+all. Read class: `fread`, `fgets`, `fgetc`, `getc`, `getline`, `getdelim`,
+`__getdelim`, `__fread_chk`, `__fgets_chk`. Write class: `fwrite`, `fputs`,
+`fputc`, `putc`, `fprintf`, `vfprintf`, `fflush`, `__fprintf_chk`,
+`__vfprintf_chk`. `ERRNO` returns the stdio error value (0 items, NULL, EOF,
+negative count), sets errno and raises the stream's error indicator (bit
+`0x20` of the first word of `FILE` on glibc and musl, set under the stream
+lock). `TORN` does not apply: a short `fwrite` signals an error in stdio, not
+partial success. Not wrapped: `scanf` family, `*_unlocked`, and
+`printf`/`puts`/`putchar`/`getchar`, which only use descriptors 0–2.
 
 ### [`src/config/chaos_io_config.c`](../src/config/chaos_io_config.c)
 
-This file owns config ingestion and rule selection.
+Owns rule-file ingestion and rule selection. Invariants:
 
-Use it when:
-
-- extending the config grammar
-- adding a new operation or effect
-- changing reload behavior
-- changing prefix-matching semantics
-
-The critical invariants are:
-
-- invalid config means passthrough, not partial activation
-- longest prefix wins
-- prefix matching is path-boundary aware
-- one thread may reload, many threads may read
+- a rejected file means no rules, never a partial rule set
+- the longest matching prefix wins; prefixes match at path boundaries
+  (`/data` covers `/data/file`, not `/database`)
+- `*` covers absolute paths except `/memfd:`; pipes, sockets and anonymous
+  inodes only match a rule that names them
+- one thread reloads, any number read
 
 ### [`src/effects/chaos_io_actions.c`](../src/effects/chaos_io_actions.c)
 
-This file owns effect mechanics, not rule lookup.
-
-Use it when:
-
-- changing probability behavior
-- changing how torn writes are sized
-- changing corruption behavior
-- changing latency application
-
-The wrappers should not reimplement effect logic. If the same branching starts
-appearing in multiple wrappers, it belongs here instead.
+Owns effect mechanics, not lookup. If the same effect branching appears in
+two wrappers, it belongs here.
 
 ### [`src/config/chaos_io_fdcache.c`](../src/config/chaos_io_fdcache.c)
 
-This file translates descriptor-based calls back into paths.
+Translates descriptors back into paths. 32 direct-mapped slots indexed by
+`fd % 32`, one table per process, mapped with a raw `mmap` on the first store.
 
-Use it when:
+- Each slot has a seqlock (odd while written) and a generation bumped by every
+  invalidation; a lookup that raced with `close` cannot store the stale path.
+- Excluded paths (the rule file, `/proc`, `/sys`, `/dev`) are never stored or returned.
+- If the table cannot be mapped, every lookup reads `/proc/self/fd`.
 
-- changing cache size or policy
-- changing how `/proc/self/fd/<fd>` results are filtered
-- changing when cache entries are stored or invalidated
-
-The cache is intentionally small and direct-mapped. That is a deliberate trade:
-the library prefers simple predictable code and a tiny footprint over perfect
-hit ratios.
+It used to be thread-local. That cost every thread `32 × PATH_MAX` bytes of
+static TLS from its first instruction (the static-TLS budget that crashed the
+Erlang VM under `libchaos-net`) and left other threads' entries stale after a
+`close`, so a recycled descriptor number could match the old path.
 
 ### [`src/net/chaos_net.c`](../src/net/chaos_net.c)
 
-This file owns the network subsystem's runtime state and constructor.
-
-Use it when:
-
-- adding or resolving a downstream network libc symbol
-- changing the PRNG seed path
-- changing constructor ordering or startup behavior
-- changing reentrancy-guard boundaries shared across network wrappers
-
-Do not use it for:
-
-- wrapper-specific call flow
-- endpoint translation logic
-- config parse rules
+Owns net start-up: real functions, seed, constructor order. Not for wrapper
+flow, endpoint translation or parsing.
 
 ### [`src/net/chaos_net_config.c`](../src/net/chaos_net_config.c)
 
-This file owns network config ingestion and endpoint-rank match selection.
-
-Use it when:
-
-- extending the network config grammar
-- adding a new network operation or effect
-- changing reload behavior
-- changing how endpoint rank comparisons are ordered
-
-The critical invariants mirror the IO config model: invalid config means
-passthrough, the two-snapshot CAS must remain all-or-nothing, and one thread
-may reload while many threads read.
+Owns net rule-file ingestion and endpoint-rank selection: a more specific
+endpoint beats a wildcard; equal ranks go to the longer selector text. Same
+reload invariants as io.
 
 ### [`src/net/chaos_net_endpoint.c`](../src/net/chaos_net_endpoint.c)
 
-This file owns sockaddr-to-endpoint translation.
-
-Use it when:
-
-- adding support for a new address family
-- changing how IPv4-mapped IPv6 addresses are normalized
-- changing UNIX socket exclusion policy
-- changing how the accept/accept4 direction is determined via getsockname
-
-Do not use it for wrapper flow, probability math, or config parsing. Its
-single job is translating a raw sockaddr into a matchable endpoint
-representation.
+Translates a `sockaddr` (or a descriptor's local/peer address) into a
+matchable endpoint. Kind comes from `(sa_family, SO_TYPE)` with
+`SOCK_CLOEXEC`/`SOCK_NONBLOCK` masked off. Change it to add an address
+family or change IPv4-mapped IPv6 normalisation. A descriptor that is not a
+socket yields `ENOTSOCK`, which is how the shared wrappers leave files to io.
 
 ### [`src/net/chaos_net_socket.c`](../src/net/chaos_net_socket.c)
 
-This file owns the connect, accept, send, and recv wrapper bodies.
+Owns `connect`, `accept`/`accept4`, `send`/`sendto`/`sendmsg`,
+`recv`/`recvfrom`/`recvmsg`, the fortified receive variants, and the generic
+`read`/`readv` (counted as `recv`), `write`/`writev` (counted as `send`) and
+`close` on sockets. Every call it does not decide goes to `RTLD_NEXT`, never
+to libc directly. Receive reshaping lives here: `TRICKLE` only on stream
+sockets (shortening a datagram receive truncates the datagram), and only for
+iovec arrays of at most 64 entries; `DUP` skips peeks, `MSG_TRUNC`,
+out-of-band and error-queue reads, `MSG_WAITALL` and empty buffers.
 
-Use it when:
+### [`src/net/chaos_net_extra.c`](../src/net/chaos_net_extra.c)
 
-- adding or changing connect behavior
-- adding or changing accept or accept4 behavior
-- adding or changing send, sendto, recv, or recvfrom behavior
-- changing how endpoint resolution feeds into rule matching for each call
-
-Keep this file's scope limited to the four logical operation families. If a new
-network call does not naturally belong with connect, accept, send, or recv, it
-may warrant its own translation unit.
+Owns `socket`, `socketpair`, `shutdown`, `sendmmsg`, `recvmmsg`. `socket`
+selectors can use only kind and wildcards: there is no address yet.
 
 ### [`src/net/chaos_net_wait.c`](../src/net/chaos_net_wait.c)
 
-This file owns the multiplexed-wait wrappers.
-
-Use it when:
-
-- adding or changing select behavior
-- adding or changing poll behavior
-- adding or changing epoll_wait behavior
-- changing how epoll member fd sets are discovered via /proc/self/fdinfo
-- changing multi-fd scan logic
-
-The critical invariant here is that multi-fd scans must not allocate heap
-memory. All fd enumeration must remain on-stack or use fixed-size arrays.
+Owns readiness waits. Multi-descriptor scans do not allocate. Epoll
+membership is read from `/proc/self/fdinfo/<epfd>` in 512-byte chunks, at most
+256 KiB per wait; when it cannot be read the wait passes through.
 
 ### [`src/net/chaos_net_actions.c`](../src/net/chaos_net_actions.c)
 
-This file owns network effect mechanics.
-
-Use it when:
-
-- changing probability behavior for network operations
-- changing latency application or usleep chunking
-- changing corruption draw logic
-- adding a new network effect
-
-Network wrappers must not reimplement effect logic. If the same branching starts
-appearing in multiple network wrappers, it belongs here.
+Owns net effect mechanics: probability, latency, corruption bounded to the
+bytes the kernel actually wrote.
 
 ### [`src/dns/chaos_dns.c`](../src/dns/chaos_dns.c)
 
-This file owns the DNS subsystem's runtime state and constructor.
-
-Use it when:
-
-- adding or resolving a downstream resolver libc symbol
-- changing the PRNG seed path (note: uses a raw /dev/urandom syscall, not the
-  shared libc read path, to avoid preload recursion at constructor time)
-- changing constructor ordering or startup behavior
-
-Do not use it for wrapper bodies, transform pipeline logic, or config parsing.
+Owns dns start-up. The seed is read from `/dev/urandom` with raw
+`openat`/`read`/`close` system calls, like every library's: the libc path
+would pass through `libchaos-io`'s wrappers.
 
 ### [`src/dns/chaos_dns_config.c`](../src/dns/chaos_dns_config.c)
 
-This file owns DNS config ingestion and suffix-depth match selection.
-
-Use it when:
-
-- extending the DNS config grammar
-- adding a new DNS operation or effect
-- changing reload behavior
-- changing how suffix-depth match ranking is computed
-
-The invariants are the same as all other subsystem config files: invalid config
-means passthrough, the two-snapshot CAS must remain all-or-nothing.
+Owns dns rule-file ingestion and selection: exact (rank 3) > suffix (2) >
+any (1), ties to the longer text. Suffix selectors apply to forward lookups
+only.
 
 ### [`src/dns/chaos_dns_actions.c`](../src/dns/chaos_dns_actions.c)
 
-This file owns the getaddrinfo transform pipeline and DNS effect mechanics.
-
-Use it when:
-
-- changing FILTER_FAMILY, SHUFFLE, or LIMIT pipeline stage ordering
-- changing EAI error injection
-- adding a new DNS transform effect (REWRITE, SERVICE, OVERRIDE, etc.)
-- changing latency application
-
-The pipeline ordering (FILTER_FAMILY → SHUFFLE → LIMIT) is intentional. Do not
-reorder stages without understanding how each stage feeds the next. The pipeline
-must remain side-effect-free with respect to the caller's original addrinfo
-list until all transforms are complete.
+Owns pre-call effects and the result transforms. The stage order
+`FILTER_FAMILY` → `SHUFFLE` → `LIMIT` is part of the contract: `LIMIT=1`
+after `SHUFFLE` yields a random single answer, and filtering first ensures
+`LIMIT` counts only surviving families. Nodes a transform removes are freed
+through the real `freeaddrinfo`. `SHUFFLE` allocates its pointer array with
+`calloc`; on allocation failure the list is left unchanged.
 
 ### [`src/dns/chaos_dns_lookup.c`](../src/dns/chaos_dns_lookup.c)
 
-This file owns the getaddrinfo and getnameinfo wrapper bodies.
-
-Use it when:
-
-- changing how getaddrinfo results are handed off to the transform pipeline
-- changing getnameinfo fault injection behavior
-- adding a new resolver symbol wrapper
-
-Keep this file's scope limited to wrapper entry, rule lookup, and pipeline
-dispatch. Effect logic belongs in `chaos_dns_actions.c`.
+Owns wrapper entry, rule lookup and dispatch for `getaddrinfo`,
+`getnameinfo` and the `gethostby*` family. Effect logic belongs in
+`chaos_dns_actions.c`.
 
 ### [`src/time/chaos_time.c`](../src/time/chaos_time.c)
 
-This file owns the time subsystem's runtime state and constructor.
-
-Use it when:
-
-- adding or resolving a downstream time libc symbol
-- changing the PRNG seed path
-- changing constructor ordering or startup behavior
-- changing reentrancy-guard boundaries
-
-Do not use it for wrapper bodies, offset arithmetic, or config parsing.
+Owns time start-up. Its own sleeps and clock reads never use the interposed
+symbols (see [Recursion And Internal Calls](#recursion-and-internal-calls)).
 
 ### [`src/time/chaos_time_config.c`](../src/time/chaos_time_config.c)
 
-This file owns time config ingestion and rule selection.
-
-Use it when:
-
-- extending the time config grammar
-- adding a new time operation or effect
-- changing reload behavior
-- changing how clock-id matching is performed
-
-The invariants are the same as all other subsystem config files.
+Owns time rule-file ingestion: selectors `*` (rank 1), operation (rank 2),
+`clock_gettime/<clock>` (rank 3). `OFFSET` is valid only on `clock_gettime`
+selectors; `REGRESS` only on `clock_gettime/<clock>` with a positive offset.
 
 ### [`src/time/chaos_time_actions.c`](../src/time/chaos_time_actions.c)
 
-This file owns time effect mechanics including OFFSET arithmetic.
-
-Use it when:
-
-- changing latency sleep chunking behavior
-- changing the OFFSET effect (signed nanosecond arithmetic, negative-clamp to
-  zero, CLOCK_MONOTONIC non-monotonicity handling)
-- changing probability sampling
-- adding a new time effect
-
-The OFFSET logic must preserve the constraint that CLOCK_MONOTONIC results
-never go backward: clamping to the previous value is correct; returning a
-value less than the last observed value is not.
+Owns `OFFSET` arithmetic on `int64_t` intermediates (no signed overflow),
+normalising `tv_nsec` into `[0, 999 999 999]` and clamping a negative result
+to `{0, 0}`. Neither `OFFSET` nor `REGRESS` keeps `CLOCK_MONOTONIC`
+monotonic; that is their purpose.
 
 ### [`src/time/chaos_time_hooks.c`](../src/time/chaos_time_hooks.c)
 
-This file owns the clock_gettime, clock_getres, nanosleep, and usleep wrapper
-bodies.
-
-Use it when:
-
-- changing how clock_gettime results are post-processed by the actions layer
-- changing nanosleep or usleep interception behavior
-- adding a new time-related symbol wrapper
-
-Keep wrapper entry, reentrancy guard, and action dispatch together per symbol.
-Do not inline effect logic here; it belongs in `chaos_time_actions.c`.
+Owns the eight time wrappers. Order per wrapper: guard → `LATENCY` →
+`ERRNO` → real call → `OFFSET`/`REGRESS` (clock reads only, on success).
+`gettimeofday`, `time` and `timespec_get` use the `clock_gettime/realtime`
+rules; `clock_nanosleep` and `sleep` use the `nanosleep` rules.
 
 ### [`src/memory/chaos_memory.c`](../src/memory/chaos_memory.c)
 
-This file owns the memory subsystem's runtime state and constructor.
-
-Use it when:
-
-- adding or resolving a downstream memory libc symbol
-- changing the PRNG seed path
-- changing constructor ordering or startup behavior
-- changing reentrancy-guard boundaries
-
-Do not use it for wrapper bodies, MAP_ANONYMOUS detection, or config parsing.
+Owns memory start-up. `chaos_once` returns 0 instead of deadlocking when
+`dlsym` allocates and a preloaded allocator calls `mmap` back into this
+library during resolution; that `mmap` passes through.
 
 ### [`src/memory/chaos_memory_config.c`](../src/memory/chaos_memory_config.c)
 
-This file owns memory config ingestion and rule selection.
-
-Use it when:
-
-- extending the memory config grammar
-- adding a new memory operation or effect
-- changing reload behavior
-- changing how mmap operation-class matching is performed
-
-The invariants are the same as all other subsystem config files.
+Owns memory rule-file ingestion; selectors `*`, operation, `mmap/anon`,
+`mmap/file`.
 
 ### [`src/memory/chaos_memory_actions.c`](../src/memory/chaos_memory_actions.c)
 
-This file owns memory effect mechanics.
-
-Use it when:
-
-- changing ERRNO injection behavior
-- changing LATENCY or DELAY effect logic
-- adding a new memory effect
-
-CORRUPT and OFFSET are deliberately absent from mmap effects. mmap returns a
-virtual address range, not a value buffer; corrupting the mapping contents
-after return would affect live process memory in an uncontrolled way. If a
-future design needs that, it requires a separate, explicitly scoped mechanism
-and must not be added here without that design.
+Owns the two memory effects, `ERRNO` and `LATENCY`. There is deliberately no
+`CORRUPT` or `OFFSET`: a mapping is live process memory, not a result buffer,
+and corrupting it after return would fault the process in places no test can
+attribute. Such a feature needs its own explicitly scoped design.
 
 ### [`src/memory/chaos_memory_hooks.c`](../src/memory/chaos_memory_hooks.c)
 
-This file owns the mmap, mprotect, munmap, and madvise wrapper bodies.
-
-Use it when:
-
-- changing MAP_ANONYMOUS detection logic (flags & 0x20)
-- changing how the glibc MMAP_THRESHOLD interacts with mmap interception
-- adding a new memory-related symbol wrapper
-- changing how mprotect or madvise faults are injected
-
-Keep the MAP_ANONYMOUS flag check and the MMAP_THRESHOLD note as comments in
-the code. These are non-obvious platform behaviors that future readers must not
-accidentally remove.
+Owns `mmap` (`mmap64` is an alias on 64-bit glibc; current musl exports no
+`mmap64`), `mprotect`, `madvise`, `posix_madvise`, `munmap`. `mmap/anon` vs
+`mmap/file` is decided by `flags & MAP_ANONYMOUS`. `posix_madvise` follows
+the `madvise` rules and returns the error number instead of setting errno,
+as POSIX specifies.
 
 ### [`src/process/chaos_process.c`](../src/process/chaos_process.c)
 
-This file owns the process subsystem's runtime state and constructor.
-
-Use it when:
-
-- adding or resolving a downstream process libc symbol
-- changing the PRNG seed path
-- changing constructor ordering or startup behavior
-- changing the `chaos_process_try_resolve_symbol` path for optional symbols
-  (execveat is absent from musl; the try-resolve path must remain to handle
-  that gracefully)
-
-Do not use it for wrapper bodies, FAIL_AFTER counter logic, or config parsing.
+Owns process start-up. `execveat`, `execvpe` and `fexecve` are resolved with
+`chaos_process_try_resolve_symbol` (absent from some libcs);
+`pthread_create` is resolved on first use because before glibc 2.34 it lives
+in libpthread, which may be loaded after the constructor ran.
 
 ### [`src/process/chaos_process_config.c`](../src/process/chaos_process_config.c)
 
-This file owns process config ingestion and rule selection.
-
-Use it when:
-
-- extending the process config grammar
-- adding a new process operation or effect
-- changing reload behavior
-- changing how process-name or operation-class matching is performed
-
-The invariants are the same as all other subsystem config files. Note that
-FAIL_AFTER counters are reset on every config reload; this is intentional and
-must remain true after any config change.
+Owns process rule-file ingestion; selectors `*` or an operation name. Resets
+every `FAIL_AFTER` counter when a reload changes the rule file. A provisional
+re-read that finds identical content keeps the counters.
 
 ### [`src/process/chaos_process_actions.c`](../src/process/chaos_process_actions.c)
 
-This file owns process effect mechanics including FAIL_AFTER counter logic.
-
-Use it when:
-
-- changing ERRNO injection behavior
-- changing LATENCY effect logic (note: vfork is async-signal-safe constrained;
-  usleep inside a vfork child is a POSIX hazard and must not be added)
-- changing the FAIL_AFTER counter (pre-increment, shared across threads, reset
-  on reload)
-- adding a new process effect
-
-The FAIL_AFTER counter is deliberately not per-thread. A per-thread counter
-would allow thread N to always succeed if thread M already consumed the limit.
-If you change this, document the semantic change explicitly.
+Owns `ERRNO`, `LATENCY` and `FAIL_AFTER`. A `FAIL_AFTER` rule (`ERRNO,N`)
+atomically increments one counter per operation (`__sync_fetch_and_add`) and
+fails when the value before the increment is ≥ N: the first N calls succeed.
+The counter is process-wide by design: per-thread counters would let a fresh
+thread succeed after another thread exhausted the budget. Document any change
+to that semantic.
 
 ### [`src/process/chaos_process_hooks.c`](../src/process/chaos_process_hooks.c)
 
-This file owns the pthread_create, fork, posix_spawn, execve, execveat, and
-waitpid wrapper bodies.
+Owns the process wrappers. Order per wrapper: guard → `LATENCY` → `ERRNO` →
+`FAIL_AFTER` → real call.
 
-Use it when:
-
-- adding or changing pthread_create injection behavior
-- adding or changing fork injection behavior
-- changing posix_spawn behavior (note: glibc and musl differ in how they
-  implement posix_spawn internally; the cascade gap between glibc's internal
-  clone and musl's exec-based posix_spawn must be documented in comments)
-- changing execve or execveat behavior (note: exec replaces the process image;
-  the chaos library is gone after a successful exec, so post-exec state
-  invalidation is not possible and must not be attempted)
-- adding or changing waitpid injection behavior
-
-The exec process-image replacement constraint is fundamental. Any wrapper that
-injects into exec-family calls must complete all fault decisions before the
-real exec call. There is no wrapper return path after a successful exec.
+- `posix_spawn`/`posix_spawnp` are decided at their own boundary; neither
+  glibc nor musl calls the exported `fork`, so `fork` rules never reach them.
+  `system` and `popen` follow the `posix_spawn` rules.
+- Every exec-family decision completes before the real call. A successful
+  exec does not return; library state and destructors are gone.
+- A `fork` arriving while the real `fork` is still unresolved (a call from
+  inside symbol resolution) fails with `ENOSYS` rather than issuing a bare
+  `clone`, which would skip libc's atfork handlers.
+- `vfork` is not interposed. A future wrapper must not sleep in the child,
+  which runs on the parent's stack until it execs or exits.
 
 ## Wrapper Semantics
 
 ### `open()` and `openat()`
 
-`open()` and `openat()` are the wrappers that naturally start from a path. That
-makes them special in two ways:
+These start from a path:
 
-- it performs direct path-based matching without going through fd resolution
-- it seeds the fd cache for later descriptor-based calls
+1. Resolve the path to an absolute string (`chaos_io_resolve_at_path`):
+   relative paths against the current directory or the `dirfd`. Failure is
+   not fatal.
+2. Match `open` rules on the resolved path; apply `LATENCY`, then `ERRNO`
+   (no real call).
+3. Call the real function.
+4. On success, seed the fd cache so later descriptor calls need no
+   `/proc/self/fd` lookup.
 
-`openat()` adds one extra rule: when the pathname is relative, the wrapper tries
-to resolve a match path from `AT_FDCWD` or from the supplied directory fd before
-rule selection. If that pre-open resolution fails, the wrapper must bypass
-pre-call injection and rely on post-open fd resolution only.
-
-If you extend open-path behavior, keep those responsibilities together.
+If step 1 fails, pre-call injection is skipped and only the post-open cache
+seeding applies.
 
 ### `read()`, `readv()`, `pread()`, and `preadv()`
 
-Read-style wrappers may:
-
-- delay before the real call
-- fail before the real call
-- corrupt the returned buffer after a successful real call
-
-They do not truncate the requested byte count before delegation. Any corruption
-happens after libc has already returned data.
-
-`readv()` and `preadv()` must preserve that contract across the logical
-concatenation of the returned iovec buffers. Corruption sampling therefore
-happens across the total byte stream, not independently per segment.
+May delay before, fail before (no real call), or corrupt after a successful
+real call. They never shorten the request. Corruption applies only when
+`rc > 0` and only within the returned bytes; for `readv`/`preadv` the target
+byte is chosen across the concatenation of the returned segments. A torn read
+is not offered: the caller cannot tell it from a genuine short read.
 
 ### `write()`, `writev()`, `pwrite()`, `pwritev()`, and Linux `sendfile()` / `copy_file_range()`
 
-Write-style wrappers may:
+May delay before, fail before, or shorten the request (`TORN`). The caller's
+buffer is never modified. For `writev`/`pwritev` the torn byte budget is
+mapped back into a truncated copy of the iovec array (vectors longer than
+`CHAOS_IO_TORN_MAX_IOV` are not torn). `sendfile` and `copy_file_range` match
+on the destination descriptor and support `ERRNO`, `LATENCY`, `TORN`.
 
-- delay before the real call
-- fail before the real call
-- shorten the outgoing byte count before delegation for torn-write behavior
-
-They do not modify the caller buffer. Torn writes are modeled as partial writes,
-not buffer corruption.
-
-`writev()` and `pwritev()` must apply torn-write sizing across the logical
-total byte span and then translate that shortened byte budget back into a valid
-truncated iovec array for the real libc call.
-
-Linux `sendfile()` and `copy_file_range()` now reuse the same logical `write`
-rule class, but they match on the destination fd only. There is no read-side
-corruption path for either call because there is no caller-visible read buffer
-to mutate.
-
-The remaining gap is other alternate copy paths. Tools that move data through
-`splice()`, `mmap()`, or similar non-`write()`, non-`writev()`,
-non-`sendfile()`, and non-`copy_file_range()` paths are still outside the
-current fault surface.
+Data moved through `splice`, `mmap` or other paths outside the wrapped set is
+not faulted.
 
 ### `ftruncate()`, Linux `fallocate()`, `unlinkat()`, and `renameat()`
 
-These wrappers model filesystem lifecycle and capacity edges without changing
-the basic rule engine:
+| Call | Operation | Matched on |
+| --- | --- | --- |
+| `ftruncate`, `truncate` | `truncate` | descriptor path / path |
+| `fallocate`, `posix_fallocate` | `allocate` | descriptor path |
+| `unlinkat`, `unlink`, `rmdir`, `remove` | `unlink` | resolved target path |
+| `renameat`, `renameat2`, `rename` | `rename_from`, `rename_to` | resolved source, destination |
 
-- `ftruncate()` matches the logical `truncate` rule class on the target fd path
-- Linux `fallocate()` matches the logical `allocate` rule class on the target
-  fd path
-- `unlinkat()` matches the logical `unlink` rule class on the resolved target
-  path
-- `renameat()` matches `rename_from` and `rename_to` on the resolved source and
-  destination paths
-
-`renameat()` keeps source and destination separate on purpose. Atomic replace
-patterns often care more about the destination pathname than about the original
-temporary source. Successful `unlinkat()` and `renameat()` reset the current
-thread fd cache because already-cached `/proc/self/fd` resolutions may no
-longer describe the same pathname.
+A rename evaluates both sides, takes the longer-prefix match, and breaks ties
+towards the destination: atomic-replace patterns (write a temporary file,
+rename it over the final name) care about the final name. A successful
+unlink or rename resets the fd cache.
 
 ### `close()`
 
-`close()` has one subtle requirement that is easy to regress: cache invalidation
-must only happen after a successful real close. Invalidating earlier would make
-the cache lie if the close fails.
+Linux releases the descriptor even when `close` reports an error (`EIO` on
+NFS write-back, `EINTR`), and correct programs never retry it. The wrapper
+keeps that contract: it applies `LATENCY` before, always calls the real
+`close`, invalidates the fd-cache slot whatever the result (the number may be
+reused by the next `open`), and reports an injected `ERRNO` after the
+descriptor is gone. A synthetic error that left the descriptor open would
+leak it in exactly the programs that handle `close` correctly.
 
 ### `fsync()` and `fdatasync()`
 
-These wrappers are intentionally boring. They exist because persistence
-boundaries are often where higher-level systems surface failures. Keep them
-boring. If they start carrying wrapper-specific policy, that policy probably
-belongs elsewhere.
+Persistence boundaries, where higher layers surface storage failures.
+`ERRNO` and `LATENCY` only; no cache change.
 
 ## Config Model
 
-Each rule is parsed once into a fixed-size in-memory representation. Reload
-works by writing the next rule set into the inactive snapshot and then flipping
-the active index. Readers never mutate the active snapshot in place.
+Each rule is parsed once into a fixed-size struct. A reload parses into the
+inactive snapshot and publishes it by flipping the active index after a full
+barrier; readers never see a snapshot being written (seqlock), and never
+mutate one.
 
-That design gives this project three useful properties:
+Properties this buys:
 
-- readers stay cheap
-- invalid config can be rejected cleanly
-- reload never requires allocating a dynamic rule graph
+- the match path is a linear scan of at most 256 fixed-size rules, no
+  allocation
+- a rejected file is rejected whole; the previous snapshot stays intact until
+  the replacement is complete
+- reload never allocates
 
-Path matching is prefix-based, but not naive string-prefix matching. `/data`
-must match `/data/file` and must not match `/database`. If you change path
-semantics, preserve that boundary behavior unless you are intentionally changing
-the config contract.
+The rule file is read with raw `openat`/`read` system calls into a static
+262,145-byte buffer: through libc, `libchaos-io` would see one library reading
+its rules and an io rule could fail that read. See
+[SYSTEM.md §8](SYSTEM.md#8-concurrency-and-threading-model) for the reload
+protocol, the 1 ms throttle and the 20 ms racy-stamp window.
 
 ## Recursion And Internal Calls
 
-The recursion guard is not optional defensive coding. It is the mechanism that
-keeps the preload library from trapping itself.
+The recursion guard is what keeps a library from intercepting itself. Every
+call a library makes to a real function on its own behalf runs between
+`chaos_<lib>_enter_internal()` and `chaos_<lib>_leave_internal(previous)`;
+wrappers entered in internal mode pass straight through. The guard is a
+per-thread `int`, saved and restored (not just cleared), so nested internal
+sections compose.
 
-Any code path that touches:
+Work that must not even reach another chaos library uses no interposable
+symbol at all:
 
-- real libc symbols
-- `stat()`
-- `/proc/self/fd`
-- `/dev/urandom`
-- config-file reads
+| Work | Mechanism | Why |
+| --- | --- | --- |
+| rule-file read | raw `openat`/`read`/`close` | io rules must not fail another library's rule load |
+| status and hits files | raw `openat`/`write`/`renameat`/`linkat` | io rules must not fail the report |
+| `LATENCY` sleep | raw `clock_nanosleep(CLOCK_MONOTONIC)` | time rules must not shorten (`EINTR`) or lengthen another library's delay |
+| throttle, hits, `@from`/`@until` clock | vDSO via `AT_SYSINFO_EHDR`, else raw `clock_gettime` | time rules must not change rule timing |
+| seed | raw `openat`/`read` of `/dev/urandom` | runs before the real-function table may exist |
+| fd cache, `DUP` table | raw `mmap` | memory rules must not fail the library's own memory |
 
-must be deliberate about entering and leaving internal mode. If you add a new
-helper that performs I/O and it is reachable from a wrapper, assume it needs a
-guard boundary unless you can prove otherwise.
+Every path that may change errno on behalf of the library (rule-file `stat`,
+reads, socket lookups, status writes) restores it; `test_errno_glibc.sh`
+checks that an idle library never leaks errno into a successful call. A new
+helper reachable from a wrapper that performs I/O needs the guard, or a raw
+system call, unless you can prove otherwise.
 
 ## Testing Philosophy
 
-The tests are intentionally close to the implementation.
+The tests sit close to the implementation:
 
-- parser tests include config internals directly so malformed input and reload
-  edges can be tested precisely
-- wrapper tests include the wrapper implementation files directly through
+- Parser and reload tests include the config sources directly, so malformed
+  input, size limits, NUL bytes, racy stamps and reload races are exercised
+  precisely.
+- Wrapper tests include the wrapper sources through
   [`test/support/test_chaos_io_harness.h`](../test/support/test_chaos_io_harness.h)
-  so every branch can be forced without needing a real preload environment
-- integration tests still exist to validate the real shared library on Linux
+  (and the `test_<lib>_support.h` headers), which replace every dependency
+  with recording stubs, so every branch can be forced without a real preload.
+- Test seams are compile-time macros (`CHAOS_SLEEP_SYSCALL`,
+  `CHAOS_STATUS_OPEN`, `CHAOS_CONFIG_FILE_OPEN`, `CHAOS_CLOCK_RAW_GETTIME`,
+  `CHAOS_NET_SOCKET_TYPE`, ...) or replaceable function pointers; production
+  builds compile the raw system calls.
+- `test/unit/test_config_proptest.c` runs property tests over the parser;
+  `test/fuzz/` holds libFuzzer targets for every rule parser (`make fuzz`).
+- `test/runtime/` loads the real shared objects in glibc and Alpine
+  containers: per-library behaviour, errno hygiene, alternate entry points
+  (`open64`, `__read_chk`, ...), io/net sharing in both orders, cross-library
+  isolation, fork, reload, status and hits files, stdio, SECCOMP mode.
 
-This is a low-level systems library. Direct source inclusion in tests is a
-feature here, not a smell.
+Direct source inclusion is deliberate for a low-level library: it is the
+cheapest way to reach every branch.
 
-To verify the complete test suite passes from a clean state:
+To run the unit suite from a clean state:
 
 ```sh verified
 make unit
 ```
 
-To verify all six native shared libraries build successfully (Linux only):
+To build all six shared libraries (Linux only):
 
 ```sh verified
 [ "$(uname -s)" != "Linux" ] && exit 0; make native
@@ -745,233 +552,178 @@ To verify all six native shared libraries build successfully (Linux only):
 
 ### Adding a new interposed symbol to an existing subsystem
 
-1. Add the enum value in `src/<subsystem>/chaos_<subsystem>_config.h`.
-2. Add parser dispatch in `src/<subsystem>/chaos_<subsystem>_config.c`.
-3. Add the real libc symbol pointer in `src/<subsystem>/chaos_<subsystem>_internal.h`
-   (typedef + extern).
-4. Resolve the symbol in the constructor. Use `chaos_<subsystem>_resolve_symbol`
-   for symbols that are guaranteed present, or `chaos_<subsystem>_try_resolve_symbol`
-   for optional symbols (such as execveat on musl, which may be absent).
-5. Add the wrapper in `src/<subsystem>/chaos_<subsystem>_hooks.c`.
-6. Ensure the TLS reentrancy guard is saved, set, and restored in the correct
-   order at wrapper entry. The guard must be raised before any call to real libc
-   and must be restored on every exit path, including error returns.
-7. Add direct unit coverage for every new branch; keep `make coverage` at 100%.
+1. If it introduces a new operation, add the enum value in the library's
+   config header and the parser dispatch in its config source.
+2. Add the real-function typedef and pointer in the library's internal header.
+3. Resolve it in `chaos_<lib>_resolve_all_symbols()`: mandatory symbols abort
+   when missing; a symbol a supported libc may lack must be optional and its
+   wrapper must report `ENOSYS` when it is NULL.
+4. Add the wrapper with `CHAOS_<LIB>_EXPORT`. It calls
+   `chaos_<lib>_ensure_symbols()` first, passes through in internal mode, and
+   calls the real function between `enter_internal` and `leave_internal` on
+   every path.
+5. If the symbol is a generic descriptor call, decide only on your own
+   descriptor kind and forward everything else to `RTLD_NEXT`.
+6. Cover every new branch with unit tests (`make coverage` stays at 100.00 %)
+   and add a runtime probe for glibc and musl.
 
 ### Adding a new effect to an existing subsystem
 
-1. Add the enum value in the subsystem config header.
-2. Define which operations are allowed to use it (validation in the config
-   parser).
-3. Add parser support.
-4. Add effect logic in `chaos_<subsystem>_actions.c` (or a new helper if the
-   logic cannot live there cleanly).
-5. Wire wrapper branches in `chaos_<subsystem>_hooks.c`.
-6. Add deterministic tests first, then integration coverage where it matters.
+1. Add the enum value in the config header.
+2. Define the operations it is valid for; reject every other combination in
+   the parser (the whole file is rejected).
+3. Add the effect mechanics to `chaos_<lib>_actions.c`.
+4. Wire the wrapper branches.
+5. Write deterministic unit tests first, then runtime coverage, and, when
+   SECCOMP mode cannot apply it, reject it in `chaos-init` with reason
+   `unsupported in seccomp mode`.
 
 ### Cross-subsystem invariants for any extension
 
-- Never allocate heap memory on the hot path inside a wrapper.
-- Any code path that calls real libc must raise the reentrancy guard before
-  the call.
-- Config reload must remain all-or-nothing: partially-parsed config must never
-  activate. The two-snapshot CAS flip happens only after a fully validated
-  parse.
-- `CHAOS_<SUBSYSTEM>_EXPORT` is applied only to the wrapper symbols that
-  replace libc symbols — never to internal helpers.
+- No allocation on the match path. The exceptions are `libchaos-dns` result
+  transforms, which operate on `getaddrinfo` results that are heap objects
+  anyway.
+- Every real call made on the library's behalf runs in internal mode.
+- Reload stays all-or-nothing: the index flips only after a complete,
+  validated parse.
+- `CHAOS_<LIB>_EXPORT` marks only the wrappers that replace libc symbols.
+- errno is unchanged on every path that does not inject.
 
 ## ABI Commitments
 
 ### Shared Object ABI Surface
 
-The exported symbol surface of each chaos library is intentionally minimal.
-`__attribute__((visibility("default")))` (the `CHAOS_*_EXPORT` macro defined in
-each library's `_internal.h`) is applied only to the interposed libc symbols.
-Everything else uses the default `-fvisibility=hidden` compilation unit default.
+Every object is compiled with `-fvisibility=hidden`; only functions marked
+`CHAOS_<LIB>_EXPORT` (`__attribute__((visibility("default")))`, defined in
+each library's internal header) enter `.dynsym`. The exported set is the
+wrapper list in [SYSTEM.md §1](SYSTEM.md#global-invariant).
 
-This means:
+Consequences:
 
-- Only the symbols that need to be found by the dynamic linker (the interposed
-  function names) are in the `.dynsym` table.
-- Internal helpers (`chaos_*_check_config`, `chaos_*_enter_internal`, etc.) are
-  not exported. They cannot conflict with symbols in the target application.
-- The `.gnu.hash` and `.gnu.version` tables are smaller; dynamic linker symbol
-  lookup is faster.
+- internal helpers cannot interpose on, or be interposed by, symbols of the
+  target or of other preloaded objects
+- `.dynsym`, `.dynstr` and `.gnu.hash` stay small, so symbol lookup in the
+  object is cheap
 
 ### ELF `SONAME`
 
-Each `.so` is built with `-Wl,-soname,libchaos-<lib>-<libc>-<arch>.so`. The
-SONAME is embedded in the ELF `DT_SONAME` entry. The target process's
-`LD_PRELOAD` string must match the filename (not the SONAME, in LD_PRELOAD
-context — but the SONAME is used if the library is listed in `DT_NEEDED`).
+The objects carry no `DT_SONAME`: the link line passes no `-soname`. Nothing
+links against them, and `LD_PRELOAD` loads by path or file name, so a soname
+would only add a dynamic entry.
 
 ### No Public C API
 
-There is no header file that callers should include. The libraries have no
-`libchaos-*.h` installation target. The ABI contract is:
+There is no header to include and no install target. The contract is:
 
-1. Load via `LD_PRELOAD`.
-2. Write a config file at the documented path.
-3. The interposed symbols are active; no function calls needed.
+1. load via `LD_PRELOAD` (or run under `chaos-init`)
+2. write the rule file at its documented path
+3. read the status and hits files
 
-This is a deliberate design: a public C API would create versioning
-obligations, calling-convention commitments, and a compatibility surface that
-would constrain refactoring. None of those apply to a preload-only library.
+A C API would create versioning, calling-convention and compatibility
+obligations that constrain refactoring and buy nothing for a preload-only
+library.
 
 ## Build Flag Rationale
 
-Each chaos library is built with the following flags (in addition to standard
-`-std=c99 -Wall -Wextra -Werror`). The rationale for each is documented here.
+Every shared object is built with the base flags
+`-std=c99 -Wall -Wextra -Werror -pedantic -Os`, linked with `-ldl`
+(`dlsym` lives in libdl before glibc 2.34), plus the flags below
+(`SHARED_CFLAGS`, `SHARED_LDFLAGS` in the `Makefile`). Unit tests use only the
+base flags; sanitizer and coverage builds override `CFLAGS`.
 
 ### `-fvisibility=hidden`
 
-All symbols default to hidden (not in `.dynsym`). Only symbols marked with
-`__attribute__((visibility("default")))` are exported. Purpose:
-
-- Prevents symbol collision with target application symbols of the same name.
-- Prevents the dynamic linker from using the library's internal symbols when
-  resolving other libraries' references.
-- Reduces `.dynsym` and `.gnu.hash` table sizes.
-
-Without this flag, internal helpers like `chaos_io_check_config` would be in
-`.dynsym` and could shadow identically-named symbols in the target application
-or other preloaded libraries.
+Only symbols marked for export enter `.dynsym`. Without it, a helper such as
+`chaos_io_config_prepare` would be exported and could shadow, or be shadowed
+by, a same-named symbol in the target or another preloaded object.
 
 ### `-ffunction-sections` and `-fdata-sections`
 
-Places each function and data object in its own ELF section
-(`.text.<function_name>`, `.data.<variable_name>` etc.). Purpose:
-
-- Enables the linker to dead-strip unused functions and data with `--gc-sections`.
-- Without this flag, the linker operates at translation-unit granularity; any
-  reference to any symbol in a `.o` forces the entire `.o` into the output.
-
-Effect in practice: for a chaos library that includes the full config parser
-but is loaded in a context where only passthrough is used, dead-stripping
-removes the unreachable parse branches from the `.so`.
+One ELF section per function and per data object, so `--gc-sections` can drop
+unreferenced code and data individually instead of per translation unit.
 
 ### `-Wl,--gc-sections`
 
-The linker dead-strips sections not reachable from the entry point. Combined
-with `-ffunction-sections`, this removes:
-
-- Unreachable config parser branches (e.g., effects defined for future use)
-- Cold-path error-handling functions not reachable from normal execution
-- Unused wrapper families if any were accidentally left in
-
-In practice for a heavily tested codebase with 100% coverage, `--gc-sections`
-should remove very little, but it is a correctness check: if something is
-being stripped that should not be, it reveals a dead-code issue.
+Drops every section unreachable from the exported symbols and constructors.
+With 100 % line coverage little is dead; the flag mostly removes unused
+`static inline` copies from `src/common/` and unreferenced data.
 
 ### `-Wl,--strip-all`
 
-Strips all symbol table entries and relocation sections from the final `.so`
-that are not required for dynamic linking. Keeps:
+Removes `.symtab`, `.strtab` and debug sections; `.dynsym`, `.dynstr`, the
+hash tables and the dynamic relocations stay, because the loader needs them.
+There is no separate debug variant of the shared objects; to debug, build with
+your own `CFLAGS`/`LDFLAGS` overrides.
 
-- `.dynsym` (exported symbols: the interposed libc wrappers)
-- `.gnu.hash` / `.hash` (used by the dynamic linker for symbol lookup)
-- `.rela.dyn` / `.rela.plt` (runtime relocations)
-- `.eh_frame` (if not stripped by `-fno-asynchronous-unwind-tables`)
+### `-fno-unwind-tables`, `-fno-asynchronous-unwind-tables`, `-fomit-frame-pointer`, `-fno-ident`
 
-Strips:
-- `.symtab` (static symbol table, used by debuggers and `nm`)
-- `.strtab` (string table for `.symtab`)
-- `.debug_*` (DWARF debug info, if present)
-
-Purpose: reduces `.so` size; removes information that could help an attacker
-understand internal structure. For release builds. Debug builds omit this flag.
-
-### `-fno-asynchronous-unwind-tables`
-
-Suppresses the generation of `.eh_frame` (exception handling frame) and
-`.ARM.exidx` tables. These tables support:
-
-- C++ exception unwinding (not needed: library is C99, no exceptions)
-- `libunwind` / `backtrace()` call-stack unwinding through the chaos library
-- GCC/Clang frame-pointer-free stack unwinding (`-fomit-frame-pointer`)
-
-Purpose: removes ~2-5 KB of `.eh_frame` data from the `.so`. Unwinding through
-the chaos library is not needed for correct operation. If you need stack traces
-that include chaos library frames for debugging, remove this flag in the debug
-build variant.
-
-**Trade-off:** `perf record` and similar profiling tools can still profile the
-chaos library by frame pointer if `-fno-omit-frame-pointer` is set (the default
-for most debug builds). `--strip-all` does not affect profiling because the
-profiler reads the vDSO and kernel symbol tables separately.
+No `.eh_frame` and no `.comment` payload, and no frame-pointer register
+reserved. The library is C99 and throws nothing. Trade-off: debuggers,
+`backtrace()` and frame-pointer profilers cannot unwind through a chaos
+frame; `perf` attributes samples to the object but cannot walk past it.
 
 ### `-fno-stack-protector`
 
-Disables the GCC/Clang stack smashing protection (`-fstack-protector-strong`
-inserts a canary value between the return address and local variables). Purpose
-of disabling:
+No canary checks, therefore no import of `__stack_chk_fail`: one fewer libc
+dependency and symbol version, and smaller code. The compensating controls are
+bounded fixed-size buffers with explicit length checks, no `gets`/`scanf`,
+100 % line coverage, ASan and UBSan unit runs, libFuzzer targets for every
+parser, and `-Wall -Wextra -Werror`.
 
-1. Stack canary checking calls `__stack_chk_fail()` on failure. This function
-   calls `write()` to `stderr`. `write()` is interposed by `libchaos-io`. A
-   stack canary failure inside `libchaos-io` would re-enter the IO wrapper,
-   triggering the reentrancy guard and calling the real `write()` — but the
-   reentrancy guard's TLS access itself calls the library's constructor path,
-   which is partially active. This creates an undefined-behaviour chain.
-2. The chaos libraries have no user-controlled input buffers that could overflow.
-   Config parsing uses bounded fixed-size buffers with explicit length checks.
-   The stack-protector canary adds overhead without a corresponding threat
-   surface.
-3. If the linked glibc/musl has stack protection enabled (which it does), and
-   the chaos library code is inlined into a glibc function by LTO (which doesn't
-   happen with preload), the canary would still fire from glibc's own protection.
-   The two mechanisms are independent.
+### `-Wl,--build-id=none`
 
-**Note for hardening auditors:** the absence of `-fstack-protector` is deliberate
-and is compensated by: strict bounded buffer usage, no `gets()`/`scanf()`, 100%
-source coverage gate (ensuring all buffer-access branches are tested), and
-`-Wall -Wextra -Werror` catching off-by-one warnings at compile time.
+No build-id note; release objects are identified by version and file name.
+
+### `-Wl,-z,max-page-size=4096` and `-Wl,-z,common-page-size=4096`
+
+4 KiB segment alignment instead of the 64 KiB aarch64 default, which pads the
+file. Consequence: the segments assume 4 KiB pages. On arm64 kernels
+configured with 16 KiB or 64 KiB pages the loader cannot map these objects.
 
 ### Summary Table
 
-| Flag                              | Effect                                      | Why                                       |
-|-----------------------------------|---------------------------------------------|-------------------------------------------|
-| `-fvisibility=hidden`             | All symbols hidden by default               | No symbol collision; minimal .dynsym      |
-| `-ffunction-sections`             | One section per function                    | Enables --gc-sections dead-strip          |
-| `-fdata-sections`                 | One section per data object                 | Enables --gc-sections dead-strip          |
-| `-Wl,--gc-sections`               | Dead-strip unreachable sections             | Smaller .so; dead-code check              |
-| `-Wl,--strip-all`                 | Remove non-dynamic symbol tables            | Smaller .so; less info leakage            |
-| `-fno-asynchronous-unwind-tables` | No .eh_frame                                | Removes ~2-5 KB; no C++ unwinding needed  |
-| `-fno-stack-protector`            | No stack canary                             | Avoids write() re-entrancy in canary path |
+| Flag | Effect | Why |
+| --- | --- | --- |
+| `-Os` | optimise for size | the object is mapped into every target process |
+| `-fvisibility=hidden` | only exported wrappers in `.dynsym` | no symbol collision; small dynamic table |
+| `-ffunction-sections`, `-fdata-sections` | one section per function / object | enables `--gc-sections` |
+| `-Wl,--gc-sections` | drop unreachable sections | smaller object |
+| `-Wl,--strip-all` | drop non-dynamic symbols and debug info | smaller object |
+| `-fno-unwind-tables`, `-fno-asynchronous-unwind-tables` | no `.eh_frame` | smaller; no unwinding through chaos frames |
+| `-fomit-frame-pointer`, `-fno-ident` | no frame pointer, no `.comment` | smaller, one more register |
+| `-fno-stack-protector` | no canary | no `__stack_chk_fail` import |
+| `-Wl,--build-id=none` | no build-id note | smaller |
+| `-Wl,-z,max-page-size=4096`, `common-page-size=4096` | 4 KiB alignment | smaller arm64 objects; requires 4 KiB pages |
+| `-ldl` | link libdl | `dlsym` before glibc 2.34 |
 
 ## Verified Doc Examples
 
-Documentation examples rot. A command shown in a doc that no longer works is
-worse than no command at all — it signals the docs are not maintained.
-
-This repository uses an opt-in tagging convention to prevent that. Any fenced
-shell block in `docs/*.md` tagged with `verified` is automatically extracted
-and executed as part of CI:
-
-````markdown
-```sh verified
-make unit
-```
-````
-
-Untagged blocks — placeholder paths, conceptual commands, Linux-only sequences,
-pseudo-code — are never touched. Only blocks you explicitly mark are run.
+A command in a document that no longer works is worse than none. Fenced shell
+blocks in `docs/` whose info string is `sh verified`, `bash verified` or
+`shell verified` are extracted and run by `make verify-docs`
+(`scripts/run_verified_examples.sh`), the last step of the `unit` job in
+`ci.yml`. Untagged blocks are never run.
 
 ### Safety model
 
-Each block runs in a subprocess with:
+Each block is written to a temporary script and run with:
 
-- `set -euo pipefail` — the first failing command aborts that block
-- a 30-second timeout per block
-- `REPO_ROOT` exported so blocks can reference the project root
+- `set -euo pipefail`; the first failing command fails the block
+- a 30-second limit (`timeout`, or `gtimeout` on macOS; without either, no limit)
+- the working directory set to the repository root, and `REPO_ROOT` exported
 
-There is no sandbox beyond that. The convention is: **only tag commands you
-would be comfortable running in a fresh checkout**. If a command has side
-effects, requires root, touches absolute paths outside the project, or is
-platform-specific, leave it untagged or add an explicit guard:
+There is no sandbox: the block runs in the checkout. Tag only commands that
+are safe in a fresh checkout. Guard platform-specific commands, as the
+`make native` example in [Testing Philosophy](#testing-philosophy) does with
+`[ "$(uname -s)" != "Linux" ] && exit 0`.
 
-```sh verified
-[ "$(uname -s)" != "Linux" ] && exit 0; make native
-```
+The scan covers `docs/*.md` and one level of subdirectories
+(`docs/development/*.md`). The opening fence must start in column 0; an
+indented fence, such as the illustration below, is not executed:
+
+    ```sh verified
+    make unit
+    ```
 
 ### Running locally
 
@@ -979,46 +731,37 @@ platform-specific, leave it untagged or add an explicit guard:
 make verify-docs
 ```
 
-The same target runs as the final step of the `unit` CI job.
-
 ### Adding a new verified block
 
-1. Write the command you want validated.
-2. Change ` ```sh ` to ` ```sh verified `.
-3. Run `make verify-docs` locally to confirm it passes.
+1. Write the command.
+2. Change the info string from `sh` to `sh verified`.
+3. Run `make verify-docs`.
 4. Commit.
 
-That is the entire workflow. There is no registry, no manifest file, no
-separate test file to update.
+There is no registry or manifest.
 
 ### What to tag
 
-Good candidates:
+Tag: `make unit`, `make fmt-check`, `make coverage`; `make native` behind a
+Linux guard; commands from quick-start sections that finish within 30 s.
 
-- `make unit`, `make fmt-check`, `make coverage` — always portable
-- `make native` with a Linux guard
-- Config syntax examples that pipe through a validator
-- Any command from a "Quick start" or "Getting started" section
-
-Bad candidates (leave untagged):
-
-- Commands with placeholder paths (`/path/to/libchaos-io.so`)
-- Root or privilege-requiring commands
-- Commands that assume a specific running process or environment
-- Long-running commands without a natural exit (fuzz runs, Docker pulls)
+Do not tag: placeholder paths (`/path/to/libchaos-io.so`), commands that need
+root, a running process or a specific environment, and long-running commands
+(fuzzing, image pulls).
 
 ## Maintenance Bar
 
-Good changes in this repository usually have these properties:
+A good change in this repository:
 
-- they make the wrapper flow easier to audit, not harder
-- they do not add dynamic allocation to hot paths
-- they do not weaken passthrough behavior on invalid config
-- they preserve or improve test determinism
-- they do not inflate the shared object for cosmetic abstraction
+- makes wrapper flow easier to audit
+- adds no allocation to the match path
+- keeps a rejected rule file a no-rules state, never a partial one
+- keeps tests deterministic
+- does not grow the object for cosmetic abstraction
+- keeps every decision inside one library's domain
 
-If a change fights those constraints, it needs a stronger argument than "it is
-more generic."
+A change that fights these constraints needs a stronger argument than
+"it is more generic".
 
 ---
 

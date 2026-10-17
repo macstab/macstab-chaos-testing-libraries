@@ -1,52 +1,62 @@
 /**
  * @file net_probe.c
- * @brief Runtime validation probe for libchaos-net under LD_PRELOAD.
+ * @brief End-to-end probe for libchaos-net in LD_PRELOAD mode on glibc and musl.
  *
  * @details
- * Standalone C program compiled inside a Docker container and executed under
- * `LD_PRELOAD=libchaos-net.so`. Validates end-to-end fault injection for the
- * network library's interposed symbols across all supported socket operations.
+ * Proves that rules in the rule file `/tmp/.chaos-net.conf`
+ * (`<selector>:<operation>:<ERRNO-name | effect>:<value>`) are matched against real loopback
+ * sockets and fault every wrapped socket call with the documented result. Each check uses its
+ * own 127.0.0.1 port (41001-41036) so a rule can only match the socket under test. Exit code of
+ * each check, in main()'s order:
  *
- * Each subtest writes a config rule with a future-mtime timestamp to
- * `/tmp/.chaos-net.conf`, then exercises the interposed symbol and asserts the
- * expected behavior. The future-mtime pattern guarantees a config reload cycle
- * on the first post-write invocation, ensuring the new rule is active. Config
- * rules use the `proto://host:port:operation:effect:param` format; endpoint
- * matching is performed by `src/net/chaos_net_endpoint.c` after resolving the
- * file descriptor to a `host:port` key via `getsockname` or `getpeername`.
+ * - 10-11   bind:EMFILE; bind returns -1/EMFILE.
+ * - 20-26   listen:LATENCY:200; listen succeeds after >= 150 ms.
+ * - 30-32   connect:EHOSTUNREACH; -1/EHOSTUNREACH although a listener exists.
+ * - 210-213 the tcp4:// connect rule also matches an AF_INET6 socket connecting to
+ *           ::ffff:127.0.0.1 (dual-stack sockets, as Java and Go use them).
+ * - 40-41   accept:EAGAIN; accept returns -1/EAGAIN.
+ * - 50-51   the accept rule also fails accept4 (one operation covers both).
+ * - 60-64   send:LATENCY:200; send in a forked client takes >= 150 ms, the data arrives.
+ * - 70-75   recv:CORRUPT:1.0; 4 bytes arrive but differ from what was sent.
+ * - 180-183 recv:TRICKLE:3; recv, read, readv and recvmsg each return 1-3 bytes and the pieces
+ *           reassemble to the sent bytes exactly.
+ * - 190-194 recv:DUP:1.0; a payload is delivered, then delivered again on the next read
+ *           (read() included), then the next real payload follows.
+ * - 220-222 a kept DUP payload is replayed only on the socket it came from: after dup2() puts
+ *           another connection under the same fd number, that connection is read for real.
+ * - 230-233 a recv rule for the server's address also fires on the client, where that address
+ *           is the peer: for TCP and for an unbound unix-socket client.
+ * - 240-241 unix://@name selects an abstract unix socket, written as Linux shows it.
+ * - 200-202 recv:TRICKLE:1 on a UDP socket changes nothing: shortening the buffer would truncate
+ *           the datagram and the kernel would drop the rest. (Overlaps the rule-file codes.)
+ * - 80-81   udp4 send:EHOSTUNREACH fails sendto.
+ * - 90-94   udp4 recv:CORRUPT corrupts recvfrom (forked sender).
+ * - 100-101 udp4 send:EHOSTUNREACH fails sendmsg.
+ * - 110-114 udp4 recv:CORRUPT corrupts recvmsg (forked sender).
+ * - 140     tcp4://\*:0 socket:EAFNOSUPPORT fails socket(); socket rules accept only wildcard
+ *           selectors because no address exists yet.
+ * - 141     unix://\* socket:EMFILE fails socketpair(AF_UNIX).
+ * - 142-143 shutdown:ENOTCONN fails shutdown on a connected socket.
+ * - 144-149 poll:TIMEOUT:1.0 makes poll and ppoll report 0 with revents cleared although data
+ *           is queued.
+ * - 150-153 the poll rule makes select wait out its 200 ms (>= 150 ms), report 0, clear the fd
+ *           and leave no time in the timeval; a select without timeout still reports the ready
+ *           fd, because a wait that cannot time out must not be faked.
+ * - 153-155 the same for pselect (153 is reused).
+ * - 156-165 the poll rule makes epoll_wait and epoll_pwait return 0 with data queued.
+ * - 166-167 udp4 send:EHOSTUNREACH fails sendmmsg.
+ * - 168-172 udp4 recv:CORRUPT corrupts recvmmsg.
+ * - 200-204 the rule file could not be written.
  *
- * Subtests cover:
- * - `ERRNO` on `bind` (TCP4, synthetic `EMFILE`)
- * - `LATENCY` on `listen` (TCP4, ≥ 150 ms added sleep)
- * - `ERRNO` on `connect` (TCP4, synthetic `EHOSTUNREACH`)
- * - `ERRNO` on `accept` (TCP4, synthetic `EAGAIN`)
- * - `ERRNO` on `accept4` (TCP4, synthetic `EAGAIN` via shared `accept` rule)
- * - `LATENCY` on `send` (TCP4, ≥ 150 ms; measured in child process)
- * - `CORRUPT` on `recv` (TCP4, single-bit flip verified against known payload)
- * - `ERRNO` on `sendto` (UDP4, synthetic `EHOSTUNREACH`)
- * - `CORRUPT` on `recvfrom` (UDP4, single-bit flip)
- * - `ERRNO` on `sendmsg` (UDP4, synthetic `EHOSTUNREACH`)
- * - `CORRUPT` on `recvmsg` (UDP4, single-bit flip)
- * - `ERRNO` on `socket` (TCP4 wildcard, synthetic `EAFNOSUPPORT`)
- * - `ERRNO` on `socketpair` (UNIX, synthetic `EMFILE`)
- * - `ERRNO` on `shutdown` (TCP4, synthetic `ENOTCONN`)
- * - `TIMEOUT` on `poll` (TCP4, suppresses ready event; verified by rc==0 and revents==0)
- * - `TIMEOUT` on `ppoll` (TCP4, same semantics as `poll`)
- * - `TIMEOUT` on `select` (TCP4, fd cleared from readfds)
- * - `TIMEOUT` on `pselect` (TCP4, fd cleared from readfds)
- * - `TIMEOUT` on `epoll_wait` (TCP4, rc==0 with data in flight)
- * - `TIMEOUT` on `epoll_pwait` (TCP4, same semantics as `epoll_wait`)
- * - `ERRNO` on `sendmmsg` (UDP4, synthetic `EHOSTUNREACH`)
- * - `CORRUPT` on `recvmmsg` (UDP4, single-bit flip)
+ * SIGPIPE is ignored so a faulted connection cannot kill the probe. Fork-based checks keep the
+ * client in a child so the client's and server's calls are separate processes' wrappers.
  *
- * Fork-based subtests (`send`, `recv`, `recvfrom`, `recvmsg`, `recvmmsg`)
- * create a real TCP/UDP connection pair using loopback ports in the 41005–41020
- * range so that the endpoint resolver can match the injected rule. `SIGPIPE` is
- * set to `SIG_IGN` in `main()` to avoid termination when writing to a half-closed
- * connection during chaos injection.
+ * Run by test_net_glibc.sh (gcc:bookworm) and test_net_alpine.sh (alpine:3.20), which build
+ * the library, compile this file in the container and run it with
+ * `LD_PRELOAD=/tmp/libchaos-net.so`. Needs loopback TCP/UDP, AF_INET6 and unix sockets.
  *
- * Returns 0 on success; returns a non-zero numbered exit code identifying
- * the failing subtest.
+ * Exit: 0 when every check passes; otherwise the code of the first failing check above. The
+ * rule file is left in place. The probe never skips.
  */
 #include <arpa/inet.h>
 #include <errno.h>
@@ -56,12 +66,15 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
+#include <sys/syscall.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -79,7 +92,34 @@ static long long elapsed_ms(const struct timespec *start, const struct timespec 
     return seconds * 1000LL + nanos / 1000000LL;
 }
 
-static int write_config(const char *line)
+/**
+ * @brief Sleeps 2 ms so the next intercepted call re-checks the rule file.
+ *
+ * With rules loaded, a library stats its rule file at most once per CHAOS_CHECK_INTERVAL_NS
+ * (1 ms); a rewrite is seen by the first call after that, not necessarily the next call. The
+ * sleep is a raw clock_nanosleep system call, restarted on EINTR, so no wrapper (libchaos-time
+ * faults nanosleep) can fail or stretch it.
+ */
+static void wait_for_rule_check(void)
+{
+    struct timespec delay = {0, 2000000L};
+
+    while (syscall(SYS_clock_nanosleep, CLOCK_MONOTONIC, 0, &delay, &delay) != 0 && errno == EINTR)
+    {
+    }
+}
+
+/**
+ * @brief Replaces the rule file `/tmp/.chaos-net.conf` with @p line plus a newline and stamps a
+ *        fresh mtime.
+ *
+ * The mtime is set explicitly to 1000, 1001, ... seconds since the epoch, so each write
+ * changes the reload change stamp even when two writes land within one filesystem timestamp
+ * tick.
+ *
+ * @return 0, or 200 (fopen), 201 (fprintf), 202 (fflush), 203 (futimens), 204 (fclose).
+ */
+static int write_config_now(const char *line)
 {
     struct timespec times[2];
     FILE *config = fopen("/tmp/.chaos-net.conf", "w");
@@ -115,6 +155,17 @@ static int write_config(const char *line)
     return 0;
 }
 
+/** @brief write_config_now(), then wait_for_rule_check(); returns write_config_now()'s code. */
+static int write_config(const char *line)
+{
+    const int rc = write_config_now(line);
+
+    wait_for_rule_check();
+    return rc;
+}
+
+/** @brief Sets SO_REUSEADDR so a port in TIME_WAIT from a previous run can be rebound; 1 on
+ * failure. */
 static int set_reuseaddr(int fd)
 {
     int enabled = 1;
@@ -126,6 +177,7 @@ static int set_reuseaddr(int fd)
     return 0;
 }
 
+/** @brief Fills @p address with 127.0.0.1:@p port. */
 static void set_loopback_v4(struct sockaddr_in *address, unsigned short port)
 {
     (void)memset(address, 0, sizeof(*address));
@@ -137,6 +189,7 @@ static void set_loopback_v4(struct sockaddr_in *address, unsigned short port)
     }
 }
 
+/** @brief Listening TCP socket on 127.0.0.1:@p port (backlog 16); -1 on failure. */
 static int create_tcp_listener(unsigned short port)
 {
     struct sockaddr_in address;
@@ -165,6 +218,7 @@ static int create_tcp_listener(unsigned short port)
     return fd;
 }
 
+/** @brief TCP socket connected to 127.0.0.1:@p port; -1 on failure. */
 static int connect_tcp(unsigned short port)
 {
     struct sockaddr_in address;
@@ -183,6 +237,10 @@ static int connect_tcp(unsigned short port)
     return fd;
 }
 
+/**
+ * @brief Connected loopback TCP pair on @p port; the listener is closed afterwards.
+ * @return 0, or -1 with nothing left open.
+ */
 static int create_tcp_pair(unsigned short port, int *server_fd, int *client_fd)
 {
     int listener = create_tcp_listener(port);
@@ -218,6 +276,7 @@ static int create_tcp_pair(unsigned short port, int *server_fd, int *client_fd)
     return 0;
 }
 
+/** @brief UDP socket bound to 127.0.0.1:@p port; -1 on failure. */
 static int create_udp_bound(unsigned short port)
 {
     struct sockaddr_in address;
@@ -241,6 +300,10 @@ static int create_udp_bound(unsigned short port)
     return fd;
 }
 
+/**
+ * @brief Reaps @p pid; 0 if it exited 0, @p failure_code if waitpid failed, @p failure_code + 1
+ *        for any other status.
+ */
 static int wait_child_ok(pid_t pid, int failure_code)
 {
     int status;
@@ -369,6 +432,52 @@ static int probe_connect_errno(void)
         return 32;
     }
     return 0;
+}
+
+/**
+ * @brief A dual-stack AF_INET6 socket connecting to ::ffff:127.0.0.1, as Java and Go do, is
+ *        matched by the tcp4:// rule for 127.0.0.1 (exit 210-213).
+ *
+ * Without unmapping v4-mapped addresses, every tcp4:// rule would silently miss JVM and Go
+ * clients.
+ */
+static int probe_connect_v4_mapped(void)
+{
+    struct sockaddr_in6 address;
+    int listener = create_tcp_listener(41033U);
+    int fd;
+    int rc;
+
+    if (listener < 0)
+    {
+        return 210;
+    }
+    rc = write_config("tcp4://127.0.0.1:41033:connect:EHOSTUNREACH:1.0");
+    if (rc != 0)
+    {
+        close(listener);
+        return rc;
+    }
+    fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd < 0)
+    {
+        close(listener);
+        return 211;
+    }
+    memset(&address, 0, sizeof(address));
+    address.sin6_family = AF_INET6;
+    address.sin6_port = htons(41033U);
+    if (inet_pton(AF_INET6, "::ffff:127.0.0.1", &address.sin6_addr) != 1)
+    {
+        close(fd);
+        close(listener);
+        return 212;
+    }
+    errno = 0;
+    rc = connect(fd, (const struct sockaddr *)&address, (socklen_t)sizeof(address));
+    close(fd);
+    close(listener);
+    return rc == -1 && errno == EHOSTUNREACH ? 0 : 213;
 }
 
 static int probe_accept_errno(void)
@@ -856,7 +965,7 @@ static int probe_poll_timeout(void)
     pfd.fd = server_fd;
     pfd.events = POLLIN;
     pfd.revents = POLLIN;
-    rc = poll(&pfd, 1U, 1000);
+    rc = poll(&pfd, 1U, 200);
     close(server_fd);
     close(client_fd);
     if (rc != 0 || pfd.revents != 0)
@@ -895,8 +1004,8 @@ static int probe_ppoll_timeout(void)
     pfd.fd = server_fd;
     pfd.events = POLLIN;
     pfd.revents = POLLIN;
-    timeout.tv_sec = 1;
-    timeout.tv_nsec = 0L;
+    timeout.tv_sec = 0;
+    timeout.tv_nsec = 200000000L;
     rc = ppoll(&pfd, 1U, &timeout, NULL);
     close(server_fd);
     close(client_fd);
@@ -909,6 +1018,9 @@ static int probe_ppoll_timeout(void)
 
 static int probe_select_timeout(void)
 {
+    struct timeval wait;
+    struct timespec start;
+    struct timespec end;
     fd_set readfds;
     int server_fd;
     int client_fd;
@@ -932,14 +1044,32 @@ static int probe_select_timeout(void)
         return 151;
     }
 
+    /* TIMEOUT waits out the caller's 200 ms, then reports nothing ready and, as Linux select
+     * does on timeout, zero time left in the timeval. */
+    FD_ZERO(&readfds);
+    FD_SET(server_fd, &readfds);
+    wait.tv_sec = 0;
+    wait.tv_usec = 200000;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    rc = select(server_fd + 1, &readfds, NULL, NULL, &wait);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    if (rc != 0 || FD_ISSET(server_fd, &readfds) || wait.tv_usec != 0 ||
+        elapsed_ms(&start, &end) < 150LL)
+    {
+        close(server_fd);
+        close(client_fd);
+        return 152;
+    }
+    /* A wait without a timeout cannot time out, so TIMEOUT must not fake one: the ready
+     * socket is reported. */
     FD_ZERO(&readfds);
     FD_SET(server_fd, &readfds);
     rc = select(server_fd + 1, &readfds, NULL, NULL, NULL);
     close(server_fd);
     close(client_fd);
-    if (rc != 0 || FD_ISSET(server_fd, &readfds))
+    if (rc != 1 || !FD_ISSET(server_fd, &readfds))
     {
-        return 152;
+        return 153;
     }
     return 0;
 }
@@ -972,8 +1102,8 @@ static int probe_pselect_timeout(void)
 
     FD_ZERO(&readfds);
     FD_SET(server_fd, &readfds);
-    timeout.tv_sec = 1;
-    timeout.tv_nsec = 0L;
+    timeout.tv_sec = 0;
+    timeout.tv_nsec = 200000000L;
     rc = pselect(server_fd + 1, &readfds, NULL, NULL, &timeout, NULL);
     close(server_fd);
     close(client_fd);
@@ -1030,7 +1160,7 @@ static int probe_epoll_wait_timeout(void)
         return 159;
     }
 
-    rc = epoll_wait(epfd, events, 1, 1000);
+    rc = epoll_wait(epfd, events, 1, 200);
     close(epfd);
     close(server_fd);
     close(client_fd);
@@ -1083,7 +1213,7 @@ static int probe_epoll_pwait_timeout(void)
         return 164;
     }
 
-    rc = epoll_pwait(epfd, events, 1, 1000, NULL);
+    rc = epoll_pwait(epfd, events, 1, 200, NULL);
     close(epfd);
     close(server_fd);
     close(client_fd);
@@ -1184,6 +1314,293 @@ static int probe_recvmmsg_corrupt(void)
     return 0;
 }
 
+/**
+ * @brief TRICKLE:3 on recv: recv, read, readv (split 2+6 iovec) and recvmsg, in rotation, each
+ *        return 1-3 bytes, and the pieces reassemble to the sent bytes (exit 180-183).
+ */
+static int probe_recv_trickle(void)
+{
+    static const char sent[] = "HELLOWORLD!";
+    char received[sizeof(sent)] = {0};
+    size_t total = 0U;
+    int server;
+    int client;
+    int round = 0;
+    int rc;
+
+    rc = write_config("tcp4://127.0.0.1:41030:recv:TRICKLE:3");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    if (create_tcp_pair(41030U, &server, &client) != 0)
+    {
+        return 180;
+    }
+    if (send(client, sent, sizeof(sent) - 1U, 0) != (ssize_t)(sizeof(sent) - 1U))
+    {
+        return 181;
+    }
+    while (total < sizeof(sent) - 1U)
+    {
+        char chunk[8];
+        struct iovec iov[2];
+        struct msghdr message;
+        ssize_t got;
+
+        iov[0].iov_base = chunk;
+        iov[0].iov_len = 2U;
+        iov[1].iov_base = chunk + 2;
+        iov[1].iov_len = 6U;
+        memset(&message, 0, sizeof(message));
+        message.msg_iov = iov;
+        message.msg_iovlen = 2U;
+        switch (round++ % 4)
+        {
+        case 0:
+            got = recv(server, chunk, sizeof(chunk), 0);
+            break;
+        case 1:
+            got = read(server, chunk, sizeof(chunk));
+            break;
+        case 2:
+            got = readv(server, iov, 2);
+            break;
+        default:
+            got = recvmsg(server, &message, 0);
+            break;
+        }
+        if (got <= 0 || got > 3)
+        {
+            return 182;
+        }
+        memcpy(received + total, chunk, (size_t)got);
+        total += (size_t)got;
+    }
+    close(client);
+    close(server);
+    return memcmp(received, sent, sizeof(sent) - 1U) == 0 ? 0 : 183;
+}
+
+/**
+ * @brief DUP:1.0 on recv: a payload is delivered, replayed once on the next read (via read()),
+ *        and then the next real payload follows, in order (exit 190-194).
+ */
+static int probe_recv_dup(void)
+{
+    char buffer[8];
+    int server;
+    int client;
+    int rc;
+
+    rc = write_config("tcp4://127.0.0.1:41031:recv:DUP:1.0");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    if (create_tcp_pair(41031U, &server, &client) != 0)
+    {
+        return 190;
+    }
+    if (send(client, "one", 3U, 0) != 3 || recv(server, buffer, sizeof(buffer), 0) != 3 ||
+        memcmp(buffer, "one", 3U) != 0)
+    {
+        return 191;
+    }
+    if (send(client, "two", 3U, 0) != 3)
+    {
+        return 192;
+    }
+    memset(buffer, 0, sizeof(buffer));
+    if (read(server, buffer, sizeof(buffer)) != 3 || memcmp(buffer, "one", 3U) != 0)
+    {
+        return 193;
+    }
+    memset(buffer, 0, sizeof(buffer));
+    if (recv(server, buffer, sizeof(buffer), 0) != 3 || memcmp(buffer, "two", 3U) != 0)
+    {
+        return 194;
+    }
+    close(client);
+    close(server);
+    return 0;
+}
+
+/**
+ * @brief A recv rule written for the server's address also fires on the client side, where
+ *        that address is the socket's peer: for TCP, and for a unix socket the client never
+ *        bound (its only name is the peer's path) (exit 230-233).
+ */
+static int probe_recv_rule_on_client_side(void)
+{
+    struct sockaddr_un address;
+    char buffer[8];
+    int server;
+    int client;
+    int listener;
+    int rc = write_config("tcp4://127.0.0.1:41036:recv:ECONNRESET:1.0");
+
+    if (rc != 0)
+    {
+        return rc;
+    }
+    if (create_tcp_pair(41036U, &server, &client) != 0 || send(server, "data", 4U, 0) != 4)
+    {
+        return 230;
+    }
+    errno = 0;
+    if (recv(client, buffer, sizeof(buffer), 0) != -1 || errno != ECONNRESET)
+    {
+        return 231;
+    }
+    close(client);
+    close(server);
+
+    rc = write_config("unix:///tmp/net-probe-client.sock:recv:ECONNRESET:1.0");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    (void)snprintf(address.sun_path, sizeof(address.sun_path), "%s", "/tmp/net-probe-client.sock");
+    (void)unlink(address.sun_path);
+    listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    client = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (listener < 0 || client < 0 ||
+        bind(listener, (struct sockaddr *)&address, (socklen_t)sizeof(address)) != 0 ||
+        listen(listener, 1) != 0 ||
+        connect(client, (struct sockaddr *)&address, (socklen_t)sizeof(address)) != 0 ||
+        (server = accept(listener, NULL, NULL)) < 0 || send(server, "data", 4U, 0) != 4)
+    {
+        return 232;
+    }
+    errno = 0;
+    if (recv(client, buffer, sizeof(buffer), 0) != -1 || errno != ECONNRESET)
+    {
+        return 233;
+    }
+    close(client);
+    close(server);
+    close(listener);
+    (void)unlink(address.sun_path);
+    return 0;
+}
+
+/**
+ * @brief unix://@name selects an abstract unix socket (leading NUL in sun_path), the form
+ *        /proc/net/unix shows; connect fails with ECONNREFUSED (exit 240-241).
+ */
+static int probe_abstract_unix_connect(void)
+{
+    struct sockaddr_un address;
+    const socklen_t length = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 12U);
+    int listener;
+    int client;
+    int rc = write_config("unix://@chaos-probe:connect:ECONNREFUSED:1.0");
+
+    if (rc != 0)
+    {
+        return rc;
+    }
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, "\0chaos-probe", 12U);
+    listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    client = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (listener < 0 || client < 0 || bind(listener, (struct sockaddr *)&address, length) != 0 ||
+        listen(listener, 1) != 0)
+    {
+        return 240;
+    }
+    errno = 0;
+    rc = connect(client, (struct sockaddr *)&address, length);
+    close(client);
+    close(listener);
+    return rc == -1 && errno == ECONNREFUSED ? 0 : 241;
+}
+
+/**
+ * @brief A kept DUP payload is replayed only on the socket it came from (exit 220-222).
+ *
+ * After dup2() puts a second connection under the first one's fd number, a read must return
+ * the second connection's real data, not the first one's pending duplicate: replay state is
+ * bound to the socket, not to the descriptor number.
+ */
+static int probe_recv_dup_after_dup2(void)
+{
+    char buffer[8];
+    int first_server;
+    int first_client;
+    int second_server;
+    int second_client;
+    int rc = write_config("tcp4://127.0.0.1:41034:recv:DUP:1.0");
+
+    if (rc != 0)
+    {
+        return rc;
+    }
+    if (create_tcp_pair(41034U, &first_server, &first_client) != 0 ||
+        create_tcp_pair(41034U, &second_server, &second_client) != 0)
+    {
+        return 220;
+    }
+    if (send(first_client, "AAAA", 4U, 0) != 4 ||
+        recv(first_server, buffer, sizeof(buffer), 0) != 4 ||
+        send(second_client, "BBBB", 4U, 0) != 4 || dup2(second_server, first_server) < 0)
+    {
+        return 221;
+    }
+    memset(buffer, 0, sizeof(buffer));
+    if (recv(first_server, buffer, sizeof(buffer), 0) != 4 || memcmp(buffer, "BBBB", 4U) != 0)
+    {
+        return 222;
+    }
+    close(first_client);
+    close(first_server);
+    close(second_client);
+    close(second_server);
+    return 0;
+}
+
+/**
+ * @brief TRICKLE on a UDP socket is a no-op (exit 200-202): shortening the receive buffer would
+ *        truncate the datagram and the kernel would discard the rest, which is data loss, not
+ *        a slow peer.
+ */
+static int probe_recv_trickle_datagram(void)
+{
+    struct sockaddr_in address;
+    char buffer[16];
+    int receiver;
+    int sender;
+    int rc;
+
+    rc = write_config("udp4://127.0.0.1:41032:recv:TRICKLE:1");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    receiver = create_udp_bound(41032U);
+    sender = socket(AF_INET, SOCK_DGRAM, 0);
+    if (receiver < 0 || sender < 0)
+    {
+        return 200;
+    }
+    set_loopback_v4(&address, 41032U);
+    if (sendto(sender, "abcd", 4U, 0, (struct sockaddr *)&address, sizeof(address)) != 4)
+    {
+        return 201;
+    }
+    if (recv(receiver, buffer, sizeof(buffer), 0) != 4 || memcmp(buffer, "abcd", 4U) != 0)
+    {
+        return 202;
+    }
+    close(sender);
+    close(receiver);
+    return 0;
+}
+
 int main(void)
 {
     int rc;
@@ -1199,6 +1616,9 @@ int main(void)
     rc = probe_connect_errno();
     if (rc != 0)
         return rc;
+    rc = probe_connect_v4_mapped();
+    if (rc != 0)
+        return rc;
     rc = probe_accept_errno();
     if (rc != 0)
         return rc;
@@ -1209,6 +1629,24 @@ int main(void)
     if (rc != 0)
         return rc;
     rc = probe_recv_corrupt();
+    if (rc != 0)
+        return rc;
+    rc = probe_recv_trickle();
+    if (rc != 0)
+        return rc;
+    rc = probe_recv_dup();
+    if (rc != 0)
+        return rc;
+    rc = probe_recv_dup_after_dup2();
+    if (rc != 0)
+        return rc;
+    rc = probe_recv_rule_on_client_side();
+    if (rc != 0)
+        return rc;
+    rc = probe_abstract_unix_connect();
+    if (rc != 0)
+        return rc;
+    rc = probe_recv_trickle_datagram();
     if (rc != 0)
         return rc;
     rc = probe_sendto_errno();

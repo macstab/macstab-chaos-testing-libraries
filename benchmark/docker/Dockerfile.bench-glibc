@@ -1,16 +1,19 @@
 # =============================================================================
-# Dockerfile.bench-glibc  —  Tier 1 benchmark image (glibc / debian).
+# Dockerfile.bench-glibc  —  Tier 1 benchmark image (glibc, Debian 12).
 #
-# Container caveats (encoded in the harness's ADVISORY mode):
-#   - The host scheduler decides where this container runs; CPU pinning
-#     via --cpuset-cpus is best-effort and inherits host's online CPUs.
-#   - The host's cpufreq governor applies; the container cannot set it.
-#   - Host IRQs may land on the cpuset cores.  This image does not
-#     attempt to mitigate.
+# Toolchain-only image for `benchmark/run-bench.sh` (default, or --libc=glibc).
+# The script builds it from the benchmark/docker context, bind-mounts the
+# repository at /work and builds the libchaos libraries and the harness inside
+# the container, so the image has no source and needs no rebuild when code
+# changes. python3 is present for the comparison driver.
 #
-# For OFFICIAL-mode runs, deploy the same image to a Tier 2 host that
-# has been provisioned with isolcpus/nohz_full/governor=performance at
-# the host kernel.  The harness adapts automatically.
+# Every run in this image is tagged ADVISORY by the harness: /.dockerenv exists,
+# and the container cannot control what OFFICIAL requires:
+#   - CPU placement: run-bench.sh restricts the container to CPUs 0 and 1 with
+#     --cpuset-cpus, but does not isolate them from host tasks or IRQs.
+#   - cpufreq governor and SMT are host settings.
+# OFFICIAL numbers need a Tier 2 host (isolcpus, nohz_full, performance
+# governor, steered IRQs); see benchmark/README.md.
 # =============================================================================
 
 FROM debian:12-slim
@@ -29,9 +32,8 @@ RUN apt-get update \
 
 WORKDIR /work
 
-# The repo is mounted at /work by the wrapper script; we don't COPY here
-# so the container can rebuild on every source change without an image
-# rebuild.
+# No COPY: run-bench.sh bind-mounts the repository here.
 
-# Default entry runs the harness in --list mode for sanity.
+# Without arguments: build the harness and list every registered benchmark.
+# Useful as a toolchain smoke test; run-bench.sh always overrides the command.
 CMD ["make", "-f", "benchmark/Makefile.bench", "bench-list"]

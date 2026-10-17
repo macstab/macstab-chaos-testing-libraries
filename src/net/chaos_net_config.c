@@ -1,75 +1,89 @@
 /**
  * @file chaos_net_config.c
- * @brief Config file loading, parsing, and two-snapshot live-reload implementation.
+ * @brief Rule-file loading, parsing and lock-free two-snapshot reload for libchaos-net.
  *
  * @details
- * This file implements the full config lifecycle for libchaos-net:
+ * Lifecycle of the rules of one process:
  *
- *   1. **Data structures**: `chaos_net_config_state_t` holds one complete parsed
- *      snapshot (up to CHAOS_NET_MAX_RULES rules). Two instances exist
- * (g_chaos_net_config_states[0/1]); at most one is "active" at any time, indexed by
- * g_chaos_net_active_config_index.
+ *   1. **Snapshots.** Two static chaos_net_config_state_t instances; the active one is
+ *      g_chaos_net_config_states[g_chaos_net_active_config_index]. Wrappers read only the
+ *      active one; a reload writes only the other one.
  *
- *   2. **Mtime-based change detection**: On every call to chaos_net_config_prepare(),
- *      stat(2) is called on the config file and its mtime is hashed to a uint64_t.
- *      The hash avoids direct st_mtime comparison because st_mtime is a struct
- *      timespec on modern kernels (seconds + nanoseconds) and we need to fit the
- *      comparison in a single atomic word.
+ *   2. **Throttled change detection.** chaos_net_config_prepare() looks at the file at
+ *      most once per CHAOS_CHECK_INTERVAL_NS (1 ms), timed with the vDSO CLOCK_MONOTONIC
+ *      (chaos_clock.h): the stat(2) was the largest part of a wrapper's cost. Without a
+ *      vDSO clock, and until the first load completes, every call looks. A look hashes
+ *      mtime (s, ns), size, inode and device into one 64-bit stamp, so it fits one CAS
+ *      word and also catches a same-tick append (size) and a rename-over rewrite such as
+ *      `sed -i` (inode). A rewrite with the same size inside one mtime tick is caught by
+ *      the provisional rule: a load whose mtime is under CHAOS_RACY_WINDOW_MS (20 ms) old
+ *      is re-read on the next look and replaced only if its content hash changed.
  *
- *   3. **Two-snapshot CAS reload protocol**: Reloading proceeds as follows:
- *      a. The calling thread atomically swaps g_chaos_net_cached_mtime from the
- *         observed value to MTIME_RELOADING via CAS. If the CAS fails, another
- *         thread won the race and this thread returns immediately using the
- *         current active snapshot.
- *      b. The winner reads the inactive snapshot index (1 - active_index), fills it
- *         from disk, then publishes by writing active_index then cached_mtime
- *         (two full memory barriers ensure the new rules are visible before
- *         readers switch to the new index).
- *      c. Readers that observe g_chaos_net_cached_mtime == MTIME_RELOADING
- *         simply use the current active snapshot; they never block.
+ *   3. **Reload claim.** The thread that sees a new stamp CASes the cached stamp to
+ *      CHAOS_NET_MTIME_RELOADING. Exactly one thread wins; everyone else, including a
+ *      thread that sees RELOADING, uses the active snapshot and never blocks. The winner
+ *      reads the file into the static buffer, parses into the inactive snapshot, writes
+ *      the status file, and publishes the index and then the stamp, which releases the
+ *      claim.
  *
- *   4. **Read buffer**: The TLS buffer g_chaos_net_config_buffer is per-thread so
- *      that two threads reloading concurrently (which cannot happen due to the CAS,
- *      but is handled gracefully by design) do not share buffer memory. In practice,
- *      only the thread that wins the CAS reads the file.
+ *   4. **Torn-copy protection.** Two reloads later a snapshot is reused, possibly while
+ *      a preempted reader is still copying a rule out of it. Each snapshot carries a
+ *      seqlock sequence (chaos_hits.h): odd while rewritten; a reader validates its copy
+ *      and treats a torn one as no match.
  *
- *   5. **All-or-nothing parsing**: If any line in the config file is invalid,
- *      chaos_net_config_parse_buffer() returns -1 and the new snapshot is marked
- *      parse_ok=0. The snapshot is still published (so future stat results do not
- *      cause repeated failed reloads) but parse_ok=0 causes all match queries to
- *      return 0, passing all syscalls through without injection.
+ *   5. **All-or-nothing parsing.** One bad line rejects the file: a snapshot with
+ *      parse_ok = 0 and no rules is published (so the bad file is not re-parsed on every
+ *      look) and the status file names the line. A transient failure (open or read error
+ *      other than EACCES/EPERM/EISDIR, or a writer changing the file during the read)
+ *      publishes nothing: the claim is released with the old stamp and the next look
+ *      retries.
  *
- * @par Platform differences:
- *   - st_mtim (Linux) vs st_mtimespec (macOS / BSDs): handled by CHAOS_NET_STAT_SEC
- *     and CHAOS_NET_STAT_NSEC macros.
+ *   6. **Hit counting.** Each rule gets a slot from a static pool; a rule whose text is
+ *      unchanged across a reload keeps its slot and count. Counts go to the hits file on
+ *      each of the first CHAOS_HITS_EAGER (64) hits, then at most every
+ *      CHAOS_HITS_INTERVAL_MS (100 ms), and at exit.
  *
- * @par Invariants maintained by this file:
- *   - g_chaos_net_active_config_index is always 0 or 1.
- *   - The inactive snapshot is only modified by the thread holding the reload lock
- *     (the one that successfully CAS'd MTIME_RELOADING).
- *   - chaos_net_config_publish() always issues two full memory barriers (one before
- *     writing active_index, one before writing cached_mtime) so readers observing
- *     either value see a consistent snapshot.
- *   - Rules in the active snapshot are read-only after publication.
+ * @par Fork and exec:
+ *   A pthread_atfork child handler releases a reload claim and the hits-writer flag held
+ *   by parent threads, restarts hit counts for the new pid and reseeds the PRNG. vfork()
+ *   children and posix_spawn run no handler; they share the parent's memory, see its
+ *   claims as busy, and the pid check keeps them from writing its hits file. exec()
+ *   discards everything; the new image loads the rule file afresh.
+ *
+ * @par Invariants:
+ *   - g_chaos_net_active_config_index is 0 or 1.
+ *   - Only the claim holder writes the inactive snapshot, the read buffer, the error
+ *     record and the text table.
+ *   - chaos_net_config_publish() ends the snapshot's write sequence, then stores the index,
+ *     then the stamp, each behind a full barrier.
+ *   - A published snapshot is read-only until it becomes inactive again.
+ *
+ * @par Test seams:
+ *   CHAOS_CONFIG_FILE_OPEN/READ/CLOSE (chaos_status.h), g_chaos_net_check_interval_ns (0
+ *   disables the throttle), CHAOS_RACY_WINDOW_MS, CHAOS_NET_RULE_SUPPORTED (chaos-init).
  *
  * @par Module: chaos-net
  * @par Stability: private / internal
  */
 
 #include "chaos_net_config.h"
+#include "chaos_clock.h"
 
 #include "chaos_net_endpoint.h"
 
+#include <errno.h>
+#include <pthread.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 /*---------------------------------------------------------------------------
  * Platform mtime extraction
  *---------------------------------------------------------------------------*/
 
-/** @brief Extracts the seconds component of the file modification time. */
+/** @brief mtime of a struct stat: st_mtim on Linux, st_mtimespec on macOS/BSD. */
 #if defined(__linux__)
 #define CHAOS_NET_STAT_SEC(st) ((st)->st_mtim.tv_sec)
 #define CHAOS_NET_STAT_NSEC(st) ((st)->st_mtim.tv_nsec)
@@ -83,141 +97,196 @@
  *---------------------------------------------------------------------------*/
 
 /**
- * @brief One complete parsed configuration snapshot.
+ * @brief One complete rule snapshot.
  *
- * @details Two instances of this struct exist as process-global BSS objects
- * (g_chaos_net_config_states[0] and [1]). The inactive one is populated by the
- * reload thread; the active one is read by interposition hot-paths.
+ * @details Two static instances exist (g_chaos_net_config_states[0] and [1]). The reload
+ * owner fills the inactive one; wrappers copy rules out of the active one.
  *
  * @par Field semantics:
- *   - `rules`: array of parsed rules; the first `rule_count` entries are valid.
- *   - `rule_count`: number of valid rules; 0 means no active rules.
- *   - `parse_ok`: non-zero if the last reload succeeded (even if rule_count is 0
- *     because the file was empty or had only comments). Zero means the file was
- *     present but contained at least one invalid line; in this case match queries
- *     return 0 (fail-open).
+ *   - `sequence`: seqlock counter, odd while a reload rewrites this snapshot.
+ *   - `rules[0..rule_count)`: the parsed rules.
+ *   - `parse_ok`: 0 when the file was rejected as a whole (invalid line, too many rules,
+ *     NUL byte, too large, unreadable); such a snapshot never matches. 1 otherwise, also
+ *     for an empty or missing file.
+ *   - `hits[i]`: hit slot of rules[i] (chaos_hits.h).
+ *   - `text[i]`: rules[i] as written in the file, reported in the hits file.
  */
 typedef struct chaos_net_config_state
 {
+    /** Odd while a reload rewrites the snapshot (see chaos_snapshot_read_begin()). */
+    volatile uint64_t sequence;
     chaos_net_rule_t rules[CHAOS_NET_MAX_RULES]; /**< Parsed rule array. */
     size_t rule_count;                           /**< Number of valid rules in @c rules. */
     int parse_ok;                                /**< Non-zero if parse succeeded. */
+    /** Hit counters, one per rule (see chaos_hits.h). */
+    chaos_hit_slot_t *hits[CHAOS_NET_MAX_RULES];
+    /** Each rule as written in the file, reported with its count. */
+    char text[CHAOS_NET_MAX_RULES][CHAOS_STATUS_TEXT_MAX + 1U];
 } chaos_net_config_state_t;
 
 /** @brief The two config snapshots. Index 0 and 1 alternate as active/inactive. */
 static chaos_net_config_state_t g_chaos_net_config_states[2];
 
+/** @brief Hit slots of the rules of both snapshots (see chaos_hits_assign()). */
+static chaos_hit_slot_t g_chaos_net_hit_pool[2U * CHAOS_NET_MAX_RULES];
+
 /**
- * @brief Index (0 or 1) of the currently active snapshot.
+ * @brief Index (0 or 1) of the active snapshot.
  *
- * @details Written by the reload thread under the MTIME_RELOADING lock, then
- * read by all threads. Marked volatile to prevent the compiler from caching the
- * value across the synchronise barrier in chaos_net_config_active_state().
+ * @details Written only by the reload owner in chaos_net_config_publish() and by
+ * chaos_net_config_init(); read by every wrapper behind a full barrier.
  */
 static volatile unsigned int g_chaos_net_active_config_index = 0U;
 
 /**
- * @brief Cached mtime hash of the last successfully observed config file state.
+ * @brief Change stamp of the loaded rule file, and the reload claim.
  *
- * @details Serves two purposes:
- *   1. Change detection: compared against the freshly computed mtime hash on
- *      each call to chaos_net_config_prepare().
- *   2. Reload lock: the CAS target. While a reload is in progress, this is set
- *      to CHAOS_NET_MTIME_RELOADING; threads that observe this skip the reload.
- *
- * Initial value is CHAOS_NET_MTIME_UNKNOWN so the first call always performs a
- * full reload attempt.
+ * @details Holds a chaos_net_config_hash_mtime() stamp or one of three reserved values:
+ * CHAOS_NET_MTIME_UNKNOWN before the first load, CHAOS_NET_MTIME_MISSING when no file
+ * existed, CHAOS_NET_MTIME_RELOADING while a thread owns a reload. A look compares it
+ * with the observed stamp; a reload is claimed by CAS on it.
  */
 static volatile uint64_t g_chaos_net_cached_mtime = CHAOS_NET_MTIME_UNKNOWN;
 
 /**
- * @brief Per-thread buffer used to read the raw config file content.
- *
- * @details TLS allocation avoids a global lock around the file-read path.
- * The buffer is sized CHAOS_NET_MAX_CONFIG_BYTES + 1 to accommodate a NUL
- * terminator after the last byte read. The +1 ensures chaos_net_config_parse_buffer()
- * can always NUL-terminate safely.
- *
- * In practice only one thread reloads at a time (CAS lock), so the per-thread
- * allocation is conservative but avoids any design constraint on the concurrency model.
+ * @brief The loaded file's mtime was within CHAOS_RACY_WINDOW_MS of the clock, so its
+ *        stamp cannot be trusted (chaos_clock_stamp_is_recent()): the next look re-reads.
  */
-static __thread char g_chaos_net_config_buffer[CHAOS_NET_MAX_CONFIG_BYTES + 1U];
+static volatile int g_chaos_net_config_provisional = 0;
+
+/** @brief chaos_config_content_hash() of the loaded file; 0 when none was read. */
+static uint64_t g_chaos_net_config_content = 0U;
+
+/**
+ * @brief The reload owner's read buffer for the rule file.
+ *
+ * @details CHAOS_NET_MAX_CONFIG_BYTES + 1 for the NUL that chaos_net_config_read_file()
+ * appends. Only the holder of the CHAOS_NET_MTIME_RELOADING claim touches it, so one
+ * process-wide buffer suffices.
+ *
+ * Deliberately not `__thread`: a 256 KiB TLS object is static TLS, which glibc reserves in
+ * every thread of the preloaded process and adds to each thread's minimum stack size.
+ * Runtimes that create threads with small explicit stacks (the Erlang VM, for one) then
+ * fail pthread_create() with EINVAL and cannot start at all.
+ */
+static char g_chaos_net_config_buffer[CHAOS_NET_MAX_CONFIG_BYTES + 1U];
+
+/**
+ * @brief The line the last parse rejected and why, for the status file.
+ *
+ * @details Written only by the reload owner (or a unit test calling the parser).
+ */
+static chaos_status_error_t g_chaos_net_config_error;
+
+/** @brief Text of each rule accepted by the last parse; copied into the next snapshot. */
+static char g_chaos_net_config_texts[CHAOS_NET_MAX_RULES][CHAOS_STATUS_TEXT_MAX + 1U];
+
+/** @brief Hits-writer flag: set (by CAS) while one thread writes the hits file. */
+static volatile int g_chaos_net_hits_writing = 0;
+
+/** @brief Whether the pthread_atfork handler is registered (once per image). */
+static int g_chaos_net_atfork_registered = 0;
+
+static void chaos_net_config_after_fork(void);
+
+/** @brief Set by every hit, cleared by the write that reports it. */
+static volatile int g_chaos_net_hits_pending = 0;
+
+/** @brief Hits recorded by this process since start or fork; drives the eager phase. */
+static uint64_t g_chaos_net_hits_total = 0U;
+
+/** @brief CLOCK_MONOTONIC time of the last hits-file write, in ms. */
+static uint64_t g_chaos_net_hits_last_ms = 0U;
+
+/** @brief Pid the counts belong to; set at init and in a fork() child. */
+static volatile uint64_t g_chaos_net_hits_pid = 0U;
+
+/** @brief Number `<n>` of this image's hits file (chaos_hits_file_number()). */
+static long g_chaos_net_hits_file = 0L;
+/** @brief Whether this image created that file (chaos_hits_write_for()). */
+static int g_chaos_net_hits_owned = 0;
+
+/** @brief Scratch for formatting the hits file; used only by the hits writer. */
+static char g_chaos_net_hits_buffer[CHAOS_NET_MAX_RULES * CHAOS_HITS_LINE_MAX + 1U];
 
 /*---------------------------------------------------------------------------
  * Internal helpers
  *---------------------------------------------------------------------------*/
 
 /**
- * @brief Zeroes a config snapshot and sets its parse_ok flag.
+ * @brief Empties a snapshot and sets its parse_ok, keeping its sequence odd.
  *
- * @details Used to reset the inactive snapshot before a reload, and to mark it
- * as parse_ok=0 if the reload fails.
+ * @details Starts (idempotently) the snapshot's write sequence first, so a reader still
+ * copying from it detects the change; chaos_net_config_publish() or chaos_net_config_init()
+ * ends the sequence.
  *
- * @param state    Snapshot to reset. No-op if NULL.
- * @param parse_ok Initial parse_ok value; 1 = clean state, 0 = failed state.
+ * @param state    Snapshot to reset; NULL is a no-op.
+ * @param parse_ok 1 for a usable (possibly empty) snapshot, 0 for a rejected file.
  */
 static void chaos_net_config_reset_state(chaos_net_config_state_t *state, int parse_ok)
 {
+    uint64_t sequence;
+
     if (state == NULL)
     {
         return;
     }
 
+    /* Odd before the memset: a reader still holding this snapshot sees the rewrite. */
+    chaos_snapshot_write_begin(&state->sequence);
+    sequence = state->sequence;
     (void)memset(state, 0, sizeof(*state));
+    state->sequence = sequence;
     state->parse_ok = parse_ok;
 }
 
 /**
- * @brief Returns a pointer to the currently active config snapshot.
+ * @brief The active snapshot.
  *
- * @details Issues a full memory barrier before reading g_chaos_net_active_config_index
- * to ensure the snapshot contents written by the reload thread are visible before
- * the index value is read. This is the reader side of the two-barrier publish
- * protocol; the writer side is chaos_net_config_publish().
+ * @details Full barrier, then the index load: the reader side of chaos_net_config_publish().
+ * The returned snapshot can still be rewritten two reloads later; readers that copy rules
+ * validate the copy with its sequence.
  *
- * @return Pointer to the active snapshot; never NULL.
+ * @return The active snapshot; never NULL.
  */
 static const chaos_net_config_state_t *chaos_net_config_active_state(void)
 {
     unsigned int index;
 
-    /* Acquire: ensure we see all rule data written before the index was published. */
+    /* Pairs with the barrier before the index store in chaos_net_config_publish(). */
     __sync_synchronize();
     index = g_chaos_net_active_config_index;
     return &g_chaos_net_config_states[index];
 }
 
 /**
- * @brief Publishes a newly-loaded snapshot by updating the active index and cached mtime.
+ * @brief Publishes the freshly loaded snapshot and releases the reload claim.
  *
- * @details The publication order is critical for correctness:
- *   1. Full memory barrier.
- *   2. Write g_chaos_net_active_config_index = next_index. After this, new readers
- *      will begin reading from the new snapshot.
- *   3. Full memory barrier.
- *   4. Write g_chaos_net_cached_mtime = observed_mtime. This releases the reload
- *      lock (replaces MTIME_RELOADING) and allows the next mtime change to trigger
- *      a new reload.
+ * @details Order:
+ *   1. End the snapshot's write sequence (even again).
+ *   2. Full barrier; store the active index. New readers now see the new rules.
+ *   3. Full barrier; store the observed stamp in place of CHAOS_NET_MTIME_RELOADING.
+ *      The claim is released, and a later change can start the next reload.
  *
- * The two-barrier ordering ensures that a reader cannot see the new active_index
- * before the snapshot's rule data is fully written, and cannot see the new
- * cached_mtime before active_index has been updated.
+ * A reader that sees the new index therefore sees the complete rules, and a thread that
+ * sees the released claim also sees the new index.
  *
  * @param next_index     Index (0 or 1) of the snapshot just loaded.
- * @param observed_mtime Mtime hash observed at the start of this reload cycle.
+ * @param observed_mtime Stamp observed when this reload was claimed.
  */
 static void chaos_net_config_publish(unsigned int next_index, uint64_t observed_mtime)
 {
-    /* Release: ensure all rule writes are visible before the index is updated. */
+    chaos_snapshot_write_end(&g_chaos_net_config_states[next_index].sequence);
+    /* Release: the snapshot's contents before the index. */
     __sync_synchronize();
     g_chaos_net_active_config_index = next_index;
-    /* Second barrier: ensure the index update is visible before we release the lock. */
+    /* The index before the claim release. */
     __sync_synchronize();
     g_chaos_net_cached_mtime = observed_mtime;
 }
 
 /**
- * @brief Returns non-zero if @p ch is a whitespace character for config trimming.
+ * @brief Whether @p ch is a blank for rule-line trimming (space, tab, CR, LF).
  */
 static int chaos_net_is_blank_char(char ch)
 {
@@ -225,15 +294,11 @@ static int chaos_net_is_blank_char(char ch)
 }
 
 /**
- * @brief Trims leading and trailing whitespace from a string in place.
+ * @brief Trims leading and trailing blanks in place.
  *
- * @details Returns a pointer into the original buffer (no copy). The trailing NUL
- * is written over the last trailing whitespace character. The returned pointer
- * is always within the original buffer.
- *
- * @param text  Writable NUL-terminated string. May be NULL (returns NULL).
- * @return Pointer to the first non-whitespace character, with trailing whitespace
- *         removed. Points to the NUL terminator if the input is all whitespace.
+ * @param text  Writable NUL-terminated string; NULL returns NULL.
+ * @return Pointer into @p text at the first non-blank, with trailing blanks cut by a
+ *         NUL; points at the terminator when @p text is all blanks.
  */
 static char *chaos_net_trim(char *text)
 {
@@ -263,12 +328,12 @@ static char *chaos_net_trim(char *text)
 }
 
 /**
- * @brief Terminates a config line at the first '#' character.
+ * @brief Cuts a rule line at its first `#`.
  *
- * @details Modifies @p line in place. The '#' and everything after it is discarded.
- * No-op if @p line is NULL or contains no '#'.
+ * @details No escape exists: a `#` anywhere, including inside a UNIX path, starts a
+ * comment.
  *
- * @param line  Writable NUL-terminated config line.
+ * @param line  Writable NUL-terminated line; NULL is a no-op.
  */
 static void chaos_net_strip_comment(char *line)
 {
@@ -287,14 +352,13 @@ static void chaos_net_strip_comment(char *line)
 }
 
 /**
- * @brief Maps an operation name string to its chaos_net_operation_t value.
+ * @brief Maps an operation name to chaos_net_operation_t.
  *
- * @details Performs exact string comparisons against the set of recognised
- * operation names. Case-sensitive. Returns CHAOS_NET_OP_INVALID for any
- * unrecognised input including NULL.
+ * @details Exact, case-sensitive names: bind, listen, connect, accept, socket, shutdown,
+ * poll, send, recv, close.
  *
- * @param text  Operation name token (e.g., "bind", "recv"). Must not be NULL.
- * @return The corresponding operation enum value, or CHAOS_NET_OP_INVALID.
+ * @param text  Operation token; NULL yields CHAOS_NET_OP_INVALID.
+ * @return The operation, or CHAOS_NET_OP_INVALID.
  */
 static chaos_net_operation_t chaos_net_parse_operation(const char *text)
 {
@@ -338,19 +402,24 @@ static chaos_net_operation_t chaos_net_parse_operation(const char *text)
     {
         return CHAOS_NET_OP_RECV;
     }
+    if (strcmp(text, "close") == 0)
+    {
+        return CHAOS_NET_OP_CLOSE;
+    }
     return CHAOS_NET_OP_INVALID;
 }
 
 /**
- * @brief Maps an errno name string to its numeric value.
+ * @brief Maps an errno name to its value, from a fixed whitelist.
  *
- * @details The whitelist of supported errno names covers the common network error
- * codes that are meaningful to inject. An exhaustive mapping is avoided to
- * prevent config files from injecting errnos that would cause undefined or
- * dangerous behaviour in common application error-handling paths (e.g., EFAULT).
+ * @details Accepted (exact, case-sensitive): ECONNREFUSED, ETIMEDOUT, ECONNRESET,
+ * EHOSTUNREACH, ENETUNREACH, EADDRINUSE, EADDRNOTAVAIL, EAFNOSUPPORT, EPROTONOSUPPORT,
+ * EPIPE, ENOTCONN, EOPNOTSUPP, EINVAL, EINTR, ENOMEM, ENOBUFS, EMFILE, ENFILE, EAGAIN.
+ * The list is closed on purpose: errnos such as EFAULT or EBADF describe caller bugs no
+ * network can cause, and would send applications down paths that test nothing real.
  *
- * @param text  Errno macro name (e.g., "ECONNREFUSED"). Must not be NULL.
- * @return The numeric errno value (>= 0) if recognised; -1 if NULL or unrecognised.
+ * @param text  Errno name; NULL yields -1.
+ * @return The errno value (> 0), or -1 if not on the list.
  */
 static int chaos_net_parse_errno_name(const char *text)
 {
@@ -438,50 +507,30 @@ static int chaos_net_parse_errno_name(const char *text)
 }
 
 /**
- * @brief Parses a probability value from a NUL-terminated string.
+ * @brief Parses a probability, locale-independently (chaos_policy_parse_probability()).
  *
- * @details Calls strtod with strict validation: the entire string (after trimming
- * trailing whitespace) must have been consumed, and the resulting value must be in
- * [0.0, 1.0]. Probability 0.0 means "never fire"; probability 1.0 means "always fire".
+ * @details Accepts "0", "1", "0." followed by digits, or "1." followed by zeros.
  *
- * @param text         Decimal probability string. Must not be NULL.
- * @param probability  Output: receives the parsed value. Must not be NULL.
- * @return 0 on success; -1 if parsing fails or the value is out of [0.0, 1.0].
+ * @param text         Probability text; must not be NULL.
+ * @param probability  Output; must not be NULL.
+ * @return 0 on success; -1 when @p text is not a probability.
  */
 static int chaos_net_parse_probability(const char *text, double *probability)
 {
-    char *end = NULL;
-    double value;
-
-    if (text == NULL || probability == NULL)
-    {
-        return -1;
-    }
-
-    value = strtod(text, &end);
-    if (end == text || *chaos_net_trim(end) != '\0')
-    {
-        return -1;
-    }
-    if (value < 0.0 || value > 1.0)
-    {
-        return -1;
-    }
-
-    *probability = value;
-    return 0;
+    return chaos_policy_parse_probability(text, probability);
 }
 
 /**
- * @brief Parses a latency value (milliseconds) from a NUL-terminated string.
+ * @brief Parses an unsigned decimal integer of at most 32 bits (LATENCY ms, TRICKLE bytes).
  *
- * @details Requires a pure decimal integer with no trailing non-numeric characters.
- * The value is capped at UINT_MAX (0xffffffff) which is approximately 49 days —
- * sufficient for any practical test scenario.
+ * @details strtoul semantics, so leading blanks and a sign are accepted ("-1" wraps to a
+ * value above UINT32_MAX and is rejected on 64-bit longs). Trailing blanks are allowed,
+ * anything else after the digits is not. The upper bound, 4294967295 ms, is about 49.7
+ * days.
  *
- * @param text        Decimal millisecond string. Must not be NULL.
- * @param latency_ms  Output: receives the parsed value. Must not be NULL.
- * @return 0 on success; -1 if parsing fails or the value exceeds UINT_MAX.
+ * @param text        Decimal text; NULL yields -1.
+ * @param latency_ms  Output; NULL yields -1.
+ * @return 0 on success; -1 if no digits, trailing garbage, or above 0xffffffff.
  */
 static int chaos_net_parse_latency(const char *text, unsigned int *latency_ms)
 {
@@ -494,7 +543,16 @@ static int chaos_net_parse_latency(const char *text, unsigned int *latency_ms)
     }
 
     value = strtoul(text, &end, 10);
-    if (end == text || *chaos_net_trim(end) != '\0')
+    if (end == text)
+    {
+        return -1;
+    }
+    /* Trailing blanks are skipped here; the caller's text is not modified. */
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')
+    {
+        ++end;
+    }
+    if (*end != '\0')
     {
         return -1;
     }
@@ -508,17 +566,17 @@ static int chaos_net_parse_latency(const char *text, unsigned int *latency_ms)
 }
 
 /**
- * @brief Validates that an effect is applicable to an operation.
+ * @brief Whether @p effect may be used with @p operation.
  *
- * @details Enforces the effect/operation compatibility matrix:
- *   - LATENCY:  valid for all operations.
- *   - ERRNO:    valid for all operations that can meaningfully return -1 with errno.
- *   - CORRUPT:  only valid for RECV (buffer content is only available post-call for recv).
- *   - TIMEOUT:  only valid for POLL (polls are the only multiplexed-wait operations).
+ * @details The compatibility matrix:
+ *   - LATENCY, ERRNO: every operation.
+ *   - CORRUPT, TRICKLE, DUP: RECV only; they act on received bytes.
+ *   - TIMEOUT: POLL only; it fakes a wait that found nothing ready.
+ *   - RESET: CLOSE only; it turns the close into an abortive one.
  *
- * @param operation  The operation parsed from the rule.
- * @param effect     The effect parsed from the rule.
- * @return Non-zero if the combination is permitted; 0 otherwise.
+ * @param operation  The rule's operation.
+ * @param effect     The rule's effect.
+ * @return Non-zero if the combination is allowed; 0 otherwise.
  */
 static int chaos_net_effect_allowed(chaos_net_operation_t operation, chaos_net_effect_t effect)
 {
@@ -532,9 +590,10 @@ static int chaos_net_effect_allowed(chaos_net_operation_t operation, chaos_net_e
                operation == CHAOS_NET_OP_CONNECT || operation == CHAOS_NET_OP_ACCEPT ||
                operation == CHAOS_NET_OP_SOCKET || operation == CHAOS_NET_OP_SHUTDOWN ||
                operation == CHAOS_NET_OP_POLL || operation == CHAOS_NET_OP_SEND ||
-               operation == CHAOS_NET_OP_RECV;
+               operation == CHAOS_NET_OP_RECV || operation == CHAOS_NET_OP_CLOSE;
     }
-    if (effect == CHAOS_NET_EFFECT_CORRUPT)
+    if (effect == CHAOS_NET_EFFECT_CORRUPT || effect == CHAOS_NET_EFFECT_TRICKLE ||
+        effect == CHAOS_NET_EFFECT_DUP)
     {
         return operation == CHAOS_NET_OP_RECV;
     }
@@ -542,23 +601,26 @@ static int chaos_net_effect_allowed(chaos_net_operation_t operation, chaos_net_e
     {
         return operation == CHAOS_NET_OP_POLL;
     }
+    if (effect == CHAOS_NET_EFFECT_RESET)
+    {
+        return operation == CHAOS_NET_OP_CLOSE;
+    }
     return 0;
 }
 
 /**
- * @brief Validates that an endpoint selector is acceptable for a given operation.
+ * @brief Whether @p selector may be used with @p operation.
  *
- * @details Socket-creation operations (CHAOS_NET_OP_SOCKET) can only be matched
- * by selectors that describe a socket type without a specific address — the socket
- * does not have one yet. Permitted selectors for socket are:
- *   - The ANY wildcard.
- *   - An IP selector with wildcard_host=1 and port=0 (e.g., `tcp4://\*:0`).
- *   - A UNIX selector with path `"*"`.
- * All other operations accept any non-INVALID endpoint kind.
+ * @details A socket() call has no address yet, so SOCKET rules accept only selectors
+ * that describe a kind of socket:
+ *   - `*` (ANY);
+ *   - an IP selector with wildcard host and port 0 (`tcp4://\*:0`);
+ *   - `unix://\*`.
+ * Every other operation accepts any valid selector.
  *
- * @param operation  The operation to validate against.
- * @param selector   Parsed endpoint selector. Must not be NULL.
- * @return Non-zero if the selector is valid for the operation; 0 otherwise.
+ * @param operation  The rule's operation.
+ * @param selector   Parsed selector; NULL yields 0.
+ * @return Non-zero if allowed; 0 otherwise.
  */
 static int
 chaos_net_selector_allowed(chaos_net_operation_t operation, const chaos_net_endpoint_t *selector)
@@ -573,7 +635,7 @@ chaos_net_selector_allowed(chaos_net_operation_t operation, const chaos_net_endp
     }
     if (operation == CHAOS_NET_OP_SOCKET)
     {
-        /* socket() rules may only use wildcard selectors because no address exists yet. */
+        /* No address exists at socket() time: only kind-describing wildcards. */
         if ((selector->kind == CHAOS_NET_ENDPOINT_TCP4 ||
              selector->kind == CHAOS_NET_ENDPOINT_TCP6 ||
              selector->kind == CHAOS_NET_ENDPOINT_UDP4 ||
@@ -590,17 +652,14 @@ chaos_net_selector_allowed(chaos_net_operation_t operation, const chaos_net_endp
 }
 
 /**
- * @brief Adjusts a computed mtime hash to avoid collisions with sentinel values.
+ * @brief Moves a computed stamp off the three reserved values.
  *
- * @details The sentinel values MTIME_MISSING, MTIME_RELOADING, and MTIME_UNKNOWN are
- * reserved for internal state signalling. If the FNV-based mtime hash accidentally
- * produces one of these values, XOR it with a constant to obtain a different
- * non-reserved value. The XOR constant is chosen to be non-zero and to differ
- * sufficiently from all three sentinels (the probability of a double collision
- * is negligible for a 64-bit hash).
+ * @details CHAOS_NET_MTIME_MISSING (0), _RELOADING (2^64 - 2) and _UNKNOWN (2^64 - 1)
+ * carry protocol meaning. A stamp equal to one of them is XORed with the golden-ratio
+ * constant; for these three inputs the result is never itself reserved.
  *
- * @param value Raw computed mtime hash.
- * @return The value itself, or a remapped non-reserved value if it collides.
+ * @param value Computed stamp.
+ * @return @p value, or the remapped value on a collision.
  */
 static uint64_t chaos_net_config_normalize_mtime_hash(uint64_t value)
 {
@@ -614,15 +673,17 @@ static uint64_t chaos_net_config_normalize_mtime_hash(uint64_t value)
 }
 
 /**
- * @brief Computes a 64-bit hash of the file's mtime (seconds + nanoseconds).
+ * @brief 64-bit change stamp of the rule file: FNV-1a-style mix of mtime, size, inode
+ *        and device.
  *
- * @details Uses a modified FNV-like mixing: XOR the seconds into an FNV offset
- * basis, multiply by the FNV prime, then XOR in nanoseconds and multiply again.
- * The result is adjusted to avoid sentinel collisions. If @p st is NULL
- * (file does not exist), returns CHAOS_NET_MTIME_MISSING.
+ * @details mtime alone is not enough: file systems stamp it from a coarse clock (a few
+ * ms), so two writes in one tick leave it unchanged. An append changes the size, and a
+ * rewrite through a temporary file and rename(2) (`sed -i`) changes the inode, so both
+ * are seen within one tick. A same-size in-place rewrite within one tick is left to the
+ * provisional re-read (g_chaos_net_config_provisional).
  *
- * @param st  Pointer to a populated struct stat, or NULL for a missing file.
- * @return 64-bit mtime hash.
+ * @param st  Result of stat/fstat, or NULL for a missing file.
+ * @return The normalised stamp, or CHAOS_NET_MTIME_MISSING when @p st is NULL.
  */
 static uint64_t chaos_net_config_hash_mtime(const struct stat *st)
 {
@@ -638,17 +699,23 @@ static uint64_t chaos_net_config_hash_mtime(const struct stat *st)
     value *= UINT64_C(1099511628211);
     value ^= (uint64_t)CHAOS_NET_STAT_NSEC(st);
     value *= UINT64_C(1099511628211);
+    value ^= (uint64_t)st->st_size;
+    value *= UINT64_C(1099511628211);
+    value ^= (uint64_t)st->st_ino;
+    value *= UINT64_C(1099511628211);
+    value ^= (uint64_t)st->st_dev;
+    value *= UINT64_C(1099511628211);
     return chaos_net_config_normalize_mtime_hash(value);
 }
 
 /**
- * @brief Stats the config file and returns its mtime hash.
+ * @brief stat(2)s the rule file and returns its change stamp.
  *
- * @details Sets the reentrancy guard around the stat(2) call to prevent
- * libchaos-io (if also loaded) from intercepting it, and to ensure libchaos-net
- * does not re-enter its own config load path.
+ * @details stat goes through libc and so through any other preloaded library that wraps
+ * it; the reentrancy guard only keeps libchaos-net's own wrappers out.
  *
- * @return The mtime hash, or CHAOS_NET_MTIME_MISSING if stat fails.
+ * @return The stamp, or CHAOS_NET_MTIME_MISSING if stat fails for any reason.
+ * @par errno: clobbered; chaos_net_config_prepare() restores it.
  */
 static uint64_t chaos_net_config_observed_mtime(void)
 {
@@ -668,25 +735,26 @@ static uint64_t chaos_net_config_observed_mtime(void)
 }
 
 /**
- * @brief Reads the entire config file into the per-thread TLS buffer.
+ * @brief Reads the whole rule file into g_chaos_net_config_buffer and checks that it is
+ *        still the file whose stamp triggered the reload.
  *
- * @details Opens the file and reads in a loop (to handle short reads on slow
- * devices or large files). The loop terminates when:
- *   - read() returns 0 (EOF): success.
- *   - read() returns < 0: I/O error; returns -1.
- *   - total bytes reaches CHAOS_NET_MAX_CONFIG_BYTES: file too large; returns -1.
+ * @details Uses CHAOS_CONFIG_FILE_OPEN/READ/CLOSE: raw openat/read/close system calls on
+ * Linux, so libchaos-io neither sees nor faults the library's own read. EINTR is retried.
+ * After EOF, fstat must reproduce @p expected_stamp; a writer that rewrote or appended
+ * meanwhile could have left a half-old, half-new copy. On success the mtime decides
+ * whether the load is provisional, and the buffer is NUL-terminated.
  *
- * On success, writes a NUL terminator at g_chaos_net_config_buffer[total] so
- * the buffer is safe to use as a C string.
- *
- * The reentrancy guard is held for the duration of open/read/close to prevent
- * libchaos-net from intercepting these calls.
- *
- * @param size_out  Output: number of bytes read. Must not be NULL.
- * @return 0 on success; -1 on I/O error or file-too-large.
+ * @param size_out        Output: bytes read; must not be NULL.
+ * @param expected_stamp  Stamp observed by the stat that triggered this reload.
+ * @return  0 on success;
+ *         -1 transient (open/read error, file changed during the read): retry later;
+ *         -2 file is CHAOS_NET_MAX_CONFIG_BYTES or larger: reject until it changes;
+ *         -3 EACCES/EPERM on open or EISDIR on read: reject until it changes.
+ * @par Caller: the reload owner only.
  */
-static int chaos_net_config_read_file(size_t *size_out)
+static int chaos_net_config_read_file(size_t *size_out, uint64_t expected_stamp)
 {
+    struct stat st;
     size_t total = 0U;
     int previous;
     int fd;
@@ -697,22 +765,36 @@ static int chaos_net_config_read_file(size_t *size_out)
     }
 
     previous = chaos_net_enter_internal();
-    fd = open(CHAOS_NET_CONFIG_PATH, O_RDONLY);
+    do
+    {
+        fd = CHAOS_CONFIG_FILE_OPEN(CHAOS_NET_CONFIG_PATH);
+    } while (fd < 0 && errno == EINTR);
     if (fd < 0)
     {
+        /* EACCES/EPERM persist until the file changes; anything else (gone since the
+         * stat, out of descriptors, ...) is retried on the next look. */
+        const int open_error = errno;
+
         chaos_net_leave_internal(previous);
-        return -1;
+        return open_error == EACCES || open_error == EPERM ? -3 : -1;
     }
 
     for (;;)
     {
-        ssize_t rc =
-            read(fd, g_chaos_net_config_buffer + total, CHAOS_NET_MAX_CONFIG_BYTES - total);
+        ssize_t rc = CHAOS_CONFIG_FILE_READ(
+            fd, g_chaos_net_config_buffer + total, CHAOS_NET_MAX_CONFIG_BYTES - total
+        );
+        if (rc < 0 && errno == EINTR)
+        {
+            continue;
+        }
         if (rc < 0)
         {
-            (void)close(fd);
+            const int read_error = errno;
+
+            CHAOS_CONFIG_FILE_CLOSE(fd);
             chaos_net_leave_internal(previous);
-            return -1;
+            return read_error == EISDIR ? -3 : -1;
         }
         if (rc == 0)
         {
@@ -721,14 +803,28 @@ static int chaos_net_config_read_file(size_t *size_out)
         total += (size_t)rc;
         if (total == CHAOS_NET_MAX_CONFIG_BYTES)
         {
-            /* File is at or over the size limit; treat as an error. */
-            (void)close(fd);
+            /* Filling the buffer means the file is at or over the limit. */
+            CHAOS_CONFIG_FILE_CLOSE(fd);
             chaos_net_leave_internal(previous);
-            return -1;
+            return -2;
         }
     }
 
-    (void)close(fd);
+    /* The file must still be the one whose stamp triggered this reload. A writer that
+     * rewrote or appended to it during the read leaves a different stamp; the copy may
+     * be half old, half new, so it is discarded and the next look reloads the finished
+     * file. */
+    if (fstat(fd, &st) != 0 || chaos_net_config_hash_mtime(&st) != expected_stamp)
+    {
+        CHAOS_CONFIG_FILE_CLOSE(fd);
+        chaos_net_leave_internal(previous);
+        return -1;
+    }
+    g_chaos_net_config_provisional = chaos_clock_stamp_is_recent(
+        (int64_t)CHAOS_NET_STAT_SEC(&st), (long)CHAOS_NET_STAT_NSEC(&st)
+    );
+
+    CHAOS_CONFIG_FILE_CLOSE(fd);
     chaos_net_leave_internal(previous);
     g_chaos_net_config_buffer[total] = '\0';
     *size_out = total;
@@ -736,23 +832,17 @@ static int chaos_net_config_read_file(size_t *size_out)
 }
 
 /**
- * @brief Splits a config rule line into its four colon-delimited fields.
+ * @brief Splits a rule line into selector, operation, effect and value.
  *
- * @details Parsing proceeds right-to-left using strrchr(':') to split off the
- * value, effect, and operation fields in order. The remaining prefix is the
- * selector. This right-to-left strategy is necessary because IPv6 addresses in
- * the selector (e.g., `tcp6://[::1]:443`) contain colons that must not be
- * treated as field separators.
+ * @details Splits right to left at the last three `:` so that colons inside the selector
+ * (`tcp6://[::1]:443`, the port separator) stay in it. Each field is trimmed.
  *
- * Each field pointer is trimmed of leading/trailing whitespace before being
- * returned so that callers receive clean tokens without embedded spaces.
- *
- * @param line            Writable NUL-terminated rule line (modified in place).
- * @param selector_text   Output: pointer to the selector field token.
- * @param operation_text  Output: pointer to the operation field token.
- * @param effect_text     Output: pointer to the effect/errno field token.
- * @param value_text      Output: pointer to the value (probability or ms) token.
- * @return 1 if exactly three ':' separators were found; 0 otherwise.
+ * @param line            Writable NUL-terminated rule line; modified in place.
+ * @param selector_text   Output: selector field.
+ * @param operation_text  Output: operation field.
+ * @param effect_text     Output: errno name or effect field.
+ * @param value_text      Output: value field.
+ * @return 1 if three separators were found; 0 otherwise (fields then unset).
  */
 static int chaos_net_split_rule_fields(
     char *line, char **selector_text, char **operation_text, char **effect_text, char **value_text
@@ -803,30 +893,41 @@ static int chaos_net_split_rule_fields(
 /**
  * @copydoc chaos_net_config_init
  *
- * Implementation notes: resets both snapshots to a `parse_ok == 1` empty
- * state, sets the active index to 0, and seeds the cached mtime to
- * `CHAOS_NET_MTIME_UNKNOWN` so the next `prepare()` call unconditionally
- * reads the on-disk config.  Not thread-safe; intended for the library
- * constructor or test-fixture setup only.
+ * Also records the pid and hits-file number for chaos_net_config_report_hits(). Both
+ * snapshots end with an even sequence, index 0 active, stamp CHAOS_NET_MTIME_UNKNOWN.
  */
 void chaos_net_config_init(void)
 {
+    g_chaos_net_hits_pid = (uint64_t)getpid();
+    g_chaos_net_hits_file = chaos_hits_file_number(CHAOS_NET_HITS_PREFIX);
+    g_chaos_net_hits_owned = 0;
+    chaos_hits_pool_reset(
+        g_chaos_net_hit_pool, sizeof(g_chaos_net_hit_pool) / sizeof(g_chaos_net_hit_pool[0])
+    );
+    if (!g_chaos_net_atfork_registered)
+    {
+        g_chaos_net_atfork_registered = 1;
+        (void)pthread_atfork(NULL, NULL, chaos_net_config_after_fork);
+    }
+    /* Resolve the vDSO clock now, not first inside a wrapper a signal handler re-entered. */
+    (void)chaos_clock_now_ns();
     chaos_net_config_reset_state(&g_chaos_net_config_states[0], 1);
     chaos_net_config_reset_state(&g_chaos_net_config_states[1], 1);
+    chaos_snapshot_write_end(&g_chaos_net_config_states[0].sequence);
+    chaos_snapshot_write_end(&g_chaos_net_config_states[1].sequence);
     g_chaos_net_active_config_index = 0U;
     g_chaos_net_cached_mtime = CHAOS_NET_MTIME_UNKNOWN;
 }
 
 /**
- * @brief Parses one config line into a rule.
+ * @brief Parses one rule line into @p rule (contract in chaos_net_config.h).
  *
- * @details See chaos_net_config.h for the full contract. The parsing sequence:
- *   1. Strip '#' comment suffix.
- *   2. Trim whitespace; skip blank lines (return 0).
- *   3. Split into four fields (right-to-left on ':').
- *   4. Reject if any field is empty after trimming.
- *   5. Parse selector, operation, effect/errno, and value.
- *   6. Validate effect/operation compatibility.
+ * @details Steps:
+ *   1. Cut at `#`; trim; a blank line returns 0.
+ *   2. Split into four fields right to left; any empty field is invalid.
+ *   3. Parse the selector, then the operation, then check the selector is allowed for it.
+ *   4. The third field is an errno name (effect ERRNO) or an effect keyword.
+ *   5. Parse the value for that effect; check the effect is allowed for the operation.
  */
 int chaos_net_config_parse_line(char *line, chaos_net_rule_t *rule)
 {
@@ -875,8 +976,8 @@ int chaos_net_config_parse_line(char *line, chaos_net_rule_t *rule)
         return -1;
     }
 
-    /* Determine effect by trying errno name first (it also identifies ERRNO effect),
-     * then falling through to the named effects. */
+    /* An errno name in the effect field means ERRNO; otherwise it must be an effect
+     * keyword. */
     errnum = chaos_net_parse_errno_name(effect_text);
     if (errnum >= 0)
     {
@@ -911,6 +1012,32 @@ int chaos_net_config_parse_line(char *line, chaos_net_rule_t *rule)
             return -1;
         }
     }
+    else if (strcmp(effect_text, "TRICKLE") == 0)
+    {
+        /* The data stays complete and correct; only its chunking is pathological. */
+        rule->effect = CHAOS_NET_EFFECT_TRICKLE;
+        rule->probability = 1.0;
+        if (chaos_net_parse_latency(value_text, &rule->chunk_bytes) != 0 || rule->chunk_bytes == 0U)
+        {
+            return -1;
+        }
+    }
+    else if (strcmp(effect_text, "DUP") == 0)
+    {
+        rule->effect = CHAOS_NET_EFFECT_DUP;
+        if (chaos_net_parse_probability(value_text, &rule->probability) != 0)
+        {
+            return -1;
+        }
+    }
+    else if (strcmp(effect_text, "RESET") == 0)
+    {
+        rule->effect = CHAOS_NET_EFFECT_RESET;
+        if (chaos_net_parse_probability(value_text, &rule->probability) != 0)
+        {
+            return -1;
+        }
+    }
     else
     {
         return -1;
@@ -920,17 +1047,31 @@ int chaos_net_config_parse_line(char *line, chaos_net_rule_t *rule)
 }
 
 /**
- * @brief Parses all lines from the TLS config buffer into a rules array.
+ * @brief Whether this build can apply @p rule.
  *
- * @details Splits on '\n' by writing NUL terminators in place. Stops and returns
- * -1 on the first invalid line (all-or-nothing policy). The rule count is written
- * only if the entire buffer is parsed successfully.
+ * @details Always 1 in the library. chaos-init (SECCOMP mode), which applies rules from
+ * outside the tracee, defines it before including this file: a rule it cannot apply then
+ * rejects the file like an invalid line, with reason UNSUPPORTED, so the status file says
+ * so instead of the rule silently doing nothing.
+ */
+#ifndef CHAOS_NET_RULE_SUPPORTED
+#define CHAOS_NET_RULE_SUPPORTED(rule) 1
+#endif
+
+/**
+ * @brief Parses a whole rule file (contract in chaos_net_config.h).
+ *
+ * @details Lines are split on '\n' in place. The line as written is kept in the error
+ * record before the parser edits it, so a rejection reports the original text, and the
+ * same copy becomes the rule's text for the hits file.
  */
 int chaos_net_config_parse_buffer(char *buffer, chaos_net_rule_t *rules, size_t *rule_count)
 {
     char *cursor;
     size_t count = 0U;
+    size_t number = 0U;
 
+    chaos_status_clear(&g_chaos_net_config_error);
     if (buffer == NULL || rules == NULL || rule_count == NULL)
     {
         return -1;
@@ -940,12 +1081,10 @@ int chaos_net_config_parse_buffer(char *buffer, chaos_net_rule_t *rules, size_t 
     while (*cursor != '\0')
     {
         char *line = cursor;
+        chaos_net_rule_t parsed;
+        chaos_rule_policy_t policy;
         int rc;
 
-        if (count >= CHAOS_NET_MAX_RULES)
-        {
-            return -1;
-        }
         while (*cursor != '\0' && *cursor != '\n')
         {
             ++cursor;
@@ -955,49 +1094,90 @@ int chaos_net_config_parse_buffer(char *buffer, chaos_net_rule_t *rules, size_t 
             *cursor++ = '\0';
         }
 
-        rc = chaos_net_config_parse_line(line, &rules[count]);
+        /* The parser edits the line in place; keep it as written for the report. */
+        chaos_status_keep_line(&g_chaos_net_config_error, ++number, line);
+        if (chaos_policy_extract(line, &policy) != 0)
+        {
+            chaos_status_reject(&g_chaos_net_config_error, CHAOS_STATUS_REASON_INVALID);
+            *rule_count = 0U;
+            return -1;
+        }
+        memset(&parsed, 0, sizeof(parsed));
+        rc = chaos_net_config_parse_line(line, &parsed);
         if (rc < 0)
         {
+            chaos_status_reject(&g_chaos_net_config_error, CHAOS_STATUS_REASON_INVALID);
+            *rule_count = 0U;
             return -1;
         }
         if (rc == 0)
         {
+            if (!chaos_policy_is_empty(&policy))
+            {
+                /* Qualifiers on a blank or comment-only line: invalid. */
+                chaos_status_reject(&g_chaos_net_config_error, CHAOS_STATUS_REASON_INVALID);
+                *rule_count = 0U;
+                return -1;
+            }
             continue;
         }
-
-        ++count;
+        parsed.policy = policy;
+        parsed.call_size = CHAOS_POLICY_NO_SIZE;
+        if (count >= CHAOS_NET_MAX_RULES)
+        {
+            chaos_status_reject(&g_chaos_net_config_error, CHAOS_STATUS_REASON_TOO_MANY);
+            *rule_count = 0U;
+            return -1;
+        }
+        if (!CHAOS_NET_RULE_SUPPORTED(&parsed))
+        {
+            chaos_status_reject(&g_chaos_net_config_error, CHAOS_STATUS_REASON_UNSUPPORTED);
+            *rule_count = 0U;
+            return -1;
+        }
+        (void)memcpy(
+            g_chaos_net_config_texts[count],
+            g_chaos_net_config_error.text,
+            sizeof(g_chaos_net_config_texts[count])
+        );
+        rules[count++] = parsed;
     }
 
+    chaos_status_clear(&g_chaos_net_config_error);
     *rule_count = count;
     return 0;
 }
 
+const chaos_status_error_t *chaos_net_config_last_error(void)
+{
+    return &g_chaos_net_config_error;
+}
+
+/** @brief Running best match while scanning rules for one or more endpoints. */
+typedef struct chaos_net_best_rule
+{
+    unsigned int rank;
+    size_t length;
+    int found;
+} chaos_net_best_rule_t;
+
 /**
- * @brief Finds the best-matching rule in a rule array for an (operation, endpoint) pair.
+ * @brief Updates @p rule and @p best with any rule for @p operation that matches
+ *        @p endpoint more specifically (higher rank, then longer selector) than @p best.
  *
- * @details Iterates the entire array to find the highest-rank match. On a tie
- * in rank, the rule with the longer selector_len text wins. This tie-breaking
- * convention ensures that `tcp4://127.0.0.1:8080` beats `tcp4://\*:8080` which
- * beats `*`, giving operators intuitive precedence without requiring an
- * explicit rule ordering in the config file.
+ * @details Strict comparisons: on a full tie the rule found first is kept. That makes the
+ * first endpoint passed by chaos_net_config_match_either_loaded() win ties.
  */
-int chaos_net_config_select_endpoint_rule(
+static void chaos_net_config_select_better(
     const chaos_net_rule_t *rules,
     size_t rule_count,
     chaos_net_operation_t operation,
     const chaos_net_endpoint_t *endpoint,
-    chaos_net_rule_t *rule
+    chaos_net_rule_t *rule,
+    chaos_net_best_rule_t *best
 )
 {
     size_t index;
-    unsigned int best_rank = 0U;
-    size_t best_len = 0U;
-    int found = 0;
-
-    if (rules == NULL || endpoint == NULL || rule == NULL)
-    {
-        return 0;
-    }
 
     for (index = 0U; index < rule_count; ++index)
     {
@@ -1011,90 +1191,405 @@ int chaos_net_config_select_endpoint_rule(
         {
             continue;
         }
-        /* Prefer higher rank; break ties by longer selector text (more specific). */
-        if (!found || rank > best_rank ||
-            (rank == best_rank && rules[index].selector.selector_len > best_len))
+        /* Higher rank wins; equal rank, the longer (more specific) selector text. */
+        if (!best->found || rank > best->rank ||
+            (rank == best->rank && rules[index].selector.selector_len > best->length))
         {
             *rule = rules[index];
-            best_rank = rank;
-            best_len = rules[index].selector.selector_len;
-            found = 1;
+            best->rank = rank;
+            best->length = rules[index].selector.selector_len;
+            best->found = 1;
         }
     }
+}
 
-    return found;
+int chaos_net_config_select_endpoint_rule(
+    const chaos_net_rule_t *rules,
+    size_t rule_count,
+    chaos_net_operation_t operation,
+    const chaos_net_endpoint_t *endpoint,
+    chaos_net_rule_t *rule
+)
+{
+    chaos_net_best_rule_t best = {0U, 0U, 0};
+
+    if (rules == NULL || endpoint == NULL || rule == NULL)
+    {
+        return 0;
+    }
+    chaos_net_config_select_better(rules, rule_count, operation, endpoint, rule, &best);
+    return best.found;
 }
 
 /**
- * @brief Checks for config changes and reloads if necessary.
+ * @brief Publishes @p state as "file rejected as a whole" with @p reason.
  *
- * @details Implements the two-snapshot CAS reload protocol. If the CAS to claim
- * the reload lock fails (another thread is already reloading), returns immediately
- * with the current snapshot's rule count, so the caller can still proceed with
- * fault injection using whatever rules are currently active.
- *
- * On reload failure (file missing, read error, parse error), the inactive snapshot
- * is marked parse_ok=0 and published, so repeated reload attempts on a corrupt file
- * do not repeatedly re-read it until the mtime changes.
+ * @details For conditions that persist until the file changes: too large (TOO_LARGE),
+ * not openable (EACCES/EPERM) or a directory (UNREADABLE), a NUL byte (NUL). Unlike a
+ * transient read failure, the file is not re-read on every look: the snapshot has no
+ * rules, the status file says state=error, and the next change of the stamp retries.
  */
-int chaos_net_config_prepare(void)
+static void chaos_net_config_reject_file(chaos_net_config_state_t *state, const char *reason)
+{
+    chaos_net_config_reset_state(state, 0);
+    chaos_status_clear(&g_chaos_net_config_error);
+    chaos_status_reject(&g_chaos_net_config_error, reason);
+}
+
+/**
+ * @brief Writes this process's hit counts after a hit on @p slot (NULL: forced, e.g. at
+ *        exit or after an idle interval).
+ *
+ * @details Rate: the hits file is written on each of the first CHAOS_HITS_EAGER (64) hits,
+ * then at most every CHAOS_HITS_INTERVAL_MS (100 ms); a NULL call writes whatever is
+ * pending. One writer at a time, chosen by CAS on g_chaos_net_hits_writing, never by
+ * waiting (a signal handler may hit while this thread writes): a hit that finds the writer
+ * busy leaves `pending` set, and the writer loops until nothing is pending. Only the pid
+ * the counts belong to writes, which keeps a vfork() child, sharing this memory, out.
+ */
+static void chaos_net_config_report_hits(chaos_hit_slot_t *slot)
+{
+    chaos_net_config_state_t *state;
+    const uint64_t now = chaos_hits_now_ms();
+
+    if (slot != NULL)
+    {
+        ++g_chaos_net_hits_total;
+        if (g_chaos_net_hits_pending == 0)
+        {
+            g_chaos_net_hits_pending = 1;
+        }
+        /* Past the eager phase and inside the interval: counters only, no system
+         * call. */
+        if (g_chaos_net_hits_total > CHAOS_HITS_EAGER &&
+            now - g_chaos_net_hits_last_ms < CHAOS_HITS_INTERVAL_MS)
+        {
+            return;
+        }
+    }
+    else if (g_chaos_net_hits_pending == 0)
+    {
+        return;
+    }
+    /* Only the process the counts belong to writes them. A vfork child shares this
+     * memory but is another process and runs no atfork handler. */
+    if ((uint64_t)getpid() != g_chaos_net_hits_pid)
+    {
+        return;
+    }
+    do
+    {
+        if (!__sync_bool_compare_and_swap(&g_chaos_net_hits_writing, 0, 1))
+        {
+            return;
+        }
+        state = (chaos_net_config_state_t *)chaos_net_config_active_state();
+        while (g_chaos_net_hits_pending != 0)
+        {
+            g_chaos_net_hits_pending = 0;
+            __sync_synchronize();
+            chaos_hits_write_for(
+                CHAOS_NET_HITS_PREFIX,
+                (long)getpid(),
+                &g_chaos_net_hits_file,
+                &g_chaos_net_hits_owned,
+                state->hits,
+                (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) state->text,
+                state->rule_count,
+                g_chaos_net_hits_buffer,
+                sizeof(g_chaos_net_hits_buffer)
+            );
+        }
+        g_chaos_net_hits_last_ms = now;
+        __sync_lock_release(&g_chaos_net_hits_writing);
+        __sync_synchronize();
+        /* A hit that found the writer busy after the last check is written now. */
+    } while (g_chaos_net_hits_pending != 0);
+}
+
+/**
+ * @brief fork() child handler: drops the state of parent threads that do not exist here.
+ *
+ * @details Registered with pthread_atfork() by chaos_net_config_init(). A reload claim
+ * held at the fork reverts to CHAOS_NET_MTIME_UNKNOWN (the next call reloads), the hits
+ * writer flag is cleared, counts restart at zero for the child's pid and hits file, the
+ * PRNG is reseeded on its next draw, and @first claims restart (chaos_hits_pool_after_fork()).
+ * vfork() children and posix_spawn run no atfork handler: they share the parent's memory,
+ * see its claims as busy and write nothing.
+ */
+static void chaos_net_config_after_fork(void)
+{
+    if (g_chaos_net_cached_mtime == CHAOS_NET_MTIME_RELOADING)
+    {
+        g_chaos_net_cached_mtime = CHAOS_NET_MTIME_UNKNOWN;
+    }
+    g_chaos_net_hits_writing = 0;
+    g_chaos_net_hits_pending = 0;
+    g_chaos_net_hits_total = 0U;
+    g_chaos_net_hits_last_ms = 0U;
+    g_chaos_net_hits_pid = (uint64_t)getpid();
+    g_chaos_net_hits_file = chaos_hits_file_number(CHAOS_NET_HITS_PREFIX);
+    g_chaos_net_hits_owned = 0;
+    /* The child must not draw the parent's numbers (pre-fork workers would all decide
+     * alike): its PRNG reseeds from its own thread id on the next draw. */
+    g_chaos_net_tls_prng_state = 0U;
+    chaos_hits_pool_after_fork(
+        g_chaos_net_hit_pool,
+        sizeof(g_chaos_net_hit_pool) / sizeof(g_chaos_net_hit_pool[0]),
+        chaos_net_config_active_state()->hits,
+        chaos_net_config_active_state()->rule_count
+    );
+}
+
+/** @brief Writes pending hit counts at normal exit (exit() or return from main). */
+__attribute__((destructor)) static void chaos_net_config_report_hits_at_exit(void)
+{
+    chaos_net_config_report_hits(NULL);
+}
+
+/**
+ * @brief Gives each rule of a freshly parsed snapshot its text, hit slot and generation.
+ *
+ * @details A rule whose text equals one in the active snapshot keeps that rule's slot
+ * (chaos_hits_assign()), so adding a rule does not reset the others' counts, and a firing
+ * through a rule copy taken before the reload still lands on the right counter.
+ */
+static void chaos_net_config_attach_hits(chaos_net_config_state_t *next_state)
+{
+    const chaos_net_config_state_t *active = chaos_net_config_active_state();
+    size_t index;
+
+    for (index = 0U; index < next_state->rule_count; ++index)
+    {
+        (void)memcpy(
+            next_state->text[index],
+            g_chaos_net_config_texts[index],
+            sizeof(next_state->text[index])
+        );
+    }
+    chaos_hits_assign(
+        g_chaos_net_hit_pool,
+        sizeof(g_chaos_net_hit_pool) / sizeof(g_chaos_net_hit_pool[0]),
+        active->hits,
+        (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) active->text,
+        active != next_state ? active->rule_count : 0U,
+        next_state->hits,
+        (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) next_state->text,
+        next_state->rule_count,
+        chaos_net_config_report_hits
+    );
+    for (index = 0U; index < next_state->rule_count; ++index)
+    {
+        next_state->rules[index].hit = next_state->hits[index];
+        next_state->rules[index].hit_generation =
+            next_state->hits[index] != NULL ? next_state->hits[index]->generation : 0U;
+    }
+}
+
+/**
+ * @brief Writes the status file for the load that produced @p state.
+ *
+ * @details Called by the reload owner before publishing. No rule file: the status file
+ * is removed. Rejected file: state=error with the line and reason. Otherwise state=ok with
+ * the rule count.
+ */
+static void chaos_net_config_report(uint64_t observed_mtime, const chaos_net_config_state_t *state)
+{
+    if (observed_mtime == CHAOS_NET_MTIME_MISSING)
+    {
+        chaos_status_remove(CHAOS_NET_STATUS_PATH);
+    }
+    else if (state->parse_ok == 0)
+    {
+        chaos_status_write(
+            CHAOS_NET_STATUS_PATH, CHAOS_STATUS_ERROR, 0U, &g_chaos_net_config_error
+        );
+    }
+    else
+    {
+        chaos_status_write(CHAOS_NET_STATUS_PATH, CHAOS_STATUS_OK, state->rule_count, NULL);
+    }
+}
+
+/** @brief Last look at the rule file (vDSO CLOCK_MONOTONIC, ns); see chaos_clock.h. */
+static volatile uint64_t g_chaos_net_last_check_ns = 0U;
+
+/** @brief Look throttle in ns: CHAOS_CHECK_INTERVAL_NS (1 ms); unit tests set 0 (every call). */
+static uint64_t g_chaos_net_check_interval_ns = CHAOS_CHECK_INTERVAL_NS;
+
+/**
+ * @brief Whether the rule file was looked at too recently to look again.
+ *
+ * @details A look is a stat(2), the largest part of a wrapper's cost. After the first
+ * completed load the file is looked at no more than once per CHAOS_CHECK_INTERVAL_NS
+ * (1 ms) per process, so a change takes effect within 1 ms instead of on the next call.
+ * Every call looks while no load has completed (UNKNOWN), while another thread holds the
+ * claim (RELOADING), and when no vDSO clock is available (chaos_clock_now_ns() returns 0).
+ * The timestamp is a plain word: two threads racing on it at worst both look.
+ */
+static int chaos_net_config_checked_recently(void)
+{
+    const uint64_t cached = chaos_net_atomic_load_u64(&g_chaos_net_cached_mtime);
+
+    if (cached == CHAOS_NET_MTIME_UNKNOWN || cached == CHAOS_NET_MTIME_RELOADING)
+    {
+        return 0;
+    }
+    return chaos_clock_checked_recently(&g_chaos_net_last_check_ns, g_chaos_net_check_interval_ns);
+}
+
+/**
+ * @brief Looks for a change of the rule file and reloads it if needed.
+ *
+ * @details The protocol of the file header, steps 2 to 5. Also flushes hits pending for
+ * longer than CHAOS_HITS_INTERVAL_MS, so a process that stopped hitting still reports its
+ * last hits before exit. Every early return reports the active snapshot.
+ *
+ * @return Non-zero if the snapshot active afterwards has at least one rule and parsed.
+ * @par errno: clobbered; see chaos_net_config_prepare().
+ */
+static int chaos_net_config_refresh(void)
 {
     uint64_t observed_mtime;
     uint64_t cached_mtime;
     unsigned int active_index;
     unsigned int next_index;
-    size_t config_size;
+    size_t config_size = 0U;
+    uint64_t content = 0U;
     chaos_net_config_state_t *next_state;
 
-    observed_mtime = chaos_net_config_observed_mtime();
-    cached_mtime = chaos_net_atomic_load_u64(&g_chaos_net_cached_mtime);
-
-    if (observed_mtime == cached_mtime)
+    if (chaos_net_config_checked_recently())
     {
         return chaos_net_config_active_state()->rule_count != 0U;
     }
-    /* Race to become the reload thread. Exactly one caller proceeds. */
+    /* Hits of an interval that is over are written now, not only at the next hit or at
+     * exit: a long-running process that stopped hitting reports them too. */
+    if (g_chaos_net_hits_pending != 0 &&
+        chaos_hits_now_ms() - g_chaos_net_hits_last_ms >= CHAOS_HITS_INTERVAL_MS)
+    {
+        chaos_net_config_report_hits(NULL);
+    }
+    observed_mtime = chaos_net_config_observed_mtime();
+    cached_mtime = chaos_net_atomic_load_u64(&g_chaos_net_cached_mtime);
+
+    if (observed_mtime == cached_mtime && !g_chaos_net_config_provisional)
+    {
+        return chaos_net_config_active_state()->rule_count != 0U;
+    }
+    /* Another thread of this process owns the reload: use the active snapshot. Without
+     * this check the CAS below would succeed as RELOADING -> RELOADING and two threads
+     * would fill the same inactive snapshot and read buffer. A claim inherited through
+     * fork() was already released by the atfork handler; a vfork child must not take
+     * over its parent's. */
+    if (cached_mtime == CHAOS_NET_MTIME_RELOADING)
+    {
+        return chaos_net_config_active_state()->rule_count != 0U;
+    }
     if (!chaos_net_atomic_cas_u64(
             &g_chaos_net_cached_mtime, cached_mtime, CHAOS_NET_MTIME_RELOADING
         ))
     {
         return chaos_net_config_active_state()->rule_count != 0U;
     }
+    g_chaos_net_config_provisional = 0;
 
     active_index = g_chaos_net_active_config_index;
     next_index = active_index == 0U ? 1U : 0U;
     next_state = &g_chaos_net_config_states[next_index];
     chaos_net_config_reset_state(next_state, 1);
 
-    if (observed_mtime != CHAOS_NET_MTIME_MISSING &&
-        chaos_net_config_read_file(&config_size) == 0 && config_size > 0U &&
-        chaos_net_config_parse_buffer(
-            g_chaos_net_config_buffer, next_state->rules, &next_state->rule_count
-        ) != 0)
+    if (observed_mtime != CHAOS_NET_MTIME_MISSING)
     {
-        /* Parse failed: mark the snapshot invalid so match queries return 0. */
-        chaos_net_config_reset_state(next_state, 0);
+        const int read_rc = chaos_net_config_read_file(&config_size, observed_mtime);
+
+        if (read_rc == -2 || read_rc == -3)
+        {
+            chaos_net_config_reject_file(
+                next_state,
+                read_rc == -2 ? CHAOS_STATUS_REASON_TOO_LARGE : CHAOS_STATUS_REASON_UNREADABLE
+            );
+            config_size = 0U;
+        }
+        else if (read_rc != 0)
+        {
+            /* A failed read says nothing about the rules: keep the active snapshot and
+             * release the claim with the previous stamp, so the next look retries
+             * instead of running with no rules until the file changes again. */
+            __sync_synchronize();
+            g_chaos_net_cached_mtime = cached_mtime;
+            return chaos_net_config_active_state()->rule_count != 0U;
+        }
+        if (read_rc == 0)
+        {
+            content = chaos_config_content_hash(g_chaos_net_config_buffer, config_size);
+            if (observed_mtime == cached_mtime && content == g_chaos_net_config_content)
+            {
+                /* A provisional load re-read and found the same bytes: the snapshot
+                 * stays, with its hit counts and @first claims. */
+                __sync_synchronize();
+                g_chaos_net_cached_mtime = cached_mtime;
+                return chaos_net_config_active_state()->rule_count != 0U;
+            }
+        }
+        if (config_size > 0U && memchr(g_chaos_net_config_buffer, '\0', config_size) != NULL)
+        {
+            /* The parser would stop at the NUL and drop every later rule unreported. */
+            chaos_net_config_reject_file(next_state, CHAOS_STATUS_REASON_NUL);
+            config_size = 0U;
+        }
+        if (config_size > 0U &&
+            chaos_net_config_parse_buffer(
+                g_chaos_net_config_buffer, next_state->rules, &next_state->rule_count
+            ) != 0)
+        {
+            /* Rejected: parse_ok = 0, so this snapshot never matches. */
+            chaos_net_config_reset_state(next_state, 0);
+        }
     }
 
+    g_chaos_net_config_content = content;
+    chaos_net_config_attach_hits(next_state);
+    chaos_net_config_report(observed_mtime, next_state);
+    /* Slots of rules that leave with this load are freed and marked outdated for rule
+     * copies still held. Done before the publish, while this thread holds the claim. */
+    chaos_hits_release(
+        g_chaos_net_hit_pool,
+        sizeof(g_chaos_net_hit_pool) / sizeof(g_chaos_net_hit_pool[0]),
+        next_state->hits,
+        next_state->rule_count
+    );
     chaos_net_config_publish(next_index, observed_mtime);
     return next_state->parse_ok != 0 && next_state->rule_count != 0U;
 }
 
 /**
+ * @brief Reloads the rule file if it changed, preserving errno.
+ *
+ * @details The stat, openat, read and status-file calls of a reload belong to the
+ * library: a wrapped call that then succeeds must not report, say, the ENOENT of a
+ * missing rule file.
+ */
+int chaos_net_config_prepare(void)
+{
+    const int saved_errno = errno;
+    const int result = chaos_net_config_refresh();
+
+    errno = saved_errno;
+    return result;
+}
+
+/**
  * @copydoc chaos_net_config_match_endpoint_loaded
  *
- * Implementation notes: reads the active snapshot pointer with an acquire
- * barrier (provided by `chaos_net_config_active_state`) and rejects any
- * snapshot whose `parse_ok == 0`, so a corrupt config is treated as
- * passthrough rather than producing arbitrary matches.  Does not refresh
- * the snapshot — callers in the hot path call `prepare()` once and then
- * dispatch through this function for each socket operation.
+ * Reads the active snapshot without refreshing it, under its seqlock sequence: a copy
+ * made while a reload rewrote the snapshot is discarded and reported as no match.
  */
 int chaos_net_config_match_endpoint_loaded(
     chaos_net_operation_t operation, const chaos_net_endpoint_t *endpoint, chaos_net_rule_t *rule
 )
 {
     const chaos_net_config_state_t *state = chaos_net_config_active_state();
+    const uint64_t sequence = chaos_snapshot_read_begin(&state->sequence);
 
     if (state->parse_ok == 0)
     {
@@ -1102,18 +1597,48 @@ int chaos_net_config_match_endpoint_loaded(
     }
 
     return chaos_net_config_select_endpoint_rule(
-        state->rules, state->rule_count, operation, endpoint, rule
-    );
+               state->rules, state->rule_count, operation, endpoint, rule
+           ) &&
+           chaos_snapshot_read_valid(&state->sequence, sequence);
+}
+
+int chaos_net_config_match_either_loaded(
+    chaos_net_operation_t operation,
+    const chaos_net_endpoint_t *first,
+    const chaos_net_endpoint_t *second,
+    chaos_net_rule_t *rule
+)
+{
+    const chaos_net_config_state_t *state = chaos_net_config_active_state();
+    const uint64_t sequence = chaos_snapshot_read_begin(&state->sequence);
+    chaos_net_best_rule_t best = {0U, 0U, 0};
+
+    if (state->parse_ok == 0)
+    {
+        return 0;
+    }
+    /* One search over both ends: a wildcard rule for the end tried first must not
+     * shadow a more specific rule for the other. */
+    if (first != NULL)
+    {
+        chaos_net_config_select_better(
+            state->rules, state->rule_count, operation, first, rule, &best
+        );
+    }
+    if (second != NULL)
+    {
+        chaos_net_config_select_better(
+            state->rules, state->rule_count, operation, second, rule, &best
+        );
+    }
+    return best.found && chaos_snapshot_read_valid(&state->sequence, sequence);
 }
 
 /**
  * @copydoc chaos_net_config_match_endpoint
  *
- * Implementation notes: convenience wrapper that combines
- * `chaos_net_config_prepare()` and `chaos_net_config_match_endpoint_loaded()`
- * into one call.  Used by socket wrappers that have no external trigger to
- * decide when to refresh; returns 0 immediately when the snapshot is empty
- * so the caller never inspects an unprepared rule set.
+ * chaos_net_config_prepare(), then chaos_net_config_match_endpoint_loaded(); returns 0
+ * at once for a NULL argument or while no rule is active.
  */
 int chaos_net_config_match_endpoint(
     chaos_net_operation_t operation, const chaos_net_endpoint_t *endpoint, chaos_net_rule_t *rule

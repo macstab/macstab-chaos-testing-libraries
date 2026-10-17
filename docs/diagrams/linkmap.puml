@@ -5,10 +5,12 @@
 '                Macstab GmbH · Hamburg, Germany
 '                https://macstab.com
 '
-' ELF lazy binding via PLT/GOT — first call (cold path) vs hot path
-' under LD_PRELOAD interposition.
+' ELF lazy binding via PLT/GOT under LD_PRELOAD interposition: when the
+' real-function table is resolved, the first call (cold path) and every
+' later call (hot path).
 '
-' Reference: docs/PLATFORM.md §1.4
+' Reference: docs/PLATFORM.md §1.2-§1.4
+'            src/core/chaos_io.c (chaos_io_ensure_symbols), src/common/chaos_once.h
 '
 title ELF lazy binding via PLT/GOT — first call (cold) vs hot path
 
@@ -31,42 +33,53 @@ participant "GOT[read]"                    as GOT
 participant "ld.so /\n_dl_runtime_resolve" as Ldso
 participant "do_lookup_x()"                as Lookup
 participant "libchaos-io.so:read"          as Chaos
-participant "libc.so.6:read"               as Glibc
+participant "libc:read"                    as Glibc
 
-== First call — cold path ==
+== Load time ==
+Ldso   ->  Chaos  : constructor: ensure_symbols()
+note right of Chaos
+  chaos_once: dlsym(RTLD_NEXT, …) for the whole
+  real-function table, exactly once per process.
+  A wrapper that runs before the constructor
+  (another object's constructor) triggers it
+  instead; concurrent callers sched_yield()
+  until it is done.
+end note
+
+== First call — cold path (lazy binding) ==
 App    ->  PLT    : call read
 PLT    ->  GOT    : jmp *GOT[read]\n(resolver stub)
 GOT    ->  Ldso   : bounce into resolver
-Ldso   ->  Lookup : walk link-map
+Ldso   ->  Lookup : walk the global scope
 note over Lookup
   Order:
-  1. main exe
-  2. LD_PRELOAD entries
-  3. DT_NEEDED transitively
-  First match wins.
+  1. main executable
+  2. LD_PRELOAD entries, left to right
+  3. DT_NEEDED, breadth-first
+  First definition wins.
 end note
 Lookup --> Ldso   : found in libchaos-io.so
 Ldso   ->  GOT    : patch slot → libchaos-io.so:read
-Ldso   ->  Chaos  : tail-call wrapper
-Chaos  ->  Chaos  : dlsym(RTLD_NEXT, "read")
-Chaos  ->  Glibc  : cache real_read pointer
-Chaos  ->  Chaos  : match config, maybe inject
-Chaos  ->  Glibc  : real_read(fd, buf, n)
+Ldso   ->  Chaos  : jump to wrapper
+Chaos  ->  Chaos  : ensure_symbols() (done: one acquire load)\nmatch rules, maybe inject
+Chaos  ->  Glibc  : real_read(fd, buf, n)\n(pointer cached at load, guard set)
 Glibc  --> Chaos  : result
 Chaos  --> App    : return
 
 == Second call onward — hot path ==
 App    ->  PLT    : call read
-PLT    ->  GOT    : jmp *GOT[read]\n(now → Chaos)
+PLT    ->  GOT    : jmp *GOT[read]\n(now → wrapper)
 GOT    ->  Chaos  : direct
-Chaos  ->  Chaos  : match config, maybe inject
+Chaos  ->  Chaos  : ensure_symbols(), match rules, maybe inject
 Chaos  ->  Glibc  : real_read(fd, buf, n)
 Glibc  --> Chaos  : result
 Chaos  --> App    : return
 
 note across
-  Hot path overhead: one extra indirect branch (the patched GOT slot)
-  plus the wrapper body. Resolver dance and dlsym are one-time cold cost.
+  With -z now or LD_BIND_NOW the loader fills GOT[read] at load time and the cold path
+  is skipped; interposition is identical. Hot-path cost of interposition itself: one
+  indirect branch through the GOT slot and one indirect call through the cached
+  real-function pointer. No dlsym runs per call.
 end note
 
 @enduml

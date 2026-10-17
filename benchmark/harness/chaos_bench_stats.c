@@ -1,38 +1,29 @@
 /**
  * @file chaos_bench_stats.c
- * @brief Statistics over per-iteration nanosecond samples.
+ * @brief Summary statistics over the per-call nanosecond samples of one run.
  *
  * @details
- * Stage 1 computes a fixed set of summary statistics: `min`, `max`, `mean`,
- * `stdev`, and percentiles `p50/p90/p99/p999/p9999` plus `median` (alias
- * for `p50`).  Percentile values use the type-7 (R-7) interpolation
- * scheme — the same default used by NumPy, R, and Pandas — so values
- * are directly comparable to analyses produced in those tools.
+ * Computes `min`, `max`, `mean`, sample `stdev`, and the percentiles p50 (also reported as
+ * `median`), p90, p95, p99, p99.9 and p99.99. Percentiles use type-7 (R-7) linear
+ * interpolation, the default of NumPy, R and pandas, so values are directly comparable with
+ * analyses done in those tools.
  *
- * **What's *not* here, and where it goes.**
- *  - Bootstrap confidence intervals (Stage 2): require ~10 ms of
- *    additional work per benchmark, deferred until the Python A/B
- *    driver lands so the work happens once per *report*, not per *trial*.
- *  - KS test for non-normality (Stage 2): same reasoning.
- *  - Outlier trimming: Stage 1 reports raw stats with `samples_after_trim
- *    == samples`.  Stage 2 will trim by MAD-based rejection at the
- *    driver layer where we have full samples preserved.
+ * **Deliberately absent.**
+ *  - Confidence intervals and hypothesis tests: one run is one observation. The Python
+ *    driver (`driver/chaos_bench_driver.py`) compares runs with a Wilcoxon rank-sum test and
+ *    a bootstrap confidence interval on the median delta.
+ *  - Outlier trimming: none; `samples_after_trim == samples`. Tail events stay visible in
+ *    the upper percentiles instead of being discarded.
  *
- * **Numerical hygiene.**
- *  - `stdev` is computed via the corrected two-pass algorithm: first
- *    pass for the mean, second pass for the squared deviations.  The
- *    naive single-pass sum-of-squares formula is catastrophic when
- *    samples cluster around a large mean (it loses all bits of
- *    precision in the subtraction step).  The two-pass cost is ~2× a
- *    single-pass scan, which is negligible against the millions of ns
- *    of measurement work that produced the samples.
- *  - Percentile interpolation uses `double` throughout to avoid
- *    rounding artifacts on small sample sets.
+ * **Numerics.**
+ *  - `stdev` uses the two-pass algorithm (mean first, then squared deviations). The
+ *    single-pass sum-of-squares formula cancels catastrophically when samples cluster tightly
+ *    around a large mean, which is exactly the shape of a stable benchmark. The second pass
+ *    costs one more scan, negligible next to the measurement that produced the samples.
+ *  - All arithmetic is in `double`.
  *
- * **Sort cost.**
- *  - `qsort(3)` on `double` over up to @ref CHAOS_BENCH_MAX_SAMPLES (1 M)
- *    samples completes in <50 ms on a contemporary CPU — well within
- *    the post-measurement budget.  No allocation.
+ * **Cost.** One in-place `qsort(3)` over at most @ref CHAOS_BENCH_MAX_SAMPLES (1 Mi) doubles,
+ * under 50 ms on a contemporary CPU, after the timed loop. No allocation.
  */
 
 #include "chaos_bench_internal.h"
@@ -42,12 +33,12 @@
 #include <string.h>
 
 /**
- * @brief `qsort` comparator for `double` arrays, ascending.
+ * @brief `qsort` comparator for `double`, ascending.
  *
- * @details Uses subtraction-and-sign to avoid the classic
- * "(a > b) - (a < b)" trick failing on NaN inputs, but the harness
- * never produces NaN samples (all inputs are positive cycle deltas
- * scaled by a positive ns_per_cycle factor) so either form is safe.
+ * @details `(a > b) - (a < b)` returns -1/0/1 without the overflow and truncation of
+ * `(int)(a - b)`. It treats NaN as equal to everything, which would break qsort's ordering
+ * contract; samples are never NaN because they are unsigned cycle deltas times a finite,
+ * positive `ns_per_cycle`.
  */
 static int chaos_bench_double_cmp(const void *lhs, const void *rhs)
 {
@@ -57,12 +48,11 @@ static int chaos_bench_double_cmp(const void *lhs, const void *rhs)
 }
 
 /**
- * @brief Computes one percentile from a sorted array using R-7 interpolation.
+ * @brief Returns percentile @p p of @p sorted using R-7 interpolation.
  *
- * @details R-7 is the default in NumPy and R: for a target rank
- * `h = (N-1) * p`, the percentile is a linear interpolation between the
- * floor and ceiling indices.  Returns the floor sample when `N == 1` or
- * when @p p falls exactly on an integer index.
+ * @details With the 0-based rank `h = (N-1) * p`, the result is
+ * `sorted[floor(h)] + (sorted[floor(h)+1] - sorted[floor(h)]) * frac(h)`. `N == 1` returns
+ * the only sample; `p == 1.0` returns the maximum.
  *
  * @param[in] sorted        Pre-sorted ascending array.
  * @param[in] sample_count  Length of @p sorted; must be > 0.
@@ -100,8 +90,8 @@ void chaos_bench_stats_compute(
     double mean;
     double sum_sq;
 
-    /* Caller invariant; we assert by clearing the output and bailing on
-     * the degenerate case rather than crashing. */
+    /* Zero the result first so sample_count == 0 yields all-zero statistics instead of
+     * reading samples[-1]. */
     memset(out, 0, sizeof(*out));
     if (sample_count == 0U)
     {
@@ -129,7 +119,7 @@ void chaos_bench_stats_compute(
     out->min_ns             = samples[0];
     out->max_ns             = samples[sample_count - 1U];
     out->mean_ns            = mean;
-    /* Sample stdev (Bessel's correction) — what `numpy.std(ddof=1)` gives. */
+    /* Sample stdev with Bessel's correction, equal to numpy.std(ddof=1); 0 for one sample. */
     out->stdev_ns           = sample_count > 1U
                                   ? sqrt(sum_sq / (double)(sample_count - 1U))
                                   : 0.0;

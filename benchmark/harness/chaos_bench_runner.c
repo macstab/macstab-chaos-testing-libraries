@@ -1,45 +1,43 @@
 /**
  * @file chaos_bench_runner.c
- * @brief Process entry point: parse argv, calibrate, run one benchmark, emit JSON.
+ * @brief Benchmark process entry point: parse options, calibrate, run one benchmark, emit
+ *        one JSON envelope.
  *
  * @details
- * One process executes one benchmark from start to finish.  The runner
- * is intentionally minimal — the cycle is:
- *   1. Parse argv (`--benchmark`, `--mode`, `--warmup`, `--iters`,
- *      `--batch`, `--scenario`, `--scenario-target`, `--output`, `--list`).
- *   2. Capture environment + check isolation (publishes mode in JSON).
- *   3. Calibrate timer.
- *   4. Find the descriptor by name (the constructor list is fully
- *      populated by the time `main` runs).
- *   5. If a scenario file is requested, copy it into the chaos config
- *      target path and bump its mtime to a future value (the existing
- *      future-mtime convention used by the runtime probes).
- *   6. Allocate the descriptor's per-benchmark state buffer.
- *   7. Invoke setup → warmup loop → measurement loop → teardown.
- *   8. Compute statistics.
- *   9. Emit the JSON envelope.
+ * One process runs one benchmark. `main` performs, in order:
+ *   1. Parse options (`--benchmark`, `--mode`, `--warmup`, `--iters`, `--batch`,
+ *      `--scenario`, `--scenario-target`, `--output`, `--list`, `--help`).
+ *   2. Capture the environment and evaluate the isolation checks.
+ *   3. Select and calibrate the timer (about 110 ms on rdtscp/cntvct).
+ *   4. Look up the descriptor; ELF constructors have registered all of them before `main`.
+ *   5. If both `--scenario` and `--scenario-target` are given, copy the scenario to the rule
+ *      file path and set its mtime 60 s into the future.
+ *   6. Allocate the zeroed state buffer, call setup, allocate the sample buffer.
+ *   7. Warmup loop, PMU start, measurement loop, PMU stop.
+ *   8. Compute statistics, then call teardown and free the buffers.
+ *   9. Write the JSON envelope to `--output` or stdout, close the PMU, delete the installed
+ *      rule file.
  *
- * The runner does *not* fork, pin to a CPU, or set LD_PRELOAD.  All of
- * those are the wrapper script's job (`run-bench.sh`), so the same
- * runner code is reusable in any orchestration environment without
- * recompilation.
+ * The runner does not fork, pin CPUs or set LD_PRELOAD; `run-bench.sh` does, so the same
+ * binary runs unchanged under Docker, bare metal or any other orchestrator.
+ *
+ * **Exit codes.** 0 success (also `--help`, `--list`); 2 invalid options; 3 unknown
+ * benchmark; 4 scenario install failed; 5 state allocation failed; 6 sample allocation
+ * failed; 7 output file cannot be opened. Error exits after step 5 leave the installed rule
+ * file in place; `run-bench.sh` removes it.
  *
  * **Loop discipline.**
- * The measurement loop reads the timer once before the iteration and
- * once after, recording the cycle delta.  Per-iteration sample is
- * stored in a pre-allocated `double` array so we can sort and compute
- * percentiles after the loop completes.  We *do not* call malloc inside
- * the loop, take a fast-path on the timer, or branch on anything other
- * than the loop counter — the optimizer is encouraged to unroll
- * trivially.
+ * Each timing window is bracketed by @ref CHAOS_BENCH_CLOBBER_MEMORY and two serializing
+ * timer reads. The sample goes into a preallocated `double` array; the loop allocates
+ * nothing, performs no I/O and branches only on its counters, so the only variable cost in a
+ * window is the iteration callback and the fixed timer-read cost (reported as
+ * `timer.overhead_ns`, not subtracted).
  *
- * **What `batch_size > 1` does.**
- * For sub-100ns iteration costs, the timer-read pair (~30 cycles) is a
- * meaningful fraction of the measurement.  The runner can be told to
- * call the iter callback `batch_size` times per timing window,
- * amortizing the timer overhead.  The reported value is per-op
- * (delta_ns / batch_size).  Batch size is exposed in the JSON for
- * downstream auditing.
+ * **Batching.**
+ * With `--batch=N` the iteration callback runs N times per window and the sample is the
+ * window's duration divided by N, amortising the timer-read cost for sub-100 ns operations
+ * at the price of hiding per-call variance (percentiles then describe N-call averages).
+ * `config.batch_size` in the envelope records N.
  */
 
 #include "chaos_bench.h"
@@ -58,16 +56,16 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Externally defined in chaos_bench_register.c. */
+/* Defined in chaos_bench_register.c; not in chaos_bench_internal.h because only --list uses it. */
 extern void chaos_bench_registry_list(FILE *out);
 
-/* Defaults — overridable by argv. */
+/* Defaults for --warmup, --iters and --batch. */
 #define CHAOS_BENCH_DEFAULT_WARMUP_ITERS       10000U
 #define CHAOS_BENCH_DEFAULT_MEASUREMENT_ITERS  200000U
 #define CHAOS_BENCH_DEFAULT_BATCH_SIZE         1U
 
 /**
- * @brief Parsed argv values.
+ * @brief Parsed command-line options; string fields point into argv.
  */
 typedef struct chaos_bench_args
 {
@@ -189,14 +187,20 @@ static int chaos_bench_parse_args(int argc, char **argv, chaos_bench_args_t *out
 }
 
 /**
- * @brief Copies @p src to @p dst and stamps the destination's mtime to
- *        a future value so the chaos library's reload mechanism picks
- *        the file up on its next prepare() call.
+ * @brief Installs scenario @p src as rule file @p dst and sets its mtime 60 s ahead.
  *
- * @details Mirrors the future-mtime convention used by the runtime
- * probes (test/runtime/\*_probe.c).  A fixed offset (60 s) is large
- * enough that a benchmark process cannot outrun the kernel's mtime
- * granularity.
+ * @details Copies with `read`/`write` in 8 KiB chunks (handling short writes), creating or
+ * truncating @p dst with mode 0644, then sets atime and mtime to now + 60 s with `futimens`.
+ * The libraries reload when the rule file's mtime changes; a future timestamp guarantees the
+ * new file differs from any mtime a previous run left behind, even when both writes fall in
+ * the same timestamp granule. The runtime probes under `test/runtime/` use the same
+ * convention.
+ *
+ * @param src  Scenario file to copy; must be readable.
+ * @param dst  Rule file path, e.g. `/tmp/.chaos-time.conf`.
+ *
+ * @return 0 on success; -1 after printing the failing call and `strerror(errno)` to stderr.
+ *         On failure @p dst may exist with partial content.
  */
 static int chaos_bench_install_scenario(const char *src, const char *dst)
 {
@@ -267,32 +271,32 @@ cleanup:
 }
 
 /**
- * @brief Allocates the descriptor's state buffer (zero-initialised).
+ * @brief Allocates the descriptor's zeroed state buffer.
+ *
+ * @return The buffer, or NULL if `calloc` fails.
  */
 static void *chaos_bench_alloc_state(const chaos_bench_descriptor_t *desc)
 {
     if (desc->state_size == 0U)
     {
-        /* Allocate one byte so the iter callback always receives a
-         * non-NULL pointer; the iter must ignore it. */
+        /* One byte keeps the never-NULL contract of the callbacks when the descriptor
+         * declares no state; the callbacks must not use it. */
         return calloc(1U, 1U);
     }
     return calloc(1U, desc->state_size);
 }
 
 /**
- * @brief Runs the warmup phase: invokes iter @p iters times without
- *        recording any samples.
+ * @brief Calls the iteration callback @p iters times without timing it.
  *
- * @details Warmup exists to cross every cold-state threshold before
- * measurement begins:
- *  - Lazy PLT resolution of `clock_gettime` and any other PLT-bound
- *    function used by the iter callback.
- *  - First TLS-slot allocation in the chaos library's reentrancy guard.
- *  - First config snapshot prepare (which includes opening the chaos
- *    config file the wrapper installed).
- *  - Branch predictor and BTB warm-up.
- *  - Page faults on any not-yet-touched pages of the iter callback.
+ * @details Moves every one-time cost out of the measured samples:
+ *  - lazy PLT binding of the functions the callback calls;
+ *  - first access to the library's thread-local reentrancy guard;
+ *  - the library's first rule-file load (the scenario is installed before warmup);
+ *  - branch-predictor and BTB training;
+ *  - first-touch page faults in the code and data the callback uses.
+ * With `--warmup=0` the first measured sample includes all of them, which is what a cold-path
+ * `SINGLE_SHOT` run wants.
  */
 static void chaos_bench_warmup(
     const chaos_bench_descriptor_t *desc, void *user_state, size_t iters
@@ -307,16 +311,13 @@ static void chaos_bench_warmup(
 }
 
 /**
- * @brief Runs the measurement phase: records per-iteration sample in @p out.
+ * @brief Times @p iters windows of @p batch_size callback calls each.
  *
- * @details Each sample is `(t_after - t_before) / batch_size`, converted
- * to ns by the calibrated timer.  We bracket the iter call(s) with full
- * memory clobbers so the optimizer cannot reorder loads/stores across
- * the timing boundary.
+ * @details Stores `cycles_to_ns(after - before) / batch_size` in `out_ns[i]`. The compiler
+ * clobbers on both sides keep the compiler from moving loads or stores into or out of the
+ * window; the serializing timer reads do the same for the CPU.
  *
- * The inner loop over `batch_size` exists so the timer-overhead tax
- * doesn't dominate sub-100ns measurements.  When `batch_size == 1` the
- * compiler is free to unroll it away.
+ * @param out_ns  Array of at least @p iters elements.
  */
 static void chaos_bench_measure(
     const chaos_bench_descriptor_t *desc,
@@ -388,8 +389,8 @@ int main(int argc, char **argv)
         return 3;
     }
 
-    /* Install scenario before any iter call (so the chaos library's
-     * first reload after warmup picks it up). */
+    /* Install the rule file before setup and warmup: the library loads it on the first
+     * wrapper call, so warmup absorbs the parse and measurement sees steady state. */
     if (args.scenario_path != NULL && args.scenario_target != NULL)
     {
         if (chaos_bench_install_scenario(args.scenario_path,
@@ -421,9 +422,10 @@ int main(int argc, char **argv)
 
     chaos_bench_warmup(desc, state, args.warmup_iters);
 
-    /* Open PMU after warmup so first-PLT / first-page-fault costs are
-     * not counted; close it before stats so the JSON writer can include
-     * the deltas. */
+    /* Open the PMU after warmup so warmup's one-time costs are not counted, and stop it
+     * right after the loop so statistics, teardown and JSON output are not counted. It is
+     * closed only after the envelope, which reads pmu.total, has been written. Failure to
+     * open is not fatal: the envelope reports pmu.available=false with the reason. */
     chaos_bench_pmu_t pmu;
     (void)chaos_bench_pmu_init(&pmu);
     chaos_bench_pmu_start(&pmu);
@@ -482,8 +484,8 @@ int main(int argc, char **argv)
         (void)fclose(out);
     }
 
-    /* Clean up the installed scenario so subsequent benches start from
-     * a known state (the wrapper script also does this for safety). */
+    /* Remove the rule file so the next benchmark process starts without rules;
+     * run-bench.sh removes it too, covering the error exits above. */
     if (scenario_active)
     {
         (void)unlink(args.scenario_target);

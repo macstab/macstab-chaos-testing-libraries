@@ -1,72 +1,82 @@
 /**
  * @file chaos_time_config.c
- * @brief Config file loading, parsing, and live-reload logic for libchaos-time.
+ * @brief Rule-file reload, parsing, rule selection, status and hits reporting for
+ *        libchaos-time.
  *
- * This translation unit owns the full lifecycle of the configuration state:
- * reading the file from disk, parsing it into rule arrays, and publishing new
- * snapshots to readers on other threads without locking.
+ * @details
+ * ### Reload protocol (two snapshots, lock-free readers)
  *
- * ### Two-snapshot lock-free reload protocol
+ * g_chaos_time_config_states[2] holds the active snapshot (g_chaos_time_active_config_index)
+ * and a spare. g_chaos_time_cached_mtime is the change stamp of the loaded file and, as
+ * CHAOS_TIME_MTIME_RELOADING, the reload lock. chaos_time_config_refresh():
  *
- * Two config state snapshots (g_chaos_time_config_states[0] and [1]) are kept
- * in a static array.  At any instant exactly one is "active" (indexed by
- * g_chaos_time_active_config_index).  The inactive snapshot is used as the
- * write target during a reload.  The protocol is:
+ *  1. Returns at once if the file was looked at less than CHAOS_CHECK_INTERVAL_NS (1 ms)
+ *     ago (vDSO CLOCK_MONOTONIC; never throttled before the first load or during a
+ *     reload, always looks when there is no vDSO clock).
+ *  2. Writes the hits file if a report is overdue.
+ *  3. stat()s the file. Same stamp and not provisional: done.
+ *  4. Claims the reload by CAS of the cached stamp to RELOADING; a loser, or a caller that
+ *     sees RELOADING, uses the active snapshot without waiting.
+ *  5. Marks the spare odd (sequence) and empties it; reads the file with raw system calls;
+ *     fstat()s the open descriptor and drops the read if the stamp moved meanwhile.
+ *  6. Rejects a file with a NUL byte, parses the rest, carries hit slots over by rule text,
+ *     writes the status file and frees slots of rules that left.
+ *  7. Publishes: sequence even, then the index, then the stamp, each behind a full barrier.
  *
- *  1. Atomically load the cached mtime hash.
- *  2. Stat the config file to get the observed mtime hash.
- *  3. If they match, no work is needed.
- *  4. CAS the cached mtime from its observed value to CHAOS_TIME_MTIME_RELOADING.
- *     - If the CAS fails, another thread is already reloading; read the current
- *       active state and return.
- *     - If the CAS succeeds, this thread owns the reload.
- *  5. Write into the inactive snapshot.
- *  6. Publish: store the new active index, then store the new mtime hash.
+ * Index before stamp: a thread that already sees the new stamp must also see the new
+ * index, or it could conclude the file is unchanged and serve the old rules. Readers copy a
+ * rule out and validate the copy with the snapshot's sequence (chaos_hits.h), because
+ * the spare they may still hold is rewritten by the next reload.
  *
- * The two-store publish sequence (index first, mtime second) means a racing
- * reader that loaded the old index before step 6 will see the old state, which
- * is still valid.  A reader that loads the new index will see the fully written
- * new state because the write to the inactive snapshot completed before the
- * index store.  Full memory barriers (__sync_synchronize) surround each
- * index/mtime access to prevent the CPU and compiler from reordering loads and
- * stores across the protocol boundary.
+ * ### Failure behaviour
  *
- * ### Per-thread read buffer
+ * | Condition                                   | Rules applied | Status   | Retried    |
+ * |---------------------------------------------|---------------|----------|------------|
+ * | no file (stat fails)                        | none          | removed  | on change  |
+ * | invalid line, > 256 rules, NUL byte         | none          | error    | on change  |
+ * | >= 256 KiB, EACCES/EPERM on open, EISDIR    | none          | error    | on change  |
+ * | other open/read error, stamp moved mid-read | previous set  | as before| next look  |
  *
- * g_chaos_time_config_buffer is TLS-allocated at CHAOS_TIME_MAX_CONFIG_BYTES+1
- * bytes.  It is only used by the thread that wins the reload CAS, so there is
- * no sharing.  TLS allocation avoids a large stack frame (256 KB) in what is
- * nominally a hot path.
+ * Rejecting a file means no rule applies: the library fails open and the program runs
+ * unfaulted. A stamp younger than CHAOS_RACY_WINDOW_MS (20 ms) makes the load
+ * provisional: the next look re-reads the file and keeps the snapshot (with its hit
+ * counts and `@first` claims) if the content hash is unchanged.
  *
- * ### Reentrancy during file I/O
+ * ### Reentrancy and errno
  *
- * stat(), open(), read(), and close() calls are wrapped in
- * chaos_time_enter_internal() / chaos_time_leave_internal() so that any
- * intercepted symbols called by the C runtime's implementation of those
- * functions will bypass chaos injection.
+ * The guard is held around stat() and the file read, so nothing they call reaches a
+ * libchaos-time wrapper. The read uses raw openat/read/close (CHAOS_CONFIG_FILE_*), so
+ * another preloaded library (libchaos-io) neither sees nor faults it.
+ * chaos_time_config_prepare() restores errno.
  *
- * @invariant  g_chaos_time_config_states[g_chaos_time_active_config_index]
- *             always contains a coherent, fully parsed ruleset or an empty
- *             ruleset with parse_ok == 1.  It is never partially written.
+ * ### Fork
+ *
+ * An atfork child handler releases a reload claim, the hits-writer flag and the hit
+ * counts inherited from the parent and reseeds the forking thread's PRNG. vfork and
+ * posix_spawn children run no handler; they share the parent's memory and write nothing.
+ *
+ * @invariant  The active snapshot is complete: its sequence is even and its rules,
+ *             counts and texts belong to one load.
  *
  * @module chaos-time
  * @stability Internal.
  */
 
 #include "chaos_time_config.h"
+#include "chaos_clock.h"
 
+#include <errno.h>
+#include <pthread.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 /*
- * Platform abstraction for struct stat mtime fields.
- *
- * Linux exposes sub-second precision through st_mtim (POSIX.1-2008 timespec
- * member), while macOS and BSDs expose it through st_mtimespec.  Both are
- * incorporated into the mtime hash so that a file written and immediately
- * re-written within the same second still triggers a reload.
+ * mtime with nanoseconds: st_mtim (POSIX.1-2008) on Linux, st_mtimespec on macOS and
+ * the BSDs. Both halves enter the change stamp, so two writes within one second differ
+ * whenever the file system's timestamp granularity separates them.
  */
 #if defined(__linux__)
 #define CHAOS_TIME_STAT_SEC(st) ((st)->st_mtim.tv_sec)
@@ -77,82 +87,140 @@
 #endif
 
 /**
- * @brief One complete, coherent snapshot of the parsed config state.
+ * @brief One load of the rule file: rules, their hit slots and their text.
  *
- * Two instances of this struct are kept in static storage.  The reload
- * protocol always writes into the inactive instance and then publishes it
- * atomically, so readers never observe a partially populated state.
+ * Two live in static storage; nothing is allocated. Only the reload owner writes one,
+ * and only the inactive one.
  *
- * @invariant  If parse_ok == 1, the first rule_count entries of rules[] are
- *             fully initialised.  If parse_ok == 0, the config file was
- *             present but contained at least one unparseable line; the whole
- *             snapshot is treated as empty (no rules applied).
+ * @invariant  parse_ok == 1: rules[0, rule_count) are valid (rule_count may be 0).
+ *             parse_ok == 0: the file was rejected (invalid line, too many rules, NUL
+ *             byte, too large or unreadable); rule_count is 0 and nothing applies.
  */
 typedef struct chaos_time_config_state
 {
-    chaos_time_rule_t rules[CHAOS_TIME_MAX_RULES]; /**< Parsed rules, indices [0, rule_count). */
-    size_t rule_count;                             /**< Number of valid entries in rules[]. */
-    int parse_ok; /**< 1 = config parsed cleanly; 0 = parse error. */
+    /** Odd while a reload rewrites the snapshot (see chaos_snapshot_read_begin()). */
+    volatile uint64_t sequence;
+    chaos_time_rule_t rules[CHAOS_TIME_MAX_RULES]; /**< Rules in file order. */
+    size_t rule_count;                             /**< Valid entries of rules[]. */
+    int parse_ok; /**< 1: loaded (possibly empty); 0: file rejected. */
+    /** Hit counters, one per rule (see chaos_hits.h). */
+    chaos_hit_slot_t *hits[CHAOS_TIME_MAX_RULES];
+    /** Each rule as written in the file, reported with its count. */
+    char text[CHAOS_TIME_MAX_RULES][CHAOS_STATUS_TEXT_MAX + 1U];
 } chaos_time_config_state_t;
 
-/** The two config snapshots; index 0 is the initial active snapshot. */
+/** The active snapshot and the spare; 0 is active after init. */
 static chaos_time_config_state_t g_chaos_time_config_states[2];
 
-/**
- * Index into g_chaos_time_config_states[] identifying the currently active
- * (readable) snapshot.  Updated atomically by the reload thread before
- * writing the new mtime.  Readers load this value under a memory barrier.
- */
+/** @brief Hit slots for the rules of both snapshots (see chaos_hits_assign()). */
+static chaos_hit_slot_t g_chaos_time_hit_pool[2U * CHAOS_TIME_MAX_RULES];
+
+/** Index of the active snapshot; stored by the reload owner before the stamp. */
 static volatile unsigned int g_chaos_time_active_config_index = 0U;
 
 /**
- * Hash of the config file's mtime at the last successful reload, or one of
- * the CHAOS_TIME_MTIME_* sentinel values.
+ * Change stamp of the loaded file, or a CHAOS_TIME_MTIME_* sentinel.
  *
- * Acts as both the "have we checked recently?" cache and the CAS mutex for
- * the reload protocol.  See chaos_time_config_prepare() for the full state
- * machine.
+ * Doubles as the reload lock: the thread that CASes it to CHAOS_TIME_MTIME_RELOADING
+ * owns the reload until it stores a stamp again (chaos_time_config_refresh()).
  */
 static volatile uint64_t g_chaos_time_cached_mtime = CHAOS_TIME_MTIME_UNKNOWN;
 
 /**
- * Per-thread buffer used to hold the raw config file content during a reload.
- *
- * Only the thread that wins the reload CAS uses this buffer.  TLS storage
- * avoids putting 256 KB on the call stack.  The extra byte beyond
- * CHAOS_TIME_MAX_CONFIG_BYTES provides space for a NUL terminator written by
- * chaos_time_config_read_file() after the last byte of file content.
+ * @brief The loaded file's mtime was too recent to trust its stamp
+ *        (chaos_clock_stamp_is_recent()): the next look re-reads it.
  */
-static __thread char g_chaos_time_config_buffer[CHAOS_TIME_MAX_CONFIG_BYTES + 1U];
+static volatile int g_chaos_time_config_provisional = 0;
+
+/** @brief chaos_config_content_hash() of the loaded file; 0 when none was read. */
+static uint64_t g_chaos_time_config_content = 0U;
 
 /**
- * Resets a config state snapshot to a known-empty state.
+ * @brief Read buffer for the rule file: 256 KiB plus the NUL terminator.
  *
- * Zeroes the entire struct via memset (which zero-initialises all rule fields
- * and sets rule_count to 0) then writes parse_ok.
+ * @details Only the reload owner (CHAOS_TIME_MTIME_RELOADING) touches it, so one
+ * process-wide buffer suffices; on the stack it would be a 256 KiB frame inside a
+ * wrapper.
  *
- * @param state     Snapshot to reset.  Ignored if NULL.
- * @param parse_ok  Value to store in state->parse_ok after the memset.
+ * Deliberately not `__thread`: a 256 KiB TLS object is static TLS, which glibc reserves
+ * in every thread of the preloaded process and adds to each thread's minimum stack
+ * size.  Runtimes that create threads with small explicit stacks -- the Erlang VM, for
+ * one -- then fail pthread_create() with EINVAL and cannot start at all.
+ */
+static char g_chaos_time_config_buffer[CHAOS_TIME_MAX_CONFIG_BYTES + 1U];
+
+/**
+ * @brief The first line the last parse rejected, reported in the status file.
+ *
+ * @details Written only by the thread that owns the reload claim.
+ */
+static chaos_status_error_t g_chaos_time_config_error;
+
+/** @brief Text of each accepted rule of the last parse; copied into the snapshot. */
+static char g_chaos_time_config_texts[CHAOS_TIME_MAX_RULES][CHAOS_STATUS_TEXT_MAX + 1U];
+
+/** @brief Hits-writer lock: set (by CAS) while a thread writes the hits file. */
+static volatile int g_chaos_time_hits_writing = 0;
+
+/** @brief Set once the atfork handler is registered; pthread_atfork() cannot unregister. */
+static int g_chaos_time_atfork_registered = 0;
+
+static void chaos_time_config_after_fork(void);
+
+/** @brief Set by every hit, cleared by the write that reports it. */
+static volatile int g_chaos_time_hits_pending = 0;
+
+/** @brief Hits recorded by this process (reset in a forked child). */
+static uint64_t g_chaos_time_hits_total = 0U;
+
+/** @brief chaos_hits_now_ms() at the last write, in ms. */
+static uint64_t g_chaos_time_hits_last_ms = 0U;
+
+/** @brief Process the counters belong to: set at init and in a forked child. */
+static volatile uint64_t g_chaos_time_hits_pid = 0U;
+
+/** @brief Number `<n>` of this image's hits file (chaos_hits_file_number()). */
+static long g_chaos_time_hits_file = 0L;
+/** @brief Whether this image created that file (chaos_hits_write_for()). */
+static int g_chaos_time_hits_owned = 0;
+
+/** @brief Scratch for the hits file; used only by the holder of the writer lock. */
+static char g_chaos_time_hits_buffer[CHAOS_TIME_MAX_RULES * CHAOS_HITS_LINE_MAX + 1U];
+
+/**
+ * Empties @p state and sets parse_ok; marks its sequence odd first.
+ *
+ * The sequence stays odd, so a reader still copying from this snapshot discards its
+ * copy; chaos_time_config_publish() (or init) makes it even again.
+ *
+ * @param state     Snapshot to reset; NULL is ignored.
+ * @param parse_ok  Value for state->parse_ok.
  */
 static void chaos_time_config_reset_state(chaos_time_config_state_t *state, int parse_ok)
 {
+    uint64_t sequence;
+
     if (state == NULL)
     {
         return;
     }
 
+    /* Odd before the memset: a reader still copying from this snapshot discards it. */
+    chaos_snapshot_write_begin(&state->sequence);
+    sequence = state->sequence;
     (void)memset(state, 0, sizeof(*state));
+    state->sequence = sequence;
     state->parse_ok = parse_ok;
 }
 
 /**
- * Returns a read-only pointer to the currently active config snapshot.
+ * The active snapshot, read after a full barrier.
  *
- * Issues a full memory barrier before reading the active index to prevent
- * the CPU from speculating the index load before stores by the last publishing
- * thread have become visible.
+ * The pointer stays valid, but the snapshot behind it becomes the spare at the next
+ * publish and is rewritten by the reload after that; callers validate what they copy
+ * with chaos_snapshot_read_begin() / chaos_snapshot_read_valid().
  *
- * @return  Pointer to the active chaos_time_config_state_t.  Never NULL.
+ * @return Never NULL.
  */
 static const chaos_time_config_state_t *chaos_time_config_active_state(void)
 {
@@ -164,28 +232,19 @@ static const chaos_time_config_state_t *chaos_time_config_active_state(void)
 }
 
 /**
- * Publishes a newly loaded snapshot as the active config.
+ * Makes snapshot @p next_index active and releases the reload claim.
  *
- * The two-store ordering is critical:
+ * Order, each step behind a full barrier: sequence even (the snapshot is complete),
+ * active index, then the stamp. Storing the stamp last both releases the claim and
+ * guarantees that whoever sees the new stamp also sees the new index; the reverse
+ * order would let a thread decide "unchanged" and serve the previous rules.
  *
- *  1. Full barrier + store active index — from this point, readers that load
- *     the index will see the new snapshot, which has already been fully written.
- *  2. Full barrier + store observed mtime — subsequent calls to
- *     chaos_time_config_prepare() by any thread will see the current mtime and
- *     skip redundant reloads.
- *
- * The mtime is stored after the index because a thread that reads the new
- * index but the old mtime will correctly serve the new rules and simply
- * schedule a premature (but harmless) re-stat on the next call.  The reverse
- * order would risk a window where the new mtime is visible but the old index
- * is still active, causing readers to serve stale rules until the next reload.
- *
- * @param next_index      Index into g_chaos_time_config_states[] to activate.
- * @param observed_mtime  Mtime hash to cache; future calls comparing against
- *                        this value will skip a reload if the file is unchanged.
+ * @param next_index      Snapshot to activate; written completely by the caller.
+ * @param observed_mtime  Change stamp the snapshot was loaded from.
  */
 static void chaos_time_config_publish(unsigned int next_index, uint64_t observed_mtime)
 {
+    chaos_snapshot_write_end(&g_chaos_time_config_states[next_index].sequence);
     __sync_synchronize();
     g_chaos_time_active_config_index = next_index;
     __sync_synchronize();
@@ -193,13 +252,10 @@ static void chaos_time_config_publish(unsigned int next_index, uint64_t observed
 }
 
 /**
- * Returns non-zero if a character is considered whitespace for trimming.
- *
- * Recognises space, tab, carriage return, and newline — the set of characters
- * that can appear at the margins of a config line on any platform.
+ * Space, tab, CR or LF. Not isspace(): that depends on the locale the program set.
  *
  * @param ch  Character to test.
- * @return    Non-zero if @p ch is blank, zero otherwise.
+ * @return    Non-zero for a blank.
  */
 static int chaos_time_is_blank_char(char ch)
 {
@@ -207,17 +263,10 @@ static int chaos_time_is_blank_char(char ch)
 }
 
 /**
- * Trims leading and trailing whitespace from a string in-place.
+ * Trims blanks in place: writes a NUL after the last non-blank character.
  *
- * Advances the pointer past any leading blank characters, then writes a NUL
- * terminator after the last non-blank character.  The returned pointer may
- * point into the interior of the original buffer; the original pointer is
- * not valid as an argument to free() after this call.
- *
- * @param text  Mutable NUL-terminated string.  May be NULL.
- * @return      Pointer to the first non-blank character, or a pointer to a
- *              NUL byte if the string is entirely whitespace.  NULL if @p text
- *              is NULL.
+ * @param text  Mutable string; NULL returns NULL.
+ * @return      First non-blank character inside @p text, or its terminating NUL.
  */
 static char *chaos_time_trim(char *text)
 {
@@ -247,13 +296,9 @@ static char *chaos_time_trim(char *text)
 }
 
 /**
- * Truncates a line at the first '#' character, removing any comment.
+ * Cuts @p line at its first '#'. No value of this grammar contains '#'.
  *
- * Writes a NUL byte over the '#', so subsequent parsing does not see the
- * comment text.  The function is idempotent: if no '#' is present the buffer
- * is unchanged.
- *
- * @param line  Mutable NUL-terminated line buffer.  May be NULL (no-op).
+ * @param line  Mutable line; NULL is ignored.
  */
 static void chaos_time_strip_comment(char *line)
 {
@@ -272,18 +317,17 @@ static void chaos_time_strip_comment(char *line)
 }
 
 /**
- * Maps a clock name string or decimal integer to a POSIX clockid_t.
+ * Parses a clock name or a decimal clock id.
  *
- * Recognises the portable names ("realtime", "monotonic") as well as
- * platform-specific names guarded by the appropriate preprocessor symbols
- * (e.g. "monotonic_raw" on Linux, "tai" on kernels with CLOCK_TAI).  Falls
- * back to strtol() parsing for numeric clock IDs not covered by the string
- * table, allowing future or non-standard clocks to be targeted without
- * recompiling the library.
+ * Names: realtime, monotonic, and, where the C library defines the constant,
+ * monotonic_raw, realtime_coarse, monotonic_coarse, boottime, tai, process_cputime_id,
+ * thread_cputime_id. Any other text is read as a decimal id (strtol, trailing blanks
+ * allowed, sign allowed) and not range-checked, so dynamic clock ids (negative, e.g.
+ * per-process CPU clocks) and newer clocks can be selected; an unused id never matches.
  *
- * @param text      NUL-terminated clock name or decimal string.
- * @param clock_id  Output: set to the corresponding clockid_t on success.
- * @return          1 on success, 0 if @p text is unrecognised or malformed.
+ * @param text      Clock text; NULL or empty returns 0.
+ * @param clock_id  Receives the id.
+ * @return          1 on success, 0 when @p text is neither a name nor a number.
  */
 static int chaos_time_parse_clock_id(const char *text, clockid_t *clock_id)
 {
@@ -365,21 +409,14 @@ static int chaos_time_parse_clock_id(const char *text, clockid_t *clock_id)
 }
 
 /**
- * Parses the selector token from a config line into a chaos_time_selector_t.
+ * Parses a selector: `*`, `clock_gettime`, `clock_gettime/<clock>`, `nanosleep`, `usleep`.
  *
- * Recognises the following forms:
- *  - `*`                       → SELECTOR_ANY
- *  - `clock_gettime`           → SELECTOR_OPERATION / OP_CLOCK_GETTIME
- *  - `clock_gettime/<clock>`   → SELECTOR_CLOCK_ID; <clock> parsed via
- *                                chaos_time_parse_clock_id()
- *  - `nanosleep`               → SELECTOR_OPERATION / OP_NANOSLEEP
- *  - `usleep`                  → SELECTOR_OPERATION / OP_USLEEP
+ * Exact, case-sensitive names. @p selector is zeroed first.
  *
- * @p selector is zeroed before any fields are written.
- *
- * @param text      NUL-terminated selector token (not modified).
- * @param selector  Output: populated on success.
- * @return          1 on success, 0 if the text is unrecognised or malformed.
+ * @param text      Trimmed selector text; not modified.
+ * @param selector  Receives the selector.
+ * @return          1 on success, 0 for anything else (including a clock text of
+ *                  CHAOS_TIME_MAX_TEXT bytes or more).
  */
 static int chaos_time_selector_parse(const char *text, chaos_time_selector_t *selector)
 {
@@ -440,23 +477,16 @@ static int chaos_time_selector_parse(const char *text, chaos_time_selector_t *se
 }
 
 /**
- * Tests whether a selector matches a (operation, clock_id) pair and, if so,
- * computes a specificity rank.
+ * Whether @p selector matches a call, and how specifically.
  *
- * Specificity ranks (higher = more specific, wins over lower):
- *  - 3 — SELECTOR_CLOCK_ID with matching operation and clock_id
- *  - 2 — SELECTOR_OPERATION with matching operation
- *  - 1 — SELECTOR_ANY (matches everything)
+ * Rank 3: CLOCK_ID with equal operation and clock id; 2: OPERATION with equal
+ * operation; 1: ANY.
  *
- * The rank is used by chaos_time_config_select_rule() to choose the most
- * specific applicable rule when multiple rules match the same call site.
- *
- * @param selector    Selector to test.  May be NULL (returns 0).
- * @param operation   Operation from the intercepted call.
- * @param clock_id    Clock ID from the intercepted call.
- * @param rank_out    Optional output: set to the specificity rank on a match,
- *                    0 on no-match.  May be NULL.
- * @return            Non-zero if the selector matches, zero otherwise.
+ * @param selector  Selector; NULL never matches.
+ * @param operation Operation of the call.
+ * @param clock_id  Clock of the call; compared for CLOCK_ID selectors only.
+ * @param rank_out  Receives the rank, 0 on no match; may be NULL.
+ * @return          Non-zero on a match.
  */
 static int chaos_time_selector_matches(
     const chaos_time_selector_t *selector,
@@ -505,16 +535,13 @@ static int chaos_time_selector_matches(
 }
 
 /**
- * Parses an errno name string or decimal integer into a positive int.
+ * Parses an ERRNO value: EINVAL, EFAULT, EINTR, EPERM, ENOSYS, EAGAIN, or a decimal.
  *
- * Recognises the six errno symbols that are meaningful for the intercepted
- * functions: EINVAL, EFAULT, EINTR, EPERM, ENOSYS, EAGAIN.  Falls back to
- * strtol() for other values, allowing numeric errno codes to be specified
- * directly.  Negative values and zero are rejected.
+ * The names are the errors the wrapped functions document; any other errno is given as
+ * a number in [1, 2147483647].
  *
- * @param text  NUL-terminated errno name or decimal string.
- * @return      Positive errno value, or -1 if @p text is unrecognised or
- *              out of range.
+ * @param text  Value text; NULL returns -1.
+ * @return      The errno (> 0), or -1 when @p text is neither.
  */
 static int chaos_time_parse_errno_name(const char *text)
 {
@@ -559,45 +586,25 @@ static int chaos_time_parse_errno_name(const char *text)
 }
 
 /**
- * Parses a probability string in [0.0, 1.0] from decimal text.
+ * @brief Parses a probability (see chaos_policy_parse_probability()): "0", "1",
+ *        "0." and digits, or "1." and zeros, whatever the locale.
  *
- * Uses strtod() for parsing.  Values outside the closed interval [0.0, 1.0]
- * are rejected; trailing non-whitespace after the number is also rejected.
- *
- * @param text         NUL-terminated decimal probability string.
- * @param probability  Output: set on success.
- * @return             0 on success, -1 on parse error or out-of-range value.
+ * @param text         Probability string. Must not be NULL.
+ * @param probability  Output: receives the parsed value. Must not be NULL.
+ * @return 0 on success; -1 when @p text is not a probability.
  */
 static int chaos_time_parse_probability(const char *text, double *probability)
 {
-    char *end = NULL;
-    double value;
-
-    if (text == NULL || probability == NULL)
-    {
-        return -1;
-    }
-
-    value = strtod(text, &end);
-    if (end == text || *chaos_time_trim(end) != '\0' || value < 0.0 || value > 1.0)
-    {
-        return -1;
-    }
-
-    *probability = value;
-    return 0;
+    return chaos_policy_parse_probability(text, probability);
 }
 
 /**
- * Copies a NUL-terminated string into a fixed-size buffer with bounds checking.
+ * Copies a non-empty @p text into @p buffer, NUL included.
  *
- * Fails if the source string is empty or if it would not fit with its NUL
- * terminator within @p buffer_size bytes.
- *
- * @param text         Source string to copy.
- * @param buffer       Destination buffer.
- * @param buffer_size  Total byte capacity of @p buffer including the NUL.
- * @return             0 on success, -1 on NULL argument or overflow.
+ * @param text         Source.
+ * @param buffer       Destination.
+ * @param buffer_size  Capacity of @p buffer in bytes, NUL included.
+ * @return             0 on success; -1 for NULL arguments, empty text or overflow.
  */
 static int chaos_time_copy_text_value(const char *text, char *buffer, size_t buffer_size)
 {
@@ -619,22 +626,16 @@ static int chaos_time_copy_text_value(const char *text, char *buffer, size_t buf
 }
 
 /**
- * Splits a combined "value[@probability]" token into its two components.
+ * Splits `value[@probability]` at its last '@'.
  *
- * Looks for the last '@' in @p text.  If found, copies everything before it
- * into @p payload and parses everything after it as a probability.  If no '@'
- * is present, copies the entire text into @p payload and sets *probability to
- * 1.0 (always trigger).
+ * Without '@' the probability is 1.0. The value part must be non-empty and shorter than
+ * @p payload_size; the probability must satisfy chaos_policy_parse_probability().
  *
- * The last '@' is used (not the first) to allow values that themselves contain
- * '@' characters, though no current value syntax requires this.
- *
- * @param text          NUL-terminated combined token.
- * @param payload       Output buffer for the value portion.
- * @param payload_size  Byte capacity of @p payload including NUL.
- * @param probability   Output: probability in [0.0, 1.0].
- * @return              0 on success, -1 on NULL argument, parse error, or
- *                      payload overflow.
+ * @param text          Value field.
+ * @param payload       Receives the value part.
+ * @param payload_size  Capacity of @p payload in bytes, NUL included.
+ * @param probability   Receives the probability; set to 1.0 first.
+ * @return              0 on success, -1 otherwise.
  */
 static int chaos_time_parse_payload_probability(
     const char *text, char *payload, size_t payload_size, double *probability
@@ -671,14 +672,14 @@ static int chaos_time_parse_payload_probability(
 }
 
 /**
- * Parses a latency duration in milliseconds from a decimal string.
+ * Parses a LATENCY value: decimal ms in [0, 4294967295] (about 49.7 days).
  *
- * Accepts values in [0, UINT_MAX].  The value 0 is valid and produces a
- * no-op LATENCY rule (triggers probability check but sleeps for zero time).
+ * 0 is valid: the rule still draws, counts hits and claims `@first`, but sleeps 0 ms.
+ * On LP64 a negative value wraps above the limit in strtoul and is rejected.
  *
- * @param text        NUL-terminated decimal millisecond count.
- * @param latency_ms  Output: latency in milliseconds.
- * @return            0 on success, -1 on parse error or overflow.
+ * @param text        Value text.
+ * @param latency_ms  Receives the delay in ms.
+ * @return            0 on success, -1 on malformed or out-of-range text.
  */
 static int chaos_time_parse_latency(const char *text, unsigned int *latency_ms)
 {
@@ -700,17 +701,19 @@ static int chaos_time_parse_latency(const char *text, unsigned int *latency_ms)
     return 0;
 }
 
+/** @brief Largest OFFSET or REGRESS shift accepted: 100 years in milliseconds. */
+#define CHAOS_TIME_MAX_OFFSET_MS INT64_C(3155760000000)
+
 /**
- * Parses a signed time offset in milliseconds from a decimal string.
+ * Parses an OFFSET or REGRESS value: signed decimal ms, |value| <= 3155760000000.
  *
- * Accepts the full range of int64_t (negative offsets move time backwards).
- * No range restriction is imposed beyond what strtoll() provides; callers
- * that receive very large offsets will clamp the result to zero (see
- * chaos_time_add_offset_ms()).
+ * The bound (100 years) exists because strtoll clamps an overflow silently and the
+ * shift is negated (REGRESS, absolute deadlines), which INT64_MIN does not survive.
+ * Negative values move the clock back.
  *
- * @param text       NUL-terminated signed decimal millisecond value.
- * @param offset_ms  Output: offset in milliseconds.
- * @return           0 on success, -1 on parse error.
+ * @param text       Value text.
+ * @param offset_ms  Receives the shift in ms.
+ * @return           0 on success, -1 on malformed or out-of-range text.
  */
 static int chaos_time_parse_offset(const char *text, int64_t *offset_ms)
 {
@@ -722,8 +725,10 @@ static int chaos_time_parse_offset(const char *text, int64_t *offset_ms)
         return -1;
     }
 
+    errno = 0;
     value = strtoll(text, &end, 10);
-    if (end == text || *chaos_time_trim(end) != '\0')
+    if (end == text || *chaos_time_trim(end) != '\0' || errno == ERANGE ||
+        value > CHAOS_TIME_MAX_OFFSET_MS || value < -CHAOS_TIME_MAX_OFFSET_MS)
     {
         return -1;
     }
@@ -733,19 +738,15 @@ static int chaos_time_parse_offset(const char *text, int64_t *offset_ms)
 }
 
 /**
- * Checks whether an effect is valid for the given selector.
+ * Whether @p effect may be combined with @p selector.
  *
- * ERRNO and LATENCY are universally applicable: they can be attached to any
- * selector kind.  OFFSET is restricted to selectors that target
- * clock_gettime (SELECTOR_OPERATION or SELECTOR_CLOCK_ID with
- * OP_CLOCK_GETTIME) because OFFSET modifies the returned struct timespec,
- * which sleep functions do not produce.  The wildcard selector (`*`) is also
- * rejected for OFFSET because it would implicitly target nanosleep and usleep,
- * which is meaningless.
+ * ERRNO and LATENCY: any selector. OFFSET and REGRESS change a returned time, which
+ * only clock reads have: `clock_gettime` or `clock_gettime/<clock>`, not `*`.
+ * (REGRESS is further limited to `clock_gettime/<clock>` by its parser.)
  *
- * @param selector  The selector from the rule being validated.
- * @param effect    The effect to validate.
- * @return          Non-zero if the combination is permitted, zero otherwise.
+ * @param selector  Parsed selector; NULL returns 0.
+ * @param effect    Effect.
+ * @return          Non-zero when allowed.
  */
 static int
 chaos_time_effect_allowed(const chaos_time_selector_t *selector, chaos_time_effect_t effect)
@@ -758,7 +759,7 @@ chaos_time_effect_allowed(const chaos_time_selector_t *selector, chaos_time_effe
     {
         return 1;
     }
-    if (effect != CHAOS_TIME_EFFECT_OFFSET)
+    if (effect != CHAOS_TIME_EFFECT_OFFSET && effect != CHAOS_TIME_EFFECT_REGRESS)
     {
         return 0;
     }
@@ -767,16 +768,18 @@ chaos_time_effect_allowed(const chaos_time_selector_t *selector, chaos_time_effe
 }
 
 /**
- * Ensures that a computed mtime hash does not collide with the two reserved
- * sentinel values CHAOS_TIME_MTIME_UNKNOWN and CHAOS_TIME_MTIME_RELOADING.
+ * Keeps a change stamp off CHAOS_TIME_MTIME_UNKNOWN and CHAOS_TIME_MTIME_RELOADING.
  *
- * If a hash happens to equal one of the sentinels (probability ≈ 2/2^64), it
- * is shifted by −1.  This is safe because the only property required of the
- * hash is that it changes when the mtime changes; a single collision on a
- * given file state causes an extra reload on that state, which is harmless.
+ * A stamp equal to either (probability 2/2^64) is decremented. MISSING (0) is not
+ * remapped (see the sentinel group in chaos_time_internal.h).
  *
- * @param value  Raw hash value.
- * @return       @p value if not a sentinel, otherwise value − 1.
+ * Known defect: UNKNOWN - 1 is RELOADING, so a raw stamp equal to UNKNOWN is published
+ * as RELOADING, and every later refresh then treats the reload as owned by another
+ * thread: the process stops reloading until it forks or restarts. Probability 2^-64
+ * per stamp.
+ *
+ * @param value  Raw stamp.
+ * @return       @p value, or value - 1 for a sentinel.
  */
 static uint64_t chaos_time_config_normalize_mtime_hash(uint64_t value)
 {
@@ -788,18 +791,16 @@ static uint64_t chaos_time_config_normalize_mtime_hash(uint64_t value)
 }
 
 /**
- * Produces a 64-bit hash of a struct stat's mtime fields.
+ * 64-bit change stamp of a file: FNV-1a-style mix of mtime (s, ns), size, inode, device.
  *
- * Combines the second and nanosecond fields of the mtime using FNV-inspired
- * multiply-and-XOR steps seeded with a non-trivial initialisation constant.
- * Sub-second precision is included so that a file replaced within the same
- * second is still detected as changed.
+ * mtime alone misses changes: file systems stamp it from a coarse clock (a few ms), so
+ * two writes in one tick leave it equal. The size catches an append, the inode a
+ * rewrite through a temporary file and rename(2) (`sed -i`). A same-size rewrite in
+ * place within one tick is caught only by the provisional re-read
+ * (chaos_clock_stamp_is_recent()).
  *
- * If @p st is NULL, returns CHAOS_TIME_MTIME_MISSING (indicating the file
- * does not exist).
- *
- * @param st  Stat result.  May be NULL.
- * @return    Normalised hash, or CHAOS_TIME_MTIME_MISSING if @p st is NULL.
+ * @param st  stat result; NULL returns CHAOS_TIME_MTIME_MISSING.
+ * @return    Normalised stamp.
  */
 static uint64_t chaos_time_config_hash_mtime(const struct stat *st)
 {
@@ -815,18 +816,20 @@ static uint64_t chaos_time_config_hash_mtime(const struct stat *st)
     value *= UINT64_C(1099511628211);
     value ^= (uint64_t)CHAOS_TIME_STAT_NSEC(st);
     value *= UINT64_C(1099511628211);
+    value ^= (uint64_t)st->st_size;
+    value *= UINT64_C(1099511628211);
+    value ^= (uint64_t)st->st_ino;
+    value *= UINT64_C(1099511628211);
+    value ^= (uint64_t)st->st_dev;
+    value *= UINT64_C(1099511628211);
     return chaos_time_config_normalize_mtime_hash(value);
 }
 
 /**
- * Stats the config file and returns a normalised mtime hash.
+ * stat()s the rule file under the guard; one system call, the cost of every look.
  *
- * Wraps the stat(2) call in the reentrancy guard so that any internal
- * function calls made by the C runtime's stat() implementation do not
- * recurse into the chaos wrappers.
- *
- * @return  Normalised mtime hash, or CHAOS_TIME_MTIME_MISSING if the file
- *          does not exist or stat() fails for any reason.
+ * @return Change stamp, or CHAOS_TIME_MTIME_MISSING when stat() fails for any reason.
+ *         errno may change (chaos_time_config_prepare() restores it).
  */
 static uint64_t chaos_time_config_observed_mtime(void)
 {
@@ -846,24 +849,25 @@ static uint64_t chaos_time_config_observed_mtime(void)
 }
 
 /**
- * Reads the config file into g_chaos_time_config_buffer.
+ * Reads the rule file into g_chaos_time_config_buffer and NUL-terminates it.
  *
- * Opens the file, reads it in a loop until EOF or until
- * CHAOS_TIME_MAX_CONFIG_BYTES have been consumed, then NUL-terminates the
- * buffer.  Files larger than CHAOS_TIME_MAX_CONFIG_BYTES are rejected to
- * prevent truncated rule sets (the caller would parse an incomplete rule and
- * either produce wrong rules or hit a parse error).
+ * Raw openat (O_CLOEXEC)/read/close under the guard, each retried on EINTR. After EOF
+ * the open descriptor is fstat()ed: if its stamp is not @p expected_stamp a writer
+ * changed the file during the read, the copy may mix old and new bytes, and it is
+ * discarded. Sets g_chaos_time_config_provisional from the file's mtime age. Reload
+ * owner only.
  *
- * All I/O calls are guarded by chaos_time_enter_internal() so that they do
- * not trigger chaos injection recursively.
- *
- * @param size_out  Output: number of bytes read on success (not including the
- *                  NUL terminator).  Unchanged on failure.
- * @return          0 on success, -1 on any I/O error or if the file is too
- *                  large.
+ * @param size_out        Receives the byte count (without the NUL) on success.
+ * @param expected_stamp  Stamp observed by the stat() that triggered this read.
+ * @return  0 on success;
+ *          -1 transient failure (open or read error, stamp moved): retry at next look;
+ *          -2 file of CHAOS_TIME_MAX_CONFIG_BYTES (256 KiB) or more: reject;
+ *          -3 open failed with EACCES/EPERM or read with EISDIR: reject.
+ *          errno may change.
  */
-static int chaos_time_config_read_file(size_t *size_out)
+static int chaos_time_config_read_file(size_t *size_out, uint64_t expected_stamp)
 {
+    struct stat st;
     size_t total = 0U;
     int previous;
     int fd;
@@ -874,22 +878,36 @@ static int chaos_time_config_read_file(size_t *size_out)
     }
 
     previous = chaos_time_enter_internal();
-    fd = open(CHAOS_TIME_CONFIG_PATH, O_RDONLY);
+    do
+    {
+        fd = CHAOS_CONFIG_FILE_OPEN(CHAOS_TIME_CONFIG_PATH);
+    } while (fd < 0 && errno == EINTR);
     if (fd < 0)
     {
+        /* Missing permission lasts until the file changes; anything else (removed since
+         * the stat, EMFILE, ...) is retried at the next look. */
+        const int open_error = errno;
+
         chaos_time_leave_internal(previous);
-        return -1;
+        return open_error == EACCES || open_error == EPERM ? -3 : -1;
     }
 
     for (;;)
     {
-        ssize_t rc =
-            read(fd, g_chaos_time_config_buffer + total, CHAOS_TIME_MAX_CONFIG_BYTES - total);
+        ssize_t rc = CHAOS_CONFIG_FILE_READ(
+            fd, g_chaos_time_config_buffer + total, CHAOS_TIME_MAX_CONFIG_BYTES - total
+        );
+        if (rc < 0 && errno == EINTR)
+        {
+            continue;
+        }
         if (rc < 0)
         {
-            (void)close(fd);
+            const int read_error = errno;
+
+            CHAOS_CONFIG_FILE_CLOSE(fd);
             chaos_time_leave_internal(previous);
-            return -1;
+            return read_error == EISDIR ? -3 : -1;
         }
         if (rc == 0)
         {
@@ -898,13 +916,26 @@ static int chaos_time_config_read_file(size_t *size_out)
         total += (size_t)rc;
         if (total == CHAOS_TIME_MAX_CONFIG_BYTES)
         {
-            (void)close(fd);
+            CHAOS_CONFIG_FILE_CLOSE(fd);
             chaos_time_leave_internal(previous);
-            return -1;
+            return -2;
         }
     }
 
-    (void)close(fd);
+    /* The file must still be the one whose change triggered this reload. A writer
+     * that rewrote or appended to it during the read leaves a different stamp; the
+     * copy may be half old, half new, so it is dropped and the next look reloads. */
+    if (fstat(fd, &st) != 0 || chaos_time_config_hash_mtime(&st) != expected_stamp)
+    {
+        CHAOS_CONFIG_FILE_CLOSE(fd);
+        chaos_time_leave_internal(previous);
+        return -1;
+    }
+    g_chaos_time_config_provisional = chaos_clock_stamp_is_recent(
+        (int64_t)CHAOS_TIME_STAT_SEC(&st), (long)CHAOS_TIME_STAT_NSEC(&st)
+    );
+
+    CHAOS_CONFIG_FILE_CLOSE(fd);
     chaos_time_leave_internal(previous);
     g_chaos_time_config_buffer[total] = '\0';
     *size_out = total;
@@ -912,18 +943,15 @@ static int chaos_time_config_read_file(size_t *size_out)
 }
 
 /**
- * Splits a trimmed rule line into its three colon-delimited fields.
+ * Splits @p line at its first two ':' (overwritten with NUL) and trims each field.
  *
- * Writes NUL bytes over the first and second ':' separators and returns
- * trimmed pointers to each segment through the output parameters.
+ * Further ':' stay in the value field, where the value parser rejects them.
  *
- * @param line           Mutable NUL-terminated line content (comment already
- *                       stripped, not yet trimmed).
- * @param selector_text  Output: pointer to the trimmed selector field.
- * @param effect_text    Output: pointer to the trimmed effect name field.
- * @param value_text     Output: pointer to the trimmed value/probability field.
- * @return               Non-zero on success, zero if fewer than two ':' found
- *                       or if any argument is NULL.
+ * @param line           Mutable line, comment already cut.
+ * @param selector_text  Receives the selector field.
+ * @param effect_text    Receives the effect field.
+ * @param value_text     Receives the value field (`value[@probability]`).
+ * @return               Non-zero on success; 0 for fewer than two ':' or a NULL argument.
  */
 static int chaos_time_split_rule_fields(
     char *line, char **selector_text, char **effect_text, char **value_text
@@ -961,8 +989,24 @@ static int chaos_time_split_rule_fields(
  */
 void chaos_time_config_init(void)
 {
+    g_chaos_time_hits_pid = (uint64_t)getpid();
+    g_chaos_time_hits_file = chaos_hits_file_number(CHAOS_TIME_HITS_PREFIX);
+    g_chaos_time_hits_owned = 0;
+    chaos_hits_pool_reset(
+        g_chaos_time_hit_pool, sizeof(g_chaos_time_hit_pool) / sizeof(g_chaos_time_hit_pool[0])
+    );
+    if (!g_chaos_time_atfork_registered)
+    {
+        g_chaos_time_atfork_registered = 1;
+        (void)pthread_atfork(NULL, NULL, chaos_time_config_after_fork);
+    }
+    /* Resolve the vDSO clock now, not first inside a wrapper a signal handler re-enters
+     * (a lookup in progress there makes the throttle look on every call meanwhile). */
+    (void)chaos_clock_now_ns();
     chaos_time_config_reset_state(&g_chaos_time_config_states[0], 1);
     chaos_time_config_reset_state(&g_chaos_time_config_states[1], 1);
+    chaos_snapshot_write_end(&g_chaos_time_config_states[0].sequence);
+    chaos_snapshot_write_end(&g_chaos_time_config_states[1].sequence);
     g_chaos_time_active_config_index = 0U;
     g_chaos_time_cached_mtime = CHAOS_TIME_MTIME_UNKNOWN;
 }
@@ -970,14 +1014,8 @@ void chaos_time_config_init(void)
 /**
  * @copydoc chaos_time_config_parse_line
  *
- * Implementation notes:
- *
- *  - The line is stripped of comments and trimmed before splitting; an
- *    empty result after trimming produces return value 0 (skip).
- *  - Fields are split on exactly two ':' characters; missing separators
- *    produce return value -1.
- *  - For OFFSET rules, chaos_time_effect_allowed() enforces the restriction
- *    that OFFSET is only valid on clock_gettime selectors.
+ * Effect names are exact and case-sensitive. The selector is checked against the
+ * effect before the value is parsed.
  */
 int chaos_time_config_parse_line(char *line, chaos_time_rule_t *rule)
 {
@@ -1056,6 +1094,22 @@ int chaos_time_config_parse_line(char *line, chaos_time_rule_t *rule)
         }
         return chaos_time_parse_offset(payload, &rule->offset_ms) == 0 ? 1 : -1;
     }
+    if (strcmp(effect_text, "REGRESS") == 0)
+    {
+        rule->effect = CHAOS_TIME_EFFECT_REGRESS;
+        /* One clock per rule, offset > 0: the jump state is per rule, and a rule over
+         * all clocks would arm on one clock and jump on another. */
+        if (!chaos_time_effect_allowed(&rule->selector, rule->effect) ||
+            rule->selector.kind != CHAOS_TIME_SELECTOR_CLOCK_ID ||
+            chaos_time_parse_payload_probability(
+                value_text, payload, sizeof(payload), &rule->probability
+            ) != 0 ||
+            chaos_time_parse_offset(payload, &rule->offset_ms) != 0 || rule->offset_ms <= 0)
+        {
+            return -1;
+        }
+        return 1;
+    }
 
     return -1;
 }
@@ -1063,19 +1117,15 @@ int chaos_time_config_parse_line(char *line, chaos_time_rule_t *rule)
 /**
  * @copydoc chaos_time_config_parse_buffer
  *
- * Implementation notes:
- *
- *  - The buffer is modified in-place: newlines are replaced with NUL bytes
- *    to produce individual line strings without additional allocation.
- *  - parse_line() return value 0 (blank/comment) is silently skipped;
- *    return value -1 causes immediate failure so the caller can mark the
- *    snapshot as parse_ok == 0 and treat the entire config as empty.
+ * Line numbers in the error record count from 1, blank and comment lines included.
  */
 int chaos_time_config_parse_buffer(char *buffer, chaos_time_rule_t *rules, size_t *rule_count)
 {
     char *cursor;
     size_t count = 0U;
+    size_t number = 0U;
 
+    chaos_status_clear(&g_chaos_time_config_error);
     if (buffer == NULL || rules == NULL || rule_count == NULL)
     {
         return -1;
@@ -1085,50 +1135,78 @@ int chaos_time_config_parse_buffer(char *buffer, chaos_time_rule_t *rules, size_
     while (*cursor != '\0')
     {
         char *line = cursor;
-        int parsed;
+        chaos_time_rule_t parsed;
+        chaos_rule_policy_t policy;
+        int rc;
 
-        cursor = strchr(cursor, '\n');
-        if (cursor != NULL)
+        while (*cursor != '\0' && *cursor != '\n')
+        {
+            ++cursor;
+        }
+        if (*cursor == '\n')
         {
             *cursor++ = '\0';
         }
-        else
-        {
-            cursor = line + strlen(line);
-        }
 
-        parsed = chaos_time_config_parse_line(line, &rules[count]);
-        if (parsed < 0)
+        /* The parsers edit the line in place; keep it as written for the reports. */
+        chaos_status_keep_line(&g_chaos_time_config_error, ++number, line);
+        if (chaos_policy_extract(line, &policy) != 0)
         {
+            chaos_status_reject(&g_chaos_time_config_error, CHAOS_STATUS_REASON_INVALID);
+            *rule_count = 0U;
             return -1;
         }
-        if (parsed == 0)
+        memset(&parsed, 0, sizeof(parsed));
+        rc = chaos_time_config_parse_line(line, &parsed);
+        if (rc < 0)
         {
+            chaos_status_reject(&g_chaos_time_config_error, CHAOS_STATUS_REASON_INVALID);
+            *rule_count = 0U;
+            return -1;
+        }
+        if (rc == 0)
+        {
+            if (!chaos_policy_is_empty(&policy))
+            {
+                /* Qualifiers without a rule: an operator error, not a blank line. */
+                chaos_status_reject(&g_chaos_time_config_error, CHAOS_STATUS_REASON_INVALID);
+                *rule_count = 0U;
+                return -1;
+            }
             continue;
         }
-        ++count;
-        if (count > CHAOS_TIME_MAX_RULES)
+        parsed.policy = policy;
+        parsed.call_size = CHAOS_POLICY_NO_SIZE;
+        if (count >= CHAOS_TIME_MAX_RULES)
         {
+            chaos_status_reject(&g_chaos_time_config_error, CHAOS_STATUS_REASON_TOO_MANY);
+            *rule_count = 0U;
             return -1;
         }
+        (void)memcpy(
+            g_chaos_time_config_texts[count],
+            g_chaos_time_config_error.text,
+            sizeof(g_chaos_time_config_texts[count])
+        );
+        rules[count++] = parsed;
     }
 
+    chaos_status_clear(&g_chaos_time_config_error);
     *rule_count = count;
     return 0;
+}
+
+const chaos_status_error_t *chaos_time_config_last_error(void)
+{
+    return &g_chaos_time_config_error;
 }
 
 /**
  * @copydoc chaos_time_config_select_rule
  *
- * Implementation notes:
- *
- *  - The entire array is scanned linearly; the first matching rule
- *    initialises the "best" candidate.  Subsequent matches replace it only
- *    if they have a strictly higher rank, or the same rank with a longer
- *    selector text.
- *  - Selector text length is used as a secondary tiebreaker rather than
- *    file order, so reordering lines in the config does not change which rule
- *    is chosen (assuming no two lines are exactly identical).
+ * A later match replaces the candidate only with a strictly higher rank or, at equal
+ * rank, a strictly longer selector; hence the earlier line wins a full tie, and two
+ * rules with the same selector and effect resolve to the first one in the file.
  */
 int chaos_time_config_select_rule(
     const chaos_time_rule_t *rules,
@@ -1175,34 +1253,274 @@ int chaos_time_config_select_rule(
 }
 
 /**
- * @copydoc chaos_time_config_prepare
+ * @brief Empties @p state as a rejected file (parse_ok 0) and records @p reason.
  *
- * Implementation notes:
- *
- *  - The CAS target is CHAOS_TIME_MTIME_RELOADING: a second thread that
- *    arrives while a reload is in progress loses the CAS and falls back to
- *    the current active state, which is the last successfully loaded config.
- *  - parse_buffer() returning non-zero (error) causes the next_state to be
- *    reset with parse_ok == 0.  The snapshot is still published so that the
- *    mtime advances past the broken file; otherwise every call would re-try
- *    the failing parse on every intercepted function call.
- *  - An empty file (config_size == 0) leaves the snapshot empty with
- *    parse_ok == 1 (no rules, no injection) and is treated the same as a
- *    missing file from the caller's perspective.
+ * @details For conditions that persist until the file changes: size limit reached,
+ * EACCES/EPERM on open, EISDIR on read, a NUL byte. Reported like an invalid line
+ * (no rules, state=error) and, since the snapshot is published with the file's stamp,
+ * not re-read until the stamp changes. A transient read failure takes a different path
+ * (the previous snapshot stays).
  */
-int chaos_time_config_prepare(void)
+static void chaos_time_config_reject_file(chaos_time_config_state_t *state, const char *reason)
+{
+    chaos_time_config_reset_state(state, 0);
+    chaos_status_clear(&g_chaos_time_config_error);
+    chaos_status_reject(&g_chaos_time_config_error, reason);
+}
+
+/**
+ * @brief Records a hit on @p slot and writes the hits file when due; NULL flushes.
+ *
+ * @details Writes on each of the first CHAOS_HITS_EAGER (64) hits, then at most every
+ * CHAOS_HITS_INTERVAL_MS (100 ms); between writes a hit costs no system call. NULL
+ * (at exit, or from a reload look with an overdue report) writes only if hits are
+ * pending. One writer at a time, elected by CAS: a hit that finds the writer busy
+ * leaves `pending` set, and the writer loops until it is clear, re-checking after
+ * releasing the lock so no hit is lost. Only the process the counts belong to writes:
+ * a vfork child shares this memory but must not write the parent's file. A forked
+ * child starts from zero (chaos_time_config_after_fork()).
+ */
+static void chaos_time_config_report_hits(chaos_hit_slot_t *slot)
+{
+    chaos_time_config_state_t *state;
+    const uint64_t now = chaos_hits_now_ms();
+
+    if (slot != NULL)
+    {
+        ++g_chaos_time_hits_total;
+        if (g_chaos_time_hits_pending == 0)
+        {
+            g_chaos_time_hits_pending = 1;
+        }
+        /* Past the eager hits and inside the interval: nothing to write, no system
+         * call, no shared write beyond the counters. */
+        if (g_chaos_time_hits_total > CHAOS_HITS_EAGER &&
+            now - g_chaos_time_hits_last_ms < CHAOS_HITS_INTERVAL_MS)
+        {
+            return;
+        }
+    }
+    else if (g_chaos_time_hits_pending == 0)
+    {
+        return;
+    }
+    /* Only the process the counts belong to writes them. A vfork child shares this
+     * memory but is another process and runs no atfork handler. */
+    if ((uint64_t)getpid() != g_chaos_time_hits_pid)
+    {
+        return;
+    }
+    do
+    {
+        if (!__sync_bool_compare_and_swap(&g_chaos_time_hits_writing, 0, 1))
+        {
+            return;
+        }
+        state = (chaos_time_config_state_t *)chaos_time_config_active_state();
+        while (g_chaos_time_hits_pending != 0)
+        {
+            g_chaos_time_hits_pending = 0;
+            __sync_synchronize();
+            chaos_hits_write_for(
+                CHAOS_TIME_HITS_PREFIX,
+                (long)getpid(),
+                &g_chaos_time_hits_file,
+                &g_chaos_time_hits_owned,
+                state->hits,
+                (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) state->text,
+                state->rule_count,
+                g_chaos_time_hits_buffer,
+                sizeof(g_chaos_time_hits_buffer)
+            );
+        }
+        g_chaos_time_hits_last_ms = now;
+        __sync_lock_release(&g_chaos_time_hits_writing);
+        __sync_synchronize();
+        /* A hit that found the lock taken after the inner loop's last check is written
+         * by this thread now, since its own CAS failed. */
+    } while (g_chaos_time_hits_pending != 0);
+}
+
+/**
+ * @brief pthread_atfork() child handler: drops state owned by parent threads.
+ *
+ * @details Only the forking thread exists in the child, so a reload claim
+ * (RELOADING -> UNKNOWN), the hits-writer lock and an in-progress REGRESS decision
+ * (via chaos_hits_pool_after_fork()) are released. Hit counts and `@first` claims start
+ * from zero, the child gets its own hits file, and the forking thread's PRNG reseeds.
+ * vfork children and posix_spawn run no atfork handler: they share the parent's
+ * memory, see its claims as busy and write nothing.
+ */
+static void chaos_time_config_after_fork(void)
+{
+    if (g_chaos_time_cached_mtime == CHAOS_TIME_MTIME_RELOADING)
+    {
+        g_chaos_time_cached_mtime = CHAOS_TIME_MTIME_UNKNOWN;
+    }
+    g_chaos_time_hits_writing = 0;
+    g_chaos_time_hits_pending = 0;
+    g_chaos_time_hits_total = 0U;
+    g_chaos_time_hits_last_ms = 0U;
+    g_chaos_time_hits_pid = (uint64_t)getpid();
+    g_chaos_time_hits_file = chaos_hits_file_number(CHAOS_TIME_HITS_PREFIX);
+    g_chaos_time_hits_owned = 0;
+    /* The child must not replay the parent's stream (pre-fork workers would all decide
+     * alike): the forking thread reseeds from its new thread id on the next draw. */
+    g_chaos_time_tls_prng_state = 0U;
+    chaos_hits_pool_after_fork(
+        g_chaos_time_hit_pool,
+        sizeof(g_chaos_time_hit_pool) / sizeof(g_chaos_time_hit_pool[0]),
+        chaos_time_config_active_state()->hits,
+        chaos_time_config_active_state()->rule_count
+    );
+}
+
+/** @brief Writes pending hits at normal exit (exit() or return from main; not _exit). */
+__attribute__((destructor)) static void chaos_time_config_report_hits_at_exit(void)
+{
+    chaos_time_config_report_hits(NULL);
+}
+
+/**
+ * @brief Gives each rule of the new snapshot its text, hit slot and slot generation.
+ *
+ * @details A rule whose text is unchanged from the active snapshot keeps its slot
+ * (chaos_hits_assign()): editing one rule resets neither the counts, `@first` claims
+ * nor REGRESS state of the others, and a firing through a rule copy taken before the
+ * reload still lands. Reload owner only.
+ */
+static void chaos_time_config_attach_hits(chaos_time_config_state_t *next_state)
+{
+    const chaos_time_config_state_t *active = chaos_time_config_active_state();
+    size_t index;
+
+    for (index = 0U; index < next_state->rule_count; ++index)
+    {
+        (void)memcpy(
+            next_state->text[index],
+            g_chaos_time_config_texts[index],
+            sizeof(next_state->text[index])
+        );
+    }
+    chaos_hits_assign(
+        g_chaos_time_hit_pool,
+        sizeof(g_chaos_time_hit_pool) / sizeof(g_chaos_time_hit_pool[0]),
+        active->hits,
+        (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) active->text,
+        active != next_state ? active->rule_count : 0U,
+        next_state->hits,
+        (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) next_state->text,
+        next_state->rule_count,
+        chaos_time_config_report_hits
+    );
+    for (index = 0U; index < next_state->rule_count; ++index)
+    {
+        next_state->rules[index].hit = next_state->hits[index];
+        next_state->rules[index].hit_generation =
+            next_state->hits[index] != NULL ? next_state->hits[index]->generation : 0U;
+    }
+}
+
+/**
+ * @brief Writes the status file for the load that produced @p state.
+ *
+ * @details state=ok with the rule count, state=error with the rejected line, or, with
+ * no rule file, removes the status file. Called by the reload owner before the
+ * publish.
+ */
+static void
+chaos_time_config_report(uint64_t observed_mtime, const chaos_time_config_state_t *state)
+{
+    if (observed_mtime == CHAOS_TIME_MTIME_MISSING)
+    {
+        chaos_status_remove(CHAOS_TIME_STATUS_PATH);
+    }
+    else if (state->parse_ok == 0)
+    {
+        chaos_status_write(
+            CHAOS_TIME_STATUS_PATH, CHAOS_STATUS_ERROR, 0U, &g_chaos_time_config_error
+        );
+    }
+    else
+    {
+        chaos_status_write(CHAOS_TIME_STATUS_PATH, CHAOS_STATUS_OK, state->rule_count, NULL);
+    }
+}
+
+/** @brief When this process last looked at the rule file (vDSO CLOCK_MONOTONIC, ns). */
+static volatile uint64_t g_chaos_time_last_check_ns = 0U;
+
+/** @brief Look interval, CHAOS_CHECK_INTERVAL_NS (1 ms); 0 looks on every call (unit tests). */
+static uint64_t g_chaos_time_check_interval_ns = CHAOS_CHECK_INTERVAL_NS;
+
+/**
+ * @brief Whether this call may skip looking at the rule file.
+ *
+ * @details A look is a stat() system call, the largest part of a wrapper's cost, so
+ * after the first load the file is looked at no more than once per interval; a change
+ * takes effect within 1 ms instead of at the very next call. Never skips while the
+ * stamp is UNKNOWN (no load yet) or RELOADING, or when there is no vDSO clock
+ * (chaos_clock_checked_recently() then returns 0). A missing or empty rule file is
+ * throttled like any other. Concurrent callers may race on the timestamp; the worst
+ * case is one extra stat().
+ */
+static int chaos_time_config_checked_recently(void)
+{
+    const uint64_t cached = chaos_time_atomic_load_u64(&g_chaos_time_cached_mtime);
+
+    if (cached == CHAOS_TIME_MTIME_UNKNOWN || cached == CHAOS_TIME_MTIME_RELOADING)
+    {
+        return 0;
+    }
+    return chaos_clock_checked_recently(
+        &g_chaos_time_last_check_ns, g_chaos_time_check_interval_ns
+    );
+}
+
+/**
+ * @brief chaos_time_config_prepare() without the errno save; see the file header for
+ *        the protocol and the failure table.
+ *
+ * @details A rejected file is still published (empty, parse_ok 0) with its stamp, so
+ * the bad file is parsed once, not again at every look. An empty file publishes an
+ * empty snapshot with parse_ok 1 and status ok, 0 rules.
+ *
+ * @return Non-zero when the snapshot in effect after this call holds at least one rule.
+ */
+static int chaos_time_config_refresh(void)
 {
     uint64_t observed_mtime;
     uint64_t cached_mtime;
     unsigned int active_index;
     unsigned int next_index;
-    size_t config_size;
+    size_t config_size = 0U;
+    uint64_t content = 0U;
     chaos_time_config_state_t *next_state;
 
+    if (chaos_time_config_checked_recently())
+    {
+        return chaos_time_config_active_state()->rule_count != 0U;
+    }
+    /* Hits of an elapsed interval are written now, not only at the next hit or at
+     * exit: a long-running process that stopped hitting reports them too. */
+    if (g_chaos_time_hits_pending != 0 &&
+        chaos_hits_now_ms() - g_chaos_time_hits_last_ms >= CHAOS_HITS_INTERVAL_MS)
+    {
+        chaos_time_config_report_hits(NULL);
+    }
     observed_mtime = chaos_time_config_observed_mtime();
     cached_mtime = chaos_time_atomic_load_u64(&g_chaos_time_cached_mtime);
 
-    if (observed_mtime == cached_mtime)
+    if (observed_mtime == cached_mtime && !g_chaos_time_config_provisional)
+    {
+        return chaos_time_config_active_state()->rule_count != 0U;
+    }
+    /* Another thread of this process owns the reload: use the active snapshot. Without
+     * this test the CAS below would succeed as RELOADING -> RELOADING, and two threads
+     * would fill the same spare snapshot and read buffer at once. A claim inherited
+     * through fork() was released by the atfork handler; a vfork child must not take
+     * over its parent's. */
+    if (cached_mtime == CHAOS_TIME_MTIME_RELOADING)
     {
         return chaos_time_config_active_state()->rule_count != 0U;
     }
@@ -1212,27 +1530,96 @@ int chaos_time_config_prepare(void)
     {
         return chaos_time_config_active_state()->rule_count != 0U;
     }
+    g_chaos_time_config_provisional = 0;
 
     active_index = g_chaos_time_active_config_index;
     next_index = active_index == 0U ? 1U : 0U;
     next_state = &g_chaos_time_config_states[next_index];
     chaos_time_config_reset_state(next_state, 1);
 
-    if (observed_mtime != CHAOS_TIME_MTIME_MISSING &&
-        chaos_time_config_read_file(&config_size) == 0 && config_size > 0U &&
-        chaos_time_config_parse_buffer(
-            g_chaos_time_config_buffer, next_state->rules, &next_state->rule_count
-        ) != 0)
+    if (observed_mtime != CHAOS_TIME_MTIME_MISSING)
     {
-        chaos_time_config_reset_state(next_state, 0);
+        const int read_rc = chaos_time_config_read_file(&config_size, observed_mtime);
+
+        if (read_rc == -2 || read_rc == -3)
+        {
+            chaos_time_config_reject_file(
+                next_state,
+                read_rc == -2 ? CHAOS_STATUS_REASON_TOO_LARGE : CHAOS_STATUS_REASON_UNREADABLE
+            );
+            config_size = 0U;
+        }
+        else if (read_rc != 0)
+        {
+            /* A failed read says nothing about the rules: keep the active snapshot and
+             * release the claim with the previous stamp, so the next look retries
+             * instead of running with no rules until the file changes again. */
+            __sync_synchronize();
+            g_chaos_time_cached_mtime = cached_mtime;
+            return chaos_time_config_active_state()->rule_count != 0U;
+        }
+        if (read_rc == 0)
+        {
+            content = chaos_config_content_hash(g_chaos_time_config_buffer, config_size);
+            if (observed_mtime == cached_mtime && content == g_chaos_time_config_content)
+            {
+                /* A provisional load re-read with identical content: the snapshot stays,
+                 * with its hit counts, `@first` claims and REGRESS state. */
+                __sync_synchronize();
+                g_chaos_time_cached_mtime = cached_mtime;
+                return chaos_time_config_active_state()->rule_count != 0U;
+            }
+        }
+        if (config_size > 0U && memchr(g_chaos_time_config_buffer, '\0', config_size) != NULL)
+        {
+            /* The parser would stop at the NUL and drop every rule after it unreported. */
+            chaos_time_config_reject_file(next_state, CHAOS_STATUS_REASON_NUL);
+            config_size = 0U;
+        }
+        if (config_size > 0U &&
+            chaos_time_config_parse_buffer(
+                g_chaos_time_config_buffer, next_state->rules, &next_state->rule_count
+            ) != 0)
+        {
+            /* Rejected: publish an empty snapshot (parse_ok 0), so no rule applies. */
+            chaos_time_config_reset_state(next_state, 0);
+        }
     }
 
+    g_chaos_time_config_content = content;
+    chaos_time_config_attach_hits(next_state);
+    chaos_time_config_report(observed_mtime, next_state);
+    /* Slots of rules that leave with this load are freed and outdated in rule copies
+     * still held; done before the publish, while this thread still holds the claim. */
+    chaos_hits_release(
+        g_chaos_time_hit_pool,
+        sizeof(g_chaos_time_hit_pool) / sizeof(g_chaos_time_hit_pool[0]),
+        next_state->hits,
+        next_state->rule_count
+    );
     chaos_time_config_publish(next_index, observed_mtime);
     return next_state->parse_ok != 0 && next_state->rule_count != 0U;
 }
 
 /**
+ * @brief chaos_time_config_refresh() with errno preserved.
+ *
+ * @details The stat, open and read of a refresh are the library's, not the caller's: a
+ * wrapped call that then succeeds must not carry the ENOENT of a missing rule file.
+ */
+int chaos_time_config_prepare(void)
+{
+    const int saved_errno = errno;
+    const int result = chaos_time_config_refresh();
+
+    errno = saved_errno;
+    return result;
+}
+
+/**
  * @copydoc chaos_time_config_match_loaded
+ *
+ * A rejected snapshot (parse_ok 0) has no rules and returns 0 before the scan.
  */
 int chaos_time_config_match_loaded(
     chaos_time_effect_t effect,
@@ -1242,6 +1629,7 @@ int chaos_time_config_match_loaded(
 )
 {
     const chaos_time_config_state_t *state = chaos_time_config_active_state();
+    const uint64_t sequence = chaos_snapshot_read_begin(&state->sequence);
 
     if (state->parse_ok == 0)
     {
@@ -1249,8 +1637,9 @@ int chaos_time_config_match_loaded(
     }
 
     return chaos_time_config_select_rule(
-        state->rules, state->rule_count, effect, operation, clock_id, rule
-    );
+               state->rules, state->rule_count, effect, operation, clock_id, rule
+           ) &&
+           chaos_snapshot_read_valid(&state->sequence, sequence);
 }
 
 /**

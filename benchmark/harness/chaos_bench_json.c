@@ -1,40 +1,51 @@
 /**
  * @file chaos_bench_json.c
- * @brief Hand-rolled JSON envelope writer.
+ * @brief Writes the per-run JSON result envelope.
  *
  * @details
- * The harness output is a single JSON object per benchmark invocation,
- * written to a caller-supplied `FILE *` (typically `stdout` or a file
- * specified by `--output`).  We hand-roll the writer because:
- *  - The schema is fixed and small; pulling in a JSON dependency would
- *    triple the harness binary size for no functional benefit.
- *  - The writer must run *after* the timed loop (no allocation in the
- *    hot path is required), so we trade compactness against
- *    no-runtime-deps simplicity.
- *  - String escaping is restricted to the subset that actually appears
- *    in our values (newline, double-quote, backslash, control bytes).
+ * Each benchmark process emits exactly one JSON object to `--output` or stdout. The writer is
+ * hand-rolled with stdio because:
+ *  - the schema is fixed and small, so a JSON library would add a build dependency for no
+ *    functional gain;
+ *  - it runs after the timed loop, so stdio buffering and formatting cost are irrelevant;
+ *  - escaping only has to cover what the values can contain (see
+ *    @ref chaos_bench_json_write_escaped).
  *
- * **Schema (versioned via `schema_version`).**
+ * **Schema** (`schema_version` 1; numbers are JSON numbers, `%.3f` for ns, `%.6f` for
+ * `ns_per_cycle`):
  * @code
  * {
  *   "schema_version": 1,
  *   "benchmark":   { "name": "...", "category": "..." },
- *   "config":      { "mode": "AVG_TIME", "warmup_iters": N, "measurement_iters": N, "batch_size": N },
- *   "execution":   { "mode": "OFFICIAL"|"ADVISORY", "warnings": [...] },
- *   "timer":       { "source": "...", "calibrated_hz": ..., "ns_per_cycle": ..., "overhead_ns": ... },
+ *   "config":      { "mode": "AVG_TIME", "warmup_iters": N, "measurement_iters": N,
+ *                    "batch_size": N },
+ *   "execution":   { "mode": "OFFICIAL"|"ADVISORY",
+ *                    "warnings": [ { "check": "...", "detail": "..." }, ... ] },
+ *   "timer":       { "source": "rdtscp"|"cntvct_el0"|"clock_monotonic_raw",
+ *                    "calibrated_hz": ..., "ns_per_cycle": ...,
+ *                    "calibration_window_ns": N, "overhead_ns": N },
  *   "scenario":    { "path": "...", "active": true|false },
- *   "stats":       { "samples": N, "min_ns": ..., "max_ns": ..., "mean_ns": ..., "stdev_ns": ...,
- *                    "p50_ns": ..., "p90_ns": ..., "p99_ns": ..., "p999_ns": ..., "p9999_ns": ... },
+ *   "stats":       { "samples": N, "samples_after_trim": N, "min_ns": ..., "max_ns": ...,
+ *                    "mean_ns": ..., "stdev_ns": ..., "median_ns": ..., "p50_ns": ...,
+ *                    "p90_ns": ..., "p95_ns": ..., "p99_ns": ..., "p999_ns": ...,
+ *                    "p9999_ns": ... },
+ *   "pmu":         { "available": true, "counters": { "cycles": N, ..., "page_faults": N } }
+ *                | { "available": false, "reason": "..." },
  *   "environment": { "kernel_release": "...", "kernel_version": "...", "cpu_model": "...",
- *                    "governor": "...", "isolated_cpus": "...", "thp_enabled": "...",
- *                    "smt_active": true|false, "container": true|false, "libc": "...",
- *                    "git_sha": "...", "build_cflags": "...", "ld_preload": "...",
- *                    "constant_tsc": true|false, "nonstop_tsc": true|false }
+ *                    "cpu_flags": "...", "governor": "...", "isolated_cpus": "...",
+ *                    "thp_enabled": "...", "libc": "...", "git_sha": "...",
+ *                    "build_cflags": "...", "ld_preload": "...", "smt_active": true|false,
+ *                    "container": true|false, "constant_tsc": true|false,
+ *                    "nonstop_tsc": true|false }
  * }
  * @endcode
  *
- * Schema bumps are breaking: a Stage 2 driver consuming Stage 1 JSON
- * checks `schema_version` and refuses to compare across versions.
+ * Adding fields keeps `schema_version` 1; renaming or removing a field, or changing its
+ * meaning, must bump it. `driver/chaos_bench_driver.py` reads `stats.*` by name and does not
+ * check `schema_version`.
+ *
+ * **Failure behaviour.** stdio write errors (full disk, closed pipe) are not detected; the
+ * caller sees a truncated file. `fflush` runs at the end; closing is the caller's job.
  */
 
 #include "chaos_bench_internal.h"
@@ -44,13 +55,12 @@
 #include <string.h>
 
 /**
- * @brief Writes a JSON-escaped string literal (without surrounding quotes).
+ * @brief Writes @p s JSON-escaped, without surrounding quotes; NULL writes nothing.
  *
- * @details Escapes the JSON-mandatory set: `"`, `\`, `\b`, `\f`, `\n`,
- * `\r`, `\t`, plus control bytes `< 0x20` via `\u00XX`.  All other bytes
- * pass through.  The harness inputs are ASCII or UTF-8 captured from
- * `/proc` paths, so the simple byte-passthrough does the right thing on
- * UTF-8 too.
+ * @details Escapes exactly what RFC 8259 requires: `"` and `\`, the short forms `\b`, `\f`,
+ * `\n`, `\r`, `\t`, and every other byte below 0x20 as `\u00XX`. Bytes >= 0x80 pass
+ * through, which is correct for UTF-8 input such as `/proc` text; invalid UTF-8 would yield
+ * invalid JSON, which no captured source produces in practice.
  */
 static void chaos_bench_json_write_escaped(FILE *out, const char *s)
 {
@@ -85,8 +95,8 @@ static void chaos_bench_json_write_escaped(FILE *out, const char *s)
 }
 
 /**
- * @brief Convenience: writes `"key": "<escaped value>"` followed by an
- *        optional trailing comma + newline.
+ * @brief Writes one 4-space-indented `"key": "<escaped value>"` line, with a trailing comma
+ *        if @p trailing_comma is non-zero. @p key is written unescaped and must be a literal.
  */
 static void chaos_bench_json_str_field(
     FILE *out, const char *key, const char *value, int trailing_comma
@@ -98,7 +108,8 @@ static void chaos_bench_json_str_field(
 }
 
 /**
- * @brief Convenience: writes `"key": <bool>`.
+ * @brief Writes one 4-space-indented `"key": true|false` line (non-zero @p value is true),
+ *        with a trailing comma if @p trailing_comma is non-zero.
  */
 static void chaos_bench_json_bool_field(
     FILE *out, const char *key, int value, int trailing_comma
@@ -111,7 +122,8 @@ static void chaos_bench_json_bool_field(
 }
 
 /**
- * @brief Translates the timer-source enum to a stable string.
+ * @brief Maps the timer source to its `timer.source` string; these strings are part of the
+ *        schema.
  */
 static const char *chaos_bench_timer_source_str(chaos_bench_timer_source_t s)
 {
@@ -125,7 +137,8 @@ static const char *chaos_bench_timer_source_str(chaos_bench_timer_source_t s)
 }
 
 /**
- * @brief Translates the mode enum to a stable string.
+ * @brief Maps the measurement mode to its `config.mode` string, identical to the `--mode`
+ *        spelling.
  */
 static const char *chaos_bench_mode_str(chaos_bench_mode_t m)
 {

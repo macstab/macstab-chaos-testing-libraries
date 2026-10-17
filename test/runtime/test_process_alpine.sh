@@ -1,16 +1,29 @@
 #!/bin/sh
 #
-# test_process_alpine.sh — libchaos-process runtime validation on musl/Alpine (Docker).
+# test_process_alpine.sh: libchaos-process end-to-end in LD_PRELOAD mode on musl (Alpine 3.20).
 #
-# Builds libchaos-process.so for the target platform using Docker buildx with a
-# musl (alpine) base, then runs the pre-compiled process_probe binary under
-# LD_PRELOAD in an Alpine container. Validates process lifecycle fault injection
-# on musl libc. Note: on musl, posix_spawn calls fork() so fork rules cascade
-# to posix_spawn — this is the opposite of glibc behavior.
+# Proves, for one architecture per run, that pthread_create, fork, posix_spawn/posix_spawnp, the
+# exec family, system, popen and the wait family honour ERRNO, LATENCY and FAIL_AFTER rules with
+# each function's own error contract; process_probe.c lists every check.
 #
-# Usage:   test_process_alpine.sh [linux/amd64|linux/arm64]
-# Env:     CHAOS_PROCESS_DOCKER_PLATFORM  platform override
-# Prereqs: docker with buildx and multi-arch support
+# Method: docker buildx builds libchaos-process-musl-<arch>.so (make cross-musl-<arch>) from
+# docker/Dockerfile.build on alpine:3.20. Then a fresh alpine:3.20 container (build-base installed
+# at run time) compiles test/runtime/process_probe.c from the read-only repository mount and runs it
+# with LD_PRELOAD=/tmp/libchaos-process.so. The probe is compiled in the target image so it uses the
+# same libc the library was built against.
+#
+# posix_spawn is faulted through its own selector: neither glibc's nor musl's posix_spawn calls the
+# public fork() (both clone with CLONE_VM|CLONE_VFORK), so fork rules do not reach it.
+#
+# Usage:   test_process_alpine.sh [linux/amd64|linux/arm64]   (default: the host architecture)
+# Env:     CHAOS_PROCESS_DOCKER_PLATFORM  platform when no argument is given
+#          CHAOS_SKIP_EXIT  exit status of a skip (default 0; CI sets 1)
+# Prereqs: docker with buildx; QEMU binfmt for a foreign platform. Run by `make test` and,
+#          once per platform, by `make test-matrix`.
+# Exit:    the probe's exit code (0 = every check passed; process_probe.c lists the others);
+#          non-zero when the build fails or yields no library; 2 on bad usage;
+#          CHAOS_SKIP_EXIT when the host or platform is not amd64/arm64, docker is missing
+#          or its daemon is unreachable.
 
 set -eu
 
@@ -33,7 +46,7 @@ if [ -z "$DOCKER_PLATFORM" ]; then
             ;;
         *)
             echo "process alpine test skipped: unsupported host architecture $(uname -m)" >&2
-            exit 0
+            exit "${CHAOS_SKIP_EXIT:-0}"
             ;;
     esac
 fi
@@ -49,7 +62,7 @@ case "$DOCKER_PLATFORM" in
         ;;
     *)
         echo "process alpine test skipped: unsupported docker platform $DOCKER_PLATFORM" >&2
-        exit 0
+        exit "${CHAOS_SKIP_EXIT:-0}"
         ;;
 esac
 
@@ -61,12 +74,12 @@ trap cleanup EXIT INT TERM
 
 if ! command -v docker >/dev/null 2>&1; then
     echo "process alpine test skipped: docker not available" >&2
-    exit 0
+    exit "${CHAOS_SKIP_EXIT:-0}"
 fi
 
 if ! docker version >/dev/null 2>&1; then
     echo "process alpine test skipped: docker daemon not accessible" >&2
-    exit 0
+    exit "${CHAOS_SKIP_EXIT:-0}"
 fi
 
 docker buildx build \

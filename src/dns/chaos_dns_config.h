@@ -1,53 +1,51 @@
 /**
  * @file chaos_dns_config.h
- * @brief Configuration types, parsing API, and rule-matching interface.
+ * @brief Rule model, rule-file parser and snapshot matching API of libchaos-dns.
  *
  * @details
- * This header defines the complete data model for libchaos-dns fault rules
- * and exposes the functions that load, parse, and query those rules.
+ * ### Rule grammar
+ * One rule per line of `/tmp/.chaos-dns.conf`; `#` starts a comment; qualifiers
+ * (`@first=N`, `@from=`, `@until=`, `@size`, see chaos_policy.h) are extracted first.
+ * @code
+ *   <selector> : <EAI-name | effect> : <value>
+ * @endcode
+ * Selectors:
+ *   - `*` or `dns://\*` -- every forward lookup. A bare `*` must be followed directly by
+ *     `:` (`*:EAI_AGAIN:0.5`); `* :` with a blank is rejected.
+ *   - `dns://host` -- that name, ASCII case-insensitive.
+ *   - `dns://\*.suffix` -- any name ending in `.suffix` (not `suffix` itself).
+ *   - `rdns://\*`, `rdns://1.2.3.4`, `rdns://[::1]` -- reverse lookups of that address,
+ *     compared in inet_ntop form.
+ * Values by effect (`@p` is an optional probability, default 1.0):
+ *   | Effect        | Value                         | Selector domains |
+ *   |---------------|-------------------------------|------------------|
+ *   | EAI_* name    | probability                   | dns, rdns        |
+ *   | LATENCY       | `<ms>[@p]`                    | dns, rdns        |
+ *   | REWRITE       | `<host name>[@p]`             | dns, rdns        |
+ *   | SERVICE       | `<service>[@p]`               | dns, rdns        |
+ *   | OVERRIDE      | `<ip>[,<ip>...][@p]` (max 32) | dns              |
+ *   | FILTER_FAMILY | `inet4`, `inet6`, `ipv4`, `ipv6` or `any`, `[@p]` | dns |
+ *   | LIMIT         | `<n >= 1>[@p]`                | dns              |
+ *   | SHUFFLE       | probability                   | dns              |
  *
- * ### Data model overview
- *
- * Each line in `/tmp/.chaos-dns.conf` maps to a `chaos_dns_rule_t`.  A rule
- * has three logical parts:
- *
- *   - A **selector** (`chaos_dns_selector_t`) — identifies which DNS queries
- *     the rule applies to.  The selector has both a *domain* (forward lookup
- *     vs reverse lookup) and a *kind* (any-wildcard, exact hostname/IP, or
- *     suffix pattern).
- *
- *   - An **effect** (`chaos_dns_effect_t`) — the category of fault or
- *     transform to apply.
- *
- *   - **Effect parameters** — fields inside `chaos_dns_rule_t` whose
- *     interpretation depends on the effect: `gai_error`, `probability`,
- *     `latency_ms`, `limit`, `family`, and `text`.
- *
- * ### Config reload protocol
- * Rules are held in a pair of static snapshots (`g_chaos_dns_config_states[2]`).
- * The active snapshot index is stored in `g_chaos_dns_active_config_index`.
- * On every lookup call, chaos_dns_config_prepare() compares the file's mtime
- * hash against a cached value; if they differ and a CAS succeeds, the calling
- * thread reloads the inactive snapshot and publishes it with a full memory
- * fence.  All other concurrent threads continue reading the previously active
- * snapshot throughout the reload.  This is the two-snapshot CAS protocol.
+ * ### Reload
+ * Two static snapshots and one CAS on the cached change stamp, as in libchaos-net:
+ * chaos_dns_config_prepare() looks at the rule file at most once per
+ * CHAOS_CHECK_INTERVAL_NS (1 ms, vDSO clock) after the first load; on a new stamp one
+ * thread claims the reload, fills the inactive snapshot and publishes it; every other
+ * thread keeps reading the active snapshot and never blocks.
  *
  * ### Selector precedence
- * When multiple rules match the same query and effect, the most specific
- * selector wins:
- *   - EXACT (rank 3) > SUFFIX (rank 2) > ANY (rank 1)
- *   - Among equal ranks, the selector with the longer text wins.
+ * Per effect, the most specific matching rule wins: EXACT (rank 3) over SUFFIX (2) over
+ * ANY (1); on equal rank the longer selector text; on a full tie the earlier rule. Each
+ * effect is matched separately, so one lookup can be shaped by several rules.
  *
  * ### Thread safety
- * - chaos_dns_config_prepare(), chaos_dns_config_match(), and
- *   chaos_dns_config_match_reverse() are safe to call concurrently from
- *   multiple threads.  They use the CAS protocol for reload serialisation and
- *   read-only access to the active snapshot.
- * - chaos_dns_config_parse_line() and chaos_dns_config_parse_buffer() operate
- *   on caller-supplied buffers and have no shared state; they are safe to call
- *   from any thread.
- * - chaos_dns_config_init() is called exactly once from the library constructor
- *   and must not be called again after init completes.
+ * - prepare and the match functions are safe from any thread; matching reads the
+ *   active snapshot under its seqlock sequence.
+ * - The parser writes a file-scope error record and text table; only the reload owner
+ *   (or a single-threaded unit test) calls it.
+ * - chaos_dns_config_init() runs in the constructor (or unit-test setup) only.
  *
  * @module  libchaos-dns configuration
  * @stability  Private
@@ -57,27 +55,25 @@
 #define CHAOS_DNS_CONFIG_H
 
 #include "chaos_dns_internal.h"
+#include "chaos_hits.h"
+#include "chaos_policy.h"
+#include "chaos_status.h"
 
 /* =========================================================================
  * Enumerations
  * ========================================================================= */
 
 /**
- * @brief Discriminates the matching strategy used by a selector's text field.
+ * @brief How a selector's text is compared with the queried name or address.
  *
- * @details The kind controls how `chaos_dns_selector_t::text` is compared
- * against an incoming hostname or IP-address string.
- *
- * | Kind    | Rank | Matches when …                                          |
+ * | Kind    | Rank | Matches when                                            |
  * |---------|------|---------------------------------------------------------|
- * | ANY     |  1   | Unconditionally (text field is unused).                 |
- * | SUFFIX  |  2   | Hostname ends with `.text` (dot-delimited label check). |
- * | EXACT   |  3   | Hostname equals text exactly (case-insensitive ASCII).  |
+ * | ANY     |  1   | Always (text unused).                                   |
+ * | SUFFIX  |  2   | The name ends in `.text`; the name `text` itself does not match. |
+ * | EXACT   |  3   | The name equals text, ASCII case-insensitive.           |
  *
- * SUFFIX is only meaningful for the LOOKUP domain; EXACT is used for both
- * LOOKUP (hostname) and REVERSE (normalised IP string) selectors.
- *
- * INVALID is not stored in live rules; it marks parse failure.
+ * SUFFIX exists only for dns:// selectors; EXACT is a host name for dns:// and an
+ * inet_ntop address for rdns://. INVALID marks a parse failure only.
  */
 typedef enum chaos_dns_selector_kind
 {
@@ -88,16 +84,16 @@ typedef enum chaos_dns_selector_kind
 } chaos_dns_selector_kind_t;
 
 /**
- * @brief Discriminates the call path a selector applies to.
+ * @brief Which call path a selector applies to.
  *
  * @details
- *   - **LOOKUP** — forward lookups via `getaddrinfo(3)`.  Selected by the
- *     `dns://` URI prefix or the bare `*` wildcard.
- *   - **REVERSE** — reverse lookups via `getnameinfo(3)`.  Selected by the
- *     `rdns://` URI prefix.
+ *   - **LOOKUP** -- forward lookups: getaddrinfo and the gethostbyname family. Written
+ *     `dns://...` or bare `*`.
+ *   - **REVERSE** -- reverse lookups: getnameinfo and the gethostbyaddr family. Written
+ *     `rdns://...`.
  *
- * Only a subset of effects is permitted on REVERSE selectors; see
- * chaos_dns_effect_allowed() in chaos_dns_config.c.
+ * REVERSE selectors accept only GAI, LATENCY, REWRITE and SERVICE
+ * (chaos_dns_effect_allowed()).
  */
 typedef enum chaos_dns_selector_domain
 {
@@ -107,33 +103,29 @@ typedef enum chaos_dns_selector_domain
 } chaos_dns_selector_domain_t;
 
 /**
- * @brief Identifies the class of fault or transform a rule applies.
+ * @brief What a rule does, grouped by when it acts.
  *
- * @details Effects fall into two execution phases:
+ * @details
+ * **Before the resolver**
+ *   - @c CHAOS_DNS_EFFECT_LATENCY -- sleep latency_ms, then continue.
+ *   - @c CHAOS_DNS_EFFECT_GAI     -- return the EAI_* code (hostent APIs: the matching
+ *     h_errno) without resolving.
  *
- * **Pre-call (intercept before real resolver)**
- *   - @c CHAOS_DNS_EFFECT_GAI     — return a synthetic EAI_* error immediately.
- *   - @c CHAOS_DNS_EFFECT_LATENCY — sleep for `latency_ms` milliseconds, then
- *     continue to the real resolver.
+ * **Inputs and source of the answer**
+ *   - @c CHAOS_DNS_EFFECT_REWRITE  -- getaddrinfo resolves `text` instead of the queried
+ *     name; reverse lookups report `text` as the host name.
+ *   - @c CHAOS_DNS_EFFECT_SERVICE  -- getaddrinfo uses `text` as the service; getnameinfo
+ *     reports it as the service name.
+ *   - @c CHAOS_DNS_EFFECT_OVERRIDE -- no resolver query: the answer is the IP literals in
+ *     `text`, each expanded by the real getaddrinfo with AI_NUMERICHOST.
  *
- * **Name/service rewrite (substitute inputs to the real resolver)**
- *   - @c CHAOS_DNS_EFFECT_REWRITE  — replace the hostname passed to getaddrinfo
- *     or the hostname written back by getnameinfo.
- *   - @c CHAOS_DNS_EFFECT_SERVICE  — replace the service/port string.
- *   - @c CHAOS_DNS_EFFECT_OVERRIDE — skip the real resolver entirely; call the
- *     real getaddrinfo with each IP address literal in `rule->text`.
- *
- * **Post-call result-set transforms (mutate the addrinfo list in place)**
- *   Applied in fixed order: FILTER_FAMILY → SHUFFLE → LIMIT.  Order matters
- *   because: (1) filtering first reduces the set SHUFFLE and LIMIT operate on,
- *   making LIMIT semantics deterministic after family filtering; (2) shuffling
- *   before limiting means the limit selects from the randomised order, not the
- *   OS-determined order.
- *
- *   - @c CHAOS_DNS_EFFECT_FILTER_FAMILY — drop all nodes not matching the
- *     configured address family.
- *   - @c CHAOS_DNS_EFFECT_SHUFFLE       — randomise the node order in place.
- *   - @c CHAOS_DNS_EFFECT_LIMIT         — truncate the list to at most N nodes.
+ * **Result transforms**, in the fixed order FILTER_FAMILY, SHUFFLE, LIMIT: filtering
+ * first means SHUFFLE and LIMIT act on the addresses that will be returned; shuffling
+ * before limiting means LIMIT keeps a random subset, not the resolver's first entries.
+ *   - @c CHAOS_DNS_EFFECT_FILTER_FAMILY -- drop addresses of the other family; none left
+ *     is EAI_NONAME.
+ *   - @c CHAOS_DNS_EFFECT_SHUFFLE       -- random order.
+ *   - @c CHAOS_DNS_EFFECT_LIMIT         -- keep at most `limit` addresses.
  */
 typedef enum chaos_dns_effect
 {
@@ -149,11 +141,10 @@ typedef enum chaos_dns_effect
 } chaos_dns_effect_t;
 
 /**
- * @brief Address-family filter specifier for FILTER_FAMILY rules.
+ * @brief Family a FILTER_FAMILY rule keeps.
  *
- * @details Parsed from the string tokens `inet4`/`ipv4`, `inet6`/`ipv6`, and
- * `any`.  The value @c ANY is stored in parsed rules but causes the filter to
- * be a no-op (chaos_dns_filter_result_list returns immediately).
+ * @details Parsed from `inet4`/`ipv4`, `inet6`/`ipv6` and `any` (case-sensitive). A rule
+ * with ANY parses but is skipped at lookup time without counting a hit.
  */
 typedef enum chaos_dns_family_filter
 {
@@ -168,27 +159,20 @@ typedef enum chaos_dns_family_filter
  * ========================================================================= */
 
 /**
- * @brief Parsed representation of the selector portion of a config rule.
- *
- * @details A selector binds a rule to a specific query domain and pattern.
- * It is embedded by value in @ref chaos_dns_rule_t and has the same lifetime.
+ * @brief The parsed selector of a rule; embedded by value in chaos_dns_rule_t.
  *
  * ### Field invariants
- * - `kind` and `domain` are always valid enum members when the selector has
- *   been successfully parsed; INVALID values are only present transiently
- *   during error handling.
- * - `text` is NUL-terminated and non-empty for EXACT and SUFFIX kinds;
- *   zero-initialised for ANY.
- * - `selector_len` is the length of the original selector string as written
- *   in the config file (e.g., `strlen("dns://\*.example.com")`).  It is used
- *   as a tiebreaker when two selectors have equal rank: the longer selector
- *   is considered more specific.
- * - For SUFFIX selectors, `text` holds the suffix *without* the leading `*.`
- *   (e.g., `"example.com"` for `dns://\*.example.com`).
- * - For REVERSE/EXACT selectors, `text` holds the normalised IP string as
- *   returned by inet_ntop(3) so that `1.2.3.004` and `1.2.3.4` compare equal.
+ * - `kind` and `domain` are valid members once parsed; INVALID values exist only on the
+ *   failure path.
+ * - `text` is NUL-terminated and non-empty for EXACT and SUFFIX, zero for ANY. It holds
+ *   no `*`.
+ * - SUFFIX: `text` without the leading `*.` (`example.com` for `dns://\*.example.com`).
+ * - REVERSE EXACT: `text` in inet_ntop form, so `rdns://[0:0::1]` and a query for ::1
+ *   compare equal.
+ * - `selector_len` is strlen of the selector as written (`dns://\*.example.com`): the
+ *   tie-breaker between equal ranks, longer winning.
  *
- * @threadsafety  Read-only after construction; safe to read from multiple threads.
+ * @threadsafety  Read-only once its snapshot is published.
  */
 typedef struct chaos_dns_selector
 {
@@ -199,41 +183,47 @@ typedef struct chaos_dns_selector
 } chaos_dns_selector_t;
 
 /**
- * @brief A fully parsed chaos rule ready for matching and application.
+ * @brief One parsed rule, plus its per-snapshot hit slot.
  *
- * @details One `chaos_dns_rule_t` corresponds to one non-blank, non-comment
- * line in the config file.  Rules are stored in
- * `chaos_dns_config_state_t::rules[]` and are never modified after parsing.
+ * @details Fields by effect:
  *
- * Which fields are meaningful depends on `effect`:
- *
- * | effect          | meaningful additional fields               |
- * |-----------------|--------------------------------------------|
- * | GAI             | gai_error, probability                     |
- * | LATENCY         | latency_ms, probability                    |
- * | REWRITE         | text (target hostname), probability        |
- * | SERVICE         | text (target service string), probability  |
+ * | effect          | parameters                                      |
+ * |-----------------|-------------------------------------------------|
+ * | GAI             | gai_error, probability                          |
+ * | LATENCY         | latency_ms, probability                         |
+ * | REWRITE         | text (host name), probability                   |
+ * | SERVICE         | text (service), probability                     |
  * | OVERRIDE        | text (comma-separated IP literals), probability |
- * | FILTER_FAMILY   | family, probability                        |
- * | LIMIT           | limit (>0), probability                    |
- * | SHUFFLE         | probability                                |
+ * | FILTER_FAMILY   | family, probability                             |
+ * | LIMIT           | limit (>= 1), probability                       |
+ * | SHUFFLE         | probability                                     |
  *
- * The `probability` field is always present (range [0.0, 1.0]).  A value of
- * 1.0 means the rule always triggers; 0.0 means it never triggers.
+ * `probability` is in [0.0, 1.0]; effects with a `@p` suffix default to 1.0 without one.
+ * Wrappers copy rules out of the snapshot and may set `call_size` on their copy.
  *
- * @threadsafety  Read-only after construction; safe to copy by value (all
- *               fields are POD types).
+ * @threadsafety  Read-only once its snapshot is published; plain data, copied by value.
  */
 typedef struct chaos_dns_rule
 {
     chaos_dns_selector_t selector;    /**< Which queries this rule matches. */
     chaos_dns_effect_t effect;        /**< The fault category to apply. */
-    int gai_error;                    /**< EAI_* code to return (GAI effect only). */
-    double probability;               /**< Trigger probability in [0.0, 1.0]. */
-    unsigned int latency_ms;          /**< Sleep duration in milliseconds (LATENCY only). */
-    unsigned int limit;               /**< Maximum result list length, ≥1 (LIMIT only). */
-    chaos_dns_family_filter_t family; /**< Address family to retain (FILTER_FAMILY only). */
-    char text[CHAOS_DNS_MAX_VALUE];   /**< NUL-terminated value for REWRITE/SERVICE/OVERRIDE. */
+    int gai_error;                    /**< EAI_* code to return (GAI only). */
+    double probability;               /**< Firing probability in [0.0, 1.0]. */
+    unsigned int latency_ms;          /**< Delay in ms (LATENCY only), at most UINT32_MAX. */
+    unsigned int limit;               /**< Most addresses kept, >= 1 (LIMIT only). */
+    chaos_dns_family_filter_t family; /**< Family kept (FILTER_FAMILY only). */
+    char text[CHAOS_DNS_MAX_VALUE];   /**< REWRITE/SERVICE/OVERRIDE value; NUL-terminated. */
+    /** Qualifiers written after the rule (`@first`, `@from`, `@until`, `@size`). */
+    chaos_rule_policy_t policy;
+    /**
+     * Byte count of the call this copy is being decided for, set by wrappers that
+     * move data; CHAOS_POLICY_NO_SIZE otherwise, which no `@size` gate passes.
+     */
+    uint64_t call_size;
+    /** Hit counter of this rule (see chaos_hits.h); NULL for a rule outside a snapshot. */
+    chaos_hit_slot_t *hit;
+    /** Generation of @c hit when the rule was published; a later one means the rule left. */
+    uint64_t hit_generation;
 } chaos_dns_rule_t;
 
 /* =========================================================================
@@ -241,172 +231,179 @@ typedef struct chaos_dns_rule
  * ========================================================================= */
 
 /**
- * @brief Initialise the config subsystem to a clean, empty state.
+ * @brief Resets the rule subsystem to "nothing loaded yet".
  *
- * @details Zero-initialises both config snapshots, resets the active index to
- * 0, and sets the cached mtime to CHAOS_DNS_MTIME_UNKNOWN so that the first
- * call to chaos_dns_config_prepare() will always perform a stat(2) and
- * attempt a load.
+ * @details Empties both snapshots (parse_ok = 1), sets the cached stamp to
+ * CHAOS_DNS_MTIME_UNKNOWN so the next chaos_dns_config_prepare() loads, resets the hit
+ * pool and hits-file identity, registers the fork handler once, and resolves the vDSO
+ * clock up front.
  *
- * Called exactly once from the library constructor (chaos_dns_init).  Must
- * not be called again after initialisation is complete.
- *
- * @threadsafety  Not safe to call concurrently; single-threaded constructor only.
+ * @threadsafety  None: constructor (chaos_dns_init()) or unit-test setup only.
  */
 void chaos_dns_config_init(void);
 
 /**
- * @brief Check for config file changes and reload if the mtime hash differs.
+ * @brief Reloads the rule file if it changed; reports whether any rule is active.
  *
- * @details Implements the two-snapshot CAS reload protocol:
- *   1. Stat the config file and hash its mtime.
- *   2. If the hash matches the cached value, return immediately (fast path).
- *   3. Attempt to CAS the cached mtime from its current value to
- *      CHAOS_DNS_MTIME_RELOADING.  Only one thread wins; all others fall
- *      through to the still-active snapshot.
- *   4. The winning thread reads and parses the file into the inactive
- *      snapshot, then calls chaos_dns_config_publish() to swap the active
- *      index and update the cached mtime under full memory fences.
+ * @details
+ *   1. Throttle: after the first load, at most one look per CHAOS_CHECK_INTERVAL_NS
+ *      (1 ms, vDSO clock); without a vDSO clock, every call.
+ *   2. stat(2) into a change stamp (mtime, size, inode, device). Unchanged, and the last
+ *      load not provisional: done.
+ *   3. CAS the cached stamp to CHAOS_DNS_MTIME_RELOADING; losers use the active snapshot.
+ *   4. Read and parse into the inactive snapshot, write the status file, publish.
  *
- * On parse failure the inactive snapshot is reset to an empty-but-valid state
- * so that subsequent lookups fail-open (no rules active) rather than
- * continuing to use stale rules.
+ * Failure behaviour (fail-open throughout):
+ *   - File missing: an empty snapshot is published and the status file removed.
+ *   - Invalid line, too many rules, NUL byte, file >= 256 KiB, EACCES/EPERM/EISDIR: a
+ *     snapshot with no rules is published and the status file says why, until the file
+ *     changes. Stale rules are never kept.
+ *   - Other open/read failures, or a writer changing the file during the read: the
+ *     active snapshot stays and the next look retries.
  *
- * @return  Non-zero if the active config has at least one rule; zero otherwise.
+ * @return  Non-zero if the active snapshot has at least one rule; zero otherwise.
  *
- * @threadsafety  Safe to call concurrently from multiple threads.
+ * @threadsafety  Any thread; one CAS serialises reload ownership, nobody waits. errno is
+ *               preserved.
  */
 int chaos_dns_config_prepare(void);
 
 /**
- * @brief Match a forward-lookup name against the currently active rule set.
+ * @brief Best forward-lookup rule for @p effect and @p name in the active snapshot.
  *
- * @details Queries the active config snapshot without triggering a reload.
- * Intended for use after chaos_dns_config_prepare() has been called.
+ * @details Does not reload; for callers that already ran chaos_dns_config_prepare().
+ * A copy torn by a concurrent reload of the same snapshot (seqlock) is reported as no
+ * match, as is any match in a rejected snapshot (parse_ok == 0).
  *
- * @param effect  The effect category to search for.
- * @param name    Hostname to match (NUL-terminated, non-empty).
- * @param rule    Output buffer for the matched rule (copied by value).
+ * @param effect  Effect to look for.
+ * @param name    Queried host name, as the caller passed it.
+ * @param rule    Output: the winning rule, copied by value.
  *
- * @return  Non-zero if a matching rule was found and @p rule is populated.
- * @return  Zero if the active config failed to parse, or if no rule matches.
+ * @return  Non-zero if a rule matched and @p rule is written; zero otherwise.
  *
- * @pre   chaos_dns_config_prepare() or chaos_dns_config_init() has been called.
- * @threadsafety  Safe — reads only the active snapshot (read-only after publish).
+ * @threadsafety  Any thread.
  */
 int chaos_dns_config_match_loaded(
     chaos_dns_effect_t effect, const char *name, chaos_dns_rule_t *rule
 );
 
 /**
- * @brief Match a reverse-lookup IP address string against the currently active rule set.
+ * @brief Best reverse-lookup rule for @p effect and @p address in the active snapshot.
  *
- * @details Reverse-lookup counterpart to chaos_dns_config_match_loaded().
- * The @p address parameter must be a normalised IP string as produced by
- * chaos_dns_reverse_query_from_sockaddr() (i.e., the output of inet_ntop).
+ * @details Reverse counterpart of chaos_dns_config_match_loaded(). @p address is the
+ * inet_ntop text produced by chaos_dns_reverse_query_from_sockaddr() or
+ * chaos_dns_reverse_query_from_address().
  *
- * @param effect   The effect category to search for.
- * @param address  Normalised IP address string (NUL-terminated, non-empty).
- * @param rule     Output buffer for the matched rule.
+ * @param effect   Effect to look for.
+ * @param address  inet_ntop form of the address.
+ * @param rule     Output: the winning rule.
  *
- * @return  Non-zero if a matching rule was found; zero otherwise.
+ * @return  Non-zero if a rule matched; zero otherwise.
  *
- * @threadsafety  Safe — reads only the active snapshot.
+ * @threadsafety  Any thread.
  */
 int chaos_dns_config_match_reverse_loaded(
     chaos_dns_effect_t effect, const char *address, chaos_dns_rule_t *rule
 );
 
 /**
- * @brief Prepare config if needed, then match a forward-lookup hostname.
+ * @brief chaos_dns_config_prepare(), then chaos_dns_config_match_loaded().
  *
- * @details Combines chaos_dns_config_prepare() and
- * chaos_dns_config_match_loaded() for the common case.  Returns zero
- * immediately if @p name is NULL or empty, @p rule is NULL, or the config has
- * no rules.
+ * @details Returns 0 without matching for a NULL or empty @p name, a NULL @p rule, or
+ * while no rule is active.
  *
- * @param effect  Effect category to search for.
- * @param name    Hostname to match.
- * @param rule    Output buffer for the matched rule.
+ * @param effect  Effect to look for.
+ * @param name    Queried host name.
+ * @param rule    Output: the winning rule.
  *
- * @return  Non-zero if a matching rule was found; zero otherwise.
+ * @return  Non-zero if a rule matched; zero otherwise.
  *
- * @threadsafety  Safe to call concurrently.
+ * @threadsafety  Any thread.
  */
 int chaos_dns_config_match(chaos_dns_effect_t effect, const char *name, chaos_dns_rule_t *rule);
 
 /**
- * @brief Prepare config if needed, then match a reverse-lookup IP address.
+ * @brief chaos_dns_config_prepare(), then chaos_dns_config_match_reverse_loaded().
  *
- * @details Combines chaos_dns_config_prepare() and
- * chaos_dns_config_match_reverse_loaded() for the common case.
+ * @details Returns 0 without matching for a NULL or empty @p address, a NULL @p rule,
+ * or while no rule is active.
  *
- * @param effect   Effect category to search for.
- * @param address  Normalised IP address string to match.
- * @param rule     Output buffer for the matched rule.
+ * @param effect   Effect to look for.
+ * @param address  inet_ntop form of the address.
+ * @param rule     Output: the winning rule.
  *
- * @return  Non-zero if a matching rule was found; zero otherwise.
+ * @return  Non-zero if a rule matched; zero otherwise.
  *
- * @threadsafety  Safe to call concurrently.
+ * @threadsafety  Any thread.
  */
 int chaos_dns_config_match_reverse(
     chaos_dns_effect_t effect, const char *address, chaos_dns_rule_t *rule
 );
 
 /**
- * @brief Parse a single mutable config file line into a rule.
+ * @brief Parses one rule line (qualifiers already removed).
  *
- * @details @p line is modified in place (comment stripping and tokenisation).
- * The caller must ensure @p line is writable.
+ * @details @p line is modified in place (comment cut, fields split and trimmed).
  *
  * Return values:
- *   -  1  — line parsed successfully; @p rule is populated.
- *   -  0  — line is blank or a comment; @p rule is unmodified.
- *   - -1  — line is malformed; the rule set should be considered invalid.
+ *   -  1  -- parsed; @p rule is written.
+ *   -  0  -- blank or comment-only; @p rule is untouched.
+ *   - -1  -- invalid (unknown selector or effect, effect not allowed for the selector
+ *            domain, bad value); @p rule may be partly written. The caller rejects the
+ *            whole file.
  *
- * @param line  NUL-terminated, writable line buffer.  Modified in place.
- * @param rule  Output buffer; populated only on return value 1.
+ * @param line  Writable NUL-terminated line.
+ * @param rule  Output.
  *
- * @return  1, 0, or -1 as described above.
+ * @return  1, 0 or -1 as above.
  *
- * @threadsafety  No shared state; safe from any thread given distinct buffers.
+ * @threadsafety  Caller-supplied buffers only.
  */
 int chaos_dns_config_parse_line(char *line, chaos_dns_rule_t *rule);
 
 /**
- * @brief Parse an entire config file buffer into an array of rules.
+ * @brief Parses a whole rule file; all or nothing.
  *
- * @details Splits @p buffer on newlines (modifying it in place) and calls
- * chaos_dns_config_parse_line() for each line.  Parsing stops and returns -1
- * on the first malformed line so that a partially updated config does not
- * take effect.
+ * @details Splits @p buffer on newlines in place; per line, qualifiers are extracted
+ * (chaos_policy_extract()) and chaos_dns_config_parse_line() parses the rest. The first
+ * failure rejects the file and records the line and the reason for the status file
+ * (chaos_dns_config_last_error()): INVALID (bad line, or qualifiers without a rule) or
+ * TOO_MANY (more than CHAOS_DNS_MAX_RULES). Each accepted rule's text is kept for the
+ * hits file.
  *
- * @param buffer      NUL-terminated, writable buffer containing the file contents.
- * @param rules       Output array of at least CHAOS_DNS_MAX_RULES elements.
- * @param rule_count  Output: number of rules stored in @p rules on success.
+ * @param buffer      Writable NUL-terminated rule text.
+ * @param rules       Output array with room for CHAOS_DNS_MAX_RULES rules.
+ * @param rule_count  Output: rules written; 0 on failure.
  *
- * @return  0 on success; -1 if any line fails to parse or @p rules is full.
+ * @return  0 on success; -1 on the first rejected line.
  *
- * @threadsafety  No shared state; safe from any thread given distinct buffers.
+ * @threadsafety  Writes file-scope state; reload owner only.
  */
 int chaos_dns_config_parse_buffer(char *buffer, chaos_dns_rule_t *rules, size_t *rule_count);
 
 /**
- * @brief Select the best-matching forward-lookup rule from an explicit rule array.
+ * @brief The line the last chaos_dns_config_parse_buffer() call rejected.
  *
- * @details Used by the reload path to query a freshly-parsed snapshot before
- * it is published.  Delegates to the internal domain-agnostic selector with
- * `CHAOS_DNS_SELECTOR_DOMAIN_LOOKUP`.
+ * @return The rejected line (`reason != NULL`), or a cleared record when the last
+ *         parse succeeded. Valid until the next parse.
+ */
+const chaos_status_error_t *chaos_dns_config_last_error(void);
+
+/**
+ * @brief Best forward-lookup rule in an explicit rule array.
  *
- * @param rules       Rule array to search.
- * @param rule_count  Number of valid entries in @p rules.
- * @param effect      Effect category to match.
- * @param name        Hostname to match.
- * @param rule        Output buffer for the winning rule.
+ * @details Precedence: rank (EXACT 3, SUFFIX 2, ANY 1), then longer selector text, then
+ * the earlier rule. Used by chaos_dns_config_match_loaded() and by unit tests.
  *
- * @return  Non-zero if a match was found; zero otherwise.
+ * @param rules       Rule array.
+ * @param rule_count  Valid entries in @p rules.
+ * @param effect      Effect to match.
+ * @param name        Queried host name.
+ * @param rule        Output: the winning rule.
  *
- * @threadsafety  No shared state; safe from any thread given distinct buffers.
+ * @return  Non-zero if a rule matched; zero otherwise.
+ *
+ * @threadsafety  Read-only on @p rules.
  */
 int chaos_dns_config_select_rule(
     const chaos_dns_rule_t *rules,
@@ -417,20 +414,19 @@ int chaos_dns_config_select_rule(
 );
 
 /**
- * @brief Select the best-matching reverse-lookup rule from an explicit rule array.
+ * @brief Best reverse-lookup rule in an explicit rule array.
  *
- * @details Reverse-lookup counterpart to chaos_dns_config_select_rule().
- * Delegates with `CHAOS_DNS_SELECTOR_DOMAIN_REVERSE`.
+ * @details Reverse counterpart of chaos_dns_config_select_rule().
  *
- * @param rules       Rule array to search.
- * @param rule_count  Number of valid entries in @p rules.
- * @param effect      Effect category to match.
- * @param address     Normalised IP address string to match.
- * @param rule        Output buffer for the winning rule.
+ * @param rules       Rule array.
+ * @param rule_count  Valid entries in @p rules.
+ * @param effect      Effect to match.
+ * @param address     inet_ntop form of the address.
+ * @param rule        Output: the winning rule.
  *
- * @return  Non-zero if a match was found; zero otherwise.
+ * @return  Non-zero if a rule matched; zero otherwise.
  *
- * @threadsafety  No shared state; safe from any thread given distinct buffers.
+ * @threadsafety  Read-only on @p rules.
  */
 int chaos_dns_config_select_reverse_rule(
     const chaos_dns_rule_t *rules,

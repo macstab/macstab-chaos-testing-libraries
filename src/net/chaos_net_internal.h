@@ -1,20 +1,21 @@
 /**
  * @file chaos_net_internal.h
- * @brief Private implementation contracts shared across all libchaos-net translation units.
+ * @brief Private contracts shared by every libchaos-net translation unit.
  *
  * @details
- * This header is the single internal seam that every .c file in the net subsystem includes.
- * It defines:
- *   - Compile-time constants (config path, buffer ceilings, sentinel mtime values).
- *   - The CHAOS_NET_EXPORT visibility macro that controls which symbols escape the DSO.
- *   - Platform-abstraction macros for the glibc sockaddr union vs. plain-pointer calling
- *     conventions, and for the flags type difference in sendmmsg/recvmmsg.
- *   - Function-pointer typedefs for every intercepted symbol; instances live in chaos_net.c.
- *   - Thread-local state: reentrancy guard (g_chaos_net_tls_guard) and per-thread PRNG state.
- *   - Inline helpers: TLS guard, acquire/release barriers, xorshift64* PRNG, tid fetch.
+ * The one header every net .c file includes. It owns:
+ *   - The fixed paths (rule file, status file, hits file prefix) and the capacity limits
+ *     (rules, rule-file bytes, UNIX path text).
+ *   - The reserved change-stamp values that double as the reload claim.
+ *   - CHAOS_NET_EXPORT, the only way a symbol escapes the `-fvisibility=hidden` DSO.
+ *   - The glibc/musl ABI shims for the sockaddr union and the sendmmsg/recvmmsg flags type.
+ *   - One function-pointer type and one `g_chaos_net_real_*` pointer per real function.
+ *   - Thread-local state: the reentrancy guard and the per-thread PRNG.
  *
- * Nothing in this file is part of the public ABI. All declarations are either
- * `static inline` or reference `extern` globals defined in chaos_net.c.
+ * Every helper here is `static inline` and touches only thread-local data or a single
+ * word with a full barrier, so all of them are async-signal-safe and need no lock.
+ * Nothing in this header is ABI: the pointers are defined in chaos_net.c, and
+ * chaos-init (SECCOMP mode) includes the parser sources directly.
  *
  * @par Stability: private / internal
  * @par Module: chaos-net
@@ -49,100 +50,101 @@
 #endif
 
 /**
- * @brief Filesystem path where libchaos-net looks for its rule configuration.
+ * @brief Rule file of libchaos-net.
  *
- * @details The file is stat(2)ed on every hot-path invocation to detect changes.
- * A missing file is treated as "no rules" (fail-open). The path is in /tmp so
- * that unprivileged processes can create and modify it without root access.
+ * @details Looked at (stat(2)) at most once per CHAOS_CHECK_INTERVAL_NS (1 ms) per process
+ * once a first load has completed; see chaos_net_config_checked_recently(). A missing file
+ * means no rules (fail-open). /tmp lets an unprivileged test harness create and rewrite it.
  */
 #define CHAOS_NET_CONFIG_PATH "/tmp/.chaos-net.conf"
 
+/** @brief Status file: outcome of the last load of the rule file (see chaos_status.h). */
+#define CHAOS_NET_STATUS_PATH "/tmp/.chaos-net.status"
+
+/** @brief Hits file prefix; each image appends `.<n>` (see chaos_hits_file_number()). */
+#define CHAOS_NET_HITS_PREFIX "/tmp/.chaos-net.hits"
+
 /**
- * @brief Maximum number of fault-injection rules that can be loaded simultaneously.
+ * @brief Most rules one snapshot holds.
  *
- * @details Sized to be large enough for real-world test suites while keeping the
- * two config snapshots (see chaos_net_config.c) completely stack- or BSS-allocated.
- * Exceeding this limit during a reload causes the entire reload to be rejected and
- * the previous snapshot to remain active.
+ * @details Bounds both snapshots, the hit-slot pool and the hits-file scratch buffer, all
+ * of which are static (BSS), so no load allocates. A rule file with more rules is
+ * rejected as a whole (status reason TOO_MANY): the published snapshot then has no rules.
  */
 #define CHAOS_NET_MAX_RULES 256U
 
 /**
- * @brief Maximum length (in bytes, including NUL) of a single config-file line.
+ * @brief Nominal line length, used only to size CHAOS_NET_MAX_CONFIG_BYTES.
  *
- * @details Enforced during buffer read, not during line parsing. Lines longer
- * than this value can only occur if the total config file is also truncated,
- * because CHAOS_NET_MAX_CONFIG_BYTES is derived from this constant.
+ * @details No per-line limit is enforced: a long line is parsed like any other, and the
+ * status file reports at most CHAOS_STATUS_TEXT_MAX (200) bytes of it.
  */
 #define CHAOS_NET_MAX_LINE_LENGTH 1024U
 
 /**
- * @brief Maximum total size (bytes) of the config file that will be read.
+ * @brief Rule file size limit in bytes: 256 x 1024 = 256 KiB.
  *
- * @details Derived as CHAOS_NET_MAX_RULES * CHAOS_NET_MAX_LINE_LENGTH. If the
- * file is larger, chaos_net_config_read_file() returns -1 and the reload is
- * aborted, leaving the previous snapshot active (fail-open).
- * The read buffer is allocated as a __thread TLS array so it is never shared
- * between threads; this avoids a lock in the hot-path reload path.
+ * @details A file of this size or larger is rejected as a whole (status reason TOO_LARGE)
+ * and the published snapshot has no rules until the file changes; the largest file
+ * accepted is one byte smaller. The read buffer is a single static array of this size plus
+ * the NUL, used only by the reload owner. It is deliberately not `__thread`: see
+ * g_chaos_net_config_buffer.
  */
 #define CHAOS_NET_MAX_CONFIG_BYTES (CHAOS_NET_MAX_RULES * CHAOS_NET_MAX_LINE_LENGTH)
 
 /**
- * @brief Maximum text length (bytes, including NUL) for a UNIX socket path stored
- *        inside chaos_net_endpoint_t::value.text.
+ * @brief Capacity, NUL included, of chaos_net_endpoint_t::value.text (UNIX paths).
  *
- * @details Must be at least UNIX_PATH_MAX (108 on Linux). The value 256 gives
- * comfortable headroom and keeps the endpoint struct cache-friendly.
+ * @details Must exceed sizeof(sun_path) (108 on Linux); chaos_net_endpoint.c enforces this
+ * at compile time. The parser rejects a `unix://` path of 256 bytes or more.
  */
 #define CHAOS_NET_MAX_TEXT 256U
 
 /**
- * @brief Visibility attribute used on every symbol that must be interposable.
+ * @brief Default visibility for the wrappers; every other symbol stays hidden.
  *
- * @details The shared library is built with -fvisibility=hidden, which hides all
- * symbols by default. Only the interposed syscall wrappers (bind, connect, recv,
- * etc.) carry this attribute; all internal helpers remain hidden. This prevents
- * accidental symbol clashes with the target application's own symbols and
- * reduces dynamic linker overhead.
+ * @details The library builds with `-fvisibility=hidden`. Only the wrappers (bind,
+ * connect, recv, read, close, ...) carry this attribute, so internal helpers can neither
+ * clash with the application's symbols nor be interposed themselves.
  */
 #define CHAOS_NET_EXPORT __attribute__((visibility("default")))
 
 /**
- * @brief Sentinel mtime hash value meaning the config file does not exist.
+ * @brief Change stamp of a rule file that does not exist (stat(2) failed).
  *
- * @details When stat(2) on CHAOS_NET_CONFIG_PATH fails, the hash function returns
- * this value. Distinguishing "missing" from "zero-hash-collision" is handled by
- * chaos_net_config_normalize_mtime_hash(), which maps any reserved sentinel to a
- * different value if the hash computation accidentally produces it.
+ * @details One of three reserved stamp values. chaos_net_config_normalize_mtime_hash()
+ * remaps a computed stamp that collides with any of them, so a reserved value always
+ * means what it says.
  */
 #define CHAOS_NET_MTIME_MISSING UINT64_C(0)
 
 /**
- * @brief Sentinel mtime hash value used as a CAS lock during a reload.
+ * @brief Change stamp held while a reload is in progress: the reload claim.
  *
- * @details The reloading thread atomically swaps the cached mtime to this value
- * before touching the inactive config snapshot. Any other thread that observes
- * this value knows a reload is in progress and falls through to use the current
- * active snapshot without contending for a mutex.
+ * @details The reloading thread CASes the cached stamp from its observed value to this
+ * one, fills the inactive snapshot, then publishes the real stamp. A thread that sees this
+ * value uses the active snapshot and does not wait. A fork() child whose parent was
+ * mid-reload resets it to CHAOS_NET_MTIME_UNKNOWN in its atfork handler.
  */
 #define CHAOS_NET_MTIME_RELOADING UINT64_C(0xfffffffffffffffe)
 
 /**
- * @brief Sentinel mtime hash value used at library startup before the first stat.
+ * @brief Change stamp before the first load.
  *
- * @details Set during chaos_net_config_init(). The first call to
- * chaos_net_config_prepare() will always see observed_mtime != cached_mtime
- * and perform an initial load, converting MTIME_UNKNOWN to the real value.
+ * @details Set by chaos_net_config_init(). It never equals an observed stamp, so the first
+ * chaos_net_config_prepare() always loads, and the 1 ms throttle stays off until then.
  */
 #define CHAOS_NET_MTIME_UNKNOWN UINT64_C(0xffffffffffffffff)
 
 /*---------------------------------------------------------------------------
  * glibc sockaddr ABI shim
  *
- * glibc wraps struct sockaddr * in a union (__SOCKADDR_ARG / __CONST_SOCKADDR_ARG)
- * to silence strict-aliasing warnings from its own headers.  Non-glibc toolchains
- * expose plain pointers.  These macros make the interposition wrappers source-
- * compatible with both ABIs without sacrificing type safety.
+ * glibc declares the sockaddr parameters as transparent unions
+ * (__SOCKADDR_ARG / __CONST_SOCKADDR_ARG); musl uses plain pointers. A wrapper must
+ * match the libc prototype exactly or the header declaration conflicts, so the
+ * parameter type and the unwrapping expression are selected per libc here. The
+ * sendmmsg/recvmmsg flags parameter differs the same way (int on glibc, unsigned
+ * int on musl).
  *---------------------------------------------------------------------------*/
 
 #if defined(__GLIBC__)
@@ -170,12 +172,15 @@
 #endif
 
 /*---------------------------------------------------------------------------
- * Function-pointer typedefs for intercepted symbols
+ * Function-pointer types of the real functions
  *
- * One typedef per intercepted libc/libsocket symbol. The global variables
- * g_chaos_net_real_* are populated by dlsym(RTLD_NEXT, …) in chaos_net_init()
- * and are never written again after construction; reads on the hot path are
- * therefore safe without barriers (they observe the initialized value).
+ * One type per wrapped symbol, plus the non-wrapped getsockname, getpeername,
+ * getsockopt and setsockopt that the library calls itself. The pointers are filled
+ * by dlsym(RTLD_NEXT) in chaos_net_ensure_symbols() and never change afterwards, so
+ * hot-path reads need no barrier. "Never NULL after init" below means after that
+ * resolution: a call that arrives during it (a signal handler, or an allocator doing
+ * I/O inside dlsym) still sees NULL, and the call_real helpers then issue the system
+ * call directly.
  *---------------------------------------------------------------------------*/
 
 /** @brief Real bind(2) pointer; never NULL after library init. */
@@ -223,6 +228,21 @@ typedef int (*chaos_net_getpeername_fn)(int, struct sockaddr *, socklen_t *);
 /** @brief Real getsockopt(2) pointer; used to determine SOCK_STREAM vs SOCK_DGRAM; never NULL after
  * init. */
 typedef int (*chaos_net_getsockopt_fn)(int, int, int, void *, socklen_t *);
+
+/** @brief Type of the real setsockopt(2); resolved, not interposed. */
+typedef int (*chaos_net_setsockopt_fn)(int, int, int, const void *, socklen_t);
+
+/** @brief Type of the real read(2); interposed for sockets only. */
+typedef ssize_t (*chaos_net_read_fn)(int, void *, size_t);
+
+/** @brief Type of the real write(2); interposed for sockets only. */
+typedef ssize_t (*chaos_net_write_fn)(int, const void *, size_t);
+
+/** @brief Type of the real readv(2) and writev(2); interposed for sockets only. */
+typedef ssize_t (*chaos_net_readv_fn)(int, const struct iovec *, int);
+
+/** @brief Type of the real close(2); interposed for sockets only. */
+typedef int (*chaos_net_close_fn)(int);
 #ifdef __linux__
 /** @brief Real accept4(2) pointer; Linux-only; never NULL after library init on Linux. */
 typedef int (*chaos_net_accept4_fn)(int, struct sockaddr *, socklen_t *, int);
@@ -239,7 +259,7 @@ typedef int (*chaos_net_epoll_pwait_fn)(int, struct epoll_event *, int, int, con
 #endif
 
 /*---------------------------------------------------------------------------
- * Real-symbol pointer instances (defined in chaos_net.c)
+ * Real-function pointers (defined in chaos_net.c)
  *---------------------------------------------------------------------------*/
 
 extern chaos_net_bind_fn g_chaos_net_real_bind;
@@ -262,6 +282,23 @@ extern chaos_net_pselect_fn g_chaos_net_real_pselect;
 extern chaos_net_getsockname_fn g_chaos_net_real_getsockname;
 extern chaos_net_getpeername_fn g_chaos_net_real_getpeername;
 extern chaos_net_getsockopt_fn g_chaos_net_real_getsockopt;
+extern chaos_net_setsockopt_fn g_chaos_net_real_setsockopt;
+extern chaos_net_read_fn g_chaos_net_real_read;
+extern chaos_net_write_fn g_chaos_net_real_write;
+extern chaos_net_readv_fn g_chaos_net_real_readv;
+extern chaos_net_readv_fn g_chaos_net_real_writev;
+extern chaos_net_close_fn g_chaos_net_real_close;
+
+/**
+ * @brief Resolves every real function once, whichever caller comes first.
+ *
+ * @details The constructor alone is not enough: ELF initialisers run in dependency order,
+ * so another object's constructor can reach a wrapper (read, close, ...) before
+ * chaos_net_init() has run. Every wrapper calls this first; after the first call it is
+ * one acquire load (chaos_once(), which needs no libpthread before glibc 2.34). A call
+ * from inside the resolution on the same thread returns at once with pointers still NULL.
+ */
+void chaos_net_ensure_symbols(void);
 #ifdef __linux__
 extern chaos_net_accept4_fn g_chaos_net_real_accept4;
 extern chaos_net_sendmmsg_fn g_chaos_net_real_sendmmsg;
@@ -275,40 +312,37 @@ extern chaos_net_epoll_pwait_fn g_chaos_net_real_epoll_pwait;
  *---------------------------------------------------------------------------*/
 
 /**
- * @brief Per-thread reentrancy guard preventing libchaos-net from intercepting
- *        its own internal socket calls.
+ * @brief Per-thread reentrancy guard: non-zero while libchaos-net itself is calling out.
  *
- * @details Set to 1 by chaos_net_enter_internal() before any syscall made by
- * libchaos-net itself (stat, getsockname, getpeername, getsockopt, read, open,
- * close, etc.), and restored to its previous value by chaos_net_leave_internal().
- * The save/restore idiom (not simple increment/decrement) makes the guard
- * reentrant: if a signal handler or a deeply nested call checks the guard while
- * it is already set, the flag is left set until the outermost frame restores it.
+ * @details Set by chaos_net_enter_internal() around every call the library makes into an
+ * interposable symbol (real functions, stat, getsockname, getpeername, getsockopt, the
+ * fdinfo open/read/close) and restored by chaos_net_leave_internal(). Every wrapper
+ * checks it first and forwards straight to the real function when set, which stops the
+ * library from matching rules against its own traffic and from recursing (getsockname
+ * inside endpoint resolution, read() inside the epoll fdinfo scan).
  *
- * All interposed symbols check chaos_net_in_internal() at entry and fast-path
- * directly to the real symbol when it returns non-zero, which prevents infinite
- * recursion when the endpoint-resolution code calls getsockname/getpeername.
+ * Save/restore rather than a counter keeps it correct for nested sections and for a
+ * signal handler that runs a wrapper in the middle of one: each frame restores exactly
+ * the value it found. The guard is per library; it does not hide these calls from other
+ * preloaded libraries such as libchaos-io.
  */
 extern __thread int g_chaos_net_tls_guard;
 
 /**
- * @brief Per-thread xorshift64* PRNG state.
+ * @brief Per-thread xorshift64* state; 0 means not yet seeded.
  *
- * @details Zero means "not seeded yet". The first call to chaos_net_prng_next_u32()
- * on a new thread invokes chaos_net_prng_ensure_seeded(), which mixes the process
- * seed, the thread ID, and the stack address of a local variable to derive a
- * thread-unique starting state. This avoids any shared lock for PRNG advancement
- * while still giving different threads different random streams.
+ * @details The first draw on a thread seeds it from the process seed, the thread id and a
+ * stack address (chaos_net_prng_ensure_seeded()). Per-thread state needs no lock and
+ * gives every thread its own stream. A fork() child zeroes it in its atfork handler so
+ * pre-fork workers do not all draw the parent's sequence.
  */
 extern __thread uint64_t g_chaos_net_tls_prng_state;
 
 /**
- * @brief Process-wide seed used as the base for per-thread PRNG seeding.
+ * @brief Process-wide seed, the base of every per-thread seed.
  *
- * @details Initialised from /dev/urandom during library construction (chaos_net_init).
- * Falls back to a compile-time constant XORed with getpid() if the read fails.
- * Written exactly once (during the constructor), then read-only; no synchronisation
- * is required for subsequent reads.
+ * @details Read from /dev/urandom by chaos_net_init() with raw system calls; if that
+ * fails, a constant XOR getpid(). Written once in the constructor, read-only afterwards.
  */
 extern uint64_t g_chaos_net_process_seed;
 
@@ -317,16 +351,14 @@ extern uint64_t g_chaos_net_process_seed;
  *---------------------------------------------------------------------------*/
 
 /**
- * @brief Returns non-zero when the calling thread is already executing inside
- *        libchaos-net's own implementation.
+ * @brief Whether the calling thread is inside a libchaos-net section.
  *
- * @details Checked at the top of every interposed symbol. A non-zero result means
- * the call arrived from within libchaos-net itself (e.g. getsockname called while
- * resolving an endpoint for bind()), and the wrapper must forward directly to the
- * real symbol without any fault injection.
+ * @details Checked first by every wrapper. Non-zero means the call comes from the library
+ * itself (getsockname during endpoint resolution, read() in the fdinfo scan) and must go
+ * to the real function without rule matching.
  *
- * @return Non-zero if reentrancy guard is set; 0 otherwise.
- * @par Thread-safety: reads a thread-local variable; inherently thread-safe.
+ * @return Non-zero when the guard is set; 0 otherwise.
+ * @par Thread-safety: reads thread-local data; async-signal-safe.
  */
 static inline int chaos_net_in_internal(void)
 {
@@ -334,16 +366,14 @@ static inline int chaos_net_in_internal(void)
 }
 
 /**
- * @brief Sets the reentrancy guard for the current thread and returns the previous
- *        value so it can be restored with chaos_net_leave_internal().
+ * @brief Sets the reentrancy guard and returns the value it replaces.
  *
- * @details Call this before any internal syscall that could otherwise recurse back
- * through an interposed symbol. Example call sites: getsockname calls in
- * chaos_net_endpoint_from_local_fd, and stat calls in chaos_net_config_observed_mtime.
+ * @details Bracket every library call into an interposable symbol with this and
+ * chaos_net_leave_internal(), e.g. getsockname in chaos_net_endpoint_from_local_fd() and
+ * stat in chaos_net_config_observed_mtime().
  *
- * @return Previous value of g_chaos_net_tls_guard (0 or 1). Must be passed to
- *         chaos_net_leave_internal() after the protected section completes.
- * @par Thread-safety: writes a thread-local variable; inherently thread-safe.
+ * @return Previous guard value (0 or 1), to pass to chaos_net_leave_internal().
+ * @par Thread-safety: writes thread-local data; async-signal-safe.
  */
 static inline int chaos_net_enter_internal(void)
 {
@@ -353,17 +383,15 @@ static inline int chaos_net_enter_internal(void)
 }
 
 /**
- * @brief Restores the reentrancy guard to the value captured before entering
- *        an internal section.
+ * @brief Restores the reentrancy guard saved by chaos_net_enter_internal().
  *
- * @details Using save/restore rather than simple decrement preserves correctness
- * if signal handlers run between enter and leave, or if the same thread legitimately
- * nests internal sections (e.g., endpoint_from_local_fd calling getsockopt then
- * getsockname: each sets the guard to 1 and restores to 1, not to 0, so the outer
- * frame's restore to 0 is the only one that actually clears it).
+ * @details Restoring the saved value, not clearing, keeps nested sections correct: the
+ * epoll fdinfo scan sets the guard and calls read(), whose wrapper forwards through
+ * chaos_net_call_real_read(), which saves 1 and restores 1; only the outermost frame
+ * clears it.
  *
- * @param previous Value returned by a prior call to chaos_net_enter_internal().
- * @par Thread-safety: writes a thread-local variable; inherently thread-safe.
+ * @param previous Value returned by the matching chaos_net_enter_internal().
+ * @par Thread-safety: writes thread-local data; async-signal-safe.
  */
 static inline void chaos_net_leave_internal(int previous)
 {
@@ -371,21 +399,19 @@ static inline void chaos_net_leave_internal(int previous)
 }
 
 /*---------------------------------------------------------------------------
- * Atomic helpers (GCC built-ins, C99 compatible)
+ * Atomic helpers (GCC __sync built-ins: C99, no stdatomic.h)
  *---------------------------------------------------------------------------*/
 
 /**
- * @brief Performs a full memory barrier then loads a 64-bit value from a
- *        volatile location.
+ * @brief Full barrier, then a load of a 64-bit word.
  *
- * @details Used when reading g_chaos_net_cached_mtime and
- * g_chaos_net_active_config_index to ensure the reader observes any preceding
- * store from the reloading thread. The barrier is intentionally conservative
- * (full fence rather than acquire) to remain correct on all hardware without
- * pulling in C11 stdatomic.h.
+ * @details Reads g_chaos_net_cached_mtime so that a reader sees the stores the reload
+ * owner made before publishing it. A full fence rather than an acquire load keeps the
+ * code C99 (no stdatomic.h); on amd64 and arm64 a 64-bit aligned load is single-copy
+ * atomic.
  *
- * @param value Pointer to the volatile uint64_t to load. Must not be NULL.
- * @return The value observed after the memory barrier.
+ * @param value Word to load; must not be NULL.
+ * @return The value after the barrier.
  */
 static inline uint64_t chaos_net_atomic_load_u64(volatile uint64_t *value)
 {
@@ -394,18 +420,16 @@ static inline uint64_t chaos_net_atomic_load_u64(volatile uint64_t *value)
 }
 
 /**
- * @brief Atomic compare-and-swap on a 64-bit value.
+ * @brief 64-bit compare-and-swap with full-barrier semantics.
  *
- * @details Attempts to atomically replace *value with @p desired if *value
- * currently equals @p expected. Used to claim the reload lock by swapping
- * g_chaos_net_cached_mtime from its observed value to CHAOS_NET_MTIME_RELOADING.
- * If two threads race to reload concurrently, exactly one wins; the loser skips
- * the reload and uses the current active snapshot.
+ * @details Claims the reload by swapping g_chaos_net_cached_mtime from the observed stamp
+ * to CHAOS_NET_MTIME_RELOADING. Of threads racing to reload, exactly one wins; the others
+ * use the active snapshot.
  *
- * @param value    Pointer to the volatile uint64_t to update. Must not be NULL.
- * @param expected Value the caller believes is current.
- * @param desired  Value to write if the CAS succeeds.
- * @return Non-zero if the swap was performed; 0 if another thread changed *value first.
+ * @param value    Word to update; must not be NULL.
+ * @param expected Value the caller saw.
+ * @param desired  Value to store on success.
+ * @return Non-zero if the swap happened; 0 if @p value no longer held @p expected.
  */
 static inline int
 chaos_net_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint64_t desired)
@@ -414,20 +438,17 @@ chaos_net_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint64_t d
 }
 
 /*---------------------------------------------------------------------------
- * Thread-ID helper
+ * Thread id
  *---------------------------------------------------------------------------*/
 
 /**
- * @brief Returns a numeric identifier for the calling thread.
+ * @brief Kernel thread id of the caller, used only to seed the per-thread PRNG.
  *
- * @details On Linux, uses SYS_gettid (via raw syscall to avoid the reentrancy
- * problem: the glibc wrapper for gettid() may not exist on older kernels, and
- * using the raw syscall avoids any interposable symbol). On other platforms,
- * getpid() is used, which means threads within a process share a seed base and
- * differ only by stack-address XOR. This is sufficient for the PRNG seeding
- * purpose (low collision probability) without requiring pthreads.
+ * @details Linux: the raw SYS_gettid system call (glibc exports gettid() only since 2.30,
+ * and a raw call cannot be interposed). Elsewhere getpid(), so threads differ only by the
+ * stack address mixed into their seed.
  *
- * @return A uint64_t encoding the calling thread's OS-level identifier.
+ * @return The caller's thread id (Linux) or process id.
  */
 static inline uint64_t chaos_net_current_tid(void)
 {
@@ -439,20 +460,17 @@ static inline uint64_t chaos_net_current_tid(void)
 }
 
 /*---------------------------------------------------------------------------
- * PRNG: xorshift64* with splitmix64 finalizer
+ * PRNG: xorshift64*, seeded through the splitmix64 finaliser
  *---------------------------------------------------------------------------*/
 
 /**
- * @brief Applies the splitmix64 finalizer to a 64-bit value, producing a
- *        well-distributed hash.
+ * @brief splitmix64 finaliser: maps a 64-bit word to a well-mixed one.
  *
- * @details Used when constructing initial PRNG state from heterogeneous inputs
- * (process seed, TID, stack address) that may have poor bit distribution on their
- * own. The three-step multiply-xorshift sequence is the Murmur3 finalizer adapted
- * for 64 bits; it passes BigCrush with negligible bias.
+ * @details Seed inputs (process seed, tid, stack address) differ in few bits; this
+ * spreads every input bit over the whole output before it becomes xorshift state.
  *
- * @param value Input word to mix.
- * @return Mixed output with all bits dependent on all input bits.
+ * @param value Input word.
+ * @return Mixed word.
  */
 static inline uint64_t chaos_net_prng_mix(uint64_t value)
 {
@@ -463,20 +481,16 @@ static inline uint64_t chaos_net_prng_mix(uint64_t value)
 }
 
 /**
- * @brief Lazily seeds the calling thread's PRNG state if it has not been seeded yet.
+ * @brief Seeds the calling thread's PRNG on its first draw.
  *
- * @details Called by chaos_net_prng_next_u32() before every draw. The seed is
- * derived from three sources to minimise the probability of two threads sharing a
- * PRNG stream:
- *   1. g_chaos_net_process_seed  — unique across processes (from /dev/urandom).
- *   2. chaos_net_current_tid()   — unique across threads within a process.
- *   3. The address of a local variable — adds ASLR entropy on systems that randomise
- *      stack layout, differentiating threads that share the same TID across fork.
+ * @details Called before every draw by chaos_net_prng_next_u32(); a no-op once seeded.
+ * The seed mixes:
+ *   1. g_chaos_net_process_seed -- differs between processes.
+ *   2. chaos_net_current_tid()  -- differs between threads of a process.
+ *   3. The address of a local  -- differs with stack placement (ASLR, per-thread stacks).
+ * The result is forced odd, so it is never 0, the one state xorshift64* cannot leave.
  *
- * If the mixed value is zero (the only invalid xorshift64* state), it is replaced
- * with a fixed non-zero fallback constant.
- *
- * @par Thread-safety: reads/writes g_chaos_net_tls_prng_state (thread-local); safe.
+ * @par Thread-safety: thread-local state only; async-signal-safe.
  */
 static inline void chaos_net_prng_ensure_seeded(void)
 {
@@ -490,23 +504,18 @@ static inline void chaos_net_prng_ensure_seeded(void)
     seed = g_chaos_net_process_seed;
     seed ^= chaos_net_current_tid();
     seed ^= (uint64_t)(uintptr_t)&seed;
-    g_chaos_net_tls_prng_state = chaos_net_prng_mix(seed);
-    if (g_chaos_net_tls_prng_state == 0U)
-    {
-        g_chaos_net_tls_prng_state = UINT64_C(0x2545f4914f6cdd1d);
-    }
+    /* Odd: never 0, the one state xorshift64* cannot leave. */
+    g_chaos_net_tls_prng_state = chaos_net_prng_mix(seed) | 1U;
 }
 
 /**
- * @brief Explicitly seeds the calling thread's PRNG with a caller-supplied value.
+ * @brief Seeds the calling thread's PRNG with @p seed.
  *
- * @details Passes the seed through chaos_net_prng_mix() before storing it to
- * guarantee good bit distribution even if @p seed is a small integer. If @p seed
- * is zero, the value 1 is used before mixing (xorshift64* state must be non-zero).
- * Called from chaos_net_init() to seed the main thread at library load time.
+ * @details @p seed passes through chaos_net_prng_mix(); 0 is replaced by 1 first. Called
+ * by chaos_net_init() for the thread that runs the constructor.
  *
- * @param seed Desired starting value. 0 is treated as 1.
- * @par Thread-safety: writes g_chaos_net_tls_prng_state (thread-local); safe.
+ * @param seed Seed value.
+ * @par Thread-safety: thread-local state only; async-signal-safe.
  */
 static inline void chaos_net_prng_seed_thread(uint64_t seed)
 {
@@ -514,21 +523,14 @@ static inline void chaos_net_prng_seed_thread(uint64_t seed)
 }
 
 /**
- * @brief Advances the xorshift64* generator and returns the upper 32 bits of
- *        the output.
+ * @brief Advances the calling thread's xorshift64* generator and returns 32 bits.
  *
- * @details The three-step xorshift sequence (right 12, left 25, right 27) is the
- * Marsaglia xorshift64 generator. Multiplying by the Knuth constant before
- * extracting the upper 32 bits applies a finalizer that removes the known
- * correlation between the raw xorshift output and simple linear combinations,
- * giving statistical quality comparable to xoroshiro128+.
+ * @details Marsaglia's xorshift64 step (shifts 12, 25, 27), then the xorshift64*
+ * multiplier 0x2545F4914F6CDD1D; the high 32 bits of the product are returned because
+ * the low bits of xorshift64* are the weakest. No lock, no allocation, no system call.
  *
- * The function is allocation-free, branch-free (after the seed check), and
- * operates entirely on thread-local state, making it safe to call from the
- * hot interposition path without any locking.
- *
- * @return A pseudo-random 32-bit value drawn from the calling thread's stream.
- * @par Thread-safety: reads/writes g_chaos_net_tls_prng_state (thread-local); safe.
+ * @return A pseudo-random 32-bit value from the calling thread's stream.
+ * @par Thread-safety: thread-local state only; async-signal-safe.
  */
 static inline uint32_t chaos_net_prng_next_u32(void)
 {

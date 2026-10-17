@@ -1,129 +1,91 @@
 /**
  * @file chaos_memory.c
- * @brief Module initialisation: symbol resolution, entropy collection, and
- *        subsystem bootstrap for libchaos-memory.
+ * @brief libchaos-memory start-up: storage of the shared state, real function
+ *        lookup, seeding and the first load of the rule file.
  *
  * @details
- * This translation unit owns three things:
+ * Owns:
+ *  - the definitions of the state declared `extern` in chaos_memory_internal.h
+ *    (real function pointers, reentrancy guard, PRNG state, process seed);
+ *  - chaos_memory_ensure_symbols(), the run-once `dlsym(RTLD_NEXT)` lookup every
+ *    wrapper calls first;
+ *  - the constructor, which resolves the real functions, seeds the PRNG and loads
+ *    the rule file so that a bad file is reported in the status file at start-up
+ *    rather than on the first intercepted call.
  *
- *  1. **Global storage** for all process-wide and thread-local state declared
- *     as @c extern in chaos_memory_internal.h: the six real-symbol function
- *     pointers, the TLS reentrancy guard, the TLS PRNG state, and the
- *     process-wide seed.
+ * @par Ordering hazard
+ * A wrapper can run before the constructor: another object's constructor may call
+ * mmap(), and dlsym() itself may allocate (`dlsym` -> `calloc` -> a preloaded
+ * allocator -> `mmap`). Therefore the lookup is lazy and run-once, and a wrapper
+ * that finds its real function pointer still NULL issues the system call directly
+ * (chaos_memory_hooks.c).
  *
- *  2. **chaos_memory_resolve_symbol()** — a thin wrapper around
- *     dlsym(RTLD_NEXT) that populates a function pointer slot and calls
- *     abort() on hard resolution failure (NULL with a pending dlerror).
+ * @par Failure behaviour
+ * Fail-closed on lookup: a real function that dlsym() cannot find while dlerror()
+ * reports an error aborts the process. A missing /dev/urandom falls back to a
+ * PID-derived seed.
  *
- *  3. **chaos_memory_init()** — the GCC constructor that runs before main()
- *     (and before most of the application's own constructors, depending on
- *     link order).  It resolves all six real symbols, reads entropy, seeds
- *     the main-thread PRNG, and initialises the config subsystem.
- *
- * @par Invariants
- * After chaos_memory_init() returns:
- *  - g_chaos_memory_real_mmap, _munmap, _mprotect, _madvise are non-NULL.
- *  - g_chaos_memory_real_nanosleep and _usleep may be NULL only if libc does
- *    not export those symbols (practically never); the latency action handles
- *    NULL gracefully.
- *  - g_chaos_memory_process_seed is non-zero.
- *  - The main thread's TLS PRNG is seeded.
- *  - The config subsystem is in a clean, zero-rule state ready for its first
- *    lazy reload.
- *
- * @par Reentrancy during initialisation
- * chaos_memory_read_seed_material() reads /dev/urandom using raw Linux
- * syscalls (SYS_openat, SYS_read, SYS_close) rather than libc wrappers.
- * This avoids re-entering the mmap hook through glibc's internal FILE
- * allocation or fd-table expansion paths, which can call mmap before the
- * real-symbol pointers have been populated.  The reentrancy guard is set
- * around the syscall block as an additional safety measure even though the
- * hook wrappers in chaos_memory_hooks.c would fall through to the real symbol
- * at that point (since g_chaos_memory_real_mmap is NULL until resolve is
- * complete — hooks check for NULL and abort, so the guard prevents any
- * re-entrant call from reaching that check).
- *
- * @par Stability
- * Internal — do not depend on the symbols or layout of this file from outside
- * the memory chaos module.
+ * @par Test seams
+ * CHAOS_MEMORY_CONSTRUCTOR (empty in unit tests, which then call the steps
+ * themselves); resolve_symbol() keeps pointers a test has already set.
  */
 
+#include "chaos_once.h"
 #include "chaos_memory_config.h"
 #include "chaos_memory_internal.h"
 
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 
 /* =========================================================================
- * Global storage for extern-declared state
+ * Storage for the state declared in chaos_memory_internal.h
  * =========================================================================
- * Defined here; declared extern in chaos_memory_internal.h.
- * All NULL / zero until chaos_memory_init() runs.
  */
 
-/** @brief Real mmap(2) function pointer, resolved via RTLD_NEXT at startup. */
+/** @brief Real mmap(2); NULL until chaos_memory_ensure_symbols() resolves it. */
 chaos_memory_mmap_fn g_chaos_memory_real_mmap = NULL;
 
-/** @brief Real munmap(2) function pointer, resolved via RTLD_NEXT at startup. */
+/** @brief Real munmap(2); NULL until resolved. */
 chaos_memory_munmap_fn g_chaos_memory_real_munmap = NULL;
 
-/** @brief Real mprotect(2) function pointer, resolved via RTLD_NEXT at startup. */
+/** @brief Real mprotect(2); NULL until resolved. */
 chaos_memory_mprotect_fn g_chaos_memory_real_mprotect = NULL;
 
-/** @brief Real madvise(2) function pointer, resolved via RTLD_NEXT at startup. */
+/** @brief Real madvise(2); NULL until resolved. */
 chaos_memory_madvise_fn g_chaos_memory_real_madvise = NULL;
 
-/** @brief Real nanosleep(2) function pointer, resolved via RTLD_NEXT at startup. */
-chaos_memory_nanosleep_fn g_chaos_memory_real_nanosleep = NULL;
-
-/** @brief Real usleep(3) function pointer, resolved via RTLD_NEXT at startup. */
-chaos_memory_usleep_fn g_chaos_memory_real_usleep = NULL;
+/** @brief Real posix_madvise(3); NULL until resolved. */
+chaos_memory_posix_madvise_fn g_chaos_memory_real_posix_madvise = NULL;
 
 /**
- * @brief Per-thread reentrancy guard.
- *
- * Non-zero while this thread is executing inside any chaos-library internal
- * path.  Zero-initialised by the C runtime at thread creation; never requires
- * explicit reset across calls because enter/leave always restore the previous
- * value.
+ * @brief Per-thread reentrancy guard (see chaos_memory_internal.h). Zero at thread
+ *        start; enter/leave restore the saved value, so it never needs a reset.
  */
 __thread int g_chaos_memory_tls_guard = 0;
 
-/**
- * @brief Per-thread xorshift64* PRNG state.
- *
- * Zero is the uninitialised sentinel.  chaos_memory_prng_ensure_seeded()
- * lazily populates this on first use without I/O or heap allocation.
- */
+/** @brief Per-thread xorshift64* state; 0 until the thread's first draw seeds it. */
 __thread uint64_t g_chaos_memory_tls_prng_state = 0U;
 
 /**
- * @brief Process-wide entropy seed shared across threads.
+ * @brief Process seed; replaced by the constructor with /dev/urandom bytes.
  *
- * Initialised from /dev/urandom in chaos_memory_init() via raw syscalls.
- * Each thread's TLS PRNG derives its own seed by XOR-ing this value with
- * the kernel TID and a stack address, ensuring per-thread independence.
- * The default value (0x2545f4914f6cdd1d, a Weyl constant) is a safe fallback
- * if the constructor has somehow not yet run — it produces a non-zero seed
- * that will be mixed further by chaos_memory_prng_mix().
+ * @details The initial value only matters for a draw made before the constructor
+ * (from another object's constructor); it is mixed with the tid and a stack
+ * address like any seed.
  */
 uint64_t g_chaos_memory_process_seed = UINT64_C(0x2545f4914f6cdd1d);
 
 /* =========================================================================
- * Constructor macro override for testing
+ * Constructor seam
  * =========================================================================
  */
 
 /**
- * @brief GCC constructor attribute, overridable at compile time for unit tests.
- *
- * @details
- * Test harnesses that link chaos_memory.c directly can define
- * CHAOS_MEMORY_CONSTRUCTOR to an empty string (or a different priority) to
- * suppress or reorder the automatic constructor call and drive initialisation
- * explicitly.
+ * @brief Constructor attribute of chaos_memory_init(); unit tests define it empty
+ *        and drive initialisation themselves.
  */
 #ifndef CHAOS_MEMORY_CONSTRUCTOR
 #define CHAOS_MEMORY_CONSTRUCTOR __attribute__((constructor))
@@ -135,28 +97,30 @@ uint64_t g_chaos_memory_process_seed = UINT64_C(0x2545f4914f6cdd1d);
  */
 
 /**
- * @brief Resolve a single libc symbol via RTLD_NEXT and store it in a
- *        function pointer slot.
+ * @brief Resolves @p symbol with `dlsym(RTLD_NEXT)` into the function pointer at
+ *        @p target, unless it is already set.
  *
- * @details
- * Uses memcpy() to transfer the void* returned by dlsym() into the typed
- * function-pointer target, avoiding the ISO C restriction on casting between
- * object and function pointers (technically undefined behaviour, but the
- * only portable approach with POSIX dlsym).
+ * @details The pointer is copied with memcpy(): ISO C does not define converting
+ * an object pointer (dlsym()'s void *) to a function pointer, POSIX requires the
+ * representation to match. dlsym() returning NULL with dlerror() set means the
+ * symbol exists in no later object; the process aborts. NULL without an error is
+ * stored as is (the wrapper then uses the system call).
  *
- * Calls abort() if dlsym returns NULL and dlerror() is non-NULL, which
- * indicates a hard link failure (symbol genuinely absent from any loaded
- * library).  A NULL result with a NULL dlerror is treated as "symbol
- * resolved to address zero", which is legitimate for optional symbols but
- * practically never occurs for mmap/munmap/mprotect/madvise.
- *
- * @param target  Pointer to the function-pointer variable to populate.
- *                Must point to a storage of exactly sizeof(void*) bytes.
- * @param symbol  Null-terminated name of the symbol to resolve.
+ * @param target  Address of a function pointer variable (sizeof(void *) bytes).
+ * @param symbol  Symbol name.
  */
 static void chaos_memory_resolve_symbol(void *target, const char *symbol)
 {
     void *resolved;
+    void *current;
+
+    /* Only fill what is still unset, so a pointer already wired (by an earlier call,
+     * or by a test harness) is never replaced. */
+    (void)memcpy(&current, target, sizeof(current));
+    if (current != NULL)
+    {
+        return;
+    }
 
     (void)dlerror();
     resolved = dlsym(RTLD_NEXT, symbol);
@@ -169,45 +133,23 @@ static void chaos_memory_resolve_symbol(void *target, const char *symbol)
 }
 
 /* =========================================================================
- * Entropy collection
+ * Seeding
  * =========================================================================
  */
 
 /**
- * @brief Read 8 bytes of entropy from /dev/urandom using raw Linux syscalls.
+ * @brief Reads 8 bytes from /dev/urandom with raw system calls.
  *
- * @details
- * This function deliberately avoids all libc I/O wrappers to prevent
- * reentrancy through the mmap hook during the constructor.  Specifically:
+ * @details SYS_openat/SYS_read/SYS_close instead of libc: nothing allocates (an
+ * allocation could call mmap() and re-enter this library during its own start-up),
+ * and no other preloaded library's open()/read() wrapper (libchaos-io) sees or
+ * fails the read. The reentrancy guard is held as well, so any wrapper of this
+ * library reached in between passes through.
  *
- *  - glibc's open(2) wrapper may call malloc() for the FILE* structure or the
- *    fd table, and large allocations go through mmap(MAP_ANONYMOUS).  At
- *    constructor time, g_chaos_memory_real_mmap is not yet resolved; a
- *    re-entrant mmap call would hit the hook and find a NULL real pointer.
- *  - Even if the real pointer were already set, a recursive mmap call during
- *    seeding would invoke the hook, the hook would call config_prepare(), and
- *    config_prepare() calls stat() — creating a deep reentrant chain before
- *    the module is fully initialised.
- *
- * The reentrancy guard is set around the entire syscall block as a belt-and-
- * suspenders measure; any intercepted symbol that is somehow called during
- * this window will observe the guard and bypass fault injection.
- *
- * @par Fallback behaviour
- * If SYS_openat fails (e.g., in a container without /dev/urandom), a
- * deterministic but process-unique fallback seed derived from a fixed
- * constant XOR'd with getpid() is returned.  Fault injection remains
- * probabilistic but reproducible for the same PID.
- *
- * @return 64-bit entropy value, or a deterministic fallback on failure.
- *         Never returns zero (the Weyl constant fallback is non-zero, and
- *         getpid() > 0 on Linux so the XOR is non-zero unless pid == constant,
- *         which is astronomically unlikely).
- *
- * @note Linux-only.  On other platforms the function body is empty and the
- *       fallback is always returned.
+ * @return The random bytes; `0x6a09e667f3bcc909 ^ getpid()` when the device
+ *         cannot be opened or a short read occurs (and always on non-Linux builds).
  */
-static uint64_t chaos_memory_read_seed_material(void)
+static uint64_t chaos_memory_read_urandom_seed(void)
 {
 #ifdef __linux__
     uint64_t seed = 0U;
@@ -235,49 +177,79 @@ static uint64_t chaos_memory_read_seed_material(void)
     return UINT64_C(0x6a09e667f3bcc909) ^ (uint64_t)getpid();
 }
 
+/**
+ * @brief chaos_memory_read_urandom_seed() with errno preserved.
+ *
+ * @details The application's errno must not change because the library read
+ * /dev/urandom, whether that happens in the constructor or later.
+ */
+static uint64_t chaos_memory_read_seed_material(void)
+{
+    const int saved_errno = errno;
+    const uint64_t seed = chaos_memory_read_urandom_seed();
+
+    errno = saved_errno;
+    return seed;
+}
+
 /* =========================================================================
- * Module constructor
+ * Real function lookup and constructor
  * =========================================================================
  */
 
 /**
- * @brief Module constructor: resolve real symbols, seed entropy, initialise
- *        the config subsystem.
+ * @brief Run-once state of the real function lookup.
  *
- * @details
- * Executed by the dynamic linker before main() (priority determined by link
- * order; no explicit priority attribute is used, so this runs with default
- * priority after all higher-priority constructors).  It is safe to call
- * only once per process; the dynamic linker guarantees this for shared-library
- * constructors.
- *
- * Sequence:
- *  1. Resolve the six real libc symbols via RTLD_NEXT.  Failure of any
- *     mandatory symbol (mmap, munmap, mprotect, madvise) calls abort().
- *  2. Collect entropy from /dev/urandom via raw syscalls (see
- *     chaos_memory_read_seed_material() for the reentrancy rationale).
- *  3. Seed the main thread's TLS PRNG immediately so that the first
- *     intercepted call on the main thread does not need the lazy seeding
- *     path.
- *  4. Initialise the config subsystem to a clean zero-rule state.  The first
- *     actual config read occurs lazily on the first intercepted call that
- *     reaches chaos_memory_config_prepare().
- *
- * @note The function is declared static to prevent it from appearing in the
- *       library's symbol table.  The constructor attribute ensures it is
- *       called automatically regardless of visibility.
+ * @details chaos_once(), not pthread_once(): before glibc 2.34 the latter lives in
+ * libpthread, which programs such as `cat` and `sh` do not load.
  */
-CHAOS_MEMORY_CONSTRUCTOR
-static void chaos_memory_init(void)
+static volatile chaos_once_t g_chaos_memory_symbols_once = CHAOS_ONCE_INIT;
+
+/**
+ * @brief Resolves all five real functions. Runs once, through
+ *        chaos_memory_ensure_symbols().
+ *
+ * @details Calls no wrapper of this library directly. dlsym() walks the link map
+ * already loaded and opens no file, but it may allocate; an mmap() that this
+ * causes re-enters the wrapper, which finds its pointer NULL and uses the system
+ * call (chaos_once() returns 0 to the nested call instead of deadlocking).
+ */
+static void chaos_memory_resolve_all_symbols(void)
 {
     chaos_memory_resolve_symbol(&g_chaos_memory_real_mmap, "mmap");
     chaos_memory_resolve_symbol(&g_chaos_memory_real_munmap, "munmap");
     chaos_memory_resolve_symbol(&g_chaos_memory_real_mprotect, "mprotect");
     chaos_memory_resolve_symbol(&g_chaos_memory_real_madvise, "madvise");
-    chaos_memory_resolve_symbol(&g_chaos_memory_real_nanosleep, "nanosleep");
-    chaos_memory_resolve_symbol(&g_chaos_memory_real_usleep, "usleep");
+    chaos_memory_resolve_symbol(&g_chaos_memory_real_posix_madvise, "posix_madvise");
+}
 
+void chaos_memory_ensure_symbols(void)
+{
+    (void)chaos_once(&g_chaos_memory_symbols_once, chaos_memory_resolve_all_symbols);
+}
+
+/**
+ * @brief Library constructor.
+ *
+ * @details Runs once per process image, with default priority, in the order the
+ * dynamic linker runs initialisers (wrappers may have run before; see the file
+ * header). Steps:
+ *  1. Resolve the real functions (no-op if a wrapper already did).
+ *  2. Read the process seed from /dev/urandom and seed the main thread's PRNG.
+ *  3. Reset the rule state (both snapshots empty, stamp UNKNOWN), register the
+ *     fork child handler and find the vDSO clock.
+ *  4. Load the rule file now, so the status file reports a bad file at start-up.
+ *
+ * `static`: kept out of the dynamic symbol table; the attribute alone makes the
+ * linker call it.
+ */
+CHAOS_MEMORY_CONSTRUCTOR
+static void chaos_memory_init(void)
+{
+    chaos_memory_ensure_symbols();
     g_chaos_memory_process_seed = chaos_memory_read_seed_material();
     chaos_memory_prng_seed_thread(g_chaos_memory_process_seed);
     chaos_memory_config_init();
+    /* Load the rules now so a bad rule file is reported at start-up. */
+    (void)chaos_memory_config_prepare();
 }

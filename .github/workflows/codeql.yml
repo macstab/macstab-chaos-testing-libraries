@@ -1,3 +1,7 @@
+# CodeQL security-and-quality analysis of the C sources, on every branch push and weekly
+# (Monday 06:00 UTC) so that new queries reach unchanged code. CodeQL traces the compiler calls
+# of `make native`, so only code compiled into the six libraries is analysed; chaos-init and the
+# tests are not built here. Results go to the repository's code-scanning alerts.
 name: codeql
 
 on:
@@ -10,10 +14,12 @@ permissions:
   contents: read
   security-events: write
 
+# A newer push to the same ref supersedes the running analysis.
 concurrency:
   group: codeql-${{ github.ref }}
   cancel-in-progress: true
 
+# Runs JavaScript actions on Node 24 ahead of GitHub's default switch.
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 

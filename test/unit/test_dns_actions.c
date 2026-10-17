@@ -1,49 +1,35 @@
 /**
  * @file test_dns_actions.c
- * @brief Unit tests for DNS-domain probability, GAI error injection, latency, result-list
- *   filtering, limiting, and shuffling helpers.
+ * @brief Unit tests for the libchaos-dns effect helpers: probability, rule firing, GAI,
+ *   LATENCY, and the FILTER_FAMILY / SHUFFLE / LIMIT result-list transforms.
  *
- * Subsystem under test: `src/dns/chaos_dns_actions.c`
+ * @details
+ * Unit under test: `src/dns/chaos_dns_actions.c`, compiled into this file together with
+ * `src/dns/chaos_dns_owned.c`. The suite proves:
+ * - probability: 0.0 never hits, 1.0 always hits, and 0.5 maps the 32-bit sample space at
+ *   2^31 (sample 0 hits, UINT32_MAX misses);
+ * - firing: `chaos_dns_rule_should_trigger()` applies the `@from`/`@until` window, the `@size`
+ *   gate, probability and `@first=N` in that order, and counts a hit only when the effect
+ *   fires; a GAI rule writes its `gai_error` only when it fires, other effects never do;
+ * - transforms: FILTER_FAMILY and LIMIT release exactly the dropped nodes through the real
+ *   freeaddrinfo, SHUFFLE never loses a node, and all three keep `ai_canonname` on the head
+ *   (where the C libraries put it and where callers read it);
+ * - ownership: nodes of a list libchaos-dns built itself (OVERRIDE, see `chaos_dns_owned.h`)
+ *   are only unlinked, never passed to the real freeaddrinfo; with no real freeaddrinfo
+ *   resolved, dropped nodes are unlinked and leaked rather than freed by the wrong allocator;
+ * - SHUFFLE fails open: when its temporary pointer array cannot be allocated the list is
+ *   returned unchanged.
  *
- * Coverage approach:
- * - The production source file is included directly after replacing `calloc` with a test-local
- *   stub controlled by `g_force_calloc_fail`. This lets tests exercise the graceful-fallback
- *   path in `chaos_dns_shuffle_result_list` when temporary memory allocation fails, without
- *   system-level memory pressure.
- * - `CHAOS_DNS_DEFINE_TEST_GLOBALS()` instantiates all real-function-pointer globals required
- *   by the production action helpers.
- * - `chaos_dns_test_freeaddrinfo` is the test-local freeaddrinfo that actually releases the
- *   memory allocated by `make_result_node`. It is assigned to
- *   `g_chaos_dns_real_freeaddrinfo` in `reset_actions_state()` so the production
- *   `chaos_dns_call_real_freeaddrinfo` dispatches through it correctly.
- * - `make_result_node(family, canonname)` constructs a single `addrinfo` node with a real
- *   `sockaddr_in` or `sockaddr_in6` and an optional `canonname` copy, suitable for use
- *   in linked-list operations.
+ * Seams:
+ * - `calloc` is macro-redirected to `chaos_dns_test_calloc()` for the actions source only, so
+ *   `g_force_calloc_fail` fails SHUFFLE's scratch allocation without real memory pressure.
+ * - `CHAOS_DNS_DEFINE_TEST_GLOBALS()` defines the real-function pointers and TLS state the
+ *   source links against; `reset_actions_state()` installs `chaos_dns_test_freeaddrinfo()` as
+ *   the real freeaddrinfo, which frees `make_result_node()` lists and counts every node.
+ * - The PRNG state `g_chaos_dns_tls_prng_state` is set directly where order matters.
  *
- * Properties under test:
- * - Probability helpers: `chaos_dns_probability_hit_sample` at 0.0, 1.0, 0.5 boundary
- *   samples (0 and UINT32_MAX); `chaos_dns_probability_hit` at 0.0 and 1.0.
- * - GAI injection: `chaos_dns_rule_apply_gai` with probability=1.0 sets the output error
- *   and returns true; probability=0.0 does not apply; NULL rule or NULL output → false.
- * - `chaos_dns_rule_should_trigger`: NULL → false; GAI effect with probability=1.0 → true.
- * - Latency helper: a rule with LATENCY effect and `latency_ms=1` causes real sleep (not
- *   asserted on duration, just verifies no crash); REWRITE effect ignores the call.
- * - `chaos_dns_result_count(NULL)` → 0; `chaos_dns_call_real_freeaddrinfo(NULL)` is a no-op.
- * - Filter: `CHAOS_DNS_FAMILY_INET4` removes AF_INET6 nodes and keeps AF_INET nodes; the
- *   freed node count tracked via `g_freeaddrinfo_calls` is correct; NULL result-list pointer
- *   → false; empty list → false; `FAMILY_ANY` is a no-op (→ false).
- * - Filter with IPv6-first list: head node is AF_INET6, second is AF_INET; after filtering
- *   for INET4 the head becomes the AF_INET node.
- * - Limit: `limit(&head, 1)` frees the tail node; `limit(&head, 0)` frees all remaining
- *   nodes (head becomes NULL).
- * - Shuffle: 3-node list with a seeded PRNG retains all 3 nodes (count invariant);
- *   single-node list is unaffected; NULL and empty-list arguments are safe; calloc failure
- *   leaves the list intact (2 nodes remain); `limit` after shuffle produces expected count.
- *
- * What is NOT tested here:
- * - DNS wrapper call paths (tested in `test_chaos_dns.c`).
- * - Config file parsing and rule selection (tested in `test_dns_config.c`).
- * - Constructor initialisation and symbol resolution (tested in `test_dns_runtime.c`).
+ * Out of scope: the interposed entry points (`test_chaos_dns.c`), rule parsing and matching
+ * (`test_dns_config.c`), and symbol resolution / constructor behaviour (`test_dns_runtime.c`).
  */
 
 #include "../support/test_dns_support.h"
@@ -52,32 +38,22 @@
 
 CHAOS_DNS_DEFINE_TEST_GLOBALS();
 
-/**
- * @brief When non-zero, the `chaos_dns_test_calloc` stub returns NULL unconditionally.
- *
- * Set to 1 before calling `chaos_dns_shuffle_result_list` to exercise the allocation-failure
- * fallback path (shuffle aborts gracefully, leaving the list unchanged).
- */
+/** @brief Non-zero makes every `calloc()` inside the actions source return NULL. */
 static int g_force_calloc_fail = 0;
 
 /**
- * @brief Number of times `chaos_dns_test_freeaddrinfo` has been called since the last reset.
+ * @brief Nodes released through `chaos_dns_test_freeaddrinfo()` since the last reset.
  *
- * Incremented once per node freed. Used to assert that filter and limit operations release
- * exactly the expected number of nodes.
+ * Counts nodes, not calls: LIMIT frees its tail as one sub-list, FILTER_FAMILY frees each
+ * dropped node on its own, and both must add up to the number of nodes removed.
  */
 static int g_freeaddrinfo_calls = 0;
 
 /**
- * @brief Test-local calloc stub gated by `g_force_calloc_fail`.
+ * @brief `calloc()` replacement for the actions source; NULL while `g_force_calloc_fail` is set.
  *
- * Returns NULL when `g_force_calloc_fail` is non-zero; otherwise delegates to the real
- * `calloc`. Replaces `calloc` inside the production actions source to intercept the temporary
- * array allocation used by `chaos_dns_shuffle_result_list`.
- *
- * @param count  Number of elements.
- * @param size   Size of each element.
- * @return NULL when forced to fail; real calloc result otherwise.
+ * The only `calloc()` in that source is SHUFFLE's pointer array, so this fails exactly that
+ * allocation. Test code below the `#undef` uses the real `calloc()`.
  */
 static void *chaos_dns_test_calloc(size_t count, size_t size)
 {
@@ -89,13 +65,14 @@ static void *chaos_dns_test_calloc(size_t count, size_t size)
 }
 
 /**
- * @brief Test-local freeaddrinfo that walks the linked list and frees each node's memory.
+ * @brief Stand-in for the real freeaddrinfo: frees a `make_result_node()` list node by node.
  *
- * Increments `g_freeaddrinfo_calls` for each node freed. Releases `ai_addr`, `ai_canonname`,
- * and the node itself in that order. Assigned to `g_chaos_dns_real_freeaddrinfo` by
- * `reset_actions_state()` so production code dispatches through this function.
+ * Frees `ai_addr`, `ai_canonname` and the node, and counts each node in
+ * `g_freeaddrinfo_calls`. Freeing `ai_canonname` per node means a name duplicated onto two
+ * nodes would be a double free under ASan, so it also checks that the transforms move the name
+ * instead of copying it.
  *
- * @param result  Head of the addrinfo linked list; may be NULL.
+ * @param result  Head of the list; NULL is a no-op.
  */
 static void chaos_dns_test_freeaddrinfo(struct addrinfo *result)
 {
@@ -114,18 +91,14 @@ static void chaos_dns_test_freeaddrinfo(struct addrinfo *result)
 #define calloc chaos_dns_test_calloc
 #include "../../src/dns/chaos_dns_actions.c"
 #undef calloc
+#include "../../src/dns/chaos_dns_owned.c"
 
 /**
- * @brief Allocate a single addrinfo node with a real sockaddr and optional canonname.
+ * @brief Heap-allocates one unlinked addrinfo node shaped like a C library result.
  *
- * For `AF_INET`, allocates and initialises a `sockaddr_in`; for any other family (treated as
- * IPv6), allocates a `sockaddr_in6`. If `canonname` is non-NULL, a `strdup` copy is stored
- * in `ai_canonname`. The caller is responsible for freeing the returned node via
- * `chaos_dns_test_freeaddrinfo`.
- *
- * @param family    Address family; `AF_INET` for IPv4, anything else for IPv6.
- * @param canonname Optional canonical name string; NULL if not needed.
- * @return Newly allocated addrinfo node; aborts on allocation failure.
+ * @param family     `AF_INET` gets a `sockaddr_in`; any other value an AF_INET6 `sockaddr_in6`.
+ * @param canonname  Duplicated into `ai_canonname`; NULL leaves it NULL.
+ * @return The node; asserts on allocation failure. Release with chaos_dns_test_freeaddrinfo().
  */
 static struct addrinfo *make_result_node(int family, const char *canonname)
 {
@@ -161,11 +134,8 @@ static struct addrinfo *make_result_node(int family, const char *canonname)
 }
 
 /**
- * @brief Reset all per-test action state to well-known defaults.
- *
- * Calls `chaos_dns_test_reset_runtime()` to zero the PRNG and real-function-pointer globals,
- * installs `chaos_dns_test_freeaddrinfo` as the active freeaddrinfo implementation, and
- * clears `g_force_calloc_fail` and `g_freeaddrinfo_calls`.
+ * @brief Clears real-function pointers and PRNG state, then installs the counting freeaddrinfo
+ *   and clears the calloc failure flag and node counter.
  */
 static void reset_actions_state(void)
 {
@@ -176,21 +146,14 @@ static void reset_actions_state(void)
 }
 
 /**
- * @brief Invariant: probability sampling and GAI injection helpers produce correct
- *   outcomes at boundary values and respect NULL guards.
+ * @brief Proves the probability boundaries and that a GAI rule reports its error only when it
+ *   fires.
  *
- * Triggering condition: `chaos_dns_probability_hit_sample` with p=0.0/1.0/0.5 and
- *   sample=0/UINT32_MAX; `chaos_dns_probability_hit` with p=0.0/1.0; a rule with
- *   GAI effect and probability=1.0; and then with probability=0.0.
- *
- * Expected observable behaviour:
- * - `probability_hit_sample(0.0, 0)` → false; `(1.0, 0)` → true.
- * - `probability_hit_sample(0.5, 0)` → true (sample < threshold); `(0.5, UINT32_MAX)` → false.
- * - `probability_hit(0.0)` → false; `probability_hit(1.0)` → true.
- * - GAI rule with probability=1.0: `should_trigger` → true; `apply_gai` sets output to
- *   `EAI_AGAIN` and returns true.
- * - GAI rule with probability=0.0: `apply_gai` returns false and does not modify the output.
- * - NULL rule or NULL output pointer: `apply_gai` and `should_trigger` return false.
+ * @details `hit_sample(p, s)` hits when `s < p * 2^32`; 0.0 and 1.0 short-circuit so no sample
+ * can turn them into the opposite outcome. A GAI rule at 1.0 writes `EAI_AGAIN` and returns 1;
+ * at 0.0, with a NULL rule or a NULL output it returns 0. A LATENCY rule at 1.0 returns 0 and
+ * leaves the output untouched, so the getaddrinfo wrapper cannot fail a call through a rule of
+ * the wrong effect.
  */
 static void test_probability_and_gai_helpers(void)
 {
@@ -218,20 +181,21 @@ static void test_probability_and_gai_helpers(void)
     assert(!chaos_dns_rule_apply_gai(NULL, &gai_error));
     assert(!chaos_dns_rule_apply_gai(&rule, NULL));
     assert(!chaos_dns_rule_should_trigger(NULL));
+
+    /* Effect is checked before probability: a firing LATENCY rule must not write an error. */
+    gai_error = 0;
+    rule.probability = 1.0;
+    rule.effect = CHAOS_DNS_EFFECT_LATENCY;
+    assert(!chaos_dns_rule_apply_gai(&rule, &gai_error));
+    assert(gai_error == 0);
 }
 
 /**
- * @brief Invariant: latency application and result counting helpers handle edge cases safely.
+ * @brief Proves the LATENCY, count and free helpers accept degenerate input.
  *
- * Triggering condition: `chaos_dns_rule_apply_latency` with a LATENCY rule and with a
- *   REWRITE rule; `chaos_dns_result_count(NULL)`; `chaos_dns_call_real_freeaddrinfo(NULL)`.
- *
- * Expected observable behaviour:
- * - A LATENCY rule with `latency_ms=1` completes without crashing (real nanosleep is invoked;
- *   no duration assertion is made in this test).
- * - A REWRITE rule passed to `apply_latency` is silently ignored (effect mismatch).
- * - `chaos_dns_result_count(NULL)` → 0.
- * - `chaos_dns_call_real_freeaddrinfo(NULL)` is a no-op (no crash, no freeaddrinfo call).
+ * @details A LATENCY rule of 1 ms sleeps for real through `chaos_sleep_ms()` (the duration is
+ * not asserted here); a REWRITE rule passed to the latency helper returns without sleeping.
+ * An empty list counts 0 nodes, and freeing NULL never reaches the real freeaddrinfo.
  */
 static void test_latency_and_count_helpers(void)
 {
@@ -249,25 +213,13 @@ static void test_latency_and_count_helpers(void)
 }
 
 /**
- * @brief Invariant: filter and limit operations remove exactly the expected nodes and
- *   update the list correctly.
+ * @brief Proves FILTER_FAMILY and LIMIT relink the list and free exactly the removed nodes.
  *
- * Triggering condition: a 3-node list (AF_INET, AF_INET6, AF_INET) filtered for INET4,
- *   then limited to 1 node, then limited to 0 nodes; followed by a 2-node list with
- *   AF_INET6 as head filtered for INET4.
- *
- * Expected observable behaviour:
- * - Filtering for INET4: the AF_INET6 node is freed (`g_freeaddrinfo_calls == 1`); the
- *   resulting list has 2 AF_INET nodes; head and head->ai_next are both AF_INET;
- *   head->ai_next->ai_next is NULL.
- * - `limit(&head, 1)`: the second node is freed (`g_freeaddrinfo_calls == 2`); head->ai_next
- *   is NULL.
- * - `limit(&head, 0)`: the remaining node is freed (`g_freeaddrinfo_calls == 3`);
- *   head becomes NULL.
- * - `filter_result_list(NULL, ...)` → false; filter on an already-NULL list → false;
- *   `FAMILY_ANY` on a NULL list → false (no-op).
- * - Filtering an IPv6-first 2-node list for INET4: the AF_INET6 head is removed and the
- *   remaining head is AF_INET (relink across the former head).
+ * @details {v4, v6, v4} filtered to INET4 frees the middle node (relink across an interior
+ * node); LIMIT 1 then frees the tail and LIMIT 0 frees the rest, leaving the head NULL. The
+ * node counter checks every step. FILTER_FAMILY returns 0 for a NULL list pointer, an empty
+ * list and ANY. Finally {v6, v4} filtered to INET4 drops the head, proving `*result` is
+ * updated when the first node goes.
  */
 static void test_filter_and_limit_helpers(void)
 {
@@ -308,23 +260,13 @@ static void test_filter_and_limit_helpers(void)
 }
 
 /**
- * @brief Invariant: shuffle preserves node count, handles degenerate inputs safely, and
- *   falls back gracefully when the temporary allocation fails.
+ * @brief Proves SHUFFLE never loses or duplicates a node and fails open.
  *
- * Triggering condition: a 3-node list shuffled with a seeded PRNG; a single-node list;
- *   NULL and empty-list arguments; `g_force_calloc_fail = 1` with a 2-node list; a 3-node
- *   list followed by `chaos_dns_limit_result_list`.
- *
- * Expected observable behaviour:
- * - 3-node list with `g_chaos_dns_tls_prng_state = 1`: after shuffle,
- *   `chaos_dns_result_count(head) == 3` (nodes rearranged but none lost).
- * - Single-node list: count remains 1 after shuffle.
- * - `chaos_dns_shuffle_result_list(NULL)` is a no-op.
- * - Passing a pointer to a NULL head is a no-op.
- * - When `g_force_calloc_fail = 1` (temporary array cannot be allocated), a 2-node list
- *   is left untouched: count remains 2.
- * - 3-node list → `limit(&head, 2)` → count 2, with head and head->ai_next non-NULL
- *   and head->ai_next->ai_next NULL.
+ * @details A seeded 3-node shuffle still holds 3 nodes, and freeing them node by node under
+ * ASan proves none is linked twice. A 1-node list, a NULL list pointer and an empty list are
+ * left alone (fewer than 2 nodes allocate nothing). With the pointer-array allocation failed,
+ * a 2-node list comes back intact instead of half relinked. LIMIT 2 on 3 nodes keeps
+ * exactly two.
  */
 static void test_shuffle_helper(void)
 {
@@ -366,11 +308,206 @@ static void test_shuffle_helper(void)
     chaos_dns_test_freeaddrinfo(head);
 }
 
+/**
+ * @brief Proves a hit is counted only when the effect fires.
+ *
+ * @details The hits file must report firings, not evaluations: probability 1.0 fires and
+ * counts 1, probability 0.0 neither fires nor counts. A rule with no hit slot (a copy made
+ * outside a rule snapshot) still fires.
+ */
+static void test_should_trigger_counts_hits(void)
+{
+    chaos_dns_rule_t rule;
+    chaos_hit_slot_t slot;
+
+    memset(&rule, 0, sizeof(rule));
+    memset(&slot, 0, sizeof(slot));
+    rule.effect = CHAOS_DNS_EFFECT_GAI;
+    rule.hit = &slot;
+    rule.probability = 1.0;
+    assert(chaos_dns_rule_should_trigger(&rule) == 1);
+    assert(slot.count == 1U);
+    rule.probability = 0.0;
+    assert(chaos_dns_rule_should_trigger(&rule) == 0);
+    assert(slot.count == 1U);
+    rule.hit = NULL;
+    rule.probability = 1.0;
+    assert(chaos_dns_rule_should_trigger(&rule) == 1);
+}
+
+/**
+ * @brief Proves `chaos_dns_rule_should_trigger()` applies `@first`, `@from`/`@until` and
+ *   `@size`.
+ *
+ * @details `@first=2` fires twice, then stops, and the hit count stays 2. The window is
+ * compared with the wall clock in Unix ms: `@until=1` has passed, `@from=4000000000000`
+ * (year 2096) has not started, and `@from=1` is open. `@size>100` rejects a call without a
+ * byte count (`CHAOS_POLICY_NO_SIZE`) and a call of exactly 100 bytes (strict bound), passes
+ * 101, and `@size<101` added on top rejects 101 again.
+ */
+static void test_should_trigger_honours_qualifiers(void)
+{
+    chaos_dns_rule_t rule;
+    chaos_hit_slot_t slot;
+
+    memset(&rule, 0, sizeof(rule));
+    memset(&slot, 0, sizeof(slot));
+    rule.effect = CHAOS_DNS_EFFECT_GAI;
+    rule.hit = &slot;
+    rule.probability = 1.0;
+    rule.policy.first = 2U;
+    assert(chaos_dns_rule_should_trigger(&rule) == 1);
+    assert(chaos_dns_rule_should_trigger(&rule) == 1);
+    assert(chaos_dns_rule_should_trigger(&rule) == 0);
+    assert(slot.count == 2U);
+
+    memset(&rule.policy, 0, sizeof(rule.policy));
+    rule.policy.until_ms = 1;
+    assert(chaos_dns_rule_should_trigger(&rule) == 0);
+    rule.policy.until_ms = 0;
+    rule.policy.from_ms = INT64_C(4000000000000);
+    assert(chaos_dns_rule_should_trigger(&rule) == 0);
+    rule.policy.from_ms = 1;
+    assert(chaos_dns_rule_should_trigger(&rule) == 1);
+
+    memset(&rule.policy, 0, sizeof(rule.policy));
+    rule.policy.has_size_above = 1U;
+    rule.policy.size_above = 100U;
+    rule.call_size = CHAOS_POLICY_NO_SIZE;
+    assert(chaos_dns_rule_should_trigger(&rule) == 0);
+    rule.call_size = 100U;
+    assert(chaos_dns_rule_should_trigger(&rule) == 0);
+    rule.call_size = 101U;
+    assert(chaos_dns_rule_should_trigger(&rule) == 1);
+    rule.policy.has_size_below = 1U;
+    rule.policy.size_below = 101U;
+    assert(chaos_dns_rule_should_trigger(&rule) == 0);
+}
+
+/**
+ * @brief Proves `ai_canonname` stays on the head through every transform, and that nodes of
+ *   an OVERRIDE list are never freed individually.
+ *
+ * @details Callers read the canonical name from the first node only. FILTER_FAMILY dropping
+ * the named head hands the name to the next node; 20 shuffles keep it on whichever node ends
+ * up first. When FILTER_FAMILY drops every node the name travels to the last one and is freed
+ * with it (2 nodes freed, no leak). For a `chaos_dns_owned_copy()` list FILTER_FAMILY and
+ * LIMIT only unlink: freeing one node of that single allocation would corrupt the heap, so the
+ * counter stays 0 and the block is released whole by chaos_dns_owned_free().
+ */
+static void test_canonname_and_owned_lists(void)
+{
+    struct addrinfo *head;
+    struct addrinfo *parts[1];
+    struct addrinfo *owned;
+    int index;
+
+    reset_actions_state();
+    head = make_result_node(AF_INET6, "canon");
+    head->ai_next = make_result_node(AF_INET, NULL);
+    head->ai_next->ai_next = make_result_node(AF_INET6, NULL);
+    head->ai_next->ai_next->ai_next = make_result_node(AF_INET, NULL);
+    assert(chaos_dns_filter_result_list(&head, CHAOS_DNS_FAMILY_INET4));
+    assert(head->ai_canonname != NULL && strcmp(head->ai_canonname, "canon") == 0);
+    assert(head->ai_next->ai_canonname == NULL);
+
+    for (index = 0; index < 20; ++index)
+    {
+        chaos_dns_shuffle_result_list(&head);
+        assert(head->ai_canonname != NULL && head->ai_next->ai_canonname == NULL);
+    }
+    chaos_dns_test_freeaddrinfo(head);
+
+    g_freeaddrinfo_calls = 0;
+    head = make_result_node(AF_INET6, "gone");
+    head->ai_next = make_result_node(AF_INET6, NULL);
+    assert(!chaos_dns_filter_result_list(&head, CHAOS_DNS_FAMILY_INET4));
+    assert(head == NULL && g_freeaddrinfo_calls == 2);
+
+    reset_actions_state();
+    parts[0] = make_result_node(AF_INET, NULL);
+    parts[0]->ai_next = make_result_node(AF_INET6, NULL);
+    parts[0]->ai_next->ai_next = make_result_node(AF_INET, NULL);
+    owned = chaos_dns_owned_copy(parts, 1U, "name");
+    chaos_dns_test_freeaddrinfo(parts[0]);
+    g_freeaddrinfo_calls = 0;
+    head = owned;
+    assert(chaos_dns_filter_result_list(&head, CHAOS_DNS_FAMILY_INET4));
+    chaos_dns_limit_result_list(&head, 1U);
+    assert(head == owned && head->ai_next == NULL && g_freeaddrinfo_calls == 0);
+    assert(chaos_dns_owned_free(head) == 1);
+}
+
+/**
+ * @brief Proves the FILTER_FAMILY and LIMIT edge cases, including a missing real
+ *   freeaddrinfo.
+ *
+ * @details
+ * - {v4, v6, v4} filtered to INET6 leaves {v6}, frees 2 nodes, and the head's name "v4" has
+ *   moved onto the surviving v6 node.
+ * - ANY on a non-empty list returns 0 and frees nothing.
+ * - LIMIT 5 on 2 nodes changes nothing; LIMIT with a NULL list pointer or an empty list, with
+ *   limit 0 or 1, frees nothing.
+ * - With `g_chaos_dns_real_freeaddrinfo` NULL (symbol not yet resolved) a dropped node is
+ *   unlinked, its `ai_next` cleared, and not freed: leaking is preferred over calling into an
+ *   unresolved symbol or another allocator.
+ * - The latency helper accepts NULL.
+ */
+static void test_filter_and_limit_edges(void)
+{
+    struct addrinfo *head;
+    struct addrinfo *dropped;
+
+    reset_actions_state();
+    head = make_result_node(AF_INET, "v4");
+    head->ai_next = make_result_node(AF_INET6, NULL);
+    head->ai_next->ai_next = make_result_node(AF_INET, NULL);
+    assert(chaos_dns_filter_result_list(&head, CHAOS_DNS_FAMILY_INET6));
+    assert(head != NULL && head->ai_family == AF_INET6 && head->ai_next == NULL);
+    assert(head->ai_canonname != NULL && strcmp(head->ai_canonname, "v4") == 0);
+    assert(g_freeaddrinfo_calls == 2);
+
+    head->ai_next = make_result_node(AF_INET, NULL);
+    assert(!chaos_dns_filter_result_list(&head, CHAOS_DNS_FAMILY_ANY));
+    assert(chaos_dns_result_count(head) == 2U);
+    assert(g_freeaddrinfo_calls == 2);
+
+    chaos_dns_limit_result_list(&head, 5U);
+    assert(chaos_dns_result_count(head) == 2U);
+    assert(g_freeaddrinfo_calls == 2);
+    chaos_dns_test_freeaddrinfo(head);
+
+    g_freeaddrinfo_calls = 0;
+    head = NULL;
+    chaos_dns_limit_result_list(NULL, 0U);
+    chaos_dns_limit_result_list(NULL, 1U);
+    chaos_dns_limit_result_list(&head, 0U);
+    chaos_dns_limit_result_list(&head, 1U);
+    assert(head == NULL && g_freeaddrinfo_calls == 0);
+
+    g_chaos_dns_real_freeaddrinfo = NULL;
+    head = make_result_node(AF_INET6, NULL);
+    dropped = head;
+    head->ai_next = make_result_node(AF_INET, NULL);
+    assert(chaos_dns_filter_result_list(&head, CHAOS_DNS_FAMILY_INET4));
+    assert(head != dropped && head->ai_family == AF_INET && head->ai_next == NULL);
+    assert(dropped->ai_next == NULL);
+    assert(g_freeaddrinfo_calls == 0);
+    chaos_dns_test_freeaddrinfo(dropped);
+    chaos_dns_test_freeaddrinfo(head);
+
+    chaos_dns_rule_apply_latency(NULL);
+}
+
 int main(void)
 {
+    test_canonname_and_owned_lists();
+    test_should_trigger_honours_qualifiers();
+    test_should_trigger_counts_hits();
     test_probability_and_gai_helpers();
     test_latency_and_count_helpers();
     test_filter_and_limit_helpers();
     test_shuffle_helper();
+    test_filter_and_limit_edges();
     return 0;
 }

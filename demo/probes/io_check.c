@@ -1,5 +1,8 @@
-/* io use-case 2 — write a record, fsync, read it back N times, verify a checksum.
- * With /data:read:CORRUPT:p a bit is flipped in the returned buffer → mismatch. */
+/* Demo io2: writes a 4 KiB record to /data/record.bin, fsyncs it, then reads it back 20
+ * times and compares an FNV-1a hash per read. Under libchaos-io with `/data:read:CORRUPT:0.5`
+ * each read has a 50 % chance of one flipped bit in the returned buffer (the file is
+ * untouched), reported as CHECKSUM MISMATCH: silent corruption that only an end-to-end
+ * checksum catches. Exit code is 0 either way; the output is the result. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,7 +10,7 @@
 #include <unistd.h>
 
 static unsigned long sum(const unsigned char *b, int n) {
-    unsigned long s = 1469598103934665603UL;           /* FNV-1a */
+    unsigned long s = 1469598103934665603UL;           /* FNV-1a 64-bit offset basis */
     for (int i = 0; i < n; i++) { s ^= b[i]; s *= 1099511628211UL; }
     return s;
 }
@@ -32,5 +35,5 @@ int main(void) {
         if (!ok) mismatch = 1;
     }
     close(fd);
-    return mismatch ? 0 : 0;   /* both outcomes are informative; exit 0 either way */
+    return mismatch ? 0 : 0;   /* both outcomes are reported on stdout; exit 0 either way */
 }

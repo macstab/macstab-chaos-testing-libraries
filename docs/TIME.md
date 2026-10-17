@@ -14,17 +14,26 @@
 
 ---
 
-`libchaos-time` is the dedicated clock/sleep preload library in this repository.
-Repository-wide ownership and composition rules live in [`docs/SYSTEM.md`](SYSTEM.md).
-Platform-layer internals (vDSO dispatch per arch, PLT/GOT cold/hot paths) are in
-[`docs/PLATFORM.md`](PLATFORM.md). The vDSO dispatch sequence diagram and per-arch
-kernel source table are embedded inline in §2 of this document.
+`libchaos-time` is the LD_PRELOAD library that fails, delays and shifts the clock reads
+and sleeps of a dynamically linked process. It changes what the process observes at the
+libc boundary; it never changes a kernel clock, the vDSO data page or another process.
+Repository-wide ownership and composition rules are in [`docs/SYSTEM.md`](SYSTEM.md);
+loader-level internals (link map, PLT/GOT, `dlsym(RTLD_NEXT)`, vDSO symbol tables) are
+in [`docs/PLATFORM.md`](PLATFORM.md).
 
-Current implementation status:
+| | |
+|---|---|
+| Wrappers | `clock_gettime()`, `gettimeofday()`, `time()`, `timespec_get()`, `nanosleep()`, `clock_nanosleep()`, `sleep()`, `usleep()` |
+| Selectors | `*`, `clock_gettime`, `clock_gettime/<clock>`, `nanosleep`, `usleep` |
+| Effects | ERRNO, LATENCY, OFFSET, REGRESS |
+| Qualifiers | `@first`, `@from`, `@until`, `@size` (accepted; `@size` never matches, §8.4) |
+| Rule file | `/tmp/.chaos-time.conf` |
+| Status file | `/tmp/.chaos-time.status` |
+| Hits file | `/tmp/.chaos-time.hits.<n>` |
+| Verification | unit tests with a 100.00 % line-coverage gate on `src/time/*.c`; runtime suites `test/runtime/test_time_glibc.sh` and `test_time_alpine.sh` (glibc and musl, amd64 and arm64) |
 
-- interposed symbols: `clock_gettime()`, `nanosleep()`, `usleep()`
-- config path: `/tmp/.chaos-time.conf`
-- unit-tested; runtime probe for glibc/musl and amd64/arm64 validation
+SECCOMP mode (`chaos-init`) applies no time rules: clock reads go through the vDSO
+without a system call ([SECCOMP.md §6](SECCOMP.md#6-not-possible)).
 
 ---
 
@@ -32,150 +41,105 @@ Current implementation status:
 
 1. [Clock Taxonomy](#1-clock-taxonomy)
 2. [vDSO Offload Table per Architecture](#2-vdso-offload-table-per-architecture)
-3. [Hardware Clock Sources — TSC, CNTPCT_EL0, and Friends](#3-hardware-clock-sources--tsc-cntpct_el0-and-friends)
+3. [Hardware Clock Sources — TSC and CNTVCT_EL0](#3-hardware-clock-sources--tsc-and-cntvct_el0)
 4. [clock_gettime Selector Grammar](#4-clock_gettime-selector-grammar)
-5. [OFFSET Effect — Monotonicity Implications](#5-offset-effect--monotonicity-implications)
-6. [nanosleep — POSIX Cancellation Contract](#6-nanosleep--posix-cancellation-contract)
+5. [OFFSET and REGRESS — Monotonicity Implications](#5-offset-and-regress--monotonicity-implications)
+6. [nanosleep — EINTR and Cancellation Contract](#6-nanosleep--eintr-and-cancellation-contract)
 7. [usleep — Surface and Constraints](#7-usleep--surface-and-constraints)
 8. [DSL Grammar and Rule Semantics](#8-dsl-grammar-and-rule-semantics)
 9. [Per-Hook Call Flows](#9-per-hook-call-flows)
 10. [Bypass Surfaces — When the Wrapper Is Not Invoked](#10-bypass-surfaces--when-the-wrapper-is-not-invoked)
-11. [Non-Coverage: clock_nanosleep](#11-non-coverage-clock_nanosleep)
-12. [Non-Coverage: gettimeofday](#12-non-coverage-gettimeofday)
-13. [Non-Coverage: sleep and alarm](#13-non-coverage-sleep-and-alarm)
+11. [clock_nanosleep and Absolute Deadlines](#11-clock_nanosleep-and-absolute-deadlines)
+12. [gettimeofday, time and timespec_get](#12-gettimeofday-time-and-timespec_get)
+13. [sleep and alarm](#13-sleep-and-alarm)
 14. [Non-Coverage: setitimer and POSIX Timer APIs](#14-non-coverage-setitimer-and-posix-timer-apis)
-15. [Non-Coverage: Futex Timeout Paths](#15-non-coverage-futex-timeout-paths)
+15. [Limit: Futex Timeouts Under a Shifted Clock](#15-limit-futex-timeouts-under-a-shifted-clock)
 16. [Non-Coverage: timerfd](#16-non-coverage-timerfd)
 17. [Reentrancy Guard and TLS State](#17-reentrancy-guard-and-tls-state)
 18. [PRNG Model](#18-prng-model)
 19. [Config Reload Protocol](#19-config-reload-protocol)
 20. [glibc vs musl Divergence](#20-glibc-vs-musl-divergence)
-21. [Execution Boundary Summary](#21-execution-boundary-summary)
+21. [Execution Boundary Summary and Limits](#21-execution-boundary-summary-and-limits)
 
 ---
 
 ## 1. Clock Taxonomy
 
-POSIX.1-2017 and the Linux kernel define a set of clock IDs that `clock_gettime`
-accepts. Each has distinct semantic guarantees, hardware backing, and
-vDSO-offload status.
+The clock a rule targets decides which program behaviour it exercises. Every clock ID
+below is accepted by `clock_gettime()`; nine of them have a selector name (§4.1), any
+other is addressed by number.
 
 ### 1.1 POSIX-Mandatory Clocks
 
-| Clock ID                   | Value (x86_64) | Semantics                                                                                           |
-|----------------------------|----------------|-----------------------------------------------------------------------------------------------------|
-| `CLOCK_REALTIME`           | 0              | Wall-clock time. Adjustable by NTP, `settimeofday`, `clock_settime`. Can jump forward or backward.  |
-| `CLOCK_MONOTONIC`          | 1              | Monotonically increasing. Not adjustable. Stopped while system is suspended (no hibernation ticks). |
-| `CLOCK_PROCESS_CPUTIME_ID` | 2              | CPU time consumed by all threads in the calling process. Kernel-tracked.                            |
-| `CLOCK_THREAD_CPUTIME_ID`  | 3              | CPU time consumed by the calling thread only. Kernel-tracked.                                       |
+| Clock ID                   | Value | Semantics                                                                                 |
+|----------------------------|-------|-------------------------------------------------------------------------------------------|
+| `CLOCK_REALTIME`           | 0     | Wall clock. Set by `settimeofday`, `clock_settime`; stepped and slewed by NTP.            |
+| `CLOCK_MONOTONIC`          | 1     | Never set; slewed by NTP; does not advance while the system is suspended.                 |
+| `CLOCK_PROCESS_CPUTIME_ID` | 2     | CPU time of all threads of the calling process.                                           |
+| `CLOCK_THREAD_CPUTIME_ID`  | 3     | CPU time of the calling thread.                                                           |
 
 ### 1.2 Linux Extension Clocks
 
-| Clock ID                 | Value (x86_64) | Semantics                                                                                                                  |
-|--------------------------|----------------|----------------------------------------------------------------------------------------------------------------------------|
-| `CLOCK_MONOTONIC_RAW`    | 4              | Like CLOCK_MONOTONIC but not NTP-slewed. Reads TSC/CNTPCT directly. No adjtime() correction.                               |
-| `CLOCK_REALTIME_COARSE`  | 5              | Low-resolution REALTIME; updated once per jiffy (CONFIG_HZ ticks). Fast, not vDSO-precise.                                 |
-| `CLOCK_MONOTONIC_COARSE` | 6              | Low-resolution MONOTONIC; once per jiffy. Suitable for approximate intervals.                                              |
-| `CLOCK_BOOTTIME`         | 7              | Like CLOCK_MONOTONIC but includes time spent in suspend. Useful for elapsed-time across suspend.                           |
-| `CLOCK_REALTIME_ALARM`   | 8              | Like CLOCK_REALTIME; wakes system from suspend for `timer_settime`. Requires `CAP_WAKE_ALARM`.                             |
-| `CLOCK_BOOTTIME_ALARM`   | 9              | Like CLOCK_BOOTTIME; wakes system from suspend. Requires `CAP_WAKE_ALARM`.                                                 |
-| `CLOCK_TAI`              | 11             | International Atomic Time. No leap seconds. `CLOCK_REALTIME + tai_offset`. TAI offset updated by `adjtimex(ADJ_TAI, ...)`. |
-| `CLOCK_SGI_CYCLE`        | 10             | SGI MIPS cycle counter; not present on Linux mainline, historical artefact.                                                |
+| Clock ID                 | Value | Semantics                                                                       |
+|--------------------------|-------|---------------------------------------------------------------------------------|
+| `CLOCK_MONOTONIC_RAW`    | 4     | Like MONOTONIC, without NTP frequency correction.                               |
+| `CLOCK_REALTIME_COARSE`  | 5     | REALTIME at tick resolution (`CONFIG_HZ`); no counter read.                     |
+| `CLOCK_MONOTONIC_COARSE` | 6     | MONOTONIC at tick resolution.                                                   |
+| `CLOCK_BOOTTIME`         | 7     | Like MONOTONIC, but advances during suspend.                                    |
+| `CLOCK_REALTIME_ALARM`   | 8     | REALTIME; timers on it wake the system. Timers need `CAP_WAKE_ALARM`.           |
+| `CLOCK_BOOTTIME_ALARM`   | 9     | BOOTTIME; timers on it wake the system. Timers need `CAP_WAKE_ALARM`.           |
+| `CLOCK_SGI_CYCLE`        | 10    | Reserved; unused by mainline Linux.                                             |
+| `CLOCK_TAI`              | 11    | International Atomic Time: REALTIME plus the kernel's TAI offset (`adjtimex`).  |
 
-### 1.3 Semantic Distinctions for Injection
+### 1.3 Which Clock Exercises What
 
-**CLOCK_REALTIME vs CLOCK_MONOTONIC:** REALTIME is the clock used for wall-clock
-timestamps (log entries, SSL cert validation, JWT expiry). Injecting
-`clock_gettime/realtime:OFFSET:+86400000` advances the process's view of wall
-time by 24 hours, which exercises certificate expiry checks, token TTL logic, and
-scheduled-job timing without actually waiting.
-
-**CLOCK_MONOTONIC:** Used for interval measurement (latency timers, timeout
-calculations, backoff loops). Injecting `OFFSET` here breaks interval invariants
-— code that computes `delta = end - start` will see inflated deltas. Useful for
-timeout testing. But see §5: monotonicity is broken by positive offsets and
-definitionally violated by negative offsets.
-
-**CLOCK_MONOTONIC_RAW:** NTP-free; used in performance benchmarks and kernel
-subsystems that must not be affected by time-sync slews. Injecting OFFSET here
-affects benchmark-quality timing code.
-
-**CLOCK_PROCESS_CPUTIME_ID / CLOCK_THREAD_CPUTIME_ID:** Used by profilers and
-CPU-time budget tracking (watchdog threads). Not vDSO-offloaded on all arches;
-these always go through the kernel. Injecting ERRNO:EINVAL here tests budget-
-tracking error paths. OFFSET injection is valid but affects CPU profiler readings.
-
-**CLOCK_BOOTTIME:** Used by `systemd` unit start timing, `iproute2` statistics,
-and any code that needs elapsed time including suspend. Injection here can cause
-systemd unit timeout logic to fire prematurely.
-
-**CLOCK_TAI:** Used by financial systems, telecom (PTP/PPSAPI), and any
-application that needs UTC-without-leapseconds. TAI offset is typically 37 seconds
-ahead of UTC as of 2024. Injecting OFFSET on TAI moves both the TAI reading and
-the effective UTC-equivalent computation in the caller. TAI is rarely tested for
-resilience; this is an underutilised injection surface.
+- **REALTIME** carries every wall-clock decision: certificate and token expiry, cron-style
+  scheduling, log timestamps. `clock_gettime/realtime:OFFSET:86400000` moves the process
+  one day ahead without waiting. A realtime rule also governs `gettimeofday()`, `time()`
+  and `timespec_get(TIME_UTC)` (§12), so the process never sees two wall clocks.
+- **MONOTONIC** carries intervals: timeouts, backoff, rate limiters, latency histograms.
+  OFFSET and REGRESS here break the non-decreasing guarantee on purpose (§5).
+- **MONOTONIC_RAW** is read by benchmark and profiling code that must not see NTP slew.
+- **PROCESS/THREAD_CPUTIME_ID** feed CPU budgets and profilers; they are never served by
+  the vDSO (§2.1), but the wrapper sees them like any other `clock_gettime()` call.
+- **BOOTTIME** measures elapsed time across suspend.
+- **TAI** is read by PTP and timing-sensitive systems; the offset to UTC is 37 s since
+  2017. It is rarely exercised and easy to forget.
 
 ---
 
 ## 2. vDSO Offload Table per Architecture
 
-The vDSO (virtual Dynamic Shared Object) is a small kernel-mapped shared library
-exported via `AT_SYSINFO_EHDR` in the auxiliary vector. It provides user-space
-implementations of selected syscalls to avoid the ring-transition cost. The
-`clock_gettime` entry in the vDSO reads the `vvar` page (a read-only kernel-mapped
-page containing `struct vdso_data`) to compute the time without a syscall.
+The vDSO is a kernel-provided shared object, announced to every process through
+`AT_SYSINFO_EHDR` in the auxiliary vector. Its `clock_gettime` computes the time in user
+space from a kernel-maintained data page and a hardware counter, without a system call.
+`libchaos-time` sits in front of libc, so the vDSO is downstream of the wrapper (§2.2).
 
 ### 2.1 Per-Architecture vDSO Clock Support
 
-Source ground-truth: `include/vdso/datapage.h` (`struct vdso_data`, `VDSO_BASES`),
-`arch/<arch>/*/vgettimeofday.c` or `vclock_gettime.c` per arch, Linux 6.6 LTS.
+`libchaos-time` and `chaos-init` are built for x86_64 and aarch64 only; other
+architectures are outside the supported matrix and are not listed. Kernel sources:
+`lib/vdso/gettimeofday.c` (generic vDSO) plus the per-architecture files below.
 
-| Architecture | Kernel source file                                                              | Hardware counter                                                                               | Clocks in vDSO                                                                                     |
-|--------------|---------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------|
-| x86_64       | `arch/x86/entry/vdso/vclock_gettime.c`                                          | `VCLOCK_TSC` (`rdtsc`/`rdtscp`); `VCLOCK_PVCLOCK` (KVM/Xen PV); `VCLOCK_HVCLOCK` (Hyper-V)     | REALTIME, MONOTONIC, MONOTONIC_RAW, REALTIME_COARSE, MONOTONIC_COARSE, BOOTTIME, TAI               |
-| aarch64      | `arch/arm64/kernel/vdso/vgettimeofday.c`                                        | `isb; mrs x0, cntvct_el0` (virtual counter) or `cntpct_el0` (physical; kernel decides at boot) | REALTIME, MONOTONIC, MONOTONIC_RAW, REALTIME_COARSE, MONOTONIC_COARSE, BOOTTIME, TAI               |
-| i386         | `arch/x86/entry/vdso/vclock_gettime.c` (shared) + vsyscall legacy at 0xFFFFe000 | `VCLOCK_TSC`; vsyscall stub for compat                                                         | REALTIME, MONOTONIC (COARSE/BOOTTIME/TAI added Linux 4.13+)                                        |
-| arm (32-bit) | `arch/arm/vdso/vgettimeofday.c`                                                 | `CP15` generic timer or platform coprocessor (arch-dependent)                                  | REALTIME, MONOTONIC                                                                                |
-| riscv64      | `arch/riscv/kernel/vdso/vgettimeofday.c` (Linux 5.3+)                           | `rdtime` pseudo-instruction (reads `time` CSR; maps to M-mode/SBI timer)                       | REALTIME, MONOTONIC, MONOTONIC_RAW, REALTIME_COARSE, MONOTONIC_COARSE, BOOTTIME, TAI               |
-| mips         | `arch/mips/vdso/vgettimeofday.c`                                                | `mfc0 t0, $9` (CP0 Count register, MIPS32 R2+)                                                 | REALTIME, MONOTONIC, REALTIME_COARSE, MONOTONIC_COARSE (Linux 4.6+)                                |
-| powerpc64    | `arch/powerpc/kernel/vdso/gettimeofday.S`                                       | `mfspr rX, SPRN_TBRL` (time base lower)                                                        | REALTIME, MONOTONIC, MONOTONIC_RAW, REALTIME_COARSE, MONOTONIC_COARSE, BOOTTIME, TAI (Linux 5.11+) |
-| s390x        | `arch/s390/kernel/vdso64/clock_gettime.S`                                       | `STCKF` (store clock fast; TOD clock; ~1 ns resolution; available z9-109+)                     | REALTIME, MONOTONIC                                                                                |
+| Architecture | Kernel source file                       | vDSO symbol              | Hardware counter                                                                 | Clocks served by the vDSO                                                       |
+|--------------|------------------------------------------|--------------------------|----------------------------------------------------------------------------------|---------------------------------------------------------------------------------|
+| x86_64       | `arch/x86/entry/vdso/vclock_gettime.c`   | `__vdso_clock_gettime`   | TSC (`rdtsc`/`rdtscp`); paravirtual clocks under KVM (`pvclock`) and Hyper-V      | REALTIME, MONOTONIC, MONOTONIC_RAW, REALTIME_COARSE, MONOTONIC_COARSE, BOOTTIME, TAI |
+| aarch64      | `arch/arm64/kernel/vdso/vgettimeofday.c` | `__kernel_clock_gettime` | Generic Timer virtual counter `CNTVCT_EL0` (`isb; mrs`)                           | REALTIME, MONOTONIC, MONOTONIC_RAW, REALTIME_COARSE, MONOTONIC_COARSE, BOOTTIME, TAI |
 
-**`struct vdso_data` key fields** (`include/vdso/datapage.h`, Linux 5.6+):
-
-```c
-struct vdso_data {
-    u32  clock_mode;          /* VCLOCK_NONE/TSC/PVCLOCK/HVCLOCK/… */
-    u64  cycle_last;          /* last hardware counter snapshot */
-    u64  mask;                /* counter bitmask */
-    u32  mult;                /* NTP-adjusted ns multiplier */
-    u32  shift;               /* NTP-adjusted shift */
-    struct vdso_timestamp  basetime[VDSO_BASES]; /* per-clock base */
-    s32  tz_minuteswest;
-    s32  tz_dsttime;
-    u32  hrtimer_res;
-};
-```
-
-`VDSO_BASES` = `HRTIMER_BASE_TAI + 1` = 4 (Linux 5.6+). The COARSE clocks do not
-get their own `basetime` entry; they read the same `CS_HRES_COARSE` clocksource data
-but quantise to the jiffy boundary before returning. `PROCESS_CPUTIME_ID` and
-`THREAD_CPUTIME_ID` have **no** vDSO entry on any architecture — they always trap to
-`SYS_clock_gettime`.
-
-Clocks not in vDSO always go through the `SYS_clock_gettime` syscall regardless of
-vDSO availability.
+- `CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_THREAD_CPUTIME_ID` and the ALARM clocks are not
+  served by the vDSO on either architecture; libc issues `SYS_clock_gettime` for them.
+- The vDSO also falls back to the system call when the current clocksource cannot be
+  read from user space (for example an unstable TSC marked unusable by the kernel).
+- The same symbols are what `chaos_clock.h` resolves for the libraries' own throttle and
+  `@from`/`@until` clock (§19), so a time rule never moves another rule's clock.
 
 ### 2.2 Interposition and the vDSO
 
-`libchaos-time` intercepts the libc symbol `clock_gettime` via PLT interposition.
-glibc's `clock_gettime` wrapper internally calls `__vdso_clock_gettime` when the
-vDSO entry is available. Our interposition fires **before** glibc's wrapper, so
-the vDSO call is downstream of us — the OFFSET post-call mutation fires after the
-vDSO returns its answer to glibc, which returns to our wrapper.
-
-This is the key fact: our wrapper owns the result regardless of whether glibc used
-the vDSO internally. Full dispatch sequence ([source](diagrams/vdso.puml)):
+`libchaos-time` exports `clock_gettime`; with LD_PRELOAD the dynamic linker binds every
+PLT reference to it. The wrapper calls the real function (the libc definition found with
+`dlsym(RTLD_NEXT)`), and libc calls the vDSO. The wrapper therefore owns the result
+whether libc used the vDSO or the system call. Dispatch sequence
+([source](diagrams/vdso.puml)):
 
 ```plantuml
 @startuml vdso
@@ -217,668 +181,730 @@ else Passthrough to real
         Kernel --> Glibc: ts
     end
     Glibc   --> Wrapper : 0, ts
-    Wrapper ->  Wrapper : maybe OFFSET\n(post-call mutation)
+    Wrapper ->  Wrapper : maybe OFFSET / REGRESS\n(post-call mutation)
     Wrapper --> App     : 0, possibly-mutated ts
 end
 
 note across
-  Bypass cases — wrapper NOT invoked:
-  • Application calls syscall(SYS_clock_gettime, ...) directly
-    (Go runtime, hardened daemons, sanitizer interceptors).
-  • Application resolves __vdso_clock_gettime via getauxval(AT_SYSINFO_EHDR)
-    and calls it directly (vanishingly rare in user code).
-  • Statically-linked binary (no dynamic loader → no LD_PRELOAD).
+  Bypass cases — wrapper NOT invoked (§10):
+  • Code issues syscall(SYS_clock_gettime, ...) itself.
+  • Code resolves the vDSO symbol via getauxval(AT_SYSINFO_EHDR)
+    and calls it directly (the Go runtime does).
+  • Statically linked binary (no dynamic loader, no LD_PRELOAD).
 end note
 
 @enduml
 ```
 
-**Bypass case:** If application code calls `__vdso_clock_gettime` directly (by
-resolving it from `getauxval(AT_SYSINFO_EHDR)` and calling the vDSO function
-pointer), our interposition is bypassed. This is vanishingly rare in user-space
-application code but common in the Go runtime (see §10).
-
 ### 2.3 Fallback to Syscall
 
-If the vDSO is not available (container without vDSO mapping, kernel with
-`CONFIG_VDSO=n`, or a clock ID not in the vDSO), glibc falls back to the
-`SYS_clock_gettime` syscall. Our interposition is still effective in this path —
-we intercept the libc symbol, not the syscall.
+Without a vDSO entry for the clock, without a vDSO mapping, or with an unreadable
+clocksource, libc issues `SYS_clock_gettime`. Interposition is unaffected: the wrapper
+intercepts the libc symbol, not the mechanism behind it. The wrapper itself issues
+`SYS_clock_gettime` directly only while the real pointer is still unresolved (a call
+from inside symbol resolution, §17).
 
-Reference: `vdso(7)` Linux man-pages; kernel `lib/vdso/gettimeofday.c`;
-glibc `sysdeps/unix/sysv/linux/clock_gettime.c`.
+References: `vdso(7)`; kernel `lib/vdso/gettimeofday.c`; glibc
+`sysdeps/unix/sysv/linux/clock_gettime.c`.
 
 ---
 
-## 3. Hardware Clock Sources — TSC, CNTPCT_EL0, and Friends
+## 3. Hardware Clock Sources — TSC and CNTVCT_EL0
 
-The vDSO reads `vvar` data to compute time. The `vvar` page is updated by the
-kernel from a hardware clock source. Understanding the hardware layer clarifies
-why `clock_gettime` returns nanosecond-precision without a syscall.
+Background for reasoning about what OFFSET cannot touch. The kernel publishes, per
+clocksource, a base time, the counter value it was taken at (`cycle_last`) and a
+`mult`/`shift` pair. A reader computes `base + ((counter - cycle_last) * mult) >> shift`
+under a sequence counter and retries while the kernel updates the page.
 
-### 3.1 x86_64: TSC (Time Stamp Counter)
+### 3.1 x86_64: TSC
 
-The TSC is a 64-bit monotonically incrementing counter in every modern x86
-processor (Intel P6+, AMD K6-2+). It increments at the processor's base frequency
-(not the variable boost frequency) when `X86_FEATURE_CONSTANT_TSC` is set.
+The Time Stamp Counter is a 64-bit per-core counter. With `constant_tsc` and
+`nonstop_tsc` it ticks at a fixed rate independent of frequency scaling and idle states.
+`rdtsc` can be reordered by out-of-order execution; `rdtscp` waits for prior
+instructions and returns the CPU id in `ecx`. When the kernel marks the TSC unstable it
+switches clocksource, and the vDSO falls back to the system call.
 
-**rdtsc variants:**
+### 3.2 aarch64: CNTVCT_EL0
 
-```c
-// RDTSC — reads TSC; may be reordered by out-of-order execution
-uint64_t tsc = __builtin_ia32_rdtsc();
+The ARMv8 Generic Timer provides a 64-bit system counter at the frequency in
+`CNTFRQ_EL0`. The vDSO reads the virtual view, `CNTVCT_EL0`, preceded by `isb` so the
+read is not speculated ahead of earlier instructions. EL0 access is enabled by the
+kernel through `CNTKCTL_EL1`.
 
-// RDTSCP — serialising read; also returns processor ID in ecx
-uint32_t pid;
-uint64_t tsc = __builtin_ia32_rdtscp(&pid);
-```
+### 3.3 Relevance to Injection
 
-The kernel uses `rdtsc` (with memory barriers) to update `vvar.clock_data.cycle_last`
-and computes `ns = (tsc - cycle_last) * mult >> shift + ns_offset` using a
-multiply-shift algorithm calibrated at boot and periodically updated by NTP.
-
-glibc's vDSO (`arch/x86/entry/vdso/vclock_gettime.c` in kernel source) reads
-`vvar.clock_data.seq` (a seqlock counter), reads `cycle_last`, `mult`, `shift`,
-`ns_offset`, calls `rdtsc`, computes the time, and validates the seqlock. If the
-seqlock retry count is exceeded (kernel was updating `vvar` concurrently), it
-falls back to the syscall.
-
-### 3.2 aarch64: CNTPCT_EL0
-
-The ARMv8 Generic Timer provides `CNTPCT_EL0` (Counter-timer Physical Count
-register, EL0-accessible) which counts at the `CNTFRQ_EL0`-specified frequency
-(typically 24 MHz or 100 MHz on embedded/server ARMv8).
-
-```asm
-mrs  x0, CNTPCT_EL0   // read 64-bit physical counter
-mrs  x1, CNTFRQ_EL0   // read frequency (once, at init)
-```
-
-The vDSO on aarch64 reads `CNTPCT_EL0` directly from EL0 without a syscall.
-`CNTPCT_EL0` is always-on and not gated by `CNTP_CTL_EL0.EN` when EL0 access is
-enabled by `CNTKCTL_EL1.EL0PCTEN`.
-
-### 3.3 riscv64: RDTIME
-
-RISC-V provides the `rdtime` instruction (or `csrr t0, time` pseudo-instruction)
-which reads the machine-level `mtime` register. It is a 64-bit counter at a
-platform-defined frequency (e.g., 1 MHz on SiFive). The Linux vDSO on riscv64
-(Linux 5.3+) uses `rdtime` in the vDSO implementation.
-
-### 3.4 Relevance to Injection
-
-The hardware counter is always monotonically increasing and cannot be modified by
-user-space or by this library. The OFFSET effect modifies the value returned by
-the libc `clock_gettime` symbol — it does not modify `CNTPCT_EL0`, the TSC, or
-the `vvar` page. The hardware backing is untouched. This is correct: we are
-injecting a fault at the software ABI boundary, not at the hardware level.
+The counter and the kernel's data page are read-only to user space and untouched by this
+library. OFFSET and REGRESS rewrite the `struct timespec` the wrapper returns, after the
+real call. The fault lives at the ABI boundary of one process: other processes,
+`chaos-init`, and the libraries' own clocks (`chaos_clock.h`) keep reading real time.
 
 ---
 
 ## 4. clock_gettime Selector Grammar
 
-The `clock_gettime` selector family uses a name or numeric ID after the slash:
-
 ```
-clock_gettime/<name-or-id>
+clock_gettime/<clock>
 ```
 
-### 4.1 Recognised Name Aliases
+### 4.1 Recognised Clock Names
 
-| DSL selector string                | Maps to clockid_t              | Notes           |
-|------------------------------------|--------------------------------|-----------------|
-| `clock_gettime/realtime`           | `CLOCK_REALTIME` (0)           |                 |
-| `clock_gettime/monotonic`          | `CLOCK_MONOTONIC` (1)          |                 |
-| `clock_gettime/monotonic_raw`      | `CLOCK_MONOTONIC_RAW` (4)      | Linux extension |
-| `clock_gettime/realtime_coarse`    | `CLOCK_REALTIME_COARSE` (5)    |                 |
-| `clock_gettime/monotonic_coarse`   | `CLOCK_MONOTONIC_COARSE` (6)   |                 |
-| `clock_gettime/boottime`           | `CLOCK_BOOTTIME` (7)           |                 |
-| `clock_gettime/tai`                | `CLOCK_TAI` (11)               | Linux 3.10+     |
-| `clock_gettime/process_cputime_id` | `CLOCK_PROCESS_CPUTIME_ID` (2) |                 |
-| `clock_gettime/thread_cputime_id`  | `CLOCK_THREAD_CPUTIME_ID` (3)  |                 |
+| Selector                           | clockid_t                      |
+|------------------------------------|--------------------------------|
+| `clock_gettime/realtime`           | `CLOCK_REALTIME` (0)           |
+| `clock_gettime/monotonic`          | `CLOCK_MONOTONIC` (1)          |
+| `clock_gettime/process_cputime_id` | `CLOCK_PROCESS_CPUTIME_ID` (2) |
+| `clock_gettime/thread_cputime_id`  | `CLOCK_THREAD_CPUTIME_ID` (3)  |
+| `clock_gettime/monotonic_raw`      | `CLOCK_MONOTONIC_RAW` (4)      |
+| `clock_gettime/realtime_coarse`    | `CLOCK_REALTIME_COARSE` (5)    |
+| `clock_gettime/monotonic_coarse`   | `CLOCK_MONOTONIC_COARSE` (6)   |
+| `clock_gettime/boottime`           | `CLOCK_BOOTTIME` (7)           |
+| `clock_gettime/tai`                | `CLOCK_TAI` (11)               |
 
-The name match is case-insensitive in the parser. A numeric ID form (`clock_gettime/0`,
-`clock_gettime/1`) is also accepted and compared directly to the `clockid_t`
-argument.
+- Names are matched with `strcmp`: **case-sensitive**, lower case only.
+  `clock_gettime/MONOTONIC` is not a name; it is parsed as a number, fails, and rejects
+  the rule file.
+- Any other text is parsed with `strtol(…, 10)` and compared with the `clockid_t`
+  argument: `clock_gettime/1` equals `clock_gettime/monotonic`. Numbers are not
+  range-checked, so dynamic clock IDs (`FD_TO_CLOCKID`) can be targeted.
+- A name is compiled in only if the libc headers define the constant; on Linux with glibc
+  or musl all nine are present.
 
-The bare `clock_gettime` selector matches any `clock_gettime()` call regardless
-of clock ID (wildcard within the symbol). The `clock_gettime/<name>` form is more
-specific and takes precedence per the first-match rule.
+### 4.2 Precedence
+
+For each effect the wrapper picks one rule, by rank, not by file order:
+
+| Rank | Selector                 | Matches                                                  |
+|------|--------------------------|----------------------------------------------------------|
+| 3    | `clock_gettime/<clock>`  | `clock_gettime` reads (and §12 readers) of that clock    |
+| 2    | `clock_gettime`, `nanosleep`, `usleep` | every call of that operation               |
+| 1    | `*`                      | every call of every operation                            |
+
+A higher rank wins. Equal rank: the longer selector text wins. Equal rank and length: the
+first such rule in the file wins. Effects are selected independently, so one read can
+take a LATENCY from `*`, an ERRNO from `clock_gettime` and an OFFSET from
+`clock_gettime/realtime`.
 
 ---
 
-## 5. OFFSET Effect — Monotonicity Implications
+## 5. OFFSET and REGRESS — Monotonicity Implications
 
-### 5.1 Semantics
+### 5.1 OFFSET Semantics
 
-`OFFSET:N` adds N milliseconds (signed) to the `timespec` returned by a
-successful `clock_gettime()` call:
+`OFFSET:N` adds `N` milliseconds to the `struct timespec` of a successful read.
 
-```c
-ts->tv_sec  += offset_ms / 1000;
-ts->tv_nsec += (offset_ms % 1000) * 1000000L;
-// normalise tv_nsec overflow into tv_sec
-if (ts->tv_nsec >= 1000000000L) { ts->tv_sec++; ts->tv_nsec -= 1000000000L; }
-if (ts->tv_nsec < 0) { ts->tv_sec--; ts->tv_nsec += 1000000000L; }
-```
+- `N` is a signed decimal (`+` and `-` accepted), `|N| ≤ 3155760000000` (100 years). A
+  larger value, or one `strtoll` reports as out of range, rejects the rule file: the
+  shift is negated for REGRESS and for absolute deadlines (§11), which `INT64_MIN` would
+  not survive.
+- Valid only on `clock_gettime` and `clock_gettime/<clock>`; on `*`, `nanosleep` or
+  `usleep` it rejects the rule file.
+- Arithmetic is in `int64_t`, with `tv_nsec` normalised into `[0, 999999999]`.
+- **A result before the epoch is clamped to `{0, 0}`.** `OFFSET:-86400000` on a
+  `CLOCK_MONOTONIC` that reads 3600 s returns `0.000000000`, not a negative time; every
+  read inside that hour returns the same value.
+- The probability is drawn on every read, per thread. A read that misses the gate is
+  returned unshifted; each shifted read is one hit.
+- `N = 0` is legal: the rule fires and counts hits but shifts nothing.
 
-### 5.2 Monotonicity Breaking — By Design
+### 5.2 Monotonicity Breaks by Design
 
-`CLOCK_MONOTONIC` has a POSIX.1-2017 guarantee: successive calls return
-non-decreasing values. The OFFSET effect breaks this when:
+`CLOCK_MONOTONIC` promises non-decreasing values. Under OFFSET it does not hold:
 
-1. **Positive offset then no offset** (transient injection): Two successive calls
-   straddle the injection rule's probability gate. Call N sees the rule fire
-   (`PRNG` ≤ threshold); call N+1 does not. Call N returns `T + offset`; call
-   N+1 returns `T' < T + offset` (where `T' > T` but `T' - T << offset`). The
-   delta appears negative. Any code computing `delta = end - start` and asserting
-   `delta ≥ 0` will fail.
+1. **Probability below 1.** Read *k* is shifted by +N, read *k+1* is not: the clock
+   appears to step back by almost N. Code that asserts `end - start >= 0` fails.
+2. **Negative N.** Every shifted read is N earlier; the clock still advances, from an
+   earlier point. Only the transition (rule added, gate missed, rule removed) is visible.
+3. **Reload.** Adding, changing or removing the rule steps the observed clock by the
+   difference.
 
-2. **Negative offset**: Explicitly moves the clock backward. `CLOCK_MONOTONIC`
-   contract violated unconditionally on every injected call. Useful for testing
-   "what if the application's interval computation sees a clock running backward"
-   (which can happen on VMs with live migration or on hardware with TSC sync
-   issues between CPU cores).
+This is the purpose. Backward and forward steps of "monotonic" time happen in
+production: VM live migration, suspend/resume, hypervisor timer bugs. The library
+changes only the value one process observes; the kernel clock and its guarantee stay
+intact.
 
-**This is documented as intentional.** The purpose of the OFFSET effect is to
-test application resilience to clock anomalies that **do** occur in production
-(NTP step adjustments, VM migration, PTP slew events). Code that assumes
-`CLOCK_MONOTONIC` never goes backward is correct by POSIX — but fragile on
-virtualised infrastructure where CLOCK_MONOTONIC_RAW and wall-clock synchronisation
-interact with VM suspend/resume.
+### 5.3 OFFSET on CLOCK_REALTIME
 
-POSIX.1-2017 §11.2.2: "The value of the CLOCK_MONOTONIC clock is the amount of
-time since an unspecified starting point. The clock is not allowed to be set."
-POSIX says it cannot be set; it does not prohibit a middleware layer from
-returning a different value. Our injection is above the POSIX ABI; it does not
-violate the kernel's CLOCK_MONOTONIC implementation.
+`CLOCK_REALTIME` is already adjustable, so a realtime OFFSET models an NTP step or a
+wrong host clock: `clock_gettime/realtime:OFFSET:+3600000` moves wall time one hour
+ahead for certificate expiry, session timeouts, lease renewal and log correlation.
 
-### 5.3 OFFSET and CLOCK_REALTIME
-
-`CLOCK_REALTIME` is already adjustable by NTP and `clock_settime`. Injecting
-`clock_gettime/realtime:OFFSET:+3600000` (advance wall clock by one hour)
-simulates an NTP step or a leap-second smear event. This is the intended use:
-exercise certificate expiry, session timeout, lease renewal, and log timestamp
-correlation logic without actually modifying the system time.
+A realtime rule covers every wall-clock reader the library wraps. glibc and musl serve
+`gettimeofday()`, `time()` and `timespec_get()` without calling the exported
+`clock_gettime`, so each has its own wrapper that reads `CLOCK_REALTIME` through the
+`clock_gettime` rules (§12): LATENCY, ERRNO, OFFSET and REGRESS of
+`clock_gettime/realtime`, `clock_gettime` and `*` apply to them exactly as to
+`clock_gettime(CLOCK_REALTIME)`.
 
 ### 5.4 Thread Safety of OFFSET
 
-The OFFSET value is per-rule, read from the config. Config is reloaded atomically
-(see §19). OFFSET application is per-call in the wrapper, after the real call
-returns. No shared mutable state is involved in the offset arithmetic. Thread-safe.
+OFFSET is stateless: the rule copy is taken from the active snapshot under its sequence
+counter (§19), the arithmetic is on the caller's buffer, and the hit is counted with an
+atomic add. Two threads reading the same instant can return different values because
+each draws its own probability sample.
+
+### 5.5 REGRESS — a One-Time Backward Step
+
+`clock_gettime/monotonic:REGRESS:5000` makes the clock step back once, observably:
+
+1. The first read under the rule (inside its `@from`/`@until` window) is returned real
+   and arms the rule. The program now holds a time to go back from.
+2. A later read where the rule fires (window, probability, `@first`) is returned
+   5000 ms earlier. That decision is the jump and counts **one hit**.
+3. Every read after the jump stays shifted by 5000 ms without drawing again, so the
+   clock advances normally from the earlier time.
+
+Rules of the effect:
+
+- **A clock is required.** Only `clock_gettime/<clock>` is valid; bare `clock_gettime`,
+  `*`, `nanosleep` and `usleep` reject the rule file. The state belongs to the rule, and
+  one rule across all clocks would arm on one clock and jump on another.
+  `clock_gettime/realtime:REGRESS:…` also steps `gettimeofday()`, `time()` and
+  `timespec_get()`.
+- **Value:** `1 ≤ ms ≤ 3155760000000`; zero or negative rejects the rule file.
+- **State machine** (per process, in the rule's hit slot, `chaos_hits.h`):
+  `0` unarmed → `1` armed → `3` deciding → `2` jumped, or back to `1` when the gate
+  misses. Transitions use compare-and-swap: exactly one thread decides the jump; a read
+  that meets state `3` is returned unshifted.
+- **Reload:** a reload that keeps the rule's text keeps the state. Removing the rule ends
+  the shift: the observed clock jumps forward by the same amount.
+- **Window:** outside `@from`/`@until` nothing is shifted, also after the jump.
+- **fork():** the child inherits the state (a jumped parent has a jumped child); a
+  decision in progress (`3`) is reset to `1`.
+- With `@size` the rule never jumps (clock reads carry no byte count, §8.4).
+
+A static negative OFFSET never shows the step, because the first read is already
+shifted. REGRESS exists for code that must survive the step itself: timeouts, rate
+limiters, leases and elapsed-time arithmetic that trust `CLOCK_MONOTONIC`.
+
+When both an OFFSET and a REGRESS rule match a read, OFFSET is applied first, then
+REGRESS.
 
 ---
 
-## 6. nanosleep — POSIX Cancellation Contract
+## 6. nanosleep — EINTR and Cancellation Contract
 
-### 6.1 POSIX.1-2017 §2.4.3 Contract
+### 6.1 Kernel Contract
 
-`nanosleep(2)` is a cancellation point (POSIX.1-2017 Table 2-6). It is not
-restarted by `SA_RESTART` (see `docs/PROCESS.md` §8.1). If a signal is delivered:
+`nanosleep()` returns -1 with `EINTR` when a signal handler runs, writes the unslept time
+to `*rem` if `rem` is non-NULL, and is never restarted by `SA_RESTART`
+(`signal(7)`; see [PROCESS.md §8.1](PROCESS.md#81-the-restartable--non-restartable-split)).
+It is a cancellation point.
 
-- Returns -1, `errno = EINTR`.
-- If `*rem` is non-null, it is set to the remaining sleep duration.
+### 6.2 Injected EINTR
 
-### 6.2 Library Injection Model
-
-`nanosleep:ERRNO:EINTR` injection fires before the real call:
+An ERRNO rule fires before the real call. With `EINTR` the wrapper copies the request
+into `*rem` (when both pointers are non-NULL), sets `errno` and returns -1, without
+sleeping:
 
 ```c
-if (remaining != NULL) {
-    *remaining = *requested;
+if (request != NULL && remaining != NULL)
+{
+    *remaining = *request;
 }
 errno = EINTR;
 return -1;
 ```
 
-The library sets `*remaining = *requested` because injection fires before any
-real sleep elapsed. This is the conservative model: it gives the application the
-maximum remaining time (none was consumed). A compliant caller will retry with
-`nanosleep(remaining, &remaining)`.
-
-POSIX.1-2017 §11.4.2 notes that the `rqtp` argument is not required to be a
-multiple of the timer resolution, but `nanosleep` sleeps for at least `rqtp`.
-The injection bypasses the actual sleep entirely; no time is actually consumed.
+The full request is reported as remaining because none of it elapsed. A caller that
+loops on `nanosleep(&rem, &rem)` retries correctly; one that ignores `EINTR` returns
+early. Any other injected errno leaves `*rem` untouched.
 
 ### 6.3 LATENCY on nanosleep
 
-`nanosleep:LATENCY:200` adds 200 ms of pre-call sleep via `real_nanosleep`
-(the cached real pointer, not the interposed symbol). This models "sleep call
-encounters scheduler delays" — the application's intended sleep gets an extra
-200 ms on top of its requested duration. Useful for testing timeout overshoot
-handling.
+`nanosleep:LATENCY:200` sleeps 200 ms before the real call; the caller observes its
+request plus 200 ms. The delay:
 
-The LATENCY nanosleep uses the reentrancy guard (TLS) to prevent recursive
-invocation; `real_nanosleep` points directly to the kernel's libc `nanosleep`
-wrapper without going through the PLT again.
+- sleeps through the real `usleep` (resolved with `dlsym(RTLD_NEXT)`), in chunks of at
+  most 1 s, with the reentrancy guard raised; the real `nanosleep` is used, and
+  restarted on `EINTR`, only where `usleep` did not resolve;
+- preserves the caller's `errno`;
+- **can end early on a signal:** the real `usleep` returns on `EINTR` and the chunk is
+  not resumed, so each signal shortens the delay by up to the rest of a 1 s chunk. The
+  other libraries sleep with a restarted raw `clock_nanosleep` (`chaos_sleep.h`) and do
+  not have this property;
+- counts one hit, also for `LATENCY:0`.
 
-### 6.4 POSIX Thread Cancellation
+### 6.4 Cancellation
 
-POSIX.1-2017 §9.2 defines thread cancellation points. `nanosleep` is a
-cancellation point. If a thread is cancelled while in `real_nanosleep()`, the
-thread receives a cancellation signal and unwinds. The pre-call injection
-(`LATENCY` delay or `ERRNO` injection) fires before `real_nanosleep()` is called,
-so it is not subject to the cancellation-point behaviour of the real `nanosleep`.
-Once `real_nanosleep()` is called, normal POSIX cancellation applies.
+The real `usleep`/`nanosleep` used for the injected delay are cancellation points. A
+deferred `pthread_cancel()` pending or arriving during an injected delay acts there,
+including inside `clock_gettime()`, `gettimeofday()` and `time()`, which are not
+cancellation points on their own. An injected ERRNO is not a cancellation point. Once the
+real `nanosleep()` runs, normal POSIX cancellation applies.
 
 ---
 
 ## 7. usleep — Surface and Constraints
 
-`usleep(3)` sleeps for a number of microseconds. It is a legacy POSIX function
-(POSIX.1-2001, marked obsolescent; removed in POSIX.1-2008, but still exported
-by both glibc and musl for backwards compatibility).
+`usleep(3)` sleeps a number of microseconds. POSIX.1-2001 marked it obsolescent and
+POSIX.1-2008 removed it; glibc and musl still export it.
 
-### 7.1 glibc Implementation
+### 7.1 Own Selector, Own Rules
 
-glibc implements `usleep` as:
+`usleep` has its own selector. `usleep` rules apply to `usleep()` only; `nanosleep`
+rules never apply to a `usleep()` call. The real `usleep` runs with the reentrancy guard
+raised, so whatever libc does inside it (glibc and musl both implement it with a
+nanosleep) bypasses the wrappers.
 
-```c
-int usleep(useconds_t useconds)
-{
-    struct timespec ts = { useconds / 1000000, (useconds % 1000000) * 1000 };
-    return nanosleep(&ts, NULL);
-}
-```
+### 7.2 Effects
 
-On glibc, `usleep` calls the libc `nanosleep` symbol via the PLT. If
-`libchaos-time` is loaded, the `nanosleep` wrapper intercepts this. However,
-`libchaos-time` also intercepts `usleep` directly at the PLT; when `usleep` is
-called by the application, the `usleep` wrapper fires first. The internal
-`nanosleep` call inside glibc's `usleep` is then intercepted by the TLS guard
-(reentrancy protection), which lets it pass through to the real `nanosleep`.
+- LATENCY delays the call (§6.3).
+- ERRNO returns -1 with the configured `errno`; there is no remaining-time output, so the
+  caller cannot know how much elapsed and must measure with a clock if it retries.
+- OFFSET and REGRESS are rejected on `usleep`.
 
-### 7.2 musl Implementation
-
-musl implements `usleep` via `nanosleep` as well (musl `src/time/usleep.c`).
-Same reentrancy-guard logic applies.
-
-### 7.3 No Returned Timestamp
-
-`usleep` has no `struct timespec *remaining` output parameter. Therefore:
-
-- `OFFSET` is not applicable.
-- `ERRNO:EINTR` injection returns -1 + EINTR without any remaining-time output.
-- The application has no way to know how much of the sleep elapsed; a robust caller
-  either retries the full original duration or uses `clock_gettime` to measure
-  elapsed time before retrying.
-
-### 7.4 Deprecation Note
-
-New code should use `nanosleep` or `clock_nanosleep` (not yet interposed; see §11).
-`usleep` is covered here because a significant quantity of C/C++ library code
-still calls it, and injecting `usleep:ERRNO:EINTR` is a valid test for any caller
-that does not handle the return value of `usleep`.
+A rule `usleep:ERRNO:EINTR` exposes callers that ignore `usleep()`'s return value. In new
+code, `nanosleep()` and `clock_nanosleep()` (§11) replace it.
 
 ---
 
 ## 8. DSL Grammar and Rule Semantics
 
-### 8.1 Full ABNF (RFC 5234)
+### 8.1 Grammar (RFC 5234 ABNF)
 
 ```abnf
-rule-line      = selector ":" effect ":" value [ "@" probability ] CRLF / LF
-selector       = "*"
-               / "clock_gettime"
-               / "clock_gettime" "/" ( clock-name / clock-id )
-               / "nanosleep"
-               / "usleep"
-clock-name     = "realtime" / "monotonic" / "monotonic_raw"
-               / "realtime_coarse" / "monotonic_coarse"
-               / "boottime" / "tai"
-               / "process_cputime_id" / "thread_cputime_id"
-clock-id       = 1*DIGIT
-effect         = "ERRNO" / "LATENCY" / "OFFSET"
-value          = errno-name / latency-ms / offset-ms
-errno-name     = 1*ALPHA *( ALPHA / DIGIT / "_" )
-latency-ms     = 1*DIGIT
-offset-ms      = [ "-" ] 1*DIGIT
-probability    = "0." 1*DIGIT / "1.0" / "1"
+line         = [ rule *( 1*WSP qualifier ) ] [ comment ] LF
+rule         = selector *WSP ":" *WSP effect *WSP ":" *WSP value
+selector     = "*"
+             / "clock_gettime"
+             / "clock_gettime/" ( clock-name / clock-id )
+             / "nanosleep"
+             / "usleep"
+clock-name   = "realtime" / "monotonic" / "monotonic_raw"
+             / "realtime_coarse" / "monotonic_coarse"
+             / "boottime" / "tai"
+             / "process_cputime_id" / "thread_cputime_id"
+clock-id     = [ "+" / "-" ] 1*DIGIT                 ; strtol, base 10
+effect       = "ERRNO" / "LATENCY" / "OFFSET" / "REGRESS"
+value        = payload [ "@" probability ]           ; no blank before "@"
+payload      = errno / latency-ms / offset-ms
+errno        = "EINVAL" / "EFAULT" / "EINTR" / "EPERM" / "ENOSYS" / "EAGAIN"
+             / 1*DIGIT                               ; 1 .. 2147483647
+latency-ms   = 1*DIGIT                               ; 0 .. 4294967295
+offset-ms    = [ "+" / "-" ] 1*DIGIT                 ; |v| <= 3155760000000; REGRESS: 1 ..
+probability  = "0" / "1" / "0." 1*DIGIT / "1." 1*"0"
+qualifier    = "@first=" 1*18DIGIT                   ; > 0
+             / "@from=" 1*18DIGIT / "@until=" 1*18DIGIT   ; Unix ms, until > from
+             / "@size>" 1*18DIGIT / "@size<" 1*18DIGIT
+comment      = "#" *( %x01-09 / %x0B-FF )
 ```
 
-`OFFSET` accepts a signed millisecond value. Negative values move the clock
-backward. Positive values move it forward. Zero is a no-op but legal.
+- Selectors, effect names and errno names are case-sensitive.
+- Blanks (space, tab, CR) around fields are trimmed. Everything from the first `#` is a
+  comment.
+- The probability is attached to the value with `@` and no blank:
+  `nanosleep:LATENCY:200@0.25`. Written as a separate word (`200 @0.25`) it is parsed as
+  a qualifier, is unknown, and rejects the rule file.
+- The probability is parsed locale-independently (`chaos_policy_parse_probability()`):
+  an application's `setlocale(LC_ALL, "")` cannot break `0.5`. Missing means 1.
+- A line with qualifiers but no rule rejects the rule file.
 
-### 8.2 Effect Applicability per Symbol
+### 8.2 Effect Applicability
 
-| Symbol                  | LATENCY | ERRNO | OFFSET | Notes                                            |
-|-------------------------|---------|-------|--------|--------------------------------------------------|
-| `clock_gettime`         | yes     | yes   | yes    | OFFSET fires post-call, after real clock returns |
-| `clock_gettime/<clock>` | yes     | yes   | yes    | Sub-selector; same effect availability           |
-| `nanosleep`             | yes     | yes   | no     | No timestamp return value to mutate              |
-| `usleep`                | yes     | yes   | no     | Same; no remaining-time output                   |
+| Selector                | LATENCY | ERRNO | OFFSET | REGRESS |
+|-------------------------|---------|-------|--------|---------|
+| `*`                     | yes     | yes   | —      | —       |
+| `clock_gettime`         | yes     | yes   | yes    | —       |
+| `clock_gettime/<clock>` | yes     | yes   | yes    | yes     |
+| `nanosleep`             | yes     | yes   | —      | —       |
+| `usleep`                | yes     | yes   | —      | —       |
 
-### 8.3 Valid errno Values
+"—" rejects the rule file. No selector names `gettimeofday`, `time`, `timespec_get`,
+`clock_nanosleep` or `sleep`; each follows the rules of the call it is a form of:
 
-`clock_gettime()`: `EFAULT` (bad ts pointer), `EINVAL` (unknown clock ID or
-unsupported on this kernel), `ENOSYS` (not supported at all — rare on Linux).
+| Wrapper           | Follows rules of          | Failure report                                                                  |
+|-------------------|---------------------------|---------------------------------------------------------------------------------|
+| `gettimeofday`    | `clock_gettime/realtime`  | -1, `errno` set; microseconds derived from the shifted timespec                 |
+| `time`            | `clock_gettime/realtime`  | `(time_t)-1`, `errno` set                                                       |
+| `timespec_get`    | `clock_gettime/realtime`  | `TIME_UTC` only; returns 0 (other bases are forwarded)                          |
+| `sleep`           | `nanosleep`               | returns the full request unslept, `errno` set                                   |
+| `clock_nanosleep` | `nanosleep`               | returns the error number, `errno` untouched; EINTR fills `*rem` only for a relative sleep |
 
-`nanosleep()`: `EFAULT` (bad rqtp/rem pointer), `EINTR` (signal), `EINVAL`
-(negative tv_nsec or tv_nsec ≥ 1e9).
+### 8.3 errno Values
 
-`usleep()`: `EINTR` (signal), `EINVAL` (useconds ≥ 1e6 on some implementations).
+Six names are recognised; any other errno is given as a decimal number. Values a caller
+is likely to handle:
+
+| Call              | errno                                                                     |
+|-------------------|---------------------------------------------------------------------------|
+| `clock_gettime()` | `EINVAL` (unsupported clock), `EFAULT` (bad pointer), `EPERM`             |
+| `nanosleep()`     | `EINTR`, `EINVAL` (`tv_nsec` out of range), `EFAULT`                      |
+| `usleep()`        | `EINTR`, `EINVAL`                                                         |
+
+The library does not check that an errno is plausible for the call; `clock_gettime:ERRNO:5`
+returns `EIO`.
+
+### 8.4 Qualifiers
+
+`@first`, `@from`, `@until` and `@size` behave as in every library (`chaos_policy.h`):
+`@first=N` caps the firings per process, `@from`/`@until` gate on the real wall clock in
+Unix milliseconds (read from the vDSO, so a realtime OFFSET does not move the window).
+Clock reads and sleeps carry no byte count, so **a rule with `@size` parses but never
+fires**.
+
+### 8.5 Failure Behaviour of the Rule File
+
+Parsing is all-or-nothing and fails open:
+
+| Condition                                      | Rules applied           | Status file                                             |
+|------------------------------------------------|-------------------------|---------------------------------------------------------|
+| No rule file                                   | none                    | removed                                                 |
+| Any invalid line                               | none                    | `state=error`, `line=<n>`, `reason=invalid rule`, `text=` |
+| More than 256 rules                            | none                    | `reason=too many rules`                                 |
+| File ≥ 262144 bytes (256 KiB)                  | none                    | `reason=file too large`, `line=0`                       |
+| `EACCES`/`EPERM` on open, or a directory       | none                    | `reason=file unreadable`, `line=0`                      |
+| A NUL byte in the file                         | none                    | `reason=file contains a NUL byte`, `line=0`             |
+| Other read error, or file changed while read   | previous snapshot kept  | unchanged; retried on the next look                     |
 
 ---
 
 ## 9. Per-Hook Call Flows
 
+Every wrapper first calls `chaos_time_ensure_symbols()` (one-time `dlsym(RTLD_NEXT)`
+resolution, §17). "Bypass" forwards to the real function with the guard raised.
+
 ### 9.1 clock_gettime()
 
 ```
 wrapper entry
-  ├─ chaos_time_enter_internal()       TLS guard check (see §17)
-  ├─ chaos_time_check_config()         mtime-CAS reload (see §19)
-  ├─ LATENCY rule match (clock + sub-selector)
-  │    if matched → real_nanosleep(latency_ns, NULL)
-  ├─ ERRNO rule match
-  │    if matched and PRNG ≤ probability → errno=value, return -1
-  ├─ real_clock_gettime(clk_id, ts)    ← may use vDSO internally (invisible to us)
-  ├─ if real call succeeded:
-  │    OFFSET rule match
-  │    if matched → apply signed ms offset to ts
-  └─ chaos_time_leave_internal()
-  return real_clock_gettime result (possibly with mutated ts)
+  ├─ guard set or value == NULL          → bypass (NULL reaches libc's EFAULT)
+  ├─ rule lookup (each lookup may reload, §19)
+  ├─ LATENCY rule for (clock_gettime, clock_id)
+  │    if it fires → sleep (§6.3)
+  ├─ ERRNO rule
+  │    if it fires → errno = value, return -1      (*value never written)
+  ├─ real clock_gettime(clock_id, value)            (vDSO or syscall inside libc)
+  │    on failure → return its result
+  ├─ OFFSET rule  → if it fires: value += offset ms (clamped at {0, 0})
+  ├─ REGRESS rule → arm / decide / keep shift (§5.5)
+  └─ return 0
 ```
-
-The OFFSET is applied only on success. A synthetic ERRNO fire returns -1 before
-`real_clock_gettime` is called, so `ts` is never written.
 
 ### 9.2 nanosleep()
 
 ```
 wrapper entry
-  ├─ chaos_time_enter_internal()
-  ├─ chaos_time_check_config()
-  ├─ LATENCY rule match
-  │    if matched → real_nanosleep(latency_ns, NULL)
-  ├─ ERRNO rule match
-  │    if matched → write *rem = *req if rem != NULL; errno = value; return -1
-  ├─ real_nanosleep(req, rem)
-  └─ chaos_time_leave_internal()
+  ├─ guard set or request == NULL        → bypass
+  ├─ LATENCY rule for nanosleep          → sleep (§6.3)
+  ├─ ERRNO rule
+  │    if it fires → if errno == EINTR: *rem = *req (rem != NULL); return -1
+  └─ real nanosleep(req, rem)
 ```
 
 ### 9.3 usleep()
 
 ```
 wrapper entry
-  ├─ chaos_time_enter_internal()
-  ├─ chaos_time_check_config()
-  ├─ LATENCY rule match
-  │    if matched → real_nanosleep(latency_ns, NULL)
-  ├─ ERRNO rule match
-  │    if matched → errno = value; return -1
-  ├─ real_usleep(usec)
-  └─ chaos_time_leave_internal()
+  ├─ guard set                           → bypass
+  ├─ LATENCY rule for usleep             → sleep (§6.3)
+  ├─ ERRNO rule                          → errno = value, return -1
+  └─ real usleep(usec)
 ```
+
+### 9.4 Derived Wrappers
+
+```
+gettimeofday(tv, tz)   guard or tv == NULL → bypass; else §9.1 on CLOCK_REALTIME;
+                       tz != NULL is filled by the real gettimeofday; tv from the timespec
+time(t)                guard → bypass; else §9.1 on CLOCK_REALTIME; failure → (time_t)-1
+timespec_get(ts, b)    guard, ts == NULL or b != TIME_UTC → bypass; else §9.1; failure → 0
+sleep(s)               guard → bypass; LATENCY and ERRNO of nanosleep; ERRNO → return s
+clock_nanosleep(c,f,r,m)
+                       guard or r == NULL → bypass; LATENCY and ERRNO of nanosleep
+                       (errno restored, error returned); TIMER_ABSTIME → deadline
+                       converted (§11); real clock_nanosleep
+```
+
+`gettimeofday()` and `timespec_get()` read their pointer argument through a `volatile`
+copy: glibc declares it `nonnull`, which would let the compiler drop the NULL test.
 
 ---
 
 ## 10. Bypass Surfaces — When the Wrapper Is Not Invoked
 
-This section enumerates all cases where `clock_gettime()` may be called without
-passing through the `libchaos-time` wrapper.
+`libchaos-time` sees every clock read and sleep that goes through the exported libc
+symbols. It does not see these:
 
 ### 10.1 Go Runtime
 
-The Go runtime (gc compiler, not gccgo) calls `clock_gettime` via direct syscall
-in `src/runtime/sys_linux_amd64.s` (x86_64) and equivalent architecture files.
-It does not link `libc` for clock operations. `LD_PRELOAD` interposition does not
-apply. Go programs are effectively invisible to `libchaos-time` for all time
-operations.
-
-For Go targets, time injection requires either:
-
-- `libfaketime` with `FAKETIME_DONT_RESET_SYSCALL=1` (which patches the vsyscall
-  interface — not the same as LD_PRELOAD)
-- A Go-native time-injection shim using `time.Now` monkey-patching (goroutine-safe
-  but architecture-specific JIT rewriting, e.g. `github.com/bouk/monkey`)
+The Go runtime (gc toolchain) does not call libc for time. On linux/amd64 and
+linux/arm64 it locates the vDSO itself and calls `__vdso_clock_gettime` /
+`__kernel_clock_gettime` directly, with `SYS_clock_gettime` as its fallback; sleeps are
+runtime timers, not `nanosleep()`. Go time is invisible to `libchaos-time` with or
+without cgo, and invisible to SECCOMP mode as well
+([SECCOMP.md §6](SECCOMP.md#6-not-possible)). Time faults for Go need source-level
+injection (an injectable clock).
 
 ### 10.2 Direct vDSO Call
 
-If user code resolves `__vdso_clock_gettime` from the vDSO DSO (via
-`getauxval(AT_SYSINFO_EHDR)` + ELF symbol lookup) and calls the function pointer
-directly, the PLT is bypassed. This is vanishingly rare in application code but
-possible. The Go runtime does not use this path; it calls the syscall directly.
+Code that parses the vDSO from `getauxval(AT_SYSINFO_EHDR)` and calls its
+`clock_gettime` never passes the PLT. Outside language runtimes this is rare.
 
-### 10.3 Direct Syscall
+### 10.3 Direct System Call
 
-`syscall(SYS_clock_gettime, clkid, &ts)` or inline assembly `syscall` instruction
-bypasses the libc symbol entirely. glibc itself uses the vDSO path internally, not
-a raw syscall.
+`syscall(SYS_clock_gettime, …)`, `syscall(SYS_nanosleep, …)` or an inline `syscall`
+instruction bypasses the libc symbol.
 
-### 10.4 Statically Linked Binaries
+### 10.4 Libc-Internal Calls
 
-Statically linked binaries have no dynamic loader and no PLT for libc symbols.
-`LD_PRELOAD` is ignored. The binary's own statically linked `clock_gettime`
-implementation runs without interposition.
+Calls libc makes to its own functions bind inside libc and never reach the exported
+symbol. This is why `gettimeofday`, `time`, `timespec_get`, `sleep` and
+`clock_nanosleep` have wrappers of their own (§12, §13, §11). Other libc functions that
+read the clock internally (for example timeouts computed inside `pthread_cond_timedwait`
+or `sem_timedwait`, §15) are not affected.
 
-### 10.5 Hardened Daemons
+### 10.5 Statically Linked Binaries
 
-Some hardened daemons (OpenSSH, systemd) use `seccomp` or custom libc wrappers
-that call `clock_gettime` through an internal sanitised code path. These are not
-guaranteed to route through the PLT symbol.
+No dynamic loader, no LD_PRELOAD. SECCOMP mode reaches static binaries for other
+libraries, not for time.
 
-Reference: `vdso(7)` Linux man-pages; Go source `src/runtime/sys_linux_amd64.s`;
-`docs/diagrams/vdso.puml`.
+### 10.6 Programs Started Without the Preload
 
----
+A set-user-ID or file-capability program runs with `AT_SECURE`, and the loader ignores
+an `LD_PRELOAD` path with a slash ([PLATFORM.md §6](PLATFORM.md#6-at_secure-and-the-ld_preload-strip)).
 
-## 11. Non-Coverage: clock_nanosleep
-
-`clock_nanosleep(2)` (POSIX.1-2001, Linux 2.6) is a higher-precision sleep that
-takes an explicit `clockid` and supports absolute wakeup time (`TIMER_ABSTIME`).
-It is preferred over `nanosleep` in new code because:
-
-1. It specifies which clock governs the sleep.
-2. `TIMER_ABSTIME` avoids TOCTTOU between reading the clock and computing the
-   relative sleep duration.
-3. It returns `EINTR` with a more precise `*remain` semantics relative to the
-   requested clock.
-
-Why not yet interposed:
-
-1. The `clockid` argument means the sub-selector grammar needs to be extended to
-   cover `clock_nanosleep/<clock>`, matching the `clock_gettime/<clock>` pattern.
-2. `TIMER_ABSTIME` sleep injection requires the library to understand absolute
-   target time vs relative offset — a semantically richer injection model than
-   the current millisecond-delay model.
-
-Candidate for next time-surface expansion. POSIX.1-2017 §11.4.2.
+Reference: `vdso(7)`; Go `src/runtime/vdso_linux.go`; [`docs/PLATFORM.md` §5.3](PLATFORM.md#53-where-we-are-bypassed).
 
 ---
 
-## 12. Non-Coverage: gettimeofday
+## 11. clock_nanosleep and Absolute Deadlines
 
-`gettimeofday(2)` is a POSIX-legacy function returning `struct timeval`
-(microsecond resolution). It is vDSO-offloaded on all major Linux architectures.
+`clock_nanosleep()` follows the `nanosleep` rules (LATENCY, ERRNO). It reports failure by
+returning the error number and leaves `errno` untouched; an injected `EINTR` fills
+`*rem` only for a relative sleep, as POSIX specifies. glibc's own `nanosleep()` is built
+on its internal `clock_nanosleep`, which never reaches this wrapper.
 
-Why not interposed:
+With `TIMER_ABSTIME` the request is a deadline the program computed from the clock as it
+observes it, shifted by the OFFSET and REGRESS rules of `clock_gettime/<clock>` (or
+`clock_gettime`). The kernel compares it with the real clock. The wrapper converts the
+deadline back before the call:
 
-1. POSIX.1-2008 marked `gettimeofday` as obsolescent, superseded by
-   `clock_gettime(CLOCK_REALTIME)`.
-2. glibc implements `gettimeofday` by calling the vDSO `__vdso_gettimeofday`
-   entry directly. The libc `gettimeofday` symbol does not call `clock_gettime`;
-   there is no transitive coverage.
-3. Adding a `gettimeofday` wrapper would require a separate `OFFSET` path for
-   `struct timeval` (tv_sec + tv_usec) rather than `struct timespec`.
+- an OFFSET of +O ms is subtracted;
+- a REGRESS of R ms that has jumped is added.
 
-New-code injection targets should use `clock_gettime/realtime:OFFSET:N`.
-`gettimeofday` injection is a future addition for legacy-code targets.
+Without the conversion, `OFFSET:3000` made "now + 100 ms" sleep 3.1 s, and a negative
+offset ended every absolute sleep at once.
 
-Reference: `gettimeofday(2)` Linux man-pages; glibc
-`sysdeps/unix/sysv/linux/gettimeofday.c`.
+Only a shift that every read carries is converted:
+
+| Rule    | Converted when                                                                            |
+|---------|-------------------------------------------------------------------------------------------|
+| OFFSET  | probability 1, no `@first`, no `@size`, `@from`/`@until` window open                      |
+| REGRESS | state jumped (`2`) and window open                                                        |
+
+A deadline computed from a read the probability gate left unshifted cannot be told apart
+and is passed unchanged. The conversion counts no hit.
 
 ---
 
-## 13. Non-Coverage: sleep and alarm
+## 12. gettimeofday, time and timespec_get
 
-`sleep(3)` sleeps for integer seconds. glibc implements it via `nanosleep` (glibc
-≥ 2.3, see glibc `sysdeps/posix/sleep.c`). Therefore `nanosleep:LATENCY:N` and
-`nanosleep:ERRNO:EINTR` cover `sleep()` transitively on glibc.
+glibc and musl serve all three without calling the exported `clock_gettime`, so a
+`clock_gettime` rule alone would leave them on the real wall clock: one process would see
+two different wall clocks. Each has a wrapper that reads `CLOCK_REALTIME` through the
+`clock_gettime` rules (§9.4) and converts the result:
 
-However, on older glibc (< 2.3), `sleep()` was implemented using `alarm()` and
-`pause()`. This is not a concern for modern targets.
+- **`gettimeofday(tv, tz)`**: `tv_usec = tv_nsec / 1000` of the possibly shifted read. A
+  non-NULL `tz` (obsolete) is filled by the real `gettimeofday`. ERRNO returns -1.
+- **`time(t)`**: seconds of the read; `(time_t)-1` with `errno` on ERRNO, its only
+  failure report. `t` may be NULL.
+- **`timespec_get(ts, TIME_UTC)`**: the read itself; returns `TIME_UTC`, or 0 on failure.
+  Other bases are forwarded unchanged.
 
-`alarm(2)` sets a `SIGALRM` timer. It is a kernel mechanism; no libc symbol
-interposition touches the signal delivery or the timer underlying it. `alarm`
-injection requires `sigaction` interposition, which is outside this library's scope.
+While the real pointer is unresolved, `time()` reads `CLOCK_REALTIME` with
+`SYS_clock_gettime` (aarch64 has no `time` system call) and `timespec_get()` likewise.
+
+Reference: `gettimeofday(2)`, `time(2)`, `timespec_get(3)`.
+
+---
+
+## 13. sleep and alarm
+
+**`sleep()`** is wrapped. glibc and musl implement it with their internal nanosleep,
+which never passes through the exported symbol, so the wrapper applies the `nanosleep`
+rules: LATENCY, then ERRNO. `sleep()` has no error return; an injected error is reported
+the way an interrupted sleep is, as the whole request unslept (`return seconds`), with
+`errno` set to the injected value.
+
+**`alarm()`** is not wrapped. It arms a kernel timer that delivers `SIGALRM`; there is no
+libc call at expiry to intercept, and faulting the arming call would need signal-domain
+semantics this library does not model.
 
 ---
 
 ## 14. Non-Coverage: setitimer and POSIX Timer APIs
 
-`setitimer(2)` (Linux heritage, not POSIX.1-2017 real-time) and the POSIX real-time
-timer API (`timer_create`, `timer_settime`, `timer_gettime`, `timer_delete`,
-POSIX.1-2001 §14.2) are not interposed.
+`setitimer()`, `timer_create()`, `timer_settime()`, `timer_gettime()` and `timer_delete()`
+are not wrapped.
 
-Why not:
-
-1. These are fire-and-forget mechanisms: the timer is set by one call and fires
-   via signal delivery (SIGALRM, SIGEV_SIGNAL, or SIGEV_THREAD). Injecting a
-   failure at `setitimer` or `timer_settime` is useful but requires separate
-   signal-domain reasoning.
-2. `timer_create` with `SIGEV_THREAD` creates a thread to deliver the notification;
-   this interacts with `libchaos-process`'s `pthread_create` wrapper in a
-   non-trivial way.
-3. `timerfd_create` / `timerfd_settime` (Linux 2.6.25) are the recommended modern
-   alternative; see §16.
-
-POSIX timer API reference: POSIX.1-2017 §14.2.1 through §14.2.5.
+- They arm a timer once; expiry arrives as a signal or a `SIGEV_THREAD` callback, with no
+  libc call to fault at that moment.
+- `SIGEV_THREAD` creates threads inside libc, which `libchaos-process`'s `pthread_create`
+  wrapper does not see either (libc-internal call, §10.4).
+- `timerfd` is the modern alternative (§16).
 
 ---
 
-## 15. Non-Coverage: Futex Timeout Paths
+## 15. Limit: Futex Timeouts Under a Shifted Clock
 
-`futex(2)` with `FUTEX_WAIT` accepts a `struct timespec *timeout` parameter
-controlling how long to block. This is the underlying primitive for:
+`pthread_cond_timedwait`, `pthread_mutex_timedlock`, `sem_timedwait`,
+`std::condition_variable::wait_until` and `std::timed_mutex::try_lock_until` take an
+absolute deadline and end in `futex(2)` (`FUTEX_WAIT_BITSET`), which compares it with the
+real clock.
 
-- `pthread_mutex_timedlock`
-- `pthread_cond_timedwait`
-- `sem_timedwait`
-- `std::timed_mutex::try_lock_for` (C++11)
-
-The `timeout` passed to `FUTEX_WAIT` is not processed through `clock_gettime`.
-The kernel reads the value directly from the syscall argument register. There is
-no libc symbol for the timeout path; interposition is impossible via LD_PRELOAD.
-
-This means: injecting `clock_gettime/monotonic:OFFSET:+5000` does NOT affect the
-timeout in `pthread_cond_timedwait` — that function computes an absolute deadline
-from `clock_gettime(CLOCK_MONOTONIC)` before calling `futex`, but the `futex`
-syscall timeout is the raw kernel timeout value, not re-read through `clock_gettime`.
-
-However: if `pthread_cond_timedwait` calls `clock_gettime` to compute the absolute
-deadline, and our OFFSET fires, the deadline passed to `futex` is shifted by the
-OFFSET. So there is indirect coverage through the deadline computation step.
-
-This indirect path requires the application to use `CLOCK_MONOTONIC` for the
-condition variable (the default on Linux; `pthread_condattr_setclock` can change it).
+The program computes the deadline from a read OFFSET or REGRESS shifted. These functions
+are not wrapped, so the deadline is not converted as for `clock_nanosleep` (§11): under
+`clock_gettime/realtime:OFFSET:-3000` a one-second `pthread_cond_timedwait` returns
+`ETIMEDOUT` at once, and a positive offset makes it wait that much longer. Shift a clock
+only for programs whose timed waits do not depend on it, or expect those waits to be off
+by the shift.
 
 ---
 
 ## 16. Non-Coverage: timerfd
 
-`timerfd_create(2)` / `timerfd_settime(2)` / `timerfd_gettime(2)` (Linux 2.6.25)
-create a file descriptor that delivers timer events readable via `read(2)` or
-`epoll(2)`. The timer resolution and clock are specified at creation. No libc
-symbol interposition point exists for the actual timer firing.
+`timerfd_create()`, `timerfd_settime()` and `timerfd_gettime()` are not wrapped.
 
-`timerfd_gettime` returns the current timer setting as a `struct itimerspec`.
-It is not `clock_gettime`; our `clock_gettime` wrapper does not affect it.
-
-Why not interposed: the primary value in timerfd chaos is controlling when the fd
-becomes readable — which is a kernel timer event, not a libc symbol call. This
-would require a `read`-level injection (intercept `read(timerfd_fd, ...)`) with
-fd-type awareness. That is `libchaos-io` territory, not `libchaos-time`.
+- Expiry makes the descriptor readable; the event is delivered by `read(2)` or
+  `epoll_wait(2)`, not by a time call.
+- `timerfd_gettime()` returns the timer's setting, not a clock reading; `clock_gettime`
+  rules do not affect it.
+- Faulting expiry needs fd-type-aware `read` injection, which belongs to `libchaos-io`.
 
 ---
 
 ## 17. Reentrancy Guard and TLS State
 
-Identical architecture to `libchaos-memory` and `libchaos-process`. The time
-library uses:
+Same design as `libchaos-memory` ([MEMORY.md §14](MEMORY.md#14-reentrancy-guard-and-tls-state)):
 
 ```c
-extern __thread int g_chaos_time_tls_guard;
-extern __thread uint64_t g_chaos_time_tls_prng_state;
+extern __thread int g_chaos_time_tls_guard;          /* non-zero: inside the library */
+extern __thread uint64_t g_chaos_time_tls_prng_state; /* 0: not seeded yet */
 ```
 
-The LATENCY path calls `real_nanosleep` (cached pointer, bypasses PLT). Config
-reload uses `open`/`read`/`fstat`. If `libchaos-io` is simultaneously loaded, the
-guard is per-library and does not cross-suppress the IO wrapper. See
-`docs/MEMORY.md` §14 for the full TLS guard protocol.
+- Every call to a real function, the config `stat()`, and the LATENCY sleep run between
+  `chaos_time_enter_internal()` and `chaos_time_leave_internal(previous)`. Leave restores
+  the saved value instead of clearing it, so nested internal sections never drop the
+  outer guard early.
+- A wrapper entered with the guard set (from inside libc, or from a signal handler that
+  interrupted the library on the same thread) forwards to the real function without
+  consulting rules.
+- The guard is per library. Rule files are read with raw `openat`/`read`/`close` system
+  calls (`chaos_status.h`), so `libchaos-io` never sees `libchaos-time` reading its rules.
+- **Symbol resolution** runs once, through `chaos_once()` (not `pthread_once()`, which
+  lives in libpthread before glibc 2.34), from the constructor or from the first wrapper
+  call, whichever comes first: another object's ELF constructor can call a wrapper before
+  this library's constructor ran. A lookup `dlerror()` reports as failed calls `abort()`.
+  While a pointer is still NULL (a call from inside the lookup, for example a preloaded
+  allocator), each wrapper issues the system call libc would have made.
 
 ---
 
 ## 18. PRNG Model
 
-The xorshift64* PRNG is structurally identical across `libchaos-time`,
-`libchaos-memory`, and `libchaos-process`. See `docs/MEMORY.md` §15 for the
-full analysis (SplitMix64 constants, per-thread seeding from process seed XOR TID
-XOR stack address, GoldenRatio finaliser, period 2^64 − 1 per thread, zero-state
-guard).
+xorshift64* per thread, identical across the libraries
+([MEMORY.md §15](MEMORY.md#15-prng-model)):
+
+- Process seed: 8 bytes from `/dev/urandom`, read with raw `openat`/`read`/`close` system
+  calls in the constructor; fallback `0x6a09e667f3bcc909 ^ getpid()`.
+- Thread seed: SplitMix64 finaliser of `process seed ^ gettid() ^ &local`, forced odd so
+  the state is never 0. Seeded lazily on the first draw.
+- Step: `x ^= x >> 12; x ^= x << 25; x ^= x >> 27`, output the upper 32 bits of
+  `x * 0x2545f4914f6cdd1d`. A rule fires when `sample < p * 2^32`; `p ≤ 0` never fires and
+  `p ≥ 1` always fires, both without drawing.
+- In a forked child the atfork handler zeroes the calling thread's state, so pre-fork
+  workers do not draw the same sequence.
 
 ---
 
 ## 19. Config Reload Protocol
 
-Identical two-snapshot CAS design with `CHAOS_TIME_MTIME_MISSING`,
-`CHAOS_TIME_MTIME_RELOADING`, and `CHAOS_TIME_MTIME_UNKNOWN` sentinels. See
-`docs/MEMORY.md` §16 for the full protocol. Config path: `/tmp/.chaos-time.conf`.
+Same two-snapshot design as the other libraries
+([MEMORY.md §16](MEMORY.md#16-config-reload-protocol--two-snapshot-cas)), with
+`CHAOS_TIME_MTIME_MISSING` (`0`), `CHAOS_TIME_MTIME_RELOADING` (`0xfffffffffffffffe`) and
+`CHAOS_TIME_MTIME_UNKNOWN` (`0xffffffffffffffff`) as sentinels of the cached stamp.
+
+- **When it looks.** Every rule lookup may look at the rule file, but at most once per
+  1 ms per process (`CHAOS_CHECK_INTERVAL_NS`), timed with the vDSO `CLOCK_MONOTONIC`
+  (never the wrapped `clock_gettime`, so a time rule does not change how often other
+  libraries see their rules). Without a vDSO clock it looks on every lookup. The
+  constructor loads the file once, so a bad rule file is reported at start-up.
+- **Change stamp.** FNV-style hash of `st_mtim` (s and ns), `st_size`, `st_ino` and
+  `st_dev`. Size catches an append within one mtime tick; inode catches a
+  rename-over (`sed -i`). A file whose mtime is within 20 ms of now
+  (`CHAOS_RACY_WINDOW_MS`) is loaded provisionally and read again on the next look; if
+  its content hash is unchanged, the snapshot stays, with its counts and `@first` claims.
+- **One reloader.** A CAS of the cached stamp to `RELOADING` elects one thread; others
+  keep using the active snapshot without waiting. The winner parses into the inactive
+  snapshot, attaches hit slots (rules with unchanged text keep their slot, counts and
+  REGRESS state), writes the status file, then publishes index and stamp behind full
+  barriers.
+- **Readers.** A rule is copied out of the snapshot under a sequence counter and used
+  only if the counter did not change, so a reader preempted across two reloads never
+  uses half of one rule.
+- **Torn writes.** The file is `fstat`ed after reading; a stamp different from the one
+  that triggered the reload discards the copy and retries on the next look.
+- **errno.** A reload leaves the caller's `errno` untouched.
+- **fork().** The atfork child handler releases a `RELOADING` claim inherited from a
+  thread that does not exist in the child, resets counts and `@first` claims, and gives
+  the child its own hits file. vfork children share memory and run no handler; they see
+  the parent's claims as busy and write nothing.
+
+**Hits file** `/tmp/.chaos-time.hits.<n>`: one `count<TAB>rule text` line per rule,
+`<n>` = pid (or `pid × 10^9 + salt` when a file of that pid exists, e.g. from the image
+an `execve` replaced). Written on each of the process's first 64 hits, then at most every
+100 ms, on the next rule-file look after that interval, and at normal exit.
 
 ---
 
 ## 20. glibc vs musl Divergence
 
-| Aspect                          | glibc                                                                                      | musl                                                                 |
-|---------------------------------|--------------------------------------------------------------------------------------------|----------------------------------------------------------------------|
-| `clock_gettime` vDSO            | Yes; `__vdso_clock_gettime` via `ifunc` resolver                                           | Yes on Linux; `__clock_gettime` vDSO entry                           |
-| `clock_gettime` libc symbol     | `__clock_gettime` / `clock_gettime@@GLIBC_2.17`                                            | `clock_gettime` (no version symbol)                                  |
-| Symbol versioning               | `@@GLIBC_2.17` (from Linux 3.10+); older: `@@GLIBC_2.2` with different prototype on 32-bit | Not versioned; single symbol                                         |
-| `gettimeofday` implementation   | `__vdso_gettimeofday` via `ifunc`                                                          | `__vdso_gettimeofday` if available, else syscall                     |
-| `usleep` implementation         | Calls `nanosleep` via PLT (glibc ≥ 2.3)                                                    | Calls `nanosleep` via PLT                                            |
-| `nanosleep` cancellation point  | Yes (POSIX-compliant)                                                                      | Yes                                                                  |
-| `clock_gettime` on CLOCK_TAI    | glibc 2.21+ (matches Linux 3.10+ kernel support)                                           | Passes clockid through; kernel returns EINVAL on unsupported kernels |
-| STT_GNU_IFUNC for clock_gettime | Yes; resolver selects vDSO or syscall path at bind time                                    | Not used; simpler dispatch                                           |
+| Aspect                                   | glibc                                                         | musl                                     |
+|------------------------------------------|---------------------------------------------------------------|------------------------------------------|
+| `clock_gettime` through the vDSO         | yes                                                           | yes                                      |
+| `gettimeofday`, `time`, `timespec_get` call exported `clock_gettime` | no (own wrappers needed, §12)     | no (own wrappers needed, §12)            |
+| `sleep` calls exported `nanosleep`       | no (own wrapper, §13)                                         | no (own wrapper, §13)                    |
+| `clock_gettime` symbol version           | `clock_gettime@@GLIBC_2.17` (moved from librt in 2.17)        | unversioned                              |
+| `pthread_create`, `pthread_once` in libc | from 2.34; before in libpthread (§17 uses `chaos_once`)       | always in libc                           |
 
-**Symbol versioning note:** On 64-bit glibc targets, `clock_gettime` is exported
-as `clock_gettime@@GLIBC_2.17`. The PLT slot for `clock_gettime` in a dynamically
-linked binary resolves to the versioned symbol. `dlsym(RTLD_NEXT, "clock_gettime")`
-returns the glibc implementation matching the default version for the current
-symbol table. There is no ambiguity on 64-bit; on 32-bit x86 glibc the older
-`@@GLIBC_2.2` variant exists but is not relevant for modern targets.
-
-**IFUNC resolver for clock_gettime (glibc):** glibc uses `STT_GNU_IFUNC` to
-resolve `clock_gettime` to either the vDSO-backed fast path or a pure-syscall
-fallback at `dl_open` time. The resolution happens once during loading. Our
-`dlsym(RTLD_NEXT, "clock_gettime")` captures the resolved address — which is
-the post-IFUNC function pointer — so we correctly call the fast path or syscall
-path that glibc selected. See `docs/PLATFORM.md` §3 for full IFUNC mechanics.
+`dlsym(RTLD_NEXT, "clock_gettime")` returns the default version, the one an unversioned
+reference binds to, so the wrapper calls exactly what the program would have called. See
+[PLATFORM.md §3](PLATFORM.md#3-symbol-versioning-dlsym-vs-dlvsym) and
+[§4](PLATFORM.md#4-stt_gnu_ifunc-and-the-resolver-phase) for versioning and IFUNC.
 
 ---
 
-## 21. Execution Boundary Summary
+## 21. Execution Boundary Summary and Limits
 
-`libchaos-time` operates at the libc clock/sleep boundary. It intercepts libc
-symbols traversed via the PLT.
+`libchaos-time` operates at the libc clock and sleep boundary of one process.
 
 Covered:
 
-- `clock_gettime()` — with sub-selector per clock ID; ERRNO, LATENCY, OFFSET effects
-- `nanosleep()` — ERRNO, LATENCY
-- `usleep()` — ERRNO, LATENCY
+- `clock_gettime()`: per clock ID; ERRNO, LATENCY, OFFSET, REGRESS
+- `gettimeofday()`, `time()`, `timespec_get(TIME_UTC)`: the `clock_gettime/realtime` rules
+- `nanosleep()`: ERRNO, LATENCY
+- `clock_nanosleep()`, `sleep()`: the `nanosleep` rules; absolute deadlines converted
+- `usleep()`: ERRNO, LATENCY
 
 Not covered:
 
-- `clock_nanosleep()` — richer sleep API, not yet interposed
-- `gettimeofday()` — legacy; vDSO-only on glibc; candidates for future expansion
-- `sleep()` — covered transitively via `nanosleep` on glibc/musl ≥ 2.3
-- `alarm()` / `setitimer()` — signal-domain timers; outside scope
-- POSIX timer APIs (`timer_create`, `timer_settime`, etc.) — outside scope
-- `timerfd_create` / `timerfd_settime` — IO-domain timer fds; outside scope
-- `futex(FUTEX_WAIT, ...)` timeout — kernel-internal; no libc symbol
-- Direct vDSO calls — bypass surface; vanishingly rare
-- Direct syscall (`SYS_clock_gettime`) — bypass surface; Go runtime, hardened daemons
-- Statically linked binaries — no PLT; no coverage
+- `alarm()`, `setitimer()`, POSIX timers: signal-domain timers (§13, §14)
+- `timerfd_*`: fd-domain timers (§16)
+- futex-based timed waits: deadlines not converted (§15)
+- direct vDSO calls (Go runtime), direct system calls, libc-internal calls (§10)
+- statically linked binaries; SECCOMP mode does not apply time rules
+
+Limits:
+
+| Limit                          | Value                                      |
+|--------------------------------|--------------------------------------------|
+| Rules per file                 | 256                                        |
+| Rule file size                 | < 262144 bytes (256 KiB)                   |
+| Rule text in status/hits files | 200 bytes                                  |
+| OFFSET / REGRESS magnitude     | 3155760000000 ms (100 years)               |
+| LATENCY                        | 0 .. 4294967295 ms, slept in ≤ 1 s chunks  |
+| Rule-file look interval        | ≥ 1 ms per process                         |
+| Provisional-load window        | 20 ms                                      |
 
 ---
 

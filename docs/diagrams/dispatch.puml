@@ -5,11 +5,14 @@
 '                Macstab GmbH · Hamburg, Germany
 '                https://macstab.com
 '
-' Full dispatcher call flow for a matched interposed symbol.
-' Shows TLS guard, config reload, rule evaluation, effect dispatch,
-' real-symbol call, and post-call mutation path.
+' Dispatch of one interposed call with a matching rule, as libchaos-io
+' and libchaos-net do it (one rule per call). Shows the lazy symbol
+' table, the re-entrancy guard, the throttled rule-file check, rule
+' selection, the firing decision, the raw-syscall sleep, the real call
+' and the post-call mutation.
 '
-' Reference: docs/ARCHITECTURE.md, docs/MEMORY.md §14, docs/TIME.md §9
+' Reference: docs/ARCHITECTURE.md "Request flow", docs/DSL.md §8
+'            src/wrappers/chaos_io_rw.c, src/effects/chaos_io_actions.c
 '
 title Full Dispatcher Flow — Interposed Symbol with Matched Rule
 
@@ -28,96 +31,107 @@ skinparam sequence {
 }
 hide footbox
 
-participant "Application"    as App
-participant "Wrapper"        as Wrap
-participant "TLS Guard"      as Guard
-participant "Config Engine"  as Config
-participant "Selector\nResolver" as Sel
-participant "Effect Engine"  as FX
-participant "Real Symbol\n(libc)"  as Real
+participant "Application"           as App
+participant "Wrapper"               as Wrap
+participant "TLS Guard"             as Guard
+participant "Config Engine"         as Config
+participant "Selector\nResolver"    as Sel
+participant "Effect Engine"         as FX
+participant "Real function\n(RTLD_NEXT)" as Real
 
 App -> Wrap : symbol(args…)
-
-Wrap -> Guard : enter_internal()
+Wrap -> Wrap : ensure_symbols()\n(chaos_once: one acquire load once done)
+note right of Wrap
+  First call: dlsym(RTLD_NEXT) for the whole
+  table. A call re-entering from inside dlsym
+  finds its pointer NULL and issues the raw
+  system call (or fails with ENOSYS).
+end note
+Wrap -> Guard : in_internal()?
 note right of Guard
-  __thread int guard;
-  previous = guard;
-  guard = 1;
-  if previous != 0: bypass all injection
+  __thread int flag (saved and restored),
+  set only while the library runs its own
+  code: the real call, the rule-file read,
+  the /proc/self/fd readlink.
 end note
 
-alt Guard was already set (reentrancy)
+alt Guard set (call made from this library's own code)
   Wrap -> Real : direct call, no injection
   Real --> Wrap : result
-  Wrap -> Guard : leave_internal(previous)
   Wrap --> App : result
-else Guard was clear (normal path)
+else Guard clear (normal path)
 
-  Wrap -> Config : check_config()
+  Wrap -> Config : prepare()
   note right of Config
-    stat(config_path)
-    if mtime changed:
-      CAS(mtime, old, RELOADING)
-      reload + parse
-      CAS(mtime, RELOADING, new)
+    skip unless >= 1 ms since the last look
+    (vDSO CLOCK_MONOTONIC; never skipped while
+     the stamp is UNKNOWN or RELOADING)
+    stat(rule file) → change stamp
+    if changed or load provisional:
+      CAS(stamp, cached, RELOADING)
+      winner: read, fstat-check, parse,
+              publish inactive snapshot
+      loser:  use the active snapshot now
+    errno restored
   end note
-  Config --> Wrap : active_snapshot
+  Config --> Wrap : any rule loaded?
 
   Wrap -> Sel : resolve_selector(args…)
   note right of Sel
-    IO: fd → /proc/self/fd path
-    NET: sockaddr → endpoint string
-    TIME: clockid → clock name
-    MEM: MAP_ANONYMOUS bit
-    PROC: symbol name
+    io:  fd → fd cache → /proc/self/fd path
+         (fd 0-2 and excluded paths never match)
+    net: socket → endpoint (sockaddr or
+         getsockname/getpeername); net
+         resolves it before prepare()
   end note
-  Sel --> Wrap : selector_string
+  Sel --> Wrap : selector
 
   Wrap -> Config : select_rule(op, selector)
-  Config --> Wrap : matched_rule (or null)
+  note right of Config
+    most specific rule for the operation;
+    seqlock: a copy made while a reload
+    rewrote the snapshot is discarded
+  end note
+  Config --> Wrap : rule copy (or none)
 
   alt No rule matched
-    Wrap -> Real : real_symbol(args…)
+    Wrap -> Real : real_function(args…)
     Real --> Wrap : result
-    Wrap -> Guard : leave_internal(previous)
     Wrap --> App : result
   else Rule matched
-    Wrap -> FX : apply_latency(rule)
+    Wrap -> FX : should_trigger(rule)
     note right of FX
-      if rule.effect == LATENCY:
-        real_nanosleep(ms → ns)
-      (reentrancy guard already set;
-       nanosleep bypasses own wrapper)
+      @from/@until window, @size gate,
+      probability (skipped for LATENCY):
+        sample < p · 2^32
+        (sample: per-thread xorshift64* u32)
+      @first claim (CAS), hit counted
     end note
 
-    Wrap -> FX : apply_pre_errno(rule)
-    note right of FX
-      if rule.effect == ERRNO and
-         PRNG()/UINT32_MAX ≤ probability:
-        errno = rule.errnum; return fail
-    end note
-
-    alt ERRNO triggered
-      FX --> Wrap : inject failure
-      Wrap -> Guard : leave_internal(previous)
-      Wrap --> App : -1 or error code, errno set
-    else No pre-call failure
-      Wrap -> Real : real_symbol(args…)
-      Real --> Wrap : result
-
-      alt Post-call mutation (OFFSET / CORRUPT)
-        Wrap -> FX : apply_post_mutation(rule, result)
-        note right of FX
-          OFFSET: ts += offset_ms
-          CORRUPT: flip one bit in read buffer
-        end note
-        FX --> Wrap : mutated result
+    alt ERRNO fired (pre-call)
+      FX --> Wrap : errno = rule.errnum
+      Wrap --> App : -1
+    else LATENCY, TORN, CORRUPT, or not fired
+      opt LATENCY fired
+        FX -> FX : chaos_sleep_ms()\nraw clock_nanosleep(CLOCK_MONOTONIC),\nEINTR restarted with the remainder, errno kept
       end
-
-      Wrap -> Guard : leave_internal(previous)
+      Wrap -> Real : real_function(args…) under the guard\n(TORN fired: count shortened to [1, count-1])
+      Real --> Wrap : result
+      opt CORRUPT rule and result > 0 (decided after the call)
+        Wrap -> FX : should_trigger(rule) → flip one bit\nof the bytes returned
+      end
       Wrap --> App : result (possibly mutated)
     end
   end
 end
+
+note across
+  libchaos-net also selects one rule per call and adds TIMEOUT, RESET, TRICKLE and DUP
+  (docs/NETWORK.md). libchaos-dns, -time, -memory and -process select one rule per effect:
+  LATENCY, then ERRNO / EAI_* / FAIL_AFTER, then the real call, then post-call effects
+  (time: OFFSET, REGRESS; dns: FILTER_FAMILY, SHUFFLE, LIMIT), each with its own lookup
+  and firing decision. libchaos-time sleeps through the real usleep/nanosleep under its
+  guard; every other library sleeps with chaos_sleep_ms().
+end note
 
 @enduml
