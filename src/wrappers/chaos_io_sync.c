@@ -1,43 +1,26 @@
 /**
  * @file chaos_io_sync.c
- * @brief Sync and lifecycle wrappers for libchaos-io.
+ * @brief Descriptor lifecycle and sync wrappers: close, dup2, dup3, close_range, closedir,
+ *        pclose, closefrom, fsync, fdatasync.
  *
  * @details
- * This file implements the interposed entry points for `close(2)`,
- * `fsync(2)`, and `fdatasync(2)`.  All three operate on existing file
- * descriptors and share the same fd-backed rule lookup path as the read/write
- * wrappers, but they differ in how they update fd-cache state after the real
- * libc call.
+ * Two jobs:
+ * - Apply `close`, `fsync` and `fdatasync` rules (ERRNO, LATENCY; the parser rejects TORN
+ *   and CORRUPT for these operations).
+ * - Keep the fd cache truthful: every call that frees or retargets a descriptor
+ *   invalidates it, including closes libc performs with internal system calls the close()
+ *   wrapper never sees (closedir, pclose, closefrom).
  *
- * **`close` cache invalidation discipline.**
- * The fd-cache entry is invalidated only after a successful return from the
- * real `close()`.  This ordering is deliberate: if `close()` fails (returning
- * -1), the file descriptor is still live and its cached path remains valid.
- * Invalidating before the call would permanently lose the path mapping for a
- * descriptor that could still be used or closed again.  Invalidating after a
- * failed close would also be wrong for the same reason: a caller that retries
- * the close after `EINTR` should still get fault injection for it.
+ * @par close
+ * Linux releases the descriptor in every case, even when close() reports an error (EIO on
+ * NFS write-back, EINTR), and correct programs therefore never retry it. The wrapper keeps
+ * that contract: a LATENCY rule delays before the close, the real close always runs, the
+ * cache slot is invalidated whatever close returned, and an ERRNO rule is reported only
+ * after the descriptor is gone. A synthetic error that left the descriptor open would
+ * leak it in exactly the programs that handle close correctly.
  *
- * **`fsync` and `fdatasync`.**
- * Neither sync call modifies fd-cache state.  They support only `ERRNO` and
- * `LATENCY` effects because `TORN` and `CORRUPT` have no meaningful
- * interpretation for a sync boundary operation.
- *
- * **Effect execution model for all three wrappers:**
- * - `LATENCY`: pre-call, unconditional sleep.
- * - `ERRNO`: pre-call; the real syscall is skipped and -1 is returned.
- * - No post-call mutation path exists for any of these operations.
- *
- * **Module ownership:** wrappers/
- * **Stability:** internal
- */
-
-/*
- * Sync and lifecycle wrappers for libchaos-io.
- *
- * These wrappers all operate on existing file descriptors and share the same
- * fd-backed rule lookup path as the read/write wrappers, but they differ in how
- * they update cache state after the real libc call.
+ * @par fsync, fdatasync
+ * ERRNO fails the call without syncing; LATENCY delays it. Neither touches the cache.
  */
 
 #include "chaos_io_actions.h"
@@ -53,12 +36,13 @@
 /* --- Real-call trampolines ------------------------------------------------------- */
 
 /*
- * Each trampoline makes the system call itself while its `g_chaos_io_real_*`
- * pointer is still NULL: a call that arrives during symbol resolution. The
- * directory and pipe streams are the C library's own objects and fail with ENOSYS.
+ * Each trampoline calls the real function inside a library section and issues the system
+ * call itself while its `g_chaos_io_real_*` pointer is still NULL (a call during symbol
+ * resolution). closedir and pclose operate on libc objects no system call can stand in
+ * for; they fail with ENOSYS then.
  */
 
-/** @brief Calls the real `close()` while preserving the recursion guard. */
+/** @brief Real close() inside a library section; raw system call before resolution. */
 static int chaos_io_call_real_close(int fd)
 {
     int previous;
@@ -75,10 +59,12 @@ static int chaos_io_call_real_close(int fd)
 }
 
 /**
- * @brief Calls the real `dup2()` while preserving the recursion guard.
+ * @brief Real dup2() inside a library section; before resolution emulated with system
+ *        calls.
  *
- * @details aarch64 has no dup2 system call. dup3 does the same, except that it
- * refuses equal descriptors, which dup2 accepts when the descriptor is open.
+ * @details aarch64 has no dup2 system call. dup3 is equivalent except that it rejects
+ * equal descriptors with EINVAL, while dup2 returns @p newfd when it is open (EBADF
+ * otherwise); that case is answered with an F_GETFD probe.
  */
 static int chaos_io_call_real_dup2(int oldfd, int newfd)
 {
@@ -100,7 +86,7 @@ static int chaos_io_call_real_dup2(int oldfd, int newfd)
 }
 
 #ifdef __linux__
-/** @brief Calls the real Linux `dup3()` while preserving the recursion guard. */
+/** @brief Real dup3() inside a library section; raw system call before resolution. */
 static int chaos_io_call_real_dup3(int oldfd, int newfd, int flags)
 {
     int previous;
@@ -117,7 +103,7 @@ static int chaos_io_call_real_dup3(int oldfd, int newfd, int flags)
 }
 #endif
 
-/** @brief Calls the real `closedir()` while preserving the recursion guard. */
+/** @brief Real closedir() inside a library section; -1/ENOSYS before resolution. */
 static int chaos_io_call_real_closedir(DIR *directory)
 {
     int previous;
@@ -134,7 +120,7 @@ static int chaos_io_call_real_closedir(DIR *directory)
     return rc;
 }
 
-/** @brief Calls the real `pclose()` while preserving the recursion guard. */
+/** @brief Real pclose() inside a library section; -1/ENOSYS before resolution. */
 static int chaos_io_call_real_pclose(FILE *stream)
 {
     int previous;
@@ -151,7 +137,7 @@ static int chaos_io_call_real_pclose(FILE *stream)
     return rc;
 }
 
-/** @brief Calls the real `fsync()` while preserving the recursion guard. */
+/** @brief Real fsync() inside a library section; raw system call before resolution. */
 static int chaos_io_call_real_fsync(int fd)
 {
     int previous;
@@ -167,7 +153,7 @@ static int chaos_io_call_real_fsync(int fd)
     return rc;
 }
 
-/** @brief Calls the real `fdatasync()` while preserving the recursion guard. */
+/** @brief Real fdatasync() inside a library section; raw system call before resolution. */
 static int chaos_io_call_real_fdatasync(int fd)
 {
     int previous;
@@ -184,21 +170,19 @@ static int chaos_io_call_real_fdatasync(int fd)
 }
 
 /**
- * @brief Interposed `close(2)` entry point.
+ * @brief Interposed close(2): `close` rules; the descriptor is always closed, an injected
+ *        error is reported after the close.
  *
- * @details Linux releases the descriptor in every case, even when `close()`
- * reports an error (EIO on NFS write-back, EINTR), and programs therefore never
- * retry it. The wrapper keeps that contract: the real close always runs, and an
- * injected error is reported after it. A synthetic error that left the descriptor
- * open would leak it in exactly the programs that handle close correctly.
+ * @details The rule is matched before the close (afterwards the descriptor has no path).
+ * The real close is the next definition in the chain (another libchaos library or libc),
+ * so a library later in `LD_PRELOAD` that also wraps close sees every call, injected
+ * failures included. The cache slot is invalidated whatever close returned: the number
+ * may be handed out again by the next open. The ERRNO decision (and its hit) happens
+ * after the close.
  *
- * The real close is the next definition in the chain (another chaos library or
- * libc), so a library that shares `close` sees every call. The cache entry is
- * invalidated whatever the close returned, for the same reason: the descriptor is
- * gone and its number may be handed out again by the next open.
- *
- * @param[in] fd  File descriptor to close.
- * @return 0 on success; -1 with `errno` set on a real or injected failure.
+ * @param[in] fd  Descriptor to close.
+ * @return The real result, or -1 with the rule's errno when an ERRNO rule fired (the
+ *         descriptor is closed either way).
  */
 CHAOS_IO_EXPORT int close(int fd)
 {
@@ -224,10 +208,11 @@ CHAOS_IO_EXPORT int close(int fd)
 }
 
 /**
- * @brief Interposed `dup2(2)`: forwards unchanged, then invalidates @p newfd.
+ * @brief Interposed dup2(2): no rules; on success invalidates @p newfd.
  *
- * @details dup2 silently closes @p newfd when it was open and makes it refer to
- * @p oldfd's file, so whatever the cache held for @p newfd is stale.
+ * @details dup2 silently closes @p newfd when it was open and points it at @p oldfd's
+ * file, so whatever the cache held for @p newfd is stale. Equal descriptors change
+ * nothing and are not invalidated.
  */
 CHAOS_IO_EXPORT int dup2(int oldfd, int newfd)
 {
@@ -243,9 +228,7 @@ CHAOS_IO_EXPORT int dup2(int oldfd, int newfd)
 }
 
 #ifdef __linux__
-/**
- * @brief Interposed Linux `dup3(2)`: forwards unchanged, then invalidates @p newfd.
- */
+/** @brief Interposed dup3(2): no rules; on success invalidates @p newfd, as dup2(). */
 CHAOS_IO_EXPORT int dup3(int oldfd, int newfd, int flags)
 {
     int rc;
@@ -261,17 +244,18 @@ CHAOS_IO_EXPORT int dup3(int oldfd, int newfd, int flags)
 #endif
 
 #ifndef CLOSE_RANGE_CLOEXEC
-/** @brief close_range(2) flag: mark the range close-on-exec instead of closing it. */
+/** @brief close_range(2) flag (Linux 5.11): mark the range close-on-exec instead of closing. */
 #define CLOSE_RANGE_CLOEXEC (1U << 2)
 #endif
 
 /**
- * @brief Interposed `close_range(2)`: forwards unchanged, then invalidates the range.
+ * @brief Interposed close_range(2): no rules; on success invalidates the closed range.
  *
- * @details Reports ENOSYS when the C library has no `close_range`, as that libc
- * itself would. With CLOSE_RANGE_CLOEXEC nothing is closed now (the descriptors
- * go at exec, together with this process image), so nothing is invalidated.
- * A range at least as wide as the cache invalidates every slot.
+ * @details -1/ENOSYS when libc has no close_range (glibc before 2.34, musl), which is what
+ * a program linked against such a libc would get. With CLOSE_RANGE_CLOEXEC nothing closes
+ * now (the descriptors go at exec, together with this image and its cache), so nothing is
+ * invalidated. A range of 32 descriptors or more covers every slot and resets the whole
+ * cache instead of looping, which also bounds the cost of `close_range(3, ~0U, 0)`.
  */
 CHAOS_IO_EXPORT int close_range(unsigned int first, unsigned int last, int flags)
 {
@@ -305,11 +289,11 @@ CHAOS_IO_EXPORT int close_range(unsigned int first, unsigned int last, int flags
 }
 
 /**
- * @brief Interposed `closedir(3)`: closes the directory, then forgets its descriptor.
+ * @brief Interposed closedir(3): closes the directory, then invalidates its descriptor.
  *
- * @details The C library closes a directory's descriptor with its own system call,
- * which the close() wrapper never sees; the next descriptor with that number would
- * otherwise be taken for the directory.
+ * @details libc closes a directory's descriptor with its own system call, which close()
+ * never sees; the next descriptor with that number would otherwise be matched as the
+ * directory. errno from dirfd() is discarded; the result and errno are closedir()'s.
  */
 CHAOS_IO_EXPORT int closedir(DIR *directory)
 {
@@ -317,7 +301,8 @@ CHAOS_IO_EXPORT int closedir(DIR *directory)
     int fd;
     int rc;
 
-    /* Declared nonnull: read through a volatile so a NULL test is not dropped. */
+    /* closedir is declared nonnull, so the compiler may delete a plain NULL test; reading
+     * the pointer through a volatile keeps the test. */
     DIR *volatile checked = directory;
 
     chaos_io_ensure_symbols();
@@ -329,9 +314,8 @@ CHAOS_IO_EXPORT int closedir(DIR *directory)
 }
 
 /**
- * @brief Interposed `pclose(3)`: closes the pipe stream, then forgets its descriptor.
- *
- * @details Like closedir(): the C library closes the descriptor itself.
+ * @brief Interposed pclose(3): closes the pipe stream, then invalidates its descriptor;
+ *        libc closes it with its own system call, as for closedir().
  */
 CHAOS_IO_EXPORT int pclose(FILE *stream)
 {
@@ -350,13 +334,17 @@ CHAOS_IO_EXPORT int pclose(FILE *stream)
 }
 
 #ifndef SYS_close_range
-/** @brief close_range(2), Linux 5.9: the same number on x86_64 and aarch64. */
+/** @brief close_range(2) system call number (Linux 5.9): 436 on x86_64 and aarch64 alike. */
 #define SYS_close_range 436
 #endif
 
 /**
- * @brief closefrom() where the C library has none: the close_range system call
- *        (Linux 5.9), else every descriptor up to the limit, as glibc does.
+ * @brief closefrom() for a libc without one: the close_range system call (Linux 5.9+),
+ *        else close() on every descriptor below `sysconf(_SC_OPEN_MAX)`, as glibc's
+ *        fallback does. errno preserved.
+ *
+ * @details Raw system calls, so a later library's close wrapper does not see each close
+ * (glibc's closefrom behaves the same).
  */
 static void chaos_io_close_from(int lowfd)
 {
@@ -382,13 +370,13 @@ static void chaos_io_close_from(int lowfd)
 }
 
 /**
- * @brief Interposed `closefrom(3)`: closes every descriptor from @p lowfd up, then
- *        forgets them all.
+ * @brief Interposed closefrom(3): closes every descriptor >= @p lowfd, then resets the
+ *        whole fd cache.
  *
- * @details glibc closes them with the close_range system call, which the
- * close_range() wrapper never sees. Exported also where the C library has no
- * closefrom (musl, glibc before 2.34), so it works there too instead of being a
- * function that does nothing.
+ * @details glibc closes them with the close_range system call, which the close_range()
+ * wrapper never sees. Exported also where libc has no closefrom (musl, glibc before 2.34),
+ * where chaos_io_close_from() provides it, so a program that finds the symbol at run time
+ * gets a working implementation.
  */
 CHAOS_IO_EXPORT void closefrom(int lowfd)
 {
@@ -409,14 +397,12 @@ CHAOS_IO_EXPORT void closefrom(int lowfd)
 }
 
 /**
- * @brief Interposed `fsync(2)` entry point.
+ * @brief Interposed fsync(2): `fsync` rules; ERRNO fails without syncing, LATENCY delays.
  *
- * @details There is no post-call mutation path. Once libc has been called, the wrapper
- * is finished.  The `TORN` and `CORRUPT` effects are not applicable to a sync
- * operation; the config validator rejects such rules at parse time.
+ * @details An injected EIO models the classic lost write-back error: the data the caller
+ * believes durable is not.
  *
- * @param[in] fd  File descriptor to flush.
- * @return 0 on success; -1 with `errno` set on failure.
+ * @return 0 on success; -1 with errno on a real or injected failure.
  */
 CHAOS_IO_EXPORT int fsync(int fd)
 {
@@ -441,14 +427,10 @@ CHAOS_IO_EXPORT int fsync(int fd)
 }
 
 /**
- * @brief Interposed `fdatasync(2)` entry point.
+ * @brief Interposed fdatasync(2): `fdatasync` rules, same semantics as fsync() (separate
+ *        operation so the two can be faulted independently).
  *
- * @details Execution sequence is intentionally identical to `fsync()`.
- * The two operations share the same fault semantics: both can be delayed or
- * made to return an error; neither produces observable data output.
- *
- * @param[in] fd  File descriptor to flush.
- * @return 0 on success; -1 with `errno` set on failure.
+ * @return 0 on success; -1 with errno on a real or injected failure.
  */
 CHAOS_IO_EXPORT int fdatasync(int fd)
 {

@@ -1,20 +1,16 @@
 /**
  * @file chaos_domain_stub.c
- * @brief Implementation of the domain-stub constructor scaffold.
+ * @brief Records the identity of a domain library from its constructor.
  *
- * Stores the library identity metadata supplied by a domain constructor into
- * `volatile` module-level globals. The `volatile` qualifier is intentional: it
- * prevents the compiler from treating these write-only assignments as dead stores
- * and eliding them, which would make the constructor path invisible in a stripped
- * binary even though it still ran.
+ * @details
+ * Not compiled into any target: no Makefile rule builds this file and no library calls
+ * chaos_domain_stub_init(). All six libraries (`libchaos-io`, `-net`, `-dns`, `-time`,
+ * `-memory`, `-process`) have their own runtime and constructor. The file is kept as the
+ * original scaffold; see chaos_domain_stub.h.
  *
- * The stub libraries intentionally do almost nothing today. Keeping the domain
- * metadata in volatile storage makes the constructor path explicit and gives the
- * future real runtimes a stable place to grow from.
- *
- * Coverage note: the two storage globals are written once per process via the
- * domain constructor and are never read back in production code. Tests that verify
- * constructor execution check them indirectly through the public API.
+ * The two globals are `volatile` because they are written and never read: without the
+ * qualifier the compiler may drop both stores as dead, and the constructor would leave
+ * no trace in an optimised binary.
  */
 
 #include "chaos_domain_stub.h"
@@ -22,39 +18,30 @@
 #include <stddef.h>
 
 /**
- * @brief Last library name written by a call to `chaos_domain_stub_init()`.
+ * @brief Library name of the last chaos_domain_stub_init() call; NULL before the first.
  *
- * Declared `volatile` so the assignment is not optimised away by the compiler even
- * when the value is never read in the same compilation unit. Initialised to NULL;
- * updated to a static string literal on the first constructor call.
+ * `volatile` keeps the write-only store from being eliminated. The pointer is stored,
+ * not copied, so it must point to storage that lives as long as the process.
  */
 static volatile const char *g_chaos_stub_last_library = NULL;
 
 /**
- * @brief Last config path written by a call to `chaos_domain_stub_init()`.
+ * @brief Rule-file path of the last chaos_domain_stub_init() call; NULL before the first.
  *
- * Same lifetime and volatility contract as `g_chaos_stub_last_library`.
+ * Same lifetime and `volatile` contract as g_chaos_stub_last_library.
  */
 static volatile const char *g_chaos_stub_last_config = NULL;
 
 /**
- * @brief Store domain identity metadata from a library constructor.
+ * @brief Stores the library name and rule-file path of @p descriptor.
  *
- * Records @p descriptor->library_name and @p descriptor->config_path in the
- * module-level volatile globals. A NULL @p descriptor is silently ignored so
- * that callers do not need to guard against the degenerate case.
+ * Intended caller: a domain's `__attribute__((constructor))` function, at load time
+ * and therefore on one thread. The globals are written without synchronisation and
+ * are not safe to update from several threads at once.
  *
- * Triggering condition: called from a domain's `__attribute__((constructor))`
- * function during `dlopen` / process startup.
- *
- * Observable behaviour: after a non-NULL call, `g_chaos_stub_last_library` and
- * `g_chaos_stub_last_config` hold the corresponding pointer values from the
- * descriptor. Because both fields are `volatile`, the writes are not dead-store
- * eliminated even in optimised builds.
- *
- * @param descriptor  Filled-in descriptor provided by the domain constructor.
- *                    Must remain valid for the lifetime of the process; the pointers
- *                    are stored, not copied.
+ * @param descriptor  Descriptor whose two string pointers are stored, not copied; they
+ *                    must stay valid for the life of the process. NULL is a no-op and
+ *                    leaves the previous values in place.
  */
 void chaos_domain_stub_init(const chaos_domain_stub_descriptor_t *descriptor)
 {

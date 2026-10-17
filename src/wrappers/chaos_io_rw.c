@@ -1,66 +1,39 @@
 /**
  * @file chaos_io_rw.c
- * @brief Read and write wrappers for libchaos-io.
+ * @brief Descriptor read/write wrappers: read, readv, pread, preadv, write, writev, pwrite,
+ *        pwritev, sendfile, copy_file_range (and glibc `64` and fortified `_chk` variants).
  *
  * @details
- * This file implements the interposed entry points for all read- and
- * write-class I/O operations: `read`, `readv`, `write`, `writev`, `pread`,
- * `preadv`, `pwrite`, `pwritev`, and (on Linux) `sendfile` and
- * `copy_file_range`.  All of them operate on existing file descriptors and
- * share the same fd-backed rule lookup path (`chaos_io_match_fd_rule`).
+ * All of them look up their rule with chaos_io_match_fd_rule() on the descriptor.
  *
- * **Effect application for read-class operations:**
- * - `LATENCY`: applied pre-call, before the real syscall.
- * - `ERRNO`: applied pre-call; the real syscall is skipped.
- * - `CORRUPT`: applied post-call, to the bytes returned by the real syscall.
- *   Corruption is only applied when `rc > 0` (data was actually returned).
- * - `TORN` is not supported for reads.  A torn read cannot be distinguished
- *   from a genuine short read (EOF, socket, pipe) by the caller, and the
- *   library cannot guarantee the real call will return a predictable count.
+ * | Wrapper | Operation | Effects applied |
+ * |---------|-----------|-----------------|
+ * | read, readv | `read` | ERRNO, LATENCY before; CORRUPT after a read of > 0 bytes |
+ * | pread, preadv | `pread` | ERRNO, LATENCY before; CORRUPT after a read of > 0 bytes |
+ * | write, writev | `write` | ERRNO, LATENCY before; TORN shortens the request |
+ * | pwrite, pwritev | `pwrite` | ERRNO, LATENCY before; TORN shortens the request |
+ * | sendfile, copy_file_range | `write` on the output descriptor | ERRNO, LATENCY, TORN |
  *
- * **Effect application for write-class operations:**
- * - `LATENCY`: applied pre-call.
- * - `ERRNO`: applied pre-call; the real syscall is skipped.
- * - `TORN`: applied pre-call by reducing the byte count (or iovec span)
- *   passed to the real syscall.  The real call succeeds with the shortened
- *   count, which is returned to the caller as-is.  This models the kernel
- *   returning a partial write, which higher-level callers that check return
- *   values must handle.
- * - `CORRUPT` is not supported for writes.
+ * @par TORN
+ * The real call runs with a byte count in [1, n-1], so the caller sees a successful short
+ * write, exactly what a kernel may return and what a correct write loop must handle.
+ * Vectored writes get a trimmed copy of the iovec array covering that many bytes; vectors
+ * longer than CHAOS_IO_TORN_MAX_IOV (64) entries are written whole and count no hit.
  *
- * **Vectored I/O and torn writes.**
- * For `writev` and `pwritev`, a torn write cannot be expressed as a simple
- * byte-count reduction; the real call expects a valid iovec array.
- * `chaos_io_build_torn_iovecs()` converts the total torn byte budget back
- * into a truncated iovec view, built from a bounded copy of the caller's array
- * (at most CHAOS_IO_TORN_MAX_IOV entries; longer vectors are not torn).
+ * @par CORRUPT
+ * One bit of the bytes actually returned is flipped after the real call. For readv/preadv
+ * the returned bytes are treated as one stream across the segments. No corruption on EOF
+ * or error: there are no bytes to corrupt, and turning a detectable error into silent
+ * corruption would change what is being tested.
  *
- * **The caller's iovec array.**  It is read only once a rule matched, never past
- * IOV_MAX entries, and through a checked copy (process_vm_readv on this process),
- * so an invalid array still fails in the kernel with EINVAL or EFAULT instead of
- * crashing in the wrapper.
+ * @par The caller's iovec array
+ * Read only after a rule matched, never past IOV_MAX entries, and through a checked copy
+ * (process_vm_readv on this process), so an invalid array still fails in the kernel with
+ * EINVAL or EFAULT instead of crashing in the wrapper.
  *
- * **Corruption over vectored reads.**
- * `readv` and `preadv` return bytes scattered across multiple iovec segments.
- * `chaos_io_corrupt_iovecs()` treats the segments as a single logical byte
- * stream and picks a corruption target from the combined range, then maps
- * the selected byte index back to the correct segment.
- *
- * **`sendfile` and `copy_file_range` (Linux only).**
- * Both are treated as write-class operations on `out_fd`.  Only `ERRNO`,
- * `LATENCY`, and `TORN` are supported; `CORRUPT` would require copying the
- * kernel-to-kernel data into user space, which is contrary to the entire
- * purpose of these syscalls.
- *
- * **Module ownership:** wrappers/
- * **Stability:** internal
- */
-
-/*
- * Read- and write-side wrappers for libchaos-io.
- *
- * These wrappers all operate on existing file descriptors and therefore share
- * the same fd-backed rule lookup path.
+ * @par sendfile and copy_file_range (Linux)
+ * Treated as writes to the output descriptor. CORRUPT cannot be applied: the data moves
+ * inside the kernel and never passes through a user buffer.
  */
 
 #include "chaos_io_actions.h"
@@ -71,25 +44,29 @@
 #include <sys/syscall.h>
 #include <sys/uio.h>
 
-/** @brief Most iovec entries the kernel accepts. */
+/** @brief Most iovec entries the kernel accepts (IOV_MAX, 1024 on Linux). */
 #ifdef IOV_MAX
 #define CHAOS_IO_MAX_IOV IOV_MAX
 #else
 #define CHAOS_IO_MAX_IOV 1024
 #endif
 
-/** @brief Longest vector TORN shortens; a longer one is written whole. */
+/** @brief Longest vector TORN shortens (bounds the on-stack copy); longer ones are written
+ *         whole. */
 #define CHAOS_IO_TORN_MAX_IOV 64
 
 /**
- * @brief Copies @p count entries of the caller's array at @p iov into @p out.
+ * @brief Copies @p count entries of the caller's iovec array into @p out without faulting
+ *        on an invalid pointer.
  *
- * @details Through process_vm_readv on this very process, so an unmapped array
- * is reported instead of faulting. Where that call is unavailable (ENOSYS, or a
- * sandbox's EPERM) the array is copied directly, as the kernel will read it anyway.
- * Unit tests replace the copy.
+ * @details process_vm_readv(2) on this process returns EFAULT for unmapped memory instead
+ * of raising SIGSEGV in the wrapper. Where it is unavailable (ENOSYS, or EPERM from a
+ * seccomp profile such as Docker's default) the array is copied with memcpy: the kernel
+ * is about to read
+ * it anyway, so a fault there is the one the program would have taken. errno is
+ * preserved. Test seam: CHAOS_IO_PROCESS_VM_READV.
  *
- * @return 0, or -1 when the array cannot be read.
+ * @return 0 when all entries were copied; -1 when the array cannot be read.
  */
 #ifndef CHAOS_IO_PROCESS_VM_READV
 #define CHAOS_IO_PROCESS_VM_READV(local, remote)                                                   \
@@ -117,22 +94,15 @@ static int chaos_io_read_iovecs(const struct iovec *iov, int count, struct iovec
 }
 
 /**
- * @brief Returns the total byte count covered by an iovec array when it fits in `ssize_t`.
+ * @brief Sums the lengths of an iovec array (already copied into wrapper memory).
  *
- * @details Torn vectored writes need a concrete byte budget so the wrapper can present a
- * shortened logical request to libc. If the vector metadata is invalid or the
- * sum would overflow the real system-call contract, the helper returns zero and
- * the wrapper falls back to the original call without trying to reshape it.
+ * @details The bound is SSIZE_MAX, not SIZE_MAX, because the kernel rejects a vector
+ * whose total exceeds it with EINVAL; such a call is passed through unchanged.
  *
- * The overflow check uses `SSIZE_MAX` rather than `SIZE_MAX` because the write
- * syscall's return type is `ssize_t`; a total that overflows `ssize_t` would
- * be impossible to report correctly even if the kernel accepted it.
- *
- * @param[in]  iov     iovec array.  May be NULL (returns 0 immediately).
- * @param[in]  iovcnt  Number of entries in `iov`.
- * @param[out] total   Receives the summed byte count on success.  Must not be NULL.
- * @return Non-zero when the sum was computed successfully; zero on overflow or
- *         invalid input.
+ * @param[in]  iov     Array; NULL returns 0.
+ * @param[in]  iovcnt  Entries; <= 0 returns 0.
+ * @param[out] total   Receives the sum (0 on failure); NULL returns 0.
+ * @return Non-zero when the sum fits in ssize_t; 0 otherwise.
  */
 static int chaos_io_iovec_total_bytes(const struct iovec *iov, int iovcnt, size_t *total)
 {
@@ -162,7 +132,13 @@ static int chaos_io_iovec_total_bytes(const struct iovec *iov, int iovcnt, size_
     return 1;
 }
 
-/** @brief Byte count of an iovec array for `@size` gates; CHAOS_POLICY_NO_SIZE if unknown. */
+/**
+ * @brief Byte count of the caller's iovec array for `@size` gates; CHAOS_POLICY_NO_SIZE when
+ *        the array is invalid or unreadable.
+ *
+ * @details Reads the array through chaos_io_read_iovecs() in chunks of 64 entries, so any
+ * length up to IOV_MAX is summed with a bounded stack buffer.
+ */
 static uint64_t chaos_io_iovec_size(const struct iovec *iov, int iovcnt)
 {
     struct iovec chunk[CHAOS_IO_TORN_MAX_IOV];
@@ -171,7 +147,7 @@ static uint64_t chaos_io_iovec_size(const struct iovec *iov, int iovcnt)
 
     if (iov == NULL || iovcnt < 0 || iovcnt > CHAOS_IO_MAX_IOV)
     {
-        return CHAOS_POLICY_NO_SIZE; /* the kernel rejects it: nothing to read */
+        return CHAOS_POLICY_NO_SIZE; /* the kernel rejects it with EINVAL: do not read it */
     }
     while (done < iovcnt)
     {
@@ -191,30 +167,18 @@ static uint64_t chaos_io_iovec_size(const struct iovec *iov, int iovcnt)
 }
 
 /**
- * @brief Builds a truncated iovec view that covers exactly `limit` bytes.
+ * @brief Writes into @p target the prefix of @p source that covers exactly @p limit bytes.
  *
- * @details The wrapper uses this for `TORN` on vectored writes so the real libc call
- * still receives a structurally valid iovec array whose total byte span matches
- * the shortened logical write size.
+ * @details Whole segments are copied while they fit; the segment that crosses the limit
+ * is trimmed; later segments are dropped. Zero-length segments before the limit is
+ * reached are kept, so buffer pointers stay in their original order.
  *
- * Segments whose full length fits within the remaining budget are copied
- * verbatim.  The segment that straddles the budget boundary has its `iov_len`
- * trimmed to the remaining byte count.  Segments beyond that boundary are
- * simply not included (the target array is written only up to `*target_count`).
- *
- * An empty segment (`iov_len == 0`) is included in the output only if `remaining > 0`
- * when it is encountered; otherwise the loop exits because the budget is
- * already exhausted.
- *
- * @param[in]  source        Original iovec array.  Must not be NULL.
- * @param[in]  source_count  Number of entries in `source`.
- * @param[in]  limit         Maximum total byte count for the output array.
- * @param[out] target        Pre-allocated array for the truncated view.  Must
- *                           not be NULL and must have room for at least
- *                           `source_count` entries.
- * @param[out] target_count  Receives the number of valid entries written to
- *                           `target`.  Must not be NULL.
- * @return Non-zero when at least one segment was written; zero on invalid input.
+ * @param[in]  source        Array (wrapper copy); NULL returns 0.
+ * @param[in]  source_count  Entries; <= 0 returns 0.
+ * @param[in]  limit         Bytes the result covers; must not exceed the source total.
+ * @param[out] target        Room for @p source_count entries; NULL returns 0.
+ * @param[out] target_count  Entries written; NULL returns 0.
+ * @return Non-zero when at least one entry was written.
  */
 static int chaos_io_trim_iovecs(
     const struct iovec *source,
@@ -255,25 +219,17 @@ static int chaos_io_trim_iovecs(
 }
 
 /**
- * @brief Derives a torn vectored-write view from the caller's original iovec array.
+ * @brief Draws a torn byte count for @p source and builds the trimmed vector.
  *
- * @details Computes the total byte count of `source`, draws a torn count from
- * the PRNG, and delegates to `chaos_io_trim_iovecs()` with the shortened
- * budget.
+ * @details Returns 0 (write unchanged) when the total is unknown or 0, or when the drawn
+ * count is not a real tear: a total of 1 byte cannot be torn (chaos_io_torn_count()
+ * returns 1), and the check also guards the [1, total-1] contract.
  *
- * Returns zero (passthrough) when the total byte count cannot be computed,
- * when the total is zero, or when the PRNG returns a torn count equal to or
- * greater than the total (which would be a zero-length "partial" write and
- * should not happen given `chaos_io_torn_count` guarantees, but is guarded
- * defensively).
- *
- * @param[in]  source        Original iovec.  Must not be NULL.
- * @param[in]  source_count  Number of entries.
- * @param[out] target        Pre-allocated iovec array (at least `source_count`
- *                           entries) for the truncated view.  Must not be NULL.
- * @param[out] target_count  Receives the valid entry count.  Must not be NULL.
- * @return Non-zero when a valid torn view was built; zero to fall back to the
- *         original write.
+ * @param[in]  source        Array (wrapper copy).
+ * @param[in]  source_count  Entries.
+ * @param[out] target        Room for @p source_count entries.
+ * @param[out] target_count  Entries written.
+ * @return Non-zero when a torn vector was built.
  */
 static int chaos_io_build_torn_iovecs(
     const struct iovec *source, int source_count, struct iovec *target, int *target_count
@@ -297,10 +253,11 @@ static int chaos_io_build_torn_iovecs(
 }
 
 /**
- * @brief Shortens the caller's vector for TORN into @p torn; 0 when it cannot be.
+ * @brief Builds a torn copy of the caller's vector in @p torn (room for
+ *        CHAOS_IO_TORN_MAX_IOV entries); 0 when it cannot be torn.
  *
- * @details Works on a checked copy of at most CHAOS_IO_TORN_MAX_IOV entries, so
- * neither an invalid array nor a long one reaches anything but the kernel.
+ * @details Works on a checked copy (chaos_io_read_iovecs()) of at most 64 entries, so an
+ * invalid or long array reaches only the kernel. Draws one PRNG sample when it tears.
  */
 static int chaos_io_tear_iovecs(const struct iovec *iov, int iovcnt, struct iovec *torn, int *count)
 {
@@ -312,25 +269,16 @@ static int chaos_io_tear_iovecs(const struct iovec *iov, int iovcnt, struct iove
 }
 
 /**
- * @brief Corrupts one byte across a logical iovec byte stream.
+ * @brief CORRUPT for readv/preadv: flips one bit among the first @p size bytes of the
+ *        scattered result, chosen uniformly over the whole stream.
  *
- * @details `readv()` and `preadv()` expose one contiguous logical read result even
- * though the destination spans multiple buffers, so corruption sampling happens
- * across the logical byte range and then targets the selected segment.
+ * @details Draws byte then bit sample, like chaos_io_corrupt_buffer(), maps the byte
+ * offset to its segment and flips the bit there. Reads the caller's array directly: the
+ * real call just succeeded with it, so it is valid.
  *
- * The byte index is sampled from [0, size) treating all segments as a
- * contiguous address space.  The helper then walks the iovec array, subtracting
- * each segment's length until it finds the segment that contains the target
- * index, then calls `chaos_io_corrupt_buffer_sample()` with the within-segment
- * index.
- *
- * Both PRNG samples are drawn before the walk so the two-draw sequence is
- * consistent with `chaos_io_corrupt_buffer()`.
- *
- * @param[in,out] iov     The iovec array whose buffers may be corrupted.
- * @param[in]     iovcnt  Number of entries in `iov`.
- * @param[in]     size    Total number of bytes returned by the real read call.
- *                        May be smaller than the sum of `iov_len` values.
+ * @param[in] iov     Caller's array; the bytes its entries point to are modified.
+ * @param[in] iovcnt  Entries.
+ * @param[in] size    Bytes the real call returned; may be less than the array's total.
  */
 static void chaos_io_corrupt_iovecs(const struct iovec *iov, int iovcnt, size_t size)
 {
@@ -375,14 +323,18 @@ static void chaos_io_corrupt_iovecs(const struct iovec *iov, int iovcnt, size_t 
 /* --- Real-call trampolines ------------------------------------------------------- */
 
 /*
- * Each trampoline makes the system call itself while its `g_chaos_io_real_*`
- * pointer is still NULL: a call that arrives during symbol resolution.
+ * Each trampoline calls the real function inside a library section, so libc I/O made from
+ * inside it is not matched again, and issues the system call itself while its
+ * `g_chaos_io_real_*` pointer is still NULL (a call during symbol resolution).
  */
 
-/** @brief Splits a file offset into the low and high words preadv/pwritev take. */
+/**
+ * @brief The offset as the low and high words the preadv/pwritev system calls take (they
+ *        split it even on 64-bit kernels; the high word is ignored there).
+ */
 #define CHAOS_IO_OFFSET_WORDS(offset) (long)(offset), (long)((uint64_t)(offset) >> 32)
 
-/** @brief Calls the real `read()` while preserving the recursion guard. */
+/** @brief Real read() inside a library section; raw system call before resolution. */
 static ssize_t chaos_io_call_real_read(int fd, void *buffer, size_t count)
 {
     int previous;
@@ -398,7 +350,7 @@ static ssize_t chaos_io_call_real_read(int fd, void *buffer, size_t count)
     return result;
 }
 
-/** @brief Calls the real `write()` while preserving the recursion guard. */
+/** @brief Real write() inside a library section; raw system call before resolution. */
 static ssize_t chaos_io_call_real_write(int fd, const void *buffer, size_t count)
 {
     int previous;
@@ -414,7 +366,7 @@ static ssize_t chaos_io_call_real_write(int fd, const void *buffer, size_t count
     return result;
 }
 
-/** @brief Calls the real `pread()` while preserving the recursion guard. */
+/** @brief Real pread() inside a library section; raw pread64 before resolution. */
 static ssize_t chaos_io_call_real_pread(int fd, void *buffer, size_t count, off_t offset)
 {
     int previous;
@@ -430,7 +382,7 @@ static ssize_t chaos_io_call_real_pread(int fd, void *buffer, size_t count, off_
     return result;
 }
 
-/** @brief Calls the real `pwrite()` while preserving the recursion guard. */
+/** @brief Real pwrite() inside a library section; raw pwrite64 before resolution. */
 static ssize_t chaos_io_call_real_pwrite(int fd, const void *buffer, size_t count, off_t offset)
 {
     int previous;
@@ -446,7 +398,7 @@ static ssize_t chaos_io_call_real_pwrite(int fd, const void *buffer, size_t coun
     return result;
 }
 
-/** @brief Calls the real `readv()` while preserving the recursion guard. */
+/** @brief Real readv() inside a library section; raw system call before resolution. */
 static ssize_t chaos_io_call_real_readv(int fd, const struct iovec *iov, int iovcnt)
 {
     int previous;
@@ -462,7 +414,7 @@ static ssize_t chaos_io_call_real_readv(int fd, const struct iovec *iov, int iov
     return result;
 }
 
-/** @brief Calls the real `writev()` while preserving the recursion guard. */
+/** @brief Real writev() inside a library section; raw system call before resolution. */
 static ssize_t chaos_io_call_real_writev(int fd, const struct iovec *iov, int iovcnt)
 {
     int previous;
@@ -478,7 +430,7 @@ static ssize_t chaos_io_call_real_writev(int fd, const struct iovec *iov, int io
     return result;
 }
 
-/** @brief Calls the real `preadv()` while preserving the recursion guard. */
+/** @brief Real preadv() inside a library section; raw system call before resolution. */
 static ssize_t chaos_io_call_real_preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset)
 {
     int previous;
@@ -495,7 +447,7 @@ static ssize_t chaos_io_call_real_preadv(int fd, const struct iovec *iov, int io
     return result;
 }
 
-/** @brief Calls the real `pwritev()` while preserving the recursion guard. */
+/** @brief Real pwritev() inside a library section; raw system call before resolution. */
 static ssize_t chaos_io_call_real_pwritev(int fd, const struct iovec *iov, int iovcnt, off_t offset)
 {
     int previous;
@@ -515,22 +467,14 @@ static ssize_t chaos_io_call_real_pwritev(int fd, const struct iovec *iov, int i
 /* --- Exported interposed symbols ------------------------------------------------- */
 
 /**
- * @brief Interposed `read(2)` entry point.
+ * @brief Interposed read(2): `read` rules; ERRNO or LATENCY before the call, CORRUPT on
+ *        the bytes returned.
  *
- * @details The `CORRUPT` effect is applied only when `rc > 0`.  Applying
- * corruption to a 0-byte return (EOF) would write out of bounds on a
- * zero-size buffer and has no meaningful interpretation.  Applying it to a
- * negative return (error) would corrupt the caller's buffer even though no
- * data was delivered, which would silently change a detectable I/O error into
- * an undetectable data corruption—a strictly worse outcome.
+ * @details `@size` gates see @p count, the requested size. CORRUPT is decided (and
+ * counted) only when the real call returned > 0 bytes; an error or EOF is returned
+ * untouched. The byte count is always the real one.
  *
- * This wrapper never simulates torn reads. If the call succeeds, byte-count
- * semantics come from libc; only the returned bytes may be corrupted afterward.
- *
- * @param[in]  fd      File descriptor to read from.
- * @param[out] buffer  Destination buffer.  Must not be NULL for `count > 0`.
- * @param[in]  count   Maximum number of bytes to read.
- * @return Number of bytes read (≥ 0) on success; -1 with `errno` set on error.
+ * @return Bytes read; -1 with errno on a real or injected failure.
  */
 CHAOS_IO_EXPORT ssize_t read(int fd, void *buffer, size_t count)
 {
@@ -562,15 +506,12 @@ CHAOS_IO_EXPORT ssize_t read(int fd, void *buffer, size_t count)
 }
 
 /**
- * @brief Interposed `readv(2)` entry point.
+ * @brief Interposed readv(2): read() semantics; CORRUPT picks its byte across all segments.
  *
- * @details Semantics match `read()` exactly, but corruption is sampled across the
- * logical concatenation of all returned iovec bytes.
+ * @details `@size` gates see the array's total, read only after a rule matched; an
+ * invalid array yields CHAOS_POLICY_NO_SIZE, so a size-gated rule does not fire.
  *
- * @param[in]  fd      File descriptor to read from.
- * @param[out] iov     Scatter-gather destination.  Must not be NULL for `iovcnt > 0`.
- * @param[in]  iovcnt  Number of entries in `iov`.
- * @return Number of bytes read (≥ 0) on success; -1 with `errno` set on error.
+ * @return Bytes read; -1 with errno on a real or injected failure.
  */
 CHAOS_IO_EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
 {
@@ -582,7 +523,8 @@ CHAOS_IO_EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
     {
         return chaos_io_call_real_readv(fd, iov, iovcnt);
     }
-    /* Read only now that a rule matched: an invalid array costs nothing before. */
+    /* The caller's array is read only now that a rule matched: unmatched calls never
+     * touch it. */
     rule.call_size = chaos_io_iovec_size(iov, iovcnt);
 
     if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
@@ -603,18 +545,14 @@ CHAOS_IO_EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
 }
 
 /**
- * @brief Interposed `write(2)` entry point.
+ * @brief Interposed write(2): `write` rules; ERRNO or LATENCY before the call, TORN
+ *        shortens it.
  *
- * @details Torn writes are modeled as successful short writes, not as post-write
- * corruption. That distinction matters because higher-level callers often
- * branch on the returned byte count.  A caller that writes in a loop checking
- * return values will retry the remaining bytes—which is exactly the
- * interrupted-write scenario this effect is designed to test.
+ * @details TORN passes a count in [1, count-1] to the real write, which succeeds short; a
+ * correct caller loops and writes the rest, an incorrect one loses data, which is what
+ * the effect exposes. A 1-byte write cannot be torn (passes whole, still counted as a hit).
  *
- * @param[in] fd      File descriptor to write to.
- * @param[in] buffer  Source data.  Must not be NULL for `count > 0`.
- * @param[in] count   Number of bytes to write.
- * @return Number of bytes written (≥ 0) on success; -1 with `errno` set on error.
+ * @return Bytes written; -1 with errno on a real or injected failure.
  */
 CHAOS_IO_EXPORT ssize_t write(int fd, const void *buffer, size_t count)
 {
@@ -646,20 +584,14 @@ CHAOS_IO_EXPORT ssize_t write(int fd, const void *buffer, size_t count)
 }
 
 /**
- * @brief Interposed `writev(2)` entry point.
+ * @brief Interposed writev(2): write() semantics; TORN trims the vector to a byte count in
+ *        [1, total-1].
  *
- * @details `TORN` is applied across the logical total byte span, then translated back
- * into a shortened iovec array for the real libc call.
+ * @details The trimmed vector lives in a fixed 64-entry stack array (1 KiB on LP64), so the
+ * wrapper never allocates. A vector that cannot be torn (more than 64 entries, unreadable,
+ * total < 2 bytes) is written whole and the rule counts no hit.
  *
- * The shortened vector lives in a bounded stack array rather than the heap
- * to avoid any dynamic allocation in the hot path.  The library is compiled
- * with `-fno-stack-protector`, so VLA usage is safe from the canary-write
- * reentrancy hazard.
- *
- * @param[in] fd      File descriptor to write to.
- * @param[in] iov     Gather-I/O source array.
- * @param[in] iovcnt  Number of entries in `iov`.
- * @return Number of bytes written on success; -1 with `errno` set on error.
+ * @return Bytes written; -1 with errno on a real or injected failure.
  */
 CHAOS_IO_EXPORT ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
 {
@@ -670,7 +602,7 @@ CHAOS_IO_EXPORT ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
     {
         return chaos_io_call_real_writev(fd, iov, iovcnt);
     }
-    /* Read only now that a rule matched: an invalid array costs nothing before. */
+    /* The caller's array is read only now that a rule matched. */
     rule.call_size = chaos_io_iovec_size(iov, iovcnt);
 
     if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
@@ -686,7 +618,8 @@ CHAOS_IO_EXPORT ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
         struct iovec torn_iov[CHAOS_IO_TORN_MAX_IOV];
         int torn_iovcnt;
 
-        /* Counted only when it can be applied. */
+        /* Tear first, decide second: a hit (and an @first allowance) is consumed only
+         * when the tear can actually be applied. */
         if (chaos_io_tear_iovecs(iov, iovcnt, torn_iov, &torn_iovcnt) &&
             chaos_io_rule_should_trigger(&rule))
         {
@@ -700,11 +633,8 @@ CHAOS_IO_EXPORT ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
 #ifdef __linux__
 
 /**
- * @brief Calls the real Linux `sendfile()` while preserving the recursion guard.
- *
- * @details `sendfile()` is Linux-specific in this library because non-Linux libcs expose
- * incompatible ABIs. The wrapper therefore lives behind `__linux__` and reuses
- * the existing logical `write` rule class on the destination fd.
+ * @brief Real sendfile() inside a library section; raw system call before resolution.
+ *        Linux only: the BSD and macOS sendfile have different signatures.
  */
 static ssize_t chaos_io_call_real_sendfile(int out_fd, int in_fd, off_t *offset, size_t count)
 {
@@ -722,25 +652,13 @@ static ssize_t chaos_io_call_real_sendfile(int out_fd, int in_fd, off_t *offset,
 }
 
 /**
- * @brief Interposed `sendfile(2)` entry point (Linux only).
+ * @brief Interposed sendfile(2): `write` rules on @p out_fd; ERRNO, LATENCY, TORN.
  *
- * @details The library treats Linux `sendfile()` as a destination-side logical write.
- * Matching therefore happens on `out_fd`, and the supported effects mirror the
- * write path: `ERRNO`, `LATENCY`, and `TORN`.
+ * @details TORN shortens @p count, so the caller sees a partial transfer (and the kernel
+ * advances @p offset only by what was sent). CORRUPT never applies: the data stays in the
+ * kernel. `pread`/`read` rules on @p in_fd are not consulted.
  *
- * `CORRUPT` is not supported because the data transfer happens entirely inside
- * the kernel and never passes through a user-space buffer that could be modified.
- *
- * The `TORN` effect reduces `count`; when `sendfile` returns the shortened
- * count the caller observes a partial transfer, which is the intended chaos
- * scenario.
- *
- * @param[in]  out_fd  Destination file descriptor (write side); used for rule matching.
- * @param[in]  in_fd   Source file descriptor (read side).
- * @param[in,out] offset  If non-NULL, starting file offset in `in_fd`;
- *                        updated by the kernel to reflect bytes transferred.
- * @param[in]  count   Maximum bytes to transfer.
- * @return Bytes transferred on success; -1 with `errno` set on error.
+ * @return Bytes transferred; -1 with errno on a real or injected failure.
  */
 CHAOS_IO_EXPORT ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count)
 {
@@ -770,10 +688,8 @@ CHAOS_IO_EXPORT ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t co
 }
 
 /**
- * @brief Calls the real Linux `copy_file_range()` while preserving the recursion guard.
- *
- * @details Like `sendfile()`, this wrapper exists only on Linux and reuses the logical
- * `write` rule class on the destination fd.
+ * @brief Real copy_file_range() inside a library section; raw system call before resolution,
+ *        ENOSYS where the headers lack the system call number.
  */
 static ssize_t chaos_io_call_real_copy_file_range(
     int in_fd, off_t *in_offset, int out_fd, off_t *out_offset, size_t count, unsigned int flags
@@ -799,22 +715,12 @@ static ssize_t chaos_io_call_real_copy_file_range(
 }
 
 /**
- * @brief Interposed `copy_file_range(2)` entry point (Linux only).
+ * @brief Interposed copy_file_range(2): `write` rules on @p out_fd; ERRNO, LATENCY, TORN.
  *
- * @details The library treats Linux `copy_file_range()` as a destination-side logical
- * write. Matching therefore happens on `out_fd`, and the supported effects
- * mirror the write path: `ERRNO`, `LATENCY`, and `TORN`.
+ * @details Same model as sendfile(): TORN shortens @p count, CORRUPT never applies, the
+ * input descriptor is not matched.
  *
- * `CORRUPT` is not supported for the same reason as `sendfile`: the data
- * never passes through user space.
- *
- * @param[in]  in_fd       Source file descriptor.
- * @param[in,out] in_offset  Byte offset in source; updated on success.
- * @param[in]  out_fd      Destination file descriptor; used for rule matching.
- * @param[in,out] out_offset Byte offset in destination; updated on success.
- * @param[in]  count       Maximum bytes to copy.
- * @param[in]  flags       Reserved; must be zero.
- * @return Bytes copied on success; -1 with `errno` set on error.
+ * @return Bytes copied; -1 with errno on a real or injected failure.
  */
 CHAOS_IO_EXPORT ssize_t copy_file_range(
     int in_fd, off_t *in_offset, int out_fd, off_t *out_offset, size_t count, unsigned int flags
@@ -850,17 +756,10 @@ CHAOS_IO_EXPORT ssize_t copy_file_range(
 #endif
 
 /**
- * @brief Interposed `pread(2)` entry point.
+ * @brief Interposed pread(2): read() semantics with `pread` rules; the offset does not
+ *        take part in matching.
  *
- * @details Execution sequence matches `read()` exactly except that the supplied `offset`
- * is part of the real libc call.  The offset does not affect rule matching;
- * the same `PREAD` operation rule applies regardless of the offset value.
- *
- * @param[in]  fd      File descriptor.
- * @param[out] buffer  Destination buffer.
- * @param[in]  count   Maximum bytes to read.
- * @param[in]  offset  File offset at which to read; does not advance `fd`'s position.
- * @return Number of bytes read on success; -1 on error.
+ * @return Bytes read; -1 with errno on a real or injected failure.
  */
 CHAOS_IO_EXPORT ssize_t pread(int fd, void *buffer, size_t count, off_t offset)
 {
@@ -892,16 +791,9 @@ CHAOS_IO_EXPORT ssize_t pread(int fd, void *buffer, size_t count, off_t offset)
 }
 
 /**
- * @brief Interposed `preadv(2)` entry point.
+ * @brief Interposed preadv(2): readv() semantics with `pread` rules.
  *
- * @details Execution order matches `pread()`, including post-read corruption over the
- * logical concatenation of returned bytes.
- *
- * @param[in]  fd      File descriptor.
- * @param[out] iov     Scatter-gather destination array.
- * @param[in]  iovcnt  Number of entries in `iov`.
- * @param[in]  offset  File offset; does not advance `fd`'s position.
- * @return Number of bytes read on success; -1 on error.
+ * @return Bytes read; -1 with errno on a real or injected failure.
  */
 CHAOS_IO_EXPORT ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset)
 {
@@ -913,7 +805,7 @@ CHAOS_IO_EXPORT ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_
     {
         return chaos_io_call_real_preadv(fd, iov, iovcnt, offset);
     }
-    /* Read only now that a rule matched: an invalid array costs nothing before. */
+    /* The caller's array is read only now that a rule matched. */
     rule.call_size = chaos_io_iovec_size(iov, iovcnt);
 
     if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
@@ -934,18 +826,9 @@ CHAOS_IO_EXPORT ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_
 }
 
 /**
- * @brief Interposed `pwrite(2)` entry point.
+ * @brief Interposed pwrite(2): write() semantics with `pwrite` rules, TORN included.
  *
- * @details Execution sequence matches `write()` exactly except that the supplied
- * `offset` is part of the real libc call.  The `TORN` effect reduces `count`
- * before the call, making the real call write fewer bytes than the caller
- * intended.
- *
- * @param[in] fd      File descriptor.
- * @param[in] buffer  Source data.
- * @param[in] count   Number of bytes to write.
- * @param[in] offset  File offset; does not advance `fd`'s position.
- * @return Number of bytes written on success; -1 on error.
+ * @return Bytes written; -1 with errno on a real or injected failure.
  */
 CHAOS_IO_EXPORT ssize_t pwrite(int fd, const void *buffer, size_t count, off_t offset)
 {
@@ -977,19 +860,10 @@ CHAOS_IO_EXPORT ssize_t pwrite(int fd, const void *buffer, size_t count, off_t o
 }
 
 /**
- * @brief Interposed `pwritev(2)` entry point.
+ * @brief Interposed pwritev(2): writev() semantics with `pwrite` rules, including the
+ *        64-entry TORN limit.
  *
- * @details Semantics match `pwrite()`, with torn writes modeled over the logical total
- * byte span before translating the shortened request back to an iovec array.
- *
- * The shortened vector is a bounded stack array for the same reason as in the
- * `writev` wrapper.
- *
- * @param[in] fd      File descriptor.
- * @param[in] iov     Gather-I/O source array.
- * @param[in] iovcnt  Number of entries in `iov`.
- * @param[in] offset  File offset; does not advance `fd`'s position.
- * @return Number of bytes written on success; -1 on error.
+ * @return Bytes written; -1 with errno on a real or injected failure.
  */
 CHAOS_IO_EXPORT ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off_t offset)
 {
@@ -1028,19 +902,19 @@ CHAOS_IO_EXPORT ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off
 /* ---------------------------------------------------------------------------
  * glibc alternate entry points
  *
- * On 64-bit glibc the large-file names (`open64`, `pread64`, ...) are separate
+ * On 64-bit glibc the large-file names (`pread64`, `sendfile64`, ...) are separate
  * symbols with the same signature as the base functions, and binaries built with
- * large-file support or by the JDK bind to them. Without these aliases every such
- * call would bypass the library. The fortified `_chk`/`_2` variants are what
- * `_FORTIFY_SOURCE` builds (Debian and Ubuntu packages) call instead of the base
- * function; they check the buffer the way glibc does and then run the wrapper.
- * musl has neither, so all of this is glibc-only.
+ * large-file support, or the JDK, bind to them; without these aliases such calls would
+ * bypass the library. The fortified `_chk` variants are what `_FORTIFY_SOURCE` builds
+ * (Debian and Ubuntu packages) call instead of read/pread; they apply glibc's buffer check
+ * and then run the wrapper. musl has neither, so all of this is glibc-only (LP64).
  * ------------------------------------------------------------------------- */
 #if defined(__GLIBC__) && defined(__LP64__)
 
 extern void __chk_fail(void) __attribute__((__noreturn__));
 
-/** Overflow handler of the fortified variants; replaceable so tests can observe it. */
+/** @brief Failure handler of the fortified variants (glibc's __chk_fail, which aborts);
+ *         a test seam. */
 static void (*g_chaos_io_rw_chk_fail)(void) = __chk_fail;
 
 CHAOS_IO_EXPORT ssize_t pread64(int fd, void *buffer, size_t count, off_t offset)
@@ -1054,10 +928,8 @@ CHAOS_IO_EXPORT ssize_t pwritev64(int fd, const struct iovec *iov, int iovcnt, o
 CHAOS_IO_EXPORT ssize_t sendfile64(int out_fd, int in_fd, off_t *offset, size_t count)
     __attribute__((alias("sendfile")));
 
-/**
- * @brief Fortified `read()`: aborts like glibc when @p count exceeds the buffer,
- * otherwise `read()`.
- */
+/** @brief Fortified read(): aborts like glibc when @p count exceeds @p buffer_size,
+ *         otherwise read(). */
 CHAOS_IO_EXPORT ssize_t __read_chk(int fd, void *buffer, size_t count, size_t buffer_size)
 {
     if (count > buffer_size)
@@ -1068,10 +940,8 @@ CHAOS_IO_EXPORT ssize_t __read_chk(int fd, void *buffer, size_t count, size_t bu
     return read(fd, buffer, count);
 }
 
-/**
- * @brief Fortified `pread()`: aborts like glibc when @p count exceeds the buffer,
- * otherwise `pread()`.
- */
+/** @brief Fortified pread(): aborts like glibc when @p count exceeds @p buffer_size,
+ *         otherwise pread(). */
 CHAOS_IO_EXPORT ssize_t
 __pread_chk(int fd, void *buffer, size_t count, off_t offset, size_t buffer_size)
 {

@@ -1,31 +1,48 @@
 /**
  * @file chaos_status.h
- * @brief The status file every library writes after loading its rule file.
+ * @brief The status file (`/tmp/.chaos-<lib>.status`) every library writes after a reload,
+ *        and the raw-syscall file I/O shared with the hits file and rule-file reads.
  *
  * @details
- * Rule parsing is all-or-nothing: one bad line leaves the library with no rules.
- * Without a report that looks exactly like a rule that never fires. After every
- * load each library therefore replaces `/tmp/.chaos-<lib>.status` with what it
- * found:
+ * Rule parsing is all-or-nothing: one bad line leaves the library with no rules, which
+ * from the outside is indistinguishable from a rule that never fires. After every reload
+ * each library therefore replaces its status file with the outcome:
  *
  * @code
  * state=ok|error
- * rules=<number of active rules>
- * line=<1-based line of the first rejected rule>      (error only)
- * reason=invalid rule|too many rules|file too large|file unreadable|file contains a NUL byte
- *                                                      (error only; line=0 for the last two)
- * text=<that line as written, at most 200 bytes>       (error only)
+ * rules=<number of active rules; 0 for an error>
+ * line=<1-based line of the first rejected rule; 0 when no line is named>  (error only)
+ * reason=<one of the reasons below>                                        (error only)
+ * text=<that line as written, at most 200 bytes>                           (error only)
  * pid=<process that wrote the file>
  * @endcode
  *
- * Without a rule file there is nothing to report and the status file is removed,
- * so a status file always describes the rule file next to it.
+ * | reason | line |
+ * |--------|------|
+ * | `invalid rule` | the rejected line |
+ * | `too many rules` | the first line beyond the rule limit |
+ * | `unsupported in seccomp mode` | the rule chaos-init cannot apply |
+ * | `file too large` | 0, text empty |
+ * | `file unreadable` | 0, text empty |
+ * | `file contains a NUL byte` | 0, text empty |
  *
- * The file is written to `<path>.<pid>` and renamed over the old one, so a reader
- * never sees half a report. Like the injected sleep (chaos_sleep.h) the write
- * issues system calls directly: libchaos-io interposes open, write and rename,
- * and a user's io rule must not be able to fail the report. Writing is best
- * effort; any failure is ignored and errno is left as it was.
+ * Without a rule file there is nothing to report and the status file is removed, so a
+ * status file always describes the rule file beside it.
+ *
+ * @par Atomic publication
+ * The report is written to `<dir>/.chaos-staging-<pid>-<nonce>-<name>` and renamed over
+ * the target, so a reader sees the old or the new report, never a mix
+ * (chaos_status_publish()).
+ *
+ * @par Why raw system calls
+ * Like the injected sleep (chaos_sleep.h), every file operation here is a `syscall(2)`:
+ * libchaos-io interposes open, write and rename, and a user's io rule must not fail or
+ * delay a report or a rule-file read. All writes are best effort; failures are ignored
+ * and errno is preserved.
+ *
+ * @par Test seams
+ * CHAOS_STATUS_OPEN and its siblings, CHAOS_CONFIG_FILE_OPEN/READ/CLOSE and
+ * CHAOS_STATUS_NONCE may be predefined by unit tests.
  */
 
 #ifndef CHAOS_STATUS_H
@@ -45,20 +62,25 @@
 #include <sys/syscall.h>
 #endif
 
-/** @brief Longest rejected line kept in the report. */
+/** @brief Maximum bytes of a rule text kept for the status and hits files (excluding NUL). */
 #define CHAOS_STATUS_TEXT_MAX 200U
 
-/** @brief Largest report: six keys, a 200-byte line and a few numbers. */
+/** @brief Report buffer size: six keys, a 200-byte text and three numbers fit with room. */
 #define CHAOS_STATUS_BUFFER_SIZE 512U
 
-/** @brief Outcome of a load, as written to the `state=` key. */
+/** @brief Outcome of a reload, written as the `state=` key. */
 typedef enum chaos_status_state
 {
     CHAOS_STATUS_OK = 0,
     CHAOS_STATUS_ERROR = 1
 } chaos_status_state_t;
 
-/** @brief The first line a parse rejected; `line == 0` when none was rejected. */
+/**
+ * @brief Parser error record: the line being parsed and, once rejected, the reason.
+ *
+ * @details `reason == NULL` means no line was rejected. `line == 0` with a reason means a
+ * whole-file rejection that names no line.
+ */
 typedef struct chaos_status_error
 {
     size_t line;
@@ -66,28 +88,31 @@ typedef struct chaos_status_error
     char text[CHAOS_STATUS_TEXT_MAX + 1U];
 } chaos_status_error_t;
 
-/** @brief Reason for a line the parser rejected. */
+/** @brief Reason: the line does not parse (selector, effect, probability or qualifier). */
 #define CHAOS_STATUS_REASON_INVALID "invalid rule"
 
-/** @brief Reason for the first line beyond the rule limit. */
+/** @brief Reason: the first rule beyond the library's rule limit. */
 #define CHAOS_STATUS_REASON_TOO_MANY "too many rules"
 
-/** @brief Reason for a rule file at or over the size limit (no line is named). */
+/** @brief Reason: the rule file is at or over the library's size limit (no line named). */
 #define CHAOS_STATUS_REASON_TOO_LARGE "file too large"
 
-/** @brief Reason for a rule file this process may not open or read (no line is named). */
+/** @brief Reason: this process may not open or read the rule file (no line named). */
 #define CHAOS_STATUS_REASON_UNREADABLE "file unreadable"
 
 /**
- * @brief Reason for a rule file holding a NUL byte (no line is named): the parser
- *        would stop there and drop every rule after it without a word.
+ * @brief Reason: the rule file contains a NUL byte (no line named). A string parser would
+ *        stop there and drop every later rule silently, so the file is rejected instead.
  */
 #define CHAOS_STATUS_REASON_NUL "file contains a NUL byte"
 
-/** @brief Reason for a valid rule chaos-init cannot apply (data effects, ERRNO on close). */
+/**
+ * @brief Reason: a valid rule that SECCOMP mode cannot apply (data effects, ERRNO on
+ *        close); emitted when a parser is built for chaos-init.
+ */
 #define CHAOS_STATUS_REASON_UNSUPPORTED "unsupported in seccomp mode"
 
-/** @brief Forgets any recorded error. */
+/** @brief Resets @p error to "nothing rejected". */
 static inline void chaos_status_clear(chaos_status_error_t *error)
 {
     error->line = 0U;
@@ -96,10 +121,12 @@ static inline void chaos_status_clear(chaos_status_error_t *error)
 }
 
 /**
- * @brief Keeps a copy of line @p number before the parser modifies it in place.
+ * @brief Snapshots line @p number into @p error before the parser modifies it in place.
  *
- * @details Called for every line; only the copy of the line that fails is reported.
- * Control characters become spaces so the report stays one line per key.
+ * @details Called for every line, so the record always holds the line under parse;
+ * the copy also serves as the rule text in the hits file. Copies up to
+ * CHAOS_STATUS_TEXT_MAX bytes, stopping at NUL or LF; control characters and DEL become
+ * spaces so each report key stays on one line. Clears any earlier reason.
  */
 static inline void
 chaos_status_keep_line(chaos_status_error_t *error, size_t number, const char *line)
@@ -118,13 +145,21 @@ chaos_status_keep_line(chaos_status_error_t *error, size_t number, const char *l
     error->reason = NULL;
 }
 
-/** @brief Marks the kept line as the rejected one. */
+/** @brief Marks the line kept by chaos_status_keep_line() as rejected for @p reason. */
 static inline void chaos_status_reject(chaos_status_error_t *error, const char *reason)
 {
     error->reason = reason;
 }
 
-/** @brief Formats the report into @p buffer; returns its length. */
+/**
+ * @brief Formats a status report into @p buffer.
+ *
+ * @details The error layout is used only when @p state is CHAOS_STATUS_ERROR and
+ * @p error carries a reason; otherwise the short `state`/`rules`/`pid` layout is written.
+ * The output is truncated, not overflowed, when @p size is too small.
+ *
+ * @return Bytes written, excluding the NUL; 0 when formatting failed or @p size is 0.
+ */
 static inline size_t chaos_status_format(
     char *buffer,
     size_t size,
@@ -162,7 +197,13 @@ static inline size_t chaos_status_format(
     return (size_t)length < size ? (size_t)length : size - 1U;
 }
 
-/* The system calls of status and hits files; unit tests replace them all. */
+/*
+ * File operations of status and hits files as raw system calls (see the file header).
+ * New files: O_EXCL | O_NOFOLLOW, because /tmp is shared and a planted symlink must not
+ * redirect the write. Existing files: no O_CREAT, which fs.protected_regular would refuse
+ * for another user's file in a sticky directory. renameat2 covers architectures without
+ * SYS_renameat (aarch64). Unit tests replace them all.
+ */
 #ifndef CHAOS_STATUS_OPEN
 #ifdef __linux__
 #define CHAOS_STATUS_OPEN(path)                                                                    \
@@ -197,11 +238,10 @@ static inline size_t chaos_status_format(
 #endif
 
 /*
- * Rule files are read with raw system calls too. Through libc, another library
- * preloaded into the same process (libchaos-io) would see one library reading its
- * rules, and its rules could fail or delay that read. O_CLOEXEC: a descriptor open
- * while another thread execs must not leak into the new program. Unit tests
- * replace these with stubs.
+ * Rule-file reads as raw system calls: through libc, libchaos-io preloaded into the same
+ * process would intercept another library reading its rules, and an io rule could fail or
+ * delay that read. O_CLOEXEC: a descriptor open while another thread execs must not leak
+ * into the new program. Unit tests replace these with stubs.
  */
 #ifndef CHAOS_CONFIG_FILE_OPEN
 #ifdef __linux__
@@ -217,8 +257,11 @@ static inline size_t chaos_status_format(
 #endif
 
 /**
- * @brief FNV-1a hash of a rule file's bytes: lets a provisional load that reads the
- *        file again (chaos_clock_stamp_is_recent) see that nothing changed.
+ * @brief 64-bit FNV-1a hash of a rule file's bytes.
+ *
+ * @details A provisional load (chaos_clock_stamp_is_recent()) re-reads the file on every
+ * check; comparing hashes lets that re-read skip the reparse when the bytes are unchanged.
+ * Not collision-resistant, which is acceptable for change detection of trusted input.
  */
 static inline uint64_t chaos_config_content_hash(const char *data, size_t size)
 {
@@ -233,12 +276,20 @@ static inline uint64_t chaos_config_content_hash(const char *data, size_t size)
     return hash;
 }
 
-/** @brief Varies the staging name between writers with the same pid; unit tests fix it. */
+/**
+ * @brief Staging-name nonce: monotonic ns XOR a stack address, so writers with the same pid
+ *        (one per container sharing /tmp) pick different names. Unit tests fix it.
+ */
 #ifndef CHAOS_STATUS_NONCE
 #define CHAOS_STATUS_NONCE(staging) (chaos_clock_now_ns() ^ (uint64_t)(uintptr_t)(staging))
 #endif
 
-/** @brief Writes @p length bytes of @p data to @p fd; 1 when all were written. */
+/**
+ * @brief Writes all @p length bytes of @p data to @p fd, retrying short writes and EINTR.
+ *
+ * @return 1 when every byte was written; 0 on any other error or a zero-byte write
+ *         (errno then describes the failure).
+ */
 static inline int chaos_status_write_all(int fd, const char *data, size_t length)
 {
     size_t written = 0U;
@@ -261,29 +312,37 @@ static inline int chaos_status_write_all(int fd, const char *data, size_t length
 }
 
 /**
- * @brief Replaces the file at @p path with @p length bytes of @p data.
+ * @brief Atomically replaces (or, with @p exclusive, only creates) the file at @p path
+ *        with @p length bytes of @p data.
  *
- * @details Writes `<dir>/.chaos-staging-<pid>-<nonce>-<name>` and renames it over
- * @p path, so a reader sees the old file or the new one, never a mix. The staging
- * name starts differently from every status and hits file, so nothing that lists
- * those (`.chaos-net.hits.*`) picks up a half-written one. The nonce keeps apart
- * writers with the same pid: containers that share /tmp each run their own PID 1.
- * A name that exists is another writer's; the next nonce is tried instead.
+ * @details Writes `<dir>/.chaos-staging-<pid>-<nonce>-<name>` (a leading '.' of the name
+ * dropped) and renames it over @p path, so a reader sees the old or the new file, never a
+ * mix. The staging prefix differs from every status and hits file name, so a reader that
+ * globs `.chaos-<lib>.hits.*` never picks up a half-written file. The nonce separates
+ * writers with the same pid (containers sharing /tmp each run their own pid 1); an
+ * existing staging name (EEXIST) is another writer's, and up to 4 nonces are tried.
  *
- * Files are created readable and writable by everyone (0666): in a shared, sticky
- * /tmp another user may not rename over a file it does not own, as when an image
- * starts as root and the application runs as another user. Such a refused rename
- * falls back to rewriting @p path in place; a reader may then briefly see it
- * short. It is opened without O_CREAT, which fs.protected_regular would refuse.
+ * Files are made mode 0666 with fchmod (bypassing the umask): in a sticky /tmp another
+ * user may not rename over a file it does not own, e.g. when an image starts as root and
+ * the application runs as another user. A rename refused with EPERM or EACCES falls back
+ * to rewriting @p path in place (O_TRUNC, no O_CREAT); a reader may then briefly see a
+ * short file.
  *
- * Best effort: on any other failure the staging file is removed and @p path is
- * left as it was. errno is left untouched.
+ * With @p exclusive, the staging file is hard-linked to @p path, which fails with EEXIST
+ * when @p path exists; nothing is replaced. When linking fails for another reason (a file
+ * system without hard links), the function falls through to the rename and replaces
+ * @p path after all.
  *
- * With @p exclusive, @p path is only created, never replaced: the staging file is
- * linked to it, which fails when it exists. A file system without hard links
- * replaces it after all.
+ * Failure behaviour: best effort. On any failure the staging file is removed and @p path
+ * keeps its previous content; a staging path longer than 191 bytes writes nothing.
+ * errno is preserved.
  *
- * @return 1 when @p exclusive and @p path exists (nothing written), else 0.
+ * @param path       Target file; its directory must be writable.
+ * @param data       Content; need not be NUL-terminated.
+ * @param length     Bytes of @p data.
+ * @param exclusive  Non-zero to create only, never replace.
+ * @return 1 when @p exclusive and @p path already existed (nothing written); 0 otherwise,
+ *         including on failure.
  */
 static inline int
 chaos_status_publish(const char *path, const char *data, size_t length, int exclusive)
@@ -302,7 +361,8 @@ chaos_status_publish(const char *path, const char *data, size_t length, int excl
     {
         ++name;
     }
-    /* A new file only, never through a link: /tmp is shared. */
+    /* O_EXCL | O_NOFOLLOW (CHAOS_STATUS_OPEN): /tmp is shared, so never write through a
+     * pre-existing file or a planted symlink. */
     for (attempt = 0U; attempt < 4U; ++attempt)
     {
         if ((size_t)snprintf(
@@ -351,7 +411,8 @@ chaos_status_publish(const char *path, const char *data, size_t length, int excl
     }
     if (complete && (errno == EPERM || errno == EACCES))
     {
-        /* Another user's file in a sticky directory: rewrite it in place. */
+        /* Another user's file in a sticky directory cannot be renamed over; rewrite it in
+         * place instead (the 0666 mode set at creation makes that possible). */
         fd = CHAOS_STATUS_OPEN_EXISTING(path);
         if (fd >= 0)
         {
@@ -364,19 +425,21 @@ chaos_status_publish(const char *path, const char *data, size_t length, int excl
     return 0;
 }
 
-/** @brief chaos_status_publish(), replacing @p path. */
+/** @brief chaos_status_publish() in replace mode; best effort, errno preserved. */
 static inline void chaos_status_replace_file(const char *path, const char *data, size_t length)
 {
     (void)chaos_status_publish(path, data, length, 0);
 }
 
 /**
- * @brief Replaces the status file at @p path with the outcome of a load.
+ * @brief Atomically replaces the status file at @p path with the outcome of a reload.
+ *
+ * @details Best effort; errno is preserved. The report carries the caller's pid.
  *
  * @param path   Status file, e.g. `/tmp/.chaos-net.status`.
- * @param state  Outcome of the load.
- * @param rules  Number of active rules (ignored for an error).
- * @param error  The rejected line for CHAOS_STATUS_ERROR, otherwise NULL.
+ * @param state  Outcome of the reload.
+ * @param rules  Number of active rules; written as 0 for an error with a reason.
+ * @param error  The rejection record for CHAOS_STATUS_ERROR, otherwise NULL.
  */
 static inline void chaos_status_write(
     const char *path, chaos_status_state_t state, size_t rules, const chaos_status_error_t *error
@@ -389,7 +452,7 @@ static inline void chaos_status_write(
     chaos_status_replace_file(path, report, length);
 }
 
-/** @brief Removes the status file at @p path, leaving errno untouched. */
+/** @brief Removes the status file at @p path (no rule file); best effort, errno preserved. */
 static inline void chaos_status_remove(const char *path)
 {
     const int saved_errno = errno;

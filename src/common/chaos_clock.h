@@ -1,21 +1,33 @@
 /**
  * @file chaos_clock.h
- * @brief A monotonic clock read straight from the kernel's vDSO.
+ * @brief Clocks that bypass libc (vDSO, raw system call), the rule-file check throttle and
+ *        the "racily clean" mtime test.
  *
  * @details
- * Every intercepted call asks whether the rule file changed. Answering with a
- * `stat()` each time made that check the largest part of a wrapper's cost. The
- * libraries now look at the file at most every CHAOS_CHECK_INTERVAL_NS and need a
- * clock to know when; it must be cheap, and it must not be `clock_gettime()` from
- * the C library, which libchaos-time interposes (a time rule would then change how
- * often the other libraries see their rules).
+ * Every wrapper asks whether the rule file changed. A `stat()` per call made that check
+ * the largest part of a wrapper's cost, so the libraries look at the file at most every
+ * CHAOS_CHECK_INTERVAL_NS (1 ms). The throttle needs a clock that is cheap and is not libc
+ * `clock_gettime()`: libchaos-time interposes that, and a time rule would then change how
+ * often the other libraries see their rules.
  *
- * The kernel maps a vDSO into every process and exports its clock_gettime from
- * there; the C library's own clock_gettime calls the same code. This header finds
- * that symbol once through the auxiliary vector and calls it directly: no system
- * call, no PLT, no interposition. Where there is no vDSO (or no known symbol for
- * the architecture) chaos_clock_now_ns() returns 0 and the callers check the file
- * on every call, as before.
+ * The kernel maps a vDSO into every process and exports its clock_gettime from there; libc
+ * calls the same code. This header locates that symbol once through `AT_SYSINFO_EHDR` and
+ * calls it directly: no system call, no PLT, no interposition. Supported: x86_64
+ * (`__vdso_clock_gettime`) and aarch64 (`__kernel_clock_gettime`). Without a vDSO, or on
+ * another architecture, chaos_clock_now_ns() returns 0 and callers disable the throttle
+ * (check on every call); chaos_clock_realtime_ms() falls back to a raw system call.
+ *
+ * @par Per translation unit
+ * The lookup state is `static`, so each translation unit that includes this header does
+ * its own one-time lookup; no symbol is shared between libraries.
+ *
+ * @par Thread and signal safety
+ * The lookup never blocks: a caller that meets it in progress (another thread, or a
+ * signal handler interrupting the owner) gets NULL and uses the fallback once. After the
+ * lookup every read is a plain load plus the vDSO call, which is async-signal-safe.
+ *
+ * @par Test seams
+ * CHAOS_CLOCK_RAW_GETTIME and CHAOS_RACY_WINDOW_MS may be predefined by unit tests.
  */
 
 #ifndef CHAOS_CLOCK_H
@@ -33,8 +45,10 @@
 #include <unistd.h>
 #endif
 
-/** @brief clock_gettime without the C library (where it could be interposed); unit tests replace
- * it. */
+/**
+ * @brief clock_gettime as a raw system call, bypassing the interposable libc symbol;
+ *        returns 0 or -1 with errno. Unit tests may predefine it.
+ */
 #ifndef CHAOS_CLOCK_RAW_GETTIME
 #ifdef __linux__
 #define CHAOS_CLOCK_RAW_GETTIME(clock, now) syscall(SYS_clock_gettime, (clock), (now))
@@ -43,10 +57,10 @@
 #endif
 #endif
 
-/** @brief Signature of the vDSO clock_gettime. */
+/** @brief Signature of the vDSO clock_gettime (same as the libc function). */
 typedef int (*chaos_clock_vdso_fn)(clockid_t, struct timespec *);
 
-/** @brief Name of the vDSO clock_gettime on this architecture, or NULL. */
+/** @brief vDSO symbol of clock_gettime on this architecture; NULL disables the vDSO path. */
 #if defined(__x86_64__)
 #define CHAOS_CLOCK_VDSO_SYMBOL "__vdso_clock_gettime"
 #elif defined(__aarch64__)
@@ -56,11 +70,18 @@ typedef int (*chaos_clock_vdso_fn)(clockid_t, struct timespec *);
 #endif
 
 /**
- * @brief Looks up @p name in the vDSO mapped at @p base; NULL when absent.
+ * @brief Resolves function symbol @p name in the vDSO image mapped at @p base.
  *
- * @details Walks the vDSO's program headers for its load bias and dynamic section,
- * then its symbol table, sized by the DT_HASH chain count. A vDSO without DT_HASH
- * (none of the kernels we support) yields NULL, which only disables the throttle.
+ * @details Minimal ELF walk with no libc involvement: the first PT_LOAD gives the load
+ * bias, PT_DYNAMIC the symbol, string and hash tables; the symbol count is DT_HASH's
+ * nchain. A vDSO without
+ * DT_HASH (GNU hash only) is not searched and yields NULL, which only disables the vDSO
+ * path. Symbol versions are ignored; the first defined STT_FUNC with the name wins.
+ *
+ * @param base  Address of the vDSO ELF header (`getauxval(AT_SYSINFO_EHDR)`); 0 allowed.
+ * @param name  Symbol name; NULL allowed.
+ * @return The function's address, or NULL when @p base, @p name or the symbol is absent
+ *         or the image is not ELF. Always NULL on non-Linux builds.
  */
 static inline void *chaos_clock_vdso_lookup(uintptr_t base, const char *name)
 {
@@ -136,16 +157,21 @@ static inline void *chaos_clock_vdso_lookup(uintptr_t base, const char *name)
     return NULL;
 }
 
-/** @brief The vDSO clock, found once per process; NULL when unavailable. */
+/** @brief The vDSO clock_gettime once looked up; NULL when unavailable or not yet known. */
 static chaos_clock_vdso_fn g_chaos_clock_vdso = NULL;
 
-/** @brief Lookup state: 0 not done, 1 in progress, 2 done (g_chaos_clock_vdso is final). */
+/** @brief Lookup state: 0 not started, 1 in progress, 2 done (g_chaos_clock_vdso is final). */
 static volatile int g_chaos_clock_state = 0;
 
-/** @brief Process that claimed the lookup (state 1). */
+/** @brief Pid that claimed the lookup; lets a forked child spot an orphaned claim. */
 static volatile long g_chaos_clock_owner = 0;
 
-/** @brief Finds the vDSO clock; run once, by whichever caller claims the lookup. */
+/**
+ * @brief Performs the lookup and stores the result; run by the caller that claimed state 1.
+ *
+ * @details memcpy instead of a cast assignment: ISO C has no conversion between object
+ * and function pointers, and the copy avoids the pedantic warning.
+ */
 static void chaos_clock_find_vdso(void)
 {
 #ifdef __linux__
@@ -157,13 +183,18 @@ static void chaos_clock_find_vdso(void)
 }
 
 /**
- * @brief The vDSO clock, or NULL while it is unknown.
+ * @brief Returns the vDSO clock_gettime, performing the one-time lookup on first use;
+ *        NULL while the lookup is in progress elsewhere or when no vDSO clock exists.
  *
- * @details Never waits: a caller that finds the lookup in progress -- another
- * thread, or this thread interrupted by a signal handler -- gets NULL and uses the
- * fallback for this call. A child forked in the middle of a lookup finds it claimed
- * by another process, which will never finish it here: it takes the lookup over
- * instead of using the fallback for good.
+ * @details Never waits. A caller that finds the lookup in progress (another thread, or a
+ * signal handler interrupting the owner) gets NULL and uses the fallback for this call.
+ * A child forked mid-lookup inherits state 1 with an owner pid that is not its own; no
+ * thread will finish that lookup in the child, so it resets the claim and takes over.
+ *
+ * The owner pid is stored after the claim CAS, so another thread of the same process can
+ * briefly see a foreign pid and also take over; both then run the same idempotent lookup
+ * and store the same pointer, so the race is harmless. The full barrier before state 2
+ * publishes g_chaos_clock_vdso to readers that see state 2.
  */
 static inline chaos_clock_vdso_fn chaos_clock_vdso(void)
 {
@@ -186,7 +217,10 @@ static inline chaos_clock_vdso_fn chaos_clock_vdso(void)
 }
 
 /**
- * @brief CLOCK_MONOTONIC in nanoseconds from the vDSO; 0 when there is no vDSO clock.
+ * @brief CLOCK_MONOTONIC in ns from the vDSO; 0 when no vDSO clock is available (yet).
+ *
+ * @details No system-call fallback on purpose: callers use 0 to mean "no cheap clock" and
+ * then skip the throttle rather than pay a system call per wrapper.
  */
 static inline uint64_t chaos_clock_now_ns(void)
 {
@@ -201,12 +235,12 @@ static inline uint64_t chaos_clock_now_ns(void)
 }
 
 /**
- * @brief CLOCK_REALTIME in milliseconds since the epoch, without libchaos-time.
+ * @brief CLOCK_REALTIME in ms since the Unix epoch, never through libchaos-time; 0 when no
+ *        clock can be read.
  *
- * @details Rule windows (`@from=`, `@until=`) are wall-clock times so that every
- * process of a container agrees on them. The time is read from the vDSO, or with
- * a raw system call where there is no vDSO clock: never through the interposed
- * clock_gettime, so a time OFFSET rule does not move another rule's window.
+ * @details Rule windows (`@from`, `@until`) are wall-clock times so that every process
+ * agrees on them. Read from the vDSO, else with a raw system call; never through the
+ * interposed clock_gettime, so a time OFFSET rule does not move another rule's window.
  */
 static inline int64_t chaos_clock_realtime_ms(void)
 {
@@ -223,22 +257,25 @@ static inline int64_t chaos_clock_realtime_ms(void)
     return (int64_t)now.tv_sec * 1000 + (int64_t)(now.tv_nsec / 1000000L);
 }
 
-/** @brief How long after its mtime a rule file may still change unseen, in ms; unit
- *         tests widen it, so that a slow machine does not close it under them. */
+/**
+ * @brief Window in ms after a rule file's mtime during which a same-size rewrite may go
+ *        unseen; unit tests widen it so that a slow machine does not close it under them.
+ */
 #ifndef CHAOS_RACY_WINDOW_MS
 #define CHAOS_RACY_WINDOW_MS 20
 #endif
 
 /**
- * @brief Whether a file stamped @p sec / @p nsec (mtime) is so recent that it may
- *        still change without its stamp changing.
+ * @brief Non-zero when mtime @p sec / @p nsec is within CHAOS_RACY_WINDOW_MS of now, so
+ *        the file may still change without its change stamp changing.
  *
- * @details File systems take mtime from a coarse clock (a few milliseconds). A
- * rewrite in place with the same size within that tick leaves mtime, size, inode
- * and device as they were, so the change stamp misses it. A load of a file this
- * recent is therefore provisional: the file is read again on the next look until
- * its mtime is older than the window, as git treats "racily clean" entries. A
- * stamp further ahead (a writer with a skewed clock) is not waited for.
+ * @details File systems take mtime from a coarse clock tick (a few ms). An in-place
+ * rewrite with the same size within one tick leaves mtime, size, inode and device
+ * unchanged, and the change stamp misses it. A load of a file this recent is therefore
+ * provisional: the file is read again on every check until its mtime leaves the window,
+ * as git treats "racily clean" index entries. A stamp more than the window in the future
+ * (a writer with a skewed clock) is not treated as recent, so it cannot pin the library
+ * in re-reading. Returns 0 when the wall clock cannot be read.
  */
 static inline int chaos_clock_stamp_is_recent(int64_t sec, long nsec)
 {
@@ -248,15 +285,20 @@ static inline int chaos_clock_stamp_is_recent(int64_t sec, long nsec)
     return now != 0 && now - stamp < CHAOS_RACY_WINDOW_MS && stamp - now < CHAOS_RACY_WINDOW_MS;
 }
 
-/** @brief Longest a library goes without looking at its rule file. */
+/** @brief Throttle interval in ns between two rule-file checks of one library (1 ms). */
 #define CHAOS_CHECK_INTERVAL_NS UINT64_C(1000000)
 
 /**
- * @brief Whether the rule file was looked at less than @p interval_ns ago.
+ * @brief Throttle test: non-zero when the rule file was checked less than @p interval_ns
+ *        ago, so the caller skips the check.
  *
- * @param last         Time of the last look, updated when this returns 0.
- * @param interval_ns  Throttle interval; 0 disables the throttle.
- * @return 1 to skip the look this time, 0 to look now.
+ * @details Unsynchronised by design: concurrent callers may each read a stale @p last
+ * and check the file once more than necessary, which is harmless. Without a vDSO clock
+ * it always returns 0 (check every time).
+ *
+ * @param last         Monotonic ns of the last check; set to now when this returns 0.
+ * @param interval_ns  Throttle interval in ns; 0 disables the throttle.
+ * @return 1 to skip the check, 0 to check now.
  */
 static inline int chaos_clock_checked_recently(volatile uint64_t *last, uint64_t interval_ns)
 {

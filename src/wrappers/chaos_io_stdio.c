@@ -1,41 +1,46 @@
 /**
  * @file chaos_io_stdio.c
- * @brief stdio read and write wrappers for libchaos-io.
+ * @brief stdio wrappers: `read` and `write` rules applied to a FILE stream's descriptor.
  *
  * @details
- * glibc and musl read and write a `FILE` stream with their own internal system
- * calls, never through the `read`/`write` symbols, so a `read` or `write` rule
- * did not see `fread`, `fgets`, `fwrite`, `fprintf` or any other buffered I/O --
- * how most C programs read configuration and write logs and data files. These
- * wrappers apply the same rules to the stream's descriptor:
+ * glibc and musl read and write a FILE with internal system calls, never through the
+ * exported read/write, so without these wrappers `read` and `write` rules would miss
+ * fread, fgets, fwrite, fprintf and every other buffered call: how most C programs read
+ * configuration and write logs and data files.
  *
- * - read: `fread`, `fgets`, `fgetc`, `getc`, `getline`, `getdelim` (and
- *   `__getdelim`, which optimized glibc builds call for getline) and the
- *   fortified `__fread_chk`, `__fgets_chk`;
- * - write: `fwrite`, `fputs`, `fputc`, `putc`, `fprintf`, `vfprintf`, `fflush`
- *   and the fortified `__fprintf_chk`, `__vfprintf_chk`.
+ * - `read`: fread, fgets, fgetc, getc, getline, getdelim, __getdelim (what optimised
+ *   glibc builds call for getline), __fread_chk, __fgets_chk.
+ * - `write`: fwrite, fputs, fputc, putc, fprintf, vfprintf, fflush, __fprintf_chk,
+ *   __vfprintf_chk.
  *
- * Like every libchaos-io wrapper they leave descriptors 0-2 alone, so the
- * standard streams are never faulted; `printf`, `puts`, `putchar` and `getchar`,
- * which only use them, are therefore not wrapped.
+ * Descriptors 0-2 are never faulted, so printf, puts, putchar and getchar, which only use
+ * the standard streams, are not wrapped. Streams without a descriptor (fmemopen,
+ * fopencookie) are never matched. fclose is wrapped only to invalidate the cache.
  *
- * **Effects.** `LATENCY` delays the call. `ERRNO` fails it the way the C library
- * reports an I/O error -- 0 items, NULL, EOF or a negative count -- with errno set
- * and the stream's error indicator raised, so `ferror()` is true as after a real
- * failure. `CORRUPT` changes the bytes a read returned. `TORN` does not apply: a
- * short `fwrite` means an error in stdio, not a partial success.
+ * @par Effects
+ * - LATENCY delays the call.
+ * - ERRNO fails it the way stdio reports an I/O error (0 items, NULL, EOF or -1) with
+ *   errno set and the stream's error indicator raised, so ferror() is true as after a
+ *   real failure.
+ * - CORRUPT flips one bit of the bytes a read returned.
+ * - TORN is ignored (no hit counted): a short fwrite means an error in stdio, not a
+ *   partial success.
  *
- * **Error indicator.** There is no API to set it. glibc (`_IO_ERR_SEEN`) and musl
- * (`F_ERR`) both keep it as bit 0x20 of the first word of `FILE`; the wrapper sets
- * that bit. `test/runtime/test_stdio.sh` checks `ferror()` on both.
+ * @par Error indicator
+ * There is no API to set it. glibc (`_IO_ERR_SEEN`) and musl (`F_ERR`) both keep it as bit
+ * 0x20 of the first int of FILE; the wrapper sets that bit under the stream lock.
+ * `test/runtime/test_stdio.sh` checks ferror() on both.
  *
- * **Not covered.** The scanf family (glibc redirects it to `__isoc99_*` and
- * `__isoc23_*` names) and the `*_unlocked` variants. Reads and writes the C library
- * performs while filling or flushing a buffer happen inside one of these calls, so
- * a rule fires once per call, not once per system call.
+ * @par Granularity and gaps
+ * A rule fires once per stdio call, not per system call: the reads and writes libc makes
+ * while filling or flushing a buffer are internal system calls no wrapper sees.
+ * Not covered: the scanf family (glibc redirects it to `__isoc99_*` and `__isoc23_*`
+ * names) and the `*_unlocked` variants.
  *
- * **Module ownership:** wrappers/
- * **Stability:** internal
+ * @par Size gates
+ * fread/fwrite: size * count; fgets: the buffer size; fgetc/fputc: 1; fputs: strlen;
+ * getdelim, fflush and the printf family: unknown (CHAOS_POLICY_NO_SIZE), so a
+ * size-gated rule never fires for them.
  */
 
 #include "chaos_io_actions.h"
@@ -48,16 +53,18 @@
 #include <stdio.h>
 #include <string.h>
 
-/** @brief Bit of the first word of FILE that glibc and musl use for the error indicator. */
+/** @brief Error-indicator bit in the first int of FILE (glibc _IO_ERR_SEEN, musl F_ERR). */
 #define CHAOS_IO_STDIO_ERROR_FLAG 0x20
 
 /**
- * @brief Raises @p stream's error indicator, as a failed real call would.
+ * @brief Raises @p stream's error indicator, as a failed real call would (Linux only;
+ *        elsewhere the layout is unknown and nothing is set).
  */
 static void chaos_io_stdio_mark_error(FILE *stream)
 {
 #ifdef __linux__
-    /* Under the stream lock: the C library updates the same word under it. */
+    /* Under the stream lock: libc updates the same word under it, and an unlocked
+     * read-modify-write could lose a concurrent flag change. */
     flockfile(stream);
     *(volatile int *)(void *)stream |= CHAOS_IO_STDIO_ERROR_FLAG;
     funlockfile(stream);
@@ -66,7 +73,8 @@ static void chaos_io_stdio_mark_error(FILE *stream)
 #endif
 }
 
-/** @brief Byte count of @p count items of @p size bytes; CHAOS_POLICY_NO_SIZE on overflow. */
+/** @brief Bytes of @p count items of @p size bytes for `@size` gates; CHAOS_POLICY_NO_SIZE
+ *         on overflow. */
 static uint64_t chaos_io_stdio_size(size_t size, size_t count)
 {
     if (size != 0U && count > UINT64_MAX / size)
@@ -77,9 +85,12 @@ static uint64_t chaos_io_stdio_size(size_t size, size_t count)
 }
 
 /**
- * @brief Finds the rule for an operation on @p stream's descriptor.
+ * @brief Finds the rule for @p operation on @p stream's descriptor; errno preserved.
  *
- * @return Non-zero when a rule matched (written to @p rule).
+ * @details Returns 0 for a NULL stream, inside a library section (libc I/O made from
+ * inside another real call), and for streams without a descriptor.
+ *
+ * @return Non-zero when a rule matched (written to @p rule, with `call_size = size`).
  */
 static int chaos_io_stdio_rule(
     FILE *stream, chaos_io_operation_t operation, uint64_t size, chaos_io_rule_t *rule
@@ -101,7 +112,9 @@ static int chaos_io_stdio_rule(
 }
 
 /**
- * @brief Applies the pre-call effects; 1 when the call must fail without running.
+ * @brief Applies the pre-call effects: LATENCY delays (returns 0); a firing ERRNO sets
+ *        errno, raises the error indicator and returns 1, so the caller fails without
+ *        calling libc. TORN and CORRUPT return 0 here.
  */
 static int chaos_io_stdio_fails(FILE *stream, const chaos_io_rule_t *rule)
 {
@@ -118,7 +131,8 @@ static int chaos_io_stdio_fails(FILE *stream, const chaos_io_rule_t *rule)
     return 0;
 }
 
-/** @brief Corrupts @p bytes bytes a read returned when a CORRUPT rule fires. */
+/** @brief CORRUPT after a stdio read: flips one bit among the @p bytes returned, when the
+ *         rule fires; nothing for 0 bytes. */
 static void chaos_io_stdio_corrupt(const chaos_io_rule_t *rule, void *buffer, size_t bytes)
 {
     if (bytes > 0U && rule->effect == CHAOS_IO_EFFECT_CORRUPT && chaos_io_rule_should_trigger(rule))
@@ -130,9 +144,10 @@ static void chaos_io_stdio_corrupt(const chaos_io_rule_t *rule, void *buffer, si
 /* --- Real-call trampolines ------------------------------------------------------- */
 
 /*
- * A stream is the C library's own object, so no system call can stand in for these.
- * While a `g_chaos_io_real_*` pointer is still NULL (a call that arrives during
- * symbol resolution) the call fails the way the function reports errors, with ENOSYS.
+ * A stream is libc's own object, so no system call can stand in for these. While a
+ * `g_chaos_io_real_*` pointer is still NULL (a call during symbol resolution) the call
+ * fails the way the function reports errors, with ENOSYS. They do not enter a library
+ * section: libc's buffer I/O inside them uses internal system calls no wrapper sees.
  */
 
 static size_t chaos_io_call_real_fread(void *buffer, size_t size, size_t count, FILE *stream)
@@ -145,7 +160,7 @@ static size_t chaos_io_call_real_fread(void *buffer, size_t size, size_t count, 
     return g_chaos_io_real_fread(buffer, size, count, stream);
 }
 
-/** @brief `__fread_chk` where the C library has it, else the plain fread. */
+/** @brief The real `__fread_chk` where libc has it (glibc), else the real fread. */
 static size_t chaos_io_call_real_fread_chk(
     void *buffer, size_t buffer_size, size_t size, size_t count, FILE *stream
 )
@@ -167,7 +182,7 @@ static char *chaos_io_call_real_fgets(char *buffer, int size, FILE *stream)
     return g_chaos_io_real_fgets(buffer, size, stream);
 }
 
-/** @brief `__fgets_chk` where the C library has it, else the plain fgets. */
+/** @brief The real `__fgets_chk` where libc has it (glibc), else the real fgets. */
 static char *chaos_io_call_real_fgets_chk(char *buffer, size_t buffer_size, int size, FILE *stream)
 {
     if (g_chaos_io_real_fgets_chk != NULL)
@@ -177,7 +192,7 @@ static char *chaos_io_call_real_fgets_chk(char *buffer, size_t buffer_size, int 
     return chaos_io_call_real_fgets(buffer, size, stream);
 }
 
-/** @brief Calls @p real, the resolved fgetc or getc. */
+/** @brief Calls @p real (the real fgetc or getc); EOF with ENOSYS when NULL. */
 static int chaos_io_call_real_getc(chaos_io_fgetc_fn real, FILE *stream)
 {
     if (real == NULL)
@@ -219,7 +234,7 @@ static int chaos_io_call_real_fputs(const char *text, FILE *stream)
     return g_chaos_io_real_fputs(text, stream);
 }
 
-/** @brief Calls @p real, the resolved fputc or putc. */
+/** @brief Calls @p real (the real fputc or putc); EOF with ENOSYS when NULL. */
 static int chaos_io_call_real_putc(chaos_io_fputc_fn real, int c, FILE *stream)
 {
     if (real == NULL)
@@ -241,8 +256,8 @@ static int chaos_io_call_real_fflush(FILE *stream)
 }
 
 /**
- * @brief The real formatter: `__vfprintf_chk` for a fortified call (@p flag >= 0)
- *        where the C library has it, else vfprintf.
+ * @brief The real formatter: `__vfprintf_chk` for a fortified call (@p flag >= 0) where
+ *        libc has it, so `%n` checks stay in force; else vfprintf.
  */
 static int
 chaos_io_call_real_vfprintf(FILE *stream, int flag, const char *format, va_list arguments)
@@ -271,6 +286,10 @@ static int chaos_io_call_real_fclose(FILE *stream)
 
 /* --- Reads ------------------------------------------------------------------------ */
 
+/**
+ * @brief Interposed fread(3): `read` rules; ERRNO returns 0 items with the error indicator
+ *        set; CORRUPT flips a bit among the items returned.
+ */
 CHAOS_IO_EXPORT size_t fread(void *buffer, size_t size, size_t count, FILE *stream)
 {
     chaos_io_rule_t rule;
@@ -290,6 +309,10 @@ CHAOS_IO_EXPORT size_t fread(void *buffer, size_t size, size_t count, FILE *stre
     return items;
 }
 
+/**
+ * @brief Interposed fgets(3): `read` rules; ERRNO returns NULL with the error indicator set;
+ *        CORRUPT flips a bit of the returned line (up to its NUL; may hit the newline).
+ */
 CHAOS_IO_EXPORT char *fgets(char *buffer, int size, FILE *stream)
 {
     chaos_io_rule_t rule;
@@ -314,7 +337,8 @@ CHAOS_IO_EXPORT char *fgets(char *buffer, int size, FILE *stream)
     return line;
 }
 
-/** @brief Shared body of fgetc, getc and getchar. */
+/** @brief Shared body of fgetc and getc: `read` rules with size 1; CORRUPT flips a bit of
+ *         the returned byte. */
 static int chaos_io_stdio_getc(FILE *stream, chaos_io_fgetc_fn real)
 {
     chaos_io_rule_t rule;
@@ -340,18 +364,24 @@ static int chaos_io_stdio_getc(FILE *stream, chaos_io_fgetc_fn real)
     return (int)byte;
 }
 
+/** @brief Interposed fgetc(3): see chaos_io_stdio_getc(); ERRNO returns EOF. */
 CHAOS_IO_EXPORT int fgetc(FILE *stream)
 {
     chaos_io_ensure_symbols();
     return chaos_io_stdio_getc(stream, g_chaos_io_real_fgetc);
 }
 
+/** @brief Interposed getc(3) (when not a macro): as fgetc(). */
 CHAOS_IO_EXPORT int getc(FILE *stream)
 {
     chaos_io_ensure_symbols();
     return chaos_io_stdio_getc(stream, g_chaos_io_real_getc);
 }
 
+/**
+ * @brief Interposed getdelim(3): `read` rules (size unknown); ERRNO returns -1 with the error
+ *        indicator set; CORRUPT flips a bit of the returned bytes.
+ */
 CHAOS_IO_EXPORT ssize_t getdelim(char **line, size_t *capacity, int delimiter, FILE *stream)
 {
     chaos_io_rule_t rule;
@@ -374,18 +404,21 @@ CHAOS_IO_EXPORT ssize_t getdelim(char **line, size_t *capacity, int delimiter, F
     return length;
 }
 
+/** @brief Interposed getline(3): getdelim() with '\n'. */
 CHAOS_IO_EXPORT ssize_t getline(char **line, size_t *capacity, FILE *stream)
 {
     return getdelim(line, capacity, '\n', stream);
 }
 
-/* glibc's headers turn getline() into an inline call to __getdelim() when optimizing. */
+/* glibc's headers turn getline() into an inline call to __getdelim() when optimising, so
+ * the alias is what optimised binaries actually bind to. */
 ssize_t __getdelim(char **line, size_t *capacity, int delimiter, FILE *stream);
 CHAOS_IO_EXPORT ssize_t __getdelim(char **line, size_t *capacity, int delimiter, FILE *stream)
     __attribute__((alias("getdelim")));
 
 /* --- Writes ----------------------------------------------------------------------- */
 
+/** @brief Interposed fwrite(3): `write` rules; ERRNO returns 0 items without writing. */
 CHAOS_IO_EXPORT size_t fwrite(const void *buffer, size_t size, size_t count, FILE *stream)
 {
     chaos_io_rule_t rule;
@@ -399,6 +432,7 @@ CHAOS_IO_EXPORT size_t fwrite(const void *buffer, size_t size, size_t count, FIL
     return chaos_io_call_real_fwrite(buffer, size, count, stream);
 }
 
+/** @brief Interposed fputs(3): `write` rules; ERRNO returns EOF without writing. */
 CHAOS_IO_EXPORT int fputs(const char *text, FILE *stream)
 {
     chaos_io_rule_t rule;
@@ -412,7 +446,7 @@ CHAOS_IO_EXPORT int fputs(const char *text, FILE *stream)
     return chaos_io_call_real_fputs(text, stream);
 }
 
-/** @brief Shared body of fputc, putc and putchar. */
+/** @brief Shared body of fputc and putc: `write` rules with size 1. */
 static int chaos_io_stdio_putc(int c, FILE *stream, chaos_io_fputc_fn real)
 {
     chaos_io_rule_t rule;
@@ -425,18 +459,24 @@ static int chaos_io_stdio_putc(int c, FILE *stream, chaos_io_fputc_fn real)
     return chaos_io_call_real_putc(real, c, stream);
 }
 
+/** @brief Interposed fputc(3): `write` rules with size 1; ERRNO returns EOF. */
 CHAOS_IO_EXPORT int fputc(int c, FILE *stream)
 {
     chaos_io_ensure_symbols();
     return chaos_io_stdio_putc(c, stream, g_chaos_io_real_fputc);
 }
 
+/** @brief Interposed putc(3) (when not a macro): as fputc(). */
 CHAOS_IO_EXPORT int putc(int c, FILE *stream)
 {
     chaos_io_ensure_symbols();
     return chaos_io_stdio_putc(c, stream, g_chaos_io_real_putc);
 }
 
+/**
+ * @brief Interposed fflush(3): `write` rules (size unknown); ERRNO returns EOF without
+ *        flushing. fflush(NULL) has no descriptor and is never matched.
+ */
 CHAOS_IO_EXPORT int fflush(FILE *stream)
 {
     chaos_io_rule_t rule;
@@ -451,9 +491,10 @@ CHAOS_IO_EXPORT int fflush(FILE *stream)
 }
 
 /**
- * @brief Shared body of the printf family: the rules, then the real formatter.
+ * @brief Shared body of the printf family: `write` rules (size unknown), then the real
+ *        formatter. An injected failure returns -1 without formatting.
  *
- * @param flag  Fortification level for the `__*_chk` forms; -1 for the plain forms.
+ * @param flag  Fortification level of the `__*_chk` forms; -1 for the plain forms.
  */
 static int chaos_io_stdio_vprintf(FILE *stream, int flag, const char *format, va_list arguments)
 {
@@ -468,11 +509,13 @@ static int chaos_io_stdio_vprintf(FILE *stream, int flag, const char *format, va
     return chaos_io_call_real_vfprintf(stream, flag, format, arguments);
 }
 
+/** @brief Interposed vfprintf(3): `write` rules; ERRNO returns -1 without formatting. */
 CHAOS_IO_EXPORT int vfprintf(FILE *stream, const char *format, va_list arguments)
 {
     return chaos_io_stdio_vprintf(stream, -1, format, arguments);
 }
 
+/** @brief Interposed fprintf(3): as vfprintf(). */
 CHAOS_IO_EXPORT int fprintf(FILE *stream, const char *format, ...)
 {
     va_list arguments;
@@ -485,13 +528,15 @@ CHAOS_IO_EXPORT int fprintf(FILE *stream, const char *format, ...)
 }
 
 /**
- * @brief Interposed `fclose(3)`: forgets the descriptor's cached path.
+ * @brief Interposed fclose(3): no rules; invalidates the stream's descriptor after the
+ *        close.
  *
- * @details The C library closes the descriptor with its own system call, so the
- * close() wrapper never sees it, and the next file opened under the same number
- * would otherwise inherit this stream's path. Forgotten after the close, like
- * close() does: before it, a lookup on another thread could still cache the
- * open file's path for the number.
+ * @details libc closes the descriptor with its own system call, which close() never sees,
+ * and the next file opened under the same number would otherwise inherit this stream's
+ * path. Invalidated after the close, as close() does: before it, a lookup on another
+ * thread could still re-cache the open file's path for the number. Inside a library
+ * section (libc closing a stream it opened internally) the cache is left alone.
+ * @p stream must not be NULL (fileno() is called on it).
  */
 CHAOS_IO_EXPORT int fclose(FILE *stream)
 {
@@ -510,17 +555,21 @@ CHAOS_IO_EXPORT int fclose(FILE *stream)
 }
 
 /* --- Fortified entry points (_FORTIFY_SOURCE builds) ------------------------------ */
+/* Prototypes of the fortified entry points, which the libc headers declare only in some
+ * configurations. */
 
 int __vfprintf_chk(FILE *stream, int flag, const char *format, va_list arguments);
 int __fprintf_chk(FILE *stream, int flag, const char *format, ...);
 size_t __fread_chk(void *buffer, size_t buffer_size, size_t size, size_t count, FILE *stream);
 char *__fgets_chk(char *buffer, size_t buffer_size, int size, FILE *stream);
 
+/** @brief Fortified vfprintf(): the rules, then the real `__vfprintf_chk`. */
 CHAOS_IO_EXPORT int __vfprintf_chk(FILE *stream, int flag, const char *format, va_list arguments)
 {
     return chaos_io_stdio_vprintf(stream, flag, format, arguments);
 }
 
+/** @brief Fortified fprintf(): the rules, then the real `__vfprintf_chk`. */
 CHAOS_IO_EXPORT int __fprintf_chk(FILE *stream, int flag, const char *format, ...)
 {
     va_list arguments;
@@ -532,6 +581,7 @@ CHAOS_IO_EXPORT int __fprintf_chk(FILE *stream, int flag, const char *format, ..
     return rc;
 }
 
+/** @brief Fortified fread(): fread() semantics, the real `__fread_chk` does the check. */
 CHAOS_IO_EXPORT size_t
 __fread_chk(void *buffer, size_t buffer_size, size_t size, size_t count, FILE *stream)
 {
@@ -552,6 +602,7 @@ __fread_chk(void *buffer, size_t buffer_size, size_t size, size_t count, FILE *s
     return items;
 }
 
+/** @brief Fortified fgets(): fgets() semantics, the real `__fgets_chk` does the check. */
 CHAOS_IO_EXPORT char *__fgets_chk(char *buffer, size_t buffer_size, int size, FILE *stream)
 {
     chaos_io_rule_t rule;

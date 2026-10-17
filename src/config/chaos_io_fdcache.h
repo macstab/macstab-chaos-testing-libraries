@@ -1,41 +1,41 @@
 /**
  * @file chaos_io_fdcache.h
- * @brief Process-wide fd-to-path cache declarations.
+ * @brief Process-wide descriptor-to-path cache of libchaos-io.
  *
  * @details
- * Config matching is path-based, but most interposed operations arrive as
- * file descriptors.  Resolving a descriptor to its filesystem path on every
- * call via `readlink("/proc/self/fd/<fd>")` would be prohibitively expensive.
- * This module provides a tiny direct-mapped cache shared by all threads of the
- * process, mapped lazily on first use.
+ * Rules match paths, but most intercepted calls carry only a descriptor. Resolving it with
+ * `readlink("/proc/self/fd/<fd>")` on every call costs a system call plus a path walk; the
+ * cache makes the common case a seqlock-protected copy from memory.
  *
- * **Cache design.**
- * The cache is a fixed-size array of `CHAOS_IO_FD_CACHE_SLOTS` entries
- * indexed by `fd % CHAOS_IO_FD_CACHE_SLOTS`.  Each entry holds the fd value
- * and its resolved path.  A lookup validates the stored fd matches the
- * requested fd; a mismatch is a natural eviction (the slot was used by a
- * different fd that mapped to the same slot modulo the table size).
+ * @par Design
+ * A direct-mapped table of CHAOS_IO_FD_CACHE_SLOTS (32) entries indexed by
+ * `fd % 32`, mapped on first store (about 128 KiB), shared by all threads. An entry
+ * holds the descriptor and the kernel's path for it. A lookup for a different descriptor
+ * in the same slot misses; the next store evicts.
  *
- * **Excluded paths.**
- * Entries for excluded paths (config file, `/proc`, `/sys`, `/dev`) are
- * never stored.  The resolve path falls back to `/proc/self/fd` on every call
- * for those paths, but the internal guard prevents reentrancy.
+ * @par Excluded paths
+ * Paths chaos_io_is_excluded_path() rejects (control files, `/proc`, `/sys`, `/dev`) are
+ * never stored, so those descriptors are re-resolved on every call (inside the guard) and
+ * never matched.
  *
- * **Cache invalidation discipline.**
- * - Every call that frees or reassigns a descriptor invalidates it: `close(2)`
- *   (after the real close, whatever it returned, because Linux releases the
- *   descriptor even when close reports an error), `dup2(2)` and `dup3(2)` for
- *   the target descriptor, and `close_range(2)` for the closed range.
- * - `unlinkat(2)` and `renameat(2)` call `chaos_io_fdcache_reset()` on
- *   success rather than trying to identify which entries may have become
- *   stale: a rename can change an arbitrary path alias.
- * - Invalidation bumps a per-slot generation; it is one atomic increment and
- *   takes effect for every thread at once.
+ * @par Invalidation
+ * - Every call that frees or retargets a descriptor invalidates it: close() (always,
+ *   after the real close, whatever it returned, because Linux releases the descriptor
+ *   even when close reports an error), the target of dup2()/dup3(), the range of
+ *   close_range(), and the descriptors of fclose(), closedir(), pclose() and a failed
+ *   injected freopen(). Each new descriptor from open/openat/fopen/freopen is invalidated
+ *   before it is resolved.
+ * - unlinkat()/renameat()/renameat2() (and their path forms) and closefrom() reset the
+ *   whole cache on success: a rename or unlink changes the kernel's name of every open
+ *   descriptor of the file (`<path> (deleted)` after unlink, the new name after rename),
+ *   and finding those entries would need a reverse index.
+ * - Invalidation is one atomic increment of a per-slot generation, effective for every
+ *   thread at once and never waiting.
  *
- * **Module ownership:** config/
- * **Stability:** internal – not part of any public ABI
- * **Thread-safety:** safe from any thread; readers use a per-slot seqlock and
- * never block, writers skip a slot another writer holds.
+ * @par Thread safety
+ * Safe from any thread and from signal handlers that interrupt a wrapper: readers use a
+ * per-slot seqlock and never block; a writer that finds a slot busy skips the store.
+ * errno is preserved.
  */
 
 #ifndef CHAOS_IO_FDCACHE_H
@@ -44,93 +44,77 @@
 #include "chaos_io_internal.h"
 
 /**
- * @brief Clears the current thread's fd-cache table.
+ * @brief Outdates every cache entry by bumping all 32 slot generations.
  *
- * @details Zeros all entries via `memset`.  Called from the library
- * constructor and on successful `unlinkat`/`renameat` to discard any paths
- * that may have become stale.
- *
- * @note Not safe to call from a different thread targeting this thread's TLS;
- *       callers must always invoke it on the thread whose cache they want to
- *       reset.
+ * @details No memory is cleared and nothing is unmapped; entries simply stop validating.
+ * Called from the constructor, after a successful unlink or rename, after closefrom(),
+ * and by close_range() for a range of 32 or more descriptors. Safe from any thread.
  */
 void chaos_io_fdcache_reset(void);
 
 /**
- * @brief Looks up an fd in the current thread's cache.
+ * @brief Copies the cached path of @p fd into @p path.
  *
- * @details Computes the slot index `fd % CHAOS_IO_FD_CACHE_SLOTS`, checks
- * that the entry is valid and that the stored fd value matches, then copies
- * the path into the caller's buffer.
+ * @details Lock-free: the copy is accepted only when the slot's sequence was even and
+ * unchanged across it and the slot generation still equals the entry's, so a concurrent
+ * store or an invalidation since the store makes the lookup miss rather than return a
+ * torn or stale path. Before the first store (no table) every lookup misses.
  *
- * @param[in]  fd         File descriptor to look up.  Negative values always
- *                        return 0.
- * @param[out] path       Buffer to receive the cached path string.
- *                        Must not be NULL.
- * @param[in]  path_size  Byte capacity of `path`, including the NUL.
- *
- * @return Non-zero on a cache hit (path copied to `*path`); zero on a miss
- *         or when the stored path would not fit in `path_size` bytes.
- *
- * @post On a hit, `path` contains a null-terminated string of length less
- *       than `path_size`.
+ * @param[in]  fd         Descriptor; negative misses.
+ * @param[out] path       Buffer; NULL misses. May be written even on a miss.
+ * @param[in]  path_size  Capacity in bytes, NUL included; 0 misses.
+ * @return Non-zero on a hit with a NUL-terminated path; 0 on a miss or when the path does
+ *         not fit.
  */
 int chaos_io_fdcache_lookup(int fd, char *path, size_t path_size);
 
 /**
- * @brief Stores one resolved fd-to-path mapping in the current thread cache.
+ * @brief Caches @p path for @p fd under the slot's current generation.
  *
- * @details Silently discards entries for negative fds, NULL paths, excluded
- * paths, and paths that would not fit in `CHAOS_IO_MAX_PATH` bytes.  This
- * keeps the cache free of paths that would never match a user rule.
+ * @details Maps the table on first use. Overwrites whatever the slot held (a colliding
+ * descriptor is evicted). Skipped silently for a negative @p fd, a NULL, excluded or
+ * over-long (>= CHAOS_IO_MAX_PATH) path, a failed mapping, or a slot another writer holds.
  *
- * The store always overwrites the slot unconditionally (i.e. a collision
- * evicts the previous occupant); there is no eviction policy beyond the
- * modular slot assignment.
+ * Prefer chaos_io_fdcache_resolve(), which samples the generation before resolving and so
+ * cannot cache a path a concurrent close() made stale; this function samples it at store
+ * time.
  *
- * @param[in] fd    File descriptor to cache.  Negative values are ignored.
- * @param[in] path  Null-terminated resolved path.  May be NULL (no-op).
+ * @param[in] fd    Descriptor.
+ * @param[in] path  Kernel path of @p fd; NULL is a no-op.
  */
 void chaos_io_fdcache_store(int fd, const char *path);
 
 /**
- * @brief Invalidates any cache entry associated with an fd.
+ * @brief Outdates the slot of @p fd by bumping its generation.
  *
- * @details Checks whether the slot for `fd % CHAOS_IO_FD_CACHE_SLOTS` holds
- * an entry for exactly `fd`, and if so marks it invalid.  Called after a
- * successful `close(2)` so that a later `open(2)` that reuses the same
- * descriptor number does not inherit an unrelated cached path.
+ * @details Invalidates the whole slot, so an entry of another descriptor that shares it
+ * (fd + 32k) is outdated too and simply re-resolved. Works before the table exists (the
+ * generations live outside it), so a close before the first store is not lost. Called
+ * after every close(), whatever it returned, so a reused descriptor number never
+ * inherits the old path.
  *
- * @param[in] fd  Descriptor to invalidate.  Negative values are ignored.
- *
- * @note This function is intentionally not called on a failed close; see the
- *       file-level documentation for the rationale.
+ * @param[in] fd  Descriptor; negative is a no-op.
  */
 void chaos_io_fdcache_invalidate(int fd);
 
 /**
- * @brief Resolves an fd to a stable path string via the cache or `/proc/self/fd`.
+ * @brief Resolves @p fd to the kernel's path for it: cache hit, else
+ *        `readlink("/proc/self/fd/<fd>")` and a store.
  *
- * @details Resolution sequence:
- * 1. Rejects `fd <= 2` (stdin/stdout/stderr are excluded from injection).
- * 2. Attempts `chaos_io_fdcache_lookup()`; returns immediately on a hit.
- * 3. Formats `/proc/self/fd/<fd>` and calls `readlink()` inside the internal
- *    guard.
- * 4. Checks the resolved path against `chaos_io_is_excluded_path()`; returns
- *    0 without caching if excluded.
- * 5. Stores the resolved path in the cache via `chaos_io_fdcache_store()` and
- *    returns 1.
+ * @details The slot generation is sampled before the readlink, so a close() racing with
+ * the resolution outdates the store and the stale path is never cached. The readlink runs
+ * inside the re-entrancy guard with errno preserved. Excluded paths return 0 and are not
+ * cached.
  *
- * @param[in]  fd         File descriptor to resolve.
- * @param[out] path       Buffer to receive the resolved path.  Must not be NULL.
- * @param[in]  path_size  Byte capacity of `path`, including the NUL.  Must be
- *                        at least 2.
+ * Limits: a link target of `path_size - 1` bytes or more is indistinguishable from a
+ * truncated one and is accepted as read. Without `/proc` mounted every uncached lookup
+ * fails and the descriptor is never matched.
  *
- * @return Non-zero when resolution succeeded and `*path` contains a valid
- *         null-terminated string; zero otherwise.
- *
- * @note The `readlink` call uses `path_size - 1` as the buffer length to
- *       leave room for the NUL terminator that `readlink` does not append.
+ * @param[in]  fd         Descriptor; <= 2 returns 0 (the standard streams are never
+ *                        faulted).
+ * @param[out] path       Buffer; NULL returns 0.
+ * @param[in]  path_size  Capacity in bytes, NUL included; less than 2 returns 0.
+ * @return Non-zero with a NUL-terminated path on success; 0 otherwise.
  */
 int chaos_io_fdcache_resolve(int fd, char *path, size_t path_size);
 

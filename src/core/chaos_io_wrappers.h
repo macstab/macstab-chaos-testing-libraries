@@ -1,121 +1,79 @@
 /**
  * @file chaos_io_wrappers.h
- * @brief Cross-wrapper helper declarations for the libchaos-io preload library.
+ * @brief Lookups shared by the libchaos-io wrapper units: descriptor-to-rule and
+ *        (dirfd, path)-to-matchable-path.
  *
  * @details
- * The interposed libc symbols are split across several `.c` files to keep
- * each translation unit focused.  Those units still share two helper entry
- * points that must behave identically regardless of which wrapper is calling
- * them:
+ * The wrappers are split over five units (open, rw, sync, stdio, fsops), but every
+ * descriptor-based wrapper must resolve and match the same way, and every
+ * (dirfd, path) wrapper must build the same match string. Both live here; nothing else
+ * crosses wrapper units.
  *
- * - `chaos_io_match_fd_rule()` – the single, canonical sequence for
- *   "check config freshness, resolve fd to path, match a rule" used by
- *   every descriptor-based wrapper.
- * - `chaos_io_resolve_at_path()` – the canonical resolution of an
- *   `openat()`-style (dirfd, path) pair into a matchable string, shared
- *   between the open wrappers and the filesystem-operation wrappers.
- *
- * No other cross-wrapper state is declared here.  Each wrapper translation
- * unit includes the subsystem headers it needs directly.
- *
- * **Module ownership:** core/
- * **Stability:** internal – not part of any public ABI
- * **Thread-safety:** both functions are safe to call concurrently from
- * different threads; they operate on thread-local state (fd cache, PRNG,
- * guard) and shared read-only config snapshots.
+ * @par Thread safety
+ * Both functions are safe from any thread: they use the thread-local guard and PRNG, the
+ * lock-free process-wide fd cache, and lock-free snapshot reads. Both preserve errno.
  */
 
 #ifndef CHAOS_IO_WRAPPERS_H
 #define CHAOS_IO_WRAPPERS_H
 
-/*
- * Internal helper declarations shared between wrapper compilation units.
- *
- * The library keeps exported interposers split across several `.c` files, but
- * fd-backed wrappers still need one common rule-selection entry point so they
- * all interpret config and fd-cache state the same way.
- */
-
 #include "chaos_io_config.h"
 
 /**
- * @brief Performs the canonical fd-to-rule lookup for descriptor-based wrappers.
+ * @brief Rule lookup of every descriptor-based wrapper: refresh rules, resolve @p fd to a
+ *        path (fd cache, else `/proc/self/fd/<fd>`), select the longest-prefix rule.
  *
- * @details Centralizes the sequence: refresh config snapshot if stale, resolve
- * the fd to a path via the thread-local cache or `/proc/self/fd/<fd>`, then
- * select the longest-prefix matching rule from the active snapshot for the
- * given operation.
+ * @details Fail-open: any internal failure (rule file unusable, descriptor unresolvable,
+ * excluded path, empty rule set, torn snapshot copy) returns 0 and the wrapper passes the
+ * call through. Descriptors 0-2 always return 0.
  *
- * This is the only path through which descriptor-based wrappers (`read`,
- * `write`, `close`, `fsync`, etc.) acquire a rule.  Keeping it in one place
- * guarantees that all wrappers observe the same config freshness and exclusion
- * semantics.
+ * @param[in]  fd         Descriptor.
+ * @param[in]  operation  Operation to look up.
+ * @param[out] rule       Receives a by-value copy of the rule (chaos_io_rule_t lists the
+ *                        two members that still reference shared state); NULL returns 0.
+ * @return Non-zero when a rule matched; whether it fires is decided by the effect
+ *         helpers.
  *
- * @param[in]  fd         The file descriptor to resolve.  Descriptors 0–2
- *                        (stdin/stdout/stderr) are always passed through and
- *                        the function returns 0 immediately for them.
- * @param[in]  operation  The operation type to look up.
- * @param[out] rule       Populated with the matched rule on success.
- *                        The caller owns this storage; no pointers inside
- *                        `rule` point into shared library state.
- *
- * @return Non-zero when a matching rule was found and written to `*rule`;
- *         zero when no rule matched or when the fd is excluded.
- *
- * @pre  `rule != NULL`.
- * @pre  `chaos_io_ensure_symbols()` has been called, so every
- *       `g_chaos_io_real_*` pointer is populated.
- *
- * @note Returns 0 (passthrough) rather than propagating errors on any
- *       internal failure (config read error, fd resolution failure, empty
- *       config).  This is the "fail-open" contract: injection never prevents
- *       the target application from making progress due to a library bug.
+ * @pre chaos_io_ensure_symbols() was called; the caller is not inside a library section
+ *      (chaos_io_in_internal() is 0).
  */
 int chaos_io_match_fd_rule(int fd, chaos_io_operation_t operation, chaos_io_rule_t *rule);
 
 /**
  * @brief chaos_io_match_fd_rule() for a call that moves @p size bytes.
  *
- * @details Records @p size in the matched copy so that a rule's `@size>N` /
- * `@size<N` gate can be checked when the effect is decided.
+ * @details Stores @p size in `rule->call_size` so the rule's `@size>N` / `@size<N` gate
+ * is checked when the effect is decided. Without it, call_size stays CHAOS_POLICY_NO_SIZE
+ * and a size-gated rule never fires.
  */
 int chaos_io_match_fd_rule_sized(
     int fd, chaos_io_operation_t operation, uint64_t size, chaos_io_rule_t *rule
 );
 
 /**
- * @brief Resolves an `openat()`-style (dirfd, path) pair to a matchable string.
+ * @brief Builds the normalised absolute path an `openat()`-style (@p dirfd, @p path) pair
+ *        names, for rule matching.
  *
- * @details Handles three cases:
- * 1. `path` is absolute – copied into `resolved_path` directly.
- * 2. `dirfd == AT_FDCWD` – resolved relative to the current working directory
- *    obtained via `getcwd()` inside the internal guard.
- * 3. `dirfd` is a real descriptor – the directory path is obtained from the
- *    thread-local fd cache or via `readlink("/proc/self/fd/<dirfd>")`, then
- *    joined with `path` lexically.
+ * @details
+ * - Absolute @p path: used as written.
+ * - Relative @p path with AT_FDCWD: joined to getcwd(), called inside the guard with
+ *   errno preserved.
+ * - Relative @p path with a directory descriptor: joined to that descriptor's path (fd
+ *   cache, else `/proc/self/fd/<dirfd>`); fails for @p dirfd <= 2.
+ * The result is then normalised lexically (chaos_io_normalize_path()). Symbolic links in
+ * @p path are not resolved here: a path written through a link matches a rule written
+ * with that link name, not one written with the target's name (descriptor-based calls on
+ * the opened file then match by the kernel's resolved name).
  *
- * The join is purely lexical: `.` and `..` segments are not normalized.  The
- * resulting string is only used for prefix matching against config rules, not
- * for filesystem access, so normalization is not required.
+ * Failure is not an error for the caller: the wrapper skips path-based injection and
+ * calls the real function.
  *
- * @param[in]  dirfd              Directory fd, or `AT_FDCWD`.
- * @param[in]  path               User-supplied path string.  Must not be NULL.
- * @param[out] resolved_path      Buffer to receive the resolved string.
- *                                Must not be NULL.
- * @param[in]  resolved_path_size Byte capacity of `resolved_path`, including
- *                                the terminating NUL.
- *
- * @return Non-zero when resolution succeeded and `*resolved_path` contains a
- *         valid null-terminated string; zero when resolution failed (e.g. the
- *         dirfd could not be resolved, or the result would not fit in
- *         `resolved_path_size` bytes).
- *
- * @post On success, `resolved_path` is a null-terminated string of length
- *       less than `resolved_path_size`.
- *
- * @note Failure is not an error from the caller's perspective.  The wrapper
- *       simply has no path to match against and skips pre-call injection,
- *       falling back to the post-open fd-cache seeding path instead.
+ * @param[in]  dirfd               Directory descriptor or AT_FDCWD.
+ * @param[in]  path                Caller's path; NULL returns 0.
+ * @param[out] resolved_path       Buffer; NULL returns 0.
+ * @param[in]  resolved_path_size  Capacity in bytes, NUL included; 0 returns 0.
+ * @return Non-zero on success; 0 when the base cannot be resolved or the result does not
+ *         fit.
  */
 int chaos_io_resolve_at_path(
     int dirfd, const char *path, char *resolved_path, size_t resolved_path_size

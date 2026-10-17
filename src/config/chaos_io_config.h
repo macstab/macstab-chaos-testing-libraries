@@ -1,48 +1,63 @@
 /**
  * @file chaos_io_config.h
- * @brief Config parsing, snapshot management, and rule-selection declarations.
+ * @brief libchaos-io rule file (`/tmp/.chaos-io.conf`): grammar, parser, reload and rule
+ *        selection.
  *
  * @details
- * The runtime is entirely data-driven: wrapper code never hard-codes failure
- * behavior.  Instead, every intercepted operation asks this module for the
- * active rule set and acts on whatever was found.  That design lets operators
- * change injection scenarios by editing a text file without restarting the
- * target process.
+ * Wrappers hard-code no fault behaviour; each one asks this module for the rule that
+ * applies to its operation and path. A running process picks up an edited rule file at
+ * the first intercepted call made CHAOS_CHECK_INTERVAL_NS (1 ms) or more after its
+ * previous check; no restart and no signal are needed.
  *
- * **Snapshot model.**
- * The module maintains two statically allocated `chaos_io_config_state_t`
- * structures (indexed 0 and 1) and a volatile active-index integer.  One
- * snapshot is always readable; the other is the reload target.  A lock-free
- * CAS on the cached mtime decides which thread performs the next reload.
- * After parsing completes, the new index is published with a full memory
- * barrier so all subsequent readers see the fresh rule set.
+ * @par Rule grammar
+ * One rule per line; blank lines and `#` comments are ignored; qualifiers
+ * (chaos_policy.h) go after the rule:
+ * @code
+ * <path_prefix>:<operation>:<effect>:<parameter> [@first=N] [@from=T] [@until=T] [@size>N]
+ * /data:write:EIO:0.5
+ * /data/wal:fsync:LATENCY:200 @first=3
+ * *:read:CORRUPT:0.01
+ * @endcode
+ * Fields are split on the first three `:` and trimmed, so a path prefix cannot contain
+ * `:`. Effect and parameter:
  *
- * **Rule format (config file).**
- * Each non-blank, non-comment line contains four colon-delimited fields:
- * ```
- * <path_prefix> : <operation> : <effect_or_errno> : <param>
- * ```
- * Parsing is strict: any field error causes the entire config to be treated
- * as empty (passthrough), rather than applying a partial rule set that the
- * operator did not intend.
+ * | Effect | Parameter | Operations |
+ * |--------|-----------|------------|
+ * | EIO, ENOSPC, EDQUOT, EROFS, EACCES, EMFILE, ENFILE, ENOENT (ERRNO) | probability | all |
+ * | LATENCY | delay in ms, 0 to 4294967295 | all |
+ * | TORN | probability | write, pwrite |
+ * | CORRUPT | probability | read, pread |
  *
- * **Module ownership:** config/
- * **Stability:** internal – not part of any public ABI
- * **Thread-safety:** all exported functions are safe to call concurrently
- * from multiple threads; shared state is protected by lock-free CAS and
- * full memory barriers.
+ * `*` matches every absolute file path except memfds. At most one rule applies to a call:
+ * the one with the longest matching prefix for the call's operation, the earlier one in
+ * the file on a tie (chaos_io_config_select_rule()).
+ *
+ * Where TORN and CORRUPT take effect: TORN shortens write, pwrite, sendfile,
+ * copy_file_range, and writev/pwritev of at most 64 entries; the stdio write functions
+ * match `write` rules but ignore
+ * TORN (a short fwrite means an error in stdio, not a partial success). CORRUPT applies
+ * to read, readv, pread, preadv and the stdio reads.
+ *
+ * @par All or nothing
+ * One invalid line, more than CHAOS_IO_MAX_RULES (256) rules, a file of
+ * CHAOS_IO_MAX_CONFIG_BYTES (256 KiB) or more, an unreadable file or a NUL byte leaves
+ * the library with no rules, and the status file `/tmp/.chaos-io.status` names the
+ * reason. A partial rule set the operator did not intend is never applied.
+ *
+ * @par Snapshots and reload
+ * Two statically allocated snapshots; one is active, the other is rewritten by the
+ * single thread that wins the reload claim (a CAS on the cached change stamp) and then
+ * published. Readers never block and never take a lock; a seqlock per snapshot
+ * (chaos_hits.h) discards a rule copied while a reload rewrote it. The full protocol is
+ * documented in chaos_io_config.c.
+ *
+ * @par Thread safety
+ * Every function except chaos_io_config_init() may be called concurrently. errno is
+ * preserved by chaos_io_config_prepare() and everything that calls it.
  */
 
 #ifndef CHAOS_IO_CONFIG_H
 #define CHAOS_IO_CONFIG_H
-
-/*
- * Config parsing and rule-selection declarations for fault injection.
- *
- * The runtime stays data-driven: wrappers ask this module for the current rule
- * snapshot instead of baking failure behavior into code. That keeps scenarios
- * easy to express and keeps the wrapper layer focused on interception.
- */
 
 #include "chaos_io_internal.h"
 #include "chaos_hits.h"
@@ -50,270 +65,214 @@
 #include "chaos_status.h"
 
 /**
- * @brief Enumeration of the intercepted I/O operations understood by the config system.
+ * @brief Operation field of a rule, and the wrappers that consult it.
  *
- * @details Config text is parsed into enum values once so the hot path can match rules
- * without repeated string comparisons.
- *
- * The `RENAME_FROM` / `RENAME_TO` split lets operators write independent
- * rules for the source and destination sides of an atomic rename, which is
- * important for testing write-barrier scenarios where only the destination
- * path is significant.
- *
- * `CHAOS_IO_OP_INVALID` is the sentinel for parse errors; it must never be
- * stored in a successfully parsed rule.
+ * @details Parsed once so the per-call match compares integers, not strings. The
+ * `rename_from` / `rename_to` split lets a rule target either side of a rename, e.g.
+ * only the final name of a write-to-temp-then-rename commit. stdio wrappers use `read`
+ * and `write` on the stream's descriptor.
  */
 typedef enum chaos_io_operation
 {
-    CHAOS_IO_OP_INVALID = -1, /**< Sentinel: parse failure; not a valid rule operation. */
-    CHAOS_IO_OP_READ,         /**< `read(2)` and `readv(2)`. */
-    CHAOS_IO_OP_WRITE,        /**< `write(2)`, `writev(2)`, `sendfile(2)`, `copy_file_range(2)`. */
-    CHAOS_IO_OP_OPEN,         /**< `open(2)` and `openat(2)`. */
-    CHAOS_IO_OP_CLOSE,        /**< `close(2)`. */
-    CHAOS_IO_OP_FSYNC,        /**< `fsync(2)`. */
-    CHAOS_IO_OP_FDATASYNC,    /**< `fdatasync(2)`. */
-    CHAOS_IO_OP_PREAD,        /**< `pread(2)` and `preadv(2)`. */
-    CHAOS_IO_OP_PWRITE,       /**< `pwrite(2)` and `pwritev(2)`. */
-    CHAOS_IO_OP_TRUNCATE,     /**< `ftruncate(2)`. */
-    CHAOS_IO_OP_ALLOCATE,     /**< `fallocate(2)` (Linux only). */
-    CHAOS_IO_OP_UNLINK,       /**< `unlinkat(2)`. */
-    CHAOS_IO_OP_RENAME_FROM,  /**< Source side of `renameat(2)`. */
-    CHAOS_IO_OP_RENAME_TO     /**< Destination side of `renameat(2)`. */
+    CHAOS_IO_OP_INVALID = -1, /**< Parse failure; never stored in a parsed rule. */
+    CHAOS_IO_OP_READ,         /**< `read`: read, readv, fread, fgets, fgetc, getc, getdelim. */
+    CHAOS_IO_OP_WRITE,        /**< `write`: write, writev, sendfile, copy_file_range, stdio. */
+    CHAOS_IO_OP_OPEN,         /**< `open`: open, openat, creat, fopen, freopen. */
+    CHAOS_IO_OP_CLOSE,        /**< `close`: close (ERRNO reported after the real close). */
+    CHAOS_IO_OP_FSYNC,        /**< `fsync`: fsync. */
+    CHAOS_IO_OP_FDATASYNC,    /**< `fdatasync`: fdatasync. */
+    CHAOS_IO_OP_PREAD,        /**< `pread`: pread, preadv. */
+    CHAOS_IO_OP_PWRITE,       /**< `pwrite`: pwrite, pwritev. */
+    CHAOS_IO_OP_TRUNCATE,     /**< `truncate`: ftruncate, truncate. */
+    CHAOS_IO_OP_ALLOCATE,     /**< `allocate`: fallocate, posix_fallocate. */
+    CHAOS_IO_OP_UNLINK,       /**< `unlink`: unlinkat, unlink, rmdir, remove. */
+    CHAOS_IO_OP_RENAME_FROM,  /**< `rename_from`: source of renameat, renameat2, rename. */
+    CHAOS_IO_OP_RENAME_TO     /**< `rename_to`: target of renameat, renameat2, rename. */
 } chaos_io_operation_t;
 
 /**
- * @brief Enumeration of the fault effects that may be attached to a matched rule.
+ * @brief Effect of a rule.
  *
- * @details Validation happens at parse time, so wrappers can switch on the enum directly
- * without re-checking string tokens or unsupported combinations.
- *
- * Effect/operation compatibility is enforced by `chaos_io_effect_allowed()`:
- * - `ERRNO` and `LATENCY` are valid for any operation.
- * - `TORN` is valid only for write-class operations (`write`, `pwrite`).
- * - `CORRUPT` is valid only for read-class operations (`read`, `pread`).
- *
- * `CHAOS_IO_EFFECT_INVALID` is the sentinel for parse errors and must never
- * be stored in a successfully parsed rule.
+ * @details The parser rejects effect/operation pairs that make no sense, so wrappers never
+ * check them: TORN only with `write`/`pwrite`, CORRUPT only with `read`/`pread`; ERRNO
+ * and LATENCY with every operation.
  */
 typedef enum chaos_io_effect
 {
-    CHAOS_IO_EFFECT_INVALID = -1, /**< Sentinel: parse failure; not a valid effect. */
-    CHAOS_IO_EFFECT_ERRNO,        /**< Pre-call synthetic error: sets `errno` and returns -1. */
-    CHAOS_IO_EFFECT_LATENCY,      /**< Pre-call blocking delay of `latency_ms` milliseconds. */
-    CHAOS_IO_EFFECT_TORN,         /**< Partial write: real call with shortened byte count. */
-    CHAOS_IO_EFFECT_CORRUPT       /**< Post-read single-bit flip in the returned buffer. */
+    CHAOS_IO_EFFECT_INVALID = -1, /**< Parse failure; never stored in a parsed rule. */
+    CHAOS_IO_EFFECT_ERRNO,        /**< Fail before the real call with `errnum`. */
+    CHAOS_IO_EFFECT_LATENCY,      /**< Delay the real call by `latency_ms`. */
+    CHAOS_IO_EFFECT_TORN,         /**< Real write with a byte count in [1, n-1]. */
+    CHAOS_IO_EFFECT_CORRUPT       /**< Flip one bit of the bytes a read returned. */
 } chaos_io_effect_t;
 
 /**
- * @brief The parsed, ready-to-use representation of one configuration rule.
+ * @brief One parsed rule, as stored in a snapshot and copied to a wrapper.
  *
- * @details Rules are stored in the active snapshot exactly in this form so wrapper code
- * can make decisions without reparsing text or allocating temporary structures.
+ * @details Wrappers receive a by-value copy (chaos_io_config_match_loaded()), so a copy
+ * stays usable while a reload replaces the snapshot. Two members still point into shared
+ * state and are protected by other means: `resolved_prefix` (into the snapshot; used only
+ * during selection, under the seqlock) and `hit` (into the slot pool; guarded by
+ * `hit_generation`, see chaos_hits.h).
  *
- * **Field semantics:**
- * - `path_prefix` – null-terminated prefix string used for path matching.
- *   The wildcard `"*"` matches any path.  A prefix that ends with `/`
- *   matches all children of that directory without requiring the slash in the
- *   target path.
- * - `path_len` – cached `strlen(path_prefix)` used by the hot-path prefix
- *   comparison to avoid recomputing the length on every call.
- * - `operation` – parsed operation enum; never `CHAOS_IO_OP_INVALID` in a
- *   valid rule.
- * - `effect` – parsed effect enum; never `CHAOS_IO_EFFECT_INVALID` in a
- *   valid rule.
- * - `errnum` – errno value to inject; meaningful only when
- *   `effect == CHAOS_IO_EFFECT_ERRNO`.
- * - `probability` – floating-point trigger probability in [0.0, 1.0];
- *   meaningful for `ERRNO`, `TORN`, and `CORRUPT` effects.
- * - `latency_ms` – millisecond sleep duration; meaningful only when
- *   `effect == CHAOS_IO_EFFECT_LATENCY`.
- *
- * **Ownership:** `chaos_io_rule_t` values are always copied out of the
- * shared snapshot into caller-owned stack storage before use, so there are
- * no lifetime concerns after `chaos_io_config_match_*` returns.
- *
- * **Invariants:** a value written by `chaos_io_config_parse_line()` with
- * return value 1 satisfies: `operation != CHAOS_IO_OP_INVALID`,
- * `effect != CHAOS_IO_EFFECT_INVALID`, and `path_len == strlen(path_prefix)`.
+ * Invariants of a rule chaos_io_config_parse_line() returned 1 for: `operation` and
+ * `effect` are valid, the pair is allowed, and `path_len == strlen(path_prefix)`.
  */
 typedef struct chaos_io_rule
 {
-    char path_prefix[CHAOS_IO_MAX_RULE_PATH]; /**< Null-terminated rule path prefix. */
-    size_t path_len;                          /**< Cached `strlen(path_prefix)`. */
+    char path_prefix[CHAOS_IO_MAX_RULE_PATH]; /**< Prefix as written; absolute ones normalised. */
+    size_t path_len;                          /**< `strlen(path_prefix)`; the selection key. */
     /**
-     * The prefix with its links resolved, when that differs (`/lib` -> `/usr/lib`):
-     * a descriptor is known by the kernel's name for its file. Points into the rule's
-     * snapshot; NULL when there is none.
+     * The prefix with symbolic links resolved, when that differs (`/lib` -> `/usr/lib`):
+     * descriptors resolve to the kernel's name for their file. Points into the snapshot;
+     * NULL when the resolution equals the prefix or failed.
      */
     const char *resolved_prefix;
-    size_t resolved_len;            /**< `strlen(resolved_prefix)`; 0 when there is none. */
-    chaos_io_operation_t operation; /**< Operation this rule applies to. */
-    chaos_io_effect_t effect;       /**< Fault effect to apply when triggered. */
-    int errnum;                     /**< errno code for ERRNO effect; 0 otherwise. */
-    double probability;      /**< Trigger probability [0.0, 1.0] for probabilistic effects. */
-    unsigned int latency_ms; /**< Sleep duration in milliseconds for LATENCY effect. */
+    size_t resolved_len;            /**< `strlen(resolved_prefix)`; 0 when NULL. */
+    chaos_io_operation_t operation; /**< Operation the rule applies to. */
+    chaos_io_effect_t effect;       /**< Effect applied when the rule fires. */
+    int errnum;                     /**< errno for ERRNO; 0 otherwise. */
+    double probability;      /**< Probability in [0, 1] for ERRNO, TORN, CORRUPT; 0 for LATENCY. */
+    unsigned int latency_ms; /**< Delay in ms for LATENCY; 0 otherwise. */
     /** Qualifiers written after the rule (`@first`, `@from`, `@until`, `@size`). */
     chaos_rule_policy_t policy;
     /**
-     * Byte count of the call this copy is being decided for, set by wrappers that
-     * move data; CHAOS_POLICY_NO_SIZE otherwise, which no `@size` gate passes.
+     * Byte count of the call this copy is decided for, set by wrappers that move data;
+     * CHAOS_POLICY_NO_SIZE otherwise, which fails every `@size` gate.
      */
     uint64_t call_size;
-    /** Hit counter of this rule (see chaos_hits.h); NULL for a rule outside a snapshot. */
+    /** Hit slot of the rule (chaos_hits.h); NULL for a rule outside a snapshot (tests). */
     chaos_hit_slot_t *hit;
-    /** Generation of @c hit when the rule was published; a later one means the rule left. */
+    /** Slot generation at publication; a newer slot generation means the rule left the file. */
     uint64_t hit_generation;
 } chaos_io_rule_t;
 
 /**
- * @brief Resets the global config cache to an empty passthrough state.
+ * @brief Resets the rule cache to "no rules" and forces a rule-file read on the next
+ *        chaos_io_config_prepare().
  *
- * @details Both config snapshots are zeroed and their `parse_ok` flags are set
- * to 1 (representing an empty but valid config).  The active index is reset
- * to 0 and the cached mtime is set to `CHAOS_IO_MTIME_UNKNOWN` so the next
- * call to `chaos_io_config_prepare()` unconditionally reads the config file.
+ * @details Zeroes both snapshots (`parse_ok = 1`), resets the hit-slot pool, picks this
+ * image's hits-file suffix, registers the atfork child handler once, looks up the vDSO
+ * clock (so the first lookup does not happen inside a wrapper a signal handler may
+ * re-enter), and sets the cached change stamp to CHAOS_IO_MTIME_UNKNOWN.
  *
- * Startup and tests use this to guarantee that no stale snapshot survives from
- * an earlier run.
- *
- * @note Not thread-safe; must be called before the library begins serving
- * interposed calls (i.e. from the constructor or a single-threaded test setup).
+ * Not thread-safe: call from the constructor or a single-threaded test set-up only.
  */
 void chaos_io_config_init(void);
 
 /**
- * @brief Refreshes the cached config if the on-disk file changed.
+ * @brief Reloads the rule file when it changed, then reports whether any rule is active.
  *
- * @details Stat's the config file and compares the hashed mtime against the
- * cached value.  If they differ and no other thread is already reloading (CAS
- * on `CHAOS_IO_MTIME_RELOADING`), this thread reads and parses the config file
- * into the inactive snapshot, then publishes the new snapshot with a full
- * memory barrier.
+ * @details Throttled to one `stat()` per CHAOS_CHECK_INTERVAL_NS once a change stamp is
+ * cached. When the stamp (mtime, size, inode, device) differs, or the last load was
+ * provisional, or link-dependent rule paths are due for re-resolution, the caller tries
+ * to claim the reload with a CAS; the winner reads, parses and publishes the inactive
+ * snapshot, and every other thread continues with the current snapshot (at most one
+ * version stale, always consistent). Never blocks on another thread.
  *
- * A thread that loses the CAS race (another thread is reloading) returns
- * immediately using the current snapshot, which may be one version stale but
- * is always consistent.
+ * Failure behaviour: fail-open. A missing, unreadable, oversized or invalid rule file
+ * yields no rules (and a status file that says why); a transient read failure keeps the
+ * current rules and retries on the next check. The application's call is never failed
+ * by the library itself. errno is preserved.
  *
- * @return Non-zero when the active snapshot contains at least one rule;
- *         zero when the config is empty or absent (passthrough mode).
- *
- * @note Fail-open: any error during stat, read, or parse results in an empty
- * rule set rather than a library error, preserving the "never block the
- * target application" contract.
+ * @return Non-zero when the active snapshot holds at least one rule; 0 otherwise.
  */
 int chaos_io_config_prepare(void);
 
 /**
- * @brief Matches a path against the active in-memory rule snapshot.
+ * @brief Copies the active snapshot's best rule for @p operation on @p path into @p rule.
  *
- * @details Reads the active snapshot index with an acquire barrier and scans
- * its rule array for the longest-prefix match for the given operation.  Does
- * not trigger a config reload; the caller is responsible for having called
- * `chaos_io_config_prepare()` first.
+ * @details Lock-free: samples the snapshot's seqlock, selects with
+ * chaos_io_config_select_rule(), and reports no match when a reload rewrote the snapshot
+ * during the copy. Does not reload and does not check exclusions; call
+ * chaos_io_config_prepare() first. Probability and qualifiers are not evaluated here;
+ * see chaos_io_rule_should_trigger().
  *
- * @param[in]  operation  The operation to match against.
- * @param[in]  path       Null-terminated absolute path.  Must not be NULL.
- * @param[out] rule       Populated with a copy of the matched rule on success.
- *                        Must not be NULL.
- *
- * @return Non-zero when a rule was found and written to `*rule`;
- *         zero when no rule matched or the snapshot is empty.
- *
- * @pre `chaos_io_config_prepare()` has been called and returned non-zero in
- *      the current request context.
+ * @param[in]  operation  Operation to match.
+ * @param[in]  path       Normalised absolute path; NULL returns 0.
+ * @param[out] rule       Receives the copy; may be written even when 0 is returned (a
+ *                        torn copy). NULL returns 0.
+ * @return Non-zero when a rule matched and the copy is consistent; 0 otherwise.
  */
 int chaos_io_config_match_loaded(
     chaos_io_operation_t operation, const char *path, chaos_io_rule_t *rule
 );
 
 /**
- * @brief Refreshes config state if necessary and then matches a path.
+ * @brief Exclusion check, chaos_io_config_prepare(), then chaos_io_config_match_loaded():
+ *        the lookup for wrappers that receive a path rather than a descriptor.
  *
- * @details Combines `chaos_io_is_excluded_path()`, `chaos_io_config_prepare()`,
- * and `chaos_io_config_match_loaded()` into a single call for path-based
- * wrappers (e.g. `open()`) that receive the path directly rather than through
- * a file descriptor.
+ * @details Excluded paths (chaos_io_is_excluded_path()) return 0 before the rule file is
+ * even checked.
  *
- * @param[in]  operation  The operation to match against.
- * @param[in]  path       Null-terminated path to check.  May be NULL.
- * @param[out] rule       Populated on a successful match.  Must not be NULL.
- *
- * @return Non-zero when a rule was found; zero to pass through without injection.
+ * @param[in]  operation  Operation to match.
+ * @param[in]  path       Normalised absolute path; NULL returns 0.
+ * @param[out] rule       Receives the matching rule; NULL returns 0.
+ * @return Non-zero when a rule matched; 0 to pass the call through.
  */
 int chaos_io_config_match_path(
     chaos_io_operation_t operation, const char *path, chaos_io_rule_t *rule
 );
 
 /**
- * @brief Parses one config line into a single `chaos_io_rule_t`.
+ * @brief Parses one rule line (qualifiers already removed) into @p rule.
  *
- * @details The parser trims whitespace, strips inline comments, validates the four-field
- * format, and fills the rule in place.
+ * @details Strips a `#` comment, trims, splits on the first three `:`, trims each field
+ * and validates operation, effect, parameter and the effect/operation pair. The path
+ * prefix must be shorter than CHAOS_IO_MAX_RULE_PATH (1024) bytes and is not normalised
+ * here.
  *
- * Fields are separated by `:`.  After splitting, each field is trimmed of
- * leading/trailing whitespace.  The path prefix length is bounded by
- * `CHAOS_IO_MAX_RULE_PATH`; longer paths are rejected.
- *
- * @param[in,out] line   Mutable null-terminated line buffer.  The function
- *                       modifies the buffer in place (NUL-terminates fields
- *                       and strips comments).
- * @param[out]    rule   Populated with the parsed rule on success.  The
- *                       caller owns this storage.  Must not be NULL.
- *
- * @return
- * - `1`  – a valid rule was parsed and written to `*rule`
- * - `0`  – the line was blank or comment-only; `*rule` is not modified
- * - `-1` – a syntactic or semantic error; `*rule` contents are undefined
- *
- * @note Called with `line == NULL` returns `-1` immediately.
+ * @param[in,out] line  Mutable NUL-terminated line; modified in place. NULL returns -1.
+ * @param[out]    rule  Receives the rule; NULL returns -1.
+ * @return 1 for a rule; 0 for a blank or comment-only line (@p rule untouched); -1 for an
+ *         invalid line (@p rule partially written).
  */
 int chaos_io_config_parse_line(char *line, chaos_io_rule_t *rule);
 
 /**
- * @brief Parses a mutable config buffer into an array of rules.
+ * @brief Parses a whole rule file, all or nothing.
  *
- * @details The buffer is split in place on `'\n'` boundaries; each segment is
- * passed to `chaos_io_config_parse_line()`.  A single parse error anywhere in
- * the buffer causes the entire batch to fail (`*rule_count` is set to 0 and
- * -1 is returned), so the reload code never applies a partial rule set.
+ * @details Splits @p buffer in place on LF; for each line keeps a copy for the status
+ * report, extracts the qualifiers (chaos_policy_extract()) and parses the rule. The first
+ * failure stops the parse: an invalid line or qualifier, qualifiers without a rule, rule
+ * number CHAOS_IO_MAX_RULES + 1, or a rule this build cannot apply
+ * (CHAOS_IO_RULE_SUPPORTED, used by chaos-init). The reason is available from
+ * chaos_io_config_last_error(). Not reentrant: uses module-level scratch, so only the
+ * reload owner (or a single-threaded test) may call it.
  *
- * @param[in,out] buffer      Mutable null-terminated config file contents.
- *                            Modified in place (newlines replaced by NUL).
- * @param[out]    rules       Array of at least `CHAOS_IO_MAX_RULES` elements
- *                            to receive the parsed rules.  Must not be NULL.
- * @param[out]    rule_count  Receives the number of rules written on success;
- *                            set to 0 on failure.  Must not be NULL.
- *
- * @return 0 on success; -1 if any line failed to parse or the rule count
- *         exceeded `CHAOS_IO_MAX_RULES`.
+ * @param[in,out] buffer      Mutable NUL-terminated file contents; NULL returns -1.
+ * @param[out]    rules       Room for CHAOS_IO_MAX_RULES rules; NULL returns -1.
+ * @param[out]    rule_count  Rules parsed on success, 0 on failure; NULL returns -1.
+ * @return 0 on success; -1 on the first failure.
  */
 int chaos_io_config_parse_buffer(char *buffer, chaos_io_rule_t *rules, size_t *rule_count);
 
 /**
- * @brief The line the last chaos_io_config_parse_buffer() call rejected.
+ * @brief The rejection record of the last chaos_io_config_parse_buffer() or whole-file
+ *        rejection.
  *
- * @return The rejected line (`reason != NULL`), or a cleared record when the last
- *         parse succeeded. Valid until the next parse.
+ * @return Never NULL. `reason != NULL` when something was rejected; a cleared record
+ *         after a successful parse. Overwritten by the next reload.
  */
 const chaos_status_error_t *chaos_io_config_last_error(void);
 
 /**
- * @brief Selects the best matching rule from a caller-supplied rule array.
+ * @brief Selects the rule for @p operation whose prefix covers @p path with the longest
+ *        written prefix.
  *
- * @details Matching is deterministic: the function iterates the rule array
- * linearly and tracks the rule whose `path_prefix` is the longest string that
- * is a prefix of `path` for the requested operation.  "Longest prefix" is
- * evaluated by `path_len`, not by match quality, so a wildcard `"*"` rule has
- * effective length 0 and is always beaten by any explicit prefix.
+ * @details Linear scan, O(rule_count). A prefix covers a path when the path equals it
+ * or continues with `/` after it (so `/data` covers `/data/x` but not `/database`); the
+ * prefix as written and its link-resolved form are both tried. `*` covers every absolute
+ * path except `/memfd:` names. The key is `path_len` of the written prefix: `*` has
+ * length 1 and loses to every longer prefix; on equal length the earlier rule in the file
+ * wins.
  *
- * @param[in]  rules       Rule array to search.  Must not be NULL.
- * @param[in]  rule_count  Number of valid entries in `rules`.
- * @param[in]  operation   The operation to filter by.
- * @param[in]  path        The resolved path to match against.  Must not be NULL.
- * @param[out] rule        Populated with a copy of the winning rule.
- *                         Must not be NULL.
- *
- * @return Non-zero when a match was found; zero otherwise.
+ * @param[in]  rules       Rules to search; NULL returns 0.
+ * @param[in]  rule_count  Entries in @p rules.
+ * @param[in]  operation   Operation to filter by.
+ * @param[in]  path        Normalised absolute path; NULL returns 0.
+ * @param[out] rule        Receives a copy of the winner; NULL returns 0.
+ * @return Non-zero when a rule matched; 0 otherwise.
  */
 int chaos_io_config_select_rule(
     const chaos_io_rule_t *rules,
