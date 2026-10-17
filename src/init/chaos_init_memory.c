@@ -1,11 +1,19 @@
 /**
  * @file chaos_init_memory.c
- * @brief chaos-init: libchaos-memory rules for system calls of supervised processes.
+ * @brief `chaos-init`: libchaos-memory rules applied to tracee system calls.
  *
- * @details The memory rule core is compiled in unchanged. Everything it matches on
- * is in the arguments: the operation, mmap's flags (anonymous or file-backed) and
- * the length for `@size`. As in the hooks, a LATENCY rule delays the call and an
- * ERRNO rule then fails it; both can apply to one call.
+ * @details The libchaos-memory rule core is compiled in by `#include`, unchanged.
+ * Everything it matches on is in the registers, so no tracee memory is read: the
+ * operation (mmap, munmap, mprotect, madvise), mmap's flags (args[3], anonymous or
+ * file-backed) and the length (args[1] for all four) for `@size`.
+ *
+ * As in the wrappers, LATENCY and ERRNO are matched independently and both can apply to
+ * one call: the call is delayed, then fails.
+ *
+ * @par Caveat
+ * The filter sees every mmap of the process, including the dynamic loader's and malloc's,
+ * not only the program's own calls; an unqualified `mmap/file:ERRNO` rule can keep a
+ * dynamic program from loading.
  */
 
 #include "chaos_init_memory.h"
@@ -17,7 +25,8 @@
 #include <sys/random.h>
 #include <sys/syscall.h>
 
-/* What the rule core expects the preload library to provide. */
+/* Symbols the rule core expects from the preload library; the seed is replaced from
+ * getrandom() in chaos_init_memory_start(). */
 __thread int g_chaos_memory_tls_guard = 0;
 __thread uint64_t g_chaos_memory_tls_prng_state = 0U;
 uint64_t g_chaos_memory_process_seed = UINT64_C(0x6a09e667f3bcc909);
@@ -29,6 +38,7 @@ static uint64_t g_chaos_init_memory_load = 0U;
 static const chaos_memory_config_state_t *g_chaos_init_memory_seen_state = NULL;
 static uint64_t g_chaos_init_memory_seen_stamp = 0U;
 
+/* chaos_init_rules_t::snapshot for memory; reload detection as in chaos_init_io.c. */
 static size_t chaos_init_memory_snapshot(const chaos_init_text_t **texts, uint64_t *generation)
 {
     const chaos_memory_config_state_t *state = chaos_memory_config_active_state();
@@ -72,8 +82,10 @@ void chaos_init_memory_start(void)
 }
 
 /**
- * @brief Whether the @p effect rule for the call fires for the calling process;
- *        @p rule is the matched copy.
+ * @brief Whether a rule with @p effect matches the call and fires for the calling
+ *        process: matched against the snapshot, then triggered on the process's own slot
+ *        with args[1] as `@size`. A hit is counted only when it fires.
+ * @param rule  Output: the matched copy (valid when 1 is returned).
  */
 static int chaos_init_memory_fires(
     const chaos_init_call_t *call,
@@ -130,7 +142,8 @@ int chaos_init_memory_decide(const chaos_init_call_t *call, chaos_init_verdict_t
     }
     if (chaos_init_memory_fires(call, CHAOS_MEMORY_EFFECT_ERRNO, operation, flags, &rule))
     {
-        /* After a delay, or at once. */
+        /* With a LATENCY hit the call stays DELAY and fails when due
+         * (chaos_init_delay_answer()); otherwise it fails at once. */
         verdict->action = verdict->action == CHAOS_INIT_DELAY ? CHAOS_INIT_DELAY : CHAOS_INIT_FAIL;
         verdict->error = rule.errnum;
     }

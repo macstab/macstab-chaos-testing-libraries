@@ -1,6 +1,11 @@
 /**
  * @file chaos_init_proc.c
- * @brief chaos-init: reading a supervised process's memory and /proc entries.
+ * @brief `chaos-init`: tracee memory access and /proc parsing (see chaos_init_proc.h for
+ *        access rules and TOCTOU limits).
+ *
+ * @details No caching: every call goes to the kernel, so results reflect the tracee at the
+ * moment of the call. Test seam: CHAOS_INIT_PROC_READ replaces the /proc file reader so
+ * unit tests can feed malformed status/stat contents.
  */
 
 #include "chaos_init_proc.h"
@@ -13,7 +18,11 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
-/** @brief Granularity of string reads; a page of every architecture we build for. */
+/**
+ * @brief Chunk boundary for string reads. 4 KiB is the smallest page size on x86_64 and
+ *        aarch64; larger pages (16/64 KiB arm64 kernels) are multiples, so no chunk spans
+ *        two pages.
+ */
 #define CHAOS_INIT_PAGE 4096U
 
 int chaos_init_read_memory(pid_t pid, uint64_t address, void *out, size_t size)
@@ -29,7 +38,7 @@ int chaos_init_read_memory(pid_t pid, uint64_t address, void *out, size_t size)
     {
         if (errno == 0)
         {
-            errno = EFAULT; /* a partial read: the rest is not mapped */
+            errno = EFAULT; /* short read sets no errno: the rest is not mapped */
         }
         return -1;
     }
@@ -62,7 +71,8 @@ long chaos_init_read_string(pid_t pid, uint64_t address, char *out, size_t size)
 
     while (length < size)
     {
-        /* Never across a page boundary: the next page may not be mapped. */
+        /* Never across a page boundary: a chunk whose tail is unmapped reads short, which
+         * chaos_init_read_memory() treats as failure, though the NUL may lie before it. */
         const size_t to_page = CHAOS_INIT_PAGE - (size_t)((address + length) % CHAOS_INIT_PAGE);
         const size_t chunk = to_page < size - length ? to_page : size - length;
         const char *end;
@@ -101,7 +111,11 @@ long chaos_init_proc_link(pid_t pid, const char *name, char *out, size_t size)
     return (long)length;
 }
 
-/** @brief Reads `/proc/<pid>/<name>` into @p out (NUL-terminated); its length or -1. */
+/**
+ * @brief Reads up to @p size - 1 bytes of `/proc/<pid>/<name>` into @p out with one read(),
+ *        NUL-terminated. The callers' fields (Tgid, PPid, stat fields up to 28) lie within
+ *        their 1 KiB buffers. @p size must be > 0. @return The length, or -1.
+ */
 static long chaos_init_proc_read(pid_t pid, const char *name, char *out, size_t size)
 {
     char path[64];
@@ -124,7 +138,7 @@ static long chaos_init_proc_read(pid_t pid, const char *name, char *out, size_t 
     return (long)length;
 }
 
-/** @brief How /proc files are read; unit tests replace it to feed malformed ones. */
+/** @brief Test seam: how /proc files are read; unit tests substitute malformed contents. */
 #ifndef CHAOS_INIT_PROC_READ
 #define CHAOS_INIT_PROC_READ chaos_init_proc_read
 #endif
@@ -151,6 +165,8 @@ int chaos_init_process_of(pid_t tid, pid_t *tgid, uint64_t *start)
     long group;
     int index;
 
+    /* /proc/<tid> resolves for any thread id, not only group leaders. stat's comm field
+     * (2) may hold spaces and ')', so parsing starts after the last ')'. */
     if (CHAOS_INIT_PROC_READ(tid, "status", text, sizeof(text)) < 0 ||
         (field = strstr(text, "\nTgid:")) == NULL || sscanf(field, "\nTgid: %ld", &group) != 1 ||
         CHAOS_INIT_PROC_READ((pid_t)group, "stat", text, sizeof(text)) < 0 ||
@@ -158,8 +174,8 @@ int chaos_init_process_of(pid_t tid, pid_t *tgid, uint64_t *start)
     {
         return -1;
     }
-    /* field points at the space before field 3 (the state); each step moves to the
-     * space before the next field, so 19 steps reach field 22, the start time. */
+    /* field now points at the space before field 3 (state); each step moves to the space
+     * before the next field, so 19 steps reach field 22, starttime. */
     ++field;
     for (index = 3; index < 22; ++index)
     {
@@ -173,9 +189,11 @@ int chaos_init_process_of(pid_t tid, pid_t *tgid, uint64_t *start)
     {
         return -1;
     }
-    /* Fields 26 (start of code) and 28 (start of stack) change with every execve,
-     * which keeps pid and start time: a new image is a new process for the rules,
-     * as it is under LD_PRELOAD. 0 where the kernel hides them. */
+    /* Fields 26 (startcode) and 28 (startstack) differ after an execve(), which keeps pid
+     * and start time: a new image is a new process for the rules, as under LD_PRELOAD.
+     * They are 0 where the kernel hides them, and a missing tail is tolerated. Each is
+     * multiplied by a distinct odd 64-bit constant before XOR so the two cannot cancel
+     * trivially; the result serves only equality tests. */
     for (; index < 28; ++index)
     {
         field = strchr(field + 1, ' ');

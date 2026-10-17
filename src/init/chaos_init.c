@@ -1,31 +1,59 @@
 /**
  * @file chaos_init.c
- * @brief chaos-init: PID 1 of a container in SECCOMP injection mode.
+ * @brief `chaos-init`: container PID 1 and seccomp user-notification supervisor
+ *        (SECCOMP mode).
  *
  * @details
- * Usage: `chaos-init --libs io,net -- <entrypoint> [args...]`
+ * Usage: `chaos-init --libs io,net,memory,process -- <entrypoint> [args...]`
  *
- * 1. Forks the child that becomes the application. The child sets no_new_privs,
- *    installs the filter of chaos_init_build_filter() with a notification listener
- *    and sends the listener back over a socketpair (the one sendmsg the filter lets
- *    through), then executes the command. Installing needs no privilege, so this
- *    works under Docker's default profile; pidfd_getfd() would need CAP_SYS_PTRACE.
- * 2. Writes CHAOS_INIT_STATUS_PATH: active, or unsupported with the reason, and
- *    only then lets the child execute the command (SIGUSR1, waited for with
- *    sigwait(), which no filter passes on), so whoever sees the application
- *    running reads this run's status. When
- *    the filter cannot be installed (old kernel, emulated architecture, a stricter
- *    profile), the application still starts, without chaos, and the status says why.
- * 3. Answers every notification: the call fails, runs later (LATENCY, parked in
- *    chaos_init_delay.c so other threads go on) or runs unchanged, by the rules
- *    of the libraries named in --libs. Hits files are written per process.
- *    Forwards termination and user signals to the
- *    child, reaps every process that ends up with it (as PID 1, or as a child
- *    subreaper anywhere else), and exits with the child's exit code (128 + signal
- *    when it was killed).
+ * @par Process model
+ * 1. **Fork.** The child (the future application, the first tracee) builds the filter
+ *    (chaos_init_build_filter()), installs it with SECCOMP_FILTER_FLAG_NEW_LISTENER and
+ *    sends the listener fd to the parent over a socketpair with SCM_RIGHTS: the one
+ *    sendmsg() the filter exempts. Installing a filter needs no privilege once
+ *    no_new_privs is set, so this works under Docker's default profile. The alternative,
+ *    the parent fetching the fd with pidfd_getfd(), needs CAP_SYS_PTRACE and is blocked
+ *    there.
+ * 2. **Status, then go.** The parent writes CHAOS_INIT_STATUS_PATH (`state=active`, or
+ *    `state=unsupported` with the reason) and only then sends CHAOS_INIT_GO_SIGNAL; the
+ *    child waits for it with sigwait(), which the filter never notifies. Whoever observes
+ *    the application running therefore reads this run's status, never a stale one. When
+ *    the filter cannot be installed (kernel < 5.5, QEMU emulation, a stricter profile,
+ *    another supervisor's listener) the application still starts, without chaos.
+ * 3. **Serve.** One poll() loop multiplexes a signalfd, a timerfd and the listener. Each
+ *    notification is decided by the rule cores of the libraries in --libs and answered:
+ *    fail, return a value, run unchanged (CONTINUE), or later (LATENCY, parked in
+ *    chaos_init_delay.c so the other threads keep being served).
  *
- * no_new_privs also means that set-user-ID programs started by the application do
- * not gain privileges.
+ * @par PID 1 duties
+ * - Signals: SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2, SIGWINCH, SIGALRM and
+ *   SIGPIPE are blocked before the fork and read from a signalfd, then forwarded to the
+ *   child's pid (not its process group). Blocking also matters for PID 1: the kernel
+ *   discards signals with default disposition sent to a namespace's init, but not
+ *   blocked ones.
+ * - Reaping: every SIGCHLD reaps all exited children (orphans included). Outside PID 1,
+ *   PR_SET_CHILD_SUBREAPER makes orphans of the application reparent here.
+ * - Exit: the application's exit code, or 128 + signal; chaos-init's own failures use
+ *   2 (usage), 125 (setup/handover), 126 (not executable), 127 (not found).
+ * - Leftovers: outside PID 1, a background copy keeps answering processes the
+ *   application left behind (chaos_init_serve_the_rest()).
+ *
+ * @par Failure behaviour
+ * Fail-open for the application: no filter means no chaos, never no start. Fail-fast for
+ * the supervisor: once a filter is installed, no state may remain in which notifications
+ * go unanswered, since every filtered call would block for good. A child whose handover
+ * failed exits 125 itself; the parent kills the child with SIGKILL when the notification
+ * sizes are unusable or signalfd/timerfd cannot be created, and exits 125.
+ *
+ * @par Side effect
+ * no_new_privs is inherited by everything the application starts: set-user-ID and file
+ * capability binaries no longer gain privileges. It is set only after a probe proved the
+ * filter installs (chaos_init_try_install()).
+ *
+ * @par Test seams (compile-time, used by test/runtime builds)
+ * CHAOS_INIT_TEST_RELEASE (fake kernel release), CHAOS_INIT_TEST_HANDOVER_FAILS (handover
+ * sendmsg fails with ENOBUFS), CHAOS_INIT_TEST_NO_KILLABLE_WAIT (pre-5.19 filter flags).
+ * The process glue in this file is covered by test/runtime/test_init.sh, not unit tests.
  */
 
 #include "chaos_init_core.h"
@@ -57,16 +85,28 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-/** @brief Exit codes of chaos-init itself (the application's are passed through). */
+/**
+ * @brief Exit codes of chaos-init itself (the application's are passed through). 125-127
+ *        follow the `docker run` / shell convention: setup failure, found but not
+ *        executable, not found.
+ */
 #define CHAOS_INIT_EXIT_USAGE 2
 #define CHAOS_INIT_EXIT_HANDOVER 125
 #define CHAOS_INIT_EXIT_NOT_EXECUTABLE 126
 #define CHAOS_INIT_EXIT_NOT_FOUND 127
 
-/** @brief Tells the child the status is written and it may execute the command. */
+/**
+ * @brief Tells the child the status file is written and it may execute the command. It is
+ *        in the forwarded set, so it is already blocked in the child and cannot be lost
+ *        when it arrives before sigwait().
+ */
 #define CHAOS_INIT_GO_SIGNAL SIGUSR1
 
-/** @brief Signals passed on to the application; SIGCHLD is handled here. */
+/**
+ * @brief Signals forwarded to the application. SIGCHLD is consumed here (reaping); SIGKILL
+ *        and SIGSTOP cannot be caught. Blocked from before the fork until the child
+ *        restores the original mask right before exec.
+ */
 static const int g_chaos_init_forwarded[] = {
     SIGTERM,
     SIGINT,
@@ -80,8 +120,8 @@ static const int g_chaos_init_forwarded[] = {
 };
 
 /**
- * @brief Kernel release to judge instead of uname()'s; runtime tests build a
- *        variant with an old release to reach the unsupported path.
+ * @brief Test seam: the kernel release to judge instead of uname()'s. A runtime test build
+ *        sets an old release to reach the `state=unsupported` path on a current kernel.
  */
 #ifdef CHAOS_INIT_TEST_RELEASE
 #define CHAOS_INIT_RELEASE(name) CHAOS_INIT_TEST_RELEASE
@@ -89,26 +129,33 @@ static const int g_chaos_init_forwarded[] = {
 #define CHAOS_INIT_RELEASE(name) ((name)->release)
 #endif
 
+/* Defined here for build hosts whose UAPI headers predate Linux 5.19. */
 #ifndef SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV
 #define SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV (1UL << 5)
 #endif
 
 /**
- * @brief Filter flags tried first. Since Linux 5.19 a call the supervisor has
- *        received waits killably: a signal no longer interrupts a delayed call,
- *        which the kernel would otherwise restart as a new notification (Go
- *        signals its threads constantly). Older kernels reject the flag; the delay
- *        queue then recognises a restarted call instead (chaos_init_delay_resume).
- *        Runtime tests build a variant without it to reach that path.
+ * @brief The handover sendmsg(): the listener, or the errno explaining why there is none.
+ *        Test seam: CHAOS_INIT_TEST_HANDOVER_FAILS makes it fail with ENOBUFS, so a runtime
+ *        test reaches the path where a child with an installed filter must not exec.
  */
-/* The handover of the listener (or of why there is none); a runtime test build
- * makes it fail. */
 #ifdef CHAOS_INIT_TEST_HANDOVER_FAILS
 #define CHAOS_INIT_SENDMSG(fd, message, flags) ((void)(message), errno = ENOBUFS, (ssize_t) - 1)
 #else
 #define CHAOS_INIT_SENDMSG(fd, message, flags) sendmsg((fd), (message), (flags))
 #endif
 
+/**
+ * @brief Filter flags tried first.
+ *
+ * @details From Linux 5.19, SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV makes a thread whose
+ * notification the supervisor has received wait killably: only a fatal signal interrupts
+ * it. Without it, any signal interrupts a parked (delayed) call and the kernel restarts it
+ * as a new notification; Go signals its threads constantly (async preemption), so that
+ * path is hot. Older kernels reject the flag with EINVAL and chaos_init_install() retries
+ * without it; the delay queue then re-binds restarted calls (chaos_init_delay_resume()).
+ * Test seam: CHAOS_INIT_TEST_NO_KILLABLE_WAIT builds the pre-5.19 variant.
+ */
 #ifdef CHAOS_INIT_TEST_NO_KILLABLE_WAIT
 #define CHAOS_INIT_FILTER_FLAGS SECCOMP_FILTER_FLAG_NEW_LISTENER
 #else
@@ -116,9 +163,14 @@ static const int g_chaos_init_forwarded[] = {
     (SECCOMP_FILTER_FLAG_NEW_LISTENER | SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV)
 #endif
 
-/** @brief Large enough for the kernel's notification structures (checked at start). */
+/**
+ * @brief Bytes reserved for `struct seccomp_notif` and `struct seccomp_notif_resp`. The
+ *        kernel may grow both; main() checks SECCOMP_GET_NOTIF_SIZES against this before
+ *        serving, because NOTIF_RECV writes the kernel's size, not ours.
+ */
 #define CHAOS_INIT_NOTIF_BUFFER 512U
 
+/** @brief Fills @p set with SIGCHLD and every forwarded signal. */
 static void chaos_init_signal_set(sigset_t *set)
 {
     size_t index;
@@ -132,7 +184,16 @@ static void chaos_init_signal_set(sigset_t *set)
     }
 }
 
-/** @brief Installs @p program with a notification listener: the listener, or -1. */
+/**
+ * @brief Installs @p program on the calling thread with a notification listener.
+ *
+ * @details Raw syscall: neither glibc nor musl provides a seccomp() wrapper. Requires
+ * no_new_privs (or CAP_SYS_ADMIN). Without SECCOMP_FILTER_FLAG_TSYNC
+ * only the calling thread is filtered; the child is single-threaded here.
+ *
+ * @return The listener fd, or -1 with errno (EBUSY: a filter in the chain already has a
+ *         listener; EINVAL: unsupported flags or filter; EACCES: no no_new_privs).
+ */
 static int chaos_init_install(const struct sock_fprog *program)
 {
     int listener =
@@ -140,7 +201,7 @@ static int chaos_init_install(const struct sock_fprog *program)
 
     if (listener < 0 && errno == EINVAL)
     {
-        /* Before 5.19: without the killable wait. */
+        /* Before 5.19 the killable-wait flag is unknown (EINVAL); retry without it. */
         listener = (int
         )syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, program);
     }
@@ -148,11 +209,19 @@ static int chaos_init_install(const struct sock_fprog *program)
 }
 
 /**
- * @brief Whether @p program can be installed here, tried in a process that ends at
- *        once: no_new_privs, which cannot be undone, is then set in this one only
- *        when the install will work (it fails, for one, with EBUSY under another
- *        supervisor's listener).
- * @return 0, or the error the install failed with.
+ * @brief Probes whether @p program installs, in a throw-away child, before the caller
+ *        commits to no_new_privs.
+ *
+ * @details no_new_privs is irreversible and inherited by the application. Setting it and
+ * then failing to install (EBUSY under another supervisor's listener, EACCES/EPERM from a
+ * stricter profile or LSM) would leave an application that runs without chaos yet has
+ * lost set-user-ID semantics. The probe sets no_new_privs and installs in a forked process
+ * that _exit()s at once (exit_group is never notified, and its orphaned listener dies with
+ * it), and reports the errno through its exit status (errno values fit in 8 bits).
+ *
+ * @return 0 when the install works, or when fork() failed (the real install then reports
+ *         any error); otherwise the errno the install failed with, or EINVAL when the
+ *         probe did not exit normally.
  */
 static int chaos_init_try_install(const struct sock_fprog *program)
 {
@@ -168,7 +237,7 @@ static int chaos_init_try_install(const struct sock_fprog *program)
     }
     if (probe < 0)
     {
-        return 0; /* no probe: the install itself will tell */
+        return 0; /* no probe: the real install reports any error itself */
     }
     while (waitpid(probe, &status, 0) < 0 && errno == EINTR)
     {
@@ -177,9 +246,24 @@ static int chaos_init_try_install(const struct sock_fprog *program)
 }
 
 /**
- * @brief In the child: installs the filter and sends the listener (or the error).
- * @return 0 when the child may execute the command, -1 when it must not (a filter
- *         is installed that nobody would answer).
+ * @brief Child side of the handover: installs the filter if possible and sends the parent
+ *        either the listener (SCM_RIGHTS) or the errno that prevented it.
+ *
+ * @details Checks run cheapest and reversible first, so that every refusal leaves the
+ * application without no_new_privs:
+ * 1. kernel release >= 5.5 (ENOTSUP otherwise; CHAOS_INIT_RELEASE seam);
+ * 2. SECCOMP_GET_ACTION_AVAIL for SECCOMP_RET_USER_NOTIF;
+ * 3. chaos_init_try_install() in a throw-away process;
+ * 4. PR_SET_NO_NEW_PRIVS, then the real install.
+ *
+ * The payload is always the int errno (0 on success), so the parent can tell "refused"
+ * (payload > 0, no fd) from "child died" (EOF). With net selected, sendmsg() is filtered
+ * and this call passes only through the CHAOS_INIT_HANDOVER_FLAGS exemption.
+ *
+ * @param handover   The child's socketpair end (O_CLOEXEC).
+ * @param installed  Output: 1 when a filter with listener is installed in this process.
+ * @return 0 when the child may exec, -1 when it must not: the handover failed, so the
+ *         parent will never answer an installed filter.
  */
 static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *installed)
 {
@@ -204,15 +288,15 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *in
     {
         error = ENOTSUP;
     }
-    /* Asked first, so that an application that runs without chaos also runs without
-     * no_new_privs, which cannot be undone. */
+    /* Needs no no_new_privs: asked before it, so an application that runs without chaos
+     * also runs without no_new_privs, which cannot be undone. */
     else if (syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0, &notify) != 0)
     {
         error = errno;
     }
     else if ((error = chaos_init_try_install(&program)) != 0)
     {
-        /* Refused: no chaos, and no no_new_privs either. */
+        /* The probe was refused: report its errno; no_new_privs stays unset. */
     }
     else if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
     {
@@ -239,8 +323,8 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *in
         control.header.cmsg_len = CMSG_LEN(sizeof(int));
         memcpy(CMSG_DATA(&control.header), &listener, sizeof(int));
     }
-    /* Not sent: the parent would wait for it while this child waits for the go
-     * signal. The child gives up, which the parent sees as the end of the socket. */
+    /* If this send fails, the parent would block in recvmsg() while this child blocks in
+     * sigwait(). Returning -1 makes the child _exit(), which the parent sees as EOF. */
     *installed = listener >= 0;
     if (CHAOS_INIT_SENDMSG(handover, &message, CHAOS_INIT_HANDOVER_FLAGS) != (ssize_t)sizeof(error))
     {
@@ -250,8 +334,13 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *in
 }
 
 /**
- * @brief Runs @p path, which the kernel would not execute, as a shell script, as
- *        execvp() does: `/bin/sh path args...`. Returns only when that fails.
+ * @brief ENOEXEC fallback of execvp(): runs @p path (a script without `#!`) as
+ *        `/bin/sh path args[1]...`.
+ *
+ * @details Runs in the child after the filter is installed; this second execve() still
+ * counts as the application's start (chaos_init_process_decide()) because the image is
+ * still chaos-init's. Returns only on failure, with errno from execv(), or ENOEXEC when
+ * the argument vector cannot be allocated. @p args is argv from the command on.
  */
 static void chaos_init_exec_shell(const char *path, char **args)
 {
@@ -279,9 +368,15 @@ static void chaos_init_exec_shell(const char *path, char **args)
 }
 
 /**
- * @brief In the parent: receives the listener; -1 with @p error set when there is none.
- * @return The listener, -1 when seccomp is unsupported (@p error > 0) or the child
- *         died before answering (@p error == 0).
+ * @brief Parent side of the handover: receives the child's errno payload and, on success,
+ *        the listener fd.
+ *
+ * @details MSG_CMSG_CLOEXEC marks the received fd close-on-exec atomically. Only the first
+ * control message is inspected; the child sends at most one fd.
+ *
+ * @param error  Output: the child's errno payload, or 0 when nothing arrived.
+ * @return The listener; -1 when seccomp is unsupported (@p error > 0) or the child ended
+ *         before sending (@p error == 0).
  */
 static int chaos_init_receive_listener(int socket, int *error)
 {
@@ -316,7 +411,12 @@ static int chaos_init_receive_listener(int socket, int *error)
     return listener;
 }
 
-/** @brief Writes the status file, creating /tmp first (images built FROM scratch lack it). */
+/**
+ * @brief Writes the status file (chaos_status_replace_file(): staged, best effort), creating
+ *        /tmp with mode 01777 if missing: `FROM scratch` images have none, and the rule,
+ *        status and hits files all live there. chmod() follows mkdir() because the umask
+ *        strips mode bits.
+ */
 static void chaos_init_write_status(unsigned libs, const char *reason, int mptcp_off)
 {
     char text[CHAOS_STATUS_BUFFER_SIZE];
@@ -331,15 +431,19 @@ static void chaos_init_write_status(unsigned libs, const char *reason, int mptcp
 }
 
 /**
- * @brief ioctl() as a system call: musl declares the request as int, which the
- *        seccomp request numbers overflow.
+ * @brief ioctl() as a raw system call: musl declares the request parameter as int, and the
+ *        SECCOMP_IOCTL_* numbers (_IOWR with bit 31 set) do not fit without
+ *        implementation-defined conversion. @return The syscall result; errno on -1.
  */
 static long chaos_init_ioctl(int fd, unsigned long request, void *argument)
 {
     return syscall(SYS_ioctl, fd, request, argument);
 }
 
-/** @brief CLOCK_MONOTONIC in milliseconds (the supervisor is under no time rule). */
+/**
+ * @brief CLOCK_MONOTONIC in milliseconds, truncated. The supervisor itself is under no
+ *        filter and no time rule, so the libc clock is the real one.
+ */
 static uint64_t chaos_init_now_ms(void)
 {
     struct timespec now;
@@ -349,8 +453,15 @@ static uint64_t chaos_init_now_ms(void)
 }
 
 /**
- * @brief Sends the answer to notification @p id: run the call, fail it with
- *        @p verdict's error, or return @p verdict's value without running it.
+ * @brief Sends the reply to notification @p id: FAIL as `error = -errno`, RETURN as `val`,
+ *        anything else (PASS) as SECCOMP_USER_NOTIF_FLAG_CONTINUE.
+ *
+ * @details CONTINUE makes the kernel run the call with whatever its arguments point to at
+ * that moment, not what the decider read: acceptable for fault injection, which is why
+ * the kernel documents CONTINUE as unsuitable for security policy. DELAY never reaches
+ * this function; it is converted by chaos_init_delay_answer() first.
+ *
+ * @param response  Buffer of @p size bytes (the kernel's seccomp_notif_resp size).
  */
 static void chaos_init_reply(
     int listener, uint64_t id, const chaos_init_verdict_t *verdict, void *response, size_t size
@@ -372,11 +483,30 @@ static void chaos_init_reply(
     {
         reply->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
     }
-    /* ENOENT: the thread is gone (killed while waiting); nothing to answer. */
+    /* Errors ignored: ENOENT means the thread was killed while waiting (or, pre-5.19, a
+     * signal withdrew the notification); there is nobody left to answer. */
     (void)chaos_init_ioctl(listener, SECCOMP_IOCTL_NOTIF_SEND, reply);
 }
 
-/** @brief Receives one notification and answers it, now or (LATENCY) later. */
+/**
+ * @brief Receives one notification, decides it and answers it now or parks it (DELAY).
+ *
+ * @details Order of operations, each step required by the next:
+ * 1. NOTIF_RECV into a zeroed buffer (the kernel requires zeroed input).
+ * 2. Re-bind a restarted parked call (pre-5.19), which must not be decided twice.
+ * 3. Decide: net first (it claims read/write/close on sockets), then io, memory, process.
+ *    Deciders read tracee memory and /proc by tid.
+ * 4. NOTIF_ID_VALID, only for non-PASS verdicts: the tid in the notification may have died
+ *    and been reused between RECV and the reads, so the decision may describe another
+ *    process. ENOENT drops the notification; any other error answers anyway
+ *    (chaos_init_caller_gone()). A PASS needs no check: CONTINUE by id cannot misfire.
+ * 5. Commit deferred tracee writes (chaos_init_net_commit()), only now that the thread is
+ *    known to be the one waiting.
+ * 6. Reply, or park until due.
+ *
+ * Hit counting happens during step 3, so a verdict dropped in step 4 has still been
+ * counted for whichever process the reads resolved to.
+ */
 static void
 chaos_init_answer(int listener, unsigned libs, void *request, void *response, size_t response_size)
 {
@@ -388,7 +518,7 @@ chaos_init_answer(int listener, unsigned libs, void *request, void *response, si
     memset(notification, 0, CHAOS_INIT_NOTIF_BUFFER);
     if (chaos_init_ioctl(listener, SECCOMP_IOCTL_NOTIF_RECV, notification) != 0)
     {
-        return; /* EINTR, or the caller died (ENOENT): nothing to answer */
+        return; /* EINTR, or the caller died before RECV (ENOENT): nothing to answer */
     }
     call.tid = (pid_t)notification->pid;
     call.nr = notification->data.nr;
@@ -396,16 +526,17 @@ chaos_init_answer(int listener, unsigned libs, void *request, void *response, si
     {
         call.args[index] = notification->data.args[index];
     }
-    /* A delayed call a signal interrupted, restarted by the kernel: it keeps its
-     * due time and its verdict, and is neither decided nor counted again. */
+    /* A parked call that a signal interrupted and the kernel restarted (pre-5.19): it
+     * keeps its due time and answer and is neither decided nor counted again. */
     if (chaos_init_delay_resume(&call, notification->id))
     {
         return;
     }
     memset(&verdict, 0, sizeof(verdict));
     verdict.action = CHAOS_INIT_PASS;
-    /* The libraries' system calls are disjoint, except read, write and close: net
-     * claims them on sockets, io decides them on anything else. */
+    /* The libraries' system calls are disjoint except read, readv, write, writev and
+     * close: net claims them on sockets, io decides them on anything else. The first
+     * decider that recognises the call owns it, even when its verdict is PASS. */
     if (!((libs & CHAOS_INIT_LIB_NET) != 0U && chaos_init_net_decide(&call, &verdict)) &&
         !((libs & CHAOS_INIT_LIB_IO) != 0U && chaos_init_io_decide(&call, &verdict)) &&
         !((libs & CHAOS_INIT_LIB_MEMORY) != 0U && chaos_init_memory_decide(&call, &verdict)) &&
@@ -413,8 +544,8 @@ chaos_init_answer(int listener, unsigned libs, void *request, void *response, si
     {
         (void)chaos_init_process_decide(&call, &verdict);
     }
-    /* The decision read the thread's memory: act on it only if that thread is still
-     * the one waiting (its pid could otherwise belong to another process by now). */
+    /* The decision read memory and /proc by tid: act on it only if that notification is
+     * still pending, i.e. the tid still names the waiting thread and not a reused pid. */
     if (verdict.action != CHAOS_INIT_PASS &&
         chaos_init_ioctl(listener, SECCOMP_IOCTL_NOTIF_ID_VALID, &notification->id) != 0 &&
         chaos_init_caller_gone(errno))
@@ -426,23 +557,28 @@ chaos_init_answer(int listener, unsigned libs, void *request, void *response, si
     {
         const chaos_init_verdict_t answer = chaos_init_delay_answer(&verdict);
 
-        /* The clock is read in whole milliseconds, rounded down: one more keeps a
-         * delay from ending up to a millisecond short. */
+        /* now_ms truncates, so "now" may be up to 1 ms late; +1 ms guarantees the call is
+         * held at least delay_ms (at the cost of up to 1 ms extra). */
         if (chaos_init_delay_add(
                 notification->id, &call, chaos_init_now_ms() + verdict.delay_ms + 1U, &answer
             ) == 0)
         {
             return;
         }
-        /* The queue is full: no delay, the rest of the verdict now. */
+        /* Queue full (CHAOS_INIT_MAX_DELAYED): drop the delay, apply the rest now. */
         verdict = answer;
     }
     chaos_init_reply(listener, notification->id, &verdict, response, response_size);
 }
 
 /**
- * @brief Continues the delayed calls that are due, writes hits files that waited
- *        for the interval, and sets @p timer to the next of both.
+ * @brief Answers every parked call that is due, writes hits files that waited for
+ *        CHAOS_HITS_INTERVAL_MS, and re-arms @p timer for the earlier of the next due call
+ *        and the next flush.
+ *
+ * @details Called after every loop iteration while a listener exists, not only on timer
+ * expiry, so a call parked in this iteration is reflected in the timer at once. The timer
+ * is absolute CLOCK_MONOTONIC; a zero itimerspec disarms it when nothing is pending.
  */
 static void chaos_init_on_time(int timer, int listener, void *response, size_t response_size)
 {
@@ -471,7 +607,7 @@ static void chaos_init_on_time(int timer, int listener, void *response, size_t r
     memset(&next, 0, sizeof(next));
     if (due != 0U)
     {
-        /* An absolute time already past fires at once; 0 would disarm the timer. */
+        /* A past absolute time fires at once, but exactly 0 would disarm: clamp to now + 1. */
         due = due > now ? due : now + 1U;
         next.it_value.tv_sec = (time_t)(due / 1000U);
         next.it_value.tv_nsec = (long)(due % 1000U) * 1000000L;
@@ -480,7 +616,10 @@ static void chaos_init_on_time(int timer, int listener, void *response, size_t r
 }
 
 /**
- * @brief Reaps every exited process; @return 1 once @p child is among them.
+ * @brief Reaps every exited child, the application and adopted orphans alike, with
+ *        waitpid(-1, WNOHANG) until none is left (one SIGCHLD may stand for several exits).
+ * @param child_status  Output: the application's wait status, set only when it was reaped.
+ * @return 1 when @p child was among those reaped, else 0.
  */
 static int chaos_init_reap(pid_t child, int *child_status)
 {
@@ -504,18 +643,23 @@ static int chaos_init_reap(pid_t child, int *child_status)
 }
 
 /**
- * @brief Once the application has exited: whether a background copy of chaos-init
- *        must go on answering the processes it left behind (daemons, double forks).
+ * @brief After the application exited: forks a background copy that keeps answering the
+ *        processes it left behind (daemons, double forks), when one is needed.
  *
- * @details They keep the filter; with nobody answering, every filtered call of
- * theirs would fail with ENOSYS. As PID 1 nothing is needed: its exit ends the
- * container's processes. Otherwise this process returns the application's exit
- * code at once, as before, and a forked copy serves the listener until the kernel
- * reports that no process uses the filter any more (POLLHUP, Linux 5.8+). Its
- * standard descriptors are detached so a caller reading chaos-init's output sees
- * the end of it.
+ * @details Leftover processes keep the filter. Once the last listener fd closes, the
+ * kernel fails each of their filtered calls with ENOSYS. As PID 1 no copy is needed: PID
+ * 1's exit kills every process in its pid namespace. Otherwise the caller exits with the
+ * application's code at once (callers see the usual exit), and the copy serves the
+ * listener until the kernel reports POLLHUP, meaning no process uses the filter any more
+ * (Linux 5.8+; on 5.5-5.7 the copy idles until the container stops). Its stdin, stdout
+ * and stderr are redirected to /dev/null so a caller reading chaos-init's output sees EOF.
  *
- * @return 1 in the background copy, 0 in the process that is to exit.
+ * The copy is not the leftovers' ancestor: under Yama `ptrace_scope=1` it cannot read
+ * their memory, so their path and endpoint selectors stop matching. If fork() fails, no
+ * copy exists and the leftovers get ENOSYS.
+ *
+ * @return 1 in the background copy, 0 in the process that is to exit (no listener, PID 1,
+ *         fork() failed, or the parent side of the fork).
  */
 static int chaos_init_serve_the_rest(int listener)
 {
@@ -539,6 +683,11 @@ static int chaos_init_serve_the_rest(int listener)
     return 1;
 }
 
+/**
+ * @brief Entry point; see the file header for the process model. The notification buffers
+ *        are unsigned long arrays so they carry the alignment of the kernel structures
+ *        they are cast to.
+ */
 int main(int argc, char **argv)
 {
     static unsigned long request[CHAOS_INIT_NOTIF_BUFFER / sizeof(unsigned long)];
@@ -570,11 +719,14 @@ int main(int argc, char **argv)
         return CHAOS_INIT_EXIT_USAGE;
     }
 
-    /* Orphans of the application are reaped here even when chaos-init is not PID 1. */
+    /* Outside PID 1, orphans of the application reparent here and are reaped here. A
+     * failure (pre-3.4 kernel) is harmless: such kernels fail the version check anyway. */
     (void)prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
 
-    /* Blocked before the fork, so no signal is lost while the child starts; the
-     * child restores the original mask before it executes the command. */
+    /* Blocked before the fork: signals arriving while the child starts stay pending for
+     * the signalfd, and the child inherits the block so the go signal cannot be lost. The
+     * child restores the original mask right before exec. SOCK_CLOEXEC keeps the handover
+     * socket out of the application. */
     chaos_init_signal_set(&forwarded);
     if (sigprocmask(SIG_BLOCK, &forwarded, &original) != 0 ||
         socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0)
@@ -583,13 +735,13 @@ int main(int argc, char **argv)
         return CHAOS_INIT_EXIT_HANDOVER;
     }
 
-    /* Looked up now: the child's execvp() would try one PATH entry after another,
-     * and only the application's first execve is exempt from the process rules. */
+    /* Resolved before the fork, unfiltered: execvp() in the child would issue one execve()
+     * per PATH entry, and only the start of the application is exempt from process rules. */
     found = chaos_init_find_command(
         argv[options.command], getenv("PATH"), command_path, sizeof(command_path)
     );
-    /* Where the kernel offers Multipath TCP but cannot say where its sockets are, Go
-     * (from 1.24) is told to listen with plain TCP, so net rules can match. */
+    /* Probed in the parent, before any filter: where the kernel offers MPTCP but sock_diag
+     * cannot locate its sockets, Go 1.24+ is told to use plain TCP so net rules can match. */
     mptcp_off = (options.libs & CHAOS_INIT_LIB_NET) != 0U && chaos_init_net_mptcp_unresolvable();
     child = fork();
     if (child < 0)
@@ -606,15 +758,18 @@ int main(int argc, char **argv)
         (void)close(pair[0]);
         (void)sigemptyset(&go);
         (void)sigaddset(&go, CHAOS_INIT_GO_SIGNAL);
-        /* The go signal is blocked (it is among the forwarded ones) until it is
-         * waited for, so it cannot be lost if it comes early. */
-        /* Sent on pair[1] as it is: a fixed number would fail under a low file limit
-         * and could clobber a descriptor the application inherits. */
+        /* The go signal is inherited blocked (it is in the forwarded set), so one that
+         * arrives before sigwait() stays pending. The handover uses pair[1] at whatever
+         * number it got: dup2() to a fixed number would fail under a low RLIMIT_NOFILE and
+         * could clobber a descriptor the application inherits. From here on the filter may
+         * be installed: everything up to the exec runs under it, and the parent answers
+         * only after the go signal. */
         if (chaos_init_install_and_hand_over(options.libs, pair[1], &installed) != 0 ||
             sigwait(&go, &received) != 0 || sigprocmask(SIG_SETMASK, &original, NULL) != 0)
         {
             _exit(CHAOS_INIT_EXIT_HANDOVER);
         }
+        /* Only with chaos active: without a filter there are no net rules to serve. */
         if (mptcp_off && installed)
         {
             static char godebug[1024];
@@ -636,10 +791,12 @@ int main(int argc, char **argv)
         {
             errno = found < 0 ? EACCES : ENOENT;
         }
+        /* Exit codes as a shell reports them: 127 not found, 126 anything else. */
         error = errno;
         (void)fprintf(stderr, "chaos-init: %s: %s\n", argv[options.command], strerror(error));
         _exit(error == ENOENT ? CHAOS_INIT_EXIT_NOT_FOUND : CHAOS_INIT_EXIT_NOT_EXECUTABLE);
     }
+    /* Closing our copy of the child's end makes recvmsg() see EOF if the child dies. */
     (void)close(pair[1]);
 
     listener = chaos_init_receive_listener(pair[0], &error);
@@ -648,17 +805,22 @@ int main(int argc, char **argv)
                           sizes.seccomp_notif > CHAOS_INIT_NOTIF_BUFFER ||
                           sizes.seccomp_notif_resp > CHAOS_INIT_NOTIF_BUFFER))
     {
-        /* Without answers every filtered call of the application would hang. */
+        /* NOTIF_RECV would overrun our buffers. The child has a filter but waits for go;
+         * left alive, its first filtered call would block for good. */
         (void)kill(child, SIGKILL);
         (void)fprintf(stderr, "chaos-init: cannot read seccomp notifications\n");
         return CHAOS_INIT_EXIT_HANDOVER;
     }
+    /* EOF without payload: the child failed before or during the handover (and may have
+     * installed a filter). Nothing to supervise; reap it and fail. */
     if (listener < 0 && error == 0)
     {
         (void)waitpid(child, &child_status, 0);
         (void)fprintf(stderr, "chaos-init: the child ended before the filter was set up\n");
         return CHAOS_INIT_EXIT_HANDOVER;
     }
+    /* Rule cores start before the go signal, so the first notification finds them ready.
+     * Without a listener they stay untouched (the libraries' status files are not written). */
     if (listener >= 0 && (options.libs & CHAOS_INIT_LIB_IO) != 0U)
     {
         chaos_init_io_start();
@@ -680,8 +842,11 @@ int main(int argc, char **argv)
         listener >= 0 ? NULL : chaos_init_unsupported_reason(error),
         mptcp_off && listener >= 0
     );
+    /* Status first, then go: whoever sees the application run reads this run's status. */
     (void)kill(child, CHAOS_INIT_GO_SIGNAL);
 
+    /* Created after go; signals that arrived meanwhile are still pending (blocked) and
+     * are read from the signalfd on the first iteration. */
     signals = signalfd(-1, &forwarded, SFD_CLOEXEC);
     timer = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
     if (signals < 0 || timer < 0)
@@ -717,7 +882,8 @@ int main(int argc, char **argv)
             {
                 if (serving_the_rest)
                 {
-                    /* The application is gone: nothing to forward or reap. */
+                    /* Background copy: the application is gone and this copy has no
+                     * children; signals are drained and ignored. */
                 }
                 else if (info.ssi_signo != SIGCHLD)
                 {
@@ -725,6 +891,7 @@ int main(int argc, char **argv)
                 }
                 else if (chaos_init_reap(child, &child_status))
                 {
+                    /* Every process's hits are on disk before the exit code is reported. */
                     chaos_init_tracee_flush(1);
                     if (!chaos_init_serve_the_rest(listener))
                     {
@@ -738,19 +905,25 @@ int main(int argc, char **argv)
         {
             uint64_t expirations;
 
-            /* Only consumes the expiry; what is due is handled below. */
+            /* Drains the expiry count so poll() stops reporting it; the due work runs in
+             * chaos_init_on_time() below, which re-arms the timer. */
             if (read(timer, &expirations, sizeof(expirations)) < 0)
             {
                 expirations = 0U;
             }
         }
+        /* One notification per iteration keeps signals and due delays from starving
+         * under a notification storm. POLLIN wins over POLLHUP; a hang-up is seen on a
+         * later iteration once nothing is left to receive. */
         if (count == 3 && (watched[2].revents & POLLIN) != 0)
         {
             chaos_init_answer(listener, options.libs, request, response, sizes.seccomp_notif_resp);
         }
         else if (count == 3 && (watched[2].revents & (POLLHUP | POLLERR)) != 0)
         {
-            /* No process uses the filter any more. */
+            /* No process uses the filter any more (Linux 5.8+). Parked calls died with
+             * their threads. The main process keeps running until SIGCHLD reports the
+             * application; the background copy is done. */
             (void)close(listener);
             listener = -1;
             if (serving_the_rest)

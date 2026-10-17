@@ -1,6 +1,13 @@
 /**
  * @file chaos_init_tracee.c
- * @brief chaos-init: per-process rule state of supervised processes.
+ * @brief `chaos-init`: the per-process rule state table (see chaos_init_tracee.h).
+ *
+ * @details All storage is static: the process table here, slot arrays in each library's
+ * CHAOS_INIT_RULES_STORAGE(). Lookups are linear over CHAOS_INIT_MAX_TRACEES (128)
+ * entries; chaos_init_tracee_of() costs two /proc reads (chaos_init_process_of()), and on
+ * a full table one identity check per entry. Single-threaded use only.
+ *
+ * Test seam: CHAOS_INIT_PROCESS_OF replaces the /proc identity lookup.
  */
 
 #include "chaos_init_tracee.h"
@@ -9,18 +16,18 @@
 
 #include <string.h>
 
-/** @brief Libraries that can be registered (io, net, memory, process, ...). */
+/** @brief Registration slots; four libraries register today (io, net, memory, process). */
 #define CHAOS_INIT_MAX_LIBS 6U
 
 /**
- * @brief How a process is told from another: its pid, its start time and its image
- *        (chaos_init_process_of()).
- *        Unit tests replace the lookup.
+ * @brief Test seam: resolves a tid to (tgid, identity), the identity being start time and
+ *        image (chaos_init_process_of()). Unit tests substitute a fake process table.
  */
 #ifndef CHAOS_INIT_PROCESS_OF
 #define CHAOS_INIT_PROCESS_OF(tid, tgid, start) chaos_init_process_of((tid), (tgid), (start))
 #endif
 
+/** @brief One table entry; `tgid` and `start` together identify the process image. */
 typedef struct chaos_init_tracee
 {
     pid_t tgid; /**< 0 when free. */
@@ -35,7 +42,10 @@ static uint64_t g_chaos_init_serial = 0U;
 static chaos_init_rules_t *g_chaos_init_rules[CHAOS_INIT_MAX_LIBS];
 static size_t g_chaos_init_rule_libs = 0U;
 
-/** @brief FNV-1a of a rule text. */
+/**
+ * @brief 64-bit FNV-1a of a rule text: the key under which counts survive a reload. A
+ *        collision (about 2^-64 per pair) would hand one rule's counts to another.
+ */
 static uint64_t chaos_init_hash(const char *text)
 {
     uint64_t hash = UINT64_C(0xcbf29ce484222325);
@@ -47,7 +57,10 @@ static uint64_t chaos_init_hash(const char *text)
     return hash;
 }
 
-/** @brief Called by the core on every hit of a tracee slot. */
+/**
+ * @brief `report` hook of every per-process slot: the core calls it after each hit
+ *        (chaos_hit_slot_t::report) to schedule the hits file write.
+ */
 static void chaos_init_tracee_report(chaos_hit_slot_t *slot);
 
 int chaos_init_tracee_register(chaos_init_rules_t *rules)
@@ -60,7 +73,12 @@ int chaos_init_tracee_register(chaos_init_rules_t *rules)
     return 0;
 }
 
-/** @brief Brings @p tracee's slots of @p rules to the active snapshot. */
+/**
+ * @brief Brings @p tracee's slots of @p rules to the active snapshot; no-op when already
+ *        there. Each new rule inherits the counts of the first old rule with the same text
+ *        hash (duplicate texts thus start from the same counts); a new text starts at
+ *        zero. Every slot gets the report hook.
+ */
 static void chaos_init_tracee_sync(chaos_init_rules_t *rules, int tracee)
 {
     const chaos_init_text_t *texts;
@@ -78,8 +96,8 @@ static void chaos_init_tracee_sync(chaos_init_rules_t *rules, int tracee)
     {
         return;
     }
-    /* Each count moves to the rule with the same text; a new text starts at zero.
-     * The old slots are copied first, since a count may move to a lower index. */
+    /* Old slots go to static scratch first: a count may move to a lower index and would
+     * otherwise be overwritten before it is read. */
     memcpy(old_slots, slots, old_count * sizeof(*slots));
     memcpy(old_hashes, hashes, old_count * sizeof(*hashes));
     for (index = 0U; index < new_count; ++index)
@@ -102,7 +120,10 @@ static void chaos_init_tracee_sync(chaos_init_rules_t *rules, int tracee)
     rules->count[tracee] = new_count;
 }
 
-/** @brief Writes @p tracee's hits file of @p rules. */
+/**
+ * @brief Writes @p tracee's hits file for @p rules (after syncing to the active snapshot)
+ *        and clears its pending flag.
+ */
 static void chaos_init_tracee_write(chaos_init_rules_t *rules, int tracee)
 {
     const chaos_init_text_t *texts;
@@ -119,8 +140,10 @@ static void chaos_init_tracee_write(chaos_init_rules_t *rules, int tracee)
         slots[index] = &rules->slots[(size_t)tracee * rules->max_rules + index];
     }
     const long tgid = (long)g_chaos_init_tracees[tracee].tgid;
-    /* The number of a file this process created, 0 before its first write. A file
-     * of this pid may hold the hits of the image an execve replaced. */
+    /* The number of the file this entry created, 0 before its first write. Until then a
+     * number is chosen afresh: a file of this pid may hold the hits of the image an
+     * execve() replaced, or of a dead process with the same pid, and must not be wiped.
+     * chaos_hits_write_for() creates exclusively and moves on if the name is taken. */
     long number = rules->file[tracee];
     int owned = number != 0;
 
@@ -142,6 +165,9 @@ static void chaos_init_tracee_write(chaos_init_rules_t *rules, int tracee)
     rules->file[tracee] = owned ? number : 0;
 }
 
+/* Finds the library and process owning @p slot by address range, then writes the hits
+ * file at once for the first CHAOS_HITS_EAGER hits and marks it pending afterwards (the
+ * timer flushes pending files every CHAOS_HITS_INTERVAL_MS). */
 static void chaos_init_tracee_report(chaos_hit_slot_t *slot)
 {
     size_t lib;
@@ -168,7 +194,10 @@ static void chaos_init_tracee_report(chaos_hit_slot_t *slot)
     }
 }
 
-/** @brief Writes what is pending for @p tracee and frees its entry. */
+/**
+ * @brief Writes what is pending for @p tracee and frees its entry, resetting every
+ *        library's per-process state (generation 0 forces a fresh sync on reuse).
+ */
 static void chaos_init_tracee_drop(int tracee)
 {
     size_t lib;
@@ -190,9 +219,10 @@ static void chaos_init_tracee_drop(int tracee)
 }
 
 /**
- * @brief Frees entries of processes that ended; @return the first free index, or -1.
+ * @brief Writes and frees the entries whose process ended or whose pid now names another
+ *        process (identity mismatch). @return The first freed index, or -1.
  *
- * @details Only called on a full table, so every entry belongs to a process.
+ * @details Called only on a full table, so every entry is occupied.
  */
 static int chaos_init_tracee_reclaim(void)
 {
@@ -240,7 +270,8 @@ int chaos_init_tracee_of(pid_t tid)
         }
         if (entry->tgid == tgid)
         {
-            /* The pid of an ended process, now another one's: start over. */
+            /* Same tgid, different identity: the pid was reused or execve() loaded a new
+             * image. Write the old entry's hits and start over. */
             chaos_init_tracee_drop((int)index);
         }
         if (g_chaos_init_tracees[index].tgid == 0 && free_index < 0)
@@ -313,6 +344,7 @@ chaos_hit_slot_t *chaos_init_tracee_hit(
     size_t index;
     int tracee;
 
+    /* The copy's position in the snapshot is the rule index. */
     for (index = 0U; index < count && hits[index] != hit; ++index)
     {
     }

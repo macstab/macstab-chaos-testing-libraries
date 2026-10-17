@@ -1,31 +1,55 @@
 /**
  * @file chaos_init_net.c
- * @brief chaos-init: libchaos-net rules for system calls of supervised processes.
+ * @brief `chaos-init`: libchaos-net rules applied to tracee system calls.
  *
- * @details The net rule core (parsing, reload, status file, endpoint selectors,
- * matching, qualifiers) and its endpoint resolution are compiled in unchanged. The
- * resolution asks a descriptor three things through function pointers the preload
- * library fills with getsockopt(SO_TYPE), getsockname() and getpeername(); here
- * they answer for the supervised thread's descriptor instead, without access to it
- * (pidfd_getfd() needs CAP_SYS_PTRACE under Docker's default profile):
+ * @details The libchaos-net rule core (parsing, reload, status file, endpoint selectors,
+ * matching, qualifiers) and its endpoint resolution (chaos_net_endpoint.c) are compiled in
+ * by `#include`, unchanged. The resolution queries a descriptor through three function
+ * pointers that the preload library fills with getsockopt(SO_TYPE), getsockname() and
+ * getpeername() as real functions. Here they answer for the tracee's descriptor from
+ * outside, because the supervisor cannot hold it: pidfd_getfd() needs CAP_SYS_PTRACE,
+ * which Docker's default profile withholds.
  *
- * - the type, from the socket's `system.sockprotoname` attribute, read through
- *   /proc/<pid>/fd/<fd> (TCP, UDP, TCPv6, UDPv6, UNIX-STREAM, UNIX-DGRAM);
- * - the addresses, from the socket's row in /proc/<pid>/net/{tcp,tcp6,udp,udp6,unix},
- *   found by inode. A socket not bound yet has no row: its name is the unspecified
- *   address and it has no peer, as getsockname()/getpeername() would say. A UNIX
- *   socket's peer is not in /proc and is reported as unknown.
+ * - **Type:** the socket inode's `system.sockprotoname` xattr, read through
+ *   `/proc/<tid>/fd/<fd>` (TCP, UDP, TCPv6, UDPv6, UNIX-STREAM, UNIX-DGRAM, UNIX, MPTCP,
+ *   MPTCPv6).
+ * - **Addresses:** the socket's row in `/proc/<tid>/net/{tcp,tcp6,udp,udp6,unix}`, found
+ *   by inode. These tables follow the tracee's network namespace. MPTCP sockets are in
+ *   no table and are looked up through sock_diag instead (as `ss` does), which answers for
+ *   the supervisor's namespace, the container's.
+ * - **Unbound/unconnected:** no row means the unspecified address and no peer, as
+ *   getsockname()/getpeername() would report. A UNIX socket's peer is not in /proc and is
+ *   reported as ENOTCONN, so peer selectors never match UNIX sockets.
  *
- * The wait calls scan their descriptors like the library does: the pollfd array
- * and fd_sets from the thread's memory, an epoll instance's descriptors from
- * /proc/<pid>/fdinfo. SECCOMP mode applies ERRNO, LATENCY and (poll family)
- * TIMEOUT. CORRUPT, TRICKLE and DUP change received data, RESET needs the socket
- * itself, and ERRNO on close would have to close and fail at once: a rule file with
- * any of them is rejected while it is parsed (`unsupported in seccomp mode`).
+ * Wait calls scan their descriptors as the library does: the pollfd array and fd_sets
+ * from tracee memory, an epoll instance's registered fds from `/proc/<tid>/fdinfo/<epfd>`,
+ * at most CHAOS_INIT_NET_MAX_WAIT (1024) per call.
+ *
+ * @par Supported effects
+ * ERRNO (not on close), LATENCY, and TIMEOUT on the poll family. CORRUPT, TRICKLE and DUP
+ * change received data; RESET needs the socket itself (SO_LINGER); ERRNO on close would
+ * have to close and fail at once. A rule file with any of them is rejected at parse time
+ * via CHAOS_NET_RULE_SUPPORTED (`unsupported in seccomp mode`).
+ *
+ * @par Cost
+ * Endpoint lookups read /proc files per descriptor, so they run only when a loaded rule
+ * targets the call's operation (chaos_init_net_targeted()).
+ *
+ * @par Failure behaviour
+ * Fail-open: an unreadable argument, fd or /proc row means no endpoint and no match.
+ *
+ * @par Thread safety
+ * The query callbacks read the tracee tid from a file-scope variable set per decision;
+ * the supervisor is single-threaded.
+ *
+ * Test seams: CHAOS_INIT_NET_GETXATTR, CHAOS_INIT_NET_MPTCP_SOCKET,
+ * CHAOS_INIT_NET_MPTCP_DIAG, CHAOS_INIT_NET_DIAG_SOCKET.
  */
 
 #include "chaos_init_net.h"
 
+/* Parser hook, defined before the core is included: rules this mode cannot apply reject
+ * their file at load time. */
 struct chaos_net_rule;
 static int chaos_init_net_supported(const struct chaos_net_rule *rule);
 #define CHAOS_NET_RULE_SUPPORTED(rule) chaos_init_net_supported(rule)
@@ -49,25 +73,34 @@ static int chaos_init_net_supported(const struct chaos_net_rule *rule);
 #include <sys/un.h>
 #include <sys/xattr.h>
 
+/* CHAOS_NET_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, TIMEOUT. */
 static int chaos_init_net_supported(const struct chaos_net_rule *rule)
 {
     return (rule->effect == CHAOS_NET_EFFECT_ERRNO && rule->operation != CHAOS_NET_OP_CLOSE) ||
            rule->effect == CHAOS_NET_EFFECT_LATENCY || rule->effect == CHAOS_NET_EFFECT_TIMEOUT;
 }
 
-/** @brief The thread whose descriptors the socket queries below answer for. */
+/**
+ * @brief The tracee thread whose descriptors the query callbacks answer for. Set at the
+ *        start of every decision and commit: the callbacks' signatures (fd only) leave no
+ *        other way to pass it.
+ */
 static pid_t g_chaos_init_net_tid = 0;
 
-/** @brief How /proc files and links are read; unit tests replace them. */
+/** @brief Test seam: the xattr reader for `system.sockprotoname`. */
 #ifndef CHAOS_INIT_NET_GETXATTR
 #define CHAOS_INIT_NET_GETXATTR getxattr
 #endif
 
+/* For libc headers older than MPTCP support (Linux 5.6 UAPI value). */
 #ifndef IPPROTO_MPTCP
 #define IPPROTO_MPTCP 262
 #endif
 
-/** @brief A socket's protocol as the kernel names it, mapped to what getsockopt says. */
+/**
+ * @brief Maps the kernel's protocol name (`system.sockprotoname`) to what getsockopt()
+ *        and the address lookups need.
+ */
 typedef struct chaos_init_net_protocol
 {
     const char *name;  /**< system.sockprotoname */
@@ -85,14 +118,14 @@ static const chaos_init_net_protocol_t g_chaos_init_net_protocols[] = {
     {"UNIX-STREAM", SOCK_STREAM, AF_UNIX, "unix", 0},
     {"UNIX-DGRAM", SOCK_DGRAM, AF_UNIX, "unix", 0},
     {"UNIX", SOCK_STREAM, AF_UNIX, "unix", 0}, /* kernels before 5.x name every UNIX socket so */
-    /* Multipath TCP (Go listens with it by default from 1.24): a stream socket, but
-     * in no /proc/net table. */
+    /* Multipath TCP (Go 1.24+ listens with it by default): a stream socket in no
+     * /proc/net table, looked up through sock_diag. */
     {"MPTCP", SOCK_STREAM, AF_INET, NULL, IPPROTO_MPTCP},
     {"MPTCPv6", SOCK_STREAM, AF_INET6, NULL, IPPROTO_MPTCP},
 };
 
-/** @brief The socket that tells whether MPTCP sockets can be looked up; unit tests
- *         replace it, and the protocol sock_diag is asked for. */
+/** @brief Test seams of chaos_init_net_mptcp_unresolvable(): the probe socket, and the
+ *         protocol sock_diag is asked for (unit tests force either outcome). */
 #ifndef CHAOS_INIT_NET_MPTCP_SOCKET
 #define CHAOS_INIT_NET_MPTCP_SOCKET() socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_MPTCP)
 #endif
@@ -100,15 +133,21 @@ static const chaos_init_net_protocol_t g_chaos_init_net_protocols[] = {
 #define CHAOS_INIT_NET_MPTCP_DIAG IPPROTO_MPTCP
 #endif
 
-/** @brief The netlink socket sock_diag is asked through; unit tests make it fail. */
+/** @brief Test seam: the NETLINK_SOCK_DIAG socket; unit tests make its creation fail. */
 #ifndef CHAOS_INIT_NET_DIAG_SOCKET
 #define CHAOS_INIT_NET_DIAG_SOCKET() socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_SOCK_DIAG)
 #endif
 
 /**
- * @brief Looks for socket @p inode in @p length bytes of a sock_diag answer and
- *        puts its own address (@p peer 0) or its peer's into @p found.
- * @return 1 found; 0 not in this part; -1 the answer is over (done, or an error).
+ * @brief Scans one recv() worth (@p length bytes) of a sock_diag dump for socket @p inode
+ *        and stores its own address (@p peer 0) or its peer's in @p found.
+ *
+ * @details inet_diag_msg carries addresses as four 32-bit words in network order and
+ * ports in network order, so they are copied into the sockaddr unchanged. Messages
+ * shorter than inet_diag_msg are skipped.
+ *
+ * @return 1 found; 0 not in this chunk (read the next); -1 the dump ended (NLMSG_DONE)
+ *         or failed (NLMSG_ERROR).
  */
 static int chaos_init_net_diag_parse(
     const void *answer,
@@ -161,14 +200,17 @@ static int chaos_init_net_diag_parse(
 }
 
 /**
- * @brief The own address or peer of socket @p inode of @p protocol and @p family,
- *        asked of sock_diag (as `ss` does): for sockets no /proc/net table lists.
+ * @brief Looks up the own address (@p peer 0) or peer of socket @p inode through a
+ *        sock_diag dump (SOCK_DIAG_BY_FAMILY, all states), as `ss` does: for sockets no
+ *        /proc/net table lists.
  *
- * @details The protocol goes in an INET_DIAG_REQ_PROTOCOL attribute (5.10+), as
- * MPTCP's number does not fit the request's own byte. The answer is the
- * supervisor's network namespace, which is the container's.
+ * @details The 8-bit sdiag_protocol cannot hold IPPROTO_MPTCP (262), so the protocol also
+ * goes in an INET_DIAG_REQ_PROTOCOL attribute (5.10+), with sdiag_protocol 0 for values
+ * >= 256. The dump covers the supervisor's network namespace, which is the container's;
+ * a tracee in a namespace of its own is not found. A netlink socket is opened and closed
+ * per lookup. The 16 KiB static receive buffer makes this non-reentrant.
  *
- * @return 1 with the address in @p found, else 0.
+ * @return 1 with the address in @p found, else 0 (not found, or any netlink failure).
  */
 static int chaos_init_net_diag_name(
     int family,
@@ -217,7 +259,11 @@ static int chaos_init_net_diag_name(
     return result > 0;
 }
 
-/** @brief The protocol of descriptor @p fd of the current thread; NULL if not a known socket. */
+/**
+ * @brief The protocol entry of descriptor @p fd of g_chaos_init_net_tid, from the socket's
+ *        `system.sockprotoname` xattr (getxattr() follows the /proc fd magic link to the
+ *        socket inode). @return NULL for a non-socket or an unlisted protocol.
+ */
 static const chaos_init_net_protocol_t *chaos_init_net_protocol(int fd)
 {
     char path[64];
@@ -244,7 +290,7 @@ static const chaos_init_net_protocol_t *chaos_init_net_protocol(int fd)
     return NULL;
 }
 
-/** @brief The socket inode of descriptor @p fd of the current thread; 0 if none. */
+/** @brief Socket inode of descriptor @p fd of g_chaos_init_net_tid (`socket:[N]`); 0 if none. */
 static unsigned long chaos_init_net_inode(int fd)
 {
     char name[32];
@@ -261,8 +307,14 @@ static unsigned long chaos_init_net_inode(int fd)
 }
 
 /**
- * @brief Parses an address of /proc/net/{tcp,udp}{,6}: "0100007F:1F90" or the
- *        IPv6 form with 32 hex digits, each 8 of them a word in host order.
+ * @brief Parses a `/proc/net/{tcp,udp}{,6}` address column: `0100007F:1F90`, or 32 hex
+ *        digits for IPv6.
+ *
+ * @details The kernel prints each 32-bit address word as the hex of its in-memory value
+ * (%08X of a __be32 read as a host integer), so parsing the hex back yields the exact
+ * bytes of s_addr / each s6_addr word. The port is printed in host order and gets htons().
+ *
+ * @return 1 with the address in @p out; 0 on a malformed column.
  */
 static int chaos_init_net_parse_address(
     const char *text, int family, struct sockaddr_storage *out, socklen_t *length
@@ -312,8 +364,16 @@ static int chaos_init_net_parse_address(
 }
 
 /**
- * @brief getsockname() (@p peer 0) or getpeername() (@p peer 1) of descriptor @p fd
- *        of the current thread, from its row in /proc/<pid>/net.
+ * @brief Emulates getsockname() (@p peer 0) or getpeername() (@p peer 1) for descriptor
+ *        @p fd of g_chaos_init_net_tid, from its row in `/proc/<tid>/net/<table>` (found
+ *        by inode) or, for MPTCP, from sock_diag.
+ *
+ * @details Semantics follow the real calls: @p address receives at most *@p length bytes
+ * and *@p length the full size. Not found as own address: the family's unspecified
+ * address (an unbound socket). Peer not found, port 0, or any UNIX socket: ENOTCONN.
+ *
+ * @return 0, or -1 with errno ENOTSOCK (not a known socket, or NULL arguments) or
+ *         ENOTCONN.
  */
 static int chaos_init_net_name(int fd, struct sockaddr *address, socklen_t *length, int peer)
 {
@@ -353,10 +413,13 @@ static int chaos_init_net_name(int fd, struct sockaddr *address, socklen_t *leng
         unsigned long row_inode = 0U;
         int end = 0;
 
+        /* IP tables: sl local rem st tx:rx tr:tm retrnsmt uid timeout inode; the header
+         * line fails either scan. */
         if (protocol->family == AF_UNIX)
         {
-            /* The path is the rest of the line, spaces included; an abstract name
-             * shows as '@name', the text the library gives it too. */
+            /* Columns: Num RefCount Protocol Flags Type St Inode Path. The path is the rest
+             * of the line, spaces included; an abstract name shows as '@name', the same
+             * text the library derives for it. */
             if (sscanf(line, "%*s %*s %*s %*s %*s %*s %lu%n", &row_inode, &end) >= 1 &&
                 row_inode == inode)
             {
@@ -366,8 +429,8 @@ static int chaos_init_net_name(int fd, struct sockaddr *address, socklen_t *leng
                                                ? strcspn(name, "\n")
                                                : sizeof(un->sun_path);
 
-                /* As getsockname() reports it: an unnamed socket has only the
-                 * family, a name that fills sun_path has no NUL. */
+                /* Length as getsockname() reports it: family only for an unnamed socket,
+                 * a terminating NUL counted unless the name fills sun_path. */
                 un->sun_family = AF_UNIX;
                 memcpy(un->sun_path, name, name_length);
                 found_length =
@@ -392,7 +455,7 @@ static int chaos_init_net_name(int fd, struct sockaddr *address, socklen_t *leng
     }
     if (peer)
     {
-        /* A UNIX peer is not in /proc; an IP peer of 0 means not connected. */
+        /* A UNIX peer is not in /proc; an IP peer with port 0 means not connected. */
         const struct sockaddr_in *in = (const struct sockaddr_in *)&found;
         const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)&found;
 
@@ -406,7 +469,7 @@ static int chaos_init_net_name(int fd, struct sockaddr *address, socklen_t *leng
     }
     else if (!have)
     {
-        /* Not bound yet: the unspecified address of its family. */
+        /* No row: not bound yet, so the unspecified address of its family. */
         found.ss_family = (sa_family_t)protocol->family;
         found_length = protocol->family == AF_INET    ? (socklen_t)sizeof(struct sockaddr_in)
                        : protocol->family == AF_INET6 ? (socklen_t)sizeof(struct sockaddr_in6)
@@ -417,6 +480,7 @@ static int chaos_init_net_name(int fd, struct sockaddr *address, socklen_t *leng
     return 0;
 }
 
+/* The three "real functions" handed to the endpoint resolution (see the file header). */
 static int chaos_init_net_getsockname(int fd, struct sockaddr *address, socklen_t *length)
 {
     return chaos_init_net_name(fd, address, length, 0);
@@ -427,6 +491,8 @@ static int chaos_init_net_getpeername(int fd, struct sockaddr *address, socklen_
     return chaos_init_net_name(fd, address, length, 1);
 }
 
+/* Emulates getsockopt(SOL_SOCKET, SO_TYPE) only: ENOPROTOOPT for any other option or a
+ * buffer under sizeof(int), ENOTSOCK for a non-socket. */
 static int chaos_init_net_getsockopt(int fd, int level, int name, void *value, socklen_t *length)
 {
     const chaos_init_net_protocol_t *protocol;
@@ -448,7 +514,8 @@ static int chaos_init_net_getsockopt(int fd, int level, int name, void *value, s
     return 0;
 }
 
-/* What the rule core expects the preload library to provide. */
+/* Symbols the rule core expects from the preload library: the real functions point at
+ * the /proc emulations above; the seed is replaced from getrandom() at start. */
 chaos_net_getsockname_fn g_chaos_net_real_getsockname = chaos_init_net_getsockname;
 chaos_net_getpeername_fn g_chaos_net_real_getpeername = chaos_init_net_getpeername;
 chaos_net_getsockopt_fn g_chaos_net_real_getsockopt = chaos_init_net_getsockopt;
@@ -456,13 +523,13 @@ __thread int g_chaos_net_tls_guard = 0;
 __thread uint64_t g_chaos_net_tls_prng_state = 0U;
 uint64_t g_chaos_net_process_seed = UINT64_C(0x9e3779b97f4a7c15);
 
-/** @brief How a system call names the socket(s) it acts on. */
+/** @brief How a system call names the socket(s) it acts on, i.e. which endpoint is matched. */
 typedef enum chaos_init_net_kind
 {
     CHAOS_INIT_NET_SPEC,     /**< socket()/socketpair(): domain, type, protocol. */
     CHAOS_INIT_NET_ADDRESS,  /**< bind()/connect(): fd, sockaddr, length. */
-    CHAOS_INIT_NET_LOCAL,    /**< The socket's own address. */
-    CHAOS_INIT_NET_PEER,     /**< The socket's peer. */
+    CHAOS_INIT_NET_LOCAL,    /**< Own address first, then the peer. */
+    CHAOS_INIT_NET_PEER,     /**< Peer first, then the own address. */
     CHAOS_INIT_NET_ACTIVITY, /**< Own address, else the peer. */
     CHAOS_INIT_NET_SENDTO,   /**< sendto(): the destination argument, else the peer. */
     CHAOS_INIT_NET_SENDMSG,  /**< sendmsg(): msg_name, else the peer. */
@@ -472,6 +539,7 @@ typedef enum chaos_init_net_kind
     CHAOS_INIT_NET_EPOLL     /**< epoll_wait()/epoll_pwait(): the instance's descriptors. */
 } chaos_init_net_kind_t;
 
+/** @brief One row of the net decode table: system call number to wrapper semantics. */
 typedef struct chaos_init_net_call
 {
     long nr;
@@ -482,6 +550,7 @@ typedef struct chaos_init_net_call
                      -3 a msghdr (arg 1), -4 an mmsghdr batch (args 1-2). */
 } chaos_init_net_call_t;
 
+/* Must list exactly the numbers of g_chaos_init_net_calls in chaos_init_core.c. */
 static const chaos_init_net_call_t g_chaos_init_net_calls[] = {
     {__NR_socket, CHAOS_NET_OP_SOCKET, CHAOS_INIT_NET_SPEC, 0, -1},
     {__NR_socketpair, CHAOS_NET_OP_SOCKET, CHAOS_INIT_NET_SPEC, 0, -1},
@@ -528,6 +597,7 @@ static uint64_t g_chaos_init_net_load = 0U;
 static const chaos_net_config_state_t *g_chaos_init_net_seen_state = NULL;
 static uint64_t g_chaos_init_net_seen_stamp = 0U;
 
+/* chaos_init_rules_t::snapshot for net; reload detection as in chaos_init_io.c. */
 static size_t chaos_init_net_snapshot(const chaos_init_text_t **texts, uint64_t *generation)
 {
     const chaos_net_config_state_t *state = chaos_net_config_active_state();
@@ -570,7 +640,10 @@ void chaos_init_net_start(void)
     (void)chaos_init_tracee_register(&g_chaos_init_net_rules);
 }
 
-/** @brief Bytes an iovec array of the current thread describes; CHAOS_POLICY_NO_SIZE if unknown. */
+/**
+ * @brief Total bytes of an iovec array of g_chaos_init_net_tid, for `@size`; more than
+ *        1024 entries (UIO_MAXIOV) or an unreadable array yields CHAOS_POLICY_NO_SIZE.
+ */
 static uint64_t chaos_init_net_iov_size(uint64_t address, uint64_t count)
 {
     struct iovec vector[64];
@@ -604,7 +677,11 @@ static uint64_t chaos_init_net_iov_size(uint64_t address, uint64_t count)
     return total;
 }
 
-/** @brief Endpoint of a sockaddr in the thread's memory, typed by descriptor @p fd. */
+/**
+ * @brief Endpoint of a sockaddr in tracee memory (at most sizeof(sockaddr_storage) bytes
+ *        read), with the socket type taken from descriptor @p fd.
+ * @return 1 resolved; 0 for a NULL/empty address, an unreadable one, or no endpoint.
+ */
 static int
 chaos_init_net_sockaddr(int fd, uint64_t address, uint64_t length, chaos_net_endpoint_t *endpoint)
 {
@@ -621,7 +698,7 @@ chaos_init_net_sockaddr(int fd, uint64_t address, uint64_t length, chaos_net_end
     );
 }
 
-/** @brief Bytes a msghdr in the thread's memory describes; CHAOS_POLICY_NO_SIZE if unknown. */
+/** @brief Payload bytes of a msghdr in tracee memory; CHAOS_POLICY_NO_SIZE if unknown. */
 static uint64_t chaos_init_net_message_size(uint64_t address)
 {
     struct msghdr message;
@@ -635,10 +712,14 @@ static uint64_t chaos_init_net_message_size(uint64_t address)
     );
 }
 
-/** @brief Most messages the kernel moves in one sendmmsg call (UIO_MAXIOV), as in the library. */
+/** @brief Messages of one sendmmsg the kernel processes (UIO_MAXIOV); the library caps alike. */
 #define CHAOS_INIT_NET_MMSG_MAX 1024U
 
-/** @brief Bytes of a sendmmsg batch (its first messages); CHAOS_POLICY_NO_SIZE if unknown. */
+/**
+ * @brief Payload bytes of a sendmmsg batch (first CHAOS_INIT_NET_MMSG_MAX messages); one
+ *        tracee read per message plus its iovecs. CHAOS_POLICY_NO_SIZE if any message is
+ *        unreadable or the sum would exceed UINT64_MAX / 2.
+ */
 static uint64_t chaos_init_net_batch_size(uint64_t address, uint64_t vlen)
 {
     const uint64_t count = vlen < CHAOS_INIT_NET_MMSG_MAX ? vlen : CHAOS_INIT_NET_MMSG_MAX;
@@ -659,8 +740,9 @@ static uint64_t chaos_init_net_batch_size(uint64_t address, uint64_t vlen)
 }
 
 /**
- * @brief The destination a message in the thread's memory names (msg_name).
- * @return 1 resolved, 0 named but not resolved, -1 none named, -2 unreadable.
+ * @brief The destination a msghdr in tracee memory names (msg_name).
+ * @return 1 resolved, 0 named but not resolved, -1 none named (use the connection),
+ *         -2 the msghdr itself is unreadable.
  */
 static int chaos_init_net_message(int fd, uint64_t address, chaos_net_endpoint_t *endpoint)
 {
@@ -680,9 +762,10 @@ static int chaos_init_net_message(int fd, uint64_t address, chaos_net_endpoint_t
 }
 
 /**
- * @brief The rule for @p operation on connected socket @p fd, on one end of the
- *        connection and, failing that, the other, as the library matches it
- *        (chaos_net_match_connected()).
+ * @brief Matches @p operation on socket @p fd against either end of its connection, as the
+ *        library does (chaos_net_match_connected()): the preferred end first (@p peer_first
+ *        selects the peer), then the other. A missing end is skipped.
+ * @return 1 with the rule in @p rule, else 0.
  */
 static int chaos_init_net_match_ends(
     int fd, chaos_net_operation_t operation, int peer_first, chaos_net_rule_t *rule
@@ -702,9 +785,10 @@ static int chaos_init_net_match_ends(
 }
 
 /**
- * @brief The SEND rule for a sendmmsg batch: the first message whose destination
- *        matches, the connection standing for every message without one, as the
- *        library scans it (chaos_net_extra.c).
+ * @brief The SEND rule for a sendmmsg batch, scanned as the library does
+ *        (chaos_net_extra.c): the first message whose msg_name matches wins; the
+ *        connection's ends stand for every message without msg_name and are checked once.
+ *        An unreadable message ends the scan with no match (the kernel fails the call).
  */
 static int
 chaos_init_net_match_batch(int fd, uint64_t address, uint64_t vlen, chaos_net_rule_t *rule)
@@ -739,7 +823,10 @@ chaos_init_net_match_batch(int fd, uint64_t address, uint64_t vlen, chaos_net_ru
     return 0;
 }
 
-/** @brief Matches the first descriptor of @p fds with an endpoint and a POLL rule. */
+/**
+ * @brief POLL rule for a wait call: the first of @p fds (negative entries skipped, as poll
+ *        ignores them) whose activity endpoint matches. One /proc lookup per descriptor.
+ */
 static int chaos_init_net_match_any(const int *fds, size_t count, chaos_net_rule_t *rule)
 {
     size_t index;
@@ -757,10 +844,14 @@ static int chaos_init_net_match_any(const int *fds, size_t count, chaos_net_rule
     return 0;
 }
 
-/** @brief Most descriptors of one wait call that are looked at. */
+/** @brief Descriptors examined per wait call; the rest are ignored (bounds cost and buffers). */
 #define CHAOS_INIT_NET_MAX_WAIT 1024U
 
-/** @brief The descriptors of a pollfd array in the thread's memory. */
+/**
+ * @brief Copies the fds of a pollfd array in tracee memory into @p fds (capacity
+ *        CHAOS_INIT_NET_MAX_WAIT), 64 entries per read; stops early at an unreadable
+ *        chunk. @return The number copied.
+ */
 static size_t chaos_init_net_poll_fds(uint64_t address, uint64_t count, int *fds)
 {
     struct pollfd entries[64];
@@ -791,13 +882,20 @@ static size_t chaos_init_net_poll_fds(uint64_t address, uint64_t count, int *fds
     return found;
 }
 
-/** @brief Bytes of an fd_set that @p nfds descriptors take (whole 64-bit words). */
+/**
+ * @brief Bytes of an fd_set the kernel touches for @p nfds descriptors: whole 64-bit
+ *        words, as the kernel reads and writes them on LP64.
+ */
 static size_t chaos_init_net_set_bytes(int nfds)
 {
     return nfds <= 0 ? 0U : ((size_t)nfds + 63U) / 64U * 8U;
 }
 
-/** @brief The descriptors set in the fd_sets of a select call. */
+/**
+ * @brief Collects the fds set in the read, write and except sets (args 1-3) of a
+ *        select/pselect6 call, nfds capped at FD_SETSIZE (1024). A NULL or unreadable set
+ *        is skipped; an fd in several sets is listed once per set.
+ */
 static size_t chaos_init_net_select_fds(const chaos_init_call_t *call, int *fds)
 {
     const int count = (int)call->args[0] < FD_SETSIZE ? (int)call->args[0] : FD_SETSIZE;
@@ -809,7 +907,8 @@ static size_t chaos_init_net_select_fds(const chaos_init_call_t *call, int *fds)
         fd_set bits;
         int fd;
 
-        /* Only the bytes nfds covers: a smaller set may end where its mapping does. */
+        /* Only the bytes nfds covers: a caller's smaller set may end where its mapping
+         * does, and the kernel itself reads no more. */
         memset(&bits, 0, sizeof(bits));
         if (call->args[set] == 0U ||
             chaos_init_read_memory(
@@ -829,7 +928,10 @@ static size_t chaos_init_net_select_fds(const chaos_init_call_t *call, int *fds)
     return found;
 }
 
-/** @brief The descriptors registered in epoll instance @p epfd (its fdinfo "tfd:" lines). */
+/**
+ * @brief The fds registered in epoll instance @p epfd of the tracee, from the `tfd:` lines
+ *        of `/proc/<tid>/fdinfo/<epfd>` (numbers in the registering process's table).
+ */
 static size_t chaos_init_net_epoll_fds(int epfd, int *fds)
 {
     char path[64];
@@ -855,7 +957,12 @@ static size_t chaos_init_net_epoll_fds(int epfd, int *fds)
     return found;
 }
 
-/** @brief Finds the rule for @p call of @p entry; 0 when none matches. */
+/**
+ * @brief Resolves the endpoint(s) @p entry's kind prescribes for @p call and matches them.
+ *        Precondition: g_chaos_init_net_tid is the caller and the rules are prepared.
+ *        The static fd buffer makes this non-reentrant.
+ * @return 1 with the rule in @p rule, else 0.
+ */
 static int chaos_init_net_match(
     const chaos_init_net_call_t *entry, const chaos_init_call_t *call, chaos_net_rule_t *rule
 )
@@ -886,8 +993,9 @@ static int chaos_init_net_match(
     case CHAOS_INIT_NET_SENDTO:
     case CHAOS_INIT_NET_SENDMSG:
     {
-        /* The destination named in the call, else either end of the connection. A
-         * destination that does not resolve matches nothing, as in the library. */
+        /* The destination named in the call (sendto args[4..5], msg_name), else either
+         * end of the connection, peer first. A named destination that does not resolve
+         * matches nothing, as in the library. */
         const int named =
             entry->kind == CHAOS_INIT_NET_SENDTO
                 ? (call->args[4] == 0U
@@ -917,9 +1025,9 @@ static int chaos_init_net_match(
 }
 
 /**
- * @brief Whether a loaded rule is for @p operation. Endpoints are looked up in
- *        /proc only then: a recv or poll on many sockets costs nothing while the
- *        rules are only for connect.
+ * @brief Whether any loaded rule targets @p operation. Endpoint lookups (/proc reads, per
+ *        descriptor for wait calls) run only then, so recv or epoll on many sockets stays
+ *        at the base notification cost while the rules target only connect.
  */
 static int chaos_init_net_targeted(chaos_net_operation_t operation)
 {
@@ -936,7 +1044,11 @@ static int chaos_init_net_targeted(chaos_net_operation_t operation)
     return 0;
 }
 
-/** @brief Whether descriptor @p fd of thread @p tid is a socket. */
+/**
+ * @brief Whether descriptor @p fd of thread @p tid is a socket (`/proc/<tid>/fd/<fd>` reads
+ *        `socket:[...]`). Decides whether read/write/close belong to net or io; an
+ *        unreadable link counts as not a socket.
+ */
 static int chaos_init_net_is_socket(pid_t tid, uint64_t fd)
 {
     char name[32];
@@ -947,7 +1059,11 @@ static int chaos_init_net_is_socket(pid_t tid, uint64_t fd)
            strncmp(link, "socket:", 7U) == 0;
 }
 
-/** @brief Milliseconds of a timespec at @p address of the thread, rounded up; -1 for none. */
+/**
+ * @brief A timespec in tracee memory as milliseconds, rounded up and capped at INT32_MAX.
+ * @return The value, or -1 for NULL (wait forever), unreadable, or invalid (the kernel
+ *         fails it with EINVAL; the real call is left to report that).
+ */
 static int64_t chaos_init_net_timespec_ms(uint64_t address)
 {
     struct timespec timeout;
@@ -969,8 +1085,10 @@ static int64_t chaos_init_net_timespec_ms(uint64_t address)
 }
 
 /**
- * @brief The timeout of wait call @p call in milliseconds, as the library reads it;
- *        -1 when it waits without one (or the timeout cannot be read).
+ * @brief The timeout of wait call @p call in milliseconds, as the library reads it:
+ *        ppoll/pselect6/epoll_pwait2 timespec, select timeval, poll/epoll_wait/epoll_pwait
+ *        int milliseconds. @return -1 when it waits without one, or the timeout is
+ *        unreadable or invalid.
  */
 static int64_t chaos_init_net_wait_timeout(const chaos_init_call_t *call)
 {
@@ -1013,9 +1131,15 @@ static int64_t chaos_init_net_wait_timeout(const chaos_init_call_t *call)
 }
 
 /**
- * @brief Writes "nothing ready" into the buffers of wait call @p call, as a real
- *        timeout leaves them: revents cleared, the descriptor sets emptied, and
- *        select()'s timeout at 0. epoll writes no event, so nothing to do.
+ * @brief Writes "nothing ready" into the tracee buffers of wait call @p call, as a real
+ *        timeout leaves them: every revents cleared (up to CHAOS_INIT_NET_MAX_WAIT
+ *        entries), the fd_sets emptied over the bytes nfds covers, and select()'s timeval
+ *        zeroed (Linux select() writes back the remaining time). epoll returns 0 events
+ *        and writes nothing.
+ *
+ * @details Runs at decision time via chaos_init_net_commit(), before a TIMEOUT's delay
+ * has elapsed. The waiting thread cannot observe the difference; another thread sharing
+ * the buffers could. Write failures are ignored.
  */
 static void chaos_init_net_clear_ready(const chaos_init_call_t *call)
 {
@@ -1074,6 +1198,9 @@ static void chaos_init_net_clear_ready(const chaos_init_call_t *call)
     }
 }
 
+/* Decode by table; shared calls only on sockets; cheap rejections (no rule for the
+ * operation) before any endpoint lookup; then match, measure, and trigger on the
+ * per-process slot. */
 int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *verdict)
 {
     const chaos_init_net_call_t *entry = NULL;
@@ -1103,7 +1230,7 @@ int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *v
     {
         return 1;
     }
-    /* Measured only for a call a rule matched: a batch takes a read per message. */
+    /* `@size` input, measured only after a match: a batch costs a read per message. */
     if (entry->size >= 0)
     {
         size = call->args[entry->size];
@@ -1120,14 +1247,15 @@ int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *v
     {
         size = chaos_init_net_batch_size(call->args[1], call->args[2]);
     }
-    /* Only ERRNO, LATENCY and TIMEOUT rules get here (see chaos_init_net_supported).
-     * A wait without a timeout never times out: TIMEOUT does not apply to it. */
+    /* A loaded rule is ERRNO, LATENCY or TIMEOUT only (chaos_init_net_supported()). A
+     * wait without a timeout never times out, so TIMEOUT does not apply to it; checked
+     * before triggering, so such a call counts no hit. */
     if (rule.effect == CHAOS_NET_EFFECT_TIMEOUT &&
         (timeout_ms = chaos_init_net_wait_timeout(call)) < 0)
     {
         return 1;
     }
-    /* The rule's counters are the calling process's, not the snapshot's. */
+    /* Swap the snapshot's shared slot for the calling process's (see chaos_init_io.c). */
     state = chaos_net_config_active_state();
     rule.call_size = size;
     rule.hit = chaos_init_tracee_hit(
@@ -1150,7 +1278,9 @@ int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *v
     }
     else
     {
-        /* Nothing became ready within the timeout: waited out, then 0. */
+        /* Simulate "nothing became ready": hold the call for its own timeout (RETURN at
+         * once for a zero timeout), then return 0 with the buffers cleared. Signals do not
+         * cut the wait short, unlike a real timeout's EINTR. */
         verdict->clear_ready = 1;
         verdict->action = timeout_ms > 0 ? CHAOS_INIT_DELAY : CHAOS_INIT_RETURN;
         verdict->delay_ms = (unsigned)timeout_ms;
@@ -1182,6 +1312,8 @@ int chaos_init_net_mptcp_unresolvable(void)
     {
         return 0; /* no MPTCP: Go uses plain TCP */
     }
+    /* A listening loopback socket on an ephemeral port is what sock_diag would have to
+     * find for an MPTCP server; any failure on the way counts as unresolvable. */
     memset(&loopback, 0, sizeof(loopback));
     loopback.sin_family = AF_INET;
     loopback.sin_addr.s_addr = htonl(INADDR_LOOPBACK);

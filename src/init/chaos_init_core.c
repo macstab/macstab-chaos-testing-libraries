@@ -1,6 +1,11 @@
 /**
  * @file chaos_init_core.c
- * @brief chaos-init logic without system calls: arguments, filter, status, exit code.
+ * @brief `chaos-init` logic without system calls: arguments, BPF filter, status text, exit
+ *        code, kernel and errno classification, command lookup.
+ *
+ * @details Pure functions over their arguments (chaos_init_find_command() also calls
+ * stat() and access()), covered by test/unit/test_chaos_init.c, which runs the built
+ * filter through a small BPF interpreter to check each verdict. No mutable global state.
  */
 
 #include "chaos_init_core.h"
@@ -16,10 +21,13 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+/* Classic BPF loads 32 bits. The filter compares an argument by loading the word at
+ * offsetof(seccomp_data, args[i]), which is the low half only on little-endian. */
 #if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
 #error "the filter reads the low word of 64-bit arguments at their offset"
 #endif
 
+/* The AUDIT_ARCH value the kernel puts in seccomp_data.arch for this build's native ABI. */
 #if defined(__x86_64__)
 #define CHAOS_INIT_AUDIT_ARCH AUDIT_ARCH_X86_64
 #elif defined(__aarch64__)
@@ -28,7 +36,7 @@
 #error "chaos-init supports x86_64 and aarch64"
 #endif
 
-/** @brief Library names for --libs and the status file, in bit order. */
+/** @brief Library names for --libs and the status file's `libs=`, in bit order. */
 static const struct
 {
     const char *name;
@@ -44,7 +52,7 @@ static const struct
 
 #define CHAOS_INIT_LIB_COUNT (sizeof(g_chaos_init_libs) / sizeof(g_chaos_init_libs[0]))
 
-/** @brief Bit of library @p name (of @p length bytes); 0 when unknown. */
+/** @brief Bit of library @p name (@p length bytes, not NUL-terminated); 0 when unknown. */
 static unsigned chaos_init_lib_bit(const char *name, size_t length)
 {
     size_t index;
@@ -90,7 +98,10 @@ int chaos_init_parse_args(int argc, char **argv, chaos_init_options_t *options)
     }
 }
 
-/** @brief Appends @p nr to @p list unless it is there already. */
+/**
+ * @brief Appends @p nr to @p list unless present. The caller guarantees room: the union of
+ *        all tables (about 60 numbers) is below CHAOS_INIT_MAX_FILTER.
+ */
 static void chaos_init_add_syscall(long nr, long *list, size_t *count)
 {
     size_t index;
@@ -105,7 +116,14 @@ static void chaos_init_add_syscall(long nr, long *list, size_t *count)
     list[(*count)++] = nr;
 }
 
-/** @brief System calls each library acts on; architecture-specific ones where they exist. */
+/**
+ * @brief System calls routed to the supervisor per library. Legacy calls that aarch64
+ *        lacks (open, creat, unlink, rmdir, rename, renameat, poll, select, epoll_wait,
+ *        fork, vfork) and newer ones (openat2, epoll_pwait2, clone3) are included where
+ *        the build headers define them. Each table must match the
+ *        decider's table in chaos_init_<lib>.c: a number filtered here but unknown there
+ *        is notified and then passed, costing a round trip for nothing.
+ */
 static const long g_chaos_init_io_calls[] = {
     __NR_openat,    __NR_read,     __NR_readv,     __NR_write,           __NR_writev,
     __NR_pread64,   __NR_preadv,   __NR_pwrite64,  __NR_pwritev,         __NR_sendfile,
@@ -181,6 +199,7 @@ static const long g_chaos_init_process_calls[] = {
 #endif
 };
 
+/* Adds every entry of the array @p table (sizeof must see the array, not a pointer). */
 #define CHAOS_INIT_ADD_ALL(table, list, count)                                                     \
     do                                                                                             \
     {                                                                                              \
@@ -216,7 +235,7 @@ chaos_init_build_filter(unsigned libs, int handover_fd, struct sock_filter *out,
     {
         CHAOS_INIT_ADD_ALL(g_chaos_init_process_calls, calls, &count);
     }
-    /* sendmsg gets its own block, which lets the handover through. */
+    /* sendmsg leaves the JEQ chain for its own block, which exempts the handover. */
     for (index = 0U; index < count; ++index)
     {
         if (calls[index] == __NR_sendmsg)
@@ -226,12 +245,15 @@ chaos_init_build_filter(unsigned libs, int handover_fd, struct sock_filter *out,
             break;
         }
     }
+    /* Fixed part: 4 (arch, nr) + 2 (x32) + 7 (handover) + 2 (tail) = 15 at most. The
+     * bound also keeps (count - index) within the 8-bit jt field. */
     if (count + 16U > capacity)
     {
         return 0U;
     }
 
-    /* Another architecture (the x32 ABI included) passes: chaos-init decodes only its own. */
+    /* A foreign ABI passes unfiltered: the deciders decode only native numbers and
+     * argument layouts. x32 shares AUDIT_ARCH_X86_64 and is told apart by bit 30 of nr. */
     out[length++] =
         (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch));
     out[length++] =
@@ -245,8 +267,9 @@ chaos_init_build_filter(unsigned libs, int handover_fd, struct sock_filter *out,
 #endif
     if (handover)
     {
-        /* sendmsg(handover_fd, ..., CHAOS_INIT_HANDOVER_FLAGS) passes, any
-         * other sendmsg is notified. The accumulator still holds nr when it skips. */
+        /* sendmsg(handover_fd, ..., CHAOS_INIT_HANDOVER_FLAGS) passes; any other sendmsg
+         * is notified. A non-sendmsg skips the 6 following instructions with nr still in
+         * the accumulator for the chain. Only the low 32 bits of fd and flags compare. */
         out[length++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_sendmsg, 0, 6);
         out[length++] = (struct sock_filter
         )BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]));
@@ -261,7 +284,8 @@ chaos_init_build_filter(unsigned libs, int handover_fd, struct sock_filter *out,
     }
     for (index = 0U; index < count; ++index)
     {
-        /* A match jumps over the remaining tests and the ALLOW to the notification. */
+        /* Test `index` jumps count - index instructions: over the remaining tests and the ALLOW,
+         * onto the final USER_NOTIF. */
         out[length++] = (struct sock_filter)BPF_JUMP(
             BPF_JMP | BPF_JEQ | BPF_K, (unsigned)calls[index], (unsigned char)(count - index), 0
         );
@@ -271,6 +295,8 @@ chaos_init_build_filter(unsigned libs, int handover_fd, struct sock_filter *out,
     return length;
 }
 
+/* Linux wait-status layout: low 7 bits the terminating signal (0 = exited), bits 8-15
+ * the exit code. A stopped status cannot occur: chaos-init never waits with WUNTRACED. */
 int chaos_init_exit_code(int status)
 {
     if ((status & 0x7f) == 0)
@@ -300,6 +326,9 @@ int chaos_init_find_command(const char *command, const char *path, char *out, si
         const size_t length = end != NULL ? (size_t)(end - entry) : strlen(entry);
         struct stat info;
 
+        /* An empty entry yields the bare command name, i.e. relative to the cwd. A match
+         * that is not executable is remembered: execvp() reports EACCES only when no later
+         * entry has an executable one. */
         if ((size_t
             )snprintf(out, size, "%.*s%s%s", (int)length, entry, length > 0U ? "/" : "", command) <
                 size &&
@@ -358,7 +387,8 @@ int chaos_init_godebug_mptcp_off(const char *current, char *out, size_t size)
 {
     const char *setting = current;
 
-    /* A multipathtcp setting of the user's own, first or after a comma, stays. */
+    /* A user's own multipathtcp setting (at the start, or right after a comma) wins; a
+     * mere substring such as `xmultipathtcp=` does not count. */
     while (setting != NULL && (setting = strstr(setting, "multipathtcp=")) != NULL)
     {
         if (setting == current || setting[-1] == ',')
@@ -380,6 +410,7 @@ size_t chaos_init_format_status(
     char *buffer, size_t size, unsigned libs, const char *reason, long pid, int mptcp_off
 )
 {
+    /* All six names joined take 30 bytes; strcat() cannot overflow 64. */
     char names[64] = "";
     size_t index;
     int written;

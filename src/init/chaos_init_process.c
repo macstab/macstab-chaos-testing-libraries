@@ -1,25 +1,43 @@
 /**
  * @file chaos_init_process.c
- * @brief chaos-init: libchaos-process rules for system calls of supervised processes.
+ * @brief `chaos-init`: libchaos-process rules applied to tracee system calls.
  *
- * @details The process rule core is compiled in unchanged. The hooks' operations
- * are told apart by the system call and, for clone, its flags: a thread
- * (CLONE_THREAD) is pthread_create, a child that shares the memory until it
- * executes (CLONE_VFORK, as posix_spawn() and Go's os/exec make it) is
- * posix_spawn, any other child is fork. posix_spawnp cannot be told from
- * posix_spawn here: the path search happens in the C library, so a posix_spawnp
- * rule, which could never fire, rejects its file (CHAOS_PROCESS_RULE_SUPPORTED).
+ * @details The libchaos-process rule core is compiled in by `#include`, unchanged. The
+ * wrappers' operations are recovered from the system call:
  *
- * As in the hooks: LATENCY delays the call, then ERRNO or FAIL_AFTER fails it.
- * FAIL_AFTER counts calls per operation in each process, from 0 again after a
- * reload of the rule file; the core keeps those counters in one array, which is
- * swapped in for the calling process around each decision. A forked child starts
- * with the counts its parent had when it forked, as the library's child inherits
- * them with its memory; a new program (execve) starts from 0.
+ * | System call | Operation |
+ * |---|---|
+ * | clone/clone3 with CLONE_THREAD | pthread_create |
+ * | clone/clone3 with CLONE_VFORK, vfork | posix_spawn (glibc posix_spawn(), Go os/exec) |
+ * | any other clone/clone3, fork | fork |
+ * | execve / execveat | execve / execveat |
+ * | wait4, waitid | waitpid |
+ *
+ * clone3 flags are read from the first field of `struct clone_args` in tracee memory;
+ * unreadable means fork. posix_spawnp cannot be told from posix_spawn: the PATH search
+ * happens in the C library and issues the same system calls. A posix_spawnp rule could
+ * therefore never fire and rejects its file (CHAOS_PROCESS_RULE_SUPPORTED).
+ *
+ * @par Effects
+ * As in the wrappers: LATENCY delays the call, then ERRNO or FAIL_AFTER fails it.
+ *
+ * @par FAIL_AFTER counters
+ * The core counts calls per operation in one global array, as each preloaded process has
+ * its own. Here every process gets its own array, swapped in around each decision. The
+ * counters restart from 0 after a reload. A forked child starts with the counts its
+ * parent had at the fork, as the library's child inherits them with its memory; a new
+ * image (execve) starts from 0.
+ *
+ * @par Application start
+ * The child's execve() of the entrypoint is never faulted (chaos_init_process_start()).
+ *
+ * Test seam: CHAOS_INIT_PROCESS_OF replaces the /proc identity lookup.
  */
 
 #include "chaos_init_process.h"
 
+/* Parser hook, defined before the core is included: rules this mode cannot apply reject
+ * their file at load time. */
 struct chaos_process_rule;
 static int chaos_init_process_supported(const struct chaos_process_rule *rule);
 #define CHAOS_PROCESS_RULE_SUPPORTED(rule) chaos_init_process_supported(rule)
@@ -37,38 +55,51 @@ static int chaos_init_process_supported(const struct chaos_process_rule *rule);
 #define CHAOS_INIT_PROCESS_OF(tid, tgid, start) chaos_init_process_of((tid), (tgid), (start))
 #endif
 
-/* What the rule core expects the preload library to provide. */
+/* Symbols the rule core expects from the preload library. The FAIL_AFTER array is the
+ * core's per-process counter set; here it only holds the calling process's counters for
+ * the duration of one decision (chaos_init_process_fail_after()). */
 __thread int g_chaos_process_tls_guard = 0;
 __thread uint64_t g_chaos_process_tls_prng_state = 0U;
 uint64_t g_chaos_process_process_seed = UINT64_C(0xbb67ae8584caa73b);
 volatile uint64_t g_chaos_process_fail_after_counters[CHAOS_PROCESS_OP_COUNT] = {0U};
 
+/* CHAOS_PROCESS_RULE_SUPPORTED: everything except a posix_spawnp operation selector. */
 static int chaos_init_process_supported(const struct chaos_process_rule *rule)
 {
     return rule->selector.kind != CHAOS_PROCESS_SELECTOR_OPERATION ||
            rule->selector.operation != CHAOS_PROCESS_OP_POSIX_SPAWNP;
 }
 
-/* Per-process hit slots and FAIL_AFTER counters of the process rules. */
+/* Per-process hit slots and FAIL_AFTER counters of the process rules, indexed by tracee
+ * entry. `_load` is the rule load the counters belong to (stale load: reset to 0). */
 CHAOS_INIT_RULES_STORAGE(g_chaos_init_process, CHAOS_PROCESS_MAX_RULES);
 static uint64_t g_chaos_init_process_counters[CHAOS_INIT_MAX_TRACEES][CHAOS_PROCESS_OP_COUNT];
 static uint64_t g_chaos_init_process_counters_load[CHAOS_INIT_MAX_TRACEES];
-/* Which process (chaos_init_tracee_serial) the counters of an entry are of. */
+/* The process (chaos_init_tracee_serial()) an entry's counters belong to; a mismatch
+ * means the entry was reused by another process. */
 static uint64_t g_chaos_init_process_counters_owner[CHAOS_INIT_MAX_TRACEES];
-/* The counters at a process's latest fork, until its child takes them over. */
+/* Snapshot of the counters at a process's latest fork, with its load and owner serial,
+ * until a child takes it over (owner 0 = taken). One snapshot per parent: if the parent
+ * forks again before the first child makes a process call, whichever child comes first
+ * takes the newer snapshot and the other starts from 0. */
 static uint64_t g_chaos_init_process_forked[CHAOS_INIT_MAX_TRACEES][CHAOS_PROCESS_OP_COUNT];
 static uint64_t g_chaos_init_process_forked_load[CHAOS_INIT_MAX_TRACEES];
 static uint64_t g_chaos_init_process_forked_owner[CHAOS_INIT_MAX_TRACEES];
 
-/** @brief The application chaos-init started, while its first execve() is pending. */
+/** @brief The child chaos-init forked, while it still runs chaos-init's image; 0 after. */
 static pid_t g_chaos_init_process_application = 0;
-/** @brief The image that makes the application's start (chaos-init's); 0 before. */
+/**
+ * @brief Identity (chaos_init_process_of()) of chaos-init's image in that child, recorded
+ *        at its first execve(); 0 before.
+ */
 static uint64_t g_chaos_init_process_start_image = 0U;
 
 static uint64_t g_chaos_init_process_load = 0U;
 static const chaos_process_config_state_t *g_chaos_init_process_seen_state = NULL;
 static uint64_t g_chaos_init_process_seen_stamp = 0U;
 
+/* chaos_init_rules_t::snapshot for process; reload detection as in chaos_init_io.c. Its
+ * load counter also keys the FAIL_AFTER counters. */
 static size_t chaos_init_process_snapshot(const chaos_init_text_t **texts, uint64_t *generation)
 {
     const chaos_process_config_state_t *state = chaos_process_config_active_state();
@@ -112,7 +143,7 @@ void chaos_init_process_start(pid_t application)
     (void)chaos_init_tracee_register(&g_chaos_init_process_rules);
 }
 
-/** @brief The operation a clone with @p flags stands for. */
+/** @brief The operation a clone with @p flags stands for (CLONE_THREAD wins over VFORK). */
 static chaos_process_operation_t chaos_init_process_clone(uint64_t flags)
 {
     if ((flags & CLONE_THREAD) != 0U)
@@ -133,7 +164,7 @@ static chaos_process_operation_t chaos_init_process_operation(const chaos_init_c
         return chaos_init_process_clone(call->args[0]);
 #ifdef __NR_clone3
     case __NR_clone3:
-        /* struct clone_args begins with the flags; unreadable, it is a fork. */
+        /* struct clone_args begins with the u64 flags; unreadable leaves 0, i.e. fork. */
         (void)chaos_init_read_memory(call->tid, call->args[0], &flags, sizeof(flags));
         return chaos_init_process_clone(flags);
 #endif
@@ -157,7 +188,10 @@ static chaos_process_operation_t chaos_init_process_operation(const chaos_init_c
     }
 }
 
-/** @brief Gives @p rule the calling process's slot; 0 when it has none. */
+/**
+ * @brief Replaces @p rule's snapshot slot with the calling process's slot.
+ * @return 1, or 0 when the process has none (it ended): the rule must not fire.
+ */
 static int chaos_init_process_slot(const chaos_init_call_t *call, chaos_process_rule_t *rule)
 {
     const chaos_process_config_state_t *state = chaos_process_config_active_state();
@@ -170,14 +204,15 @@ static int chaos_init_process_slot(const chaos_init_call_t *call, chaos_process_
 }
 
 /**
- * @brief Makes the FAIL_AFTER counters of entry @p tracee those of its present
- *        process under rule load @p load.
+ * @brief Makes the FAIL_AFTER counters of entry @p tracee belong to its current process
+ *        and rule load @p load.
  *
- * @details A process new to the entry starts from 0, or, if it is the child of a
- * fork its parent made under the same load, from the parent's counts at that fork.
- * Each fork has one child: the first new process of that parent takes them over.
- * Every process call comes here first, so a child takes them before an execve of
- * its own could start a new program, which starts from 0.
+ * @details No-op when owner and load already match. Otherwise the counters reset to 0;
+ * a process new to the entry instead inherits its parent's fork snapshot when the parent
+ * (`/proc/<pid>/status` PPid, so not after reparenting) has an entry, still owns the
+ * snapshot, and forked under the same load. The snapshot is consumed: one fork, one heir.
+ * Every process call passes here before it is decided, so a child takes its inheritance
+ * before an execve() of its own could give it a new identity (which starts from 0).
  */
 static void chaos_init_process_counters_of(int tracee, uint64_t load)
 {
@@ -211,8 +246,10 @@ static void chaos_init_process_counters_of(int tracee, uint64_t load)
 }
 
 /**
- * @brief FAIL_AFTER for the calling process: its counters swapped into the core's
- *        array around the decision.
+ * @brief Evaluates FAIL_AFTER for the calling process: copies its counters into the core's
+ *        global array, lets the core count and decide, and copies them back.
+ * @param error  Output: the errno to fail with when 1 is returned.
+ * @return 1 when the call fails, else 0 (also when the process has no entry or slot).
  */
 static int chaos_init_process_fail_after(
     const chaos_init_call_t *call,
@@ -241,6 +278,8 @@ static int chaos_init_process_fail_after(
     return fails;
 }
 
+/* LATENCY and ERRNO/FAIL_AFTER are matched independently, as in the wrappers; FAIL_AFTER
+ * is consulted only when no ERRNO rule fires. */
 int chaos_init_process_decide(const chaos_init_call_t *call, chaos_init_verdict_t *verdict)
 {
     const chaos_process_operation_t operation = chaos_init_process_operation(call);
@@ -260,9 +299,10 @@ int chaos_init_process_decide(const chaos_init_call_t *call, chaos_init_verdict_
         pid_t group;
         uint64_t image;
 
-        /* The start of the application itself, as long as chaos-init's own image
-         * makes it: an execve that failed leaves the image as it was, and the one
-         * that follows (a script without #! run by /bin/sh) is still the start. */
+        /* The application's start, exempt for as long as chaos-init's image issues it: a
+         * failed execve() leaves the image unchanged, so the /bin/sh retry for a script
+         * without #! is exempt too. The first execve() from a different image ends the
+         * exemption for good, as does a failed identity lookup. */
         if (CHAOS_INIT_PROCESS_OF(call->tid, &group, &image) == 0 &&
             (g_chaos_init_process_start_image == 0U || image == g_chaos_init_process_start_image))
         {
@@ -272,7 +312,7 @@ int chaos_init_process_decide(const chaos_init_call_t *call, chaos_init_verdict_
         g_chaos_init_process_application = 0;
     }
     tracee = chaos_init_tracee_of(call->tid);
-    (void)chaos_process_config_prepare(); /* the load the decision is made under */
+    (void)chaos_process_config_prepare(); /* reload first: fixes the load decided under */
     (void)chaos_init_process_snapshot(&texts, &load);
     if (tracee >= 0)
     {
@@ -292,7 +332,8 @@ int chaos_init_process_decide(const chaos_init_call_t *call, chaos_init_verdict_
         verdict->action = verdict->action == CHAOS_INIT_DELAY ? CHAOS_INIT_DELAY : CHAOS_INIT_FAIL;
         verdict->error = error;
     }
-    /* A fork that goes ahead: its child will start from these counts. */
+    /* A fork that goes ahead (no error decided, delayed or not): snapshot the counters as
+     * they stand after this decision, for the child to inherit. */
     if (operation == CHAOS_PROCESS_OP_FORK && tracee >= 0 && error == 0)
     {
         memcpy(

@@ -1,6 +1,11 @@
 /**
  * @file chaos_init_delay.c
- * @brief chaos-init: calls held back by a LATENCY rule.
+ * @brief `chaos-init`: the delay queue (see chaos_init_delay.h for the contract).
+ *
+ * @details A fixed array of CHAOS_INIT_MAX_DELAYED entries, unordered; removal swaps the
+ * last entry into the hole, so pop order among equally due entries is unspecified. No
+ * allocation. Entries of threads killed while parked stay until due; their reply then
+ * fails with ENOENT and is ignored.
  */
 
 #include "chaos_init_delay.h"
@@ -8,6 +13,8 @@
 #include <stddef.h>
 #include <string.h>
 
+/** @brief One parked notification: its current id, the call it stands for, when and how
+ *         it is answered. */
 typedef struct chaos_init_delayed
 {
     uint64_t id;
@@ -54,6 +61,8 @@ int chaos_init_delay_resume(const chaos_init_call_t *call, uint64_t id)
     {
         const chaos_init_call_t *parked = &g_chaos_init_delayed[index].call;
 
+        /* Same thread, number and raw arguments: the restarted call. Pointed-to memory is
+         * not compared; the raw registers identify the call. */
         if (parked->tid == call->tid && parked->nr == call->nr &&
             memcmp(parked->args, call->args, sizeof(parked->args)) == 0)
         {
