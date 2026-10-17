@@ -13,10 +13,11 @@
 
 ---
 
-This document is the authoritative engineering reference for the implemented
-`libchaos-io` runtime in this repository. It describes the current code, not an
-aspirational design. Where behavior depends on Linux, glibc, musl, or `LD_PRELOAD`
-mechanics, those dependencies are called out explicitly.
+This is the engineering reference for `libchaos-io` as implemented in `src/core`,
+`src/config`, `src/effects` and `src/wrappers`. It describes the code, not a design
+intent. Every function name, errno, limit and ordering below is taken from the
+source; where behaviour depends on Linux, glibc, musl or the dynamic linker, the
+dependency is stated.
 
 ## Table of Contents
 
@@ -35,7 +36,7 @@ mechanics, those dependencies are called out explicitly.
 - [13. Configuration Reference](#13-configuration-reference)
 - [14. Extension Points and Compatibility Guarantees](#14-extension-points-and-compatibility-guarantees)
 - [15. Stack Walkdown](#15-stack-walkdown)
-- [16a. Symbol Versioning — pread and the GLIBC_2.2 Divergence](#16a-symbol-versioning--pread-and-the-glibc_22-divergence)
+- [16a. glibc Alternate Entry Points: LFS Names and _FORTIFY_SOURCE](#16a-glibc-alternate-entry-points-lfs-names-and-_fortify_source)
 - [16b. Non-Coverage: splice, tee, vmsplice](#16b-non-coverage-splice-tee-vmsplice)
 - [16c. O_DIRECT and Kernel Bypass Implications](#16c-o_direct-and-kernel-bypass-implications)
 - [16. References](#16-references)
@@ -44,353 +45,357 @@ mechanics, those dependencies are called out explicitly.
 
 ### Purpose
 
-`libchaos-io` injects controlled filesystem and file-descriptor I/O faults into
-Linux processes by interposing selected libc entry points through `LD_PRELOAD`.
+`libchaos-io` makes a dynamically linked Linux process observe storage failures on
+the files you name. It interposes the C library's file and descriptor functions
+through `LD_PRELOAD`, matches each call against the rule file
+`/tmp/.chaos-io.conf` by path, and applies one of four effects:
 
-The library exists to make real applications observe storage failure modes they
-normally only encounter in production:
+| Effect | When | What the caller sees |
+|---|---|---|
+| ERRNO | before the real call | `-1` (or the function's error value) with one of 8 errno values; the real call does not run (except `close`, §4) |
+| LATENCY | before the real call | the call completes normally, N ms later |
+| TORN | before the real call | a successful short write: the real call runs with a byte count in `[1, n-1]` |
+| CORRUPT | after a successful read | the bytes returned, with exactly one bit flipped |
 
-- syscall-style failures such as `EIO`, `ENOSPC`, or `EMFILE`
-- deterministic latency before an operation reaches libc
-- short successful writes
-- successful reads whose returned data is corrupted after the fact
+The library is a fault injector for storage paths, not a filesystem simulator: it
+does not model page cache, write-back, inode identity or crash consistency. It
+changes what one interposed call returns.
 
-The library is intentionally small. It is not a general failure framework and
-it does not try to simulate every kernel or filesystem behavior.
+### Scope: interposed functions
 
-### Scope
+Every logical operation in a rule maps to one or more C library entry points:
 
-The implemented logical operation surface is:
+| Operation | Functions (all libcs) | glibc 64-bit alternate names (§16a) |
+|---|---|---|
+| `open` | `open`, `openat`, `creat`, `fopen`, `freopen` | `open64`, `openat64`, `creat64`, `fopen64`, `freopen64`, `__open_2`, `__openat_2`, `__open64_2`, `__openat64_2` |
+| `read` | `read`, `readv`; stdio: `fread`, `fgets`, `fgetc`, `getc`, `getline`, `getdelim`, `__getdelim`, `__fread_chk`, `__fgets_chk` | `__read_chk` |
+| `write` | `write`, `writev`, `sendfile` (on `out_fd`), `copy_file_range` (on `out_fd`); stdio: `fwrite`, `fputs`, `fputc`, `putc`, `fprintf`, `vfprintf`, `fflush`, `__fprintf_chk`, `__vfprintf_chk` | `sendfile64` |
+| `close` | `close` | — |
+| `fsync` | `fsync` | — |
+| `fdatasync` | `fdatasync` | — |
+| `pread` | `pread`, `preadv` | `pread64`, `preadv64`, `__pread_chk`, `__pread64_chk` |
+| `pwrite` | `pwrite`, `pwritev` | `pwrite64`, `pwritev64` |
+| `truncate` | `ftruncate` (by descriptor), `truncate` (by path) | `ftruncate64`, `truncate64` |
+| `allocate` | `fallocate`, `posix_fallocate` | `fallocate64`, `posix_fallocate64` |
+| `unlink` | `unlinkat`, `unlink`, `rmdir`, `remove` | — |
+| `rename_from` / `rename_to` | `renameat`, `renameat2`, `rename` (source / destination path) | — |
 
-- `open`
-  Backed by `open()`, `openat()`, `creat()`, `fopen()` and `freopen()`
-- `read`
-  Backed by `read()` and `readv()`
-- `write`
-  Backed by `write()`, `writev()`, Linux `sendfile()`, and Linux
-  `copy_file_range()`
-- `close`
-- `fsync`
-- `fdatasync`
-- `pread`
-  Backed by `pread()` and `preadv()`
-- `pwrite`
-  Backed by `pwrite()` and `pwritev()`
-- `truncate`
-  Backed by `ftruncate()` and the path form `truncate()`
-- `allocate`
-  Backed by Linux `fallocate()` and `posix_fallocate()`
-- `unlink`
-  Backed by `unlinkat()`, `unlink()`, `rmdir()` and `remove()`
-- `rename_from`
-  Backed by `renameat()`, `renameat2()` and `rename()` source-path matching
-- `rename_to`
-  Backed by `renameat()`, `renameat2()` and `rename()` destination-path matching
+Interposed only to keep the fd-to-path cache correct (no rule applies):
+`dup2`, `dup3`, `close_range`, `closedir`, `pclose`, `closefrom`, `fclose`.
 
-glibc and musl implement `unlink()`, `rmdir()`, `remove()`,
-`rename()`, `renameat2()`, `truncate()`, `creat()` and `posix_fallocate()` with their own
-system calls, not through the `*at` or descriptor forms, so each has its own wrapper.
-`posix_fallocate()` reports an injected error as its return value and leaves errno
-alone; `renameat2()` fails with ENOSYS where the C library lacks it (musl). They are the forms most
-programs use: the JDK deletes with `unlink()` and moves with `rename()`. The first
-four forward to `unlinkat(AT_FDCWD, ...)`, `renameat(AT_FDCWD, ...)` and `open()`,
-which Linux defines them to be; `truncate()` matches the `truncate` rules by path.
-`fopen()` and `freopen()` open the file inside the C library too, so the `open` rules
-apply to them in their own wrappers: an injected error returns NULL with errno set,
-and `freopen()` closes the stream it was given, as a failed `freopen()` does. Reading
-and writing through the stream is covered by the stdio wrappers below.
+**Why the path forms and stdio have their own wrappers.** glibc and musl implement
+`unlink`, `rmdir`, `remove`, `rename`, `renameat2`, `truncate`, `creat`,
+`posix_fallocate`, `fopen`, `freopen` and every buffered stdio read and write with
+their own internal system calls, never through the interposed `*at`, descriptor or
+`read`/`write` symbols. Without a wrapper each would bypass every rule. These are
+the forms most programs use: the JDK deletes with `unlink()` and moves with
+`rename()`; C programs read configuration with `fgets()` and write logs with
+`fprintf()`.
 
-The C library also reads and writes `FILE` streams with its own system calls, so
-buffered I/O never reached the `read`/`write` rules. `src/wrappers/chaos_io_stdio.c`
-applies them to the stream's descriptor: `fread`, `fgets`, `fgetc`, `getc`,
-`getline`, `getdelim` (and `__getdelim`, which optimized glibc builds call for
-`getline`) under the `read` rules; `fwrite`, `fputs`, `fputc`, `putc`, `fprintf`,
-`vfprintf` and `fflush` under the `write` rules; and the fortified `__fread_chk`,
-`__fgets_chk`, `__fprintf_chk`, `__vfprintf_chk`. `ERRNO` fails the call the way
-the C library reports an I/O error (0 items, NULL, EOF or a negative count) with
-errno set and the stream's error indicator raised, so `ferror()` is true: glibc and
-musl both keep that indicator as bit 0x20 of the first word of `FILE`. `LATENCY`
-delays the call, `CORRUPT` changes what a read returned; `TORN` does not apply,
-since a short `fwrite` means an error in stdio. A rule fires once per call, not
-once per system call the C library makes while filling or flushing a buffer.
-Descriptors 0-2 are left alone as everywhere, so `printf`, `puts`, `putchar` and
-`getchar` are not wrapped. Not covered: the scanf family (glibc redirects it to
-`__isoc99_*`/`__isoc23_*` names) and the `*_unlocked` variants.
-The stdio wrappers match on the stream's descriptor through the fd-to-path cache,
-so streams keep that cache right: `fopen` and `freopen` record the new descriptor's
-path (or drop the entry for an excluded path), and an interposed `fclose` drops it,
-since the C library closes with its own system call and the next file opened under
-the same number would otherwise inherit the old path. The error indicator is set
-under the stream lock, and a lookup on a stream without a descriptor (`fmemopen`,
-cookie streams) leaves errno as it was.
-`test/runtime/test_stdio.sh` checks glibc (also with `_FORTIFY_SOURCE=2`) and musl.
-`test/runtime/test_path_forms.sh` checks them on glibc and musl.
+- `unlink(p)`, `rmdir(p)`, `rename(a, b)` and `creat(p, m)` forward to
+  `unlinkat(AT_FDCWD, p, 0)`, `unlinkat(AT_FDCWD, p, AT_REMOVEDIR)`,
+  `renameat(AT_FDCWD, a, AT_FDCWD, b)` and `open(p, O_CREAT|O_WRONLY|O_TRUNC, m)`,
+  which is how Linux defines them, so kernel semantics are unchanged.
+- `remove(p)` does what glibc and musl do: `unlinkat(p, 0)`, then
+  `unlinkat(p, AT_REMOVEDIR)` only when the first step failed with `EISDIR`. An
+  injected error on the first step ends the call.
+- `truncate(path)` matches `truncate` rules by path; `ftruncate(fd)` by descriptor.
+- `posix_fallocate` reports an injected error as its return value and leaves
+  `errno` unchanged, as POSIX specifies.
+- `renameat2` is exported on every libc. Where the C library lacks it (musl, glibc
+  before 2.28) the wrapper issues `SYS_renameat2` itself; only a build without that
+  syscall number returns `ENOSYS`.
+- `fopen`/`freopen`: an injected error returns `NULL` with `errno` set and no stream
+  is created. `freopen` first calls the real `freopen("", mode, stream)`, which
+  never opens, so the passed stream ends exactly as after a real failure: closed and,
+  on glibc, still allocated (callers that `fclose()` it anyway stay correct). A
+  `NULL` path (mode change only) is forwarded unchanged.
+
+**stdio semantics** (`src/wrappers/chaos_io_stdio.c`):
+
+- Rules match the stream's descriptor (`fileno()`), so `read`/`write` rules apply.
+  A stream without a descriptor (`fmemopen`, cookie streams) never matches, and the
+  lookup leaves `errno` unchanged.
+- ERRNO fails the call the way the C library reports an I/O error (`0` items,
+  `NULL`, `EOF` or `-1`), sets `errno`, and raises the stream's error indicator so
+  `ferror()` is true. There is no API for that indicator; glibc (`_IO_ERR_SEEN`) and
+  musl (`F_ERR`) both keep it as bit `0x20` of the first word of `FILE`, which the
+  wrapper sets under `flockfile()` because the C library updates the same word
+  under that lock (Linux builds only).
+- LATENCY delays the call. CORRUPT flips one bit in the bytes the read returned
+  (`items * size` for `fread`, `strlen(line)` for `fgets`, the returned length for
+  `getdelim`, one byte for `fgetc`/`getc`).
+- TORN never applies: a short `fwrite` signals an error in stdio, not a partial
+  success. A TORN rule matched on a stream does nothing and counts no hit.
+- A rule fires once per stdio call, not once per system call the C library makes
+  while filling or flushing its buffer.
+- Descriptors 0-2 are never faulted, so `printf`, `puts`, `putchar` and `getchar`,
+  which use only the standard streams, are not wrapped.
+- Not covered: the scanf family (glibc redirects it to `__isoc99_*`/`__isoc23_*`
+  names) and the `*_unlocked` variants.
+- `test/runtime/test_stdio.sh` checks glibc (also with `_FORTIFY_SOURCE=2`) and musl;
+  `test/runtime/test_path_forms.sh` checks the path forms on both.
 
 ### Assumptions
 
-- The target process is dynamically linked and honors `LD_PRELOAD`.
-- The target process goes through intercepted libc symbols rather than direct
-  raw syscalls.
-- Linux `/proc/self/fd` is available for descriptor-to-path recovery.
-- Path-based matching is acceptable even though the kernel ultimately executes
-  on file descriptors and inodes.
-- Safe degradation is preferred over partial or ambiguous injection.
+- The target is dynamically linked and the loader honours `LD_PRELOAD` (not a
+  set-user-ID start, see [PLATFORM.md §6](PLATFORM.md#6-at_secure-and-the-ld_preload-strip)).
+- The target reaches the kernel through the interposed C library symbols. Raw
+  `syscall()`, io_uring and statically linked binaries bypass the library;
+  `chaos-init` (SECCOMP mode, [SECCOMP.md](SECCOMP.md)) covers those with ERRNO and
+  LATENCY.
+- `/proc/self/fd` is readable; descriptor-based calls are matched by the path the
+  kernel reports there.
 
 ### Non-Goals
 
-- Static binary support in the library (chaos-init applies io rules to static
-  binaries through seccomp: [SECCOMP.md](SECCOMP.md)).
-- Full syscall-level coverage.
-- Inode-identity matching.
-- Packet, network, time, process, or memory chaos.
-- Modeling `mmap()`-driven writes.
-- Covering every alternate copy path such as `splice()`.
-- Providing a public SDK or embedding API.
+- Static binaries in LD_PRELOAD mode (use SECCOMP mode).
+- Inode-identity matching: matching is by path string.
+- Writes through `mmap()` mappings, io_uring, POSIX AIO, `splice`/`tee`/`vmsplice`
+  (§16b).
+- Network, DNS, time, process or memory faults (the other `libchaos-<lib>` libraries).
+- A public API: the only interface is the rule file and the files it produces.
 
 ## 2. Architectural Context
 
 ### System boundaries
 
-`libchaos-io` sits inside the target process address space. Its boundary is the
-dynamic linker and the libc symbol table:
+`libchaos-io` runs inside the target's address space, between the application and
+the next definition of each symbol:
 
-- Upstream boundary: the application calls libc APIs such as `write()` or
-  `openat()`.
-- Internal boundary: `libchaos-io` evaluates configuration and decides whether
-  to pass through or inject.
-- Downstream boundary: the library delegates to the real libc symbol obtained
-  through `dlsym(RTLD_NEXT, ...)`.
-- Kernel boundary: the real libc symbol eventually issues the actual system
-  call sequence.
+- Upstream: the application, or another library, calls `write()`, `openat()`,
+  `fread()` and so on.
+- Inside: the wrapper refreshes the rule snapshot, resolves the call's path,
+  selects one rule and applies its effect.
+- Downstream: the real function, obtained with `dlsym(RTLD_NEXT, name)`. That is
+  the C library, or another `libchaos-<lib>` that comes later in `LD_PRELOAD`.
+- Kernel: the real function issues the system call.
 
 ### Symbol resolution is lazy, not constructor-only
 
-The library constructor is not a sufficient guarantee that the downstream
-symbol table is populated. `LD_PRELOAD` maps this object before the
-executable's own `DT_NEEDED` libraries, but ELF initialisers run in dependency
-order, so an object loaded *after* the preload can still reach an interposed
-symbol *before* `chaos_io_init()` has run.
+The constructor cannot be relied on to fill the real-function table before the first
+wrapper runs. `LD_PRELOAD` maps the library before the executable's `DT_NEEDED`
+libraries, but ELF initialisers run in dependency order, so another library's
+constructor can call an interposed function before `chaos_io_init()` has run.
+`libcap-ng` is the case that was hit: its initialiser does file I/O, and every
+`setpriv`, `su` and `runuser` under the preload called through a NULL pointer and
+died with SIGSEGV.
 
-`libcap-ng` is the practical case: its initialiser performs file I/O, so under
-this preload every `setpriv`, `su` and `runuser` invocation entered a wrapper
-while the pointer table was still NULL and died with SIGSEGV.
+Every wrapper therefore calls `chaos_io_ensure_symbols()` first. It runs
+`chaos_io_resolve_all_symbols()` exactly once per process through `chaos_once()`
+(`src/common/chaos_once.h`):
 
-Every interposed wrapper therefore calls `chaos_io_ensure_symbols()` as its
-first action. It is idempotent and guarded by `chaos_once()`
-(`src/common/chaos_once.h`), so:
+- **Once, from whichever thread arrives first.** The others yield
+  (`sched_yield()`) until the table is complete.
+- **Release/acquire publication.** The table is complete before any thread sees it
+  as done. A plain `volatile` flag would order nothing; on aarch64 a second thread
+  could see the flag before the pointer stores and call through NULL.
+- **Cost after the first call:** one acquire load and a predictable branch.
+- **Not `pthread_once()`.** Before glibc 2.34 it lives in libpthread, and a library
+  built against glibc 2.31 that references it cannot be loaded into programs that
+  do not link libpthread: `cat`, `sh` and most tools failed with
+  `undefined symbol: pthread_once`.
+- **Re-entry on the resolving thread** returns at once instead of deadlocking (an
+  allocator inside `dlsym` may do I/O). While a pointer is still NULL each
+  trampoline issues the system call itself (`SYS_read`, `SYS_openat`, ...); stdio,
+  `closedir` and `pclose`, which have no system call equivalent, fail with
+  `ENOSYS`.
+- **Failure:** a missing mandatory symbol (`dlsym` returns NULL and `dlerror()` is
+  set) calls `abort()`. Six symbols are optional and stay NULL when the C library
+  lacks them: `close_range`, `closefrom`, `renameat2`, `__vfprintf_chk`,
+  `__fread_chk`, `__fgets_chk`.
 
-- resolution happens exactly once per process, whichever caller arrives first;
-- the completed table is published with release/acquire ordering. This matters
-  on weakly ordered architectures such as aarch64: a plain `volatile` flag
-  would permit a second thread to observe readiness before the pointer stores
-  became visible to it, and call through NULL;
-- after the first call the cost is one acquire load.
-
-`chaos_once()` is a three-state atomic flag (unset, running, done) rather than
-`pthread_once`. Before glibc 2.34 `pthread_once` lives in libpthread, not libc,
-so a library built against glibc 2.31 that referenced it could not even be
-loaded into a program that does not link libpthread: `cat`, `sh` and most other
-tools failed with `undefined symbol: pthread_once`. A caller that finds the
-initialiser running yields until it is done; the initialiser itself only calls
-`dlsym`, which never re-enters an interposed wrapper of this library.
-
-All six libraries resolve their downstream symbols this way, so the same
-guarantee holds for libchaos-net, -time, -process, -dns and -memory.
+All six libraries resolve their real functions this way.
 `test/runtime/test_baseline_glibc.sh` builds the release configuration (gcc:10,
-glibc 2.31) and preloads every library, alone and together, into `cat`, `sh`
-and a threaded program.
+glibc 2.31) and preloads every library, alone and together, into `cat`, `sh` and a
+threaded program.
 
 ### Dependencies
 
-Hard runtime dependencies are deliberately narrow:
+- libc and `libdl` (`dlsym`, `dlerror`).
+- Linux `/proc/self/fd` for descriptor-to-path resolution.
+- The kernel vDSO `clock_gettime` (found through `getauxval(AT_SYSINFO_EHDR)`) for
+  the rule-file check throttle and `@from`/`@until`; without it the file is checked on
+  every call and windows use the raw `clock_gettime` system call.
 
-- libc
-- `libdl`
-- Linux `/proc`
-- `/tmp/.chaos-io.conf`
-
-The library does not require a sidecar process, daemon, socket, IPC channel, or
-control service.
+No daemon, thread, socket or IPC channel is involved.
 
 ### Trust boundaries
 
-This library is not a security boundary. It runs with the same privilege as the
-target process. The effective trust boundaries are:
-
-- The config file is fully trusted by the target process.
-- The library trusts libc symbol resolution after load time.
-- The library does not protect the target process from malicious config input;
-  it only guarantees that invalid config causes global passthrough instead of
-  partial activation.
+The library is not a security boundary and runs with the target's privileges. The
+rule file is fully trusted input. The guarantee for invalid input is narrow: a file
+that does not parse as a whole yields no rules (passthrough) and a status report,
+never a partial rule set.
 
 ### Deployment and runtime context
-
-Typical deployment is a process launch like:
 
 ```sh
 LD_PRELOAD=/path/to/libchaos-io-glibc-amd64.so my-process
 ```
 
-In containers, the same pattern applies. The library observes the container's
-namespace view of:
-
-- filesystem paths
-- `/tmp/.chaos-io.conf`
-- `/proc/self/fd`
-
-That means matching is scoped to the container's view of the world, not the
-host's.
+In a container the library sees the container's mount namespace: its paths, its
+`/tmp/.chaos-io.conf`, its `/proc/self/fd`. Rules are written against that view, not
+the host's.
 
 ### Stable versus internal contracts
 
-Stable operational contract:
+Stable: the preload model, the rule file path, the rule grammar, the operation
+names, the effect semantics, the status and hits file formats.
 
-- the preload model
-- the config file path
-- the config grammar
-- the logical operation names
-- the effect semantics documented here
-
-Internal implementation detail:
-
-- file layout under `src/`
-- exact helper names
-- direct-mapped cache size
-- exact PRNG implementation
-- constructor ordering details
+Internal: file layout under `src/`, helper names, cache size (32 slots), PRNG
+algorithm, constructor ordering.
 
 ## 3. Key Concepts and Terminology
 
-- Rule
-  One parsed config line.
-- Logical operation
-  The config-level operation name such as `write` or `truncate`; multiple libc
-  entry points may map to one logical operation.
-- Effect
-  One of `ERRNO`, `LATENCY`, `TORN`, or `CORRUPT`.
-- Path prefix
-  The path selector in a rule. Matching is longest-prefix-wins and
-  path-boundary aware.
-- Active snapshot
-  The currently published in-memory config state used by readers.
-- Inactive snapshot
-  The alternate config buffer used during reload before publication.
-- Internal mode
-  The thread-local recursion guard state that suppresses re-interposition when
-  the library itself calls into libc.
-- FD cache
-  The process-wide mapping from file descriptor number to resolved path string,
-  mapped lazily on first use.
-- Excluded path
-  A path the library will never inject into: the control files of every libchaos
-  library (`/tmp/.chaos-*`: rules, status, hits), `/proc`, `/sys`, `/dev`, or an
-  empty/invalid path.
-- Torn write
-  A successful short write. This is not an error and not buffer corruption.
-- Corrupt read
-  A successful read whose returned buffer has one bit flipped after the real
-  libc call returns.
+| Term | Meaning |
+|---|---|
+| rule | One parsed line of `/tmp/.chaos-io.conf`. |
+| selector | The path part of a rule: an absolute path prefix, a literal name such as `pipe:[1234]`, or `*`. |
+| operation | The logical operation (`write`, `truncate`, ...); several functions map to one (§1). |
+| effect | ERRNO, LATENCY, TORN or CORRUPT. |
+| probability | Chance in [0, 1] that a matched ERRNO, TORN or CORRUPT rule fires. LATENCY has none. |
+| qualifier | `@first`, `@from`, `@until`, `@size` written after the rule ([DSL.md §7.1](DSL.md#71-todays-surface)). |
+| hit | One application of a rule's effect; counted per rule in the hits file. |
+| active snapshot | The published rule array readers match against. |
+| inactive snapshot | The second array, rewritten by the thread that owns a reload. |
+| internal mode | The thread-local guard `g_chaos_io_tls_guard`; while set, every wrapper forwards to the real function untouched. |
+| fd cache | Process-wide, 32-slot, direct-mapped map from descriptor number to path. |
+| excluded path | Never faulted: any `/tmp/.chaos-*` control file of any library, anything under `/proc`, `/sys`, `/dev`, an empty or unresolvable path; also descriptors 0-2. |
+| torn write | A successful write of fewer bytes than requested. Not an error, not corruption. |
+| corrupt read | A successful read whose returned bytes have one bit flipped after the real call. |
 
 ## 4. End-to-End Behavior
 
-### What happens on an intercepted call
+### Descriptor-based calls
 
-For a typical descriptor-backed call such as `write(fd, buf, count)`:
+For `write(fd, buf, count)` and every other descriptor-based wrapper:
 
-1. The interposed symbol in `libchaos-io` is entered instead of libc.
-2. The wrapper checks the thread-local recursion guard.
-3. If the thread is already inside library internals, the wrapper delegates
-   directly to the real libc symbol.
-4. Otherwise the wrapper asks the config module whether a rule exists:
-   - `stat()` the config file
-   - reload if the file changed
-   - resolve `fd -> path` through the thread-local cache or `/proc/self/fd`
-   - scan the active snapshot for the longest matching rule
-5. If no rule matches, the wrapper delegates unchanged.
-6. If a rule matches:
-   - `LATENCY` sleeps before the real call
-   - `ERRNO` may fail before the real call
-   - `TORN` may shorten the byte count before the real call
-   - `CORRUPT` is deferred until after a successful read returns
-7. The wrapper enters internal mode and calls the real libc symbol.
-8. The wrapper restores the previous recursion state.
-9. Any post-call state updates occur:
-   - `CORRUPT` may mutate the returned read buffer
-   - `close()` invalidates the fd-cache entry for every thread, whatever the real
-     close returned (Linux releases the descriptor either way); `dup2()`, `dup3()`,
-     `close_range()`, `closedir()`, `pclose()` and `closefrom()` invalidate the
-     descriptors they free or reassign
-   - successful `renameat()` and `unlinkat()` reset the whole cache
+1. `chaos_io_ensure_symbols()`.
+2. If the thread is in internal mode, forward to the real function and return.
+3. `chaos_io_match_fd_rule()`:
+   - `fd <= 2`: no match.
+   - `chaos_io_config_prepare()`: reload the rule file if it changed (at most one
+     look per millisecond once rules are loaded, §11); `errno` is preserved.
+     No rules loaded: no match.
+   - Resolve `fd` to a path: fd cache, else `readlink("/proc/self/fd/<fd>")`.
+     Excluded paths: no match.
+   - Select **one** rule: the longest matching prefix for this operation, the
+     first in the file on a tie.
+4. No rule: forward unchanged.
+5. Apply the selected rule's effect. Only that rule's effect can fire on this call:
+   - LATENCY: sleep, then call the real function.
+   - ERRNO: if the qualifiers pass and the probability fires, set `errno` and
+     return `-1` without calling the real function.
+   - TORN (write class): if it fires, call the real function with a shorter count.
+   - CORRUPT (read class): call the real function; if it returned `> 0` bytes and
+     the rule fires, flip one bit in the returned bytes.
+6. Return the real function's result.
 
-### What happens on `open()` and `openat()`
+Consequence: `/data:write:LATENCY:200` and `/data:write:EIO:0.5` have equal prefix
+length, so the first one in the file wins every `write` under `/data`; the second
+never fires. Combine effects with different prefix lengths or different operations.
 
-`open`-style calls are special because they begin with a path rather than an
-already-open fd.
+**`close` is the exception to "ERRNO skips the real call".** Linux releases the
+descriptor even when `close()` fails (EIO from NFS write-back, EINTR), and correct
+programs never retry it. The wrapper keeps that contract: LATENCY runs first, the
+real `close` always runs, the cache entry is invalidated whatever it returned, and
+an injected error is reported after it. An injected error that left the descriptor
+open would leak it in exactly the programs that handle `close` correctly.
 
-The path flow is:
+### Path-based calls: `open`, `openat`, `fopen`, `truncate`, `unlinkat`
 
-1. Decode varargs correctly if `mode_t` is present.
-2. Resolve a match path:
-   - absolute path: as written
-   - `AT_FDCWD` relative path: joined to the current working directory
-   - other relative path: joined to the directory fd's path (fd cache or
-     `/proc/self/fd`)
-   - then normalised lexically: repeated slashes become one, `.` goes, `..`
-     takes the component before it, a trailing slash goes
-3. Match the resolved path against config.
-4. Apply pre-call effects if a rule matches.
-5. Call the real libc `open()` or `openat()`.
-6. Cache the returned fd under the kernel's name for it (`/proc/self/fd/<fd>`,
-   links resolved), after dropping whatever an earlier fd with that number left.
+`open`-style calls start from a path, not a descriptor:
 
-Symbolic links: a call's path is matched as written, normalised but with links
-unresolved (resolving every component would cost a system call each), and a
-descriptor by the kernel's name for its file, links resolved. A rule covers both:
-its path is also resolved when the rules are loaded, so a rule for `/lib` (a link
-to `/usr/lib`) or for a Kubernetes ConfigMap mount (`..data` links) reaches its
-files however they were opened. chaos-init matches the same way.
+1. Read the `mode_t` vararg (as `int`, the promoted type) when `flags` contains
+   `O_CREAT` or all bits of `O_TMPFILE`; the real call is made with two or three
+   arguments to match.
+2. In internal mode, forward.
+3. Build the match path (`chaos_io_resolve_at_path()`):
+   - absolute path: as written;
+   - relative with `AT_FDCWD`: joined to `getcwd()` (in internal mode, `errno`
+     preserved);
+   - relative to a directory descriptor: joined to that descriptor's path (fd cache
+     or `/proc/self/fd`);
+   - then normalised lexically: repeated `/` collapse, `.` is dropped, `..` removes
+     the previous component (never above `/`), a trailing `/` is dropped.
+   If any step fails (path too long, unknown dirfd, `getcwd` failure), no pre-call
+   effect applies and the call proceeds.
+4. Excluded paths: no match. Otherwise select one `open` rule and apply LATENCY or
+   ERRNO.
+5. Call the real function.
+6. On success, invalidate the cache slot of the returned descriptor and resolve it
+   through `/proc/self/fd`, so the cache holds the kernel's name for the file (links
+   resolved), never a path an earlier descriptor with the same number left behind.
 
-A rule may name a file that does not exist yet: its longest existing directory is
-resolved and the rest appended. A link may move while the rule file stays as it
-is (a ConfigMap update points `..data` at a new directory): when a loaded rule's
-path went through a link or did not exist in full, its paths are resolved again
-once a second, and the rules reloaded when one moved.
+**Symbolic links.** A call's path is matched as written (normalised, links
+unresolved: resolving each component would cost a system call each). A descriptor
+is matched by the kernel's name for its file (links resolved). A rule covers both:
+at load time each absolute rule path is normalised and also resolved with
+`realpath()`; when the result differs, the rule matches either form. A rule for
+`/lib` (a link to `/usr/lib`) or for a Kubernetes ConfigMap mount (the `..data`
+link) therefore reaches its files however they were opened. chaos-init matches the
+same way.
 
-### What happens on `renameat()`
+A rule may name a file that does not exist yet: its longest existing ancestor is
+resolved and the rest appended. When any rule's path went through a link or did not
+exist in full, the rule paths are resolved again every 1000 ms
+(`CHAOS_IO_LINKS_RECHECK_MS`) and the rules reloaded if a resolution changed. That
+is how a ConfigMap update, which moves `..data` to a new directory without touching
+the rule file, is picked up.
 
-`renameat()` is the only operation with two path identities in scope at once.
+**Deleted files.** After `unlink`, Linux reports an open descriptor's path as
+`<path> (deleted)`. A rule naming exactly `<path>` no longer matches that descriptor
+(the byte after the prefix is a space, not a boundary); a rule for its directory
+still does.
 
-The rule-selection algorithm is:
+### Rename: two paths, one rule
 
-1. Resolve source and destination paths textually.
-2. Prepare config once.
-3. Match `rename_from` against the source path.
-4. Match `rename_to` against the destination path.
-5. If both match, choose the longer prefix.
-6. If both prefixes are the same length, prefer `rename_to`.
+`renameat`, `renameat2` and `rename` carry a source and a destination:
 
-That destination tie-break is intentional. Atomic replace flows usually care
-more about the final pathname being updated than about the temporary source.
+1. Resolve both paths as in step 3 above. If neither resolves, forward.
+2. Prepare the snapshot once.
+3. Match `rename_from` against the source and `rename_to` against the destination
+   (excluded paths never match).
+4. If both match, the longer prefix wins; on equal length `rename_to` wins.
+
+The destination preference serves the atomic-replace pattern (write a temporary
+file, rename it over the final name), where the final path is the one tests target.
+
+### Cache maintenance after the call
+
+- `close`: invalidate `fd` (always). `closedir`, `pclose`, `fclose`: invalidate the
+  stream's descriptor after the real close (the C library closes it with its own
+  system call).
+- `dup2` (result `>= 0`, `oldfd != newfd`), `dup3` (result `>= 0`): invalidate `newfd`.
+- `close_range` (result `0`, without `CLOSE_RANGE_CLOEXEC`): invalidate each
+  descriptor in range, or the whole cache when the range spans 32 or more numbers.
+  Without `close_range` in the C library it returns `ENOSYS`, as that libc would.
+- `closefrom`: invalidate everything. Exported also where the C library lacks it
+  (musl, glibc before 2.34); it then uses the `close_range` system call (Linux 5.9)
+  and falls back to closing every descriptor up to `sysconf(_SC_OPEN_MAX)`.
+- Successful `unlinkat`, `renameat`, `renameat2`: invalidate everything. An injected
+  ERRNO leaves the cache alone (nothing changed on disk).
 
 ## 5. Architecture Diagrams
 
 ### Component Diagram
 
-Question answered: What are the major runtime components and how do they depend
-on each other?
+Question answered: which runtime components exist and how do they depend on each
+other?
 
 ```plantuml
 @startuml
 title libchaos-io runtime components
 
 component "Target Application" as App
-component "Wrapper Layer\n(open/rw/sync/fsops)" as Wrappers
+component "Wrappers\n(open/rw/stdio/sync/fsops)" as Wrappers
 component "Runtime Core\n(symbols, guard, PRNG)" as Core
-component "Config Engine\n(parse + snapshots)" as Config
+component "Config Engine\n(parse, snapshots, match)" as Config
 component "FD Cache\nprocess-wide fd->path" as Cache
 component "Effect Engine\nerrno/latency/torn/corrupt" as Effects
-component "Real libc symbols" as Libc
+component "Real functions\n(dlsym RTLD_NEXT)" as Libc
 database "/tmp/.chaos-io.conf" as ConfigFile
+database "/tmp/.chaos-io.status\n/tmp/.chaos-io.hits.<n>" as Reports
 database "/proc/self/fd" as ProcFd
 
 App --> Wrappers
@@ -400,68 +405,71 @@ Wrappers --> Cache
 Wrappers --> Effects
 Wrappers --> Libc
 Config --> ConfigFile
+Config --> Reports
 Cache --> ProcFd
 Core --> Libc
 @enduml
 ```
 
-Main takeaway: the wrappers are intentionally thin. Rule parsing, effect
-evaluation, path recovery, and recursion control are all separate concerns.
+Main takeaway: wrappers translate calls; rule parsing, path recovery, effect
+mechanics and recursion control live in separate units with their own tests.
 
 ### Sequence Diagram
 
-Question answered: What actually happens for a matched descriptor-backed call?
+Question answered: what happens for a matched descriptor-based write?
 
 ```plantuml
 @startuml
-title write(fd, buf, count) with matching rule
+title write(fd, buf, count) with a matching rule
 
 actor Application as App
 participant "write() wrapper" as Wrap
 participant "Config Engine" as Config
 participant "FD Cache" as Cache
 participant "Effect Engine" as Effects
-participant "real libc write()" as Libc
+participant "real write()" as Libc
 
 App -> Wrap : write(fd, buf, count)
-Wrap -> Config : prepare()
-Config --> Wrap : active snapshot ready
+Wrap -> Config : prepare()  (stat at most every 1 ms)
+Config --> Wrap : active snapshot
 Wrap -> Cache : resolve(fd)
 Cache --> Wrap : path
-Wrap -> Config : select_rule(write, path)
-Config --> Wrap : matching rule
-Wrap -> Effects : apply latency / errno / torn
-alt errno triggered
-  Effects --> Wrap : fail
-  Wrap --> App : -1, errno set
-else pass through or torn
-  Wrap -> Libc : write(fd, buf, adjusted_count)
-  Libc --> Wrap : rc
-  Wrap --> App : rc
+Wrap -> Config : select one rule (write, path)
+Config --> Wrap : rule copy
+alt LATENCY
+  Wrap -> Effects : sleep latency_ms
+  Wrap -> Libc : write(fd, buf, count)
+else ERRNO fires
+  Wrap --> App : -1, errno
+else TORN fires
+  Wrap -> Effects : torn count in [1, count-1]
+  Wrap -> Libc : write(fd, buf, torn)
 end
+Libc --> Wrap : rc
+Wrap --> App : rc
 @enduml
 ```
 
-Main takeaway: all rule decisions happen before libc is called except
-post-success read corruption.
+Main takeaway: every decision is made before the real call except CORRUPT, which
+needs the bytes the read returned.
 
 ### Deployment Diagram
 
-Question answered: Where does the library live at runtime and which external
-objects does it rely on?
+Question answered: where does the library live at runtime and what does it touch?
 
 ```plantuml
 @startuml
 title libchaos-io deployment context
 
-node "Linux process" {
+node "Linux process (one mount namespace)" {
   artifact "Target executable"
   artifact "libchaos-io.so"
   artifact "libc.so"
 }
 
-node "Process namespace" {
+node "Namespace files" {
   database "/tmp/.chaos-io.conf"
+  database "/tmp/.chaos-io.status"
   database "/proc/self/fd"
 }
 
@@ -471,124 +479,92 @@ node "Linux kernel" {
 
 "Target executable" --> "libchaos-io.so" : interposed entry points
 "libchaos-io.so" --> "libc.so" : dlsym(RTLD_NEXT)
-"libchaos-io.so" --> "/tmp/.chaos-io.conf" : stat/read
+"libchaos-io.so" --> "/tmp/.chaos-io.conf" : stat / read
+"libchaos-io.so" --> "/tmp/.chaos-io.status" : raw syscalls
 "libchaos-io.so" --> "/proc/self/fd" : readlink
 "libc.so" --> "VFS / syscalls"
 @enduml
 ```
 
-Main takeaway: the implementation is process-local and namespace-scoped. It is
-not a privileged sidecar and it does not observe host-global state.
+Main takeaway: everything is process-local and namespace-scoped.
 
 ## 6. Component Breakdown
 
 ### Runtime core
 
-Files:
+Files: `src/core/chaos_io.c`, `src/core/chaos_io_internal.h`,
+`src/core/chaos_io_wrappers.h`.
 
-- `src/core/chaos_io.c`
-- `src/core/chaos_io_internal.h`
-- `src/core/chaos_io_wrappers.h`
-
-Responsibility:
-
-- resolve real libc symbols
-- own process-global state
-- seed the PRNG
-- provide recursion-guard helpers
-- centralize fd-backed rule matching
-
-Owned concerns:
-
-- `dlsym(RTLD_NEXT, ...)` symbol lookup
-- constructor sequencing
-- thread-local recursion guard
-- process seed and thread-local PRNG state
-
-Design shape:
-
-- no dynamic registration
-- no background threads
-- no function-pointer tables beyond resolved libc symbols
-
-Why this design exists:
-
-- constructor logic must be auditable and small
-- wrappers need one common recursion and symbol-resolution contract
-- keeping shared state in one place avoids divergent preload behavior
+- Owns the real-function pointers, the thread-local guard and PRNG state, and the
+  process seed.
+- `chaos_io_init()` (constructor) resolves symbols, reads 8 bytes from
+  `/dev/urandom` with raw `SYS_openat`/`SYS_read`/`SYS_close` (no interposed call
+  during construction; fallback `0x6a09e667f3bcc909 ^ getpid()`), seeds the main
+  thread's PRNG, resets the config, **loads the rule file at once so a bad file is
+  reported at start-up**, and resets the fd cache.
+- `chaos_io_match_fd_rule()` is the single lookup path for every descriptor-based
+  wrapper; `chaos_io_match_fd_rule_sized()` also records the byte count for `@size`.
+- `chaos_io_resolve_at_path()` (in `chaos_io_open.c`) is the single path builder for
+  open-, truncate-, unlink- and rename-style calls.
 
 ### Config engine
 
-Files:
+Files: `src/config/chaos_io_config.c`, `src/config/chaos_io_config.h`.
 
-- `src/config/chaos_io_config.c`
-- `src/config/chaos_io_config.h`
+- Parses the rule file into `chaos_io_rule_t` (all-or-nothing, §9).
+- Keeps two statically allocated snapshots and publishes a reload without locks
+  (§8).
+- Resolves rule paths through links and re-checks them (§4).
+- Selects the longest-prefix rule; writes the status file and the hits file.
 
-Responsibility:
-
-- parse config text into typed rules
-- maintain a two-snapshot active/inactive cache
-- publish new config lock-free
-- perform longest-prefix rule selection
-
-Owned concerns:
-
-- grammar validation
-- operation/effect legality
-- config reload eligibility
-- path-prefix semantics
-
-Pattern used:
-
-- double-buffer snapshot publication
-
-Why it is used here:
-
-- readers stay simple and fast
-- one thread can reload without blocking all callers
-- invalid config can be rejected wholesale before publication
-
-Trade-off:
-
-- every intercepted call still pays for `stat()`
-- readers do not get a fully transactional view of the filesystem, only a
-  stable in-memory rule snapshot
+Trade-off: a call never sees a half-parsed rule set, but a rule file change becomes
+visible only at the next look (at most 1 ms later), and each look costs a `stat()`.
 
 ### FD cache
 
-Files:
+Files: `src/config/chaos_io_fdcache.c`, `src/config/chaos_io_fdcache.h`.
 
-- `src/config/chaos_io_fdcache.c`
-- `src/config/chaos_io_fdcache.h`
+Descriptor-based calls must be matched by path, and `readlink("/proc/self/fd/<fd>")`
+on every call would dominate the wrapper cost. The cache maps descriptor numbers to
+the kernel's path for them.
 
-Responsibility:
+Design and why:
 
-- recover a path string for fd-backed operations
-- avoid repeated `readlink("/proc/self/fd/<fd>")` calls on hot fds
+- **Process-wide, not per thread.** A descriptor belongs to the process. The former
+  per-thread table had two defects: every thread carried 32 × `PATH_MAX` bytes of
+  static TLS from its first instruction (the static-TLS budget that crashed the
+  Erlang VM under libchaos-net), and a `close()` on one thread left other threads'
+  entries stale, so a reused descriptor number could be matched against the old
+  file.
+- **Mapped lazily, with a raw `SYS_mmap`.** The table (32 slots of a 4 096-byte path
+  plus 12 bytes of header, 131 456 bytes) is mapped on the first store. A raw system
+  call: no allocator (wrappers may run in a signal handler), and libchaos-memory
+  cannot fault it. Two threads may map concurrently; the CAS loser unmaps its copy.
+  If mapping fails the cache stays disabled for that call and every lookup reads
+  `/proc/self/fd`: slower, still correct.
+- **Direct-mapped, `fd % 32`.** Descriptors 32 apart share a slot; the later store
+  evicts the earlier entry.
+- **Seqlock per slot.** A writer makes the slot's sequence odd while it fills it.
+  A reader copies the path and accepts it only if the sequence was even and
+  unchanged; a concurrent write makes the lookup miss, never return a torn path. A
+  store that finds the slot busy is skipped; lookups never block.
+- **Generation per slot, outside the table.** Invalidation is one atomic increment
+  of the slot's generation (no lock, no wait, works before the table exists). An
+  entry records the generation it was resolved under and is valid only while that
+  is current. `chaos_io_fdcache_resolve()` reads the generation *before* `readlink`,
+  so a `close()` racing with the lookup makes the stale path unstorable.
+- **Excluded paths are never stored or returned.** `readlink` runs in internal mode
+  and preserves `errno`.
 
-Owned concerns:
+Limits:
 
-- process-wide direct-mapped cache slots, mapped on first store with a raw
-  `mmap` system call (no allocator, not visible to libchaos-memory)
-- fd-number hashing
-- exclusion filtering before storing
+- A descriptor closed by a call the library does not see (raw `syscall(SYS_close)`)
+  keeps its entry until an open-style wrapper returns that number again (it
+  invalidates the slot first) or something invalidates the slot. `closedir`,
+  `pclose`, `fclose` and `closefrom` are covered.
+- Collisions only cost a `readlink`.
 
-Why this design exists:
-
-- path-based config is the user-facing contract
-- many target libc functions operate only on fds
-- direct mapping keeps the code small and allocation-free
-
-Trade-off:
-
-- collisions are possible by construction
-- a slot held by another writer is skipped (best effort); lookups never block
-- descriptors freed by calls the library does not see (a raw `syscall(SYS_close)`)
-  are not invalidated until an open-style call returns that number again (it
-  clears the slot first); the C library's own closes are covered by `closedir()`,
-  `pclose()`, `closefrom()` and `fclose()`
-
-Full lookup, seeding, and invalidation flow ([source](diagrams/fdcache.puml)):
+Lookup and invalidation flow ([source](diagrams/fdcache.puml)):
 
 ```plantuml
 @startuml fdcache
@@ -610,75 +586,67 @@ skinparam sequence {
 hide footbox
 
 participant "Wrapper\n(read/write/fsync/…)" as Wrap
-participant "FD Cache\n(process-wide, direct-mapped)" as Cache
+participant "FD Cache\n(process-wide, 32 slots)" as Cache
 participant "/proc/self/fd\n<fd>" as Proc
 participant "Config Engine" as Config
-participant "Real libc" as Real
+participant "Real function" as Real
 
-== Normal read/write call ==
+== Descriptor-based call ==
 
 Wrap -> Cache : lookup(fd)
 note right of Cache
-  slot = fd % CACHE_SLOTS
-  if cache[slot].fd == fd:
-    return cache[slot].path  (hit)
-  else:
-    return NULL              (miss)
+  slot = fd % 32
+  hit only if: sequence even and unchanged,
+  slot holds fd, entry generation == slot generation
 end note
 
 alt Cache hit
-  Cache --> Wrap : cached_path
+  Cache --> Wrap : path
 else Cache miss
-  Cache --> Wrap : NULL
-  Wrap -> Proc : readlink("/proc/self/fd/<fd>", buf)
+  Wrap -> Cache : generation = slot generation (read first)
+  Wrap -> Proc : readlink("/proc/self/fd/<fd>")
   note right of Proc
-    Returns canonical path or socket pseudo-path.
-    Filtered: /proc, /sys, /dev, config path,
-    fd 0/1/2 are excluded from injection.
+    Kernel name, links resolved
+    (pipe:[N], socket:[N], anon_inode:[...] for non-files).
+    Excluded: /proc, /sys, /dev, /tmp/.chaos-*.
+    fd 0-2 never resolved.
   end note
-  Proc --> Wrap : path_string
-  Wrap -> Cache : store(fd, path_string)
+  Proc --> Wrap : path
+  Wrap -> Cache : store(fd, path, generation)\n(skipped if the slot is busy, stored but never valid\nif the generation moved since it was sampled)
 end
 
-Wrap -> Config : select_rule(op, path_string)
-Config --> Wrap : rule or null
-Wrap -> Real : real_symbol(fd, …)
+Wrap -> Config : select one rule (operation, path)
+Config --> Wrap : rule or none
+Wrap -> Real : real_function(fd, …)
 Real --> Wrap : result
 
-== open() seeds the cache ==
+== open-style call returns a descriptor ==
 
 note over Wrap, Cache
-  open(path, flags) / openat(dirfd, path, flags):
-    resolve match_path (pre-open)
-    call real_open()
-    if succeeded: store(returned_fd, match_path)
+  fd = real_open(...)
+  invalidate(fd)       (drop whatever an earlier fd left)
+  resolve(fd)          (cache the kernel's name, links resolved)
 end note
 
-== close() invalidates ==
+== close() and friends ==
 
 note over Wrap, Cache
-  close(fd):
-    call real_close(fd)
-    generation[fd % SLOTS] += 1  (invalidate, all threads)
-    Always invalidate: Linux releases the descriptor
-    even when close() reports an error.
+  close(fd): real_close(fd); generation[fd % 32] += 1
+  Always: Linux releases the descriptor even when close() fails.
+  dup2/dup3/closedir/pclose/fclose: invalidate the freed or reused fd.
 end note
 
-== renameat() / unlinkat() reset ==
+== unlinkat() / renameat() / renameat2() success, closefrom() ==
 
 note over Wrap, Cache
-  renameat() / unlinkat() success:
-    generation[every slot] += 1  (full reset)
-    Reason: previously resolved /proc/self/fd paths
-    may now point to different inodes or be stale.
+  generation[every slot] += 1  (full reset)
 end note
 
 note across
-  Process-wide scope: one table for all threads. An entry
-  records the slot generation it was resolved under and is
-  valid only while that is still current, so a close on
-  Thread A is seen by Thread B at once, and a lookup that
-  raced with the close can never re-store the stale path.
+  One table for all threads. An entry is valid only while its slot's
+  generation is unchanged, so a close on thread A is seen by thread B
+  at once, and a lookup that raced with the close never stores the
+  stale path.
 end note
 
 @enduml
@@ -686,709 +654,581 @@ end note
 
 ### Effect engine
 
-Files:
+Files: `src/effects/chaos_io_actions.c`, `src/effects/chaos_io_actions.h`.
 
-- `src/effects/chaos_io_actions.c`
-- `src/effects/chaos_io_actions.h`
-
-Responsibility:
-
-- probability sampling
-- latency sleep behavior
-- torn-write count derivation
-- buffer corruption
-
-Owned concerns:
-
-- one probability sample per rule evaluation
-- byte-count reduction for torn writes
-- single-bit corruption semantics
-
-Why this design exists:
-
-- wrappers should decide when an effect applies, not reimplement effect logic
-- test coverage is easier when the mechanics are isolated from interception
+- `chaos_io_rule_should_trigger()`: `@from`/`@until` window open, `@size` gate
+  passed, then (except LATENCY) one probability draw, then `chaos_policy_fire()`
+  claims an `@first` slot and records the hit. A rule that is filtered out at any
+  step counts nothing.
+- `chaos_io_probability_hit_sample()`: fires when `sample < p × 2^32`; `p <= 0`
+  never, `p >= 1` always, no floating point at the extremes.
+- `chaos_io_torn_count_sample()`: `sample % (n - 1) + 1`, i.e. `[1, n-1]`; `n == 1`
+  returns 1 (the write is complete but the hit is counted); `n == 0` returns 0.
+- `chaos_io_corrupt_buffer()`: draws byte index and bit position into locals
+  before use (C leaves argument evaluation order unspecified), then XORs one bit.
+- `chaos_io_rule_apply_latency()`: `chaos_sleep_ms()`, a raw `clock_nanosleep`
+  system call on `CLOCK_MONOTONIC`, restarted with the remaining time on `EINTR`,
+  `errno` preserved. A raw call because the exported `nanosleep`/`usleep` may be
+  libchaos-time's wrappers, and a time rule must not end or lengthen an io delay.
 
 ### Wrapper families
 
-Files:
+| File | Functions |
+|---|---|
+| `src/wrappers/chaos_io_open.c` | `open`, `openat`, `creat`, `fopen`, `freopen`, fortified and LFS aliases, `chaos_io_resolve_at_path()` |
+| `src/wrappers/chaos_io_rw.c` | `read`, `readv`, `write`, `writev`, `pread`, `preadv`, `pwrite`, `pwritev`, `sendfile`, `copy_file_range`, aliases |
+| `src/wrappers/chaos_io_stdio.c` | stdio reads and writes, `fclose` |
+| `src/wrappers/chaos_io_sync.c` | `close`, `fsync`, `fdatasync`, `dup2`, `dup3`, `close_range`, `closedir`, `pclose`, `closefrom` |
+| `src/wrappers/chaos_io_fsops.c` | `ftruncate`, `truncate`, `fallocate`, `posix_fallocate`, `unlinkat`, `unlink`, `rmdir`, `remove`, `renameat`, `renameat2`, `rename`, aliases |
 
-- `src/wrappers/chaos_io_open.c`
-- `src/wrappers/chaos_io_rw.c`
-- `src/wrappers/chaos_io_sync.c`
-- `src/wrappers/chaos_io_fsops.c`
+**Vectored calls.** The caller's `iovec` array is read only after a rule matched,
+never past `IOV_MAX` entries, and through a checked copy (`process_vm_readv` on the
+own pid; a direct copy where that call returns `ENOSYS` or `EPERM`). An invalid
+array therefore fails in the kernel with `EINVAL`/`EFAULT` instead of crashing the
+wrapper.
 
-Responsibility:
-
-- preserve ABI-compatible delegation to the real libc symbol
-- translate raw libc calls into logical config operations
-- apply effect ordering correctly
-
-Why the wrappers are split this way:
-
-- `open()` and `openat()` share varargs and path-resolution semantics
-- read/write-style wrappers share fd-backed matching and effect ordering
-- sync wrappers share simple pre-call-only behavior
-- rename/unlink/truncate/allocate operations share path-identity and lifecycle
-  concerns
+- `@size` for `readv`/`writev`/`preadv`/`pwritev` is the sum of `iov_len`, computed
+  in chunks of 64; an unreadable or oversized array has no size (size-gated rules do
+  not match).
+- TORN on `writev`/`pwritev` applies only to arrays of at most 64 entries
+  (`CHAOS_IO_TORN_MAX_IOV`); the shortened array is built on the stack from the
+  checked copy. A longer or unreadable array is written whole and counts no hit.
+- CORRUPT on `readv`/`preadv` picks one byte across the returned bytes as one
+  logical stream and maps it back to its segment.
 
 ## 7. Data Model and State
 
-### Rule structure
+### Rule structure (`chaos_io_rule_t`)
 
-The parsed rule type contains:
+| Field | Meaning |
+|---|---|
+| `path_prefix`, `path_len` | Selector as written, normalised for absolute paths; at most 1 023 bytes. `path_len` decides specificity. |
+| `resolved_prefix`, `resolved_len` | The prefix with links resolved, when different; NULL otherwise. Points into the owning snapshot. |
+| `operation`, `effect` | Parsed enums; never `INVALID` in a published rule. |
+| `errnum` | ERRNO only. |
+| `probability` | ERRNO, TORN, CORRUPT. |
+| `latency_ms` | LATENCY only; 0 to 4 294 967 295. |
+| `policy` | Qualifiers (`@first`, `@from`, `@until`, `@size`). |
+| `call_size` | Byte count of the call being decided; set on the caller's copy. |
+| `hit`, `hit_generation` | The rule's hit slot and the slot generation it was published with. |
 
-- `path_prefix`
-- `path_len`
-- `operation`
-- `effect`
-- `errnum`
-- `probability`
-- `latency_ms`
-
-Key invariants:
-
-- path prefixes are bounded by `CHAOS_IO_MAX_RULE_PATH`
-- at most `CHAOS_IO_MAX_RULES` rules are loaded
-- a rule is rejected if the selected effect is illegal for the chosen logical
-  operation
-- invalid config invalidates the entire load, not only the bad line
+Wrappers always work on a stack copy of the rule; nothing points into a snapshot
+after the match returns except `resolved_prefix`, which is used only during
+matching.
 
 ### Global state
 
-Process-global mutable state:
+Process-wide: real-function pointers (written once), process seed, two snapshots
+(256 rules each, with rule texts and resolved paths), active index, cached change
+stamp, the 256 KiB read buffer, hit slot pool (512 slots), fd cache table and slot
+generations.
 
-- resolved libc function pointers
-- process seed
-- active config index
-- cached config mtime hash
-- two config snapshots
-
-Thread-local mutable state:
-
-- recursion guard
-- PRNG state
-- fd cache
-- config read buffer used during reload
+Thread-local: recursion guard (`int`), PRNG state (`uint64_t`). Nothing else: the
+read buffer and fd cache were moved out of TLS because large static TLS objects are
+reserved in every thread and broke runtimes that create threads with small stacks.
 
 ### State transitions
 
-Config state transitions:
+Rule state:
 
-1. unknown at startup
-2. empty passthrough snapshot after initialization
-3. active parsed snapshot after a successful load
-4. back to empty passthrough if the config disappears or becomes invalid
+1. `UNKNOWN` at start: the first prepare always reads the file.
+2. Missing file: empty snapshot, status file removed.
+3. Parsed file: snapshot with its rules, `state=ok`.
+4. Invalid, too large, unreadable or NUL-containing file: empty snapshot,
+   `state=error`.
+5. Transient read failure, or a file that changed while it was read: the previous
+   snapshot stays and the next look retries.
 
-FD-cache entry transitions:
-
-1. empty
-2. populated on successful open or first `/proc/self/fd` resolution
-3. invalidated for every thread by `close()`, `dup2()`, `dup3()`, `close_range()`,
-   `closedir()`, `pclose()`, `closefrom()` or `fclose()`, and before an open-style
-   call caches the number anew
-4. fully reset by a successful `renameat()` or `unlinkat()`
+FD cache entry: empty → stored on first resolution → invalid once its slot
+generation moves (§4) → overwritten by the next store.
 
 ### Consistency model
 
-The config snapshot model is eventually consistent at call boundaries:
-
-- a given wrapper invocation sees one published snapshot
-- different threads may observe the new snapshot at slightly different times
-- no wrapper sees a half-parsed snapshot
-
-The fd-cache model is intentionally weaker:
-
-- cache entries are thread-local
-- no cross-thread invalidation exists
-- the cache is an optimization, not a source of truth
+- One call matches against one snapshot. A rule copied while a reload rewrote that
+  snapshot is detected by the snapshot's sequence and discarded (the call then
+  passes through).
+- Threads may switch to a new snapshot at slightly different moments, never to a
+  half-written one.
+- The fd cache is an optimisation with exact invalidation for every close the
+  library sees; `/proc/self/fd` is the source of truth.
 
 ## 8. Concurrency and Threading Model
 
 ### Execution model
 
-All wrapper logic is synchronous on the caller's thread. The library creates no
-worker threads and does not use signal handlers.
+All wrapper work runs synchronously on the caller's thread. The library creates no
+threads and installs no signal handlers.
 
-### Mutable state ownership
+### Reload protocol
 
-- Config snapshots are process-global and published lock-free.
-- Recursion guard, PRNG state, config read buffer, and fd cache are thread-local.
+The cached change stamp (`g_chaos_io_cached_mtime`) is both the freshness token and
+the reload lock. Sentinels: `MISSING` (0), `RELOADING` (`0xff…fe`), `UNKNOWN`
+(`0xff…ff`); a real stamp that hits one is XORed with `0x9e3779b97f4a7c15`.
 
-### Synchronization strategy
+1. `stat()` the rule file (in internal mode) and hash mtime seconds, mtime
+   nanoseconds, size, inode and device (FNV-1a multiply-XOR). Mtime alone misses two
+   writes within one filesystem clock tick; size catches an append, inode catches
+   `sed -i`-style rename-over.
+2. Equal to the cached stamp and not provisional and no link re-check due: done.
+3. Cached stamp is `RELOADING`: another thread owns the reload; use the current
+   snapshot without waiting.
+4. CAS cached stamp → `RELOADING`. The winner rewrites the inactive snapshot (its
+   sequence is odd meanwhile), reads the file, parses, resolves paths, attaches hit
+   slots, writes the status file, and publishes: sequence even, full barrier,
+   active index, full barrier, cached stamp.
+5. The read is validated with `fstat()` against the stamp that triggered it; a
+   writer that changed the file mid-read leaves a different stamp and the copy is
+   discarded (retry on the next look).
+6. A file whose mtime is within 20 ms of now (`CHAOS_RACY_WINDOW_MS`) is loaded
+   provisionally and read again on the next look until it is older: a same-size
+   rewrite within one tick leaves every stat field unchanged. A re-read with the same
+   content keeps the snapshot, its hit counts and its `@first` claims.
 
-The config engine uses GCC `__sync_*` builtins and full memory barriers rather
-than C11 atomics. That is a deliberate portability choice in this codebase.
+The GCC `__sync_*` builtins and full barriers are used rather than C11 atomics for
+portability across the toolchains in the build matrix.
 
-Publication model:
+### Signals, fork, vfork
 
-- one thread wins reload ownership through CAS on the cached mtime sentinel
-- the reloader fills the inactive snapshot
-- the reloader publishes the active index
-- readers then observe the new mtime hash
-
-This is enough for the current design because snapshot contents are written
-before the active index becomes visible.
-
-### Race and visibility caveats
-
-Important limitation: the fd cache is per-thread, so path identity is not
-globally coherent across threads.
-
-Examples:
-
-- Thread A closes fd `7`; only thread A invalidates its cache entry.
-- Thread B may still hold a cached path for fd `7`.
-- If the kernel later reuses fd `7` for a different file, thread B can observe
-  stale path identity until it misses cache or resets.
-
-This is not a theoretical purity issue. It materially affects correctness for
-applications that share and rapidly recycle file descriptors across threads.
-
-### JMM relevance
-
-The Java Memory Model is not relevant here. This is a C99 preload library. The
-relevant memory-ordering contract is compiler and CPU ordering around the
-`__sync_*` builtins used in the config publication path.
+- Wrappers allocate nothing and take no locks on the match path. The vDSO clock is
+  looked up in the constructor, not first inside a wrapper a signal handler may
+  re-enter. A lookup interrupted by a signal returns NULL to the nested caller, which
+  falls back for that call.
+- `pthread_atfork` child handler (`chaos_io_config_after_fork()`): releases a reload
+  claim held by a thread that does not exist in the child, clears the hits writer
+  state, resets hit counts and `@first` claims, gives the child its own hits file
+  number, and zeroes the forking thread's PRNG state so the child reseeds from its
+  own thread id (pre-fork workers would otherwise draw identical sequences).
+- `vfork` children and `posix_spawn` run no atfork handler. They share the parent's
+  memory, see its reload claim as busy, may count into its slots, and never write a
+  hits file (the writer checks `getpid()`).
 
 ## 9. Error Handling and Failure Modes
 
-### Expected failure behavior
+### Failure behaviour (fail-open)
 
-- Missing config: global passthrough.
-- Invalid config: global passthrough.
-- Unsupported operation/effect combination in config: config load rejected.
-- Rule not matched: passthrough.
-- Config too large: config load rejected.
-- Path resolution failure for `openat()`/`unlinkat()`/`renameat()`: pre-call
-  path injection is bypassed and real libc behavior proceeds.
+| Condition | Behaviour | Status file |
+|---|---|---|
+| No rule file | No rules, every call forwarded | removed |
+| Any invalid line (grammar, unknown operation, effect, errno, illegal effect/operation pair, malformed qualifier, qualifier without rule) | No rules | `state=error`, `reason=invalid rule`, `line=`, `text=` |
+| More than 256 rules | No rules | `reason=too many rules` |
+| File of 262 144 bytes or more | No rules | `reason=file too large`, `line=0` |
+| `open` fails with `EACCES`/`EPERM`, or `read` with `EISDIR` | No rules, not re-read until the file changes | `reason=file unreadable`, `line=0` |
+| NUL byte in the file | No rules | `reason=file contains a NUL byte` |
+| Other read failure, or file changed mid-read | Previous snapshot kept, retried on the next look | unchanged |
+| Path of a call cannot be built | That call is not faulted | — |
+| Mandatory real symbol missing | `abort()` | — |
+| `/dev/urandom` unreadable | Seed `0x6a09e667f3bcc909 ^ getpid()` | — |
+| fd cache cannot be mapped | Every lookup reads `/proc/self/fd` | — |
 
-### Unexpected failure behavior
+An invalid file drops the previous rules: a typo never leaves a stale rule set
+active.
 
-- Failure to resolve a real libc symbol in the constructor aborts the process.
-- Failure to read `/dev/urandom` at startup falls back to deterministic seed
-  derivation from `getpid()`.
-- `usleep()` interruption is ignored; the code continues decrementing remaining
-  latency budget.
+### errno discipline
 
-### Retry and idempotency semantics
+The library never leaks its own `errno`: rule-file checks, `getcwd`, `readlink`,
+`fileno` on descriptor-less streams, seed reads and sleeps all save and restore it.
+`errno` changes only when an ERRNO rule fires (or the real function sets it).
 
-The library does not retry real libc operations. That is intentional:
+### Retry and idempotency
 
-- retries would alter application-observed behavior
-- retries would hide precisely the failure mode the library is meant to expose
-
-Idempotency is entirely the application's concern.
-
-### Overload and backpressure
-
-The library does not implement backpressure. Under heavy call volume, the main
-costs are:
-
-- `stat()` of the rule file, at most every millisecond once rules are loaded
-- possible `readlink()` on fd-cache miss
-- linear rule scan
-- deliberate latency sleeps when configured
+The library never retries a real call; retries would hide the failure it exists to
+expose. Idempotency is the application's concern.
 
 ### Misuse examples
-
-Misuse:
 
 ```text
 /data:read:TORN:1.0
 ```
 
-Why it fails:
-
-- `TORN` is illegal for `read`
-- config parsing rejects the full file
-- the library falls back to global passthrough
-
-Misuse:
+TORN is legal only for `write` and `pwrite`. The whole file is rejected and the
+status file names this line.
 
 ```text
 /database:write:EIO:0.5
 ```
 
-Expected-but-wrong assumption:
+Matching is by path prefix at a `/` boundary, not substring: this does not match
+`/data/database/file`, and `/data` does not match `/database`.
 
-- this does not match `/data/database/file`
-- matching is prefix-based, not substring-based
+```text
+/data:write:LATENCY:200
+/data:write:EIO:0.5
+```
 
-### Safe degradation behavior
-
-The library consistently chooses passthrough over ambiguous injection. This is
-one of its most important operational properties.
+Both rules have the same prefix length; the first wins every `write` under `/data`
+and the second never fires (§4). Write the second as, for example,
+`/data/wal:write:EIO:0.5`.
 
 ## 10. Security Model
 
-### Threat-oriented explanation
+The library raises the ability to fail calls inside a process; it hardens nothing.
+Its security-relevant properties are self-protection and predictable control-plane
+behaviour:
 
-`libchaos-io` is not a hardening feature. It increases the ability to force
-failures inside a process. From a security perspective, its main concerns are
-containment of self-interference and predictable control-plane behavior.
-
-### Self-protection boundaries
-
-The library will never inject into:
-
-- `/tmp/.chaos-io.conf`
-- `/proc`
-- `/sys`
-- `/dev`
-- fd `0`, `1`, or `2`
-
-This prevents trivial self-destruction such as faulting reads of the config
-file or breaking stdout/stderr during diagnostics.
-
-### Authentication and authorization
-
-None. The library inherits process privileges and has no auth surface.
-
-### Sensitive data handling
-
-- No network exposure.
-- No secrets are stored in memory beyond whatever file paths the target process
-  already uses.
-- The library does not emit logs, so it also does not redact.
-
-### Input validation
-
-The config parser is the only input-validation surface. Its design is strict:
-
-- fixed four-field grammar
-- bounded line and file sizes
-- explicit operation/effect whitelist
-- explicit errno whitelist
+- Never faulted: every `/tmp/.chaos-*` file (rule, status and hits files of all six
+  libraries, so a shell redirecting into a rule file under the same preload still
+  works), anything under `/proc`, `/sys`, `/dev` (boundary-aware: `/process` is not
+  excluded), descriptors 0-2.
+- The status and hits files are written with raw system calls (`SYS_openat`,
+  `SYS_write`, `SYS_renameat`/`SYS_renameat2`), so no io rule can fail a report.
+- No network exposure, no logging, no authentication surface; the library inherits
+  the process's privileges.
+- Input validation is the parser: a fixed four-field grammar, bounded file size and
+  rule count, an operation whitelist, an effect/operation matrix and an 8-name errno
+  whitelist (no numeric errno values).
 
 ## 11. Performance Model
 
-### Hot path
+### Hot path (descriptor-based call)
 
-The hot path for fd-backed operations is:
+1. `chaos_once` check (one acquire load).
+2. Guard check.
+3. Rule-file check: skipped if the file was looked at less than 1 ms ago
+   (`CHAOS_CHECK_INTERVAL_NS`, vDSO `CLOCK_MONOTONIC`); otherwise one `stat()`.
+4. No rules loaded: return (passthrough).
+5. fd cache lookup, `readlink` on miss.
+6. Linear scan of at most 256 rules.
+7. Effect, real call.
 
-1. recursion-guard check
-2. `stat()` on the config file
-3. fd-cache lookup
-4. optional `readlink("/proc/self/fd/<fd>")`
-5. linear rule scan
-6. effect handling
-7. real libc call
+The throttle means a rule-file change takes effect within about 1 ms rather than on
+the next call; the first load, and every call while no rules are loaded, always
+looks. Measured for io `write` with a non-matching rule file (glibc, arm64 Docker,
+best of 5 × 200 000 calls): 161 ns native, 1 069 ns with a `stat()` per call, 769 ns
+throttled ([ARCHITECTURE.md, Change check](ARCHITECTURE.md#change-check)).
 
-### Complexity notes
+### Complexity and allocation
 
-- rule scan: `O(rule_count)`, bounded by `CHAOS_IO_MAX_RULES`
-- fd-cache lookup: `O(1)`
-- cache miss recovery: dominated by `readlink()`
-
-### Allocation behavior
-
-There are no heap allocations on the hot path. Buffers are fixed-size globals,
-TLS storage, or stack objects.
+- Rule selection: O(rules), at most 256.
+- fd cache lookup: O(1); a miss costs one `readlink`.
+- No heap allocation anywhere in the library. The fd cache table is one anonymous
+  mapping per process; everything else is static storage or stack.
 
 ### Memory footprint
 
-Footprint is intentionally dominated by:
-
-- two fixed config snapshots
-- thread-local fd cache
-- thread-local config read buffer
-
-This is larger than a purely stateless wrapper, but it avoids heap allocation
-and external runtime dependencies.
-
-### Performance-sensitive trade-offs
-
-- the rule file is looked at no more than every millisecond: a change takes
-  effect within about 1 ms instead of on the very next call, which cut the
-  wrapper cost of a non-matching call by 0.3 to 1.2 µs (see ARCHITECTURE.md,
-  Change check). No daemon or polling thread is involved.
-- thread-local fd caching reduces repeated `readlink()` cost but weakens
-  cross-thread path coherence.
-- no logs or metrics keeps the library small, but also reduces observability.
+Static: two snapshots of 256 rules (each rule carries a 1 024-byte prefix, the
+snapshot a 201-byte text and a 1 024-byte resolved path per rule), the 256 KiB read
+buffer, the hits buffer. Mapped on demand: the 131 456-byte fd cache. Per thread:
+an `int` and a `uint64_t` of TLS.
 
 ## 12. Observability and Operations
 
-### Built-in observability
+### Signals the library produces
 
-The library intentionally provides almost none:
+- **Status file** `/tmp/.chaos-io.status`, rewritten after every load (atomically:
+  written to `<path>.<pid>`, then renamed):
 
-- no logs
-- no metrics
-- no traces
-- no health endpoint
+  ```text
+  state=ok|error
+  rules=<active rules>
+  line=<1-based line of the first rejected rule>   (error only)
+  reason=<invalid rule|too many rules|file too large|file unreadable|file contains a NUL byte>
+  text=<that line as written, at most 200 bytes>   (error only)
+  pid=<process that wrote it>
+  ```
 
-That is a size and determinism trade-off, not an omission by accident.
+- **Hits file** `/tmp/.chaos-io.hits.<n>`, one per process (`<n>` is the pid, or a
+  derived number when that name is taken, e.g. after `execve`): one line per rule,
+  `<count><TAB><rule as written>`. Rewritten on each of the first 64 hits, then at
+  most every 100 ms, and at normal exit; a hit not due for a write makes no system
+  call. Sum the files of all processes.
 
-### Operator-visible signals
-
-The main signals are application-observed outcomes:
-
-- injected errno values
-- increased latency
-- short write return values
-- corrupted read payloads
+The application-visible outcomes are the injected errno values, the added latency,
+short write counts and corrupted read bytes.
 
 ### Debugging workflow
 
-Recommended workflow when validating behavior:
+1. Check `/tmp/.chaos-io.status`: `state=error` names the rejected line.
+2. Check the hits file: a rule with count 0 parsed but never matched.
+3. Confirm the process is dynamically linked and loaded the right tuple
+   (`/proc/<pid>/maps`).
+4. Confirm the rule file exists inside the target's mount namespace.
+5. Use `strace -f` to see which functions and system calls the program actually
+   uses. `cp`, for example, copies with `copy_file_range` or `sendfile` (covered,
+   as `write` on the output) rather than `read`/`write`; a program using `mmap()`,
+   `splice()` or io_uring is not reachable in LD_PRELOAD mode.
 
-1. Verify the target process is dynamically linked.
-2. Verify the correct tuple-specific shared object is loaded.
-3. Verify the config file path exists inside the target namespace.
-4. Use a direct probe that exercises the intended libc entry point.
-5. Use `strace` to confirm which libc/syscall path the target command actually
-   takes.
+### Runbook notes
 
-That last step matters. `cp` previously demonstrated why: a command can look
-like a write workload while actually using `sendfile()` or another alternate
-copy path.
-
-### Runbook-relevant notes
-
-- If the config contains one invalid line, the full file becomes passthrough;
-  `/tmp/.chaos-io.status` names that line (`state=error`, `line=`, `text=`).
-- If behavior is unexpectedly absent, confirm the program is not using
-  `splice()`, `mmap()`, or direct syscalls.
-- If behavior is unexpectedly wrong in multithreaded workloads, suspect stale
-  thread-local fd-cache state.
+- One invalid line disables the whole file; the status file says which.
+- A rule that never fires: compare its prefix with the path the kernel reports
+  (`ls -l /proc/<pid>/fd`), check it is not shadowed by an equally long rule for the
+  same operation earlier in the file, and check its qualifiers.
+- Changes take effect within about 1 ms; a test that writes rules and calls at once
+  must wait a few milliseconds.
 
 ## 13. Configuration Reference
 
-### Config path
+### Rule file
 
 `/tmp/.chaos-io.conf`
 
 ### Grammar
 
 ```text
-<path-prefix>:<operation>:<errno|action>:<value>
+<selector>:<operation>:<ERRNO-name|LATENCY|TORN|CORRUPT>:<value> [qualifier ...] [# comment]
 ```
+
+- Exactly four `:`-separated fields; whitespace around each field is trimmed. The
+  selector cannot contain `:` (the first `:` ends it) or `#` (it starts a comment).
+- ERRNO is written as the errno name itself (`EIO`, not `ERRNO:EIO`).
+- `<value>`: a probability for an errno name, TORN and CORRUPT; milliseconds
+  (decimal, 0 to 4 294 967 295) for LATENCY.
+- Probability: `0`, `1`, `0.` followed by digits, or `1.` followed by zeros, parsed
+  independently of `LC_NUMERIC` (a JVM sets it from the environment; `strtod` would
+  stop at the `.` under a German locale). No `nan`, `inf`, exponents or hex.
+- Qualifiers: separate words starting with `@` after the rule, before `#`
+  ([DSL.md §7.1](DSL.md#71-todays-surface)).
+- Limits: 256 rules, selector at most 1 023 bytes, file smaller than 262 144 bytes,
+  no NUL byte.
 
 Examples:
 
 ```text
 /data:write:EIO:0.3
 /data/wal.log:fsync:EIO:0.1
-/data:write:LATENCY:200
-/data:write:TORN:0.1
+/data:pwrite:LATENCY:200
+/data/seg:write:TORN:0.1
 /data:read:CORRUPT:0.5
 *:open:EMFILE:0.05
+/data:write:ENOSPC:1.0 @first=3 # disk fills, then recovers
 ```
 
-The parser rejects malformed lines at load time.
-Verify the parser accepts and rejects the expected inputs:
+Verify that the parser accepts and rejects the expected inputs:
 
 ```sh verified
 make unit 2>&1 | grep -E 'PROPTEST|test_config|OK'
 ```
 
+### Operations and legal effects
+
+| Operation | ERRNO | LATENCY | TORN | CORRUPT |
+|---|---|---|---|---|
+| `read`, `pread` | yes | yes | — | yes |
+| `write`, `pwrite` | yes | yes | yes | — |
+| `open`, `close`, `fsync`, `fdatasync`, `truncate`, `allocate`, `unlink`, `rename_from`, `rename_to` | yes | yes | — | — |
+
 ### Matching rules
 
-- longest prefix wins
-- `*` is the lowest-priority wildcard, and matches files only: not pipes,
-  sockets, anonymous inodes (eventfd, timerfd, ...) or memfds, which a rule
-  reaches only by naming them
-- matching is path-boundary aware
-- no globbing
-- no regex
-- paths are normalised lexically (`.`, `..`, `//`); descriptors are known by
-  their real path
+- One rule per call: the longest matching selector for the call's operation; the
+  first in the file on equal length. The selected rule's effect is the only one
+  that can fire.
+- Absolute selectors match at a path boundary: the path equals the selector, or
+  continues with `/`, or the selector ends with `/`. `/data` matches `/data` and
+  `/data/x`, not `/database`.
+- Absolute selectors are normalised (`.`, `..`, `//`, trailing `/`) and also match
+  through their link-resolved form (§4).
+- `*` matches every file: an absolute path that is not a memfd (`/memfd:...`). It
+  never matches pipes (`pipe:[N]`), sockets (`socket:[N]`) or anonymous inodes
+  (`anon_inode:[eventfd]`, timerfd, ...): a TORN or CORRUPT meant for files would
+  break their protocols (an 8-byte eventfd write). A selector that names them
+  literally still reaches them.
+- `*` counts as length 1 for specificity, so it loses to every longer selector and
+  ties with `/` (first in file wins).
+- No globbing, no regular expressions.
 
 ### Effect semantics
 
-- `ERRNO`
-  Pre-call failure with configured probability.
-- `LATENCY`
-  Pre-call sleep, always applied when the rule matches.
-- `TORN`
-  Pre-call write-length reduction with configured probability.
-- `CORRUPT`
-  Post-success single-bit corruption with configured probability.
+| Effect | Probability | Applied | Notes |
+|---|---|---|---|
+| ERRNO | yes | before the call; the real call is skipped | `close`: after the real close. `posix_fallocate`: returned, `errno` untouched. stdio: error value plus `ferror()`. |
+| LATENCY | no | before the call | Always fires when matched and the qualifiers pass; raw `clock_nanosleep`, restarted on `EINTR`. |
+| TORN | yes | before the call | Count in `[1, n-1]`; `writev`/`pwritev` only up to 64 entries; no effect on stdio. |
+| CORRUPT | yes, drawn after the call | after a call that returned `> 0` bytes | One bit of one returned byte. |
 
 ### Supported errno names
 
-- `EIO`
-- `ENOSPC`
-- `EDQUOT`
-- `EROFS`
-- `EACCES`
-- `EMFILE`
-- `ENFILE`
-- `ENOENT`
+`EIO`, `ENOSPC`, `EDQUOT`, `EROFS`, `EACCES`, `EMFILE`, `ENFILE`, `ENOENT`. No other
+name and no numeric value is accepted.
 
-### Safe and unsafe operational values
+### `@size` byte counts
 
-Safe defaults:
+| Call | Size |
+|---|---|
+| `read`, `write`, `pread`, `pwrite`, `sendfile`, `copy_file_range` | `count` |
+| `readv`, `writev`, `preadv`, `pwritev` | sum of `iov_len` (§6) |
+| `fallocate`, `posix_fallocate` | `length` |
+| `fread`, `fwrite` | `size × count` |
+| `fgets` | `size` (if positive) |
+| `fgetc`, `getc`, `fputc`, `putc` | 1 |
+| `fputs` | `strlen(text)` |
+| all others (`getline`, `getdelim`, `fflush`, printf family, `open`, `close`, sync, truncate, unlink, rename) | none: a size-gated rule never matches |
 
-- low error probabilities
-- low-latency injections
-- narrow path prefixes
+### SECCOMP mode
 
-Operationally risky values:
+`chaos-init` applies io rules to system calls of any process, including static
+binaries, with ERRNO and LATENCY. A rule file containing TORN, CORRUPT or ERRNO on
+`close` is rejected as a whole with `reason=unsupported in seccomp mode`. See
+[SECCOMP.md](SECCOMP.md).
 
-- `*:open:EMFILE:1.0`
-- high `LATENCY` on hot write paths
-- broad wildcard rules combined with high probabilities
+### Operational guidance
 
-### Minimal usage example
+Safe: low probabilities, narrow selectors, `@first` or `@from`/`@until` to bound a
+fault in time.
 
-Force occasional write failures under `/data`:
+Risky: `*:open:EMFILE:1.0` (every interposed file open fails), high LATENCY on hot write paths, broad `*` rules with high
+probabilities.
 
-```text
-/data:write:EIO:0.05
-```
-
-### Typical usage example
-
-Exercise WAL durability edges:
+Typical WAL test:
 
 ```text
 /srv/app/wal:write:TORN:0.10
 /srv/app/wal:fdatasync:EIO:0.05
-/srv/app/wal:fdatasync:LATENCY:250
+/srv/app/wal/segment-0001:fdatasync:LATENCY:250
 ```
 
-### Anti-pattern example
-
-Using one broad wildcard rule to simulate an entire filesystem:
+Anti-pattern:
 
 ```text
 *:write:EIO:0.5
 ```
 
-Why it is unsafe:
-
-- it collapses unrelated control files and data files into one fault domain
-- it makes failures difficult to diagnose
-- it can destabilize the target process before the intended scenario is reached
+It puts every file the process writes (logs, temporary files, caches) into one
+fault domain, makes failures hard to attribute, and can break the process before
+the scenario of interest is reached.
 
 ## 14. Extension Points and Compatibility Guarantees
 
-### Supported extension points
+### Adding a wrapper
 
-Reasonable future extensions inside `libchaos-io`:
+- Call `chaos_io_ensure_symbols()` first and give every real call a trampoline that
+  enters internal mode and falls back to a raw system call (or `ENOSYS`) while the
+  pointer is NULL.
+- Use `chaos_io_match_fd_rule[_sized]()` or `chaos_io_resolve_at_path()` plus
+  `chaos_io_config_match_path()`; never reimplement matching.
+- Preserve `errno` on every path the library owns; invalidate the fd cache for every
+  descriptor the call frees or reuses.
+- Add the glibc LFS or fortified alias where glibc exports one (§16a).
 
-- additional file-oriented libc entry points
-- new logical operations with explicit config names
-- more Linux-specific copy or lifecycle operations
+### Compatibility gate
 
-### Compatibility expectations
-
-The repository's release gate for this library is:
-
-- glibc amd64
-- glibc arm64
-- musl amd64
-- musl arm64
-
-No new wrapper is considered complete until runtime behavior is validated across
-that matrix.
+glibc amd64, glibc arm64, musl amd64, musl arm64. A wrapper is complete only when its
+runtime behaviour is validated across all four.
 
 ### What callers must not assume
 
-- They must not assume inode-level identity matching.
-- They must not assume cross-thread fd-cache coherence.
-- They must not assume coverage of non-interposed syscall paths.
-- They must not assume the library affects static binaries.
+- inode-identity matching;
+- coverage of raw system calls, io_uring, `mmap()` writes or static binaries in
+  LD_PRELOAD mode;
+- that two rules for the same operation and prefix length both apply.
 
-### What maintainers should preserve
+### What maintainers must preserve
 
-- safe-pass-through on invalid config
-- explicit logical operation mapping
-- no-public-API model
-- small, auditable code size
+- all-or-nothing parsing with a status report;
+- one rule per call, longest prefix, file order on ties;
+- exclusion of control files, `/proc`, `/sys`, `/dev` and descriptors 0-2;
+- no heap allocation, no static TLS beyond the guard and PRNG state.
 
 ## 15. Stack Walkdown
 
 ### API and framework level
 
-Materially relevant.
-
-The library intercepts libc entry points, not application frameworks directly.
-Any higher-level framework influence is only through which libc functions it
-chooses to call.
+The library intercepts C library functions, not frameworks. A framework is
+affected only through the functions it ends up calling (the JDK through `open64`,
+`pread64`, `unlink`, `rename` and friends).
 
 ### Application and runtime level
 
-Materially relevant.
-
-Every target call enters an interposed wrapper first. The wrapper decides
-whether to inject or delegate and therefore becomes part of the application's
-runtime control flow.
+Every interposed call enters a wrapper first, which decides between injecting and
+forwarding and so becomes part of the application's control flow.
 
 ### JVM level
 
-Not materially relevant to this document.
-
-This repository is pure C99 and operates below the JVM. A JVM-based application
-can still be affected indirectly if its native runtime ultimately calls the
-interposed libc symbols, but there is no Java-specific contract here.
+The library is C99 and sits below the JVM. A JVM is affected exactly where its
+native code calls interposed functions; there is no Java-specific contract.
 
 ### Memory and concurrency level
 
-Materially relevant.
+Thread-local: the guard and the PRNG state. Process-wide, lock-free: snapshots
+(CAS-owned reload, seqlock-validated reads), the fd cache (seqlock plus
+generations) and hit slots.
 
-The recursion guard, PRNG state, fd cache, and config read buffer are
-thread-local. Config publication uses full barriers. Those choices determine
-which races are avoided and which stale-cache cases remain possible.
+### OS, kernel and container level
 
-### OS, kernel, network, and container level
-
-Materially relevant.
-
-Key OS interactions:
-
-- dynamic linker loads the shared object and resolves the interposed symbols
-- `dlsym(RTLD_NEXT, ...)` resolves the downstream libc symbols
-- `stat()` determines config freshness
-- `readlink("/proc/self/fd/<fd>")` recovers path identity
-- real libc calls cross into the kernel
-
-Container relevance:
-
-- path matching and config lookup are namespace-scoped
-- `/proc/self/fd` reflects the target container's fd view
-
-Network is not materially relevant beyond the fact that this library does not
-own network semantics.
+- The dynamic linker binds the interposed symbols; `dlsym(RTLD_NEXT)` finds the
+  real ones.
+- `stat()` decides rule freshness; `readlink("/proc/self/fd/<fd>")` recovers
+  descriptor paths; `realpath()` resolves rule paths.
+- Everything is scoped to the target's mount namespace.
 
 ### Infrastructure level
 
-Materially relevant only for build and verification.
+Runtime behaviour is validated in Docker on glibc and musl, amd64 and arm64.
+Preload behaviour differs across libcs and architectures (symbol sets, missing
+system calls such as `open` and `dup2` on aarch64), so the matrix is part
+of the contract.
 
-The repository validates runtime behavior in Docker across:
+## 16a. glibc Alternate Entry Points: LFS Names and _FORTIFY_SOURCE
 
-- glibc
-- musl
-- amd64
-- arm64
+On 64-bit glibc the large-file names are separate exported symbols with the same
+signatures as the base functions, and binaries built with
+`_FILE_OFFSET_BITS=64` or by the JDK bind to them. Without them every such call
+would bypass the library. They are defined as aliases of the base wrappers, under
+`#if defined(__GLIBC__) && defined(__LP64__)`:
 
-That matrix is part of the library's engineering contract because preload
-behavior is sensitive to libc and architecture differences.
+`open64`, `openat64`, `creat64`, `fopen64`, `freopen64`, `pread64`, `pwrite64`,
+`preadv64`, `pwritev64`, `sendfile64`, `ftruncate64`, `truncate64`, `fallocate64`,
+`posix_fallocate64`.
 
-## 16a. Symbol Versioning — pread and the GLIBC_2.2 Divergence
+`_FORTIFY_SOURCE` builds (Debian and Ubuntu packages) call checking variants instead
+of the base functions. The library exports them, performs glibc's check, and then
+runs the normal wrapper:
 
-On 32-bit x86 glibc, `pread()` is exported in two symbol versions:
+| Variant | Check (failure calls `__chk_fail()`, which aborts) |
+|---|---|
+| `__open_2`, `__open64_2`, `__openat_2`, `__openat64_2` | `flags` that need a mode (`O_CREAT`, `O_TMPFILE`) must not arrive without one |
+| `__read_chk`, `__pread_chk`, `__pread64_chk` | `count` must not exceed the destination buffer size |
+| `__fread_chk`, `__fgets_chk`, `__fprintf_chk`, `__vfprintf_chk` | delegated to the C library's own checking function when it exports it, else the plain function |
 
-- `pread@GLIBC_2.0` — historical; takes `off_t` (32-bit on 32-bit platforms)
-- `pread64@GLIBC_2.1` — explicit 64-bit offset; recommended for LFS (Large File
-  Support, `_FILE_OFFSET_BITS=64`)
-
-On 64-bit targets (x86_64, aarch64), `off_t` is 64 bits unconditionally.
-`pread@@GLIBC_2.2` is the versioned default symbol. The `@@` suffix (double-at)
-denotes the default binding version in GNU symbol versioning (`.gnu.version_d`
-section; see ELF gABI § Symbol Versioning and glibc ABI changelog).
-
-`dlsym(RTLD_NEXT, "pread")` on 64-bit glibc returns `pread@@GLIBC_2.2` — which
-is the same underlying function. No version ambiguity on 64-bit. On 32-bit glibc,
-`dlsym(RTLD_NEXT, "pread")` returns `pread@GLIBC_2.0` (the unversioned default),
-which has 32-bit `off_t`. Code that compiles with `_FILE_OFFSET_BITS=64` on
-32-bit calls `pread64` instead.
-
-This repository does not ship 32-bit builds. The four release tuples are all
-64-bit (`amd64`, `arm64`). The symbol versioning issue is documented here because:
-1. It would become relevant if a 32-bit build were ever added.
-2. It illustrates why `dlsym` on versioned symbols must be audited per-arch.
-
-For musl, symbols are not versioned. `dlsym(RTLD_NEXT, "pread")` returns the
-single musl implementation regardless of `off_t` width. Musl uses `off_t` =
-`long` (64-bit on 64-bit platforms, 32-bit on 32-bit platforms) with no `pread64`
-alias exported.
-
-Reference: ELF gABI §2-13 "Symbol Table"; glibc ABI changelog; musl
-`src/unistd/pread.c`.
+musl has neither LFS names nor fortified variants; on 64-bit Linux `off_t` is 64
+bits everywhere, so the aliases carry no ABI difference. The release tuples are
+64-bit only (amd64, arm64); 32-bit `off_t` variants are not built.
 
 ## 16b. Non-Coverage: splice, tee, vmsplice
 
-Linux provides three zero-copy I/O primitives that move data between file
-descriptors and/or kernel pipe buffers without crossing user space:
+`splice(2)`, `tee(2)` and `vmsplice(2)` (Linux 2.6.17) move data between
+descriptors and kernel pipe buffers without passing through a user-space buffer.
+They are not interposed:
 
-| Syscall    | Linux version | Operation                                               |
-|------------|---------------|---------------------------------------------------------|
-| `splice(2)`| 2.6.17        | Move data between fd and pipe (or pipe to pipe)         |
-| `tee(2)`   | 2.6.17        | Duplicate pipe content without consuming it             |
-| `vmsplice(2)`| 2.6.17      | Map user-space pages into a pipe buffer                 |
+- There is no user-space buffer for CORRUPT, and TORN would require partial
+  pipe-buffer semantics the kernel owns.
+- `tee` only duplicates between pipes; `*` never matches pipes anyway.
+- `vmsplice` with `SPLICE_F_GIFT` transfers page ownership; a short or failed
+  transfer cannot be faked without knowing whether the pages were consumed.
 
-These are Linux-specific and not in POSIX.1-2017. They are not interposed by
-`libchaos-io` for the following reasons:
-
-1. `splice()` operates on pipe buffers. The destination of a `splice(pipe, file)`
-   call is visible via the destination fd, but the source is a kernel pipe buffer
-   not a user-space buffer. Injecting a torn splice requires partial pipe-buffer
-   semantics that are kernel-internal.
-2. `tee()` only duplicates between pipes. It has no user-space data surface for
-   corruption or torn-write injection.
-3. `vmsplice()` maps user pages into a pipe buffer. After `vmsplice()`, the page
-   may still be readable from user space or not depending on `SPLICE_F_GIFT`.
-   Injecting a torn write would require understanding whether the page ownership
-   has been transferred.
-4. All three use the `SYS_splice`, `SYS_tee`, `SYS_vmsplice` syscall numbers
-   directly in some paths (e.g., `cp --reflink` on btrfs). Those paths bypass the
-   PLT entirely.
-5. The practical chaos coverage for zero-copy paths is achieved via `sendfile()` and
-   `copy_file_range()`, which are already interposed.
-
-Reference: `splice(2)`, `tee(2)`, `vmsplice(2)` Linux man-pages.
+The zero-copy paths file-copy tools actually take, `sendfile()` and
+`copy_file_range()`, are interposed as `write` on the output descriptor.
 
 ## 16c. O_DIRECT and Kernel Bypass Implications
 
-`O_DIRECT` (Linux `fcntl.h`, not in POSIX.1-2017) opens a file with direct
-I/O: data bypasses the kernel page cache and goes directly between the user-space
-buffer and the storage device (via DMA). Requirements: buffer alignment (typically
-512-byte or 4096-byte), length alignment, offset alignment.
+`O_DIRECT` (Linux, not POSIX) transfers data between the user buffer and the device,
+bypassing the page cache, and requires buffer, length and offset alignment
+(typically 512 or 4 096 bytes, filesystem dependent).
 
-**Injection surface:** `libchaos-io` intercepts `open()`/`openat()` with
-`O_DIRECT` in the `flags` argument. The open wrapper matches the path and can
-inject `ERRNO:EINVAL` (the common O_DIRECT rejection error) before the real open.
-
-After a successful `open(O_DIRECT)`, subsequent `read()`, `write()`, `pread()`,
-`pwrite()` calls on that fd are also interposed. `ERRNO:EIO` injection on a
-direct-I/O write models a device-level error returning to user space.
-
-**Torn write with O_DIRECT:** The `TORN` effect reduces the write length. With
-O_DIRECT, the kernel requires that the write length be a multiple of the block
-size. A torn write to a partial block will cause the real libc `write()` to return
-`EINVAL` (unaligned length). This is not special-cased by the library. If you
-use `TORN` on a path known to be opened with `O_DIRECT`, verify that torn lengths
-still satisfy alignment constraints.
-
-**Corrupt read with O_DIRECT:** The `CORRUPT` effect flips one bit in the returned
-read buffer. With O_DIRECT, the buffer is DMA-filled from the device. The bit flip
-happens after the real `read()` returns, in user space, before the application
-sees the data. This is the correct injection model — it simulates data corruption
-at the user-space ABI boundary, not at the storage layer.
-
-Reference: `open(2)`, `NOTES` section on `O_DIRECT`; `ioctl_fslabel(2)` for
-block device alignment queries.
+- **open:** an `open`/`openat` with `O_DIRECT` is matched like any other. The
+  injectable errors are the 8 names in §13; `EINVAL`, the usual `O_DIRECT`
+  rejection, is not among them.
+- **read/write:** descriptors opened with `O_DIRECT` are matched like any other;
+  `EIO` on a direct write models a device error reaching user space.
+- **TORN:** the shortened count is not aligned in general, and the kernel then fails
+  the real write (typically `EINVAL`) instead of performing a short write. The
+  library does not special-case this; use TORN on `O_DIRECT` files only if that
+  outcome is what you want to test.
+- **CORRUPT:** the bit is flipped in user space after the DMA-filled buffer is
+  returned: corruption at the system-call boundary, not on the medium.
 
 ## 16. References
 
-- Reference: POSIX.1-2017
-- Reference: Linux man-pages project
-- Reference: `ld.so(8)`
-- Reference: `dlsym(3)`
-- Reference: `open(2)`
-- Reference: `openat(2)`
-- Reference: `read(2)`
-- Reference: `readv(2)`
-- Reference: `write(2)`
-- Reference: `writev(2)`
-- Reference: `pread(2)`
-- Reference: `preadv(2)`
-- Reference: `pwrite(2)`
-- Reference: `pwritev(2)`
-- Reference: `close(2)`
-- Reference: `fsync(2)`
-- Reference: `fdatasync(2)`
-- Reference: `sendfile(2)`
-- Reference: `copy_file_range(2)`
-- Reference: `ftruncate(2)`
-- Reference: `fallocate(2)`
-- Reference: `unlinkat(2)`
-- Reference: `renameat(2)`
-- Reference: `readlink(2)`
-- Reference: `stat(2)`
+- POSIX.1-2017 (IEEE Std 1003.1-2017)
+- Linux man-pages: `ld.so(8)`, `dlsym(3)`, `open(2)`, `openat(2)`, `read(2)`,
+  `readv(2)`, `write(2)`, `writev(2)`, `pread(2)`, `preadv(2)`, `pwrite(2)`,
+  `pwritev(2)`, `close(2)`, `close_range(2)`, `fsync(2)`, `fdatasync(2)`,
+  `sendfile(2)`, `copy_file_range(2)`, `ftruncate(2)`, `fallocate(2)`,
+  `posix_fallocate(3)`, `unlinkat(2)`, `renameat(2)`, `readlink(2)`, `stat(2)`,
+  `realpath(3)`, `process_vm_readv(2)`, `clock_nanosleep(2)`, `proc(5)`
+- [ARCHITECTURE.md](ARCHITECTURE.md): reload, status file, hit counters shared by all
+  libraries
+- [PLATFORM.md](PLATFORM.md): ELF symbol resolution, `RTLD_NEXT`, vDSO, `AT_SECURE`
+- [SECCOMP.md](SECCOMP.md): io rules under `chaos-init`
 
 ---
 
