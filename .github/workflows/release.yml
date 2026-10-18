@@ -1,7 +1,7 @@
 # Release pipeline, triggered by pushing a bare semantic-version tag (1.2.3, no v prefix).
 #
-#   build            the 24 libraries (6 libraries x 4 variants) via `make docker-build-all`,
-#                    glibc-floor check, SHA256SUMS
+#   build            the 24 libraries (6 libraries x 4 variants) and chaos-init (amd64, arm64)
+#                    via `make docker-build-all`, glibc-floor check, SHA256SUMS
 #   release          CHANGELOG.md from git-cliff, release notes, GitHub release (created, or
 #                    updated when the tag already has one), then a changelog PR to main
 #   bench-sweep      one benchmark sweep per variant on a native runner of that architecture
@@ -10,7 +10,7 @@
 #
 # The release is published before any benchmark runs, so a benchmark failure never blocks it.
 # A release-over-release regression instead marks the published release as a prerelease and
-# fails the workflow. chaos-init is not part of the release assets.
+# fails the workflow.
 # Secrets: GITHUB_TOKEN for release operations; BOT_GITHUB_TOKEN, BOT_USER_NAME and
 # BOT_USER_EMAIL for the commits and PRs to main/develop, which need a token that can bypass
 # branch protection (`gh pr merge --admin`).
@@ -59,7 +59,7 @@ jobs:
       - name: Generate checksums
         working-directory: dist
         run: |
-          sha256sum libchaos-*.so > SHA256SUMS
+          sha256sum libchaos-*.so chaos-init-* > SHA256SUMS
           echo "::group::SHA256SUMS"
           cat SHA256SUMS
           echo "::endgroup::"
@@ -70,6 +70,7 @@ jobs:
           name: release-binaries
           path: |
             dist/libchaos-*.so
+            dist/chaos-init-*
             dist/SHA256SUMS
           retention-days: 7
           if-no-files-found: error
@@ -123,6 +124,11 @@ jobs:
             echo "| \`musl-amd64\`  | Alpine on x86_64                     |"
             echo "| \`musl-arm64\`  | Alpine on ARM64                      |"
             echo ""
+            echo "\`chaos-init-amd64\` and \`chaos-init-arm64\` are the static SECCOMP-mode"
+            echo "supervisor for statically linked programs (Go with CGO_ENABLED=0), which"
+            echo "\`LD_PRELOAD\` cannot reach; see [docs/SECCOMP.md](https://github.com/${{ github.repository }}/blob/${TAG}/docs/SECCOMP.md)."
+            echo "Downloads lose the executable bit: \`chmod +x chaos-init-*\`."
+            echo ""
             echo "Verify downloads against \`SHA256SUMS\`:"
             echo "\`\`\`sh"
             echo "sha256sum -c SHA256SUMS --ignore-missing"
@@ -162,6 +168,7 @@ jobs:
               --draft=false
             gh release upload "$TAG" \
               release-assets/libchaos-*.so \
+              release-assets/chaos-init-* \
               release-assets/SHA256SUMS \
               CHANGELOG.md \
               --clobber
@@ -171,6 +178,7 @@ jobs:
               --notes-file release-notes.md \
               --verify-tag \
               release-assets/libchaos-*.so \
+              release-assets/chaos-init-* \
               release-assets/SHA256SUMS \
               CHANGELOG.md
           fi
