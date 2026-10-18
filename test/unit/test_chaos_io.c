@@ -537,11 +537,12 @@ static void test_open_wrapper(void)
     assert(open("/tmp/latency.bin", O_RDONLY) == 15);
     assert(g_config_match_path_calls == 1);
     assert(g_latency_calls == 1);
-    /* The new descriptor is cached under the kernel's name for it, never under a stale
-     * entry of an earlier descriptor with that number. */
+    /* The new descriptor's slot is dropped, so no stale entry of an earlier descriptor
+     * with that number is used; its name is resolved by the first fd rule check, not here
+     * (no readlink per open). */
     assert(g_fdcache_store_calls == 0);
     assert(g_fdcache_invalidate_calls == 1 && g_last_invalidate_fd == 15);
-    assert(g_fdcache_resolve_calls == 1);
+    assert(g_fdcache_resolve_calls == 0);
 
     chaos_test_reset_state();
     chaos_test_bind_real_functions();
@@ -688,7 +689,8 @@ static void test_openat_wrapper(void)
     assert(g_real_openat_mode == 0640);
     assert(g_config_match_path_calls == 0);
     assert(g_fdcache_store_calls == 0);
-    assert(g_fdcache_resolve_calls == 2);
+    /* One resolve: the directory descriptor's path; the new descriptor is not resolved. */
+    assert(g_fdcache_resolve_calls == 1);
 }
 
 /**
@@ -2462,10 +2464,10 @@ static void test_stdio_wrappers(void)
 /**
  * @brief Streams keep the fd cache right, and stdio lookups leave errno alone.
  *
- * @details fopen and freopen drop the entry of the stream's descriptor and resolve it from
- * the kernel; freopen with a NULL path keeps the file and changes nothing; a stream
- * without a descriptor is never cached; under the guard nothing is cached or dropped;
- * fclose drops the entry; a passthrough call on a descriptor-less stream keeps errno.
+ * @details fopen and freopen drop the entry of the stream's descriptor (its name is
+ * resolved later, by the first fd rule check); freopen with a NULL path keeps the file and changes
+ * nothing; a stream without a descriptor is never cached; under the guard nothing is cached or
+ * dropped; fclose drops the entry; a passthrough call on a descriptor-less stream keeps errno.
  */
 static void test_stdio_streams_keep_the_cache_right(void)
 {
@@ -2481,13 +2483,13 @@ static void test_stdio_streams_keep_the_cache_right(void)
     assert(g_real_fopen_return != NULL);
     stream = fopen("/tmp/stdio-cache.txt", "w+");
     assert(stream == g_real_fopen_return);
-    /* Cached under the kernel's name for the new descriptor, never a stale one. */
+    /* The new descriptor's stale entry is dropped; nothing is resolved at open. */
     assert(g_fdcache_invalidate_calls == 1 && g_last_invalidate_fd == fileno(stream));
-    assert(g_fdcache_resolve_calls == 1 && g_fdcache_store_calls == 0);
+    assert(g_fdcache_resolve_calls == 0 && g_fdcache_store_calls == 0);
 
-    /* Reopened: the descriptor's entry is dropped and resolved again. */
+    /* Reopened: the descriptor's entry is dropped again. */
     assert(freopen("/proc/self/status", "r", stream) == stream);
-    assert(g_fdcache_invalidate_calls == 2 && g_fdcache_resolve_calls == 2);
+    assert(g_fdcache_invalidate_calls == 2 && g_fdcache_resolve_calls == 0);
     /* A NULL path keeps the file: no change. */
     invalidations = g_fdcache_invalidate_calls;
     assert(freopen(NULL, "r", stream) == stream);
