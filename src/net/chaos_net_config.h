@@ -271,6 +271,27 @@ int chaos_net_config_match_endpoint_loaded(
 );
 
 /**
+ * @brief Whether a rule matches @p endpoint that no rule for @p operation could outrank on
+ *        another endpoint.
+ *
+ * @details For the two ends of a connection, where @p endpoint is the end that wins ties.
+ * When this returns non-zero, chaos_net_config_match_either_loaded() would pick the same
+ * rule whatever the other end is, so the caller need not resolve the other end (two
+ * system calls). It returns 0, and the caller searches both ends, when nothing matches or
+ * some rule for @p operation has a higher rank (chaos_net_endpoint_selector_rank()) or the
+ * same rank with a longer selector than the match.
+ *
+ * @param operation The operation class of the intercepted call.
+ * @param endpoint  The end that wins ties. Must not be NULL.
+ * @param rule      Output: the matching rule when non-zero is returned.
+ * @return Non-zero with @p rule written when the match is final; 0 otherwise.
+ * @pre chaos_net_config_prepare() ran in the same interposed call.
+ */
+int chaos_net_config_match_final_loaded(
+    chaos_net_operation_t operation, const chaos_net_endpoint_t *endpoint, chaos_net_rule_t *rule
+);
+
+/**
  * @brief chaos_net_config_match_endpoint_loaded() for the two ends of a connection:
  *        the most specific rule for either end, @p first's on a tie.
  *

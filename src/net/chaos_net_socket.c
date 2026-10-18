@@ -1037,8 +1037,26 @@ int chaos_net_match_connected(
     {
         return 0;
     }
-    have_local = chaos_net_endpoint_from_local_fd(fd, &local);
-    have_peer = chaos_net_endpoint_from_peer_fd(fd, &peer);
+    /* The preferred end first; the other end costs two more system calls and is resolved
+     * only when a rule could still outrank the preferred end's match there. */
+    if (peer_first)
+    {
+        have_peer = chaos_net_endpoint_from_peer_fd(fd, &peer);
+        if (have_peer && chaos_net_config_match_final_loaded(operation, &peer, rule))
+        {
+            return 1;
+        }
+        have_local = chaos_net_endpoint_from_local_fd(fd, &local);
+    }
+    else
+    {
+        have_local = chaos_net_endpoint_from_local_fd(fd, &local);
+        if (have_local && chaos_net_config_match_final_loaded(operation, &local, rule))
+        {
+            return 1;
+        }
+        have_peer = chaos_net_endpoint_from_peer_fd(fd, &peer);
+    }
     return peer_first ? chaos_net_config_match_either_loaded(
                             operation, have_peer ? &peer : NULL, have_local ? &local : NULL, rule
                         )

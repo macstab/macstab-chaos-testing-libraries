@@ -1619,6 +1619,41 @@ int chaos_net_config_match_endpoint_loaded(
            chaos_snapshot_read_valid(&state->sequence, sequence);
 }
 
+int chaos_net_config_match_final_loaded(
+    chaos_net_operation_t operation, const chaos_net_endpoint_t *endpoint, chaos_net_rule_t *rule
+)
+{
+    const chaos_net_config_state_t *state = chaos_net_config_active_state();
+    const uint64_t sequence = chaos_snapshot_read_begin(&state->sequence);
+    chaos_net_best_rule_t best = {0U, 0U, 0};
+    size_t index;
+
+    if (state->parse_ok == 0)
+    {
+        return 0;
+    }
+    chaos_net_config_select_better(
+        state->rules, state->rule_count, operation, endpoint, rule, &best
+    );
+    if (!best.found)
+    {
+        return 0;
+    }
+    /* Final unless a rule could beat it on the other end; ties go to this end. */
+    for (index = 0U; index < state->rule_count; ++index)
+    {
+        const unsigned int rank = chaos_net_endpoint_selector_rank(&state->rules[index].selector);
+
+        if (state->rules[index].operation == operation &&
+            (rank > best.rank ||
+             (rank == best.rank && state->rules[index].selector.selector_len > best.length)))
+        {
+            return 0;
+        }
+    }
+    return chaos_snapshot_read_valid(&state->sequence, sequence);
+}
+
 int chaos_net_config_match_either_loaded(
     chaos_net_operation_t operation,
     const chaos_net_endpoint_t *first,
