@@ -129,6 +129,12 @@ static chaos_io_config_state_t g_chaos_io_config_states[2];
 static chaos_hit_slot_t g_chaos_io_hit_pool[2U * CHAOS_IO_MAX_RULES];
 
 /**
+ * @brief Non-zero once a snapshot with rules was attached to the pool. Until then a
+ * forked child has no slot to reset and skips the pool, touching none of its pages.
+ */
+static int g_chaos_io_hit_pool_used = 0;
+
+/**
  * @brief Index (0 or 1) of the active snapshot.
  *
  * @details Written by chaos_io_config_publish() (and chaos_io_config_init()) between full
@@ -869,21 +875,28 @@ static void chaos_io_config_after_fork(void)
     {
         g_chaos_io_cached_mtime = CHAOS_IO_MTIME_UNKNOWN;
     }
-    g_chaos_io_hits_writing = 0;
-    g_chaos_io_hits_pending = 0;
-    g_chaos_io_hits_total = 0U;
-    g_chaos_io_hits_last_ms = 0U;
+    /* Stores only what changed (CHAOS_STORE_IF_CHANGED): every page written here is
+     * a copy-on-write fault in each child. */
+    CHAOS_STORE_IF_CHANGED(g_chaos_io_hits_writing, 0);
+    CHAOS_STORE_IF_CHANGED(g_chaos_io_hits_pending, 0);
+    CHAOS_STORE_IF_CHANGED(g_chaos_io_hits_total, 0U);
+    CHAOS_STORE_IF_CHANGED(g_chaos_io_hits_last_ms, 0U);
     g_chaos_io_hits_pid = (uint64_t)getpid();
-    g_chaos_io_hits_file = chaos_hits_file_number(CHAOS_IO_HITS_PREFIX);
-    g_chaos_io_hits_owned = 0;
+    /* The child's own pid, without probing /tmp: a stale file of an earlier process with
+     * this pid is caught by the exclusive first write, which then picks another suffix. */
+    g_chaos_io_hits_file = (long)g_chaos_io_hits_pid;
+    CHAOS_STORE_IF_CHANGED(g_chaos_io_hits_owned, 0);
     /* Zero forces a reseed on the next draw, mixing in the child's own tid. */
-    g_chaos_io_tls_prng_state = 0U;
-    chaos_hits_pool_after_fork(
-        g_chaos_io_hit_pool,
-        sizeof(g_chaos_io_hit_pool) / sizeof(g_chaos_io_hit_pool[0]),
-        chaos_io_config_active_state()->hits,
-        chaos_io_config_active_state()->rule_count
-    );
+    CHAOS_STORE_IF_CHANGED(g_chaos_io_tls_prng_state, 0U);
+    if (g_chaos_io_hit_pool_used)
+    {
+        chaos_hits_pool_after_fork(
+            g_chaos_io_hit_pool,
+            sizeof(g_chaos_io_hit_pool) / sizeof(g_chaos_io_hit_pool[0]),
+            chaos_io_config_active_state()->hits,
+            chaos_io_config_active_state()->rule_count
+        );
+    }
 }
 
 /**
@@ -1061,6 +1074,10 @@ static void chaos_io_config_attach_hits(chaos_io_config_state_t *next_state)
         (void)memcpy(
             next_state->text[index], g_chaos_io_config_texts[index], sizeof(next_state->text[index])
         );
+    }
+    if (next_state->rule_count > 0U)
+    {
+        g_chaos_io_hit_pool_used = 1;
     }
     chaos_hits_assign(
         g_chaos_io_hit_pool,

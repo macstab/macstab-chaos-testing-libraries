@@ -129,6 +129,12 @@ static chaos_process_config_state_t g_chaos_process_config_states[2];
 /** @brief Hit slots for the rules of both snapshots (see chaos_hits_assign()). */
 static chaos_hit_slot_t g_chaos_process_hit_pool[2U * CHAOS_PROCESS_MAX_RULES];
 
+/**
+ * @brief Non-zero once a snapshot with rules was attached to the pool. Until then a
+ * forked child has no slot to reset and skips the pool, touching none of its pages.
+ */
+static int g_chaos_process_hit_pool_used = 0;
+
 /** Index of the active snapshot; stored by the reload owner before the stamp. */
 static volatile unsigned int g_chaos_process_active_config_index = 0U;
 
@@ -222,7 +228,7 @@ static void chaos_process_reset_fail_after_counters(void)
 
     for (index = 0U; index < (size_t)CHAOS_PROCESS_OP_COUNT; ++index)
     {
-        g_chaos_process_fail_after_counters[index] = 0U;
+        CHAOS_STORE_IF_CHANGED(g_chaos_process_fail_after_counters[index], 0U);
     }
 }
 
@@ -1343,24 +1349,31 @@ static void chaos_process_config_after_fork(void)
     {
         g_chaos_process_cached_mtime = CHAOS_PROCESS_MTIME_UNKNOWN;
     }
-    g_chaos_process_hits_writing = 0;
-    g_chaos_process_hits_pending = 0;
-    g_chaos_process_hits_total = 0U;
-    g_chaos_process_hits_last_ms = 0U;
+    /* Stores only what changed (CHAOS_STORE_IF_CHANGED): every page written here is
+     * a copy-on-write fault in each child. */
+    CHAOS_STORE_IF_CHANGED(g_chaos_process_hits_writing, 0);
+    CHAOS_STORE_IF_CHANGED(g_chaos_process_hits_pending, 0);
+    CHAOS_STORE_IF_CHANGED(g_chaos_process_hits_total, 0U);
+    CHAOS_STORE_IF_CHANGED(g_chaos_process_hits_last_ms, 0U);
     g_chaos_process_hits_pid = (uint64_t)getpid();
-    g_chaos_process_hits_file = chaos_hits_file_number(CHAOS_PROCESS_HITS_PREFIX);
-    g_chaos_process_hits_owned = 0;
+    /* The child's own pid, without probing /tmp: a stale file of an earlier process with
+     * this pid is caught by the exclusive first write, which then picks another suffix. */
+    g_chaos_process_hits_file = (long)g_chaos_process_hits_pid;
+    CHAOS_STORE_IF_CHANGED(g_chaos_process_hits_owned, 0);
     /* The child must not draw the parent's numbers (pre-fork workers would all
      * decide alike): its PRNG reseeds from its own thread id on the next draw. */
-    g_chaos_process_tls_prng_state = 0U;
+    CHAOS_STORE_IF_CHANGED(g_chaos_process_tls_prng_state, 0U);
     /* FAIL_AFTER counts per process, like @first, and as chaos-init counts it. */
     chaos_process_reset_fail_after_counters();
-    chaos_hits_pool_after_fork(
-        g_chaos_process_hit_pool,
-        sizeof(g_chaos_process_hit_pool) / sizeof(g_chaos_process_hit_pool[0]),
-        chaos_process_config_active_state()->hits,
-        chaos_process_config_active_state()->rule_count
-    );
+    if (g_chaos_process_hit_pool_used)
+    {
+        chaos_hits_pool_after_fork(
+            g_chaos_process_hit_pool,
+            sizeof(g_chaos_process_hit_pool) / sizeof(g_chaos_process_hit_pool[0]),
+            chaos_process_config_active_state()->hits,
+            chaos_process_config_active_state()->rule_count
+        );
+    }
 }
 
 /** @brief Reports the hits not yet written when the process exits normally. */
@@ -1388,6 +1401,10 @@ static void chaos_process_config_attach_hits(chaos_process_config_state_t *next_
             g_chaos_process_config_texts[index],
             sizeof(next_state->text[index])
         );
+    }
+    if (next_state->rule_count > 0U)
+    {
+        g_chaos_process_hit_pool_used = 1;
     }
     chaos_hits_assign(
         g_chaos_process_hit_pool,

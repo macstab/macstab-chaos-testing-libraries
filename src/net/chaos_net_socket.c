@@ -630,9 +630,11 @@ static void chaos_net_dup_after_fork(void)
     chaos_net_dup_slot_t *table = g_chaos_net_dup_slots;
     int index;
 
+    /* One slot spans more than a page: an unconditional store would fault every slot's
+     * page in every child. */
     for (index = 0; index < CHAOS_NET_DUP_SLOTS; ++index)
     {
-        table[index].lock = 0;
+        CHAOS_STORE_IF_CHANGED(table[index].lock, 0);
     }
 }
 
