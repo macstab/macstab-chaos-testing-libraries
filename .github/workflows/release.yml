@@ -229,12 +229,13 @@ jobs:
           fi
 
   # One sweep per variant on a runner of that architecture, so arm64 numbers come from arm64
-  # hardware, not from emulation. Each cell is measured 5 times (BENCH_WARMUP / BENCH_ITERS
+  # hardware, not from emulation. Each cell is measured 10 times (BENCH_WARMUP / BENCH_ITERS
   # override the run-bench.sh defaults of 10000 / 200000).
   bench-sweep:
     name: bench (${{ matrix.libc }}-${{ matrix.arch }})
     needs: [release]
-    timeout-minutes: 60
+    # 10 runs of the full suite take about twice the former 5-run sweep (~45 min).
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
