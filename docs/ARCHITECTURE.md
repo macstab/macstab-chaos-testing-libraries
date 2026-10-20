@@ -614,7 +614,8 @@ Real --> Wrap : result
 note over Wrap, Cache
   real open succeeds →
     invalidate(fd)  (an fd closed where io did not see it)
-    resolve(fd)     (cache the kernel's name)
+  the name is resolved by the first fd rule check (cache miss
+  above), only while rules are active
 end note
 
 == close() / dup2 / dup3 / close_range ==

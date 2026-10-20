@@ -630,9 +630,11 @@ static void chaos_net_dup_after_fork(void)
     chaos_net_dup_slot_t *table = g_chaos_net_dup_slots;
     int index;
 
+    /* One slot spans more than a page: an unconditional store would fault every slot's
+     * page in every child. */
     for (index = 0; index < CHAOS_NET_DUP_SLOTS; ++index)
     {
-        table[index].lock = 0;
+        CHAOS_STORE_IF_CHANGED(table[index].lock, 0);
     }
 }
 
@@ -1035,8 +1037,26 @@ int chaos_net_match_connected(
     {
         return 0;
     }
-    have_local = chaos_net_endpoint_from_local_fd(fd, &local);
-    have_peer = chaos_net_endpoint_from_peer_fd(fd, &peer);
+    /* The preferred end first; the other end costs two more system calls and is resolved
+     * only when a rule could still outrank the preferred end's match there. */
+    if (peer_first)
+    {
+        have_peer = chaos_net_endpoint_from_peer_fd(fd, &peer);
+        if (have_peer && chaos_net_config_match_final_loaded(operation, &peer, rule))
+        {
+            return 1;
+        }
+        have_local = chaos_net_endpoint_from_local_fd(fd, &local);
+    }
+    else
+    {
+        have_local = chaos_net_endpoint_from_local_fd(fd, &local);
+        if (have_local && chaos_net_config_match_final_loaded(operation, &local, rule))
+        {
+            return 1;
+        }
+        have_peer = chaos_net_endpoint_from_peer_fd(fd, &peer);
+    }
     return peer_first ? chaos_net_config_match_either_loaded(
                             operation, have_peer ? &peer : NULL, have_local ? &local : NULL, rule
                         )

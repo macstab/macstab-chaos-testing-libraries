@@ -61,6 +61,23 @@
 #include <sys/syscall.h>
 #endif
 
+/**
+ * @brief Assigns @p value to @p lvalue only when it differs.
+ *
+ * @details For atfork child handlers. After fork() every page of the parent is shared
+ * copy-on-write, and the first store to a page costs the child a page fault and a page
+ * copy (several microseconds each). A child that inherited nothing to reset then touches
+ * no page at all, since reads of shared pages are free. @p value is evaluated twice.
+ */
+#define CHAOS_STORE_IF_CHANGED(lvalue, value)                                                      \
+    do                                                                                             \
+    {                                                                                              \
+        if ((lvalue) != (value))                                                                   \
+        {                                                                                          \
+            (lvalue) = (value);                                                                    \
+        }                                                                                          \
+    } while (0)
+
 /** @brief Number of first hits per process that each rewrite the hits file at once. */
 #define CHAOS_HITS_EAGER 64U
 
@@ -321,10 +338,11 @@ static inline void chaos_hits_pool_after_fork(
     size_t index;
 
     chaos_hits_release(pool, pool_size, active, active_count);
+    /* Only slots that changed are written: an untouched pool costs the child no page. */
     for (index = 0U; index < pool_size; ++index)
     {
-        pool[index].count = 0U;
-        pool[index].claimed = chaos_hit_claims_none(pool[index].generation);
+        CHAOS_STORE_IF_CHANGED(pool[index].count, 0U);
+        CHAOS_STORE_IF_CHANGED(pool[index].claimed, chaos_hit_claims_none(pool[index].generation));
         if (pool[index].state == 3U)
         {
             pool[index].state = 1U;

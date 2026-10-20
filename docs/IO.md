@@ -625,7 +625,8 @@ Real --> Wrap : result
 note over Wrap, Cache
   fd = real_open(...)
   invalidate(fd)       (drop whatever an earlier fd left)
-  resolve(fd)          (cache the kernel's name, links resolved)
+  no readlink here: the first fd rule check (only while rules
+  are active) resolves and caches the kernel's name
 end note
 
 == close() and friends ==

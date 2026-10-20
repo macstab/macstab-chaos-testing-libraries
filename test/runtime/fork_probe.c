@@ -4,8 +4,8 @@
  *        children for test_fork.sh, which judges the result.
  *
  * @details
- * Usage: fork_probe vfork|fork|spawn|open|draws, under LD_PRELOAD of libchaos-io with an
- * open rule on /tmp/fork-data.
+ * Usage: fork_probe vfork|fork|spawn|open|draws|faults, under LD_PRELOAD of libchaos-io with
+ * an open rule on /tmp/fork-data (faults: any preloads, no rule needed).
  *
  * - vfork|fork|spawn: the parent opens /tmp/fork-data/file, starts a child of that kind which
  *   opens it once, then opens it again, and prints which opens failed with EIO, e.g.
@@ -17,6 +17,10 @@
  * - draws: parent and a forked child each open 64 times under a probability rule and the probe
  *   prints "same" when both saw the identical failure pattern, "different" otherwise. A child
  *   that inherited the parent's PRNG state would print "same" (1 in 2^64 by chance at p = 0.5).
+ * - faults: forks 50 children that `_exit(0)` at once and prints their mean minor page faults
+ *   (wait4's ru_minflt). Every page an atfork child handler writes costs the child a
+ *   copy-on-write fault, so the count shows what the preloaded libraries' fork handling costs,
+ *   deterministically, unlike a timing.
  *
  * Exit: 0 after printing (open mode: 1 on EIO); 2 on bad usage or a pipe/fork failure in
  * draws mode.
@@ -31,6 +35,7 @@
 #include <spawn.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -89,12 +94,36 @@ int main(int argc, char **argv)
 
     if (argc != 2)
     {
-        (void)fprintf(stderr, "usage: %s vfork|fork|spawn|open|draws\n", argv[0]);
+        (void)fprintf(stderr, "usage: %s vfork|fork|spawn|open|draws|faults\n", argv[0]);
         return 2;
     }
     if (strcmp(argv[1], "open") == 0)
     {
         return open_fails();
+    }
+    if (strcmp(argv[1], "faults") == 0)
+    {
+        long faults = 0L;
+        int round;
+
+        for (round = 0; round < 50; ++round)
+        {
+            struct rusage usage;
+            int status;
+
+            pid = fork();
+            if (pid == 0)
+            {
+                _exit(0);
+            }
+            if (pid < 0 || wait4(pid, &status, 0, &usage) != pid)
+            {
+                return 2;
+            }
+            faults += usage.ru_minflt;
+        }
+        (void)printf("%ld\n", faults / 50L);
+        return 0;
     }
 
     if (strcmp(argv[1], "draws") == 0)

@@ -238,27 +238,34 @@ static void test_selector_parsing_and_matching(void)
     assert(chaos_net_endpoint_parse_selector("tcp4://127.0.0.1:5432", &endpoint));
     assert(chaos_net_endpoint_matches(&selector, &endpoint, &rank));
     assert(rank == 3U);
+    /* selector_rank() predicts each rank without an endpoint (final-match shortcut). */
+    assert(chaos_net_endpoint_selector_rank(&selector) == rank);
 
     assert(chaos_net_endpoint_parse_selector("tcp4://*:5432", &selector));
     assert(chaos_net_endpoint_matches(&selector, &endpoint, &rank));
     assert(rank == 2U);
+    assert(chaos_net_endpoint_selector_rank(&selector) == rank);
 
     assert(chaos_net_endpoint_parse_selector("*", &selector));
     assert(chaos_net_endpoint_matches(&selector, &endpoint, &rank));
     assert(rank == 1U);
+    assert(chaos_net_endpoint_selector_rank(&selector) == rank);
 
     assert(chaos_net_endpoint_parse_selector("unix:///tmp/socket", &selector));
     assert(chaos_net_endpoint_parse_selector("unix:///tmp/socket", &endpoint));
     assert(chaos_net_endpoint_matches(&selector, &endpoint, &rank));
     assert(rank == 4U);
+    assert(chaos_net_endpoint_selector_rank(&selector) == rank);
     assert(chaos_net_endpoint_parse_selector("unix://*", &selector));
     assert(chaos_net_endpoint_matches(&selector, &endpoint, &rank));
     assert(rank == 2U);
+    assert(chaos_net_endpoint_selector_rank(&selector) == rank);
     assert(chaos_net_endpoint_parse_selector("unix:///tmp/socket", &selector));
     endpoint.value.text[0] = 'x';
     assert(!chaos_net_endpoint_matches(&selector, &endpoint, &rank));
 
     assert(!chaos_net_endpoint_matches(NULL, &endpoint, &rank));
+    assert(chaos_net_endpoint_selector_rank(NULL) == 0U);
     assert(!chaos_net_endpoint_matches(&selector, NULL, &rank));
     assert(chaos_net_endpoint_parse_selector("tcp4://127.0.0.1:1234", &selector));
     assert(chaos_net_endpoint_parse_selector("tcp4://127.0.0.2:1234", &endpoint));
@@ -430,7 +437,7 @@ static void test_endpoint_resolution_from_sockaddr_and_fd(void)
     (void)memset(long_unix.extra, 'x', sizeof(long_unix.extra) - 1U);
     long_unix.extra[sizeof(long_unix.extra) - 1U] = '\0';
     assert(chaos_net_endpoint_from_sockaddr(
-        7, (const struct sockaddr *)&long_unix, (socklen_t)sizeof(long_unix), &endpoint
+        7, (const struct sockaddr *)&long_unix, (socklen_t)sizeof(long_unix), &endpoint, 0
     ));
     assert(endpoint.kind == CHAOS_NET_ENDPOINT_UNIX);
     assert(strlen(endpoint.value.text) == sizeof(long_unix.base.sun_path));
@@ -443,7 +450,7 @@ static void test_endpoint_resolution_from_sockaddr_and_fd(void)
         (void)memset(&unix_address, 'x', sizeof(unix_address));
         unix_address.sun_family = AF_UNIX;
         assert(chaos_net_endpoint_from_sockaddr(
-            7, (const struct sockaddr *)&unix_address, (socklen_t)sizeof(sa_family_t), &endpoint
+            7, (const struct sockaddr *)&unix_address, (socklen_t)sizeof(sa_family_t), &endpoint, 0
         ));
         assert(endpoint.kind == CHAOS_NET_ENDPOINT_UNIX && endpoint.value.text[0] == '\0');
         assert(chaos_net_endpoint_parse_selector("unix://*", &selector));
@@ -460,7 +467,8 @@ static void test_endpoint_resolution_from_sockaddr_and_fd(void)
         7,
         (const struct sockaddr *)&unix_address,
         (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 11U),
-        &endpoint
+        &endpoint,
+        0
     ));
     assert(strcmp(endpoint.value.text, "/tmp/a.sock") == 0);
 
@@ -522,6 +530,21 @@ static void test_endpoint_resolution_from_sockaddr_and_fd(void)
     assert(!chaos_net_endpoint_from_sockaddr_fd(
         7, (const struct sockaddr *)&unix_address, (socklen_t)sizeof(unix_address), &endpoint
     ));
+    /* The same UNIX address from getsockname or getpeername resolves without SO_TYPE: the
+     * lookup already proved the descriptor a socket, and every UNIX type is kind UNIX. */
+    (void)memcpy(&g_stub_sockname_storage, &unix_address, sizeof(unix_address));
+    g_stub_sockname_length = (socklen_t)sizeof(unix_address);
+    assert(chaos_net_endpoint_from_local_fd(7, &endpoint));
+    assert(endpoint.kind == CHAOS_NET_ENDPOINT_UNIX);
+    assert(strcmp(endpoint.value.text, "/tmp/chaos.sock") == 0);
+    (void)memcpy(&g_stub_peer_storage, &unix_address, sizeof(unix_address));
+    g_stub_peer_length = (socklen_t)sizeof(unix_address);
+    assert(chaos_net_endpoint_from_peer_fd(7, &endpoint));
+    assert(endpoint.kind == CHAOS_NET_ENDPOINT_UNIX);
+    (void)memcpy(&g_stub_sockname_storage, &ipv4, sizeof(ipv4));
+    g_stub_sockname_length = (socklen_t)sizeof(ipv4);
+    (void)memcpy(&g_stub_peer_storage, &ipv4, sizeof(ipv4));
+    g_stub_peer_length = (socklen_t)sizeof(ipv4);
     g_stub_getsockopt_result = 0;
 
     g_stub_getsockname_result = -1;

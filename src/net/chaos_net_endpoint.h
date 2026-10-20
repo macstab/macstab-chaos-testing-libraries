@@ -90,6 +90,17 @@ int chaos_net_endpoint_matches(
 );
 
 /**
+ * @brief The rank (1-4) chaos_net_endpoint_matches() reports when @p selector matches.
+ *
+ * @details Rank depends on the selector alone, so it bounds what any endpoint can reach
+ * before one is resolved (chaos_net_config_match_final_loaded()).
+ *
+ * @param selector  Parsed selector; NULL yields 0.
+ * @return 4 UNIX path, 3 exact address, 2 wildcard host or UNIX `*`, 1 `*`; 0 for NULL.
+ */
+unsigned int chaos_net_endpoint_selector_rank(const chaos_net_endpoint_t *selector);
+
+/**
  * @brief Resolves a runtime endpoint from @p address, with the transport of @p fd.
  *
  * @details Interprets @p address by sa_family, then asks SO_TYPE of @p fd (through
