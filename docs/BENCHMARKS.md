@@ -666,38 +666,49 @@ Microbenchmarks isolate the wrapper on a cheap kernel path (`/dev/zero`,
 - Δ % is a ratio, `wrapper_cost / native_cost`: the same few µs is
   +10 000 % on a vDSO read and single-digit % on `pthread_create`
 
-### 12.4 Scenario validity in the published matrices
+### 12.4 Scenario validity
 
-The `_match_no_fire` and `_errno` arms exercise the rule path only if the
-scenario file loads. Checked against the parsers at this revision:
+The `_match_no_fire` and `_errno` arms exercise the rule path only if their scenario loads
+and matches the benchmark's calls. `run-bench.sh --check-scenarios` proves it for every
+benchmark of `benchmark/suite.tsv`, on glibc and musl, and CI (`ci.yml`, `bench.yml`,
+`release.yml`) runs it before any sweep:
 
-| Benchmarks | Scenario defect | Effect on the arms |
-| --- | --- | --- |
-| all `time` (`clock_gettime`, `nanosleep_zero`, `usleep_zero`) | probability written `ERRNO:<name>,<p>`; the grammar is `<value>[@<p>]` | rule file rejected; arms measure passthrough |
-| all `memory`, all `process` | same `,<p>` syntax | rule file rejected; arms measure passthrough |
-| io `readv`, `writev`, `openat_close`, `ftruncate`, `fallocate`, `sendfile` | operation tokens the io grammar does not accept | rule file rejected; arms measure passthrough |
-| io `fsync`, `fdatasync` | path selector `/tmp/chaos-bench-io.*`: a literal prefix, not a glob | rule never matches; arms measure no-match |
-| net `sendto`, `recvfrom`, `sendmsg`, `recvmsg` | operation tokens net does not accept (`send`/`recv` cover them) | rule file rejected; arms measure passthrough |
-| dns `getnameinfo` | `dns://*` selector; reverse lookups consult `rdns://` rules | rule never matches; arms measure no-match |
+- the errno scenario loads (`state=ok`, at least one rule) and fires on every one of 64
+  measured calls, and the run still completes and writes its envelope;
+- the match-no-fire scenario is the errno scenario with probability 0 and loads;
+- the passthrough scenario loads with 0 rules.
 
-Effective at this revision: io `pread`, `read`, `write`, `open_close`; net
-`send`, `recv`, `socket_close`, `shutdown`; dns `getaddrinfo`. In the 1.0.1
-matrix the defective rows show all three arms within noise of each other,
-which confirms the analysis. A rejected scenario still exercises a slightly
-different path from an empty file (a status file with `state=error`), but no
-rule evaluation.
+**Matrices up to and including 2.0.0 predate this check** and are partly invalid: the time,
+memory and process scenarios used `ERRNO:<name>,<p>` (the grammar is `@<p>`) and were
+rejected; io `readv`, `writev`, `openat_close`, `ftruncate`, `fallocate`, `sendfile` and net
+`sendto`, `recvfrom`, `sendmsg`, `recvmsg` used operation names the parsers do not accept;
+io `read`, `write`, `readv`, `writev`, `open_close`, `openat_close` targeted `/dev/zero` and
+`/dev/null`, which libchaos-io excludes, and `pread`, `fsync`, `fdatasync` used selectors
+that never matched (io prefixes match at path-component boundaries); dns `getnameinfo` used a
+`dns://` rule where reverse lookups consult `rdns://`. In those matrices the affected
+`_match_no_fire` and `_errno` cells measure passthrough or a non-matching rule. Only net
+`send`, `recv`, `socket_close`, `shutdown` and dns `getaddrinfo` were effective.
 
-### 12.5 Significance testing with five runs
+The corrected benchmarks carry kernel revision 2 (`krev`, the six io kernels moved from
+`/dev` to temp files) or scenario revision 2 (`srev`) in `benchmark/suite.tsv`. The
+release-over-release gate compares a benchmark only between releases with the same
+revision, so these are re-baselined once instead of reported as regressions.
 
-The driver tests per-run medians, so with `--runs=5` each arm contributes
+### 12.5 Significance testing and the number of runs
+
+Release sweeps (`release.yml`, `bench.yml`) use `--runs=10`; this section explains why five
+were not enough. The driver tests per-run medians, so with `--runs=5` each arm contributes
 five values. With n₁ = n₂ = 5 the Mann-Whitney normal approximation reaches
 |z| = 12.5 / √(275/12) ≈ 2.61 at most (complete separation), i.e. p ≈ 0.009.
 The p < 0.01 criterion is therefore met only when every treatment median
 exceeds every baseline median, and r = z/√10 ≈ 0.83 follows automatically.
-The driver's own docstring notes that the approximation is meant for
-n₁ + n₂ ≥ 20. The bootstrap CI over five medians takes few distinct values.
-Treat the flag as "consistently slower in every run", not as a calibrated
-significance level.
+The bootstrap CI over five medians takes few distinct values. At five runs the
+flag means "consistently slower in every run", not a calibrated significance level. With
+ten runs per side the smallest reachable p is about 1.8 × 10⁻⁴, so a real slowdown clears
+p < 0.01 with margin, and n₁ + n₂ = 20 is where the normal approximation becomes
+reasonable. The release gate additionally requires the median slowdown to exceed 25 ns
+(`--vs-prev-min-ns`), so scheduler and VM jitter on nanosecond-scale benchmarks cannot fail
+a release on percentages alone.
 
 ---
 
