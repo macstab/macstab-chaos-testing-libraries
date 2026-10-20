@@ -17,6 +17,11 @@
 #                     needs >= 5 runs per arm to flag a regression at p < 0.01
 #   --compare         after the sweep, write <report-dir>/comparison.md with
 #                     benchmark/driver/chaos_bench_driver.py (needs python3)
+#   --check-scenarios instead of a sweep, prove every scenario of benchmark/suite.tsv
+#                     does what its arm claims: each errno scenario loads (status
+#                     state=ok, rules >= 1) and fires (>= 1 hit) on its benchmark, each
+#                     match-no-fire scenario is the errno scenario with probability 0,
+#                     and each empty scenario loads with 0 rules. Exit 1 on any failure.
 #   --in-container    internal: the inner half, run by the outer half
 #   -h, --help        print this text
 # Environment:
@@ -24,9 +29,11 @@
 #   BENCH_ITERS       measured iterations per run (default 200000; slow
 #                     kernels use fixed lower caps)
 #   BENCH_REPORT_DIR  host report dir (default benchmark/reports/<short-sha>);
-#                     the container always writes to the default path
-# Exit: 2 unknown option, 3 no docker, 1 regression flagged by --compare,
-# otherwise the status of the first failing command.
+#                     mounted into the container as /reports
+# The benchmarks, their libraries, iteration caps and scenarios are listed in
+# benchmark/suite.tsv.
+# Exit: 2 unknown option, 3 no docker, 1 regression flagged by --compare or a
+# failed --check-scenarios, otherwise the status of the first failing command.
 # =============================================================================
 
 set -eu
@@ -45,15 +52,17 @@ in_container=0
 for arg in "$@"; do
     case "$arg" in
         --full)            mode=full ;;
+        --check)           mode=check ;;
         --smoke)           mode=smoke ;;
         --libc=glibc)      libc=glibc ;;
         --libc=alpine)     libc=alpine ;;
         --libc=musl)       libc=alpine ;;
         --runs=*)          runs="${arg#--runs=}" ;;
         --compare)         compare=1 ;;
+        --check-scenarios) mode=check ;;
         --in-container)    in_container=1 ;;
         -h|--help)
-            sed -n '2,30p' "$0"; exit 0 ;;
+            sed -n '2,38p' "$0"; exit 0 ;;
         *)
             echo "run-bench.sh: unknown argument: $arg" >&2; exit 2 ;;
     esac
@@ -85,9 +94,8 @@ if [ "$in_container" -eq 0 ]; then
     # seccomp=unconfined lifts Docker's default seccomp profile, which blocks
     # perf_event_open on some Docker versions. Without them the harness still runs
     # and the envelope reports the PMU as unavailable.
-    # The container always writes to /work/benchmark/reports/<sha>: a host-side
-    # BENCH_REPORT_DIR override is not passed through, so --compare would then read
-    # a directory the sweep never wrote.
+    # The report directory is mounted at /reports, so the container writes exactly where
+    # --compare (and a BENCH_REPORT_DIR override) reads.
     docker run --rm \
         --cpuset-cpus="0,1" \
         --memory=2g \
@@ -95,10 +103,14 @@ if [ "$in_container" -eq 0 ]; then
         --security-opt seccomp=unconfined \
         -e BENCH_WARMUP="$BENCH_WARMUP" \
         -e BENCH_ITERS="$BENCH_ITERS" \
-        -e BENCH_REPORT_DIR=/work/benchmark/reports/"$GIT_SHA" \
+        -e BENCH_REPORT_DIR=/reports \
         -v "$REPO_ROOT":/work \
+        -v "$(cd "$BENCH_REPORT_DIR" && pwd)":/reports \
         "$image" \
-        sh /work/benchmark/run-bench.sh --in-container --"$mode" --runs="$runs"
+        sh /work/benchmark/run-bench.sh --in-container --"$mode" --runs="$runs" --libc="$libc"
+    if [ "$mode" = check ]; then
+        exit 0
+    fi
 
     if [ "$compare" -eq 1 ]; then
         echo ">>> running A/B comparison driver"
@@ -114,24 +126,30 @@ fi
 # ------------------------------------------------------------------ inner ----
 cd /work
 
-echo ">>> [container] building chaos libraries"
-make -j"$(nproc 2>/dev/null || echo 2)" \
-    build/libchaos-time.so \
-    build/libchaos-io.so \
-    build/libchaos-net.so \
-    build/libchaos-dns.so \
-    build/libchaos-memory.so \
-    build/libchaos-process.so >/dev/null
+# Per-libc build directories: the checkout is bind-mounted, so a shared build/ would let make
+# reuse glibc objects in the musl image (or the reverse) and every preload would fail to load.
+LIB_DIR=build/bench-$libc
+BIN_DIR=benchmark/build/$libc
 
-echo ">>> [container] building benchmark harness + kernels"
-make -f benchmark/Makefile.bench bench-clean >/dev/null 2>&1 || true
-make -f benchmark/Makefile.bench bench-build >/dev/null
+echo ">>> [container] building chaos libraries into $LIB_DIR"
+make -j"$(nproc 2>/dev/null || echo 2)" BUILD_DIR="$LIB_DIR" \
+    "$LIB_DIR"/libchaos-time.so \
+    "$LIB_DIR"/libchaos-io.so \
+    "$LIB_DIR"/libchaos-net.so \
+    "$LIB_DIR"/libchaos-dns.so \
+    "$LIB_DIR"/libchaos-memory.so \
+    "$LIB_DIR"/libchaos-process.so >/dev/null
+
+echo ">>> [container] building benchmark harness + kernels into $BIN_DIR"
+make -f benchmark/Makefile.bench BENCH_BUILD_DIR="$BIN_DIR" bench-clean >/dev/null 2>&1 || true
+make -f benchmark/Makefile.bench BENCH_BUILD_DIR="$BIN_DIR" bench-build >/dev/null
 
 mkdir -p "$BENCH_REPORT_DIR"
 
 # Scenario files live in the bind-mounted repository; the harness copies the
 # chosen one to the library's rule file (--scenario-target) before setup.
 SCEN_DIR=/work/benchmark/scenarios
+SUITE=/work/benchmark/suite.tsv
 
 run_one() {
     bench_name="$1"; binary="$2"; ld_preload="$3"; scenario="$4"; target="$5"; tag="$6"
@@ -153,9 +171,7 @@ run_one() {
                   --output="$out"
     fi
     # A zero exit with no envelope means the run never reached the JSON writer
-    # (for example a rule that broke one of the harness's own libc calls). A
-    # non-zero exit has already stopped the script under set -e, except inside
-    # the `run_trio ... || true` lines below, where set -e is suspended.
+    # (for example a rule that broke one of the harness's own libc calls).
     if [ ! -s "$out" ]; then
         echo "run-bench.sh: ERROR: $bench_name ($tag) produced no envelope" >&2
         echo "  output:    $out" >&2
@@ -166,106 +182,122 @@ run_one() {
     fi
 }
 
-# run_trio PREFIX ITERS BINARY LIB EMPTY_CONF STEM RULE_FILE
-# Runs PREFIX_passthrough, PREFIX_match_no_fire and PREFIX_errno, each once
-# without LD_PRELOAD (tag "baseline") and once with LIB and its scenario
-# (EMPTY_CONF, STEM-match-no-fire.conf, STEM-errno.conf). Every benchmark gets its
-# own baseline so the driver compares like with like. ITERS, when non-empty,
-# replaces BENCH_ITERS for this trio: slow calls (fork, execve, getaddrinfo,
-# open/close) would otherwise run for minutes.
-run_trio() {
-    pfx="$1"; iters="$2"; bin="$3"; lib="$4"; empty="$5"; stem="$6"; tgt="$7"
-    saved="$BENCH_ITERS"
-    [ -n "$iters" ] && BENCH_ITERS="$iters"
-    run_one "${pfx}_passthrough"    "$bin" "" "" "" baseline
-    run_one "${pfx}_passthrough"    "$bin" "$lib" "$SCEN_DIR/$empty" "$tgt" passthrough
-    run_one "${pfx}_match_no_fire"  "$bin" "" "" "" baseline
-    run_one "${pfx}_match_no_fire"  "$bin" "$lib" "$SCEN_DIR/${stem}-match-no-fire.conf" "$tgt" match-no-fire
-    run_one "${pfx}_errno"          "$bin" "" "" "" baseline
-    run_one "${pfx}_errno"          "$bin" "$lib" "$SCEN_DIR/${stem}-errno.conf" "$tgt" errno
-    BENCH_ITERS="$saved"
+# Whether bench binary $1 registers benchmark $2 (fallocate and sendfile exist only
+# in Linux builds of bench_io).
+registered() {
+    "$1" --list 2>/dev/null | cut -f 2 | grep -qx "$2"
 }
+
+# Rules of a scenario without comments and blank lines; with $2 = zero, every
+# trailing probability (`:p`, `@p`) of an errno scenario rewritten to 0.0, which is
+# what its match-no-fire scenario must equal.
+scenario_rules() {
+    sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$1" |
+        if [ "${2:-}" = zero ]; then sed -E 's/([:@])1(\.0+)?([[:space:]]|$)/\10.0\3/'; else cat; fi
+}
+
+# Sum of the hit counts in the hits files of library $1.
+hits_total() {
+    cat /tmp/.chaos-"$1".hits.* 2>/dev/null | awk -F '\t' '{ s += $1 } END { print s + 0 }'
+}
+
+check_failures=0
+check_fail() {
+    echo "FAIL $*" >&2
+    check_failures=$((check_failures + 1))
+}
+
+# check_load LIB BIN BENCH SCENARIO WANT_RULES WANT_HITS: runs BENCH for 64 measured
+# iterations (no warmup) with SCENARIO as the rule file and checks that the run succeeds
+# and writes its envelope, the library's status (state=ok, rules) and hits.
+# WANT_RULES "0" means exactly 0, "+" at least 1; WANT_HITS "+" means at least 64 hits:
+# the rule fires on every measured call, not only once (a rule that also breaks the
+# kernel's setup or the harness's own calls aborts the run after one hit).
+# The rule file is installed here, before the process starts, and stays until it ends:
+# the harness's own --scenario install removes it before writing its envelope, and a
+# library that intercepts that write (io, net) would reload and replace the status.
+check_load() {
+    lib="$1"; bin="$2"; bench="$3"; scen="$4"; want_rules="$5"; want_hits="$6"
+    rm -f /tmp/.chaos-"$lib".*
+    cp "$SCEN_DIR/$scen" /tmp/.chaos-"$lib".conf
+    rm -f /tmp/check.json
+    run_rc=0
+    LD_PRELOAD=/work/"$LIB_DIR"/libchaos-"$lib".so "$bin" --benchmark="$bench" \
+        --warmup=0 --iters=64 --output=/tmp/check.json >/tmp/check.out 2>&1 || run_rc=$?
+    status=$(cat /tmp/.chaos-"$lib".status 2>/dev/null || true)
+    state=$(printf '%s\n' "$status" | sed -n 's/^state=//p')
+    rules=$(printf '%s\n' "$status" | sed -n 's/^rules=//p')
+    hits=$(hits_total "$lib")
+    if [ "$run_rc" -ne 0 ] || [ ! -s /tmp/check.json ]; then
+        check_fail "$bench: $scen breaks the run (exit $run_rc): $(tail -n 2 /tmp/check.out | tr '\n' ' ')"
+    elif [ "$state" != ok ]; then
+        check_fail "$bench: $scen does not load: $(printf '%s' "$status" | tr '\n' ' ')"
+    elif [ "$want_rules" = 0 ] && [ "${rules:-x}" != 0 ]; then
+        check_fail "$bench: $scen should have no rules, has ${rules:-?}"
+    elif [ "$want_rules" = + ] && [ "${rules:-0}" -lt 1 ]; then
+        check_fail "$bench: $scen loads no rule"
+    elif [ "$want_hits" = + ] && [ "$hits" -lt 64 ]; then
+        check_fail "$bench: $scen fires $hits times in 64 calls, not on every call"
+    else
+        echo "ok   $bench: $scen (rules=${rules}, hits=${hits})"
+    fi
+    rm -f /tmp/.chaos-"$lib".*
+}
+
+if [ "$mode" = check ]; then
+    grep -v '^#' "$SUITE" | while read -r lib pt pfx iters empty stem when krev srev; do
+        [ -n "$lib" ] || continue
+        bin=/work/"$BIN_DIR"/bench_"$lib"
+        if ! registered "$bin" "${pfx}_errno"; then
+            [ "$when" = linux ] && { echo "skip $pfx: not registered here"; continue; }
+            check_fail "${pfx}_errno is not registered in bench_$lib"; continue
+        fi
+        errno_scen="$stem-errno.conf"
+        nofire_scen="$stem-match-no-fire.conf"
+        if [ "$(scenario_rules "$SCEN_DIR/$errno_scen" zero)" != "$(scenario_rules "$SCEN_DIR/$nofire_scen")" ]; then
+            check_fail "$nofire_scen is not $errno_scen with probability 0"
+        fi
+        check_load "$lib" "$bin" "${pfx}_errno" "$errno_scen" + +
+        check_load "$lib" "$bin" "${pfx}_match_no_fire" "$nofire_scen" + -
+        check_load "$lib" "$bin" "$pt" "$empty" 0 -
+    done > /tmp/check.log 2>&1
+    cat /tmp/check.log
+    failed=$(grep -c '^FAIL' /tmp/check.log || true)
+    echo ">>> [container] scenario check: $failed failure(s)"
+    [ "$failed" -eq 0 ]
+    exit
+fi
+
+# The suite travels with the envelopes: the release gate reads each benchmark's revision
+# from it.
+cp "$SUITE" "$BENCH_REPORT_DIR/suite.tsv"
 
 run_idx=0
 while [ "$run_idx" -lt "$runs" ]; do
     run_idx=$((run_idx + 1))
     echo ">>> [container] sweep run $run_idx / $runs"
-
-    # ---- libchaos-time ---------------------------------------------------
-    BIN=/work/benchmark/build/bench_time
-    LIB=/work/build/libchaos-time.so
-    TGT=/tmp/.chaos-time.conf
-    run_one clock_gettime_baseline "$BIN" "" "" "" baseline
-    run_one clock_gettime_baseline "$BIN" "$LIB" "$SCEN_DIR/empty.conf" "$TGT" passthrough
-    if [ "$mode" = full ]; then
-        run_one clock_gettime_match_no_fire "$BIN" "" "" "" baseline
-        run_one clock_gettime_match_no_fire "$BIN" "$LIB" \
-                "$SCEN_DIR/clock_gettime-match-no-fire.conf" "$TGT" match-no-fire
-        run_one clock_gettime_errno "$BIN" "" "" "" baseline
-        run_one clock_gettime_errno "$BIN" "$LIB" \
-                "$SCEN_DIR/clock_gettime-errno.conf" "$TGT" errno
-        run_trio nanosleep_zero "" "$BIN" "$LIB" empty.conf time-nanosleep "$TGT"
-        run_trio usleep_zero    "" "$BIN" "$LIB" empty.conf time-usleep    "$TGT"
-    fi
-
-    if [ "$mode" = smoke ]; then continue; fi
-
-    # ---- libchaos-io -----------------------------------------------------
-    BIN=/work/benchmark/build/bench_io
-    LIB=/work/build/libchaos-io.so
-    TGT=/tmp/.chaos-io.conf
-    run_trio pread        ""      "$BIN" "$LIB" io-empty.conf io-pread        "$TGT"
-    run_trio read         ""      "$BIN" "$LIB" io-empty.conf io-read         "$TGT"
-    run_trio write        ""      "$BIN" "$LIB" io-empty.conf io-write        "$TGT"
-    run_trio readv        ""      "$BIN" "$LIB" io-empty.conf io-readv        "$TGT"
-    run_trio writev       ""      "$BIN" "$LIB" io-empty.conf io-writev       "$TGT"
-    run_trio open_close   20000   "$BIN" "$LIB" io-empty.conf io-open-close   "$TGT"
-    run_trio openat_close 20000   "$BIN" "$LIB" io-empty.conf io-openat-close "$TGT"
-    run_trio fsync        20000   "$BIN" "$LIB" io-empty.conf io-fsync        "$TGT"
-    run_trio fdatasync    20000   "$BIN" "$LIB" io-empty.conf io-fdatasync    "$TGT"
-    run_trio ftruncate    ""      "$BIN" "$LIB" io-empty.conf io-ftruncate    "$TGT"
-    # fallocate and sendfile exist only in Linux builds of bench_io. If one is
-    # missing the binary prints "benchmark '...' not registered" and exits 3;
-    # `|| true` keeps the sweep going (and suspends set -e inside run_trio).
-    run_trio fallocate    20000   "$BIN" "$LIB" io-empty.conf io-fallocate    "$TGT" || true
-    run_trio sendfile     ""      "$BIN" "$LIB" io-empty.conf io-sendfile     "$TGT" || true
-
-    # ---- libchaos-net ----------------------------------------------------
-    BIN=/work/benchmark/build/bench_net
-    LIB=/work/build/libchaos-net.so
-    TGT=/tmp/.chaos-net.conf
-    run_trio send         ""      "$BIN" "$LIB" net-empty.conf net-send         "$TGT"
-    run_trio recv         ""      "$BIN" "$LIB" net-empty.conf net-recv         "$TGT"
-    run_trio sendto       ""      "$BIN" "$LIB" net-empty.conf net-sendto       "$TGT"
-    run_trio recvfrom     ""      "$BIN" "$LIB" net-empty.conf net-recvfrom     "$TGT"
-    run_trio sendmsg      ""      "$BIN" "$LIB" net-empty.conf net-sendmsg      "$TGT"
-    run_trio recvmsg      ""      "$BIN" "$LIB" net-empty.conf net-recvmsg      "$TGT"
-    run_trio socket_close 20000   "$BIN" "$LIB" net-empty.conf net-socket-close "$TGT"
-    run_trio shutdown     20000   "$BIN" "$LIB" net-empty.conf net-shutdown     "$TGT"
-
-    # ---- libchaos-dns ----------------------------------------------------
-    BIN=/work/benchmark/build/bench_dns
-    LIB=/work/build/libchaos-dns.so
-    TGT=/tmp/.chaos-dns.conf
-    run_trio getaddrinfo 20000  "$BIN" "$LIB" dns-empty.conf dns-getaddrinfo "$TGT"
-    run_trio getnameinfo 20000  "$BIN" "$LIB" dns-empty.conf dns-getnameinfo "$TGT"
-
-    # ---- libchaos-memory -------------------------------------------------
-    BIN=/work/benchmark/build/bench_memory
-    LIB=/work/build/libchaos-memory.so
-    TGT=/tmp/.chaos-memory.conf
-    run_trio madvise  ""  "$BIN" "$LIB" memory-empty.conf memory-madvise  "$TGT"
-    run_trio mprotect ""  "$BIN" "$LIB" memory-empty.conf memory-mprotect "$TGT"
-    run_trio munmap   ""  "$BIN" "$LIB" memory-empty.conf memory-munmap   "$TGT"
-
-    # ---- libchaos-process ------------------------------------------------
-    BIN=/work/benchmark/build/bench_process
-    LIB=/work/build/libchaos-process.so
-    TGT=/tmp/.chaos-process.conf
-    run_trio pthread_create  20000 "$BIN" "$LIB" process-empty.conf process-pthread "$TGT"
-    run_trio waitpid_nohang  ""    "$BIN" "$LIB" process-empty.conf process-waitpid "$TGT"
-    run_trio fork_wait       5000  "$BIN" "$LIB" process-empty.conf process-fork    "$TGT"
-    run_trio execve_short    1000  "$BIN" "$LIB" process-empty.conf process-execve  "$TGT"
+    grep -v '^#' "$SUITE" | while read -r lib pt pfx iters empty stem when krev srev; do
+        [ -n "$lib" ] || continue
+        [ "$mode" = smoke ] && [ "$when" != smoke ] && continue
+        bin=/work/"$BIN_DIR"/bench_"$lib"
+        so=/work/"$LIB_DIR"/libchaos-"$lib".so
+        tgt=/tmp/.chaos-"$lib".conf
+        if [ "$when" = linux ] && ! registered "$bin" "$pt"; then
+            echo ">>> [container] $pfx not registered in bench_$lib; skipped"
+            continue
+        fi
+        saved="$BENCH_ITERS"
+        [ "$iters" != - ] && BENCH_ITERS="$iters"
+        run_one "$pt" "$bin" "" "" "" baseline
+        run_one "$pt" "$bin" "$so" "$SCEN_DIR/$empty" "$tgt" passthrough
+        if [ "$mode" != smoke ]; then
+            run_one "${pfx}_match_no_fire" "$bin" "" "" "" baseline
+            run_one "${pfx}_match_no_fire" "$bin" "$so" "$SCEN_DIR/$stem-match-no-fire.conf" "$tgt" match-no-fire
+            run_one "${pfx}_errno" "$bin" "" "" "" baseline
+            run_one "${pfx}_errno" "$bin" "$so" "$SCEN_DIR/$stem-errno.conf" "$tgt" errno
+        fi
+        BENCH_ITERS="$saved"
+    done
 done
 
 echo ">>> [container] reports collected:"

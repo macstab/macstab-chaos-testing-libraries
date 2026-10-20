@@ -19,10 +19,8 @@
  * counterpart's wrapper. Sockets are non-blocking, so a drained buffer returns EAGAIN
  * instead of hanging the run (for example in the `_errno` arm, where nothing was sent).
  *
- * Scenario status at this revision (checked against src/net/chaos_net_config.c):
- * send, recv, socket_close and shutdown are effective; sendto, recvfrom, sendmsg and
- * recvmsg use operation tokens libchaos-net does not accept, so their `_match_no_fire`
- * and `_errno` arms measure the passthrough path.
+ * Every scenario loads, and every errno scenario fires on each measured call:
+ * `run-bench.sh --check-scenarios` proves it, and CI runs that check.
  */
 
 #include "chaos_bench.h"

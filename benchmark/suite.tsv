@@ -1,0 +1,60 @@
+# The benchmark suite: one line per benchmark, read by run-bench.sh (sweep and
+# --check-scenarios). Fields, separated by whitespace:
+#
+#   lib          library under test; its rule file is /tmp/.chaos-<lib>.conf and its binary
+#                benchmark/build/bench_<lib>
+#   passthrough  benchmark name of the arm run with the library but an empty rule file
+#   prefix       <prefix>_match_no_fire and <prefix>_errno are the other two arms
+#   iters        measured iterations, or - for BENCH_ITERS; caps the slow calls
+#   empty        scenario of the passthrough arm (an empty rule file)
+#   stem         <stem>-match-no-fire.conf and <stem>-errno.conf; the match-no-fire file is
+#                the errno file with probability 0, so both select the same calls
+#   mode         full (sweep only with --full), smoke (also with --smoke), or linux (full,
+#                and skipped when the binary does not register the benchmark)
+#   krev         kernel revision: bump when the benchmark's iteration body or setup changes
+#                what it measures (all three arms)
+#   srev         scenario revision: bump when <stem>-*.conf changes what is matched or
+#                injected (match-no-fire and errno arms)
+#
+# run-bench.sh copies this file into every report directory, so the release envelopes carry
+# it. The release-over-release gate compares a benchmark only when its revision is the same in
+# both releases; a changed one is listed as re-baselined for one release and not gated. A
+# report directory without the file (2.0.0 and earlier) counts as revision 1 throughout.
+#
+# Every benchmark is also run without LD_PRELOAD (tag "baseline") before each arm.
+# Benchmark names are the comparison key across releases: renaming one drops it from the
+# release-over-release gate for one release.
+#
+# lib    passthrough                  prefix          iters  empty               stem                 mode   krev  srev
+time     clock_gettime_baseline       clock_gettime   -      empty.conf          clock_gettime        smoke  1     2
+time     nanosleep_zero_passthrough   nanosleep_zero  -      empty.conf          time-nanosleep       full   1     2
+time     usleep_zero_passthrough      usleep_zero     -      empty.conf          time-usleep          full   1     2
+io       pread_passthrough            pread           -      io-empty.conf       io-pread             full   1     2
+io       read_passthrough             read            -      io-empty.conf       io-read              full   2     2
+io       write_passthrough            write           -      io-empty.conf       io-write             full   2     2
+io       readv_passthrough            readv           -      io-empty.conf       io-readv             full   2     2
+io       writev_passthrough           writev          -      io-empty.conf       io-writev            full   2     2
+io       open_close_passthrough       open_close      20000  io-empty.conf       io-open-close        full   2     2
+io       openat_close_passthrough     openat_close    20000  io-empty.conf       io-openat-close      full   2     2
+io       fsync_passthrough            fsync           20000  io-empty.conf       io-fsync             full   1     2
+io       fdatasync_passthrough        fdatasync       20000  io-empty.conf       io-fdatasync         full   1     2
+io       ftruncate_passthrough        ftruncate       -      io-empty.conf       io-ftruncate         full   1     2
+io       fallocate_passthrough        fallocate       20000  io-empty.conf       io-fallocate         linux  1     2
+io       sendfile_passthrough         sendfile        -      io-empty.conf       io-sendfile          linux  1     2
+net      send_passthrough             send            -      net-empty.conf      net-send             full   1     1
+net      recv_passthrough             recv            -      net-empty.conf      net-recv             full   1     1
+net      sendto_passthrough           sendto          -      net-empty.conf      net-sendto           full   1     2
+net      recvfrom_passthrough         recvfrom        -      net-empty.conf      net-recvfrom         full   1     2
+net      sendmsg_passthrough          sendmsg         -      net-empty.conf      net-sendmsg          full   1     2
+net      recvmsg_passthrough          recvmsg         -      net-empty.conf      net-recvmsg          full   1     2
+net      socket_close_passthrough     socket_close    20000  net-empty.conf      net-socket-close     full   1     1
+net      shutdown_passthrough         shutdown        20000  net-empty.conf      net-shutdown         full   1     1
+dns      getaddrinfo_passthrough      getaddrinfo     20000  dns-empty.conf      dns-getaddrinfo      full   1     1
+dns      getnameinfo_passthrough      getnameinfo     20000  dns-empty.conf      dns-getnameinfo      full   1     2
+memory   madvise_passthrough          madvise         -      memory-empty.conf   memory-madvise       full   1     2
+memory   mprotect_passthrough         mprotect        -      memory-empty.conf   memory-mprotect      full   1     2
+memory   munmap_passthrough           munmap          -      memory-empty.conf   memory-munmap        full   1     2
+process  pthread_create_passthrough   pthread_create  20000  process-empty.conf  process-pthread      full   1     2
+process  waitpid_nohang_passthrough   waitpid_nohang  -      process-empty.conf  process-waitpid      full   1     2
+process  fork_wait_passthrough        fork_wait       5000   process-empty.conf  process-fork         full   1     2
+process  execve_short_passthrough     execve_short    1000   process-empty.conf  process-execve       full   1     2

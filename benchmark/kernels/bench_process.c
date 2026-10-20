@@ -20,10 +20,8 @@
  * dominated by clone, page-table copy, exec and reaping, so the relative wrapper
  * overhead is far smaller than for the sub-microsecond kernels of the other binaries.
  *
- * Scenario status at this revision: every process scenario writes the probability as
- * `ERRNO:<name>,<p>`, but libchaos-process expects `ERRNO:<name>@<p>`. The rule is
- * rejected, so `_match_no_fire` and `_errno` measure the passthrough path. See the
- * scenario files.
+ * Every scenario loads, and every errno scenario fires on each measured call:
+ * `run-bench.sh --check-scenarios` proves it, and CI runs that check.
  */
 
 #include "chaos_bench.h"
