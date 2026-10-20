@@ -745,8 +745,8 @@ run is `ADVISORY` by construction.
 No Tier 2 data has been published. The 1.0.0 and 1.0.1 matrices come from
 the release workflow's sweep on GitHub-hosted runners (`ubuntu-24.04` and
 `ubuntu-24.04-arm`, glibc and musl, 5 runs, 5000 warm-up and 100 000
-measured iterations) and are Tier 1 `ADVISORY`. They are suitable for
-"did this regress relative to the previous release on the same runner
+measured iterations; releases after 2.0.0 use 10 runs) and are Tier 1 `ADVISORY`. They are
+suitable for "did this regress relative to the previous release on the same runner
 class?", not as absolute costs.
 
 ### 13.2 What the harness measures
