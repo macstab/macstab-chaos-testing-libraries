@@ -271,6 +271,20 @@ int chaos_net_config_match_endpoint_loaded(
 );
 
 /**
+ * @brief Whether any loaded rule is for @p operation.
+ *
+ * @details Lets a wrapper skip endpoint resolution (system calls) when no rule could match
+ * its call, whatever the endpoint: rules on connect alone leave send and recv, and the
+ * read/write calls on files, at their passthrough cost. A copy torn by a concurrent reload
+ * reports true, so the caller then resolves and matches as usual.
+ *
+ * @param operation The operation class of the intercepted call.
+ * @return Non-zero when a rule for @p operation is loaded (or the read was torn); 0 otherwise.
+ * @pre chaos_net_config_prepare() ran in the same interposed call.
+ */
+int chaos_net_config_targets_loaded(chaos_net_operation_t operation);
+
+/**
  * @brief Whether a rule matches @p endpoint that no rule for @p operation could outrank on
  *        another endpoint.
  *

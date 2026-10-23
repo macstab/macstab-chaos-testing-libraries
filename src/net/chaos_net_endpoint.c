@@ -706,31 +706,48 @@ int chaos_net_endpoint_from_sockaddr_fd(
 }
 
 /**
- * @brief getsockname on @p fd, then sockaddr resolution (contract in the header).
+ * @brief getsockname (local) or getpeername (@p peer) on @p fd, then sockaddr resolution
+ *        (contract in the header).
  *
  * @details sockaddr_storage on the stack fits every family. errno is saved and restored
  * around the lookup.
  */
-int chaos_net_endpoint_from_local_fd(int fd, chaos_net_endpoint_t *endpoint)
+int chaos_net_endpoint_from_end_fd(
+    int fd, int peer, chaos_net_endpoint_t *endpoint, int *not_socket
+)
 {
+    int (*const lookup)(int, struct sockaddr *, socklen_t *) =
+        peer ? g_chaos_net_real_getpeername : g_chaos_net_real_getsockname;
     struct sockaddr_storage storage;
     socklen_t address_length = (socklen_t)sizeof(storage);
     int previous;
     int rc;
+    int lookup_errno;
     int saved_errno;
 
-    if (endpoint == NULL || g_chaos_net_real_getsockname == NULL)
+    if (not_socket != NULL)
+    {
+        *not_socket = 0;
+    }
+    if (endpoint == NULL || lookup == NULL)
     {
         return 0;
     }
 
     saved_errno = errno;
     previous = chaos_net_enter_internal();
-    rc = g_chaos_net_real_getsockname(fd, (struct sockaddr *)&storage, &address_length);
+    rc = lookup(fd, (struct sockaddr *)&storage, &address_length);
+    lookup_errno = errno;
     chaos_net_leave_internal(previous);
     errno = saved_errno;
     if (rc != 0)
     {
+        /* ENOTSOCK (a file, pipe, terminal) or EBADF: no end of this descriptor resolves.
+         * ENOTCONN from getpeername is a socket whose other end may still. */
+        if (not_socket != NULL)
+        {
+            *not_socket = lookup_errno == ENOTSOCK || lookup_errno == EBADF;
+        }
         return 0;
     }
 
@@ -739,36 +756,19 @@ int chaos_net_endpoint_from_local_fd(int fd, chaos_net_endpoint_t *endpoint)
     );
 }
 
+/** @brief chaos_net_endpoint_from_end_fd() for the local end (contract in the header). */
+int chaos_net_endpoint_from_local_fd(int fd, chaos_net_endpoint_t *endpoint)
+{
+    return chaos_net_endpoint_from_end_fd(fd, 0, endpoint, NULL);
+}
+
 /**
- * @brief getpeername on @p fd, then sockaddr resolution (contract in the header).
+ * @brief chaos_net_endpoint_from_end_fd() for the peer (contract in the header).
  *
  * @details An unconnected socket fails with ENOTCONN; this returns 0 with errno
  * restored, and the caller forwards without injection for this end.
  */
 int chaos_net_endpoint_from_peer_fd(int fd, chaos_net_endpoint_t *endpoint)
 {
-    struct sockaddr_storage storage;
-    socklen_t address_length = (socklen_t)sizeof(storage);
-    int previous;
-    int rc;
-    int saved_errno;
-
-    if (endpoint == NULL || g_chaos_net_real_getpeername == NULL)
-    {
-        return 0;
-    }
-
-    saved_errno = errno;
-    previous = chaos_net_enter_internal();
-    rc = g_chaos_net_real_getpeername(fd, (struct sockaddr *)&storage, &address_length);
-    chaos_net_leave_internal(previous);
-    errno = saved_errno;
-    if (rc != 0)
-    {
-        return 0;
-    }
-
-    return chaos_net_endpoint_from_sockaddr(
-        fd, (const struct sockaddr *)&storage, address_length, endpoint, 1
-    );
+    return chaos_net_endpoint_from_end_fd(fd, 1, endpoint, NULL);
 }

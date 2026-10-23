@@ -46,6 +46,9 @@ static int g_stub_getsockname_result = 0;
 /** @brief Non-zero makes the fake getpeername fail with this value. */
 static int g_stub_getpeername_result = 0;
 
+/** @brief errno a failing getsockname or getpeername fake sets; 0 leaves errno alone. */
+static int g_stub_lookup_errno = 0;
+
 /** @brief Local address the fake getsockname reports. */
 static struct sockaddr_storage g_stub_sockname_storage;
 
@@ -89,6 +92,10 @@ static int chaos_net_test_getsockname(int fd, struct sockaddr *address, socklen_
     (void)fd;
     if (g_stub_getsockname_result != 0)
     {
+        if (g_stub_lookup_errno != 0)
+        {
+            errno = g_stub_lookup_errno;
+        }
         return g_stub_getsockname_result;
     }
 
@@ -106,6 +113,10 @@ static int chaos_net_test_getpeername(int fd, struct sockaddr *address, socklen_
     (void)fd;
     if (g_stub_getpeername_result != 0)
     {
+        if (g_stub_lookup_errno != 0)
+        {
+            errno = g_stub_lookup_errno;
+        }
         return g_stub_getpeername_result;
     }
 
@@ -556,6 +567,28 @@ static void test_endpoint_resolution_from_sockaddr_and_fd(void)
     assert(!chaos_net_endpoint_from_peer_fd(7, &endpoint));
     g_stub_getpeername_result = 0;
     assert(!chaos_net_endpoint_from_peer_fd(7, NULL));
+
+    /* not_socket: ENOTSOCK and EBADF mean no end of the descriptor resolves, so callers skip
+     * the other end; ENOTCONN is a socket whose other end may still. errno is preserved. */
+    {
+        int not_socket = -1;
+
+        errno = 42;
+        g_stub_getsockname_result = -1;
+        g_stub_lookup_errno = ENOTSOCK;
+        assert(!chaos_net_endpoint_from_end_fd(7, 0, &endpoint, &not_socket) && not_socket == 1);
+        g_stub_lookup_errno = EBADF;
+        assert(!chaos_net_endpoint_from_end_fd(7, 0, &endpoint, &not_socket) && not_socket == 1);
+        g_stub_getsockname_result = 0;
+        g_stub_getpeername_result = -1;
+        g_stub_lookup_errno = ENOTCONN;
+        assert(!chaos_net_endpoint_from_end_fd(7, 1, &endpoint, &not_socket) && not_socket == 0);
+        assert(!chaos_net_endpoint_from_end_fd(7, 1, &endpoint, NULL));
+        g_stub_getpeername_result = 0;
+        g_stub_lookup_errno = 0;
+        assert(!chaos_net_endpoint_from_end_fd(7, 0, NULL, &not_socket) && not_socket == 0);
+        assert(errno == 42);
+    }
 
     assert(chaos_net_endpoint_from_socket_spec(AF_INET, SOCK_STREAM, 0, &endpoint));
     assert(endpoint.kind == CHAOS_NET_ENDPOINT_TCP4);
