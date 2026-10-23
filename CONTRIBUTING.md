@@ -36,8 +36,8 @@ make test-matrix       # glibc and musl probes on linux/amd64 and linux/arm64
 make verify-docs       # run every ```sh verified``` block in docs/*.md
 ```
 
-`make docker-build-all` builds the 24 release libraries (6 × glibc/musl × amd64/arm64)
-into `dist/`. Cross compilers are needed only for `make cross-*` outside Docker.
+`make docker-build-all` builds the release assets into `dist/`: the 24 libraries
+(6 × glibc/musl × amd64/arm64) and the static `chaos-init-amd64` / `chaos-init-arm64`. Cross compilers are needed only for `make cross-*` outside Docker.
 
 ## Repository layout
 
@@ -151,9 +151,10 @@ Commit messages follow [Conventional Commits](https://www.conventionalcommits.or
 | `build` | Build |
 
 Mark an incompatible change (rule grammar, file paths, status or hits format, exported
-symbols) with `!` after the type or a `BREAKING CHANGE:` footer. A release is cut by
-pushing a bare semantic-version tag (`1.2.3`); `.github/workflows/release.yml` builds,
-checks and publishes it.
+symbols) with `!` after the type or a `BREAKING CHANGE:` footer. Releases follow
+[`RELEASING.md`](RELEASING.md): a `develop` → `main` pull request gated by the benchmark
+check, then a bare semantic-version tag (`1.2.3`) that `.github/workflows/release.yml`
+builds, checks and publishes.
 
 ## Pull requests
 

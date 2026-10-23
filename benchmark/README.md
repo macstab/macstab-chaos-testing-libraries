@@ -16,8 +16,12 @@ envelope per run with statistics, hardware counters, environment provenance and 
 ./benchmark/run-bench.sh --smoke                  # clock_gettime baseline/passthrough only
 ./benchmark/run-bench.sh --full                   # every library and benchmark (default)
 ./benchmark/run-bench.sh --full --libc=alpine     # the same on musl (Alpine 3.19)
-./benchmark/run-bench.sh --full --runs=5 --compare
+./benchmark/run-bench.sh --full --runs=10 --compare
+./benchmark/run-bench.sh --check-scenarios       # every scenario loads and fires (CI gate)
 ```
+
+The suite (benchmarks, libraries, iteration caps, scenarios, revisions) is the table
+`benchmark/suite.tsv`; `run-bench.sh` reads it for both the sweep and the check.
 
 Envelopes land in `benchmark/reports/<short-sha>/` as
 `<benchmark>.<arm>.<run>.json`. `--compare` then writes
@@ -30,9 +34,10 @@ regression. The driver needs at least 5 runs per arm to reach p < 0.01.
 | `--libc=glibc` / `--libc=alpine` (`musl`) | Debian 12 image (default) / Alpine 3.19 image |
 | `--runs=N` | repeat the whole sweep N times (default 1) |
 | `--compare` | run `driver/chaos_bench_driver.py` on the host afterwards (needs `python3`) |
+| `--check-scenarios` | instead of a sweep, prove every scenario loads and every errno scenario fires on each of 64 calls; exit 1 on any failure |
 | `BENCH_WARMUP` | warmup iterations per run (default 10 000) |
 | `BENCH_ITERS` | measured iterations per run (default 200 000); slow kernels use fixed caps of 20 000, 5 000 (`fork_wait`) and 1 000 (`execve_short`) |
-| `BENCH_REPORT_DIR` | host report directory; the container always writes to the default path, so with an override `--compare` reads a directory the sweep did not write |
+| `BENCH_REPORT_DIR` | host report directory (default `benchmark/reports/<short-sha>`), mounted into the container; receives the envelopes, a copy of `suite.tsv` and `comparison.md` |
 
 The container runs with `--cpuset-cpus=0,1`, `--memory=2g`, `--cap-add=SYS_ADMIN` and
 `--security-opt seccomp=unconfined`; the last two let `perf_event_open` work.
@@ -237,11 +242,19 @@ Exit codes: 0 no regression, 1 regression flagged, 2 fatal input error.
    `CHAOS_BENCH(category_lit, name_lit, state_t, setup_fn, iter_fn, teardown_fn)`.
    The macro expands to a static descriptor and an `__attribute__((constructor))`
    that registers it; the runner needs no edit.
-3. **Scenarios**: `benchmark/scenarios/<lib>-<fn>-match-no-fire.conf` and
-   `<lib>-<fn>-errno.conf`.
-4. **Sweep**: one `run_trio` line in `run-bench.sh` (with an iteration cap for calls
-   slower than about 10 µs).
-5. Check with `make -f benchmark/Makefile.bench bench-list`.
+3. **Scenarios**: `benchmark/scenarios/<stem>-errno.conf` (probability 1.0) and
+   `<stem>-match-no-fire.conf` (the same rule with probability 0.0). Target files the
+   library does not exclude (libchaos-io excludes `/dev`, `/proc`, `/sys`; io prefixes
+   match at path-component boundaries, so select a directory).
+4. **Suite**: one line in `benchmark/suite.tsv` (iteration cap for calls slower than about
+   10 µs; `krev` and `srev` 1).
+5. Prove it: `./benchmark/run-bench.sh --check-scenarios`.
+
+**Changing an existing benchmark**: when the kernel's measured work changes, bump `krev`;
+when a scenario changes what is matched or injected, bump `srev`. The release gate then
+re-baselines that benchmark for one release instead of comparing different measurements.
+Never rename a benchmark to the same effect: a renamed benchmark drops out of the
+comparison silently.
 
 ---
 
