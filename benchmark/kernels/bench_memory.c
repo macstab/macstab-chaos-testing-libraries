@@ -14,10 +14,8 @@
  * layout and, for small sizes, on the allocator's mmap threshold, which differs between
  * glibc and musl.
  *
- * Scenario status at this revision: every memory scenario writes the probability as
- * `ERRNO:<name>,<p>`, but libchaos-memory expects `ERRNO:<name>@<p>`. The rule is
- * rejected, so `_match_no_fire` and `_errno` measure the passthrough path (the 1.0.1
- * matrix shows all three arms within noise of each other). See the scenario files.
+ * Every scenario loads, and every errno scenario fires on each measured call:
+ * `run-bench.sh --check-scenarios` proves it, and CI runs that check.
  */
 
 #include "chaos_bench.h"

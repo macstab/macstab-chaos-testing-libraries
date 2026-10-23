@@ -1,193 +1,124 @@
-# Full benchmark sweep on a GitHub-hosted Linux x86_64 runner: on demand (workflow_dispatch, with
-# run count and libc variant as inputs) and on every v* tag.
+# Pre-release benchmark gate: the release workflow's sweep and release-over-release gate, run on
+# every pull request into main (the develop -> main release PR) and on demand, so a performance
+# regression fails the pull request instead of being found after the tag.
 #
-# Results are ADVISORY: hosted runners are shared VMs with CPU steal and no PMU isolation, so the
-# numbers support A/B comparison within one run (baseline vs preloaded, same machine) but not
-# absolute claims. Outputs, all under benchmark/reports/<short-sha>/: one JSON envelope per
-# benchmark cell and run, plus comparison.md from the A/B driver. They are uploaded for 90 days
-# and summarised on the run page.
-# Release tags without a leading v (the release.yml trigger) do not start this workflow;
-# release.yml runs its own four-variant sweep.
+#   sweep  per variant on a native runner of its architecture: benchmark scenario check
+#          (every scenario loads, every errno scenario fires on each call), then a 10-run sweep
+#          of benchmark/suite.tsv
+#   gate   benchmark/release-gate.sh against the last published release that is not a
+#          prerelease; the verdict and per-variant reports appear on the run page and as an
+#          artifact. A regression fails this check.
+#
+# Numbers are ADVISORY (shared GitHub runners); the gate therefore compares medians of 10 runs
+# per side and requires both a > 15 % and a > 25 ns slowdown that is statistically significant.
+# A benchmark whose kernel or scenario revision changed (benchmark/suite.tsv) is re-baselined,
+# not gated. Release procedure: RELEASING.md.
 name: bench
 
 on:
+  pull_request:
+    branches: [main]
   workflow_dispatch:
-    inputs:
-      runs:
-        description: "Number of runs per benchmark cell"
-        type: string
-        default: "5"
-      libc:
-        description: "Build variant"
-        type: choice
-        default: "glibc"
-        options: [glibc, alpine]
-  push:
-    tags: ["v*"]
 
 permissions:
   contents: read
 
+# A newer push to the same pull request supersedes the running sweep.
 concurrency:
-  group: bench-${{ github.ref }}
-  cancel-in-progress: false  # never abort an in-flight benchmark
+  group: bench-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  bench:
-    name: full sweep (Linux x86_64, ADVISORY)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
+  sweep:
+    name: sweep (${{ matrix.libc }}-${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - libc: glibc
+            arch: amd64
+            runner: ubuntu-24.04
+          - libc: musl
+            arch: amd64
+            runner: ubuntu-24.04
+          - libc: glibc
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - libc: musl
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      # perf_event_paranoid=1 lets the unprivileged harness open per-process hardware counters
-      # (cycles, instructions). At paranoid >= 3 perf_event_open fails with EACCES and the
-      # envelopes carry the refusal reason instead of PMU data.
-      - name: Lower perf_event_paranoid for PMU access
-        run: |
-          echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid
-          echo "perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid)"
+      # perf_event_paranoid=1 lets the harness open per-process hardware counters; otherwise
+      # the envelopes carry the refusal reason instead of PMU data.
+      - name: Lower perf_event_paranoid
+        run: echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid
 
-      # CPU model, flags and kernel in the log, so advisory numbers can be attributed later.
-      - name: Capture host environment
-        run: |
-          echo "::group::lscpu"
-          lscpu
-          echo "::endgroup::"
-          echo "::group::cpuinfo (first 30 lines)"
-          head -30 /proc/cpuinfo
-          echo "::endgroup::"
-          echo "::group::kernel"
-          uname -a
-          echo "::endgroup::"
+      - name: Check benchmark scenarios
+        run: ./benchmark/run-bench.sh --check-scenarios --libc=${{ matrix.libc }}
 
-      # run-bench.sh builds the kernels in a container of the chosen libc, runs every cell
-      # BENCH_RUNS times without and with LD_PRELOAD, then runs the A/B driver (--compare).
-      # A driver-reported regression exits 1 and fails this step; later steps still run.
-      - name: Run full benchmark sweep
+      # Exit 1 is the A/B driver reporting preloaded slower than baseline, which preloading
+      # always is; only another exit means the sweep failed.
+      - name: Run benchmark sweep
         env:
-          BENCH_LIBC: ${{ inputs.libc || 'glibc' }}
-          BENCH_RUNS: ${{ inputs.runs || '5' }}
+          BENCH_WARMUP: 5000
+          BENCH_ITERS: 100000
+          BENCH_REPORT_DIR: ${{ github.workspace }}/sweep
         run: |
-          ./benchmark/run-bench.sh \
-            --full \
-            --libc="$BENCH_LIBC" \
-            --runs="$BENCH_RUNS" \
-            --compare
-
-      - name: Show comparison report
-        if: always()
-        run: |
-          GIT_SHA=$(git rev-parse --short HEAD)
-          REPORT="benchmark/reports/$GIT_SHA/comparison.md"
-          if [ -f "$REPORT" ]; then
-            echo "::notice::Benchmark comparison report at $REPORT"
-            echo "::group::comparison.md"
-            cat "$REPORT"
-            echo "::endgroup::"
-          else
-            echo "::warning::No comparison report found at $REPORT"
+          mkdir -p "$BENCH_REPORT_DIR"
+          rc=0
+          ./benchmark/run-bench.sh --full --runs=10 --libc=${{ matrix.libc }} --compare || rc=$?
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
+            echo "::error::run-bench.sh failed with exit $rc"
+            exit "$rc"
           fi
 
-      - name: Generate run summary
-        if: always()
+      - name: Upload envelopes
+        uses: actions/upload-artifact@v4
+        with:
+          name: sweep-${{ matrix.libc }}-${{ matrix.arch }}
+          path: sweep/
+          retention-days: 30
+          if-no-files-found: error
+
+  gate:
+    name: release-over-release gate
+    runs-on: ubuntu-24.04
+    needs: [sweep]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download envelopes
+        uses: actions/download-artifact@v4
+        with:
+          path: envelopes/
+          pattern: sweep-*
+
+      # Artifact directories are named sweep-<libc>-<arch>; the gate expects <libc>-<arch>.
+      - name: Arrange envelopes per variant
         run: |
-          GIT_SHA=$(git rev-parse --short HEAD)
-          REPORT="benchmark/reports/$GIT_SHA/comparison.md"
-          {
-            echo "## Benchmark sweep — \`$GIT_SHA\` (Linux x86_64, ADVISORY)"
-            echo ""
-            echo "Runner: $(uname -m) $(uname -s) $(uname -r)"
-            echo ""
-            echo "> Numbers are **ADVISORY** because GitHub-hosted runners are shared VMs"
-            echo "> with non-deterministic CPU steal and no PMU isolation. For OFFICIAL"
-            echo "> Tier-2 numbers, run on a dedicated bare-metal host with isolcpus,"
-            echo "> nohz_full, and governor=performance."
-            echo ""
-            if [ -f "$REPORT" ]; then
-              cat "$REPORT"
-            else
-              echo "_No comparison report produced._"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          for d in envelopes/sweep-*; do
+            mv "$d" "envelopes/${d#envelopes/sweep-}"
+          done
+          ls envelopes
 
-      # Pinned hyperfine release, used only by the cross-validation step below.
-      - name: Install hyperfine
+      - name: Gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          HYPERFINE_VER=1.18.0
-          wget -qO /tmp/hyperfine.deb \
-            "https://github.com/sharkdp/hyperfine/releases/download/v${HYPERFINE_VER}/hyperfine_${HYPERFINE_VER}_amd64.deb"
-          sudo dpkg -i /tmp/hyperfine.deb
-          hyperfine --version
+          rc=0
+          sh benchmark/release-gate.sh envelopes reports || rc=$?
+          cat reports/gate-summary.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
 
-      - name: Cross-validate clock_gettime_baseline with hyperfine
-        if: always()
-        run: |
-          BIN=benchmark/build/bench_time
-          if [ ! -f "$BIN" ]; then
-            echo "::warning::bench_time not found — skipping hyperfine cross-validation"
-            exit 0
-          fi
-
-          BENCH=clock_gettime_baseline
-          ITERS=100000
-          CALIB_NS=100000000  # ~100ms calibration window
-
-          # Independent check of the harness timer: hyperfine measures whole-process wall time
-          # with its own clock, 5 runs after 2 warmups.
-          hyperfine --runs 5 --warmup 2 \
-            --export-json /tmp/hyperfine.json \
-            "$BIN --benchmark=$BENCH --warmup=1000 --iters=$ITERS"
-
-          HF_MEAN_S=$(jq '.results[0].mean' /tmp/hyperfine.json)
-          echo "Hyperfine mean wall time per invocation: ${HF_MEAN_S}s"
-
-          # Per-op estimate = (wall time - CALIB_NS) / ITERS. CALIB_NS approximates the harness
-          # start-up cost, dominated by its 100 ms timer calibration window (plus a 10 ms
-          # cross-check pass, process start and warmup, which this ignores). The result is only
-          # an order-of-magnitude check, hence the 10x tolerance below.
-          HF_PER_OP_NS=$(awk "BEGIN {
-            bench_ns = ($HF_MEAN_S * 1e9) - $CALIB_NS
-            if (bench_ns < 1) bench_ns = 1
-            printf \"%.2f\", bench_ns / $ITERS
-          }")
-          echo "Hyperfine estimated per-op: ${HF_PER_OP_NS} ns"
-
-          # Harness envelopes are named <bench>.<mode>.<run>.json (for example
-          # clock_gettime_baseline.baseline.1.json), so this exact-name search finds nothing and
-          # the step ends in the warning branch: the ratio gate below does not run as written.
-          GIT_SHA=$(git rev-parse --short HEAD)
-          HARNESS_JSON=$(find benchmark/reports/$GIT_SHA -name "${BENCH}.json" 2>/dev/null | head -1)
-
-          if [ -n "$HARNESS_JSON" ] && command -v jq >/dev/null 2>&1; then
-            HARNESS_MEDIAN=$(jq '.stats.median_ns' "$HARNESS_JSON")
-            echo "Harness median: ${HARNESS_MEDIAN} ns/op"
-
-            # Fail when the two estimates differ by more than 10x in either direction: that
-            # indicates a mis-calibrated cycle counter rather than noise.
-            RATIO=$(awk "BEGIN {
-              r = $HF_PER_OP_NS / $HARNESS_MEDIAN
-              if (r < 1) r = 1/r
-              printf \"%.2f\", r
-            }")
-            echo "Ratio (hyperfine/harness): ${RATIO}x"
-
-            if awk "BEGIN { exit ($RATIO + 0 > 10.0) ? 0 : 1 }"; then
-              echo "::error::Hyperfine/harness ratio ${RATIO}x exceeds 10x threshold — timer may be mis-calibrated"
-              exit 1
-            fi
-            echo "::notice::Hyperfine cross-validation passed (ratio: ${RATIO}x)"
-          else
-            echo "::warning::Harness JSON not found — reporting hyperfine time only (${HF_PER_OP_NS} ns/op estimate)"
-          fi
-
-      - name: Upload benchmark artifacts
+      - name: Upload gate reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-reports-${{ github.sha }}
-          path: benchmark/reports/
-          retention-days: 90
+          name: gate-reports
+          path: reports/
+          retention-days: 30
           if-no-files-found: warn

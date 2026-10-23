@@ -1,7 +1,7 @@
 # Correctness gate for every push to a long-lived or topic branch.
 #
 # Job graph: fmt runs first (cheap, catches the most common failure), then unit, integration,
-# sanitizers and static-analysis run in parallel. Every job uses the stock ubuntu-24.04 image
+# benchmark scenarios, sanitizers and static-analysis run in parallel. Every job uses the stock ubuntu-24.04 image
 # plus apt packages, which docker/Dockerfile.ci mirrors for `make ci-local`.
 # Only push events trigger it; a pull request from a fork is not gated by this workflow.
 # The four release variants are built and tested by matrix.yml, not here.
@@ -127,6 +127,21 @@ jobs:
 
   # Unit tests under ASan (with leak detection) and under UBSan, each in its own BUILD_DIR.
   # Both *_OPTIONS make the first report abort, so findings fail the job instead of scrolling by.
+  # Every benchmark scenario loads and every errno scenario fires on each measured call
+  # (run-bench.sh --check-scenarios, in the glibc benchmark image), so a scenario or kernel
+  # change cannot silently turn a benchmark arm into a passthrough measurement.
+  bench-scenarios:
+    name: benchmark scenarios
+    needs: fmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check benchmark scenarios
+        run: ./benchmark/run-bench.sh --check-scenarios --libc=glibc
+      # The release gate's decision rules: thresholds, minimum ns, revision re-baselining.
+      - name: Test the release-gate driver
+        run: python3 benchmark/driver/test_chaos_bench_driver.py
+
   sanitizers:
     name: ${{ matrix.sanitizer }} sanitizer
     runs-on: ubuntu-24.04
