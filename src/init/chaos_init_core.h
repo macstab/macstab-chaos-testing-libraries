@@ -179,9 +179,10 @@ size_t chaos_init_format_status(
  * @brief Computes the application's GODEBUG with Multipath TCP disabled (`multipathtcp=0`)
  *        from its @p current value (NULL when unset).
  *
- * @details Used only where the kernel offers MPTCP but sock_diag cannot look its sockets
- * up (no mptcp_diag; chaos_init_net_mptcp_unresolvable()). Go 1.24+ listens with MPTCP by
- * default there, and net rules on such a socket could never resolve its endpoint. A
+ * @details Used wherever the kernel offers MPTCP (chaos_init_net_mptcp_unresolvable()): Go
+ * 1.24+ listens with MPTCP by default there, and a connection it accepts from a plain TCP
+ * client falls back to TCP in a form whose endpoints cannot be resolved, so net rules on it
+ * could never match. A
  * `multipathtcp=` setting the user already made (at the start, or after a comma) wins.
  *
  * @return 1 with the new value in @p out; 0 to leave GODEBUG unchanged (user setting
