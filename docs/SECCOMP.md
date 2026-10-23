@@ -78,7 +78,7 @@ container PID 1: chaos-init --libs io,net -- <entrypoint> [args...]
    `/usr/local/bin:/usr/bin:/bin`), once, in the supervisor: the child then runs a single
    `execve` of the right file instead of one per `PATH` entry, and only the
    application's first `execve` is exempt from the process rules (§5).
-4. With `net`: probe whether MPTCP sockets can be resolved (§3.2).
+4. With `net`: probe whether the kernel offers MPTCP (§3.2).
 5. Fork. The **child**:
    - builds the filter (§1.4) and rejects kernels before 5.5 (`uname` release);
    - asks `SECCOMP_GET_ACTION_AVAIL` for `SECCOMP_RET_USER_NOTIF`;
@@ -267,15 +267,24 @@ sockets appear in no `/proc/<pid>/net` table, so chaos-init asks sock_diag for t
 attribute (the protocol number 262 does not fit the request's own byte; Linux 5.10+).
 The answer describes the supervisor's network namespace, which is the container's.
 
-At start-up, with `net` requested, chaos-init opens an `IPPROTO_MPTCP` socket, binds it
-to loopback, listens, and looks it up through sock_diag:
+sock_diag lists MPTCP sockets by their MPTCP token. A connection that an MPTCP listener
+accepts from a plain TCP client falls back to TCP and has no token, yet stays an MPTCP
+socket (`system.sockprotoname` "MPTCP"): it is in no sock_diag MPTCP dump and in no
+`/proc/net` table, so its endpoints cannot be resolved, even where `mptcp_diag` exists.
+Every plain TCP client of a Go 1.24+ server (a JVM test, `redis-cli`, a health check)
+creates such a connection.
 
-- `socket()` fails: the kernel offers no MPTCP; Go uses plain TCP; nothing to do.
-- Lookup succeeds: MPTCP sockets are resolved through sock_diag.
-- Lookup fails (no `mptcp_diag` module, or a kernel before 5.10): the application's
-  `GODEBUG` gets `multipathtcp=0` appended, so Go uses plain TCP and net rules match,
-  and the status file says `mptcp=off`. A `multipathtcp=` setting of the user's own
-  (first, or after a comma) is kept unchanged; the status still reports `mptcp=off`.
+At start-up, with `net` requested, chaos-init therefore checks only whether the kernel
+offers MPTCP (an `IPPROTO_MPTCP` socket can be created):
+
+- No MPTCP: Go uses plain TCP by itself; nothing to do.
+- MPTCP available: the application's `GODEBUG` gets `multipathtcp=0` appended, so Go uses
+  plain TCP and net rules match, and the status file says `mptcp=off`. A `multipathtcp=`
+  setting of the user's own (first, or after a comma) is kept unchanged; the status still
+  reports `mptcp=off`.
+
+MPTCP sockets a program opens explicitly (not Go's default) are still looked up through
+sock_diag where `mptcp_diag` exists; their fallback connections stay unresolvable.
 
 ---
 
@@ -376,4 +385,5 @@ first.
   dynamic loader faulted like the program, on glibc and musl, under Docker's default
   profile.
 - `test/runtime/test_mptcp.sh`: chaos-init's sock_diag lookups against the kernel's own
-  answers for MPTCP sockets (host; skipped without MPTCP).
+  answers for MPTCP sockets, fallback connections excepted, and that chaos-init turns MPTCP
+  off for Go (host; skipped without MPTCP).

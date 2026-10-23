@@ -31,15 +31,34 @@ void chaos_init_net_start(void);
 int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *verdict);
 
 /**
- * @brief Whether this kernel offers Multipath TCP but sock_diag cannot look its sockets up
- *        (no mptcp_diag), in which case net rules on MPTCP sockets could never match.
+ * @brief Whether this kernel offers Multipath TCP, in which case some MPTCP sockets can
+ *        never be resolved and net rules on them could never match.
  *
- * @details Probes with a loopback MPTCP listener of its own and asks sock_diag for it. A
- * kernel without MPTCP returns false: Go falls back to plain TCP there. Any failure after
- * the socket was created counts as unresolvable. Called before the fork, in the
+ * @details A connection an MPTCP listener accepts from a plain TCP client falls back to TCP
+ * but stays an MPTCP socket (sockprotoname "MPTCP"). sock_diag lists MPTCP sockets by their
+ * MPTCP token, and a fallback connection has none, so it is in no MPTCP dump and in no
+ * /proc/net table either: its endpoints cannot be read from outside, even where mptcp_diag
+ * exists. Go 1.24+ listens with MPTCP by default, so every plain TCP client of a Go server
+ * creates such a connection. chaos-init therefore turns MPTCP off for Go whenever this
+ * returns true. Probes by creating an MPTCP socket; called before the fork, in the
  * supervisor's network namespace.
+ *
+ * @return 1 when socket(IPPROTO_MPTCP) succeeds; 0 when the kernel has no MPTCP (Go then
+ *         uses plain TCP by itself).
  */
 int chaos_init_net_mptcp_unresolvable(void);
+
+/**
+ * @brief Whether sock_diag can look up MPTCP sockets that have an MPTCP token (listeners and
+ *        MPTCP-capable connections): mptcp_diag is present.
+ *
+ * @details Probes with a loopback MPTCP listener of its own and asks sock_diag for it. Used
+ * by the host probe (test/runtime/mptcp_probe.c) to know which MPTCP lookups this kernel
+ * can answer; a fallback connection is never found, whatever this returns.
+ *
+ * @return 1 when the probe listener is found; 0 without MPTCP or on any failure.
+ */
+int chaos_init_net_mptcp_diag_available(void);
 
 /**
  * @brief Performs the tracee memory writes @p verdict defers: for a TIMEOUT, "nothing ready"

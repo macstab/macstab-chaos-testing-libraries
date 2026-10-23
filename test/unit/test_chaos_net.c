@@ -105,6 +105,12 @@ static int g_peer_lookups = 0;
 /** @brief Non-zero makes the final-match stub report a match through the match stub. */
 static int g_stub_match_final = 0;
 
+/** @brief What the targets stub reports: 1 (a rule for the operation is loaded) by default. */
+static int g_stub_targets = 1;
+
+/** @brief Non-zero makes a failing end lookup report that the descriptor is not a socket. */
+static int g_stub_not_socket = 0;
+
 /** @brief Calls of the LATENCY stub (no sleep is performed). */
 static int g_latency_calls = 0;
 
@@ -301,6 +307,13 @@ int chaos_net_config_match_final_loaded(
     return g_stub_match_final != 0 && chaos_net_config_match_endpoint(operation, endpoint, rule);
 }
 
+/** @brief Targets stub: whether a rule for the operation is loaded (g_stub_targets). */
+int chaos_net_config_targets_loaded(chaos_net_operation_t operation)
+{
+    (void)operation;
+    return g_stub_targets;
+}
+
 /**
  * @brief Both-ends match stub: tries @p first, then @p second, through the match stub. Rule
  *   precedence between the ends is proven in test_net_config.c.
@@ -388,6 +401,24 @@ int chaos_net_endpoint_from_peer_fd(int fd, chaos_net_endpoint_t *endpoint)
     }
     *endpoint = g_stub_endpoint;
     return 1;
+}
+
+/**
+ * @brief End-lookup stub: the local or peer stub above, reporting "not a socket" on a failed
+ *   lookup while g_stub_not_socket is set.
+ */
+int chaos_net_endpoint_from_end_fd(
+    int fd, int peer, chaos_net_endpoint_t *endpoint, int *not_socket
+)
+{
+    const int found = peer ? chaos_net_endpoint_from_peer_fd(fd, endpoint)
+                           : chaos_net_endpoint_from_local_fd(fd, endpoint);
+
+    if (not_socket != NULL)
+    {
+        *not_socket = !found && g_stub_not_socket != 0;
+    }
+    return found;
 }
 
 /** @brief LATENCY stub: counts calls and records the rule's `call_size`; never sleeps. */
@@ -1042,6 +1073,8 @@ static void reset_wrapper_stubs(void)
     g_local_lookups = 0;
     g_peer_lookups = 0;
     g_stub_match_final = 0;
+    g_stub_targets = 1;
+    g_stub_not_socket = 0;
     g_latency_calls = 0;
     g_errno_trigger = 0;
     g_should_trigger = 0;
@@ -3262,6 +3295,42 @@ static void test_final_match_skips_other_end(void)
 }
 
 /**
+ * @brief Proves send and receive look up no endpoint when no rule is for their operation,
+ *   and only one end of a descriptor that is not a socket.
+ *
+ * @details Rules on connect alone, or read/write on files, must cost no getsockname or
+ * getpeername; a file under a send or recv rule costs the one lookup that says ENOTSOCK.
+ */
+static void test_lookups_skipped_without_target_or_socket(void)
+{
+    char buffer[8];
+
+    reset_descriptor_stubs();
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_ERRNO;
+    g_stub_rule.errnum = ECONNRESET;
+    g_errno_trigger = 1;
+    g_stub_endpoint_from_local = 1;
+    g_stub_endpoint_from_peer = 1;
+
+    g_stub_targets = 0;
+    assert(recv(5, buffer, sizeof(buffer), 0) == g_recv_result);
+    assert(send(5, "x", 1U, 0) == g_send_result);
+    assert(write(5, "x", 1U) == 1);
+    assert(g_local_lookups == 0 && g_peer_lookups == 0);
+
+    g_stub_targets = 1;
+    g_stub_endpoint_from_local = 0;
+    g_stub_endpoint_from_peer = 0;
+    g_stub_not_socket = 1;
+    assert(read(5, buffer, sizeof(buffer)) == 4);
+    assert(g_local_lookups == 1 && g_peer_lookups == 0);
+    g_local_lookups = 0;
+    assert(write(5, "x", 1U) == 1);
+    assert(g_peer_lookups == 1 && g_local_lookups == 0);
+}
+
+/**
  * @brief Proves CORRUPT touches only bytes the receive actually wrote into the buffer.
  *
  * @details With MSG_TRUNC a datagram receive returns the datagram's full length (60000) even
@@ -4062,6 +4131,7 @@ int main(void)
     test_corrupt_stays_in_the_buffer();
     test_rules_match_either_end();
     test_final_match_skips_other_end();
+    test_lookups_skipped_without_target_or_socket();
     test_dup_skips_and_close_races();
     test_trickle_and_dup_edges();
     test_dup_replays_the_last_payload();

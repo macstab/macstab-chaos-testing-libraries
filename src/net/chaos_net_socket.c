@@ -1032,28 +1032,33 @@ int chaos_net_match_connected(
     chaos_net_endpoint_t peer;
     int have_local;
     int have_peer;
+    int not_socket;
 
-    if (!chaos_net_config_prepare())
+    /* No rule for this operation: nothing can match, so no endpoint is looked up. */
+    if (!chaos_net_config_prepare() || !chaos_net_config_targets_loaded(operation))
     {
         return 0;
     }
-    /* The preferred end first; the other end costs two more system calls and is resolved
-     * only when a rule could still outrank the preferred end's match there. */
+    /* The preferred end first; the other end costs another system call and is resolved
+     * only when a rule could still outrank the preferred end's match there, and never for
+     * a descriptor the first lookup showed is not a socket (read and write on files). */
     if (peer_first)
     {
-        have_peer = chaos_net_endpoint_from_peer_fd(fd, &peer);
-        if (have_peer && chaos_net_config_match_final_loaded(operation, &peer, rule))
+        have_peer = chaos_net_endpoint_from_end_fd(fd, 1, &peer, &not_socket);
+        if (not_socket ||
+            (have_peer && chaos_net_config_match_final_loaded(operation, &peer, rule)))
         {
-            return 1;
+            return !not_socket;
         }
         have_local = chaos_net_endpoint_from_local_fd(fd, &local);
     }
     else
     {
-        have_local = chaos_net_endpoint_from_local_fd(fd, &local);
-        if (have_local && chaos_net_config_match_final_loaded(operation, &local, rule))
+        have_local = chaos_net_endpoint_from_end_fd(fd, 0, &local, &not_socket);
+        if (not_socket ||
+            (have_local && chaos_net_config_match_final_loaded(operation, &local, rule)))
         {
-            return 1;
+            return !not_socket;
         }
         have_peer = chaos_net_endpoint_from_peer_fd(fd, &peer);
     }
