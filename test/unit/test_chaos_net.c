@@ -98,6 +98,13 @@ static int g_stub_endpoint_from_local = 0;
 /** @brief Non-zero makes the peer endpoint stub resolve. */
 static int g_stub_endpoint_from_peer = 0;
 
+/** @brief Calls of the local and of the peer endpoint stub. */
+static int g_local_lookups = 0;
+static int g_peer_lookups = 0;
+
+/** @brief Non-zero makes the final-match stub report a match through the match stub. */
+static int g_stub_match_final = 0;
+
 /** @brief Calls of the LATENCY stub (no sleep is performed). */
 static int g_latency_calls = 0;
 
@@ -283,6 +290,18 @@ int chaos_net_config_match_endpoint_loaded(
 }
 
 /**
+ * @brief Final-match stub: while g_stub_match_final is set, matches through the match stub;
+ *   otherwise reports no final match, so the caller searches both ends. Which matches are
+ *   final is proven in test_net_config.c.
+ */
+int chaos_net_config_match_final_loaded(
+    chaos_net_operation_t operation, const chaos_net_endpoint_t *endpoint, chaos_net_rule_t *rule
+)
+{
+    return g_stub_match_final != 0 && chaos_net_config_match_endpoint(operation, endpoint, rule);
+}
+
+/**
  * @brief Both-ends match stub: tries @p first, then @p second, through the match stub. Rule
  *   precedence between the ends is proven in test_net_config.c.
  */
@@ -349,6 +368,7 @@ int chaos_net_endpoint_from_activity_fd(int fd, chaos_net_endpoint_t *endpoint)
 int chaos_net_endpoint_from_local_fd(int fd, chaos_net_endpoint_t *endpoint)
 {
     (void)fd;
+    ++g_local_lookups;
     if (g_stub_endpoint_from_local == 0 || endpoint == NULL)
     {
         return 0;
@@ -361,6 +381,7 @@ int chaos_net_endpoint_from_local_fd(int fd, chaos_net_endpoint_t *endpoint)
 int chaos_net_endpoint_from_peer_fd(int fd, chaos_net_endpoint_t *endpoint)
 {
     (void)fd;
+    ++g_peer_lookups;
     if (g_stub_endpoint_from_peer == 0 || endpoint == NULL)
     {
         return 0;
@@ -1018,6 +1039,9 @@ static void reset_wrapper_stubs(void)
     g_stub_endpoint_from_activity = 0;
     g_stub_endpoint_from_local = 0;
     g_stub_endpoint_from_peer = 0;
+    g_local_lookups = 0;
+    g_peer_lookups = 0;
+    g_stub_match_final = 0;
     g_latency_calls = 0;
     g_errno_trigger = 0;
     g_should_trigger = 0;
@@ -3202,6 +3226,42 @@ static void test_rules_match_either_end(void)
 }
 
 /**
+ * @brief Proves a final match on the preferred end skips resolving the other end.
+ *
+ * @details Each end costs getsockname or getpeername plus getsockopt. When the match on
+ * the end that wins ties cannot be outranked (chaos_net_config_match_final_loaded()), the
+ * other end is not looked up: receives resolve only the local end, sends only the peer.
+ * Without a final match both ends are resolved, as the either-end search needs.
+ */
+static void test_final_match_skips_other_end(void)
+{
+    char buffer[8];
+
+    reset_wrapper_stubs();
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_ERRNO;
+    g_stub_rule.errnum = ECONNRESET;
+    g_errno_trigger = 1;
+    g_stub_endpoint_from_local = 1;
+    g_stub_endpoint_from_peer = 1;
+
+    g_stub_match_final = 1;
+    errno = 0;
+    assert(recv(5, buffer, sizeof(buffer), 0) == -1 && errno == ECONNRESET);
+    assert(g_local_lookups == 1 && g_peer_lookups == 0);
+    g_local_lookups = 0;
+    errno = 0;
+    assert(send(5, "x", 1U, 0) == -1 && errno == ECONNRESET);
+    assert(g_peer_lookups == 1 && g_local_lookups == 0);
+
+    g_stub_match_final = 0;
+    g_peer_lookups = 0;
+    errno = 0;
+    assert(recv(5, buffer, sizeof(buffer), 0) == -1 && errno == ECONNRESET);
+    assert(g_local_lookups == 1 && g_peer_lookups == 1);
+}
+
+/**
  * @brief Proves CORRUPT touches only bytes the receive actually wrote into the buffer.
  *
  * @details With MSG_TRUNC a datagram receive returns the datagram's full length (60000) even
@@ -4001,6 +4061,7 @@ int main(void)
     test_receive_helpers_and_vector_shapes();
     test_corrupt_stays_in_the_buffer();
     test_rules_match_either_end();
+    test_final_match_skips_other_end();
     test_dup_skips_and_close_races();
     test_trickle_and_dup_edges();
     test_dup_replays_the_last_payload();

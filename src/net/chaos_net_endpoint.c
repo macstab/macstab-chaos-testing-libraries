@@ -354,6 +354,23 @@ int chaos_net_endpoint_matches(
     return 1;
 }
 
+unsigned int chaos_net_endpoint_selector_rank(const chaos_net_endpoint_t *selector)
+{
+    if (selector == NULL)
+    {
+        return 0U;
+    }
+    if (selector->kind == CHAOS_NET_ENDPOINT_ANY)
+    {
+        return 1U;
+    }
+    if (selector->kind == CHAOS_NET_ENDPOINT_UNIX)
+    {
+        return strcmp(selector->value.text, "*") == 0 ? 2U : 4U;
+    }
+    return selector->wildcard_host != 0 ? 2U : 3U;
+}
+
 /**
  * @brief Builds the endpoint of a not-yet-addressed socket from socket() arguments.
  *
@@ -546,10 +563,19 @@ chaos_net_endpoint_kind_from_socket(int fd, sa_family_t family, chaos_net_endpoi
  * @param address         sockaddr; NULL, or shorter than sa_family_t, yields 0.
  * @param address_length  Bytes valid at @p address.
  * @param endpoint        Output; zeroed on entry.
+ * @param fd_is_socket    Non-zero when @p address came from getsockname or getpeername on
+ *                        @p fd, which proves it a socket: an AF_UNIX address then needs no
+ *                        SO_TYPE query (its kind is UNIX for every type), saving a system
+ *                        call per lookup. Zero for a caller's address, where the query also
+ *                        rejects a non-socket @p fd.
  * @return 1 on success; 0 on any validation or SO_TYPE failure.
  */
 static int chaos_net_endpoint_from_sockaddr(
-    int fd, const struct sockaddr *address, socklen_t address_length, chaos_net_endpoint_t *endpoint
+    int fd,
+    const struct sockaddr *address,
+    socklen_t address_length,
+    chaos_net_endpoint_t *endpoint,
+    int fd_is_socket
 )
 {
     const struct sockaddr_in *ipv4;
@@ -625,7 +651,11 @@ static int chaos_net_endpoint_from_sockaddr(
         {
             path_max = sizeof(unix_address->sun_path);
         }
-        if (!chaos_net_endpoint_kind_from_socket(fd, AF_UNIX, &endpoint->kind))
+        if (fd_is_socket)
+        {
+            endpoint->kind = CHAOS_NET_ENDPOINT_UNIX;
+        }
+        else if (!chaos_net_endpoint_kind_from_socket(fd, AF_UNIX, &endpoint->kind))
         {
             return 0;
         }
@@ -672,7 +702,7 @@ int chaos_net_endpoint_from_sockaddr_fd(
     int fd, const struct sockaddr *address, socklen_t address_length, chaos_net_endpoint_t *endpoint
 )
 {
-    return chaos_net_endpoint_from_sockaddr(fd, address, address_length, endpoint);
+    return chaos_net_endpoint_from_sockaddr(fd, address, address_length, endpoint, 0);
 }
 
 /**
@@ -705,7 +735,7 @@ int chaos_net_endpoint_from_local_fd(int fd, chaos_net_endpoint_t *endpoint)
     }
 
     return chaos_net_endpoint_from_sockaddr(
-        fd, (const struct sockaddr *)&storage, address_length, endpoint
+        fd, (const struct sockaddr *)&storage, address_length, endpoint, 1
     );
 }
 
@@ -739,6 +769,6 @@ int chaos_net_endpoint_from_peer_fd(int fd, chaos_net_endpoint_t *endpoint)
     }
 
     return chaos_net_endpoint_from_sockaddr(
-        fd, (const struct sockaddr *)&storage, address_length, endpoint
+        fd, (const struct sockaddr *)&storage, address_length, endpoint, 1
     );
 }

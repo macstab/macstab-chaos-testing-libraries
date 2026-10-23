@@ -13,9 +13,10 @@
  * 4. LATENCY delays the call; ERRNO returns -1 with the rule's errno without opening.
  *    (TORN and CORRUPT cannot be combined with `open`.)
  * 5. Call the real function.
- * 6. On success, invalidate the new descriptor's slot and resolve it through
- *    `/proc/self/fd`, so later descriptor-based calls match by the kernel's name for the
- *    file (links resolved) and never by an entry a previous holder of the number left.
+ * 6. On success, invalidate the new descriptor's slot, so no descriptor-based call matches
+ *    by an entry a previous holder of the number left. The first fd rule check resolves
+ *    the descriptor through `/proc/self/fd` (the kernel's name, links resolved) and caches
+ *    it; without active rules there is no check, so open costs no readlink.
  *
  * @par Why stdio and creat need their own wrappers
  * glibc and musl implement fopen, freopen and creat with internal system calls, not
@@ -195,28 +196,24 @@ int chaos_io_resolve_at_path(
 }
 
 /**
- * @brief Caches the kernel's path for a descriptor an open-style call just returned.
+ * @brief Forgets any cached path for a descriptor an open-style call just returned.
  *
- * @details Always resolves through `/proc/self/fd`, never from the caller's path string:
- * the kernel's name has links resolved, which is what later lookups of this descriptor
- * see. The slot is invalidated first, because the number may have been freed by a call
- * libchaos-io does not see (a raw close system call, for one). Costs one readlink per
- * successful open.
+ * @details The number may have been freed by a call libchaos-io does not see (a raw close
+ * system call, for one), so an entry an earlier holder left behind must not be reused.
+ * The new descriptor's path is not resolved here: the first fd rule check resolves it
+ * through `/proc/self/fd` (chaos_io_fdcache_resolve(), the kernel's name with links
+ * resolved) and caches it, and only while rules are active. An open without rules thus
+ * costs no readlink.
  *
  * @param[in] fd  Result of the real call; negative is a no-op.
  */
 static void chaos_io_cache_open_result(int fd)
 {
-    char resolved_path[CHAOS_IO_MAX_PATH];
-
     if (fd < 0)
     {
         return;
     }
-    /* Never reuse an entry an earlier holder of this number left behind (closed where
-     * libchaos-io did not see it); then cache the kernel's name, links resolved. */
     chaos_io_fdcache_invalidate(fd);
-    (void)chaos_io_fdcache_resolve(fd, resolved_path, sizeof(resolved_path));
 }
 
 /* --- Exported interposed symbols ------------------------------------------------- */

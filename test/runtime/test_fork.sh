@@ -15,6 +15,11 @@
 #   Expected as for fork.
 # - draws: under a 0.5 probability rule a forked child's 64 outcomes must differ from the
 #   parent's, i.e. the child reseeds its PRNG instead of repeating the parent's numbers.
+# - faults: with all six libraries preloaded and no rule file, a forked child may take at
+#   most 60 minor page faults (10 per library) more than without them. The atfork handlers
+#   reset per-process state; a store to a page the child shares copy-on-write costs it a
+#   fault, so they store only values that changed. 2.0.0 stored unconditionally and took
+#   about 130 extra faults per fork (fork_wait 20-34 % slower than 1.0.1).
 #
 # Hits are summed from the `# first` rule's lines in /tmp/.chaos-io.hits.*.
 #
@@ -131,6 +136,21 @@ if [ "$draws" = different ]; then
     echo "ok   $LIBC fork: the child draws its own random numbers"
 else
     echo "FAIL $LIBC fork: parent and child drew $draws numbers" >&2
+    failures=$((failures + 1))
+fi
+
+d=/out
+six=$d/libchaos-io-$LIBC-'"$ARCH"'.so:$d/libchaos-net-$LIBC-'"$ARCH"'.so:$d/libchaos-dns-$LIBC-'"$ARCH"'.so
+six=$six:$d/libchaos-time-$LIBC-'"$ARCH"'.so:$d/libchaos-memory-$LIBC-'"$ARCH"'.so
+six=$six:$d/libchaos-process-$LIBC-'"$ARCH"'.so
+rm -f /tmp/.chaos-*.conf
+bare=$(/tmp/fork-probe faults)
+loaded=$(LD_PRELOAD=$six /tmp/fork-probe faults)
+if [ $((loaded - bare)) -le 60 ]; then
+    echo "ok   $LIBC fork: a child takes $loaded page faults with all six libraries, $bare without"
+else
+    echo "FAIL $LIBC fork: a child takes $loaded page faults with all six libraries, $bare" \
+        "without; at most 60 more allowed" >&2
     failures=$((failures + 1))
 fi
 [ "$failures" -eq 0 ]

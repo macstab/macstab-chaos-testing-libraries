@@ -547,7 +547,9 @@ cross-musl-arm64: $(MUSL_ARM64_DISTS)
 
 # All four library variants via docker buildx, one Dockerfile.build run per variant; arm64 runs
 # under QEMU on an amd64 host (release.yml installs it). Each run exports its dist/ into
-# build/docker-<variant>/, from which the .so files are copied to dist/. chaos-init is not built.
+# build/docker-<variant>/, from which the .so files are copied to dist/. chaos-init is built the
+# same way, once per architecture, statically on alpine:3.20 as test_init.sh and test_seccomp.sh
+# build it, into dist/chaos-init-<arch>.
 # The glibc variants use gcc:10 on purpose: the toolchain's glibc sets the minimum glibc the
 # libraries require, and test/runtime/check_glibc_baseline.sh rejects anything above
 # GLIBC_2.17. Do not bump this image without running that check.
@@ -560,6 +562,10 @@ docker-build-all: | $(BUILD_DIR) $(DIST_DIR)
 	cp $(BUILD_DIR)/docker-musl-amd64/*.so $(DIST_DIR)/
 	docker buildx build --platform linux/arm64 --build-arg BASE_IMAGE=alpine:3.20 --build-arg MAKE_TARGET=cross-musl-arm64 --output type=local,dest=$(BUILD_DIR)/docker-musl-arm64 -f $(DOCKER_DIR)/Dockerfile.build .
 	cp $(BUILD_DIR)/docker-musl-arm64/*.so $(DIST_DIR)/
+	docker buildx build --platform linux/amd64 --build-arg BASE_IMAGE=alpine:3.20 --build-arg MAKE_TARGET=cross-init-amd64 --output type=local,dest=$(BUILD_DIR)/docker-init-amd64 -f $(DOCKER_DIR)/Dockerfile.build .
+	cp $(BUILD_DIR)/docker-init-amd64/chaos-init-amd64 $(DIST_DIR)/
+	docker buildx build --platform linux/arm64 --build-arg BASE_IMAGE=alpine:3.20 --build-arg MAKE_TARGET=cross-init-arm64 --output type=local,dest=$(BUILD_DIR)/docker-init-arm64 -f $(DOCKER_DIR)/Dockerfile.build .
+	cp $(BUILD_DIR)/docker-init-arm64/chaos-init-arm64 $(DIST_DIR)/
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
