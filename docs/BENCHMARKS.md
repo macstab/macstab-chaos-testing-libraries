@@ -686,8 +686,12 @@ io `read`, `write`, `readv`, `writev`, `open_close`, `openat_close` targeted `/d
 `/dev/null`, which libchaos-io excludes, and `pread`, `fsync`, `fdatasync` used selectors
 that never matched (io prefixes match at path-component boundaries); dns `getnameinfo` used a
 `dns://` rule where reverse lookups consult `rdns://`. In those matrices the affected
-`_match_no_fire` and `_errno` cells measure passthrough or a non-matching rule. Only net
-`send`, `recv`, `socket_close`, `shutdown` and dns `getaddrinfo` were effective.
+`_match_no_fire` and `_errno` cells measure passthrough or a non-matching rule. Net
+`send`, `recv` and `shutdown` were not effective either: their `unix://*` rules target the
+benchmark's socketpair, and before 2.0.0 libchaos-net could not resolve unnamed UNIX
+sockets (and `send` looked at the peer only), so those arms measured the no-match path. Only
+net `socket_close` (its rule matches the `socket()` arguments) and dns `getaddrinfo` were
+effective.
 
 The corrected benchmarks carry kernel revision 2 (`krev`, the six io kernels moved from
 `/dev` to temp files) or scenario revision 2 (`srev`) in `benchmark/suite.tsv`. The
