@@ -18,12 +18,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **release:** Ship chaos-init-amd64 and chaos-init-arm64 ([032770b](https://github.com/macstab/macstab-chaos-testing-libraries/commit/032770bd6cf314b7ed2309bcec1db33a7f4bbef5))
 - **changelog:** Make bare x.y.z tags the changelog version boundaries ([6efb3eb](https://github.com/macstab/macstab-chaos-testing-libraries/commit/6efb3eb7a8dbecd922d6edde677930fc37ce8214))
 
+### CI
+
+- A release pipeline with valid benchmarks, a pre-release gate and a runbook ([#41](https://github.com/macstab/macstab-chaos-testing-libraries/issues/41)) ([1952666](https://github.com/macstab/macstab-chaos-testing-libraries/commit/195266656ec41970e25de0b0dc1c76a8cd61ec81))
+
 ### Documentation
 
 - Update CHANGELOG for 1.0.1 ([#25](https://github.com/macstab/macstab-chaos-testing-libraries/issues/25)) ([08cbb25](https://github.com/macstab/macstab-chaos-testing-libraries/commit/08cbb252c6e5c5f6b19fb49393fc016550875fa6))
 - **bench:** Add 1.0.1-benchmarks.md ([#26](https://github.com/macstab/macstab-chaos-testing-libraries/issues/26)) ([f2fec58](https://github.com/macstab/macstab-chaos-testing-libraries/commit/f2fec5846fada4f85fcb2dc1df38cfe48424dcf5))
 - **bench:** Add 1.0.1-benchmarks.md ([#29](https://github.com/macstab/macstab-chaos-testing-libraries/issues/29)) ([e52c280](https://github.com/macstab/macstab-chaos-testing-libraries/commit/e52c2805585aa98018af185a6bd0b12599aa47a6))
 - **bench:** Add 1.0.1-benchmarks.md ([#31](https://github.com/macstab/macstab-chaos-testing-libraries/issues/31)) ([54043a2](https://github.com/macstab/macstab-chaos-testing-libraries/commit/54043a2c62f4117941d1724938661f3f0c0b7926))
+- Update CHANGELOG for 2.0.0 ([#36](https://github.com/macstab/macstab-chaos-testing-libraries/issues/36)) ([488a464](https://github.com/macstab/macstab-chaos-testing-libraries/commit/488a464b4fd5b67751d23f28486b8de6f555f8af))
+- **bench:** Add 2.0.0-benchmarks.md ([#37](https://github.com/macstab/macstab-chaos-testing-libraries/issues/37)) ([b180199](https://github.com/macstab/macstab-chaos-testing-libraries/commit/b1801991b29144f2ecd1cfeb91ef2f656204e3dc))
+- Update CHANGELOG for 2.0.0 ([#45](https://github.com/macstab/macstab-chaos-testing-libraries/issues/45)) ([fd37c70](https://github.com/macstab/macstab-chaos-testing-libraries/commit/fd37c70984f5e5cd280c0a0160c89a16e3a8f4df))
 
 ### Features
 
@@ -37,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sync main into develop after 2.0.0 ([#38](https://github.com/macstab/macstab-chaos-testing-libraries/issues/38)) ([2dfc449](https://github.com/macstab/macstab-chaos-testing-libraries/commit/2dfc449ad61035b643647578e1da7add8e0fb668))
 - Sync main into develop after 2.0.0 ([#39](https://github.com/macstab/macstab-chaos-testing-libraries/issues/39)) ([616e28b](https://github.com/macstab/macstab-chaos-testing-libraries/commit/616e28bcc3776c9d8b325de8316514836c9a7a9b))
 - Sync main into develop before 2.0.1 ([#43](https://github.com/macstab/macstab-chaos-testing-libraries/issues/43)) ([1f8b786](https://github.com/macstab/macstab-chaos-testing-libraries/commit/1f8b786dd25b77667ed3767cbf6a4f59fb22d92d))
+- Record main as merged for the 2.0.1 release ([0288f90](https://github.com/macstab/macstab-chaos-testing-libraries/commit/0288f90342d9ec3f02962fac5335ae04a2d16261))
 
 ### Performance
 
