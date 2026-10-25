@@ -18,15 +18,17 @@ DRIVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chaos_bench_d
 SUITE_HEADER = "# lib passthrough prefix iters empty stem mode krev srev\n"
 
 
-def write_sweep(directory: str, medians: dict[str, float], suite: str | None) -> None:
-    """Writes 10 preloaded envelopes per benchmark (median + 0..9 ns) and suite.tsv."""
+def write_sweep(
+    directory: str, medians: dict[str, float], suite: str | None, cpu: str = "EPYC 9V74"
+) -> None:
+    """Writes 10 preloaded envelopes per benchmark (median + 0..9 ns, on @cpu) and suite.tsv."""
     os.makedirs(directory, exist_ok=True)
     for name, median in medians.items():
         for run in range(10):
             envelope = {
                 "benchmark": {"name": name},
                 "stats": {"median_ns": median + run, "samples": 1000},
-                "environment": {"ld_preload": "/lib/libchaos-io.so"},
+                "environment": {"ld_preload": "/lib/libchaos-io.so", "cpu_model": cpu},
             }
             with open(os.path.join(directory, f"{name}.treat.{run}.json"), "w") as fh:
                 json.dump(envelope, fh)
@@ -78,6 +80,22 @@ class VsPrevGate(unittest.TestCase):
         rc, report = gate(self.prev, self.curr)
         self.assertEqual(rc, 0)
         self.assertIn("re-baselined (k1.s1 -> k2.s2), not gated", report)
+
+    def test_different_cpu_is_reported_not_gated(self) -> None:
+        row = "dns getnameinfo_passthrough getnameinfo - d.conf d full 1 1\n"
+        write_sweep(self.prev, {"getnameinfo_errno": 510.0}, row, cpu="EPYC 9V74")
+        write_sweep(self.curr, {"getnameinfo_errno": 641.0}, row, cpu="EPYC 9V45")
+        rc, report = gate(self.prev, self.curr, "--vs-prev-min-ns", "25")
+        self.assertEqual(rc, 3)
+        self.assertIn("Not gated: different CPU", report)
+        self.assertIn("different CPU, not gated", report)
+        self.assertNotIn("getnameinfo_errno ⚠️", report)  # no row flagged
+
+    def test_same_cpu_slowdown_still_fails(self) -> None:
+        row = "dns getnameinfo_passthrough getnameinfo - d.conf d full 1 1\n"
+        write_sweep(self.prev, {"getnameinfo_errno": 510.0}, row, cpu="EPYC 9V45")
+        write_sweep(self.curr, {"getnameinfo_errno": 641.0}, row, cpu="EPYC 9V45")
+        self.assertEqual(gate(self.prev, self.curr, "--vs-prev-min-ns", "25")[0], 1)
 
     def test_missing_suite_counts_as_revision_one(self) -> None:
         write_sweep(self.prev, {"read_errno": 1000.0, "read_passthrough": 500.0}, None)

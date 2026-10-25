@@ -18,6 +18,10 @@ name: bench
 on:
   pull_request:
     branches: [main]
+    # A pull request that changes only Markdown (the release workflow's CHANGELOG and
+    # benchmark-matrix pull requests, documentation) changes nothing the sweep measures.
+    paths-ignore:
+      - '**/*.md'
   workflow_dispatch:
 
 permissions:

@@ -86,7 +86,7 @@ and takes up to about 2.5 hours:
 |---|---|
 | `ci`, `matrix`, `codeql` | A defect; fix on `develop` (new PR), this PR updates. |
 | `sweep (…)` → *Check benchmark scenarios* | A scenario no longer loads or fires (§8). |
-| `release-over-release gate` | A benchmark is slower than the last accepted release by > 15 % **and** > 25 ns, significantly. Open the run's summary and the `gate-reports` artifact (`benchmark-vs-prev-<variant>.md`, rows marked ⚠️). Fix the regression on `develop`; or, if the slowdown is the intended cost of a fix, state that in this PR's body (it becomes the release's known limit) and proceed. |
+| `release-over-release gate` | A benchmark is slower than the last accepted release by > 15 % **and** > 25 ns, significantly. (A variant whose sweep ran on another CPU model than the baseline is listed as "not gated": hosted runners vary, and nanoseconds from two processor models are not comparable.) Open the run's summary and the `gate-reports` artifact (`benchmark-vs-prev-<variant>.md`, rows marked ⚠️). Fix the regression on `develop`; or, if the slowdown is the intended cost of a fix, state that in this PR's body (it becomes the release's known limit) and proceed. |
 
 **Merge with "Create a merge commit"** (never squash or rebase): the merge commit makes
 `main` contain `develop`'s history, so the next release PR has no conflicts and

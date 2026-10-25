@@ -25,7 +25,8 @@
 # GATE_PCT percent and more than GATE_MIN_NS nanoseconds (median of run
 # medians), and the difference is significant (rank-sum p < 0.01, |r| > 0.5).
 # A benchmark whose suite.tsv revision differs between the two releases is
-# reported as re-baselined and not gated.
+# reported as re-baselined and not gated. A variant whose sweep ran on another CPU
+# model than the baseline (hosted runners vary) is reported but not gated.
 #
 # Environment: GH_TOKEN (gh), GATE_PCT (default 15), GATE_MIN_NS (default 25)
 # Exit: 0 no regression, or nothing to compare against; 1 a regression on any
@@ -100,6 +101,7 @@ for v in $VARIANTS; do
     case "$rc" in
         0) echo "| $v | pass |" >> "$SUMMARY" ;;
         1) echo "| $v | **regression** (see benchmark-vs-prev-$v.md) |" >> "$SUMMARY"; any=1 ;;
+        3) echo "| $v | not gated: baseline and sweep ran on different CPU models |" >> "$SUMMARY" ;;
         *) echo "| $v | driver error (exit $rc) |" >> "$SUMMARY"
            echo "release-gate: driver failed on $v (exit $rc)" >&2
            exit 2 ;;
