@@ -185,4 +185,25 @@ int chaos_net_endpoint_from_local_fd(int fd, chaos_net_endpoint_t *endpoint);
  */
 int chaos_net_endpoint_from_peer_fd(int fd, chaos_net_endpoint_t *endpoint);
 
+/**
+ * @brief Resolves the local (@p peer 0, getsockname) or peer (@p peer 1, getpeername) address
+ *        of @p fd, and says whether @p fd is no socket at all.
+ *
+ * @details The lookup chaos_net_endpoint_from_local_fd() and _peer_fd() share, with the
+ * guard set and errno preserved. Callers that try both ends use @p not_socket to skip the
+ * second lookup for a descriptor that is not a socket.
+ *
+ * @param fd          Descriptor.
+ * @param peer        0 for the local address, non-zero for the peer.
+ * @param endpoint    Output; NULL yields 0.
+ * @param not_socket  Optional output: 1 when the lookup failed with ENOTSOCK or EBADF (no end
+ *                    of @p fd can resolve), else 0.
+ * @return 1 on success; 0 if the lookup function is unresolved or fails, or the address does
+ *         not normalise.
+ * @par Thread-safety: safe; no shared state.
+ */
+int chaos_net_endpoint_from_end_fd(
+    int fd, int peer, chaos_net_endpoint_t *endpoint, int *not_socket
+);
+
 #endif

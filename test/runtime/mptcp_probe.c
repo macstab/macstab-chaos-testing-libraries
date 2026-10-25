@@ -17,9 +17,11 @@
  * (return code, family, port) and prints one ok/FAIL line per socket and side, plus the raw
  * sock_diag answer for diagnosis.
  *
- * Where MPTCP sockets cannot be looked up at all (no mptcp_diag module),
- * chaos_init_net_mptcp_unresolvable() must report it (chaos-init then turns MPTCP off for Go);
- * MPTCP lookups then print "n/a" and only the TCP sockets must match.
+ * chaos_init_net_mptcp_unresolvable() must report 1 on every kernel with MPTCP: chaos-init
+ * then turns MPTCP off for Go. The connection accepted from the plain TCP client is a fallback
+ * connection (sockprotoname "MPTCP", no MPTCP token), which sock_diag never lists, so its
+ * lookups print "n/a"; so do all MPTCP lookups where sock_diag has no MPTCP support at all
+ * (chaos_init_net_mptcp_diag_available() false). Every other socket must match.
  *
  * Run by test_mptcp.sh on the host (Docker Desktop's kernel has no MPTCP).
  *
@@ -37,9 +39,9 @@
 
 static int g_failures = 0;
 
-/* Set when chaos-init reports MPTCP sockets unresolvable (it then turns MPTCP off for Go):
- * failed MPTCP lookups are expected and reported as "n/a" instead of FAIL. */
-static int g_unresolvable = 0;
+/* Set when sock_diag answers for MPTCP sockets (mptcp_diag present). Without it every failed
+ * MPTCP lookup is expected and reported as "n/a" instead of FAIL. */
+static int g_diag = 0;
 
 /** @brief Port of an AF_INET/AF_INET6 address in host order, or -1 for another family. */
 static int port_of(const struct sockaddr_storage *address)
@@ -59,7 +61,7 @@ static int port_of(const struct sockaddr_storage *address)
  * @brief Compares chaos-init's local and peer address of @p fd with the kernel's (return code,
  *        family, port), prints one line per side and counts mismatches.
  */
-static void check(const char *what, int fd)
+static void check(const char *what, int fd, int fallback)
 {
     struct sockaddr_storage real;
     struct sockaddr_storage seen;
@@ -80,7 +82,8 @@ static void check(const char *what, int fd)
         const int seen_rc =
             peer ? chaos_init_net_getpeername(fd, (struct sockaddr *)&seen, &seen_length)
                  : chaos_init_net_getsockname(fd, (struct sockaddr *)&seen, &seen_length);
-        const int expected = g_unresolvable && strncmp(protocol, "MPTCP", 5U) == 0;
+        /* A fallback connection is in no sock_diag dump; without mptcp_diag no MPTCP socket is. */
+        const int expected = (!g_diag || fallback) && strncmp(protocol, "MPTCP", 5U) == 0;
         const int same = real_rc == seen_rc && (real_rc != 0 || (real.ss_family == seen.ss_family &&
                                                                  port_of(&real) == port_of(&seen)));
 
@@ -192,16 +195,22 @@ int main(void)
             (void)close(link);
         }
     }
-    g_unresolvable = chaos_init_net_mptcp_unresolvable();
+    g_diag = chaos_init_net_mptcp_diag_available();
     (void)printf(
         "%s\n",
-        g_unresolvable ? "MPTCP sockets cannot be looked up here: chaos-init turns MPTCP off for Go"
-                       : "MPTCP sockets can be looked up here"
+        g_diag ? "sock_diag answers for MPTCP sockets with a token here"
+               : "sock_diag has no MPTCP support here (no mptcp_diag)"
     );
-    check("MPTCP listener", listener);
-    check("MPTCP client", client);
-    check("MPTCP accepted", server);
-    check("TCP client", plain);
-    check("accepted from TCP client", fallback);
+    /* This kernel offers MPTCP, so chaos-init must turn it off for Go. */
+    if (!chaos_init_net_mptcp_unresolvable())
+    {
+        (void)printf("FAIL chaos-init would leave MPTCP on for Go on a kernel with MPTCP\n");
+        ++g_failures;
+    }
+    check("MPTCP listener", listener, 0);
+    check("MPTCP client", client, 0);
+    check("MPTCP accepted", server, 0);
+    check("TCP client", plain, 0);
+    check("accepted from TCP client", fallback, 1);
     return g_failures == 0 ? 0 : 1;
 }

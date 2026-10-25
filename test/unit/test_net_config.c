@@ -794,6 +794,9 @@ static void test_file_and_state_edges(void)
         assert(rule.errnum == ECONNRESET);
         assert(!chaos_net_config_match_either_loaded(CHAOS_NET_OP_RECV, NULL, NULL, &rule));
         assert(!chaos_net_config_match_either_loaded(CHAOS_NET_OP_SEND, &local, &peer, &rule));
+        /* Only recv rules are loaded: recv is a target, send is not (no lookup needed). */
+        assert(chaos_net_config_targets_loaded(CHAOS_NET_OP_RECV));
+        assert(!chaos_net_config_targets_loaded(CHAOS_NET_OP_SEND));
         /* Final: the peer's exact match (rank 3) has no higher rule; the local end's `*`
          * match (rank 1) is outranked by the exact rule, and SEND matches nothing. */
         assert(chaos_net_config_match_final_loaded(CHAOS_NET_OP_RECV, &peer, &rule));
@@ -854,6 +857,7 @@ static void test_file_and_state_edges(void)
     chaos_net_config_reset_state(&g_chaos_net_config_states[g_chaos_net_active_config_index], 0);
     assert(!chaos_net_config_match_endpoint_loaded(CHAOS_NET_OP_CONNECT, &endpoint, &rule));
     assert(!chaos_net_config_match_either_loaded(CHAOS_NET_OP_CONNECT, &endpoint, NULL, &rule));
+    assert(!chaos_net_config_targets_loaded(CHAOS_NET_OP_CONNECT)); /* rejected file: no target */
     assert(!chaos_net_config_match_final_loaded(CHAOS_NET_OP_CONNECT, &endpoint, &rule));
 
     restore_file(CHAOS_NET_CONFIG_PATH, &backup);

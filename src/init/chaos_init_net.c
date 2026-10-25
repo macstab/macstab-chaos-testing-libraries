@@ -124,8 +124,9 @@ static const chaos_init_net_protocol_t g_chaos_init_net_protocols[] = {
     {"MPTCPv6", SOCK_STREAM, AF_INET6, NULL, IPPROTO_MPTCP},
 };
 
-/** @brief Test seams of chaos_init_net_mptcp_unresolvable(): the probe socket, and the
- *         protocol sock_diag is asked for (unit tests force either outcome). */
+/** @brief Test seams of the MPTCP probes (chaos_init_net_mptcp_unresolvable(),
+ *         chaos_init_net_mptcp_diag_available()): the probe socket, and the protocol
+ *         sock_diag is asked for (unit tests force either outcome). */
 #ifndef CHAOS_INIT_NET_MPTCP_SOCKET
 #define CHAOS_INIT_NET_MPTCP_SOCKET() socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_MPTCP)
 #endif
@@ -1302,6 +1303,18 @@ void chaos_init_net_commit(const chaos_init_call_t *call, const chaos_init_verdi
 int chaos_init_net_mptcp_unresolvable(void)
 {
     const int probe = CHAOS_INIT_NET_MPTCP_SOCKET();
+
+    if (probe < 0)
+    {
+        return 0; /* no MPTCP: Go uses plain TCP */
+    }
+    (void)close(probe);
+    return 1;
+}
+
+int chaos_init_net_mptcp_diag_available(void)
+{
+    const int probe = CHAOS_INIT_NET_MPTCP_SOCKET();
     struct sockaddr_in loopback;
     struct sockaddr_storage found;
     socklen_t found_length = 0;
@@ -1310,7 +1323,7 @@ int chaos_init_net_mptcp_unresolvable(void)
 
     if (probe < 0)
     {
-        return 0; /* no MPTCP: Go uses plain TCP */
+        return 0;
     }
     /* A listening loopback socket on an ephemeral port is what sock_diag would have to
      * find for an MPTCP server; any failure on the way counts as unresolvable. */
@@ -1324,5 +1337,5 @@ int chaos_init_net_mptcp_unresolvable(void)
             AF_INET, CHAOS_INIT_NET_MPTCP_DIAG, (unsigned long)info.st_ino, 0, &found, &found_length
         );
     (void)close(probe);
-    return unresolvable;
+    return !unresolvable;
 }

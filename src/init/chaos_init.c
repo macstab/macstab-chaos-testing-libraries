@@ -740,8 +740,9 @@ int main(int argc, char **argv)
     found = chaos_init_find_command(
         argv[options.command], getenv("PATH"), command_path, sizeof(command_path)
     );
-    /* Probed in the parent, before any filter: where the kernel offers MPTCP but sock_diag
-     * cannot locate its sockets, Go 1.24+ is told to use plain TCP so net rules can match. */
+    /* Probed in the parent, before any filter: where the kernel offers MPTCP, Go 1.24+ is
+     * told to use plain TCP, because its MPTCP connections from plain TCP clients cannot be
+     * resolved and net rules on them could never match. */
     mptcp_off = (options.libs & CHAOS_INIT_LIB_NET) != 0U && chaos_init_net_mptcp_unresolvable();
     child = fork();
     if (child < 0)

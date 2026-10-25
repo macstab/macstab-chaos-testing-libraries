@@ -1619,6 +1619,26 @@ int chaos_net_config_match_endpoint_loaded(
            chaos_snapshot_read_valid(&state->sequence, sequence);
 }
 
+int chaos_net_config_targets_loaded(chaos_net_operation_t operation)
+{
+    const chaos_net_config_state_t *state = chaos_net_config_active_state();
+    const uint64_t sequence = chaos_snapshot_read_begin(&state->sequence);
+    size_t index;
+
+    if (state->parse_ok == 0)
+    {
+        return 0;
+    }
+    for (index = 0U; index < state->rule_count; ++index)
+    {
+        if (state->rules[index].operation == operation)
+        {
+            return 1;
+        }
+    }
+    return !chaos_snapshot_read_valid(&state->sequence, sequence);
+}
+
 int chaos_net_config_match_final_loaded(
     chaos_net_operation_t operation, const chaos_net_endpoint_t *endpoint, chaos_net_rule_t *rule
 )

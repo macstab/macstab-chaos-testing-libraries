@@ -273,15 +273,18 @@ static void test_sock_diag(int listener, int client, const struct sockaddr_in *s
         );
     }
 
-    /* MPTCP resolvability probe: without MPTCP in the kernel there is nothing to
-     * resolve (0); with it, sock_diag must find the probe's own listener, else the
-     * sockets are unresolvable (1). */
+    /* MPTCP probes. Unresolvable: whenever the kernel offers MPTCP (a fallback connection
+     * is never resolvable), never without it. Diag available: only when sock_diag finds the
+     * probe's own listener. */
     g_mptcp_absent = 1;
     assert(!chaos_init_net_mptcp_unresolvable());
+    assert(!chaos_init_net_mptcp_diag_available());
     g_mptcp_absent = 0;
-    assert(chaos_init_net_mptcp_unresolvable()); /* TCP stand-in: no MPTCP socket of it */
+    assert(chaos_init_net_mptcp_unresolvable());
+    assert(!chaos_init_net_mptcp_diag_available()); /* TCP stand-in: no MPTCP socket of it */
     g_test_mptcp_diag = IPPROTO_TCP;
-    assert(!chaos_init_net_mptcp_unresolvable()); /* found when asked as what it is */
+    assert(chaos_init_net_mptcp_unresolvable());
+    assert(chaos_init_net_mptcp_diag_available()); /* found when asked as what it is */
     g_test_mptcp_diag = 262;
 
     /* A socket named "MPTCP" reports SOCK_STREAM and takes its addresses from sock_diag.
