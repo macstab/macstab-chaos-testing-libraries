@@ -4,7 +4,74 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.0.0] — 2026-10-25
+
+### Bug Fixes
+
+- **io:** Resolve libc symbols lazily so wrappers survive early constructors ([8be40ec](https://github.com/macstab/macstab-chaos-testing-libraries/commit/8be40ec1b6127f703077ff90e7ba7e6f8e7f4990))
+- **io:** Resolve libc symbols lazily so wrappers survive early constructors ([7300ddd](https://github.com/macstab/macstab-chaos-testing-libraries/commit/7300ddd35c77899f5fc7e08a0df8a9842ddefe88))
+- **io:** Resolve libc symbols lazily so wrappers survive early constructors ([#28](https://github.com/macstab/macstab-chaos-testing-libraries/issues/28)) ([fe6f523](https://github.com/macstab/macstab-chaos-testing-libraries/commit/fe6f5232a11dc1fecccfe76ff7e5158f237c15ee))
+- MPTCP fallback connections under chaos-init; fewer net lookups on non-sockets ([#42](https://github.com/macstab/macstab-chaos-testing-libraries/issues/42)) ([4d4303d](https://github.com/macstab/macstab-chaos-testing-libraries/commit/4d4303d09e83526dca75ad33979dc92c9eda4c73))
+
+### Build
+
+- **release:** Ship chaos-init-amd64 and chaos-init-arm64 ([032770b](https://github.com/macstab/macstab-chaos-testing-libraries/commit/032770bd6cf314b7ed2309bcec1db33a7f4bbef5))
+- **changelog:** Make bare x.y.z tags the changelog version boundaries ([6efb3eb](https://github.com/macstab/macstab-chaos-testing-libraries/commit/6efb3eb7a8dbecd922d6edde677930fc37ce8214))
+
+### Documentation
+
+- Update CHANGELOG for 1.0.1 ([#25](https://github.com/macstab/macstab-chaos-testing-libraries/issues/25)) ([08cbb25](https://github.com/macstab/macstab-chaos-testing-libraries/commit/08cbb252c6e5c5f6b19fb49393fc016550875fa6))
+- **bench:** Add 1.0.1-benchmarks.md ([#26](https://github.com/macstab/macstab-chaos-testing-libraries/issues/26)) ([f2fec58](https://github.com/macstab/macstab-chaos-testing-libraries/commit/f2fec5846fada4f85fcb2dc1df38cfe48424dcf5))
+- **bench:** Add 1.0.1-benchmarks.md ([#29](https://github.com/macstab/macstab-chaos-testing-libraries/issues/29)) ([e52c280](https://github.com/macstab/macstab-chaos-testing-libraries/commit/e52c2805585aa98018af185a6bd0b12599aa47a6))
+- **bench:** Add 1.0.1-benchmarks.md ([#31](https://github.com/macstab/macstab-chaos-testing-libraries/issues/31)) ([54043a2](https://github.com/macstab/macstab-chaos-testing-libraries/commit/54043a2c62f4117941d1724938661f3f0c0b7926))
+
+### Features
+
+- SECCOMP injection mode (chaos-init), review fixes, full coverage ([#33](https://github.com/macstab/macstab-chaos-testing-libraries/issues/33)) ([c3dde32](https://github.com/macstab/macstab-chaos-testing-libraries/commit/c3dde32e3e8012402e24287ccee7675901584ae5))
+
+### Miscellaneous
+
+- Sync main into develop after 1.0.1 ([#27](https://github.com/macstab/macstab-chaos-testing-libraries/issues/27)) ([2e6599a](https://github.com/macstab/macstab-chaos-testing-libraries/commit/2e6599a723178152cf95e6a2e86ff4ddea40a1b0))
+- Sync main into develop after 1.0.1 ([#30](https://github.com/macstab/macstab-chaos-testing-libraries/issues/30)) ([ab2fc5b](https://github.com/macstab/macstab-chaos-testing-libraries/commit/ab2fc5bac78535a6b3ff436eba390454487ec275))
+- Sync main into develop ([8327f2a](https://github.com/macstab/macstab-chaos-testing-libraries/commit/8327f2ad345de4a88d39ca5b6da924d920b43bbc))
+- Sync main into develop after 2.0.0 ([#38](https://github.com/macstab/macstab-chaos-testing-libraries/issues/38)) ([2dfc449](https://github.com/macstab/macstab-chaos-testing-libraries/commit/2dfc449ad61035b643647578e1da7add8e0fb668))
+- Sync main into develop after 2.0.0 ([#39](https://github.com/macstab/macstab-chaos-testing-libraries/issues/39)) ([616e28b](https://github.com/macstab/macstab-chaos-testing-libraries/commit/616e28bcc3776c9d8b325de8316514836c9a7a9b))
+- Sync main into develop before 2.0.1 ([#43](https://github.com/macstab/macstab-chaos-testing-libraries/issues/43)) ([1f8b786](https://github.com/macstab/macstab-chaos-testing-libraries/commit/1f8b786dd25b77667ed3767cbf6a4f59fb22d92d))
+
+### Performance
+
+- Fork children store only the per-process state that changed ([ae03bf4](https://github.com/macstab/macstab-chaos-testing-libraries/commit/ae03bf4569b2e65c44631e555e17881f747086d7))
+- **net:** Resolve the second end of a connection only when it could win ([6ca5986](https://github.com/macstab/macstab-chaos-testing-libraries/commit/6ca59861171c8d6e055fa2fe34eb13c667c5082b))
+- **io:** Resolve a new descriptor's path at its first rule check, not at open ([88f6407](https://github.com/macstab/macstab-chaos-testing-libraries/commit/88f6407bf116471f484ca2183c37cbe9b31969a8))
+
+### Testing
+
+- **io:** Cover concurrent symbol resolution; document the ordering contract ([d3c47d3](https://github.com/macstab/macstab-chaos-testing-libraries/commit/d3c47d338a3fd68a22b58ea8f9d3a2a354b35865))
+
+## [1.0.1] — 2026-09-28
+
+### Bug Fixes
+
+- Improve changelog PR creation to handle post-release automation edge cases ([4b93329](https://github.com/macstab/macstab-chaos-testing-libraries/commit/4b93329c158b7c8fa0cce37e29b4e75cb802299e))
+- **net:** Bound UNIX sun_path scan by address_length ([7140af3](https://github.com/macstab/macstab-chaos-testing-libraries/commit/7140af3e92af0937b8427c7c2f95a31913ed41d7))
+
+### Documentation
+
+- Update CHANGELOG for 1.0.0 ([#20](https://github.com/macstab/macstab-chaos-testing-libraries/issues/20)) ([ba054b4](https://github.com/macstab/macstab-chaos-testing-libraries/commit/ba054b4e5c857cb01093a504ba74add672b4de87))
+- **bench:** Add 1.0.0-benchmarks.md ([#21](https://github.com/macstab/macstab-chaos-testing-libraries/issues/21)) ([41e0c2f](https://github.com/macstab/macstab-chaos-testing-libraries/commit/41e0c2f6ce9166f28f0d8b830ab3d9701bdc43f9))
+- **demo:** Add runnable per-fault demo profiles ([4162de0](https://github.com/macstab/macstab-chaos-testing-libraries/commit/4162de0d0e7ba1cdc91635ef34b9c14ed479325f))
+
+### Miscellaneous
+
+- Sync main into develop after 1.0.0 ([46eec28](https://github.com/macstab/macstab-chaos-testing-libraries/commit/46eec28679528989cfdddb613cf7c9b646693d3e))
+- Add Apache-2.0 LICENSE file ([9513472](https://github.com/macstab/macstab-chaos-testing-libraries/commit/9513472745a16dc8994567faa190c8e41575b0c0))
+- Ignore Python bytecode caches ([597f7c7](https://github.com/macstab/macstab-chaos-testing-libraries/commit/597f7c7d388a8c31ee8b329542da2c7ab69880d7))
+
+### Refactoring
+
+- Remove unused `run_trio` function from benchmarking script ([8429118](https://github.com/macstab/macstab-chaos-testing-libraries/commit/8429118b32a57bfe6c8e167a1d91e726ec28a2f8))
+
+## [1.0.0] — 2026-05-03
 
 ### Bug Fixes
 
@@ -15,11 +82,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Refactor release workflow to improve changelog automation and remove unused bot token checks. ([f58fedb](https://github.com/macstab/macstab-chaos-testing-libraries/commit/f58fedb55671383ffcef1880893552bdc875b736))
 - Add release-over-release benchmarking and regression gating to release workflow ([9c72734](https://github.com/macstab/macstab-chaos-testing-libraries/commit/9c72734045f5803ab57a6e959a72a4aebe4af513))
 - Scope chaos rules to target-specific patterns to avoid matching harness calls ([7d2f39d](https://github.com/macstab/macstab-chaos-testing-libraries/commit/7d2f39d416504da6f9e5dae6c2de0b4e15740e48))
-- Improve changelog PR creation to handle post-release automation edge cases ([4b93329](https://github.com/macstab/macstab-chaos-testing-libraries/commit/4b93329c158b7c8fa0cce37e29b4e75cb802299e))
-- **net:** Bound UNIX sun_path scan by address_length ([7140af3](https://github.com/macstab/macstab-chaos-testing-libraries/commit/7140af3e92af0937b8427c7c2f95a31913ed41d7))
-- **io:** Resolve libc symbols lazily so wrappers survive early constructors ([8be40ec](https://github.com/macstab/macstab-chaos-testing-libraries/commit/8be40ec1b6127f703077ff90e7ba7e6f8e7f4990))
-- **io:** Resolve libc symbols lazily so wrappers survive early constructors ([7300ddd](https://github.com/macstab/macstab-chaos-testing-libraries/commit/7300ddd35c77899f5fc7e08a0df8a9842ddefe88))
-- **io:** Resolve libc symbols lazily so wrappers survive early constructors ([#28](https://github.com/macstab/macstab-chaos-testing-libraries/issues/28)) ([fe6f523](https://github.com/macstab/macstab-chaos-testing-libraries/commit/fe6f5232a11dc1fecccfe76ff7e5158f237c15ee))
 
 ### CI
 
@@ -37,13 +99,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **bench:** Add 1.0.0-benchmarks.md ([#16](https://github.com/macstab/macstab-chaos-testing-libraries/issues/16)) ([3be92ac](https://github.com/macstab/macstab-chaos-testing-libraries/commit/3be92ac243557c412791792db871b6955948870c))
 - **bench:** Add 1.0.0-benchmarks.md ([#18](https://github.com/macstab/macstab-chaos-testing-libraries/issues/18)) ([f8e468e](https://github.com/macstab/macstab-chaos-testing-libraries/commit/f8e468e1af13c727c4c76baea092f52cc50c83ad))
 - Update CHANGELOG for 1.0.0 ([#19](https://github.com/macstab/macstab-chaos-testing-libraries/issues/19)) ([b135ac5](https://github.com/macstab/macstab-chaos-testing-libraries/commit/b135ac5f18d0b5be6d38b1ca9fd4ae71dd558175))
-- Update CHANGELOG for 1.0.0 ([#20](https://github.com/macstab/macstab-chaos-testing-libraries/issues/20)) ([ba054b4](https://github.com/macstab/macstab-chaos-testing-libraries/commit/ba054b4e5c857cb01093a504ba74add672b4de87))
-- **bench:** Add 1.0.0-benchmarks.md ([#21](https://github.com/macstab/macstab-chaos-testing-libraries/issues/21)) ([41e0c2f](https://github.com/macstab/macstab-chaos-testing-libraries/commit/41e0c2f6ce9166f28f0d8b830ab3d9701bdc43f9))
-- **demo:** Add runnable per-fault demo profiles ([4162de0](https://github.com/macstab/macstab-chaos-testing-libraries/commit/4162de0d0e7ba1cdc91635ef34b9c14ed479325f))
-- Update CHANGELOG for 1.0.1 ([#25](https://github.com/macstab/macstab-chaos-testing-libraries/issues/25)) ([08cbb25](https://github.com/macstab/macstab-chaos-testing-libraries/commit/08cbb252c6e5c5f6b19fb49393fc016550875fa6))
-- **bench:** Add 1.0.1-benchmarks.md ([#26](https://github.com/macstab/macstab-chaos-testing-libraries/issues/26)) ([f2fec58](https://github.com/macstab/macstab-chaos-testing-libraries/commit/f2fec5846fada4f85fcb2dc1df38cfe48424dcf5))
-- **bench:** Add 1.0.1-benchmarks.md ([#29](https://github.com/macstab/macstab-chaos-testing-libraries/issues/29)) ([e52c280](https://github.com/macstab/macstab-chaos-testing-libraries/commit/e52c2805585aa98018af185a6bd0b12599aa47a6))
-- **bench:** Add 1.0.1-benchmarks.md ([#31](https://github.com/macstab/macstab-chaos-testing-libraries/issues/31)) ([54043a2](https://github.com/macstab/macstab-chaos-testing-libraries/commit/54043a2c62f4117941d1724938661f3f0c0b7926))
 
 ### Features
 
@@ -52,24 +107,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add benchmarking matrix with multi-variant support to release workflow ([35a86dd](https://github.com/macstab/macstab-chaos-testing-libraries/commit/35a86dd50a4decc09111589d2817d77f165d0e90))
 - Add benchmarking matrix with multi-variant support to release workflow ([9cf2e23](https://github.com/macstab/macstab-chaos-testing-libraries/commit/9cf2e234e9c0007620968725c99cd1e4e0bc62e3))
 - Add benchmarking matrix with multi-variant support to release workflow ([3e875b6](https://github.com/macstab/macstab-chaos-testing-libraries/commit/3e875b667ecb2b730c3be90156847a6ad26eb12d))
-- SECCOMP injection mode (chaos-init), review fixes, full coverage ([#33](https://github.com/macstab/macstab-chaos-testing-libraries/issues/33)) ([c3dde32](https://github.com/macstab/macstab-chaos-testing-libraries/commit/c3dde32e3e8012402e24287ccee7675901584ae5))
 
 ### Miscellaneous
 
 - Sync main into develop after 1.0.0 ([#14](https://github.com/macstab/macstab-chaos-testing-libraries/issues/14)) ([26b8831](https://github.com/macstab/macstab-chaos-testing-libraries/commit/26b8831d4cbc739aee9bec908603344137d3d7e8))
-- Sync main into develop after 1.0.0 ([46eec28](https://github.com/macstab/macstab-chaos-testing-libraries/commit/46eec28679528989cfdddb613cf7c9b646693d3e))
-- Add Apache-2.0 LICENSE file ([9513472](https://github.com/macstab/macstab-chaos-testing-libraries/commit/9513472745a16dc8994567faa190c8e41575b0c0))
-- Ignore Python bytecode caches ([597f7c7](https://github.com/macstab/macstab-chaos-testing-libraries/commit/597f7c7d388a8c31ee8b329542da2c7ab69880d7))
-- Sync main into develop after 1.0.1 ([#27](https://github.com/macstab/macstab-chaos-testing-libraries/issues/27)) ([2e6599a](https://github.com/macstab/macstab-chaos-testing-libraries/commit/2e6599a723178152cf95e6a2e86ff4ddea40a1b0))
-- Sync main into develop after 1.0.1 ([#30](https://github.com/macstab/macstab-chaos-testing-libraries/issues/30)) ([ab2fc5b](https://github.com/macstab/macstab-chaos-testing-libraries/commit/ab2fc5bac78535a6b3ff436eba390454487ec275))
-- Sync main into develop ([8327f2a](https://github.com/macstab/macstab-chaos-testing-libraries/commit/8327f2ad345de4a88d39ca5b6da924d920b43bbc))
-
-### Refactoring
-
-- Remove unused `run_trio` function from benchmarking script ([8429118](https://github.com/macstab/macstab-chaos-testing-libraries/commit/8429118b32a57bfe6c8e167a1d91e726ec28a2f8))
-
-### Testing
-
-- **io:** Cover concurrent symbol resolution; document the ordering contract ([d3c47d3](https://github.com/macstab/macstab-chaos-testing-libraries/commit/d3c47d338a3fd68a22b58ea8f9d3a2a354b35865))
 
 
