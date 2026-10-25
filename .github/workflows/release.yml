@@ -4,13 +4,16 @@
 #                    via `make docker-build-all`, glibc-floor check, SHA256SUMS
 #   release          CHANGELOG.md from git-cliff, release notes, GitHub release (created, or
 #                    updated when the tag already has one), then a changelog PR to main
-#   bench-sweep      one benchmark sweep per variant on a native runner of that architecture
-#   bench-aggregate  release-over-release regression gate, <tag>-benchmarks.md matrix, assets
+#   bench-sweep      per variant on a native runner of that architecture: scenario check, then
+#                    a 10-run sweep (benchmark/suite.tsv)
+#   bench-aggregate  release-over-release gate (benchmark/release-gate.sh, against the last
+#                    release that is not a prerelease), <tag>-benchmarks.md matrix, assets
 #                    attached to the release, matrix PR to main, main -> develop sync PR
 #
 # The release is published before any benchmark runs, so a benchmark failure never blocks it.
 # A release-over-release regression instead marks the published release as a prerelease and
-# fails the workflow.
+# fails the workflow. bench.yml runs the same sweep and gate on every pull request into main,
+# so a regression is normally caught before the tag; see RELEASING.md.
 # Secrets: GITHUB_TOKEN for release operations; BOT_GITHUB_TOKEN, BOT_USER_NAME and
 # BOT_USER_EMAIL for the commits and PRs to main/develop, which need a token that can bypass
 # branch protection (`gh pr merge --admin`).
@@ -226,12 +229,13 @@ jobs:
           fi
 
   # One sweep per variant on a runner of that architecture, so arm64 numbers come from arm64
-  # hardware, not from emulation. Each cell is measured 5 times (BENCH_WARMUP / BENCH_ITERS
+  # hardware, not from emulation. Each cell is measured 10 times (BENCH_WARMUP / BENCH_ITERS
   # override the run-bench.sh defaults of 10000 / 200000).
   bench-sweep:
     name: bench (${{ matrix.libc }}-${{ matrix.arch }})
     needs: [release]
-    timeout-minutes: 60
+    # 10 runs of the full suite take about twice the former 5-run sweep (~45 min).
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
@@ -257,6 +261,13 @@ jobs:
       - name: Lower perf_event_paranoid
         run: echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid
 
+      # Every scenario must load, and every errno scenario fire on each call, before its
+      # numbers mean anything.
+      - name: Check benchmark scenarios (${{ matrix.libc }}-${{ matrix.arch }})
+        run: ./benchmark/run-bench.sh --check-scenarios --libc=${{ matrix.libc }}
+
+      # 10 runs per arm: the rank-sum test's smallest p is ~1.8e-4 at 10+10 runs (0.009 at
+      # 5+5, just under the 0.01 threshold), so a real slowdown is flagged with margin.
       - name: Run benchmark sweep (${{ matrix.libc }}-${{ matrix.arch }})
         env:
           BENCH_WARMUP: 5000
@@ -264,7 +275,7 @@ jobs:
         run: |
           set +e
           ./benchmark/run-bench.sh \
-            --full --runs=5 --libc=${{ matrix.libc }} --compare
+            --full --runs=10 --libc=${{ matrix.libc }} --compare
           rc=$?
           set -e
           # Exit 1 is the A/B driver flagging a regression of preloaded vs baseline. Preloading
@@ -339,83 +350,22 @@ jobs:
             fi
           done
 
-      # The previous release is the most recently published non-draft release other than this
-      # tag. Its bench-envelopes-*.tar.gz assets are unpacked per variant. With no previous
-      # release, or no assets, the gate below is skipped.
-      - name: Download previous release envelopes (per variant)
+      # benchmark/release-gate.sh compares each variant with the last published release that
+      # is not a prerelease (a regressed release never becomes the baseline). Exit 1 is a
+      # regression, acted on in the last step after all assets are published; exit 2 (no
+      # baseline envelopes downloadable, driver error) fails the job at the end as well.
+      - name: Release-over-release gate
+        id: vs_prev
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG=${GITHUB_REF#refs/tags/}
-          PREV=$(gh release list --limit 20 \
-                   --json tagName,isDraft,publishedAt \
-                   --jq "[.[] | select(.tagName != \"$TAG\" and .isDraft == false)]
-                         | sort_by(.publishedAt) | reverse
-                         | .[0].tagName // \"\"")
-          mkdir -p prev/glibc-amd64 prev/musl-amd64 prev/glibc-arm64 prev/musl-arm64
-          if [ -z "$PREV" ]; then
-            echo "No previous release; skipping vs-prev gate"
-            exit 0
-          fi
-          echo "Previous release: $PREV"
-          mkdir -p prev-dl
-          gh release download "$PREV" --pattern 'bench-envelopes-*.tar.gz' \
-            --dir prev-dl 2>/dev/null || true
-          for f in prev-dl/*.tar.gz; do
-            [ -f "$f" ] || continue
-            base=$(basename "$f")
-            matched=""
-            for v in glibc-amd64 musl-amd64 glibc-arm64 musl-arm64; do
-              if echo "$base" | grep -q -- "-${v}\.tar\.gz$"; then
-                tar -xzf "$f" -C "prev/${v}"
-                echo "Loaded ${v} from $base"
-                matched=1
-                break
-              fi
-            done
-            # Releases before the four-variant matrix shipped one tarball without a variant
-            # suffix; it holds glibc-amd64 data.
-            if [ -z "$matched" ] && \
-               echo "$base" | grep -qE "^bench-envelopes-[^-]+\.tar\.gz$"; then
-              tar -xzf "$f" -C "prev/glibc-amd64"
-              echo "Loaded glibc-amd64 (legacy filename) from $base"
-            fi
-          done
-
-      # Per variant, chaos_bench_driver.py --vs-prev compares the preloaded runs of both
-      # releases per benchmark and exits 1 when one is slower by more than 15 % (median ns/op)
-      # and the difference is significant (Wilcoxon rank-sum p < 0.01, |r| > 0.5; needs >= 3
-      # runs per side). The result is exported as any_regression and acted on in the last
-      # step, after all assets are published.
-      - name: Run vs-prev gate per variant
-        id: vs_prev
-        run: |
-          mkdir -p reports
-          ANY=0
-          for v in glibc-amd64 musl-amd64 glibc-arm64 musl-arm64; do
-            if [ -z "$(ls envelopes/${v}/*.json 2>/dev/null)" ]; then
-              continue
-            fi
-            if [ -z "$(ls prev/${v}/*.json 2>/dev/null)" ]; then
-              echo "_Release-over-release gate skipped for ${v}: no previous envelopes._" \
-                > "reports/benchmark-vs-prev-${v}.md"
-              continue
-            fi
-            set +e
-            python3 benchmark/driver/chaos_bench_driver.py \
-              --vs-prev "prev/${v}" \
-              --vs-prev-pct 15 \
-              --md \
-              --output "reports/benchmark-vs-prev-${v}.md" \
-              "envelopes/${v}"
-            rc=$?
-            set -e
-            if [ "$rc" -eq 1 ]; then
-              echo "::error::vs-prev regression on ${v} (>15%)"
-              ANY=1
-            fi
-          done
-          echo "any_regression=$ANY" >> "$GITHUB_OUTPUT"
+          rc=0
+          sh benchmark/release-gate.sh envelopes reports "$TAG" || rc=$?
+          cat reports/gate-summary.md
+          echo "any_regression=$([ "$rc" -eq 1 ] && echo 1 || echo 0)" >> "$GITHUB_OUTPUT"
+          echo "gate_error=$([ "$rc" -ge 2 ] && echo 1 || echo 0)" >> "$GITHUB_OUTPUT"
+          cat reports/gate-summary.md >> "$GITHUB_STEP_SUMMARY"
 
       # <tag>-benchmarks.md: one table across all variants that produced envelopes.
       - name: Generate benchmark matrix
@@ -440,7 +390,7 @@ jobs:
             -exec cp {} release-bench/ \;
           find bench-artifacts -name 'bench-envelopes-*.tar.gz' \
             -exec cp {} release-bench/ \;
-          cp reports/benchmark-vs-prev-*.md release-bench/ 2>/dev/null || true
+          cp reports/benchmark-vs-prev-*.md reports/gate-summary.md release-bench/ 2>/dev/null || true
           cp "reports/${TAG}-benchmarks.md" release-bench/
 
       - name: Upload aggregate artifact
@@ -510,12 +460,15 @@ jobs:
             --title "chore: sync main into develop after ${TAG}" \
             --body "Auto-generated sync after release ${TAG} (changelog + benchmark matrix)." \
             || echo "PR may already exist; continuing"
+          # A merge commit, never a squash: only a merge records main as merged into develop.
+          # A squashed sync leaves main's commits unmerged, so the next develop -> main PR
+          # conflicts with them again.
           # Admin-merge immediately; if that fails (typically a conflict on develop), request
           # auto-merge so the PR lands once a human resolves it. Never fails the step.
-          if ! gh pr merge main --squash --admin 2>/tmp/merge.err; then
+          if ! gh pr merge main --merge --admin 2>/tmp/merge.err; then
             cat /tmp/merge.err
             echo "::warning::main->develop PR could not be auto-merged (likely conflicts on develop); enabling --auto so it merges once resolved."
-            gh pr merge main --squash --admin --auto || echo "::warning::Could not enable --auto either; manual resolution required."
+            gh pr merge main --merge --admin --auto || echo "::warning::Could not enable --auto either; manual resolution required."
           fi
 
       # Runs last, so all reports are attached first. Prepends a warning to the release notes,
@@ -529,12 +482,14 @@ jobs:
           {
             echo "## ⚠️ PERFORMANCE REGRESSION DETECTED"
             echo ""
-            echo "The release-over-release benchmark gate flagged this release"
-            echo "on at least one variant: chaos-hook overhead exceeds the previous"
-            echo "release by more than 15% on at least one benchmark."
+            echo "The release-over-release benchmark gate flagged this release: on at"
+            echo "least one variant a benchmark is slower than the last accepted release"
+            echo "by more than 15 % and 25 ns. It has been marked **prerelease**"
+            echo "automatically and will not serve as the next release's baseline."
             echo ""
-            echo "See the per-variant \`benchmark-vs-prev-*.md\` (attached) for"
-            echo "the breakdown. This release has been marked **prerelease** automatically."
+            cat reports/gate-summary.md
+            echo ""
+            echo "Per-variant breakdown: the attached \`benchmark-vs-prev-*.md\`."
             echo ""
             echo "---"
             echo ""
@@ -543,4 +498,10 @@ jobs:
           gh release edit "$TAG" \
             --prerelease \
             --notes-file release-notes-warned.md
+          exit 1
+
+      - name: Fail on a gate error
+        if: steps.vs_prev.outputs.gate_error == '1'
+        run: |
+          echo "::error::The release-over-release gate could not run; see the gate step's log."
           exit 1

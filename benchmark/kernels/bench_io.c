@@ -9,16 +9,13 @@
  * matching `benchmark/scenarios/io-*.conf` copied to the rule file
  * `/tmp/.chaos-io.conf` (treatment); the driver reports the median difference.
  *
- * Targets are chosen so the kernel side is cheap and stable and the wrapper dominates:
- * `/dev/zero` and `/dev/null` (no filesystem, no blocking), or a 4 KiB unlinked temp
- * file in `/tmp` whose single page stays in the page cache.
+ * Every target is a temp file under /tmp/chaos-bench-io (sendfile's output under
+ * /tmp/chaos-bench-io/out), small enough to stay in the page cache, so the kernel side is
+ * cheap and stable and the wrapper dominates. /dev targets are not used: libchaos-io
+ * excludes /dev, so their rules could never match.
  *
- * Scenario status at this revision (checked against src/config/chaos_io_config.c):
- *  - Effective: pread, read, write, open_close.
- *  - Never fire, so `_match_no_fire` and `_errno` equal `_passthrough`: openat_close,
- *    readv, writev, ftruncate, fallocate, sendfile (operation token not accepted) and
- *    fsync, fdatasync (path selector `/tmp/chaos-bench-io.*` is a literal prefix, not
- *    a glob). Each scenario file states its defect.
+ * Every scenario loads and its errno arm fires; `run-bench.sh --check-scenarios` proves
+ * it, and CI runs that check.
  *
  * The `_errno` arm skips the real call, so its delta is wrapper cost minus the skipped
  * kernel work.
@@ -43,6 +40,26 @@
 #define BENCH_IO_PAYLOAD_BYTES 64
 #define BENCH_IO_FILE_BYTES    4096
 
+/*
+ * Every kernel's file lives under BENCH_IO_DIR (sendfile's output under BENCH_IO_OUT_DIR),
+ * and the scenarios select that directory. libchaos-io matches path prefixes at component
+ * boundaries only, so a directory is the one selector that covers mkstemp's random names,
+ * including the "<path> (deleted)" names of the unlinked ones.
+ */
+#define BENCH_IO_DIR     "/tmp/chaos-bench-io"
+#define BENCH_IO_OUT_DIR BENCH_IO_DIR "/out"
+
+/** @brief Creates BENCH_IO_DIR and BENCH_IO_OUT_DIR if missing; aborts on any other error. */
+static void bench_io_make_dirs(void)
+{
+    if ((mkdir(BENCH_IO_DIR, 0700) != 0 && errno != EEXIST) ||
+        (mkdir(BENCH_IO_OUT_DIR, 0700) != 0 && errno != EEXIST))
+    {
+        perror("bench_io: mkdir " BENCH_IO_DIR);
+        abort();
+    }
+}
+
 /**
  * @brief State of the temp-file kernels (pread, fsync, fdatasync, ftruncate, fallocate).
  *
@@ -59,7 +76,9 @@ typedef struct bench_io_state
 static void bench_io_setup(void *user_state)
 {
     bench_io_state_t *s = (bench_io_state_t *)user_state;
-    char path[] = "/tmp/chaos-bench-io.XXXXXX";
+    char path[] = BENCH_IO_DIR "/f.XXXXXX";
+
+    bench_io_make_dirs();
     char fill[BENCH_IO_FILE_BYTES];
     ssize_t written;
 
@@ -106,41 +125,79 @@ CHAOS_BENCH("io", pread_match_no_fire,  bench_io_state_t,
 CHAOS_BENCH("io", pread_errno,          bench_io_state_t,
             bench_io_setup, bench_io_iter_pread, bench_io_teardown)
 
-/* ------------------------------------------------------------------ read ---
- * `read(/dev/zero, 64)` and `write(/dev/null, 64)`: character devices with no file
- * position, no page cache and no blocking, so the kernel cost is the bare syscall.
+/* -------------------------------------------------------- read/write/readv/writev ---
+ * 64 bytes per call on a 64 KiB unlinked temp file named like the other io kernels' files,
+ * so the scenarios' `/tmp/chaos-bench-io` selector matches it. (Character devices such as
+ * /dev/zero cannot be used: libchaos-io excludes /dev, so a rule there never matches and
+ * the match-no-fire and errno arms would measure passthrough.) The position wraps to 0
+ * with one lseek every 1024 calls, so the file stays 64 KiB and in the page cache.
  */
-typedef struct bench_io_dev_state
-{
-    int     fd;
-    char    buffer[BENCH_IO_PAYLOAD_BYTES];
-    ssize_t rc;
-} bench_io_dev_state_t;
+#define BENCH_IO_RW_CALLS_PER_WRAP 1024U
+#define BENCH_IO_RW_FILE_BYTES     (BENCH_IO_RW_CALLS_PER_WRAP * BENCH_IO_PAYLOAD_BYTES)
 
-static void bench_io_devzero_setup(void *user_state)
+typedef struct bench_io_rw_state
 {
-    bench_io_dev_state_t *s = (bench_io_dev_state_t *)user_state;
-    s->fd = open("/dev/zero", O_RDONLY);
-    if (s->fd < 0) { perror("bench_io: open /dev/zero"); abort(); }
-}
+    int          fd;
+    unsigned int calls;
+    char         buffer[BENCH_IO_PAYLOAD_BYTES];
+    char         buf_a[BENCH_IO_PAYLOAD_BYTES / 2];
+    char         buf_b[BENCH_IO_PAYLOAD_BYTES / 2];
+    struct iovec iov[2];
+    ssize_t      rc;
+} bench_io_rw_state_t;
 
-static void bench_io_devnull_setup(void *user_state)
+static void bench_io_rw_setup(void *user_state)
 {
-    bench_io_dev_state_t *s = (bench_io_dev_state_t *)user_state;
-    s->fd = open("/dev/null", O_WRONLY);
-    if (s->fd < 0) { perror("bench_io: open /dev/null"); abort(); }
+    bench_io_rw_state_t *s = (bench_io_rw_state_t *)user_state;
+    char path[] = BENCH_IO_DIR "/f.XXXXXX";
+
+    bench_io_make_dirs();
+    char fill[BENCH_IO_FILE_BYTES];
+    size_t done;
+
+    s->fd = mkstemp(path);
+    if (s->fd < 0) { perror("bench_io: mkstemp"); abort(); }
+    (void)unlink(path);
+    /* pwrite, not write: setup runs with the scenario installed, and the write arms'
+     * rule selects write on this very file. */
+    memset(fill, 0xA5, sizeof(fill));
+    for (done = 0U; done < BENCH_IO_RW_FILE_BYTES; done += sizeof(fill))
+    {
+        if (pwrite(s->fd, fill, sizeof(fill), (off_t)done) != (ssize_t)sizeof(fill))
+        {
+            perror("bench_io: pwrite");
+            abort();
+        }
+    }
+    (void)lseek(s->fd, 0, SEEK_SET);
+    s->calls = 0U;
     memset(s->buffer, 0xC3, sizeof(s->buffer));
+    memset(s->buf_a, 0xA1, sizeof(s->buf_a));
+    memset(s->buf_b, 0xB2, sizeof(s->buf_b));
+    s->iov[0].iov_base = s->buf_a; s->iov[0].iov_len = sizeof(s->buf_a);
+    s->iov[1].iov_base = s->buf_b; s->iov[1].iov_len = sizeof(s->buf_b);
 }
 
-static void bench_io_dev_teardown(void *user_state)
+static void bench_io_rw_teardown(void *user_state)
 {
-    bench_io_dev_state_t *s = (bench_io_dev_state_t *)user_state;
+    bench_io_rw_state_t *s = (bench_io_rw_state_t *)user_state;
     if (s->fd >= 0) (void)close(s->fd);
+}
+
+/** @brief Rewinds the file once every BENCH_IO_RW_CALLS_PER_WRAP calls. */
+static void bench_io_rw_wrap(bench_io_rw_state_t *s)
+{
+    if (++s->calls == BENCH_IO_RW_CALLS_PER_WRAP)
+    {
+        s->calls = 0U;
+        (void)lseek(s->fd, 0, SEEK_SET);
+    }
 }
 
 static void bench_io_iter_read(void *user_state)
 {
-    bench_io_dev_state_t *s = (bench_io_dev_state_t *)user_state;
+    bench_io_rw_state_t *s = (bench_io_rw_state_t *)user_state;
+    bench_io_rw_wrap(s);
     s->rc = read(s->fd, s->buffer, sizeof(s->buffer));
     CHAOS_BENCH_DO_NOT_OPTIMIZE(s->rc);
     CHAOS_BENCH_DO_NOT_OPTIMIZE(s->buffer);
@@ -148,67 +205,16 @@ static void bench_io_iter_read(void *user_state)
 
 static void bench_io_iter_write(void *user_state)
 {
-    bench_io_dev_state_t *s = (bench_io_dev_state_t *)user_state;
+    bench_io_rw_state_t *s = (bench_io_rw_state_t *)user_state;
+    bench_io_rw_wrap(s);
     s->rc = write(s->fd, s->buffer, sizeof(s->buffer));
     CHAOS_BENCH_DO_NOT_OPTIMIZE(s->rc);
 }
 
-CHAOS_BENCH("io", read_passthrough,    bench_io_dev_state_t,
-            bench_io_devzero_setup, bench_io_iter_read, bench_io_dev_teardown)
-CHAOS_BENCH("io", read_match_no_fire,  bench_io_dev_state_t,
-            bench_io_devzero_setup, bench_io_iter_read, bench_io_dev_teardown)
-CHAOS_BENCH("io", read_errno,          bench_io_dev_state_t,
-            bench_io_devzero_setup, bench_io_iter_read, bench_io_dev_teardown)
-
-CHAOS_BENCH("io", write_passthrough,    bench_io_dev_state_t,
-            bench_io_devnull_setup, bench_io_iter_write, bench_io_dev_teardown)
-CHAOS_BENCH("io", write_match_no_fire,  bench_io_dev_state_t,
-            bench_io_devnull_setup, bench_io_iter_write, bench_io_dev_teardown)
-CHAOS_BENCH("io", write_errno,          bench_io_dev_state_t,
-            bench_io_devnull_setup, bench_io_iter_write, bench_io_dev_teardown)
-
-/* ----------------------------------------------------------- readv/writev ---
- * Two 32-byte iovecs against /dev/zero and /dev/null: same total payload as read and
- * write, so the difference isolates the vectored wrapper path.
- */
-typedef struct bench_io_iov_state
-{
-    int          fd;
-    char         buf_a[32];
-    char         buf_b[32];
-    struct iovec iov[2];
-    ssize_t      rc;
-} bench_io_iov_state_t;
-
-static void bench_io_readv_setup(void *user_state)
-{
-    bench_io_iov_state_t *s = (bench_io_iov_state_t *)user_state;
-    s->fd = open("/dev/zero", O_RDONLY);
-    if (s->fd < 0) { perror("bench_io: open /dev/zero"); abort(); }
-    s->iov[0].iov_base = s->buf_a; s->iov[0].iov_len = sizeof(s->buf_a);
-    s->iov[1].iov_base = s->buf_b; s->iov[1].iov_len = sizeof(s->buf_b);
-}
-
-static void bench_io_writev_setup(void *user_state)
-{
-    bench_io_iov_state_t *s = (bench_io_iov_state_t *)user_state;
-    s->fd = open("/dev/null", O_WRONLY);
-    if (s->fd < 0) { perror("bench_io: open /dev/null"); abort(); }
-    memset(s->buf_a, 0xA1, sizeof(s->buf_a));
-    memset(s->buf_b, 0xB2, sizeof(s->buf_b));
-    s->iov[0].iov_base = s->buf_a; s->iov[0].iov_len = sizeof(s->buf_a);
-    s->iov[1].iov_base = s->buf_b; s->iov[1].iov_len = sizeof(s->buf_b);
-}
-
-static void bench_io_iov_teardown(void *user_state)
-{
-    bench_io_iov_state_t *s = (bench_io_iov_state_t *)user_state;
-    if (s->fd >= 0) (void)close(s->fd);
-}
-
 static void bench_io_iter_readv(void *user_state)
 {
-    bench_io_iov_state_t *s = (bench_io_iov_state_t *)user_state;
+    bench_io_rw_state_t *s = (bench_io_rw_state_t *)user_state;
+    bench_io_rw_wrap(s);
     s->rc = readv(s->fd, s->iov, 2);
     CHAOS_BENCH_DO_NOT_OPTIMIZE(s->rc);
     CHAOS_BENCH_DO_NOT_OPTIMIZE(s->buf_a);
@@ -217,69 +223,99 @@ static void bench_io_iter_readv(void *user_state)
 
 static void bench_io_iter_writev(void *user_state)
 {
-    bench_io_iov_state_t *s = (bench_io_iov_state_t *)user_state;
+    bench_io_rw_state_t *s = (bench_io_rw_state_t *)user_state;
+    bench_io_rw_wrap(s);
     s->rc = writev(s->fd, s->iov, 2);
     CHAOS_BENCH_DO_NOT_OPTIMIZE(s->rc);
 }
 
-CHAOS_BENCH("io", readv_passthrough,    bench_io_iov_state_t,
-            bench_io_readv_setup, bench_io_iter_readv, bench_io_iov_teardown)
-CHAOS_BENCH("io", readv_match_no_fire,  bench_io_iov_state_t,
-            bench_io_readv_setup, bench_io_iter_readv, bench_io_iov_teardown)
-CHAOS_BENCH("io", readv_errno,          bench_io_iov_state_t,
-            bench_io_readv_setup, bench_io_iter_readv, bench_io_iov_teardown)
+CHAOS_BENCH("io", read_passthrough,    bench_io_rw_state_t,
+            bench_io_rw_setup, bench_io_iter_read, bench_io_rw_teardown)
+CHAOS_BENCH("io", read_match_no_fire,  bench_io_rw_state_t,
+            bench_io_rw_setup, bench_io_iter_read, bench_io_rw_teardown)
+CHAOS_BENCH("io", read_errno,          bench_io_rw_state_t,
+            bench_io_rw_setup, bench_io_iter_read, bench_io_rw_teardown)
 
-CHAOS_BENCH("io", writev_passthrough,    bench_io_iov_state_t,
-            bench_io_writev_setup, bench_io_iter_writev, bench_io_iov_teardown)
-CHAOS_BENCH("io", writev_match_no_fire,  bench_io_iov_state_t,
-            bench_io_writev_setup, bench_io_iter_writev, bench_io_iov_teardown)
-CHAOS_BENCH("io", writev_errno,          bench_io_iov_state_t,
-            bench_io_writev_setup, bench_io_iter_writev, bench_io_iov_teardown)
+CHAOS_BENCH("io", write_passthrough,    bench_io_rw_state_t,
+            bench_io_rw_setup, bench_io_iter_write, bench_io_rw_teardown)
+CHAOS_BENCH("io", write_match_no_fire,  bench_io_rw_state_t,
+            bench_io_rw_setup, bench_io_iter_write, bench_io_rw_teardown)
+CHAOS_BENCH("io", write_errno,          bench_io_rw_state_t,
+            bench_io_rw_setup, bench_io_iter_write, bench_io_rw_teardown)
 
-/* -------------------------------------------------------------- open_close ---
- * `open("/dev/null")` followed by `close`: both calls are wrapped, so the baseline
- * delta covers two wrappers. The pair keeps the fd table from growing. In the `_errno`
- * arm open fails with ENOENT and close is skipped. `run-bench.sh` caps it at 20000
- * iterations.
+CHAOS_BENCH("io", readv_passthrough,    bench_io_rw_state_t,
+            bench_io_rw_setup, bench_io_iter_readv, bench_io_rw_teardown)
+CHAOS_BENCH("io", readv_match_no_fire,  bench_io_rw_state_t,
+            bench_io_rw_setup, bench_io_iter_readv, bench_io_rw_teardown)
+CHAOS_BENCH("io", readv_errno,          bench_io_rw_state_t,
+            bench_io_rw_setup, bench_io_iter_readv, bench_io_rw_teardown)
+
+CHAOS_BENCH("io", writev_passthrough,    bench_io_rw_state_t,
+            bench_io_rw_setup, bench_io_iter_writev, bench_io_rw_teardown)
+CHAOS_BENCH("io", writev_match_no_fire,  bench_io_rw_state_t,
+            bench_io_rw_setup, bench_io_iter_writev, bench_io_rw_teardown)
+CHAOS_BENCH("io", writev_errno,          bench_io_rw_state_t,
+            bench_io_rw_setup, bench_io_iter_writev, bench_io_rw_teardown)
+
+/* --------------------------------------------------------- open/openat + close ---
+ * open or openat(AT_FDCWD) of a temp file that exists for the whole run, then close:
+ * both calls are wrapped, so the delta covers two wrappers. The pair keeps the fd table
+ * from growing. In the `_errno` arm the open fails and close is skipped. Capped at
+ * 20000 iterations in benchmark/suite.tsv.
  */
 typedef struct bench_io_oc_state
 {
-    int fd;
+    int  fd;
+    char path[32];
 } bench_io_oc_state_t;
+
+static void bench_io_oc_setup(void *user_state)
+{
+    bench_io_oc_state_t *s = (bench_io_oc_state_t *)user_state;
+    int fd;
+
+    bench_io_make_dirs();
+    (void)snprintf(s->path, sizeof(s->path), "%s", BENCH_IO_DIR "/f.XXXXXX");
+    fd = mkstemp(s->path);
+    if (fd < 0) { perror("bench_io: mkstemp"); abort(); }
+    (void)close(fd);
+}
+
+static void bench_io_oc_teardown(void *user_state)
+{
+    bench_io_oc_state_t *s = (bench_io_oc_state_t *)user_state;
+    (void)unlink(s->path);
+}
 
 static void bench_io_iter_open_close(void *user_state)
 {
     bench_io_oc_state_t *s = (bench_io_oc_state_t *)user_state;
-    s->fd = open("/dev/null", O_RDONLY);
+    s->fd = open(s->path, O_RDONLY);
+    CHAOS_BENCH_DO_NOT_OPTIMIZE(s->fd);
+    if (s->fd >= 0) (void)close(s->fd);
+}
+
+static void bench_io_iter_openat_close(void *user_state)
+{
+    bench_io_oc_state_t *s = (bench_io_oc_state_t *)user_state;
+    s->fd = openat(AT_FDCWD, s->path, O_RDONLY);
     CHAOS_BENCH_DO_NOT_OPTIMIZE(s->fd);
     if (s->fd >= 0) (void)close(s->fd);
 }
 
 CHAOS_BENCH("io", open_close_passthrough,    bench_io_oc_state_t,
-            NULL, bench_io_iter_open_close, NULL)
+            bench_io_oc_setup, bench_io_iter_open_close, bench_io_oc_teardown)
 CHAOS_BENCH("io", open_close_match_no_fire,  bench_io_oc_state_t,
-            NULL, bench_io_iter_open_close, NULL)
+            bench_io_oc_setup, bench_io_iter_open_close, bench_io_oc_teardown)
 CHAOS_BENCH("io", open_close_errno,          bench_io_oc_state_t,
-            NULL, bench_io_iter_open_close, NULL)
-
-/* ----------------------------------------------------------- openat_close ---
- * `openat(AT_FDCWD, "/dev/null")` followed by `close`: openat is a separate libc entry
- * point with its own wrapper. Capped at 20000 iterations.
- */
-static void bench_io_iter_openat_close(void *user_state)
-{
-    bench_io_oc_state_t *s = (bench_io_oc_state_t *)user_state;
-    s->fd = openat(AT_FDCWD, "/dev/null", O_RDONLY);
-    CHAOS_BENCH_DO_NOT_OPTIMIZE(s->fd);
-    if (s->fd >= 0) (void)close(s->fd);
-}
+            bench_io_oc_setup, bench_io_iter_open_close, bench_io_oc_teardown)
 
 CHAOS_BENCH("io", openat_close_passthrough,    bench_io_oc_state_t,
-            NULL, bench_io_iter_openat_close, NULL)
+            bench_io_oc_setup, bench_io_iter_openat_close, bench_io_oc_teardown)
 CHAOS_BENCH("io", openat_close_match_no_fire,  bench_io_oc_state_t,
-            NULL, bench_io_iter_openat_close, NULL)
+            bench_io_oc_setup, bench_io_iter_openat_close, bench_io_oc_teardown)
 CHAOS_BENCH("io", openat_close_errno,          bench_io_oc_state_t,
-            NULL, bench_io_iter_openat_close, NULL)
+            bench_io_oc_setup, bench_io_iter_openat_close, bench_io_oc_teardown)
 
 /* ------------------------------------------------------------------ fsync ---
  * `fsync` / `fdatasync` on the temp file. Setup dirties one page; the first call (in
@@ -372,10 +408,11 @@ typedef struct bench_io_sendfile_state
 static void bench_io_sendfile_setup(void *user_state)
 {
     bench_io_sendfile_state_t *s = (bench_io_sendfile_state_t *)user_state;
-    char in_path[]  = "/tmp/chaos-bench-sf-in.XXXXXX";
-    char out_path[] = "/tmp/chaos-bench-sf-out.XXXXXX";
+    char in_path[]  = BENCH_IO_DIR "/in.XXXXXX";
+    char out_path[] = BENCH_IO_OUT_DIR "/f.XXXXXX";
     char fill[BENCH_IO_FILE_BYTES];
 
+    bench_io_make_dirs();
     s->in_fd  = mkstemp(in_path);
     s->out_fd = mkstemp(out_path);
     if (s->in_fd < 0 || s->out_fd < 0) { perror("bench_io: mkstemp sendfile"); abort(); }

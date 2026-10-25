@@ -18,9 +18,8 @@
  * skipped resolver work; in the 1.0.1 matrix it is negative on every variant.
  * `run-bench.sh` caps both lookups at 20000 iterations.
  *
- * Scenario status at this revision: the getnameinfo scenarios use `dns://\*`, but
- * getnameinfo consults rdns:// rules, so its `_match_no_fire` and `_errno` arms measure
- * the passthrough path.
+ * Every scenario loads, and every errno scenario fires on each measured call:
+ * `run-bench.sh --check-scenarios` proves it, and CI runs that check.
  *
  * The getaddrinfo kernel frees every result list it receives, so allocator state does
  * not grow across iterations; a failed lookup returns no list.

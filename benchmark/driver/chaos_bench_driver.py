@@ -15,8 +15,18 @@ Inputs are grouped by benchmark `name`.  Within each group we identify:
 If both groups have at least one sample each, the comparison runs.
 
 The driver depends only on the Python 3 standard library (no scipy/numpy).
-The Mann-Whitney U test is implemented from first principles using the
-exact distribution for n+m <= 20 and the normal approximation otherwise.
+The Mann-Whitney U (Wilcoxon rank-sum) test uses the normal approximation
+for every sample size; the smallest reachable two-sided p is 0.0090 at 5+5
+runs and about 1.8e-4 at 10+10, so --regression-p 0.01 needs at least 5
+runs per side.
+
+Release-over-release mode (--vs-prev) compares the preloaded runs of two
+sweeps benchmark by benchmark. A benchmark is compared only when both
+sweeps measured the same thing: each report directory may carry the
+suite.tsv it was run from, whose krev (kernel) and srev (scenario)
+columns give every benchmark a revision; a directory without one counts
+as revision 1 throughout. A benchmark whose revision differs is listed as
+re-baselined and never flagged.
 
 Output:
   --json   One summary JSON to stdout (or --output PATH).
@@ -25,8 +35,9 @@ Output:
 Exit codes:
   0  no regressions detected
   1  one or more benchmarks show a statistically significant slowdown
-     (p < 0.01, |r| > 0.5, median delta > 3%).  Threshold tuneable via
-     --regression-p / --regression-r / --regression-pct.
+     (p < 0.01, |r| > 0.5, median delta > 3%; in --vs-prev mode > 15% and
+     more than --vs-prev-min-ns).  Tuneable via --regression-p /
+     --regression-r / --regression-pct / --vs-prev-pct / --vs-prev-min-ns.
   2  fatal error (no inputs, malformed JSON, etc.)
 """
 
@@ -65,6 +76,36 @@ def _load_dir(directory: str) -> list[dict[str, Any]]:
         if env is not None:
             out.append(env)
     return out
+
+
+def _load_revisions(directory: str) -> dict[str, str]:
+    """Benchmark name -> revision from <directory>/suite.tsv; empty without the file.
+
+    The passthrough arm carries the kernel revision ("k<krev>"); the match-no-fire and
+    errno arms also depend on their scenario ("k<krev>.s<srev>").
+    """
+    path = os.path.join(directory, "suite.tsv")
+    revisions: dict[str, str] = {}
+    if not os.path.isfile(path):
+        return revisions
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            fields = line.split()
+            if not fields or fields[0].startswith("#") or len(fields) < 9:
+                continue
+            _lib, passthrough, prefix = fields[0], fields[1], fields[2]
+            krev, srev = fields[7], fields[8]
+            revisions[passthrough] = f"k{krev}"
+            revisions[f"{prefix}_match_no_fire"] = f"k{krev}.s{srev}"
+            revisions[f"{prefix}_errno"] = f"k{krev}.s{srev}"
+    return revisions
+
+
+def _revision(revisions: dict[str, str], name: str) -> str:
+    """Revision of benchmark @name; revision 1 when its suite.tsv does not list it."""
+    if name in revisions:
+        return revisions[name]
+    return "k1.s1" if name.endswith(("_match_no_fire", "_errno")) else "k1"
 
 
 # ---------------------------------------------------------------- stats ---
@@ -281,7 +322,8 @@ class Comparison:
 
 
 def _compare(name: str, base: list[BenchSample], treat: list[BenchSample],
-             threshold_p: float, threshold_r: float, threshold_pct: float) -> Comparison:
+             threshold_p: float, threshold_r: float, threshold_pct: float,
+             min_delta_ns: float = 0.0) -> Comparison:
     base_medians = [s.median_ns for s in base]
     treat_medians = [s.median_ns for s in treat]
 
@@ -312,6 +354,7 @@ def _compare(name: str, base: list[BenchSample], treat: list[BenchSample],
         and p < threshold_p
         and abs(r) > threshold_r
         and delta_pct > threshold_pct
+        and delta > min_delta_ns
     )
 
     return Comparison(
@@ -516,6 +559,16 @@ def main() -> int:
         default=15.0,
         help="percent slowdown threshold for release-over-release regression (default 15).",
     )
+    ap.add_argument(
+        "--vs-prev-min-ns",
+        type=float,
+        default=0.0,
+        help=(
+            "absolute slowdown (median ns) a release-over-release regression must also "
+            "exceed (default 0): keeps scheduler and VM jitter on nanosecond-scale "
+            "benchmarks from failing the gate."
+        ),
+    )
     args = ap.parse_args()
 
     envelopes = _load_dir(args.input_dir)
@@ -562,14 +615,24 @@ def main() -> int:
         for s in curr_treat:
             by_curr.setdefault(s.benchmark, []).append(s)
 
+        prev_revisions = _load_revisions(args.vs_prev)
+        curr_revisions = _load_revisions(args.input_dir)
         common = sorted(set(by_prev) & set(by_curr))
         comparisons: list[Comparison] = []
         breakdown_groups: dict[str, tuple[list, list]] = {}
         for name in common:
-            comparisons.append(_compare(
+            comparison = _compare(
                 name, by_prev[name], by_curr[name],
                 args.regression_p, args.regression_r, args.vs_prev_pct,
-            ))
+                args.vs_prev_min_ns,
+            )
+            prev_rev = _revision(prev_revisions, name)
+            curr_rev = _revision(curr_revisions, name)
+            if prev_rev != curr_rev:
+                # The kernel or scenario changed: the two numbers measure different things.
+                comparison.regression = False
+                comparison.note = f"re-baselined ({prev_rev} -> {curr_rev}), not gated"
+            comparisons.append(comparison)
             breakdown_groups[name] = (by_prev[name], by_curr[name])
 
         rendered = (
