@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **io:** Resolve libc symbols lazily so wrappers survive early constructors ([7300ddd](https://github.com/macstab/macstab-chaos-testing-libraries/commit/7300ddd35c77899f5fc7e08a0df8a9842ddefe88))
 - **io:** Resolve libc symbols lazily so wrappers survive early constructors ([#28](https://github.com/macstab/macstab-chaos-testing-libraries/issues/28)) ([fe6f523](https://github.com/macstab/macstab-chaos-testing-libraries/commit/fe6f5232a11dc1fecccfe76ff7e5158f237c15ee))
 - MPTCP fallback connections under chaos-init; fewer net lookups on non-sockets ([#42](https://github.com/macstab/macstab-chaos-testing-libraries/issues/42)) ([4d4303d](https://github.com/macstab/macstab-chaos-testing-libraries/commit/4d4303d09e83526dca75ad33979dc92c9eda4c73))
+- **bench:** Gate only between sweeps on the same CPU model; skip Markdown-only PRs ([94966b3](https://github.com/macstab/macstab-chaos-testing-libraries/commit/94966b3b9c1ef1e50ec3729be3f6a969f78095c1))
 
 ### Build
 
@@ -31,6 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Update CHANGELOG for 2.0.0 ([#36](https://github.com/macstab/macstab-chaos-testing-libraries/issues/36)) ([488a464](https://github.com/macstab/macstab-chaos-testing-libraries/commit/488a464b4fd5b67751d23f28486b8de6f555f8af))
 - **bench:** Add 2.0.0-benchmarks.md ([#37](https://github.com/macstab/macstab-chaos-testing-libraries/issues/37)) ([b180199](https://github.com/macstab/macstab-chaos-testing-libraries/commit/b1801991b29144f2ecd1cfeb91ef2f656204e3dc))
 - Update CHANGELOG for 2.0.0 ([#45](https://github.com/macstab/macstab-chaos-testing-libraries/issues/45)) ([fd37c70](https://github.com/macstab/macstab-chaos-testing-libraries/commit/fd37c70984f5e5cd280c0a0160c89a16e3a8f4df))
+- Update CHANGELOG for 2.0.0 ([#47](https://github.com/macstab/macstab-chaos-testing-libraries/issues/47)) ([11322e4](https://github.com/macstab/macstab-chaos-testing-libraries/commit/11322e49577247c15d0b49d6ec3a161ad91d68fd))
+- **bench:** Add 2.0.0-benchmarks.md ([#48](https://github.com/macstab/macstab-chaos-testing-libraries/issues/48)) ([0d8a6e0](https://github.com/macstab/macstab-chaos-testing-libraries/commit/0d8a6e09e8fb618a1b9f04dc5672a2d86aca92e3))
 
 ### Features
 
