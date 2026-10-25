@@ -39,6 +39,8 @@ Exit codes:
      more than --vs-prev-min-ns).  Tuneable via --regression-p /
      --regression-r / --regression-pct / --vs-prev-pct / --vs-prev-min-ns.
   2  fatal error (no inputs, malformed JSON, etc.)
+  3  --vs-prev only: the two sweeps ran on different CPU models, so nothing was
+     gated (the report still lists every comparison)
 """
 
 from __future__ import annotations
@@ -99,6 +101,15 @@ def _load_revisions(directory: str) -> dict[str, str]:
             revisions[f"{prefix}_match_no_fire"] = f"k{krev}.s{srev}"
             revisions[f"{prefix}_errno"] = f"k{krev}.s{srev}"
     return revisions
+
+
+def _cpu_models(samples: "list[BenchSample]") -> set[str]:
+    """The CPU models recorded in @samples' envelopes (environment.cpu_model)."""
+    return {
+        str(s.raw.get("environment", {}).get("cpu_model", "")).strip()
+        for s in samples
+        if str(s.raw.get("environment", {}).get("cpu_model", "")).strip()
+    }
 
 
 def _revision(revisions: dict[str, str], name: str) -> str:
@@ -608,6 +619,13 @@ def main() -> int:
                 prev_samples.append(s)
         curr_treat = [s for s in samples if s.is_treatment]
 
+        # Hosted runners do not always have the same processor. Nanosecond medians from two
+        # CPU models are not comparable (the same code measured 25 % apart), so a sweep on
+        # other hardware than its baseline is reported but never gated.
+        prev_cpus = _cpu_models(prev_samples)
+        curr_cpus = _cpu_models(curr_treat)
+        hardware_differs = bool(prev_cpus) and bool(curr_cpus) and prev_cpus != curr_cpus
+
         by_prev: dict[str, list[BenchSample]] = {}
         by_curr: dict[str, list[BenchSample]] = {}
         for s in prev_samples:
@@ -632,6 +650,11 @@ def main() -> int:
                 # The kernel or scenario changed: the two numbers measure different things.
                 comparison.regression = False
                 comparison.note = f"re-baselined ({prev_rev} -> {curr_rev}), not gated"
+            if hardware_differs:
+                comparison.regression = False
+                comparison.note = (comparison.note + "; " if comparison.note else "") + (
+                    "different CPU, not gated"
+                )
             comparisons.append(comparison)
             breakdown_groups[name] = (by_prev[name], by_curr[name])
 
@@ -645,11 +668,22 @@ def main() -> int:
             if args.md
             else _format_json(comparisons)
         )
+        if hardware_differs and args.md:
+            rendered = (
+                "> **Not gated: different CPU.** Baseline: "
+                + ", ".join(sorted(prev_cpus))
+                + ". This sweep: "
+                + ", ".join(sorted(curr_cpus))
+                + ". Nanosecond medians are not comparable across processor models.\n\n"
+                + rendered
+            )
         if args.output:
             with open(args.output, "w", encoding="utf-8") as fh:
                 fh.write(rendered)
         else:
             sys.stdout.write(rendered)
+        if hardware_differs:
+            return 3
         return 1 if any(c.regression for c in comparisons) else 0
 
     by_name: dict[str, dict[str, list[BenchSample]]] = {}
