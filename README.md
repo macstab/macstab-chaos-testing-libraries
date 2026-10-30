@@ -69,7 +69,7 @@ its rule file, its status file (`/tmp/.chaos-<lib>.status`) and its hits files
 | Layer                              | Repo                                                                                                    | What it covers                                                                                                                                                                                                                |
 |------------------------------------|---------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | **`LD_PRELOAD` libc** (this repo)  | [`macstab/macstab-chaos-testing-libraries`](https://github.com/macstab/macstab-chaos-testing-libraries) | Pure C99 `LD_PRELOAD` shared objects: file I/O (latency / `errno` / torn / corrupt), network, DNS, clock, process, memory, plus the `chaos-init` seccomp supervisor for static binaries. **glibc + musl × amd64 + arm64**, 100 % line coverage on shipped sources, Docker runtime validation as a quality gate. Language-agnostic — works for any process inside any container. |
-| **JVM bytecode**                   | [`macstab/macstab-chaos-jvm-agent`](https://github.com/macstab/macstab-chaos-jvm-agent)                 | 62 JDK call sites instrumented in-process. Spring Boot 3/4 + Micronaut + Quarkus integration. JUnit 5 `@ChaosTest`. Selector × effect × policy DSL. Live config reload.                                                       |
+| **JVM bytecode**                   | [`macstab/macstab-chaos-jvm-agent`](https://github.com/macstab/macstab-chaos-jvm-agent)                 | JDK and client-library call sites instrumented in-process, woven on demand. The same effects where the layers overlap (`errno`, trickle, corrupt, torn, reset, timeout, DNS answer shaping, clock regress) and the same qualifiers (`@first`, `@from`/`@until`, `@size`); status and hits files in this library's format. Spring Boot 3/4 + Micronaut + Quarkus integration, JUnit 5, live plan reload. |
 | **Container orchestration**        | [`macstab/chaos-testing`](https://github.com/macstab/chaos-testing)                                     | Annotation-driven chaos on top of Testcontainers. CPU throttling, memory pressure, disk I/O, network partitions, DNS failures, pre-built Redis Sentinel + replication-lag scenarios, Toxiproxy adapter, Redis-aware fault injection.                                                                              |
 
 **Start here** when failure injection must cross language boundaries, or when the
@@ -84,7 +84,19 @@ layer wraps it.
 
 All three layers share one model: **selector × effect × policy** (mapping in
 [`docs/DSL.md`](docs/DSL.md)). There is no cross-layer coupling; each layer is
-adopted, versioned and released independently.
+adopted, versioned and released independently. The same fault in this library and in
+the JVM agent:
+
+| Rule (`/tmp/.chaos-<lib>.conf`) | JVM agent scenario (plan JSON) |
+|---|---|
+| `/var/lib/app:fsync:EIO:0.05` | selector `{"type": "fileIo", "operations": ["FILE_IO_SYNC"], "pathPattern": {"prefix": "/var/lib/app"}}`, effect `{"type": "errno", "errno": "EIO"}`, policy `{"probability": 0.05}` |
+| `tcp4://10.0.0.7:9092:send:LATENCY:200 @size>65536` | selector `{"type": "network", "operations": ["SOCKET_WRITE"], "remoteCidr": "10.0.0.7", "remotePort": 9092, "minBytes": 65537}`, effect `{"type": "delay", "minDelay": "PT0.2S", "maxDelay": "PT0.2S"}` |
+| `tcp4://10.0.0.5:5432:connect:ECONNREFUSED:1.0 @first=3` | effect `{"type": "errno", "errno": "ECONNREFUSED"}`, policy `{"maxApplications": 3}` |
+| `dns://db.internal:FILTER_FAMILY:inet6` | operation `DNS_ANSWER`, effect `{"type": "dnsAnswer", "family": "IPV6"}` |
+| `clock_gettime/realtime:REGRESS:1000` | effect `{"type": "clockSkew", "skewAmount": "PT1S", "mode": "REGRESS"}`, on `java.time` reads only: `System.currentTimeMillis()` is reached by this library alone |
+
+The full rule-by-rule mapping is the agent's `docs/cross-layer.md`; the agent's test
+suite checks every JVM name in [`docs/DSL.md`](docs/DSL.md) against its API.
 
 ## Design Constraints
 

@@ -24,9 +24,11 @@
 >
 > Scope of verification: every statement about the libc layer is taken from the
 > parsers (`src/config/chaos_io_config.c`, `src/<lib>/chaos_<lib>_config.c`,
-> `src/common/chaos_policy.h`) and the wrappers. The JVM and orchestration columns
-> describe the `chaos-testing-java-agent` and `chaos-testing` repositories and are
-> sketches of their surface, not verified here.
+> `src/common/chaos_policy.h`) and the wrappers. The JVM columns name the API of
+> `macstab-chaos-jvm-agent` 2.0; that repository's `CrossLayerDocSyncTest` reads this
+> file and fails when a JVM method, enum constant or plan JSON type named here does
+> not exist, or a JSON example does not parse. The orchestration columns describe the
+> `chaos-testing` repository and are sketches of its surface, not verified here.
 
 ---
 
@@ -248,33 +250,53 @@ Which functions each selector covers (the wrappers, not the grammar, decide this
 | process | the exec family (`execv`, `execvp`, `execvpe`, `execl`, `execlp`, `execle`) follows `execve` rules, `fexecve` follows `execveat`, `system`/`popen` follow `posix_spawn`, `wait`/`wait3`/`wait4`/`waitid` follow `waitpid`. |
 | memory | `mmap64` (glibc) follows the `mmap` rules, `posix_madvise` the `madvise` rules. |
 
-### 2.3. JVM layer (chaos-testing-java-agent) — sketch
+### 2.3. JVM layer (macstab-chaos-jvm-agent)
 
-The JVM layer expresses the same triple with a Java builder instead of text rules:
+The JVM layer expresses the triple with a Java builder or, equivalently, a JSON plan
+(agent argument, environment variable or a watched file):
 
 ```abnf
-;; Conceptual ABNF for the JVM-layer scenario builder
-jvm-scenario  = "ChaosScenario.builder(" name ")"
-                ".selector(" jvm-selector ")"
-                ".effect(" jvm-effect ")"
-                ".activationPolicy(" jvm-policy ")"
-                ".build()"
+;; Java API (chaos-agent-api)
+jvm-scenario   = "ChaosScenario.builder(" id ")"
+                 [ ".scope(" scope ")" ]
+                 ".selector(" jvm-selector ")"
+                 ".effect(" jvm-effect ")"
+                 [ ".activationPolicy(" jvm-policy ")" ]
+                 [ ".precedence(" integer ")" ]
+                 ".build()"
+scope          = "ChaosScenario.ScenarioScope.JVM" / "ChaosScenario.ScenarioScope.SESSION"
 
-jvm-selector  = "ChaosSelector." selector-class "(" *param ")"
-selector-class = "network" / "dns" / "ssl" / "jdbc" / "http"
-              / "thread" / "monitor" / "fileIO" / "classLoading"
-              / ...
+jvm-selector   = "ChaosSelector." selector-kind "(" *param ")"
+selector-kind  = "network" / "fileIo" / "dns" / "ssl" / "jdbc" / "httpClient"
+               / "thread" / "executor" / "monitor" / "classLoading" / "jvmRuntime"
+               / "method" / "messaging" / "rpc" / "redis" / "awsSdk" / "stress" / ...
 
-jvm-effect    = "ChaosEffect." effect-class "(" *param ")"
-effect-class  = "delay" / "throwException" / "fail" / "stress"
-              / "deadlock" / "spike" / "drop"
+jvm-effect     = "ChaosEffect." effect-kind "(" *param ")"
+effect-kind    = "delay" / "errno" / "reject" / "trickle" / "corruptRead" / "timeout"
+               / "connectionReset" / "tornWrite" / "skewClock" / "dnsOverride"
+               / "dnsFamily" / "dnsShuffle" / "dnsLimit" / "dnsRewrite" / "gate"
+               / "suppress" / ...
 
-jvm-policy    = "ActivationPolicy." policy-class "(" *param ")"
-policy-class  = "always" / "count" / "timeWindow" / "session"
+jvm-policy     = "ActivationPolicy.always()" / "ActivationPolicy.count(" n ")"
+               / "ActivationPolicy.window(" instant "," instant ")"
+               / "ActivationPolicy.builder()" *( "." policy-field "(" param ")" ) ".build()"
+policy-field   = "probability" / "maxApplications" / "activeFrom" / "activeUntil"
+               / "activeFor" / "activateAfterMatches" / "rateLimit" / "randomSeed"
 ```
 
-The canonical reference is the JVM repository's `chaos-agent-api` module; this sketch
-documents the shape for translation only.
+The same scenario as plan JSON:
+
+```json
+{"id": "fsync-eio-5pct", "scope": "JVM",
+ "selector": {"type": "fileIo", "operations": ["FILE_IO_SYNC"],
+              "pathPattern": {"prefix": "/var/lib/postgresql"}},
+ "effect": {"type": "errno", "errno": "EIO"},
+ "activationPolicy": {"probability": 0.05}}
+```
+
+The canonical reference is the agent's `chaos-agent-api` module and its
+`docs/cross-layer.md`, which maps every libc rule of this document to the JVM API and
+plan JSON.
 
 ### 2.4. Orchestration layer (chaos-testing) — sketch
 
@@ -296,18 +318,19 @@ Same caveat as §2.3: a sketch of the surface, not its source of truth.
 
 ## 3. Per-layer mapping table
 
-| Concept | libc layer (this repo) | JVM layer (chaos-testing-java-agent) | Orchestration layer (chaos-testing) |
+| Concept | libc layer (this repo) | JVM layer (macstab-chaos-jvm-agent) | Orchestration layer (chaos-testing) |
 |---|---|---|---|
-| **Selector** | Path prefix, endpoint, host name/address, or function selector parsed from a text rule | `ChaosSelector` typed builder — `network()`, `jdbc()`, `dns()`, etc. | `@Chaos(target=…)` annotation parameter; YAML `selector:` block |
-| **Selector match site** | Inside the wrapper, against the call's arguments (descriptors resolved to paths or endpoints) | Inside the ByteBuddy-injected advice at the JDK call site | At the orchestration boundary (Toxiproxy / Testcontainers `withCommand` hook) |
-| **Effect** | ERRNO, GAI, LATENCY, TIMEOUT, CORRUPT, TORN, TRICKLE, DUP, RESET, OFFSET, REGRESS, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER | `ChaosEffect.delay/throw/fail/stress/deadlock/spike/drop` | Toxiproxy toxics / `tc netem` rules / cgroup throttling |
-| **Effect application phase** | Pre-call (ERRNO, GAI, LATENCY, FAIL_AFTER; TORN shortens the count), instead of the call (OVERRIDE), post-call (CORRUPT, OFFSET, REGRESS, result-set transforms) | Same conceptual phases at the bytecode advice level | At the network/cgroup boundary, always pre-effect from the application's perspective |
-| **Activation policy** | Probability, `@first`, `@from`/`@until`, `@size`; FAIL_AFTER's call counter | `ActivationPolicy.always/count/timeWindow/session` | Annotation parameters + scenario lifecycle hooks |
-| **Activation evaluation** | Per call: window, size gate, one draw from a per-thread PRNG, `@first` claim | Per-call dispatcher check + session-scoped state | Lifecycle-driven (apply on `@BeforeEach`, remove on `@AfterEach`) |
-| **Configuration source** | Text file `/tmp/.chaos-<lib>.conf` | Java code (builder) + JSON startup config | YAML / annotations + dynamic Testcontainers calls |
-| **Reload semantics** | `stat()` of the rule file at most every 1 ms, two-snapshot publication under a CAS-owned reload | Live registration / deregistration via dispatcher API | Lifecycle hooks; the boundary mutates between phases |
-| **Failure mode on bad config** | Fail-open: no rules, status file names the line | Fail-fast at builder validation (`IllegalArgumentException`) | Fail-fast at YAML parse |
-| **Detection by SUT** | `getenv("LD_PRELOAD")` / `/proc/self/maps` | `Thread.currentThread().getContextClassLoader().getResource("chaos-agent-marker")` | External — orchestration is outside the SUT |
+| **Selector** | Path prefix, endpoint, host name/address, or function selector parsed from a text rule | `ChaosSelector` factories — `ChaosSelector.network(...)`, `ChaosSelector.fileIo(...)`, `ChaosSelector.dns(...)`, … — or plan JSON `"selector": {"type": ...}` | `@Chaos(target=…)` annotation parameter; YAML `selector:` block |
+| **Selector match site** | Inside the wrapper, against the call's arguments (descriptors resolved to paths or endpoints) | Inside advice woven into the JDK or library method, against the call's arguments: peer address and port, host name, path, byte count | At the orchestration boundary (Toxiproxy / Testcontainers `withCommand` hook) |
+| **Effect** | ERRNO, GAI, LATENCY, TIMEOUT, CORRUPT, TORN, TRICKLE, DUP, RESET, OFFSET, REGRESS, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER | `ChaosEffect.delay(...)`, `ChaosEffect.errno(...)`, `ChaosEffect.reject(...)`, `ChaosEffect.trickle(...)`, `ChaosEffect.corruptRead()`, `ChaosEffect.timeout()`, `ChaosEffect.connectionReset()`, `ChaosEffect.tornWrite()`, `ChaosEffect.skewClock(...)`, the DNS answer effects, and JVM-only effects and stressors (§11.1) | Toxiproxy toxics / `tc netem` rules / cgroup throttling |
+| **Effect application phase** | Pre-call (ERRNO, GAI, LATENCY, FAIL_AFTER; TORN shortens the count), instead of the call (OVERRIDE), post-call (CORRUPT, OFFSET, REGRESS, result-set transforms) | Before the call (delay, gate, reject, errno), instead of it (suppress), on its byte count (trickle, tornWrite), after it (corruptRead, return-value corruption, DNS answer shaping, clock skew) | At the network/cgroup boundary, always pre-effect from the application's perspective |
+| **Activation policy** | Probability, `@first`, `@from`/`@until`, `@size`; FAIL_AFTER's call counter | `ActivationPolicy`: probability, `maxApplications` (`ActivationPolicy.count(n)`), `activeFrom`/`activeUntil` (`ActivationPolicy.window(from, until)`), `activeFor`, `activateAfterMatches`, `rateLimit`; the selector's `minBytes`/`maxBytes` | Annotation parameters + scenario lifecycle hooks |
+| **Activation evaluation** | Per call: window, size gate, one draw from a per-thread PRNG, `@first` claim | Per call: session, selector filters, window, `activateAfterMatches`, probability (reproducible with `randomSeed`), rate limit, `maxApplications` reservation | Lifecycle-driven (apply on `@BeforeEach`, remove on `@AfterEach`) |
+| **Configuration source** | Text file `/tmp/.chaos-<lib>.conf` | Java API, or a JSON plan from an agent argument, an environment variable or a watched file | YAML / annotations + dynamic Testcontainers calls |
+| **Reload semantics** | `stat()` of the rule file at most every 1 ms, two-snapshot publication under a CAS-owned reload | The plan file is polled (modification time, size, file key, content hash); a changed plan is validated whole, then swapped; a failed read or an invalid plan keeps the previous plan | Lifecycle hooks; the boundary mutates between phases |
+| **Failure mode on bad config** | Fail-open: no rules, status file names the line | An invalid plan file is not applied; `/tmp/.chaos-jvm.status` reports `state=error` with line, column and reason. An invalid scenario passed to the API throws `ChaosValidationException` | Fail-fast at YAML parse |
+| **Status and hit counts** | `/tmp/.chaos-<lib>.status`, `/tmp/.chaos-<lib>.hits.<n>` | `/tmp/.chaos-jvm.status`, `/tmp/.chaos-jvm.hits.<pid>` in the same key and line format; diagnostics, JMX, events and metrics in-process | Test reports |
+| **Detection by SUT** | `getenv("LD_PRELOAD")` / `/proc/self/maps` | the `-javaagent:` argument in `RuntimeMXBean.getInputArguments()`, or `/tmp/.chaos-jvm.status` | External — orchestration is outside the SUT |
 
 ---
 
@@ -321,13 +344,13 @@ shared.
 
 | Predicate kind | libc layer | JVM layer | Orchestration layer |
 |---|---|---|---|
-| **Exact match** | `/data/wal.log:write:…` (a prefix that equals the path); `dns://redis-replica.local:…` | `ChaosSelector.dns(NamePattern.exact("redis-replica.local"))` | `@Chaos(host = "redis-replica.local")` |
-| **Prefix match** | `/data:write:…` (paths only, at `/` boundaries) | `NamePattern.prefix("redis-replica.")` | `@Chaos(hostPrefix = "redis-replica.")` |
-| **Suffix match** | `dns://*.example.internal:…` (host names, at `.` boundaries) | `NamePattern.suffix(".example.internal")` | YAML `hostSuffix:` |
-| **Wildcard (catch-all)** | `*` in every library (`*:write:…`, `*:LATENCY:…`) | `ChaosSelector.any()` | `@Chaos(applyToAll = true)` |
-| **Tuple match** | `tcp4://127.0.0.1:5432:connect:…` (family, host, port; host may be `*`, port is exact) | `ChaosSelector.network(Set.of(SOCKET_READ), NamePattern.prefix("redis-replica."))` | YAML `target: { family: tcp4, host:…, port:… }` |
-| **Symbol-name match** | `pthread_create:…`, `clock_gettime:…`, `munmap:…` | Implicit in the `ChaosSelector.<class>` choice | N/A (the orchestration layer is below libc) |
-| **Subkind match** | `mmap/anon`, `clock_gettime/monotonic` | Sub-selectors via builder-method choice | N/A |
+| **Exact match** | `/data/wal.log:write:…` (a prefix that equals the path); `dns://redis-replica.local:…` | `ChaosSelector.dns(Set.of(OperationType.DNS_RESOLVE), NamePattern.exact("redis-replica.local"))` | `@Chaos(host = "redis-replica.local")` |
+| **Prefix match** | `/data:write:…` (paths only, at `/` boundaries) | `PathPattern.under("/data")` (paths, at `/` boundaries); `NamePattern.prefix("redis-replica.")` (names) | `@Chaos(hostPrefix = "redis-replica.")` |
+| **Suffix match** | `dns://*.example.internal:…` (host names, at `.` boundaries) | `NamePattern.glob("*.example.internal")` | YAML `hostSuffix:` |
+| **Wildcard (catch-all)** | `*` in every library (`*:write:…`, `*:LATENCY:…`) | `NamePattern.any()`, or leave the filter out | `@Chaos(applyToAll = true)` |
+| **Tuple match** | `tcp4://127.0.0.1:5432:connect:…` (family, host, port; host may be `*`, port is exact) | `remoteCidr` `"127.0.0.1"` (a CIDR block; `"0.0.0.0/0"` for any IPv4 host) and `remotePort` `5432` on a `ChaosSelector.NetworkSelector` | YAML `target: { family: tcp4, host:…, port:… }` |
+| **Symbol-name match** | `pthread_create:…`, `clock_gettime:…`, `munmap:…` | the selector kind and its operations (`OperationType.THREAD_START`, `OperationType.SOCKET_CONNECT`, …) | N/A (the orchestration layer is below libc) |
+| **Subkind match** | `mmap/anon`, `clock_gettime/monotonic` | the operation (`OperationType.FILE_IO_SYNC`, `OperationType.DNS_ANSWER`, `OperationType.INSTANT_NOW`) | N/A |
 
 Host names have no prefix match on the libc layer: dns selectors are exact, suffix
 (`*.`) or any.
@@ -350,8 +373,9 @@ realise "more specific" as a rank, then a tie-break:
 consider (local and peer) searches both in one pass, so a wildcard for the end
 tried first cannot shadow a more specific rule for the other.
 
-The JVM layer enforces specificity through its type system; the libc layer through
-these ranks.
+The JVM layer does not select a most specific scenario: every scenario whose
+selector matches contributes, and `precedence` decides which gate and which terminal
+effect win (§8.2). The libc layer selects through these ranks.
 
 ---
 
@@ -367,11 +391,11 @@ which closes first and then reports the error, see [IO.md §4](IO.md#4-end-to-en
 
 | libc | JVM | Orchestration |
 |---|---|---|
-| `/data:write:EIO:1.0` (io) | `throwException(IOException.class)` | Toxiproxy `down` |
-| `tcp4://10.0.0.5:5432:connect:ECONNREFUSED:1.0` (net) | `throwException(ConnectException.class)` | iptables DROP / Toxiproxy `down` |
-| `tcp4://10.0.0.5:5432:recv:ETIMEDOUT:1.0` (net) | `throwException(SocketTimeoutException.class)` | Toxiproxy `timeout` |
-| `dns://db.internal:EAI_AGAIN:1.0` (dns) | `throwException(UnknownHostException.class, retry=true)` | DNS server SERVFAIL |
-| `pthread_create:ERRNO:EAGAIN` (process) | `throwException(OutOfMemoryError.class)` (native-thread analogue) | N/A |
+| `/data:write:EIO:1.0` (io) | `ChaosEffect.errno(ChaosEffect.Errno.EIO)` on `OperationType.FILE_IO_WRITE`: a `FileSystemException` naming the file | Toxiproxy `down` |
+| `tcp4://10.0.0.5:5432:connect:ECONNREFUSED:1.0` (net) | `ChaosEffect.errno(ChaosEffect.Errno.ECONNREFUSED)` on `OperationType.SOCKET_CONNECT`: `ConnectException` | iptables DROP / Toxiproxy `down` |
+| `tcp4://10.0.0.5:5432:recv:ETIMEDOUT:1.0` (net) | `ChaosEffect.errno(ChaosEffect.Errno.ETIMEDOUT)` on `OperationType.SOCKET_READ`; `ChaosEffect.timeout()` first waits out the socket's `SO_TIMEOUT` | Toxiproxy `timeout` |
+| `dns://db.internal:EAI_AGAIN:1.0` (dns) | `ChaosEffect.reject("...")` on `OperationType.DNS_RESOLVE`: `UnknownHostException` | DNS server SERVFAIL |
+| `pthread_create:ERRNO:EAGAIN` (process) | `ChaosEffect.reject("...")` on `OperationType.THREAD_START`: `RejectedExecutionException`, not the JDK's `OutOfMemoryError: unable to create native thread` (§12.4) | N/A |
 
 ### 5.2. Class B — pre-call latency (LATENCY)
 
@@ -381,7 +405,7 @@ other preloaded library (libchaos-time in particular) can shorten or lengthen it
 
 | libc | JVM | Orchestration |
 |---|---|---|
-| `tcp4://10.0.0.5:6379:recv:LATENCY:200` (net), `*:LATENCY:200` (memory) | `delay(Duration.ofMillis(200))` | Toxiproxy `latency` toxic / `tc qdisc add netem delay` |
+| `tcp4://10.0.0.5:6379:recv:LATENCY:200` (net), `*:LATENCY:200` (memory) | `ChaosEffect.delay(Duration.ofMillis(200))` | Toxiproxy `latency` toxic / `tc qdisc add netem delay` |
 
 Observed time = added latency + real call cost. In dns, time, process and memory a
 LATENCY rule and an ERRNO (or GAI) rule can both apply to one call: the delay runs
@@ -393,10 +417,10 @@ apply (§8).
 
 | libc | Phase | JVM | Orchestration |
 |---|---|---|---|
-| `clock_gettime/realtime:OFFSET:500` | after the call: the returned time is shifted | `clockSkew(Duration.ofMillis(500))` | N/A (clocks cannot be mutated at the orchestration boundary) |
-| `clock_gettime/monotonic:REGRESS:1000` | after the call: the clock steps back once | N/A | N/A |
-| `/data:read:CORRUPT:0.1` (io), `…:recv:CORRUPT:0.1` (net) | after a successful read: one bit of the returned bytes flips | `byteCorruption(probability=0.1)` | Toxiproxy `bandwidth` + custom byte mangler (rare) |
-| `/data:write:TORN:0.1` | before the call: the byte count is shortened to `[1, n-1]` | `partialWrite(probability=0.1)` | N/A |
+| `clock_gettime/realtime:OFFSET:500` | after the call: the returned time is shifted | `ChaosEffect.skewClock(Duration.ofMillis(500), ChaosEffect.ClockSkewMode.FIXED)` on `java.time` and `java.util.Date` reads (not `System.currentTimeMillis()`, §11.2) | N/A (clocks cannot be mutated at the orchestration boundary) |
+| `clock_gettime/realtime:REGRESS:1000` | after the call: the clock steps back once | `ChaosEffect.skewClock(Duration.ofSeconds(1), ChaosEffect.ClockSkewMode.REGRESS)` (same reads) | N/A |
+| `/data:read:CORRUPT:0.1` (io), `…:recv:CORRUPT:0.1` (net) | after a successful read: one bit of the returned bytes flips | `ChaosEffect.corruptRead()` with probability `0.1` | Toxiproxy `bandwidth` + custom byte mangler (rare) |
+| `/data:write:TORN:0.1` | before the call: the byte count is shortened to `[1, n-1]` | `ChaosEffect.tornWrite()` with probability `0.1` (`FileChannel` writes) | N/A |
 
 ### 5.4. Class D — result-set transform (DNS)
 
@@ -404,12 +428,12 @@ Operates on the address list of `getaddrinfo` (and the hostent resolvers).
 
 | libc | JVM | Orchestration |
 |---|---|---|
-| `dns://db.internal:OVERRIDE:127.0.0.1,[::1]` | `dnsRedirect(InetAddress[]…)` | DNS rewrite (CoreDNS / dnsmasq with custom zones) |
-| `dns://db.internal:REWRITE:newhost.internal` | `dnsRewrite("newhost.internal")` | Same |
-| `dns://db.internal:FILTER_FAMILY:inet6` | `filterAddressFamily(IPV6)` | DNS server returning AAAA-only or A-only |
-| `dns://db.internal:LIMIT:1` | `limitResults(1)` | DNS server with `--max-answers` |
-| `dns://db.internal:SHUFFLE:0.3` | `shuffleResults(probability=0.3)` | N/A (most DNS servers preserve answer order) |
-| `dns://db.internal:SERVICE:15432` | `dnsPortRewrite(15432)` | N/A (the port is application-layer, not DNS) |
+| `dns://db.internal:OVERRIDE:127.0.0.1,[::1]` | `ChaosEffect.dnsOverride("127.0.0.1", "::1")` on `OperationType.DNS_ANSWER` | DNS rewrite (CoreDNS / dnsmasq with custom zones) |
+| `dns://db.internal:REWRITE:newhost.internal` | `ChaosEffect.dnsRewrite("newhost.internal")` on `OperationType.DNS_RESOLVE` | Same |
+| `dns://db.internal:FILTER_FAMILY:inet6` | `ChaosEffect.dnsFamily(ChaosEffect.AddressFamily.IPV6)` | DNS server returning AAAA-only or A-only |
+| `dns://db.internal:LIMIT:1` | `ChaosEffect.dnsLimit(1)` | DNS server with `--max-answers` |
+| `dns://db.internal:SHUFFLE:0.3` | `ChaosEffect.dnsShuffle()` with probability `0.3` | N/A (most DNS servers preserve answer order) |
+| `dns://db.internal:SERVICE:15432` | N/A (§11.2) | N/A (the port is application-layer, not DNS) |
 
 ### 5.5. Class E — counter-driven failure (FAIL_AFTER)
 
@@ -417,7 +441,7 @@ The first N calls pass; later calls fail (each with the rule's probability).
 
 | libc | JVM | Orchestration |
 |---|---|---|
-| `pthread_create:FAIL_AFTER:EAGAIN,128` | `ActivationPolicy.count(128)` + `throwException(...)` (inverted: JVM `count(N)` fires on the first N) | N/A |
+| `pthread_create:FAIL_AFTER:EAGAIN,128` | `ActivationPolicy.builder().activateAfterMatches(128).build()` with the failing effect: the first 128 matches pass | N/A |
 
 The libc layer folds the counter into the effect, the JVM layer into the policy.
 Both are the canonical triple with the counter state in P. The libc counter is per
@@ -429,6 +453,12 @@ publication and in a forked child.
 `recv` rules can deliver data in chunks of at most N bytes (TRICKLE) or duplicate
 it (DUP); `poll` rules can time out (TIMEOUT); `close` rules can reset the
 connection (RESET). Semantics: [NETWORK.md](NETWORK.md).
+
+JVM: `ChaosEffect.trickle(n)` caps each socket read, `ChaosEffect.timeout()` waits
+out the socket's own `SO_TIMEOUT` (or connect timeout) on a read or connect and
+throws `SocketTimeoutException`, never firing on an infinite timeout, and
+`ChaosEffect.connectionReset()` closes with `SO_LINGER` 0 so the peer sees a reset.
+DUP has no JVM equivalent.
 
 ---
 
@@ -516,8 +546,9 @@ Semantics:
 - **Wall clock.** The window is checked against `CLOCK_REALTIME` read from the vDSO
   (or the raw system call), never through the interposed `clock_gettime`, so a
   libchaos-time OFFSET rule does not move another rule's window. Absolute times make
-  every process of a container agree on the window; the JVM layer turns relative
-  durations into absolute times.
+  every process of a container agree on the window. The JVM layer accepts both
+  absolute instants (`activeFrom`, `activeUntil`) and a duration measured from
+  activation (`activeFor`), and reads the window from the real clock too.
 - **Order of checks.** Window, size gate, probability, then the `@first` claim. Only
   a rule that passes all four fires and records a hit. FAIL_AFTER differs: its call
   counter advances on every matched call first, then the threshold and probability
@@ -529,29 +560,43 @@ Semantics:
 
 Policy mapping:
 
-- **`always`** ≡ probability 1 (`…:1.0` in io and net; omitted in three-field libraries).
-- **`count`** ≡ `@first=N`.
-- **`time_window`** ≡ `@from=` / `@until=`.
-- **`session`** ≡ not applicable: the libc libraries are process-scoped; a session is
-  a JVM-layer concept tied to the JUnit test lifecycle.
+- **`ActivationPolicy.always()`** ≡ probability 1 (`…:1.0` in io and net; omitted in three-field libraries).
+- **`ActivationPolicy.count(N)`** ≡ `@first=N`.
+- **`ActivationPolicy.window(from, until)`** ≡ `@from=` / `@until=`.
+- **`minBytes` / `maxBytes`** on the JVM selector ≡ `@size>` / `@size<`, off by one:
+  the JVM bounds are inclusive, so `@size>65536` is `minBytes` `65537`.
+- **Sessions** ≡ not applicable: the libc libraries are process-scoped; a JVM
+  session (`ChaosScenario.ScenarioScope.SESSION`) scopes a scenario to the threads of
+  one test and the work they hand off.
 
 ### 7.2. JVM-layer surface
 
 | Policy | Semantics |
 |---|---|
 | `ActivationPolicy.always()` | Fire on every match. |
-| `ActivationPolicy.count(N)` | Fire on the first N matches; pass through thereafter. |
-| `ActivationPolicy.timeWindow(start, end)` | Fire only between `start` and `end`. |
-| `ActivationPolicy.session(id)` | Fire only when the current thread's session context matches `id`. |
+| `ActivationPolicy.count(N)` | Fire on the first N matches that pass every other check (`maxApplications`), then become inactive. |
+| `ActivationPolicy.window(from, until)` | Fire only in `[from, until)` by the real wall clock; at `until` the scenario becomes inactive. |
+| `ActivationPolicy.builder().probability(p).build()` | One draw per match; reproducible with `randomSeed`. |
+| `ActivationPolicy.builder().activateAfterMatches(N).build()` | Skip the first N matches (FAIL_AFTER). |
+| `ActivationPolicy.builder().activeFor(d).build()` | Fire for `d` from activation. |
+| `ActivationPolicy.builder().rateLimit(permits, window).build()` | At most `permits` applications per fixed window anchored at activation. |
+| session scope | `ChaosScenario.ScenarioScope.SESSION` with `ChaosControlPlane.openSession(...)`: fire only on threads bound to the session and the work they hand off. |
+
+The agent's `docs/semantics.md` states the order of these checks as laws.
 
 ### 7.3. Cross-layer translation
 
-| JVM `ActivationPolicy` | libc rule construction |
+| JVM | libc rule construction |
 |---|---|
-| `always()` | probability `1.0` (io, net: the value field; others: omit `@p`) |
-| `count(N)` | `… @first=N` |
-| `timeWindow(start, end)` | `… @from=<start ms> @until=<end ms>` |
-| `session(id)` | *No clean translation.* Sessions do not exist in the libc layer. |
+| `ActivationPolicy.always()` | probability `1.0` (io, net: the value field; others: omit `@p`) |
+| `ActivationPolicy.builder().probability(p).build()` | probability `p` (io, net: the value field; others: `@p`) |
+| `ActivationPolicy.count(N)` | `… @first=N` |
+| `ActivationPolicy.window(from, until)` | `… @from=<from ms> @until=<until ms>` |
+| `ActivationPolicy.builder().activeFor(d).build()` | `… @from=<now ms> @until=<now + d ms>`, fixed when the rule file is written |
+| selector `minBytes` N / `maxBytes` M | `… @size>N-1` / `… @size<M+1` |
+| `ActivationPolicy.builder().activateAfterMatches(N).build()` with a failing effect | `FAIL_AFTER:<errno>,N` (process) |
+| `rateLimit` | *No translation.* |
+| session scope | *No translation.* Sessions do not exist in the libc layer. |
 
 ---
 
@@ -592,24 +637,32 @@ counter does not advance on that call.
 
 ### 8.2. JVM-layer composition order
 
-Per the JVM dispatcher (conceptual; canonical reference is the chaos-testing-java-agent
-README):
+For one intercepted call (canonical statement: the agent's `docs/semantics.md`):
 
-1. Selector match (8-check evaluation pipeline).
-2. Activation policy check.
-3. Inline effect (latency / exception throw).
-4. Background stressor effects (long-running pressure that does not return on the
-   calling thread).
+1. Every scenario indexed for the call's operation is checked in a fixed order:
+   session, selector (all filters conjunctive), wall-clock window,
+   `activateAfterMatches`, probability, rate limit, `maxApplications` reservation.
+2. Every scenario that passes contributes; contributions are ordered by descending
+   `precedence`, then scenario id.
+3. All delays add up and run first; then the highest-precedence gate holds the
+   caller; then the highest-precedence terminal effect (reject, errno, suppress,
+   corruption, DNS answer shaping, …) decides the outcome.
+4. Only contributions that take effect count as applied and spend `maxApplications`.
 
-Inline ordering inside step 3 mirrors libc: latency, then exception, then the real
-call, then result mutation.
+Stressors are not per call: they run from activation until stopped or expired.
+
+The JVM layer therefore composes like the libc dns, time, process and memory
+libraries (each matching scenario contributes, stages in a fixed order), not like io
+and net (one rule decides the call): two matching delay scenarios add up, where
+libchaos-net applies only the more specific rule.
 
 ### 8.3. Identity across layers
 
 The order has the same shape everywhere: **prelude (latency) → guard (failure) →
 real call → postlude (mutation)**. The libc io and net libraries are the degenerate
 case in which exactly one of those stages is populated per call. Result-set
-transforms (dns) are libc-specific.
+transforms exist on both layers: `getaddrinfo` in libc, `InetAddress.getAllByName`
+on the JVM.
 
 ### 8.4. DSL Rule Evaluation Pipeline Diagram
 
@@ -998,23 +1051,27 @@ holds; the vocabulary is partial.
 
 | JVM concept | Why no libc equivalent |
 |---|---|
-| `ChaosSelector.thread(synchronizedBlock=true)` | Targets bytecode-level monitor entry. No libc symbol corresponds. |
-| `ChaosSelector.classLoading(...)` | JVM-internal class-loader event. No libc symbol. |
-| `ChaosSelector.gc(pause=200ms)` | GC pause injection. No libc analogue. |
-| `safepointStorm` | Forces safepoint storms. No libc analogue. |
-| `ActivationPolicy.session(id)` | Per-test-method scoping. The libc layer is process-scoped. |
+| `ChaosScenario.ScenarioScope.SESSION` | Per-test scoping that follows the test's work across threads. The libc layer is process-scoped. |
+| `ChaosSelector.method(...)` | Any Java method by class and method pattern. libc rules name C functions. |
+| `ChaosSelector.jdbc(...)`, `ChaosSelector.httpClient(...)`, `ChaosSelector.messaging(...)`, `ChaosSelector.rpc(...)`, `ChaosSelector.redis(...)` | Protocol-level calls (JDBC, HTTP, Kafka, gRPC, Redis). libc sees the bytes on the socket. |
+| `ChaosSelector.monitor(...)`, `ChaosSelector.classLoading(...)`, `ChaosSelector.executor(...)` | JVM-internal events. No libc symbol. |
+| `ChaosEffect.gate(...)`, `ChaosEffect.suppress()`, `ChaosEffect.corruptReturnValue(...)` | They act on Java control flow and return values. |
+| `ChaosEffect.safepointStorm(...)`, `ChaosEffect.gcPressure(...)`, `ChaosEffect.deadlock(...)`, `ChaosEffect.virtualThreadCarrierPinning(...)` | JVM-internal pressure. No libc analogue. |
+| `rateLimit` | No libc qualifier limits applications per time window. |
 
-`ActivationPolicy.timeWindow(...)` translates directly to `@from`/`@until` (§7.3).
+`ActivationPolicy.window(...)` translates directly to `@from`/`@until` (§7.3).
 
 ### 11.2. libc-only vocabulary
 
 | libc concept | Why no JVM equivalent |
 |---|---|
-| `OFFSET` / `REGRESS` on `clock_gettime` | `System.currentTimeMillis()` and `System.nanoTime()` are JIT intrinsics; once compiled, no bytecode remains for the agent to advise. The libc layer sees the C library time calls beneath the JVM. |
-| `TORN` on `write` | Partial-write semantics are not exposed cleanly through Java's `OutputStream` API. |
-| Path-prefix selector with filesystem boundary semantics and link resolution | The JVM's file abstractions do not expose kernel paths; selectors are typed differently. |
+| `OFFSET` / `REGRESS` seen by `System.currentTimeMillis()` and `System.nanoTime()` | Both are JIT intrinsics; once compiled, no bytecode remains for the agent to advise. The agent skews `java.time` and `java.util.Date` reads only; the libc layer sees the C library time calls beneath the JVM. |
+| `clock_gettime/monotonic` | `System.nanoTime()` is an intrinsic (as above). |
+| `DUP`, `SERVICE` | No JVM effect duplicates received data or rewrites a resolved service port. |
+| `unix://` endpoints | Unix-domain sockets are not intercepted by the agent. |
 | `mmap/anon` vs `mmap/file` | The JVM does not expose `mmap` as a chaos target (direct ByteBuffers have a different scope). |
-| `@size` gates | Byte counts of individual system-call-level transfers are not visible at the Java API level. |
+| `fork`, `execve`, `posix_spawn`, `waitpid` | The agent does not intercept process creation; a JVM's child processes reach the process rules. |
+| SECCOMP supervision (`chaos-init`) | Static binaries and Go programs that bypass libc; the agent works inside a JVM only. |
 
 ### 11.3. Orchestration-only vocabulary
 
@@ -1071,7 +1128,16 @@ tcp4://127.0.0.1:6379:recv:LATENCY:300
 
 **Asymmetry note.** The JVM matches the *host name* it holds in its socket
 abstraction; libc matches the *endpoint*. A faithful translation composes
-libchaos-dns (address pinning) and libchaos-net (delay), not a single rule.
+libchaos-dns (address pinning) and libchaos-net (delay), not a single rule. In the
+other direction, when the replica's address is known, the JVM can match the endpoint
+as libc does:
+
+```json
+{"id": "replica-lag-300ms", "scope": "JVM",
+ "selector": {"type": "network", "operations": ["SOCKET_READ"],
+              "remoteCidr": "127.0.0.1", "remotePort": 6379},
+ "effect": {"type": "delay", "minDelay": "PT0.3S", "maxDelay": "PT0.3S"}}
+```
 
 ### 12.2. fsync EIO storm
 
@@ -1079,10 +1145,10 @@ libchaos-dns (address pinning) and libchaos-net (delay), not a single rule.
 
 ```java
 chaos.activate(ChaosScenario.builder("fsync-eio-5pct")
-    .selector(ChaosSelector.fileIO(OperationType.FSYNC, PathPattern.prefix("/var/lib/postgresql/")))
-    .effect(ChaosEffect.throwException(IOException.class).withMessage("EIO"))
-    .activationPolicy(ActivationPolicy.always())
-    .effect(ChaosEffect.probability(0.05))
+    .selector(new ChaosSelector.FileIoSelector(
+        Set.of(OperationType.FILE_IO_SYNC), PathPattern.under("/var/lib/postgresql"), null, null))
+    .effect(ChaosEffect.errno(ChaosEffect.Errno.EIO))
+    .activationPolicy(ActivationPolicy.builder().probability(0.05).build())
     .build());
 ```
 
@@ -1092,10 +1158,12 @@ chaos.activate(ChaosScenario.builder("fsync-eio-5pct")
 /var/lib/postgresql:fsync:EIO:0.05
 ```
 
-**Symmetry note.** One line. The probability is the io rule's value field rather
-than a separate effect; semantics are identical.
+**Symmetry note.** One rule on each layer. The probability is the io rule's value
+field and the JVM policy's `probability`; `FileChannel.force` and
+`FileDescriptor.sync` then throw a `FileSystemException` naming the file, with the
+reason `Input/output error`.
 
-### 12.3. Clock skew (libc-only — no JVM equivalent)
+### 12.3. Clock skew (a partial JVM equivalent)
 
 **libc source** (`/tmp/.chaos-time.conf`):
 
@@ -1106,7 +1174,17 @@ clock_gettime/realtime:OFFSET:200
 `gettimeofday`, `time` and `timespec_get` read the same clock and see the same
 offset.
 
-**JVM translation.** None: the JVM time methods are intrinsics the agent cannot
+**JVM translation.** Partial. The agent skews `Instant.now()`, `LocalDateTime.now()`,
+`ZonedDateTime.now()` and `new Date()`:
+
+```json
+{"id": "clock-offset-200ms", "scope": "JVM",
+ "selector": {"type": "jvmRuntime",
+              "operations": ["INSTANT_NOW", "LOCAL_DATE_TIME_NOW", "ZONED_DATE_TIME_NOW", "DATE_NEW"]},
+ "effect": {"type": "clockSkew", "skewAmount": "PT0.2S", "mode": "FIXED"}}
+```
+
+`System.currentTimeMillis()` and `System.nanoTime()` are intrinsics the agent cannot
 advise once compiled (§11.2). This is the canonical case for adopting both layers
 together: the libc layer covers what the JVM layer cannot.
 
@@ -1121,7 +1199,9 @@ fork:ERRNO:EAGAIN@0.2
 **JVM translation.** No clean equivalent. Java code does not call `fork()`. JVM
 platform threads are created with `pthread_create`, so
 `pthread_create:ERRNO:EAGAIN` is the libc rule behind
-`OutOfMemoryError: unable to create native thread`. Child processes started with
+`OutOfMemoryError: unable to create native thread`; the agent's nearest effect,
+`ChaosEffect.reject("...")` on `OperationType.THREAD_START`, throws
+`RejectedExecutionException` instead. Child processes started with
 `Runtime.exec()`/`ProcessBuilder` use the launch mechanism selected by
 `jdk.lang.Process.launchMechanism`: `POSIX_SPAWN` reaches `posix_spawn` rules,
 `FORK` reaches `fork` rules, and `VFORK` reaches neither (`vfork` is not
@@ -1141,7 +1221,9 @@ interposed).
 - This repo: [IO.md](IO.md), [NETWORK.md](NETWORK.md), [DNS.md](DNS.md), [TIME.md](TIME.md),
   [PROCESS.md](PROCESS.md), [MEMORY.md](MEMORY.md), [PLATFORM.md](PLATFORM.md),
   [SECCOMP.md](SECCOMP.md)
-- `chaos-testing-java-agent` repo's `chaos-agent-api` module — canonical JVM-layer DSL surface
+- `macstab-chaos-jvm-agent` repo: the `chaos-agent-api` module (canonical JVM-layer
+  surface), `docs/cross-layer.md` (rule-by-rule mapping) and `docs/semantics.md`
+  (evaluation laws); its `CrossLayerDocSyncTest` checks this document
 - `chaos-testing` repo's annotation surface — canonical orchestration-layer DSL surface
 
 ---
