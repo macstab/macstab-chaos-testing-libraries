@@ -420,7 +420,7 @@ apply (§8).
 | `clock_gettime/realtime:OFFSET:500` | after the call: the returned time is shifted | `ChaosEffect.skewClock(Duration.ofMillis(500), ChaosEffect.ClockSkewMode.FIXED)` on `java.time` and `java.util.Date` reads (not `System.currentTimeMillis()`, §11.2) | N/A (clocks cannot be mutated at the orchestration boundary) |
 | `clock_gettime/realtime:REGRESS:1000` | after the call: the clock steps back once | `ChaosEffect.skewClock(Duration.ofSeconds(1), ChaosEffect.ClockSkewMode.REGRESS)` (same reads) | N/A |
 | `/data:read:CORRUPT:0.1` (io), `…:recv:CORRUPT:0.1` (net) | after a successful read: one bit of the returned bytes flips | `ChaosEffect.corruptRead()` with probability `0.1` | Toxiproxy `bandwidth` + custom byte mangler (rare) |
-| `/data:write:TORN:0.1` | before the call: the byte count is shortened to `[1, n-1]` | `ChaosEffect.tornWrite()` with probability `0.1` (`FileChannel` writes) | N/A |
+| `/data:write:TORN:0.1` | before the call: the byte count is shortened to `[1, n-1]` | `ChaosEffect.tornWrite()` with probability `0.1` (`FileChannel` writes; the JVM also tears `SocketChannel` writes, and socket stream writes by sending a prefix then failing with a reset) | N/A |
 
 ### 5.4. Class D — result-set transform (DNS)
 
@@ -1065,12 +1065,12 @@ holds; the vocabulary is partial.
 
 | libc concept | Why no JVM equivalent |
 |---|---|
-| `OFFSET` / `REGRESS` seen by `System.currentTimeMillis()` and `System.nanoTime()` | Both are JIT intrinsics; once compiled, no bytecode remains for the agent to advise. The agent skews `java.time` and `java.util.Date` reads only; the libc layer sees the C library time calls beneath the JVM. |
-| `clock_gettime/monotonic` | `System.nanoTime()` is an intrinsic (as above). |
+| `OFFSET` / `REGRESS` seen by every `System.currentTimeMillis()` and `System.nanoTime()` read, JDK and libraries included | Both are JIT intrinsics; the methods cannot be advised. The agent skews `java.time` and `java.util.Date` reads, and direct calls only at the call sites in the packages named with its `clockCallSites` setting (`OperationType.SYSTEM_CLOCK_MILLIS`, `OperationType.SYSTEM_CLOCK_NANOS`); the libc layer sees every clock read beneath the JVM. |
+| `clock_gettime/monotonic` beneath the JDK | `System.nanoTime()` is an intrinsic (as above); only opted-in call sites are skewed. |
 | `DUP`, `SERVICE` | No JVM effect duplicates received data or rewrites a resolved service port. |
 | `unix://` endpoints | Unix-domain sockets are not intercepted by the agent. |
 | `mmap/anon` vs `mmap/file` | The JVM does not expose `mmap` as a chaos target (direct ByteBuffers have a different scope). |
-| `fork`, `execve`, `posix_spawn`, `waitpid` | The agent does not intercept process creation; a JVM's child processes reach the process rules. |
+| `waitpid`, and faults inside the child process | The agent fails a process start itself (`OperationType.PROCESS_START`, §12.4) but does not intercept waits, and a JVM's child processes reach the process rules. |
 | SECCOMP supervision (`chaos-init`) | Static binaries and Go programs that bypass libc; the agent works inside a JVM only. |
 
 ### 11.3. Orchestration-only vocabulary
@@ -1196,7 +1196,18 @@ together: the libc layer covers what the JVM layer cannot.
 fork:ERRNO:EAGAIN@0.2
 ```
 
-**JVM translation.** No clean equivalent. Java code does not call `fork()`. JVM
+**JVM translation.** For the process start, direct: the agent fails
+`ProcessBuilder.start` and `Runtime.exec` with the JDK's own failure.
+
+```json
+{"id": "fork-eagain-20pct", "scope": "JVM",
+ "selector": {"type": "process", "operations": ["PROCESS_START"]},
+ "effect": {"type": "errno", "errno": "EAGAIN"},
+ "activationPolicy": {"probability": 0.2}}
+```
+
+The application then sees `IOException: Cannot run program "x": error=11,
+Resource temporarily unavailable`. Java code does not call `fork()` itself. JVM
 platform threads are created with `pthread_create`, so
 `pthread_create:ERRNO:EAGAIN` is the libc rule behind
 `OutOfMemoryError: unable to create native thread`; the agent's nearest effect,
