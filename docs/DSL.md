@@ -322,14 +322,14 @@ Same caveat as §2.3: a sketch of the surface, not its source of truth.
 |---|---|---|---|
 | **Selector** | Path prefix, endpoint, host name/address, or function selector parsed from a text rule | `ChaosSelector` factories — `ChaosSelector.network(...)`, `ChaosSelector.fileIo(...)`, `ChaosSelector.dns(...)`, … — or plan JSON `"selector": {"type": ...}` | `@Chaos(target=…)` annotation parameter; YAML `selector:` block |
 | **Selector match site** | Inside the wrapper, against the call's arguments (descriptors resolved to paths or endpoints) | Inside advice woven into the JDK or library method, against the call's arguments: peer address and port, host name, path, byte count | At the orchestration boundary (Toxiproxy / Testcontainers `withCommand` hook) |
-| **Effect** | ERRNO, GAI, LATENCY, TIMEOUT, CORRUPT, TORN, TRICKLE, DUP, RESET, OFFSET, REGRESS, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER | `ChaosEffect.delay(...)`, `ChaosEffect.errno(...)`, `ChaosEffect.reject(...)`, `ChaosEffect.trickle(...)`, `ChaosEffect.corruptRead()`, `ChaosEffect.timeout()`, `ChaosEffect.connectionReset()`, `ChaosEffect.tornWrite()`, `ChaosEffect.skewClock(...)`, the DNS answer effects, and JVM-only effects and stressors (§11.1) | Toxiproxy toxics / `tc netem` rules / cgroup throttling |
+| **Effect** | ERRNO, GAI, LATENCY, TIMEOUT, CORRUPT, TORN, TRICKLE, DUP, RESET, OFFSET, REGRESS, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER | `ChaosEffect.delay(...)`, `ChaosEffect.errno(...)`, `ChaosEffect.reject(...)`, `ChaosEffect.trickle(...)`, `ChaosEffect.corruptRead()`, `ChaosEffect.timeout()`, `ChaosEffect.connectionReset()`, `ChaosEffect.tornWrite()`, `ChaosEffect.skewClock(...)`, the DNS answer effects, `ChaosEffect.redirect(...)`, and JVM-only effects and stressors (§11.1) | Toxiproxy toxics / `tc netem` rules / cgroup throttling |
 | **Effect application phase** | Pre-call (ERRNO, GAI, LATENCY, FAIL_AFTER; TORN shortens the count), instead of the call (OVERRIDE), post-call (CORRUPT, OFFSET, REGRESS, result-set transforms) | Before the call (delay, gate, reject, errno), instead of it (suppress), on its byte count (trickle, tornWrite), after it (corruptRead, return-value corruption, DNS answer shaping, clock skew) | At the network/cgroup boundary, always pre-effect from the application's perspective |
 | **Activation policy** | Probability, `@first`, `@from`/`@until`, `@size`; FAIL_AFTER's call counter | `ActivationPolicy`: probability, `maxApplications` (`ActivationPolicy.count(n)`), `activeFrom`/`activeUntil` (`ActivationPolicy.window(from, until)`), `activeFor`, `activateAfterMatches`, `rateLimit`; the selector's `minBytes`/`maxBytes` | Annotation parameters + scenario lifecycle hooks |
 | **Activation evaluation** | Per call: window, size gate, one draw from a per-thread PRNG, `@first` claim | Per call: session, selector filters, window, `activateAfterMatches`, probability (reproducible with `randomSeed`), rate limit, `maxApplications` reservation | Lifecycle-driven (apply on `@BeforeEach`, remove on `@AfterEach`) |
 | **Configuration source** | Text file `/tmp/.chaos-<lib>.conf` | Java API, or a JSON plan from an agent argument, an environment variable or a watched file | YAML / annotations + dynamic Testcontainers calls |
 | **Reload semantics** | `stat()` of the rule file at most every 1 ms, two-snapshot publication under a CAS-owned reload | The plan file is polled (modification time, size, file key, content hash); a changed plan is validated whole, then swapped; a failed read or an invalid plan keeps the previous plan | Lifecycle hooks; the boundary mutates between phases |
 | **Failure mode on bad config** | Fail-open: no rules, status file names the line | An invalid plan file is not applied; `/tmp/.chaos-jvm.status` reports `state=error` with line, column and reason. An invalid scenario passed to the API throws `ChaosValidationException` | Fail-fast at YAML parse |
-| **Status and hit counts** | `/tmp/.chaos-<lib>.status`, `/tmp/.chaos-<lib>.hits.<n>` | `/tmp/.chaos-jvm.status`, `/tmp/.chaos-jvm.hits.<pid>` in the same key and line format; diagnostics, JMX, events and metrics in-process | Test reports |
+| **Status and hit counts** | `/tmp/.chaos-<lib>.status` (`state`, `rules`, `line`, `reason`, `text`, `pid`), `/tmp/.chaos-<lib>.hits.<n>` | `/tmp/.chaos-jvm.status`, `/tmp/.chaos-jvm.hits.<pid>` in the same `key=value` line format, with `scenarios` for `rules`, `column` beside `line`, `source` and no `text`; diagnostics, JMX, events and metrics in-process | Test reports |
 | **Detection by SUT** | `getenv("LD_PRELOAD")` / `/proc/self/maps` | the `-javaagent:` argument in `RuntimeMXBean.getInputArguments()`, or `/tmp/.chaos-jvm.status` | External — orchestration is outside the SUT |
 
 ---
@@ -392,10 +392,14 @@ which closes first and then reports the error, see [IO.md §4](IO.md#4-end-to-en
 | libc | JVM | Orchestration |
 |---|---|---|
 | `/data:write:EIO:1.0` (io) | `ChaosEffect.errno(ChaosEffect.Errno.EIO)` on `OperationType.FILE_IO_WRITE`: a `FileSystemException` naming the file | Toxiproxy `down` |
+| `/data:fsync:EIO:1.0` (io) | `ChaosEffect.errno(ChaosEffect.Errno.EIO)` on `OperationType.FILE_IO_SYNC`: `SyncFailedException` (`FileChannel.force`, `FileDescriptor.sync`, `MappedByteBuffer.force` wrapped in `UncheckedIOException`) | N/A |
+| `/data:open:EMFILE:1.0`, `/data:close:EIO:1.0` (io) | the same errors on `OperationType.FILE_IO_OPEN` (a `java.io` constructor throws `FileNotFoundException("path (reason)")`) and `OperationType.FILE_IO_CLOSE` (after the close, which releases the descriptor, as in libc) | N/A |
+| `tcp4://0.0.0.0:8080:bind:EADDRINUSE:1.0` (net) | `ChaosEffect.errno(ChaosEffect.Errno.EADDRINUSE)` on `OperationType.SOCKET_BIND`, whose address filters match the address being bound: `BindException` | N/A |
 | `tcp4://10.0.0.5:5432:connect:ECONNREFUSED:1.0` (net) | `ChaosEffect.errno(ChaosEffect.Errno.ECONNREFUSED)` on `OperationType.SOCKET_CONNECT`: `ConnectException` | iptables DROP / Toxiproxy `down` |
 | `tcp4://10.0.0.5:5432:recv:ETIMEDOUT:1.0` (net) | `ChaosEffect.errno(ChaosEffect.Errno.ETIMEDOUT)` on `OperationType.SOCKET_READ`; `ChaosEffect.timeout()` first waits out the socket's `SO_TIMEOUT` | Toxiproxy `timeout` |
 | `dns://db.internal:EAI_AGAIN:1.0` (dns) | `ChaosEffect.reject("...")` on `OperationType.DNS_RESOLVE`: `UnknownHostException` | DNS server SERVFAIL |
-| `pthread_create:ERRNO:EAGAIN` (process) | `ChaosEffect.reject("...")` on `OperationType.THREAD_START`: `RejectedExecutionException`, not the JDK's `OutOfMemoryError: unable to create native thread` (§12.4) | N/A |
+| `pthread_create:ERRNO:EAGAIN` (process) | `ChaosEffect.errno(ChaosEffect.Errno.EAGAIN)` on a platform `OperationType.THREAD_START`: the JDK's `OutOfMemoryError: unable to create native thread` (§12.4) | N/A |
+| `mmap/file:ERRNO:ENOMEM` (memory) | `ChaosEffect.errno(ChaosEffect.Errno.ENOMEM)` on `OperationType.FILE_IO_MAP` (`FileChannel.map`): `IOException("Map failed")` | N/A |
 
 ### 5.2. Class B — pre-call latency (LATENCY)
 
@@ -433,7 +437,8 @@ Operates on the address list of `getaddrinfo` (and the hostent resolvers).
 | `dns://db.internal:FILTER_FAMILY:inet6` | `ChaosEffect.dnsFamily(ChaosEffect.AddressFamily.IPV6)` | DNS server returning AAAA-only or A-only |
 | `dns://db.internal:LIMIT:1` | `ChaosEffect.dnsLimit(1)` | DNS server with `--max-answers` |
 | `dns://db.internal:SHUFFLE:0.3` | `ChaosEffect.dnsShuffle()` with probability `0.3` | N/A (most DNS servers preserve answer order) |
-| `dns://db.internal:SERVICE:15432` | N/A (§11.2) | N/A (the port is application-layer, not DNS) |
+| `dns://db.internal:SERVICE:15432` | `ChaosEffect.redirect("db.internal", 15432)` on `OperationType.SOCKET_CONNECT`: the JVM resolves no service names, so the port changes at the connect | N/A (the port is application-layer, not DNS) |
+| `rdns://10.0.0.5:EAI_NONAME:1.0` | `ChaosEffect.reject("...")` on `OperationType.DNS_REVERSE`: `InetAddress.getHostName` returns the IP literal, as the JDK reports a failed reverse lookup | N/A |
 
 ### 5.5. Class E — counter-driven failure (FAIL_AFTER)
 
@@ -458,7 +463,11 @@ JVM: `ChaosEffect.trickle(n)` caps each socket read, `ChaosEffect.timeout()` wai
 out the socket's own `SO_TIMEOUT` (or connect timeout) on a read or connect and
 throws `SocketTimeoutException`, never firing on an infinite timeout, and
 `ChaosEffect.connectionReset()` closes with `SO_LINGER` 0 so the peer sees a reset.
-DUP has no JVM equivalent.
+They act on `java.net.Socket` and `SocketChannel` alike. The `poll` TIMEOUT is
+`ChaosEffect.timeout()` on `OperationType.NIO_SELECTOR_SELECT`: `select(timeout)`
+waits out its timeout and reports no ready channel. UDP is
+`OperationType.DATAGRAM_SEND` / `OperationType.DATAGRAM_RECEIVE`, where
+`ChaosEffect.suppress()` drops a datagram. DUP has no JVM equivalent.
 
 ---
 
@@ -483,7 +492,7 @@ Identity across layers: same definition, same closed interval.
 | Layer | State | Seeding | Quality |
 |---|---|---|---|
 | libc | `__thread uint64_t g_chaos_<lib>_tls_prng_state`, xorshift64* | Process seed: 8 bytes of `/dev/urandom` read with raw system calls in the constructor (fallback `0x6a09e667f3bcc909 ^ getpid()`). Per thread, on its first draw: SplitMix64(process seed ⊕ kernel thread id ⊕ stack address) with the low bit forced to 1 | xorshift64* (period 2^64 − 1); sufficient for fault injection |
-| JVM | `SplittableRandom` per scenario / per session (per-thread split) | `Thread`-local split from a session seed | L'Ecuyer-class (`SplittableRandom` is well studied) |
+| JVM | A `SplittableRandom` per evaluation, never shared between threads | `randomSeed` (or a random one) ⊕ the match number ⊕ the scenario id. The sampled delay draws from a split stream; the effect's own choices (torn length, corrupted bit, DNS shuffle order) from the same seed salted per choice, so a fixed `randomSeed` reproduces all of them | SplitMix-based (`SplittableRandom` is well studied) |
 | Orchestration | Server-side (Toxiproxy uses Go's `math/rand`) | Toxiproxy seeds from time at process start | Sufficient for chaos |
 
 ### 6.3. Why per-thread, lazily seeded
@@ -1067,10 +1076,10 @@ holds; the vocabulary is partial.
 |---|---|
 | `OFFSET` / `REGRESS` seen by every `System.currentTimeMillis()` and `System.nanoTime()` read, JDK and libraries included | Both are JIT intrinsics; the methods cannot be advised. The agent skews `java.time` and `java.util.Date` reads, and direct calls only at the call sites in the packages named with its `clockCallSites` setting (`OperationType.SYSTEM_CLOCK_MILLIS`, `OperationType.SYSTEM_CLOCK_NANOS`); the libc layer sees every clock read beneath the JVM. |
 | `clock_gettime/monotonic` beneath the JDK | `System.nanoTime()` is an intrinsic (as above); only opted-in call sites are skewed. |
-| `DUP`, `SERVICE` | No JVM effect duplicates received data or rewrites a resolved service port. |
-| `unix://` endpoints | Unix-domain sockets are not intercepted by the agent. |
-| `mmap/anon` vs `mmap/file` | The JVM does not expose `mmap` as a chaos target (direct ByteBuffers have a different scope). |
-| `waitpid`, and faults inside the child process | The agent fails a process start itself (`OperationType.PROCESS_START`, §12.4) but does not intercept waits, and a JVM's child processes reach the process rules. |
+| `DUP` | No JVM effect duplicates received data. (`SERVICE` is `ChaosEffect.redirect(...)` at the connect, §5.4.) |
+| `mmap/anon`, `munmap`, `mprotect`, `madvise` | The JVM exposes only file mappings (`OperationType.FILE_IO_MAP`); the heap and direct-buffer stressors are the JVM-level analogue for memory. |
+| Faults inside a child process | The agent fails a process start (`OperationType.PROCESS_START`) and a wait (`OperationType.PROCESS_WAIT`); what a JVM's child process does reaches the process rules. |
+| net `EINTR`, `EAGAIN`, `ENOMEM`; distinct GAI codes | The JDK retries interrupted calls and reports a would-block call as `0`; every failed lookup is one `UnknownHostException`. |
 | SECCOMP supervision (`chaos-init`) | Static binaries and Go programs that bypass libc; the agent works inside a JVM only. |
 
 ### 11.3. Orchestration-only vocabulary
@@ -1160,8 +1169,8 @@ chaos.activate(ChaosScenario.builder("fsync-eio-5pct")
 
 **Symmetry note.** One rule on each layer. The probability is the io rule's value
 field and the JVM policy's `probability`; `FileChannel.force` and
-`FileDescriptor.sync` then throw a `FileSystemException` naming the file, with the
-reason `Input/output error`.
+`FileDescriptor.sync` then throw a `SyncFailedException` with the reason
+`Input/output error` (`FileDescriptor.sync` declares no other exception).
 
 ### 12.3. Clock skew (a partial JVM equivalent)
 
@@ -1174,13 +1183,14 @@ clock_gettime/realtime:OFFSET:200
 `gettimeofday`, `time` and `timespec_get` read the same clock and see the same
 offset.
 
-**JVM translation.** Partial. The agent skews `Instant.now()`, `LocalDateTime.now()`,
-`ZonedDateTime.now()` and `new Date()`:
+**JVM translation.** Partial. The agent skews every `java.time` read (`Instant.now()`,
+`LocalDateTime.now()`, `ZonedDateTime.now()`, and through `OperationType.CLOCK_READ`
+the system `Clock` behind `LocalDate`, `OffsetDateTime` and the rest) and `new Date()`:
 
 ```json
 {"id": "clock-offset-200ms", "scope": "JVM",
  "selector": {"type": "jvmRuntime",
-              "operations": ["INSTANT_NOW", "LOCAL_DATE_TIME_NOW", "ZONED_DATE_TIME_NOW", "DATE_NEW"]},
+              "operations": ["INSTANT_NOW", "CLOCK_READ", "LOCAL_DATE_TIME_NOW", "ZONED_DATE_TIME_NOW", "DATE_NEW"]},
  "effect": {"type": "clockSkew", "skewAmount": "PT0.2S", "mode": "FIXED"}}
 ```
 
@@ -1210,9 +1220,9 @@ The application then sees `IOException: Cannot run program "x": error=11,
 Resource temporarily unavailable`. Java code does not call `fork()` itself. JVM
 platform threads are created with `pthread_create`, so
 `pthread_create:ERRNO:EAGAIN` is the libc rule behind
-`OutOfMemoryError: unable to create native thread`; the agent's nearest effect,
-`ChaosEffect.reject("...")` on `OperationType.THREAD_START`, throws
-`RejectedExecutionException` instead. Child processes started with
+`OutOfMemoryError: unable to create native thread`, and
+`ChaosEffect.errno(ChaosEffect.Errno.EAGAIN)` on a platform
+`OperationType.THREAD_START` raises that same error from the JVM layer. Child processes started with
 `Runtime.exec()`/`ProcessBuilder` use the launch mechanism selected by
 `jdk.lang.Process.launchMechanism`: `POSIX_SPAWN` reaches `posix_spawn` rules,
 `FORK` reaches `fork` rules, and `VFORK` reaches neither (`vfork` is not
