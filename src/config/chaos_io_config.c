@@ -740,10 +740,11 @@ static int chaos_io_prefix_covers(const char *prefix, size_t length, const char 
 /**
  * @brief Non-zero when @p rule's prefix, as written or link-resolved, covers @p path.
  *
- * @details `*` covers every absolute path except memfds (`/memfd:<name>`); pipes, sockets
- * and anonymous inodes resolve to names without a leading `/` and are reached only by a
- * rule that names them. A relative prefix never covers anything, since every path matched
- * is absolute.
+ * @details `*` covers every absolute path except memfds (`/memfd:<name>`). Pipes, sockets
+ * and anonymous inodes resolve to names without a leading `/` (`pipe:[N]`, `socket:[N]`,
+ * `anon_inode:[...]`) and no rule reaches them: a selector is the first colon-separated
+ * field, so their names cannot be written, and a prefix that is neither `*` nor absolute
+ * is rejected at parse time. Every path matched here is therefore absolute.
  */
 static int chaos_io_rule_prefix_matches(const chaos_io_rule_t *rule, const char *path)
 {
@@ -1397,6 +1398,14 @@ int chaos_io_config_parse_line(char *line, chaos_io_rule_t *rule)
         return -1;
     }
     if (strlen(fields[0]) >= CHAOS_IO_MAX_RULE_PATH)
+    {
+        return -1;
+    }
+    /* A prefix that is neither the wildcard nor absolute never covers anything
+     * (chaos_io_rule_prefix_matches): every path matched is absolute. Such a rule used to
+     * load with state=ok and never fire, which is indistinguishable from a rule whose
+     * selector simply did not come up. */
+    if (strcmp(fields[0], "*") != 0 && fields[0][0] != '/')
     {
         return -1;
     }

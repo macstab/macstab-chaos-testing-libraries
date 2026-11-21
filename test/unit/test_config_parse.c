@@ -350,6 +350,9 @@ static void test_parse_line_invalid_cases(void)
     char empty_operation[] = "/data::EIO:0.1";
     char empty_effect[] = "/data:read::0.1";
     char empty_value[] = "/data:read:EIO:";
+    char relative_prefix[] = "data:read:EIO:1.0";
+    char dotted_prefix[] = "./data:read:EIO:1.0";
+    char parent_prefix[] = "../data:read:EIO:1.0";
     chaos_io_rule_t rule;
 
     assert(chaos_io_config_parse_line(NULL, &rule) == -1);
@@ -368,6 +371,11 @@ static void test_parse_line_invalid_cases(void)
     assert(chaos_io_config_parse_line(invalid_latency, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_corrupt_probability, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_torn_probability, &rule) == -1);
+    /* A prefix that is neither the wildcard nor absolute can never cover a path:
+     * such a rule used to load and never fire. */
+    assert(chaos_io_config_parse_line(relative_prefix, &rule) == -1);
+    assert(chaos_io_config_parse_line(dotted_prefix, &rule) == -1);
+    assert(chaos_io_config_parse_line(parent_prefix, &rule) == -1);
 
     (void)memset(long_path_line, 'a', sizeof(long_path_line));
     long_path_line[0] = '/';
