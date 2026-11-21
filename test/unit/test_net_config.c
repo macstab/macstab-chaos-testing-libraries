@@ -1593,8 +1593,10 @@ static void test_vdso_lookup_rejects_bad_input(void)
 static void test_rule_qualifiers(void)
 {
     static chaos_net_rule_t rules[CHAOS_NET_MAX_RULES];
-    char qualified[] = "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 @first=3 @from=1000 "
+    /* send reports a byte count, so a size gate is meaningful on it. */
+    char qualified[] = "tcp4://127.0.0.1:9010:send:ECONNRESET:1.0 @first=3 @from=1000 "
                        "@until=2000 @size>10 @size<99 # owner\n";
+    char sized_connect[] = "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 @size>10\n";
     char unknown[] = "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 @bogus=1\n";
     char lonely[] = "# header\n  @first=3\n";
     char backwards[] = "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 @from=2000 @until=1000\n";
@@ -1620,6 +1622,9 @@ static void test_rule_qualifiers(void)
     assert(chaos_net_config_parse_buffer(lonely, rules, &count) == -1);
     assert(chaos_net_config_last_error()->line == 2U);
     assert(chaos_net_config_parse_buffer(backwards, rules, &count) == -1);
+    /* connect reports no byte count, so the gate could never pass: the rule would
+     * load and never fire. */
+    assert(chaos_net_config_parse_buffer(sized_connect, rules, &count) == -1);
     assert(chaos_net_config_parse_buffer(empty_first, rules, &count) == -1);
 }
 

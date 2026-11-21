@@ -358,6 +358,22 @@ static void chaos_net_strip_comment(char *line)
 }
 
 /**
+ * @brief Whether operation @p operation reports a byte count to a rule.
+ *
+ * @details Only send and recv do, for every call decided as one of them (send, sendto,
+ * sendmsg, sendmmsg, write, writev and their recv counterparts). socket, bind, listen,
+ * connect, accept, shutdown, close and the poll family pass CHAOS_POLICY_NO_SIZE, so a
+ * `@size` gate on them could never pass and the rule would load and never fire.
+ *
+ * @param operation Operation of the rule.
+ * @return Non-zero when the operation reports a byte count.
+ */
+static int chaos_net_operation_has_size(chaos_net_operation_t operation)
+{
+    return operation == CHAOS_NET_OP_SEND || operation == CHAOS_NET_OP_RECV;
+}
+
+/**
  * @brief Maps an operation name to chaos_net_operation_t.
  *
  * @details Exact, case-sensitive names: bind, listen, connect, accept, socket, shutdown,
@@ -1126,6 +1142,12 @@ int chaos_net_config_parse_buffer(char *buffer, chaos_net_rule_t *rules, size_t 
                 return -1;
             }
             continue;
+        }
+        if (chaos_policy_has_size(&policy) && !chaos_net_operation_has_size(parsed.operation))
+        {
+            chaos_status_reject(&g_chaos_net_config_error, CHAOS_STATUS_REASON_INVALID);
+            *rule_count = 0U;
+            return -1;
         }
         parsed.policy = policy;
         parsed.call_size = CHAOS_POLICY_NO_SIZE;

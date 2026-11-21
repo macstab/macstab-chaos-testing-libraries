@@ -738,6 +738,25 @@ static int chaos_io_prefix_covers(const char *prefix, size_t length, const char 
 }
 
 /**
+ * @brief Whether operation @p operation reports a byte count to a rule.
+ *
+ * @details Only the calls that move bytes do: read, write, pread and pwrite (including
+ * their iovec forms, sendfile and copy_file_range, which are decided as write) and
+ * fallocate, whose length is passed. open, close, fsync, fdatasync, ftruncate, rename and
+ * unlink pass CHAOS_POLICY_NO_SIZE, so a `@size` gate on them could never pass and the rule
+ * would load and never fire.
+ *
+ * @param operation Operation of the rule.
+ * @return Non-zero when the operation reports a byte count.
+ */
+static int chaos_io_operation_has_size(chaos_io_operation_t operation)
+{
+    return operation == CHAOS_IO_OP_READ || operation == CHAOS_IO_OP_WRITE ||
+           operation == CHAOS_IO_OP_PREAD || operation == CHAOS_IO_OP_PWRITE ||
+           operation == CHAOS_IO_OP_ALLOCATE;
+}
+
+/**
  * @brief Non-zero when @p rule's prefix, as written or link-resolved, covers @p path.
  *
  * @details `*` covers every absolute path except memfds (`/memfd:<name>`). Pipes, sockets
@@ -1544,6 +1563,12 @@ int chaos_io_config_parse_buffer(char *buffer, chaos_io_rule_t *rules, size_t *r
                 return -1;
             }
             continue;
+        }
+        if (chaos_policy_has_size(&policy) && !chaos_io_operation_has_size(parsed.operation))
+        {
+            chaos_status_reject(&g_chaos_io_config_error, CHAOS_STATUS_REASON_INVALID);
+            *rule_count = 0U;
+            return -1;
         }
         parsed.policy = policy;
         parsed.call_size = CHAOS_POLICY_NO_SIZE;
