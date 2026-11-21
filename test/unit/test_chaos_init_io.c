@@ -178,6 +178,7 @@ int main(void)
                 "/tmp/initio/s:fsync:EIO:1.0\n"
                 "/tmp/initio/t:truncate:EROFS:1.0\n"
                 "/tmp/initio/big:truncate:ENOSPC:1.0 @size>100\n"
+                "/tmp/initio/big:allocate:EDQUOT:1.0 @size>100\n"
                 "/tmp/initio/data:unlink:EACCES:1.0\n"
                 "/tmp/initio/ren:rename_from:EMFILE:1.0\n"
                 "/tmp/initio/ren/from:rename_from:EACCES:1.0\n"
@@ -287,6 +288,11 @@ int main(void)
      * does under LD_PRELOAD. */
     assert(FAILS(decide(__NR_truncate, P("/tmp/initio/big/f"), 200U, 0, 0, 0), ENOSPC));
     assert(PASSES(decide(__NR_truncate, P("/tmp/initio/big/f"), 50U, 0, 0, 0)));
+    /* fallocate reports its length too, from args[3]: the wrappers always passed it while
+     * this table said the call had none, so `@size` worked under LD_PRELOAD and silently
+     * never fired here. */
+    assert(FAILS(decide(__NR_fallocate, (uint64_t)big, 0, 0, 200U, 0), EDQUOT));
+    assert(PASSES(decide(__NR_fallocate, (uint64_t)big, 0, 0, 50U, 0)));
     assert(
         FAILS(decide(__NR_unlinkat, (uint64_t)AT_FDCWD, P("/tmp/initio/data/f"), 0, 0, 0), EACCES)
     );

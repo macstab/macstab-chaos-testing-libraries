@@ -339,7 +339,9 @@ CHAOS_IO_EXPORT int fallocate(int fd, int mode, off_t offset, off_t length)
 
     chaos_io_ensure_symbols();
     if (chaos_io_in_internal() ||
-        !chaos_io_match_fd_rule_sized(fd, CHAOS_IO_OP_ALLOCATE, (uint64_t)length, &rule))
+        !chaos_io_match_fd_rule_sized(
+            fd, CHAOS_IO_OP_ALLOCATE, length < 0 ? CHAOS_POLICY_NO_SIZE : (uint64_t)length, &rule
+        ))
     {
         return chaos_io_call_real_fallocate(fd, mode, offset, length);
     }
@@ -560,7 +562,9 @@ CHAOS_IO_EXPORT int posix_fallocate(int fd, off_t offset, off_t length)
 
     chaos_io_ensure_symbols();
     if (chaos_io_in_internal() ||
-        !chaos_io_match_fd_rule_sized(fd, CHAOS_IO_OP_ALLOCATE, (uint64_t)length, &rule))
+        !chaos_io_match_fd_rule_sized(
+            fd, CHAOS_IO_OP_ALLOCATE, length < 0 ? CHAOS_POLICY_NO_SIZE : (uint64_t)length, &rule
+        ))
     {
         return chaos_io_call_real_posix_fallocate(fd, offset, length);
     }
