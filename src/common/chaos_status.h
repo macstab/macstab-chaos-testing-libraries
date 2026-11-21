@@ -14,8 +14,19 @@
  * line=<1-based line of the first rejected rule; 0 when no line is named>  (error only)
  * reason=<one of the reasons below>                                        (error only)
  * text=<that line as written, at most 200 bytes>                           (error only)
+ * warnings=<number of warnings raised; omitted when none>
+ * warn.<n>=line:<line> reason:<reason>                      (one per warning, n from 1)
  * pid=<process that wrote the file>
  * @endcode
+ *
+ * A warning names a rule that loaded and is valid, but that cannot do what its author
+ * meant: one shadowed by an earlier rule, or an effect suppressed at run time. The rule
+ * file stays in force, so `state` remains `ok` and the error keys stay absent; only
+ * `warnings` and `warn.<n>` appear. A reader that ignores unknown keys is unaffected,
+ * which is why the keys are additive rather than a new state.
+ *
+ * At most CHAOS_STATUS_WARN_MAX warnings are listed while `warnings` counts them all, so
+ * a flood is visible without a flood of keys.
  *
  * | reason | line |
  * |--------|------|
@@ -52,6 +63,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -65,8 +77,14 @@
 /** @brief Maximum bytes of a rule text kept for the status and hits files (excluding NUL). */
 #define CHAOS_STATUS_TEXT_MAX 200U
 
-/** @brief Report buffer size: six keys, a 200-byte text and three numbers fit with room. */
-#define CHAOS_STATUS_BUFFER_SIZE 512U
+/** @brief Warnings listed in a report; `warnings=` still counts every one raised. */
+#define CHAOS_STATUS_WARN_MAX 8U
+
+/**
+ * @brief Report buffer size: six keys, a 200-byte text, three numbers and
+ *        CHAOS_STATUS_WARN_MAX warning lines fit with room.
+ */
+#define CHAOS_STATUS_BUFFER_SIZE 1024U
 
 /** @brief Outcome of a reload, written as the `state=` key. */
 typedef enum chaos_status_state
@@ -80,12 +98,28 @@ typedef enum chaos_status_state
  *
  * @details `reason == NULL` means no line was rejected. `line == 0` with a reason means a
  * whole-file rejection that names no line.
+ *
+ * Clear the record with chaos_status_clear() before a parse: chaos_status_keep_line()
+ * moves on to the next line and deliberately leaves the warnings alone, since those
+ * concern lines already read. Every library keeps its record in static storage, so it
+ * starts out zeroed in any case.
  */
+/** @brief One warning: the line it concerns and why it was raised. */
+typedef struct chaos_status_warning
+{
+    size_t line;
+    const char *reason;
+} chaos_status_warning_t;
+
 typedef struct chaos_status_error
 {
     size_t line;
     const char *reason;
     char text[CHAOS_STATUS_TEXT_MAX + 1U];
+    /** @brief Warnings raised so far, listed up to CHAOS_STATUS_WARN_MAX. */
+    chaos_status_warning_t warnings[CHAOS_STATUS_WARN_MAX];
+    /** @brief How many were raised, including those past the list. */
+    size_t warning_count;
 } chaos_status_error_t;
 
 /** @brief Reason: the line does not parse (selector, effect, probability or qualifier). */
@@ -107,6 +141,12 @@ typedef struct chaos_status_error
 #define CHAOS_STATUS_REASON_NUL "file contains a NUL byte"
 
 /**
+ * @brief Warning: a rule that an earlier one with the same selector, operation and effect
+ *        always wins against, so it can never fire.
+ */
+#define CHAOS_STATUS_WARN_SHADOWED "shadowed by an earlier rule"
+
+/**
  * @brief Reason: a valid rule that SECCOMP mode cannot apply (data effects, ERRNO on
  *        close); emitted when a parser is built for chaos-init.
  */
@@ -118,6 +158,28 @@ static inline void chaos_status_clear(chaos_status_error_t *error)
     error->line = 0U;
     error->reason = NULL;
     error->text[0] = '\0';
+    error->warning_count = 0U;
+}
+
+/**
+ * @brief Records a warning about line @p line.
+ *
+ * @details Every warning counts; only the first CHAOS_STATUS_WARN_MAX are kept for the
+ * report. Warnings survive chaos_status_keep_line(), which moves on to the next line,
+ * because they concern rules already parsed.
+ *
+ * @param error  Record to add to.
+ * @param line   1-based line the warning is about.
+ * @param reason One of the CHAOS_STATUS_WARN_* strings; must outlive the record.
+ */
+static inline void chaos_status_warn(chaos_status_error_t *error, size_t line, const char *reason)
+{
+    if (error->warning_count < CHAOS_STATUS_WARN_MAX)
+    {
+        error->warnings[error->warning_count].line = line;
+        error->warnings[error->warning_count].reason = reason;
+    }
+    ++error->warning_count;
 }
 
 /**
@@ -152,6 +214,38 @@ static inline void chaos_status_reject(chaos_status_error_t *error, const char *
 }
 
 /**
+ * @brief Appends a formatted key to @p buffer at @p used, never writing past @p size.
+ *
+ * @details Keys are appended one at a time so a report can carry a variable number of
+ * them. A full buffer or a formatting failure leaves the text as it was, so the report is
+ * truncated between keys rather than inside one.
+ *
+ * @param buffer Report buffer.
+ * @param size   Its size, including room for the NUL.
+ * @param used   Bytes already written, excluding the NUL.
+ * @param format printf format of the key to append.
+ * @return The new length, excluding the NUL.
+ */
+static inline size_t
+chaos_status_append(char *buffer, size_t size, size_t used, const char *format, ...)
+{
+    va_list arguments;
+    int length;
+
+    if (used + 1U >= size)
+    {
+        return used;
+    }
+    va_start(arguments, format);
+    length = vsnprintf(buffer + used, size - used, format, arguments);
+    va_end(arguments);
+    /* No branch for a negative return: the formats are fixed and the buffer is bounded, so
+     * vsnprintf cannot fail here, and were it to, the cast would exceed the remaining room
+     * and the result would clamp to a truncated report rather than run past the end. */
+    return (size_t)length < size - used ? used + (size_t)length : size - 1U;
+}
+
+/**
  * @brief Formats a status report into @p buffer.
  *
  * @details The error layout is used only when @p state is CHAOS_STATUS_ERROR and
@@ -170,31 +264,55 @@ static inline size_t chaos_status_format(
 )
 {
     static const char *const names[] = {"ok", "error"};
-    int length;
+    size_t used = 0U;
 
+    if (size == 0U)
+    {
+        return 0U;
+    }
+    /* Terminate first: a buffer too small for even one key is still a valid string. */
+    buffer[0] = '\0';
     if (state == CHAOS_STATUS_ERROR && error != NULL && error->reason != NULL)
     {
-        length = snprintf(
+        used = chaos_status_append(
             buffer,
             size,
-            "state=error\nrules=0\nline=%lu\nreason=%s\ntext=%s\npid=%ld\n",
+            used,
+            "state=error\nrules=0\nline=%lu\nreason=%s\ntext=%s\n",
             (unsigned long)error->line,
             error->reason,
-            error->text,
-            pid
+            error->text
         );
     }
     else
     {
-        length = snprintf(
-            buffer, size, "state=%s\nrules=%lu\npid=%ld\n", names[state], (unsigned long)rules, pid
+        used = chaos_status_append(
+            buffer, size, used, "state=%s\nrules=%lu\n", names[state], (unsigned long)rules
         );
     }
-    if (length < 0 || size == 0U)
+    if (error != NULL && error->warning_count > 0U)
     {
-        return 0U;
+        const size_t listed = error->warning_count < CHAOS_STATUS_WARN_MAX ? error->warning_count
+                                                                           : CHAOS_STATUS_WARN_MAX;
+        size_t index;
+
+        used = chaos_status_append(
+            buffer, size, used, "warnings=%lu\n", (unsigned long)error->warning_count
+        );
+        for (index = 0U; index < listed; ++index)
+        {
+            used = chaos_status_append(
+                buffer,
+                size,
+                used,
+                "warn.%lu=line:%lu reason:%s\n",
+                (unsigned long)(index + 1U),
+                (unsigned long)error->warnings[index].line,
+                error->warnings[index].reason
+            );
+        }
     }
-    return (size_t)length < size ? (size_t)length : size - 1U;
+    return chaos_status_append(buffer, size, used, "pid=%ld\n", pid);
 }
 
 /*

@@ -825,6 +825,8 @@ static void test_status_report(void)
     char line[260];
     char report[CHAOS_STATUS_BUFFER_SIZE];
 
+    chaos_status_clear(&error);
+
     /* Control characters (TAB, DEL) become blanks; the kept text ends at a newline. */
     chaos_status_keep_line(&error, 3U, "a\tb\177c\nd");
     assert(strcmp(error.text, "a b c") == 0 && error.line == 3U && error.reason == NULL);
@@ -848,6 +850,84 @@ static void test_status_report(void)
     );
     chaos_status_clear(&error);
     assert(error.line == 0U && error.reason == NULL && error.text[0] == '\0');
+    assert(error.warning_count == 0U);
+
+    /* No warning raised: the report carries no `warnings` key at all, so a reader that
+     * does not know the key sees exactly what it saw before. */
+    assert(chaos_status_format(report, sizeof(report), CHAOS_STATUS_OK, 2U, &error, 9L) > 0U);
+    assert(strcmp(report, "state=ok\nrules=2\npid=9\n") == 0);
+
+    /* Warnings are listed in order, numbered from 1, between the state and the pid. The
+     * rule file stays in force, so the state is still ok and no error key appears. */
+    chaos_status_warn(&error, 4U, CHAOS_STATUS_WARN_SHADOWED);
+    chaos_status_warn(&error, 7U, CHAOS_STATUS_WARN_SHADOWED);
+    assert(error.warning_count == 2U);
+    assert(chaos_status_format(report, sizeof(report), CHAOS_STATUS_OK, 2U, &error, 9L) > 0U);
+    assert(
+        strcmp(
+            report,
+            "state=ok\nrules=2\nwarnings=2\n"
+            "warn.1=line:4 reason:shadowed by an earlier rule\n"
+            "warn.2=line:7 reason:shadowed by an earlier rule\n"
+            "pid=9\n"
+        ) == 0
+    );
+
+    /* A rejected file reports both: the rejection and the warnings raised before it. */
+    chaos_status_keep_line(&error, 9U, "bad");
+    chaos_status_reject(&error, CHAOS_STATUS_REASON_INVALID);
+    assert(error.warning_count == 2U); /* keep_line leaves warnings alone */
+    assert(chaos_status_format(report, sizeof(report), CHAOS_STATUS_ERROR, 2U, &error, 9L) > 0U);
+    assert(
+        strcmp(
+            report,
+            "state=error\nrules=0\nline=9\nreason=invalid rule\ntext=bad\nwarnings=2\n"
+            "warn.1=line:4 reason:shadowed by an earlier rule\n"
+            "warn.2=line:7 reason:shadowed by an earlier rule\n"
+            "pid=9\n"
+        ) == 0
+    );
+
+    /* Past the cap only the first CHAOS_STATUS_WARN_MAX are listed, while the count keeps
+     * rising: a flood is visible without flooding the report. */
+    {
+        size_t index;
+        size_t listed = 0U;
+        const char *scan = report;
+
+        chaos_status_clear(&error);
+        for (index = 0U; index < CHAOS_STATUS_WARN_MAX + 3U; ++index)
+        {
+            chaos_status_warn(&error, index + 1U, CHAOS_STATUS_WARN_SHADOWED);
+        }
+        assert(error.warning_count == CHAOS_STATUS_WARN_MAX + 3U);
+        assert(chaos_status_format(report, sizeof(report), CHAOS_STATUS_OK, 1U, &error, 9L) > 0U);
+        assert(strstr(report, "warnings=11\n") != NULL);
+        while ((scan = strstr(scan, "warn.")) != NULL)
+        {
+            ++listed;
+            ++scan;
+        }
+        assert(listed == CHAOS_STATUS_WARN_MAX);
+        assert(strstr(report, "warn.8=line:8 ") != NULL);
+        assert(strstr(report, "warn.9=") == NULL);
+    }
+
+    /* A buffer too small truncates between keys and stays a valid string. */
+    {
+        char tiny[12];
+
+        chaos_status_clear(&error);
+        chaos_status_warn(&error, 1U, CHAOS_STATUS_WARN_SHADOWED);
+        assert(
+            chaos_status_format(tiny, sizeof(tiny), CHAOS_STATUS_OK, 1U, &error, 9L) < sizeof(tiny)
+        );
+        assert(strlen(tiny) < sizeof(tiny));
+        assert(chaos_status_format(tiny, 1U, CHAOS_STATUS_OK, 1U, &error, 9L) == 0U);
+        assert(tiny[0] == '\0');
+        assert(chaos_status_format(tiny, 0U, CHAOS_STATUS_OK, 1U, &error, 9L) == 0U);
+    }
+    chaos_status_clear(&error);
 
     /* A buffer too small: the report is truncated and the return is the length kept. */
     assert(chaos_status_format(report, 8U, CHAOS_STATUS_OK, 1U, NULL, 1L) == 7U);
