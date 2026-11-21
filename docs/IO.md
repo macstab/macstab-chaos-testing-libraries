@@ -253,7 +253,7 @@ algorithm, constructor ordering.
 | selector | The path part of a rule: an absolute path prefix, a literal name such as `pipe:[1234]`, or `*`. |
 | operation | The logical operation (`write`, `truncate`, ...); several functions map to one (§1). |
 | effect | ERRNO, LATENCY, TORN or CORRUPT. |
-| probability | Chance in [0, 1] that a matched ERRNO, TORN or CORRUPT rule fires. LATENCY has none. |
+| probability | Chance in [0, 1] that a matched rule fires. For ERRNO, TORN and CORRUPT it is the value field; for LATENCY the optional `@probability` after the milliseconds, 1.0 without one. |
 | qualifier | `@first`, `@from`, `@until`, `@size` written after the rule ([DSL.md §7.1](DSL.md#71-todays-surface)). |
 | hit | One application of a rule's effect; counted per rule in the hits file. |
 | active snapshot | The published rule array readers match against. |
@@ -283,7 +283,8 @@ For `write(fd, buf, count)` and every other descriptor-based wrapper:
      first in the file on a tie.
 4. No rule: forward unchanged.
 5. Apply the selected rule's effect. Only that rule's effect can fire on this call:
-   - LATENCY: sleep, then call the real function.
+   - LATENCY: if the qualifiers pass and the probability fires, sleep, then call the
+     real function.
    - ERRNO: if the qualifiers pass and the probability fires, set `errno` and
      return `-1` without calling the real function.
    - TORN (write class): if it fires, call the real function with a shorter count.

@@ -11,7 +11,7 @@
  * | Effect | Applied | Gate | Caller sees |
  * |--------|---------|------|-------------|
  * | ERRNO | before the real function | qualifiers, probability | the error value, `errno` set |
- * | LATENCY | before the real function | qualifiers only | the real result, later |
+ * | LATENCY | before the real function | qualifiers, probability | the real result, later |
  * | TORN | before the real function | qualifiers, probability | a short write, [1, n-1] bytes |
  * | CORRUPT | after a read of > 0 bytes | qualifiers, probability | one flipped bit |
  *
@@ -129,7 +129,7 @@ void chaos_io_rule_apply_latency(const chaos_io_rule_t *rule);
  * @brief Decides whether a selected rule fires on this call, and counts the hit if so.
  *
  * @details Checks, in order: the `@from`/`@until` window, the `@size` gate against
- * `rule->call_size`, the probability (not for LATENCY, which has none), and finally
+ * `rule->call_size`, the probability, and finally
  * chaos_policy_fire(), which claims a `@first` allowance and counts the hit. A PRNG
  * sample is drawn only when the window and size gates pass.
  *

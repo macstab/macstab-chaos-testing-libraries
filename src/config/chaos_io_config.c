@@ -497,17 +497,30 @@ static int chaos_io_parse_probability(const char *text, double *probability)
 
 /**
  * @brief Parses a LATENCY parameter: decimal milliseconds, 0 to 4294967295 (about 49.7
- *        days).
+ *        days), optionally followed by `@probability`.
  *
  * @details strtoul() base 10 with the whole token consumed (trailing blanks allowed).
  * strtoul() also accepts leading blanks and a sign; "-N" wraps to a value above the limit
  * on LP64 and is rejected, except "-0", which reads as 0.
  *
+ * Without `@probability` the rule is certain (1.0), which is what `LATENCY:ms` has always
+ * meant. A blank before the `@` makes it a qualifier word instead and the line is rejected,
+ * as everywhere else in the grammar: the milliseconds then have a trailing blank, which the
+ * whole-token rule refuses.
+ *
+ * @param[in]  text         Field; NULL returns -1.
+ * @param[out] latency_ms   Receives the value; NULL returns -1.
+ * @param[out] probability  Receives the probability, 1.0 without one; NULL returns -1.
+ * @return 0 on success; -1 on a syntax or range error.
+ */
+/**
+ * @brief Parses the milliseconds of a LATENCY parameter, whole token.
+ *
  * @param[in]  text        Field; NULL returns -1.
  * @param[out] latency_ms  Receives the value; NULL returns -1.
  * @return 0 on success; -1 on a syntax or range error.
  */
-static int chaos_io_parse_latency(const char *text, unsigned int *latency_ms)
+static int chaos_io_parse_latency_ms(const char *text, unsigned int *latency_ms)
 {
     char *end = NULL;
     unsigned long value;
@@ -529,6 +542,40 @@ static int chaos_io_parse_latency(const char *text, unsigned int *latency_ms)
 
     *latency_ms = (unsigned int)value;
     return 0;
+}
+
+static int chaos_io_parse_latency(const char *text, unsigned int *latency_ms, double *probability)
+{
+    char milliseconds[16];
+    const char *at_sign;
+    size_t length;
+
+    if (text == NULL || probability == NULL)
+    {
+        return -1;
+    }
+    *probability = 1.0;
+    at_sign = strrchr(text, '@');
+    if (at_sign != NULL)
+    {
+        length = (size_t)(at_sign - text);
+        /* The `@` must follow a digit directly. A blank before it would make it a
+         * qualifier word, and the line is rejected one level up; requiring the digit keeps
+         * this function's contract exactly `ms [ "@" probability ]` either way. */
+        if (at_sign == text || at_sign[-1] < '0' || at_sign[-1] > '9' ||
+            length >= sizeof(milliseconds))
+        {
+            return -1;
+        }
+        (void)memcpy(milliseconds, text, length);
+        milliseconds[length] = '\0';
+        if (chaos_io_parse_latency_ms(milliseconds, latency_ms) != 0)
+        {
+            return -1;
+        }
+        return chaos_io_parse_probability(at_sign + 1, probability);
+    }
+    return chaos_io_parse_latency_ms(text, latency_ms);
 }
 
 /**
@@ -1504,11 +1551,12 @@ int chaos_io_config_parse_line(char *line, chaos_io_rule_t *rule)
     else if (strcmp(fields[2], "LATENCY") == 0)
     {
         rule->effect = CHAOS_IO_EFFECT_LATENCY;
-        if (chaos_io_parse_latency(fields[3], &latency_ms) != 0)
+        if (chaos_io_parse_latency(fields[3], &latency_ms, &probability) != 0)
         {
             return -1;
         }
         rule->latency_ms = latency_ms;
+        rule->probability = probability;
     }
     else if (strcmp(fields[2], "TORN") == 0)
     {

@@ -128,9 +128,9 @@ Rules common to all libraries:
 - The probability parser accepts only the forms above, independent of
   `LC_NUMERIC` (a JVM calls `setlocale(LC_ALL, "")`; under a German locale `strtod`
   stops at the `.` of `0.5`). `nan`, `inf`, exponents and hexadecimal are rejected.
-- In three-field libraries an omitted probability is 1.0. In io and net the
-  probability is the `value` field itself and is mandatory for every effect except
-  LATENCY and TRICKLE, which have none.
+- An omitted probability is 1.0 in every library. In io and net the probability is
+  the `value` field itself and is mandatory for every effect except LATENCY, where it
+  is the optional `@probability` suffix of `ms`, and TRICKLE, which has none.
 
 The grammar is checked by the property-based parser test suite. Run it to confirm
 all six parsers accept valid inputs and reject malformed ones:
@@ -151,7 +151,7 @@ io-op         = "read" / "write" / "open" / "close" / "fsync" / "fdatasync"
               / "pread" / "pwrite" / "truncate" / "allocate"
               / "unlink" / "rename_from" / "rename_to"
 io-effect     = io-errno ":" probability
-              / "LATENCY" ":" ms
+              / "LATENCY" ":" ms [ "@" probability ]
               / "TORN" ":" probability                      ; write, pwrite only
               / "CORRUPT" ":" probability                   ; read, pread only
 io-errno      = "EIO" / "ENOSPC" / "EDQUOT" / "EROFS" / "EACCES"
@@ -171,7 +171,7 @@ port          = 1*5DIGIT                                    ; 0 .. 65535, exact:
 net-op        = "socket" / "bind" / "listen" / "connect" / "accept"
               / "shutdown" / "poll" / "send" / "recv" / "close"
 net-effect    = net-errno ":" probability                   ; every operation
-              / "LATENCY" ":" ms                            ; every operation
+              / "LATENCY" ":" ms [ "@" probability ]        ; every operation
               / "CORRUPT" ":" probability                   ; recv only
               / "TRICKLE" ":" bytes                         ; recv only; bytes >= 1
               / "DUP" ":" probability                       ; recv only

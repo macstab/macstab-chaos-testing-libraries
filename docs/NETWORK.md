@@ -493,16 +493,19 @@ tcp4://127.0.0.1:5432:connect:ECONNREFUSED:1.0 @first=3
 | Effect | Value | Operations | When it acts |
 |--------|-------|------------|--------------|
 | ERRNO (`<errno name>`) | probability | all ten | before the call; on `close` after it |
-| LATENCY | milliseconds, 0–4294967295 | all ten | before the call |
+| LATENCY | milliseconds, 0–4294967295, optionally `@probability` | all ten | before the call |
 | CORRUPT | probability | `recv` | after a receive that returned bytes |
 | TIMEOUT | probability | `poll` | instead of the wait |
 | RESET | probability | `close` | before the close |
 | TRICKLE | bytes per receive, 1–4294967295 | `recv` | before the receive |
 | DUP | probability | `recv` | instead of the next receive |
 
-An effect/operation pair outside this table rejects the rule file. LATENCY has no
-probability: it fires on every matching call that passes its qualifiers. TRICKLE
-takes a byte count, not a probability, and fires whenever it applies.
+An effect/operation pair outside this table rejects the rule file. LATENCY takes its
+probability as an optional `@probability` after the milliseconds
+(`tcp4://127.0.0.1:6379:recv:LATENCY:200@0.1`); without one it is 1.0 and the rule
+fires on every matching call that passes its qualifiers, which is what `LATENCY:ms`
+has always meant. TRICKLE takes a byte count, not a probability, and fires whenever
+it applies.
 
 ### Probability
 

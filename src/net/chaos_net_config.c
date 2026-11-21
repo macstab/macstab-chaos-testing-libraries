@@ -622,6 +622,53 @@ static int chaos_net_parse_latency(const char *text, unsigned int *latency_ms)
 }
 
 /**
+ * @brief Parses a LATENCY value: milliseconds, optionally followed by `@probability`.
+ *
+ * @details Without `@probability` the rule is certain (1.0), which is what `LATENCY:ms` has
+ * always meant. The milliseconds go through chaos_net_parse_latency(), which is shared with
+ * TRICKLE and stays as it is; a blank before the `@` makes it a qualifier word instead and
+ * the line is rejected, because the milliseconds then have a trailing blank.
+ *
+ * @param[in]  text         Value field; NULL returns -1.
+ * @param[out] latency_ms   Receives the delay in ms.
+ * @param[out] probability  Receives the probability, 1.0 without one; NULL returns -1.
+ * @return 0 on success; -1 on a syntax or range error.
+ */
+static int
+chaos_net_parse_latency_value(const char *text, unsigned int *latency_ms, double *probability)
+{
+    char milliseconds[16];
+    const char *at_sign;
+    size_t length;
+
+    if (text == NULL || probability == NULL)
+    {
+        return -1;
+    }
+    *probability = 1.0;
+    at_sign = strrchr(text, '@');
+    if (at_sign == NULL)
+    {
+        return chaos_net_parse_latency(text, latency_ms);
+    }
+    length = (size_t)(at_sign - text);
+    /* The `@` must follow a digit directly. A blank before it would make it a qualifier
+     * word, and the line is rejected one level up; requiring the digit keeps this
+     * function's contract exactly `ms [ "@" probability ]` either way. */
+    if (at_sign == text || at_sign[-1] < '0' || at_sign[-1] > '9' || length >= sizeof(milliseconds))
+    {
+        return -1;
+    }
+    (void)memcpy(milliseconds, text, length);
+    milliseconds[length] = '\0';
+    if (chaos_net_parse_latency(milliseconds, latency_ms) != 0)
+    {
+        return -1;
+    }
+    return chaos_net_parse_probability(at_sign + 1, probability);
+}
+
+/**
  * @brief Whether @p effect may be used with @p operation.
  *
  * @details The compatibility matrix:
@@ -1047,7 +1094,7 @@ int chaos_net_config_parse_line(char *line, chaos_net_rule_t *rule)
     else if (strcmp(effect_text, "LATENCY") == 0)
     {
         rule->effect = CHAOS_NET_EFFECT_LATENCY;
-        if (chaos_net_parse_latency(value_text, &rule->latency_ms) != 0)
+        if (chaos_net_parse_latency_value(value_text, &rule->latency_ms, &rule->probability) != 0)
         {
             return -1;
         }

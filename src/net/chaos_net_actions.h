@@ -103,7 +103,7 @@ void chaos_net_rule_apply_latency(const chaos_net_rule_t *rule);
  * @brief Decides whether a matched rule fires on this call, and counts the hit if so.
  *
  * @details Gates, in order: the `@from`/`@until` window, the `@size` gate against
- * rule->call_size, the probability (every effect except LATENCY), then
+ * rule->call_size, the probability, then
  * chaos_policy_fire(), which claims an `@first` slot, rejects a rule copy whose rule has
  * left the file, and counts the hit. Call it at most once per decision: each firing is
  * one hit.

@@ -117,6 +117,7 @@ static void test_latency_honours_qualifiers(void)
     (void)memset(&slot, 0, sizeof(slot));
     rule.effect = CHAOS_NET_EFFECT_LATENCY;
     rule.latency_ms = 5U;
+    rule.probability = 1.0; /* what the parser gives `LATENCY:ms` without `@p` */
     rule.hit = &slot;
     rule.policy.first = 1U;
 
@@ -144,13 +145,13 @@ static void test_latency_honours_qualifiers(void)
 }
 
 /**
- * @brief Proves LATENCY sleeps once for the whole delay, and that LATENCY rules fire without a
- *   probability while ERRNO rules draw against theirs.
+ * @brief Proves LATENCY sleeps once for the whole delay, and that every effect draws against
+ *   its probability.
  *
  * @details A NULL rule and a rule of no effect do not sleep. 2500 ms is a single sleep request
- * of 2 s + 500000000 ns, not a sequence of shorter sleeps. A LATENCY rule with probability 0
- * still fires: its value field is the delay, not a probability. ERRNO at 0.0 never fires and
- * at 1.0 always does.
+ * of 2 s + 500000000 ns, not a sequence of shorter sleeps. LATENCY is gated like the rest:
+ * `LATENCY:ms` parses as probability 1.0, `LATENCY:ms@p` as p, and a zero probability sleeps
+ * not at all. ERRNO at 0.0 never fires and at 1.0 always does.
  */
 static void test_latency_and_trigger_helpers(void)
 {
@@ -165,6 +166,12 @@ static void test_latency_and_trigger_helpers(void)
 
     rule.effect = CHAOS_NET_EFFECT_LATENCY;
     rule.latency_ms = 2500U;
+    /* Negative: no probability, no delay -- the gate has no LATENCY exception any more. */
+    chaos_net_rule_apply_latency(&rule);
+    assert(g_test_sleep_calls == 0U);
+    assert(chaos_net_rule_should_trigger(&rule) == 0);
+
+    rule.probability = 1.0; /* what the parser gives `LATENCY:ms` without `@p` */
     chaos_net_rule_apply_latency(&rule);
     assert(g_test_sleep_calls == 1U);
     assert(g_test_sleep_requests[0].tv_sec == 2);

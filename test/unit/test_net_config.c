@@ -731,6 +731,63 @@ static void test_invalid_lines(void)
 }
 
 /**
+ * @brief Proves `LATENCY:ms[@probability]` parses and that every malformed form is rejected.
+ *
+ * @details LATENCY used to be the one effect without a probability, which made
+ * `recv:LATENCY:200` fire on every matching call and left no way to delay only some of them.
+ * It now takes the same optional `@probability` the other four libraries have, so the
+ * trigger gate needs no LATENCY exception any more.
+ *
+ * Accepted: plain milliseconds (probability 1.0, which is what the form always meant) and
+ * `ms@p`. Rejected: no milliseconds before the `@`, a probability out of range or malformed,
+ * a second `@`, milliseconds too long to be a number, and a blank before the `@` -- that
+ * makes it a qualifier word, and `@0.5` is not a qualifier.
+ */
+static void test_latency_probability(void)
+{
+    char plain[] = "tcp4://127.0.0.1:5432:connect:LATENCY:200";
+    char with_probability[] = "tcp4://127.0.0.1:5432:connect:LATENCY:200@0.25";
+    char zero_probability[] = "tcp4://127.0.0.1:5432:connect:LATENCY:200@0";
+    char no_milliseconds[] = "tcp4://127.0.0.1:5432:connect:LATENCY:@0.25";
+    char out_of_range[] = "tcp4://127.0.0.1:5432:connect:LATENCY:200@2";
+    char malformed[] = "tcp4://127.0.0.1:5432:connect:LATENCY:200@x";
+    char two_at_signs[] = "tcp4://127.0.0.1:5432:connect:LATENCY:200@0.5@0.5";
+    char long_milliseconds[] = "tcp4://127.0.0.1:5432:connect:LATENCY:00000000000000200@1";
+    char blank_before_at[] = "tcp4://127.0.0.1:5432:connect:LATENCY:200 @0.25";
+    chaos_net_rule_t rule;
+
+    assert(chaos_net_config_parse_line(plain, &rule) == 1);
+    assert(rule.effect == CHAOS_NET_EFFECT_LATENCY);
+    assert(rule.latency_ms == 200U && rule.probability == 1.0);
+
+    assert(chaos_net_config_parse_line(with_probability, &rule) == 1);
+    assert(rule.latency_ms == 200U && rule.probability == 0.25);
+
+    /* 0 is a legal probability: the rule is loaded, reported and never fires. */
+    assert(chaos_net_config_parse_line(zero_probability, &rule) == 1);
+    assert(rule.latency_ms == 200U && rule.probability == 0.0);
+
+    assert(chaos_net_config_parse_line(no_milliseconds, &rule) == -1);
+    assert(chaos_net_config_parse_line(out_of_range, &rule) == -1);
+    assert(chaos_net_config_parse_line(malformed, &rule) == -1);
+    assert(chaos_net_config_parse_line(two_at_signs, &rule) == -1);
+    assert(chaos_net_config_parse_line(long_milliseconds, &rule) == -1);
+    assert(chaos_net_config_parse_line(blank_before_at, &rule) == -1);
+
+    /* The NULL guards cannot be reached through a rule file -- the value field is never
+     * NULL and neither is the rule's probability -- so the value parser is called directly,
+     * the way io's counterpart is tested in test_config_parse.c. */
+    {
+        unsigned int latency_ms = 0U;
+        double probability = 0.0;
+
+        assert(chaos_net_parse_latency_value(NULL, &latency_ms, &probability) == -1);
+        assert(chaos_net_parse_latency_value("200@0.5", &latency_ms, NULL) == -1);
+        assert(chaos_net_parse_latency_value("200@0.5", NULL, &probability) == -1);
+    }
+}
+
+/**
  * @brief Proves the read errors, the size limit, both-ends matching, a lost reload race and
  *   an invalid file.
  *
@@ -2194,6 +2251,7 @@ int main(void)
     test_parse_and_select_rules();
     test_selection_and_buffer_edges();
     test_invalid_lines();
+    test_latency_probability();
     test_file_and_state_edges();
     test_prepare_and_match();
     test_reload_in_progress_is_not_joined();

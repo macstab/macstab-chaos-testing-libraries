@@ -109,8 +109,8 @@ void chaos_io_corrupt_buffer(void *buffer, size_t size)
 /** @copydoc chaos_io_rule_apply_latency */
 void chaos_io_rule_apply_latency(const chaos_io_rule_t *rule)
 {
-    /* A delay is gated by the qualifiers (@first, @from, @until, @size) and counted as a
-     * hit like any other effect; it only skips the probability. */
+    /* A delay is gated and counted like any other effect: qualifiers (@first, @from,
+     * @until, @size) and the probability of `LATENCY:ms@p`, which is 1.0 without one. */
     if (rule == NULL || rule->effect != CHAOS_IO_EFFECT_LATENCY ||
         !chaos_io_rule_should_trigger(rule))
     {
@@ -131,10 +131,6 @@ int chaos_io_rule_should_trigger(const chaos_io_rule_t *rule)
         !chaos_policy_size_ok(&rule->policy, rule->call_size))
     {
         return 0;
-    }
-    if (rule->effect == CHAOS_IO_EFFECT_LATENCY)
-    {
-        return chaos_policy_fire(&rule->policy, rule->hit, rule->hit_generation);
     }
     if (!chaos_io_probability_hit(rule->probability))
     {

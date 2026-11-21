@@ -221,17 +221,38 @@ static void test_helper_primitives(void)
 
     {
         unsigned int latency_ms = 0U;
+        double latency_probability = 0.0;
         char invalid_latency[] = "10ms";
         char overflow_latency[] = "4294967296";
         char valid_latency[] = "25  ";
         char zero_latency[] = "0";
+        char with_probability[] = "25@0.25";
+        char empty_milliseconds[] = "@0.25";
+        char blank_before_at[] = "25 @0.25";
+        char bad_probability[] = "25@2";
+        char two_at_signs[] = "25@0.5@0.5";
+        char long_milliseconds[] = "00000000000000025@1";
 
-        assert(chaos_io_parse_latency(NULL, &latency_ms) == -1);
-        assert(chaos_io_parse_latency(invalid_latency, &latency_ms) == -1);
-        assert(chaos_io_parse_latency(overflow_latency, &latency_ms) == -1);
-        assert(chaos_io_parse_latency(valid_latency, &latency_ms) == 0);
+        assert(chaos_io_parse_latency(NULL, &latency_ms, &latency_probability) == -1);
+        assert(chaos_io_parse_latency(invalid_latency, &latency_ms, &latency_probability) == -1);
+        assert(chaos_io_parse_latency(overflow_latency, &latency_ms, &latency_probability) == -1);
+        assert(chaos_io_parse_latency(valid_latency, &latency_ms, &latency_probability) == 0);
         assert(latency_ms == 25U);
-        assert(chaos_io_parse_latency(zero_latency, NULL) == -1);
+        /* No @probability means certain, which is what `LATENCY:ms` always meant. */
+        assert(latency_probability == 1.0);
+        assert(chaos_io_parse_latency(zero_latency, NULL, &latency_probability) == -1);
+        assert(chaos_io_parse_latency(zero_latency, &latency_ms, NULL) == -1);
+
+        assert(chaos_io_parse_latency(with_probability, &latency_ms, &latency_probability) == 0);
+        assert(latency_ms == 25U && latency_probability == 0.25);
+
+        /* Rejected: no milliseconds, a blank before the `@` (that is a qualifier word),
+         * a probability out of range, a second `@`, and milliseconds too long to be one. */
+        assert(chaos_io_parse_latency(empty_milliseconds, &latency_ms, &latency_probability) == -1);
+        assert(chaos_io_parse_latency(blank_before_at, &latency_ms, &latency_probability) == -1);
+        assert(chaos_io_parse_latency(bad_probability, &latency_ms, &latency_probability) == -1);
+        assert(chaos_io_parse_latency(two_at_signs, &latency_ms, &latency_probability) == -1);
+        assert(chaos_io_parse_latency(long_milliseconds, &latency_ms, &latency_probability) == -1);
     }
 
     assert(chaos_io_effect_allowed(CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_ERRNO));
@@ -295,8 +316,9 @@ static void test_parse_line_valid_cases(void)
         {"/data:unlink:EIO:0.2", CHAOS_IO_OP_UNLINK, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U},
         {"/data:rename_from:EIO:0.2", CHAOS_IO_OP_RENAME_FROM, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U},
         {"/data:rename_to:EIO:0.2", CHAOS_IO_OP_RENAME_TO, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U},
-        {"/data:write:LATENCY:25", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_LATENCY, 0, 0.0, 25U},
-        {"/data:truncate:LATENCY:25", CHAOS_IO_OP_TRUNCATE, CHAOS_IO_EFFECT_LATENCY, 0, 0.0, 25U},
+        {"/data:write:LATENCY:25", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_LATENCY, 0, 1.0, 25U},
+        {"/data:truncate:LATENCY:25", CHAOS_IO_OP_TRUNCATE, CHAOS_IO_EFFECT_LATENCY, 0, 1.0, 25U},
+        {"/data:read:LATENCY:25@0.5", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_LATENCY, 0, 0.5, 25U},
         {"/data:write:TORN:0.9", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_TORN, 0, 0.9, 0U},
         {"/data:read:CORRUPT:1.0", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_CORRUPT, 0, 1.0, 0U}
     };
@@ -311,18 +333,16 @@ static void test_parse_line_valid_cases(void)
         assert(chaos_io_config_parse_line(line, &rule) == 1);
         assert(rule.operation == cases[index].operation);
         assert(rule.effect == cases[index].effect);
+        /* Every effect carries a probability, LATENCY included: a rule whose probability
+         * the parser forgets to store never fires, and nothing else would notice. */
+        assert(rule.probability == cases[index].probability);
         if (rule.effect == CHAOS_IO_EFFECT_ERRNO)
         {
             assert(rule.errnum == cases[index].errnum);
-            assert(rule.probability == cases[index].probability);
         }
         if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
         {
             assert(rule.latency_ms == cases[index].latency_ms);
-        }
-        if (rule.effect == CHAOS_IO_EFFECT_TORN || rule.effect == CHAOS_IO_EFFECT_CORRUPT)
-        {
-            assert(rule.probability == cases[index].probability);
         }
     }
 

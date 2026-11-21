@@ -120,10 +120,6 @@ int chaos_net_rule_should_trigger(const chaos_net_rule_t *rule)
     {
         return 0;
     }
-    if (rule->effect == CHAOS_NET_EFFECT_LATENCY)
-    {
-        return chaos_policy_fire(&rule->policy, rule->hit, rule->hit_generation);
-    }
     if (!chaos_net_probability_hit(rule->probability))
     {
         return 0;

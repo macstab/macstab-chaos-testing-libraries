@@ -134,6 +134,7 @@ static void test_latency_honours_qualifiers(void)
     (void)memset(&slot, 0, sizeof(slot));
     rule.effect = CHAOS_IO_EFFECT_LATENCY;
     rule.latency_ms = 5U;
+    rule.probability = 1.0; /* what the parser gives `LATENCY:ms` without `@p` */
     rule.hit = &slot;
     rule.policy.first = 1U;
 
@@ -164,9 +165,9 @@ static void test_latency_honours_qualifiers(void)
  * @brief LATENCY sleep requests and the trigger gate.
  *
  * @details A NULL rule, a zero-initialised rule and a 0 ms LATENCY rule do not sleep;
- * 2500 ms is one request of {2 s, 500000000 ns}. `should_trigger` is 0 for NULL, 1 for
- * LATENCY although probability is 0.0 (LATENCY has no probability), and follows the
- * probability for ERRNO.
+ * 2500 ms is one request of {2 s, 500000000 ns}. `should_trigger` is 0 for NULL and
+ * follows the probability for every effect, LATENCY included: `LATENCY:ms` parses as
+ * probability 1.0, `LATENCY:ms@p` as p, and the gate no longer has a special case.
  */
 static void test_latency_and_trigger_helpers(void)
 {
@@ -180,6 +181,10 @@ static void test_latency_and_trigger_helpers(void)
     assert(g_test_sleep_calls == 0U);
 
     rule.effect = CHAOS_IO_EFFECT_LATENCY;
+    /* A delay is probability-gated like every other effect; the parser gives
+     * `LATENCY:ms` a probability of 1.0. A zero probability must not sleep. */
+    assert(chaos_io_rule_should_trigger(&rule) == 0);
+    rule.probability = 1.0;
     chaos_io_rule_apply_latency(&rule);
     assert(g_test_sleep_calls == 0U);
 
@@ -202,6 +207,14 @@ static void test_latency_and_trigger_helpers(void)
 
     assert(chaos_io_rule_should_trigger(NULL) == 0);
     assert(chaos_io_rule_should_trigger(&rule) == 1);
+
+    /* Negative: a LATENCY rule whose probability never fires sleeps not at all. */
+    chaos_test_sleep_reset();
+    rule.probability = 0.0;
+    chaos_io_rule_apply_latency(&rule);
+    assert(g_test_sleep_calls == 0U);
+    assert(chaos_io_rule_should_trigger(&rule) == 0);
+    rule.probability = 1.0;
 
     rule.effect = CHAOS_IO_EFFECT_ERRNO;
     rule.probability = 0.0;
