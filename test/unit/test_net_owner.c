@@ -120,7 +120,10 @@ static void test_ownership_across_a_fork(void)
     if (child == 0)
     {
         /* The child inherits the socket; it reports itself and then waits to be killed. */
-        (void)write(ready[1], "x", 1U);
+        if (write(ready[1], "x", 1U) != 1)
+        {
+            _exit(1);
+        }
         for (;;)
         {
             (void)pause();
