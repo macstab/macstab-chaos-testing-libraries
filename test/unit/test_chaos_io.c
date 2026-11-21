@@ -365,11 +365,13 @@ static void test_fsops_helpers_and_wrappers(void)
      * EINVAL -- so those report none and a size-gated rule cannot match. */
     assert(ftruncate(9, 4096) == 0);
     assert(g_last_call_size == 4096U);
-    assert(ftruncate(9, -1) == 0);
+    /* -4096, not -1: CHAOS_POLICY_NO_SIZE is UINT64_MAX, which is exactly what casting -1
+     * yields, so -1 would pass this with or without the guard. */
+    assert(ftruncate(9, -4096) == 0);
     assert(g_last_call_size == CHAOS_POLICY_NO_SIZE);
     assert(fallocate(9, 0, 0, 8192) == 0);
     assert(g_last_call_size == 8192U);
-    assert(fallocate(9, 0, 0, -1) == 0);
+    assert(fallocate(9, 0, 0, -4096) == 0);
     assert(g_last_call_size == CHAOS_POLICY_NO_SIZE);
 
     chaos_test_reset_state();
