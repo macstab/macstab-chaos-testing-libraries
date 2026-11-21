@@ -40,6 +40,12 @@ static int g_stub_getsockopt_result = 0;
 /** @brief SO_TYPE the fake getsockopt reports; SOCK_STREAM by default. */
 static int g_stub_socket_type = SOCK_STREAM;
 
+/** @brief IPV6_V6ONLY the fake getsockopt reports; 1 (IPv6 only) by default. */
+static int g_stub_v6only = 1;
+
+/** @brief Non-zero makes the fake getsockopt fail the IPV6_V6ONLY query with this value. */
+static int g_stub_v6only_result = 0;
+
 /** @brief Non-zero makes the fake getsockname fail with this value. */
 static int g_stub_getsockname_result = 0;
 
@@ -62,17 +68,31 @@ static struct sockaddr_storage g_stub_peer_storage;
 static socklen_t g_stub_peer_length = 0U;
 
 /**
- * @brief Fake real getsockopt: asserts the query is `SOL_SOCKET`/`SO_TYPE`, then reports
- *   `g_stub_socket_type` or fails with `g_stub_getsockopt_result`.
+ * @brief Fake real getsockopt: answers `SOL_SOCKET`/`SO_TYPE` with `g_stub_socket_type` and
+ *   `IPPROTO_IPV6`/`IPV6_V6ONLY` with `g_stub_v6only`, or fails with the matching result.
+ *
+ * @details Only those two queries are ever made, so any other one is a test defect.
  */
 static int chaos_net_test_getsockopt(int fd, int level, int optname, void *value, socklen_t *length)
 {
     (void)fd;
-    assert(level == SOL_SOCKET);
-    assert(optname == SO_TYPE);
     assert(value != NULL);
     assert(length != NULL);
 
+    if (level == IPPROTO_IPV6)
+    {
+        assert(optname == IPV6_V6ONLY);
+        if (g_stub_v6only_result != 0)
+        {
+            return g_stub_v6only_result;
+        }
+        *(int *)value = g_stub_v6only;
+        *length = (socklen_t)sizeof(int);
+        return 0;
+    }
+
+    assert(level == SOL_SOCKET);
+    assert(optname == SO_TYPE);
     if (g_stub_getsockopt_result != 0)
     {
         return g_stub_getsockopt_result;
@@ -142,6 +162,8 @@ static void reset_endpoint_stubs(void)
     g_chaos_net_real_getpeername = chaos_net_test_getpeername;
     g_stub_getsockopt_result = 0;
     g_stub_socket_type = SOCK_STREAM;
+    g_stub_v6only = 1;
+    g_stub_v6only_result = 0;
     g_stub_getsockname_result = 0;
     g_stub_getpeername_result = 0;
     (void)memset(&g_stub_sockname_storage, 0, sizeof(g_stub_sockname_storage));
@@ -689,10 +711,112 @@ static void test_selector_rejections_and_unresolved_lookups(void)
     reset_endpoint_stubs();
 }
 
+/**
+ * @brief Proves a dual-stack wildcard listener is matched by both families.
+ *
+ * @details A server that binds `[::]` with `IPV6_V6ONLY` off serves IPv4 and IPv6 clients
+ * on one socket, which is what Go, the JVM, RabbitMQ, Elasticsearch, OpenSearch and Oracle
+ * do. Before this, such a listener resolved to TCP6 and a tcp4 wildcard rule never fired on
+ * it. Covered here:
+ * - `[::]` with V6ONLY off sets dual_stack_wildcard and matches the wildcard tcp4 selector
+ *   at rank 2, as well as the tcp6 one; UDP behaves the same.
+ * - V6ONLY on leaves it IPv6-only, and so does a failing IPV6_V6ONLY query.
+ * - A concrete IPv6 address is never dual, even with V6ONLY off.
+ * - An address selector does not reach it: only the wildcard host does.
+ */
+static void test_dual_stack_wildcard_listener(void)
+{
+    chaos_net_endpoint_t endpoint;
+    chaos_net_endpoint_t selector;
+    struct sockaddr_in6 any6;
+    unsigned int rank;
+
+    (void)memset(&any6, 0, sizeof(any6));
+    any6.sin6_family = AF_INET6;
+    any6.sin6_port = htons(8080);
+    any6.sin6_addr = in6addr_any;
+
+    /* V6ONLY off: the listener serves both families. */
+    reset_endpoint_stubs();
+    g_stub_v6only = 0;
+    assert(chaos_net_endpoint_from_sockaddr_fd(
+        7, (const struct sockaddr *)&any6, (socklen_t)sizeof(any6), &endpoint
+    ));
+    assert(endpoint.kind == CHAOS_NET_ENDPOINT_TCP6);
+    assert(endpoint.dual_stack_wildcard != 0);
+
+    assert(chaos_net_endpoint_parse_selector("tcp4://*:8080", &selector));
+    assert(chaos_net_endpoint_matches(&selector, &endpoint, &rank));
+    assert(rank == 2U);
+    assert(chaos_net_endpoint_parse_selector("tcp6://*:8080", &selector));
+    assert(chaos_net_endpoint_matches(&selector, &endpoint, &rank));
+    assert(rank == 2U);
+
+    /* The port still has to agree, and a named host never reaches a wildcard listener. */
+    assert(chaos_net_endpoint_parse_selector("tcp4://*:9090", &selector));
+    assert(!chaos_net_endpoint_matches(&selector, &endpoint, &rank));
+    assert(chaos_net_endpoint_parse_selector("tcp4://1.2.3.4:8080", &selector));
+    assert(!chaos_net_endpoint_matches(&selector, &endpoint, &rank));
+
+    /* UDP behaves the same. */
+    reset_endpoint_stubs();
+    g_stub_v6only = 0;
+    g_stub_socket_type = SOCK_DGRAM;
+    assert(chaos_net_endpoint_from_sockaddr_fd(
+        7, (const struct sockaddr *)&any6, (socklen_t)sizeof(any6), &endpoint
+    ));
+    assert(endpoint.kind == CHAOS_NET_ENDPOINT_UDP6);
+    assert(endpoint.dual_stack_wildcard != 0);
+    assert(chaos_net_endpoint_parse_selector("udp4://*:8080", &selector));
+    assert(chaos_net_endpoint_matches(&selector, &endpoint, &rank));
+    assert(rank == 2U);
+    /* Transports do not cross: a tcp4 selector never matches a UDP endpoint. */
+    assert(chaos_net_endpoint_parse_selector("tcp4://*:8080", &selector));
+    assert(!chaos_net_endpoint_matches(&selector, &endpoint, &rank));
+
+    /* V6ONLY on: IPv6 only, as before. */
+    reset_endpoint_stubs();
+    g_stub_v6only = 1;
+    assert(chaos_net_endpoint_from_sockaddr_fd(
+        7, (const struct sockaddr *)&any6, (socklen_t)sizeof(any6), &endpoint
+    ));
+    assert(endpoint.dual_stack_wildcard == 0);
+    assert(chaos_net_endpoint_parse_selector("tcp4://*:8080", &selector));
+    assert(!chaos_net_endpoint_matches(&selector, &endpoint, &rank));
+
+    /* A failing query is treated as IPv6 only: matching stays as it was. */
+    reset_endpoint_stubs();
+    g_stub_v6only_result = -1;
+    assert(chaos_net_endpoint_from_sockaddr_fd(
+        7, (const struct sockaddr *)&any6, (socklen_t)sizeof(any6), &endpoint
+    ));
+    assert(endpoint.dual_stack_wildcard == 0);
+
+    /* An unresolved getsockopt cannot report anything either. */
+    reset_endpoint_stubs();
+    g_chaos_net_real_getsockopt = NULL;
+    assert(!chaos_net_endpoint_from_sockaddr_fd(
+        7, (const struct sockaddr *)&any6, (socklen_t)sizeof(any6), &endpoint
+    ));
+
+    /* A concrete IPv6 address is never dual, whatever V6ONLY says. */
+    reset_endpoint_stubs();
+    g_stub_v6only = 0;
+    any6.sin6_addr = in6addr_loopback;
+    assert(chaos_net_endpoint_from_sockaddr_fd(
+        7, (const struct sockaddr *)&any6, (socklen_t)sizeof(any6), &endpoint
+    ));
+    assert(endpoint.kind == CHAOS_NET_ENDPOINT_TCP6);
+    assert(endpoint.dual_stack_wildcard == 0);
+    assert(chaos_net_endpoint_parse_selector("tcp4://*:8080", &selector));
+    assert(!chaos_net_endpoint_matches(&selector, &endpoint, &rank));
+}
+
 int main(void)
 {
     test_selector_parsing_and_matching();
     test_endpoint_resolution_from_sockaddr_and_fd();
     test_selector_rejections_and_unresolved_lookups();
+    test_dual_stack_wildcard_listener();
     return 0;
 }

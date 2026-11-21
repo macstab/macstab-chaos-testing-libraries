@@ -159,6 +159,15 @@ typedef struct chaos_net_endpoint
     size_t selector_len;            /**< Byte length of the original selector text; tie-breaker. */
     uint16_t port;                  /**< Port in host byte order; 0 for UNIX or ANY endpoints. */
     int wildcard_host;              /**< Non-zero if the host part is `*` (or no address yet). */
+    /**
+     * @brief Non-zero when this endpoint is a dual-stack wildcard listener.
+     *
+     * Set only on runtime endpoints, never on selectors: the address is the unspecified
+     * IPv6 address (`[::]`) and the socket has `IPV6_V6ONLY` off, so the kernel serves
+     * IPv4 and IPv6 clients on it. Such a listener is matched by a wildcard-host tcp4
+     * selector as well as a tcp6 one on the same port (likewise udp4 and udp6).
+     */
+    int dual_stack_wildcard;
     /** @brief Address storage; the active member follows @c kind. */
     union
     {

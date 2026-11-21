@@ -260,6 +260,38 @@ int chaos_net_endpoint_parse_selector(const char *text, chaos_net_endpoint_t *en
  *
  * @return Non-zero on a match (rank >= 1); 0 otherwise.
  */
+/**
+ * @brief Whether @p selector's kind can apply to @p endpoint at all.
+ *
+ * @details Normally the kinds must be equal. The one exception is a dual-stack wildcard
+ * listener (chaos_net_endpoint_serves_ipv4()): it serves IPv4 and IPv6 clients on the same
+ * port, so a wildcard-host tcp4 selector applies to it just as a tcp6 one does, and udp4
+ * likewise to udp6. The host must be the wildcard: an address selector names one family,
+ * and the listener's bound address is the unspecified one, which is neither.
+ *
+ * @param selector Rule selector.
+ * @param endpoint Resolved runtime endpoint.
+ * @return 1 if the kinds may match; 0 otherwise.
+ */
+static int chaos_net_endpoint_kind_applies(
+    const chaos_net_endpoint_t *selector, const chaos_net_endpoint_t *endpoint
+)
+{
+    if (selector->kind == endpoint->kind)
+    {
+        return 1;
+    }
+    if (endpoint->dual_stack_wildcard == 0 || selector->wildcard_host == 0)
+    {
+        return 0;
+    }
+    return (selector->kind == CHAOS_NET_ENDPOINT_TCP4 && endpoint->kind == CHAOS_NET_ENDPOINT_TCP6
+           ) || (selector->kind == CHAOS_NET_ENDPOINT_UDP4 &&
+                 endpoint->kind == CHAOS_NET_ENDPOINT_UDP6)
+               ? 1
+               : 0;
+}
+
 int chaos_net_endpoint_matches(
     const chaos_net_endpoint_t *selector,
     const chaos_net_endpoint_t *endpoint,
@@ -295,7 +327,7 @@ int chaos_net_endpoint_matches(
             rank = 4U;
         }
     }
-    else if (selector->kind == endpoint->kind)
+    else if (chaos_net_endpoint_kind_applies(selector, endpoint))
     {
         switch (selector->kind)
         {
@@ -464,6 +496,40 @@ int chaos_net_endpoint_from_activity_fd(int fd, chaos_net_endpoint_t *endpoint)
 }
 
 /**
+ * @brief Whether socket @p fd serves IPv4 clients too, from getsockopt(IPV6_V6ONLY).
+ *
+ * @details Asked only for a bound address of `[::]`, so it costs nothing on ordinary
+ * connections. A listener with IPV6_V6ONLY off accepts IPv4 clients as well (Linux
+ * defaults to this through net.ipv6.bindv6only=0), which is what Go, the JVM, RabbitMQ,
+ * Elasticsearch and Oracle do: one `[::]` listener serves both families. Such a socket
+ * is matched by a wildcard-host tcp4 selector as well as a tcp6 one on the same port.
+ *
+ * Same guard and errno discipline as chaos_net_endpoint_kind_from_socket(). A failing query
+ * answers 0, which keeps the endpoint IPv6-only: the conservative side, since it leaves
+ * matching as it was before dual-stack was recognised. g_chaos_net_real_getsockopt needs no
+ * check here, because the only caller has just resolved the kind through it and returned on
+ * an unresolved pointer.
+ *
+ * @param fd Socket to query.
+ * @return 1 if the socket also serves IPv4; 0 if it does not, or the query failed.
+ */
+static int chaos_net_endpoint_serves_ipv4(int fd)
+{
+    int v6only = 0;
+    socklen_t v6only_len = (socklen_t)sizeof(v6only);
+    int previous;
+    int saved_errno;
+    int rc;
+
+    saved_errno = errno;
+    previous = chaos_net_enter_internal();
+    rc = g_chaos_net_real_getsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, &v6only_len);
+    chaos_net_leave_internal(previous);
+    errno = saved_errno;
+    return rc == 0 && v6only == 0 ? 1 : 0;
+}
+
+/**
  * @brief The endpoint kind for @p family on socket @p fd, from getsockopt(SO_TYPE).
  *
  * @details Shared by every resolution path. Calls g_chaos_net_real_getsockopt with the
@@ -627,6 +693,12 @@ static int chaos_net_endpoint_from_sockaddr(
                                                                        : CHAOS_NET_ENDPOINT_UDP4;
             (void)memcpy(&endpoint->value.ipv4, &ipv6->sin6_addr.s6_addr[12], 4U);
             return 1;
+        }
+        if (IN6_IS_ADDR_UNSPECIFIED(&ipv6->sin6_addr) && chaos_net_endpoint_serves_ipv4(fd))
+        {
+            /* A listener bound to [::] with IPV6_V6ONLY off serves IPv4 clients too, so
+             * wildcard tcp4 and udp4 selectors reach it as well (chaos_net_config.h). */
+            endpoint->dual_stack_wildcard = 1;
         }
         /* Flow label and scope id are not kept: selectors cannot express them, and an
          * address compare that included them would never match. */
