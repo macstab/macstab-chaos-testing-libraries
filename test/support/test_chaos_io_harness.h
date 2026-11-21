@@ -665,13 +665,25 @@ void chaos_io_rule_apply_latency(const chaos_io_rule_t *rule)
 }
 
 /**
- * @brief Stub for chaos_io_rule_should_trigger(): counts calls and returns
- *        `g_rule_should_trigger_result` (1 = the probability draw hits, 0 = pass through).
+ * @brief Stub for chaos_io_rule_should_trigger(): counts calls, applies the real policy
+ *        gates and cans only the probability draw.
+ *
+ * @details The gates live in chaos_policy.h and are header-only, so the stub can run the
+ * real ones in the order the effects file uses: window, then `@size`. Only the draw itself
+ * is replaced by `g_rule_should_trigger_result` (1 = hits, 0 = pass through). A wrapper
+ * that fails to report its byte count is therefore visible here, instead of passing the
+ * gate because the stub never looked. A zeroed policy opens the window and leaves `@size`
+ * ungated, so a test that sets no policy behaves as before.
  */
 int chaos_io_rule_should_trigger(const chaos_io_rule_t *rule)
 {
     assert(rule != NULL);
     ++g_rule_should_trigger_calls;
+    if (!chaos_policy_window_open(&rule->policy) ||
+        !chaos_policy_size_ok(&rule->policy, rule->call_size))
+    {
+        return 0;
+    }
     return g_rule_should_trigger_result;
 }
 

@@ -360,6 +360,18 @@ static void test_fsops_helpers_and_wrappers(void)
     assert(g_last_match_loaded_operation == CHAOS_IO_OP_TRUNCATE);
     assert(g_latency_calls == 1);
 
+    /* truncate and allocate report a length rather than bytes moved, so `@size` can gate
+     * them. A negative length is no byte count -- the kernel rejects such a call with
+     * EINVAL -- so those report none and a size-gated rule cannot match. */
+    assert(ftruncate(9, 4096) == 0);
+    assert(g_last_call_size == 4096U);
+    assert(ftruncate(9, -1) == 0);
+    assert(g_last_call_size == CHAOS_POLICY_NO_SIZE);
+    assert(fallocate(9, 0, 0, 8192) == 0);
+    assert(g_last_call_size == 8192U);
+    assert(fallocate(9, 0, 0, -1) == 0);
+    assert(g_last_call_size == CHAOS_POLICY_NO_SIZE);
+
     chaos_test_reset_state();
     chaos_test_bind_real_functions();
     g_config_prepare_result = 1;
@@ -770,6 +782,26 @@ static void test_read_and_write_wrappers(void)
     assert(g_rule_should_trigger_calls == 1);
     assert(g_last_torn_requested == 6U);
     assert(g_real_write_count == 2U);
+
+    /* The `@size` gate decides before the probability draw: a write below the bound is not
+     * torn even though the draw would hit, one above it is. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/write.bin");
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_TORN;
+    g_config_rule.policy.has_size_above = 1U;
+    g_config_rule.policy.size_above = 10U;
+    g_rule_should_trigger_result = 1;
+    g_torn_count_result = 2U;
+    g_real_write_return = 6;
+    assert(write(9, "abcdef", 6U) == 6);
+    assert(g_real_write_count == 6U);
+    g_real_write_return = 2;
+    assert(write(9, "abcdefghijklmnop", 16U) == 2);
+    assert(g_last_torn_requested == 16U);
 
     chaos_test_reset_state();
     chaos_test_bind_real_functions();
