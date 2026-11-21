@@ -1297,7 +1297,8 @@ static void test_rule_file_check_is_throttled(void)
 /**
  * @brief Proves qualifiers parse into the rule's policy and bad ones reject the line.
  *
- * `@first`, `@from`, `@until` and both `@size` bounds land in the policy; libchaos-process
+ * `@first`, `@from` and `@until` land in the policy, while a `@size` gate is rejected
+ * because no process call reports a byte count; libchaos-process
  * calls carry no byte count, so `call_size` is CHAOS_POLICY_NO_SIZE. Rejected: an unknown
  * qualifier, a qualifier line with no rule (line 2), `@until` before `@from`, and
  * `@first=0`.
@@ -1305,12 +1306,12 @@ static void test_rule_file_check_is_throttled(void)
 static void test_rule_qualifiers(void)
 {
     static chaos_process_rule_t rules[CHAOS_PROCESS_MAX_RULES];
-    char qualified[] =
-        "fork:ERRNO:EAGAIN @first=3 @from=1000 @until=2000 @size>10 @size<99 # owner\n";
+    char qualified[] = "fork:ERRNO:EAGAIN @first=3 @from=1000 @until=2000 # owner\n";
     char unknown[] = "fork:ERRNO:EAGAIN @bogus=1\n";
     char lonely[] = "# header\n  @first=3\n";
     char backwards[] = "fork:ERRNO:EAGAIN @from=2000 @until=1000\n";
     char empty_first[] = "fork:ERRNO:EAGAIN @first=0\n";
+    char sized[] = "fork:ERRNO:EAGAIN @size>10\n";
     size_t count = 0U;
 
     assert(chaos_process_config_parse_buffer(qualified, rules, &count) == 0);
@@ -1318,8 +1319,6 @@ static void test_rule_qualifiers(void)
     assert(rules[0].policy.first == 3U);
     assert(rules[0].policy.from_ms == 1000);
     assert(rules[0].policy.until_ms == 2000);
-    assert(rules[0].policy.has_size_above && rules[0].policy.size_above == 10U);
-    assert(rules[0].policy.has_size_below && rules[0].policy.size_below == 99U);
     assert(rules[0].call_size == CHAOS_POLICY_NO_SIZE);
 
     assert(chaos_process_config_parse_buffer(unknown, rules, &count) == -1);
@@ -1328,6 +1327,9 @@ static void test_rule_qualifiers(void)
     assert(chaos_process_config_last_error()->line == 2U);
     assert(chaos_process_config_parse_buffer(backwards, rules, &count) == -1);
     assert(chaos_process_config_parse_buffer(empty_first, rules, &count) == -1);
+    /* No process call reports a byte count, so a size gate could never pass: the rule
+     * would load and never fire, which is the failure this rejection removes. */
+    assert(chaos_process_config_parse_buffer(sized, rules, &count) == -1);
 }
 
 /**

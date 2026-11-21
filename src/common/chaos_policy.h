@@ -263,6 +263,20 @@ static inline int chaos_policy_extract(char *line, chaos_rule_policy_t *policy)
     return 0;
 }
 
+/**
+ * @brief Whether @p policy carries a `@size` gate.
+ *
+ * @details A library whose calls never report a byte count rejects such a rule at parse
+ * time: the gate could never pass, so the rule would load and never fire.
+ *
+ * @param policy Policy to inspect; NULL yields 0.
+ * @return Non-zero when `@size>N` or `@size<N` was given.
+ */
+static inline int chaos_policy_has_size(const chaos_rule_policy_t *policy)
+{
+    return policy != NULL && (policy->has_size_above || policy->has_size_below);
+}
+
 /** @brief Non-zero when @p policy carries no qualifier, so the rule needs no policy checks. */
 static inline int chaos_policy_is_empty(const chaos_rule_policy_t *policy)
 {

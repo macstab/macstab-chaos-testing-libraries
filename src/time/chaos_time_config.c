@@ -1189,6 +1189,14 @@ int chaos_time_config_parse_buffer(char *buffer, chaos_time_rule_t *rules, size_
             }
             continue;
         }
+        if (chaos_policy_has_size(&policy))
+        {
+            /* No time call reports a byte count, so a size gate can never pass and the
+             * rule would load and never fire. */
+            chaos_status_reject(&g_chaos_time_config_error, CHAOS_STATUS_REASON_INVALID);
+            *rule_count = 0U;
+            return -1;
+        }
         parsed.policy = policy;
         parsed.call_size = CHAOS_POLICY_NO_SIZE;
         if (count >= CHAOS_TIME_MAX_RULES)

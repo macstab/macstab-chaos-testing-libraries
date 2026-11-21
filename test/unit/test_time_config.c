@@ -1353,7 +1353,8 @@ static void test_rule_file_check_is_throttled(void)
 }
 
 /**
- * @brief Proves the qualifiers `@first`, `@from`, `@until`, `@size>` and `@size<` after a rule
+ * @brief Proves the qualifiers `@first`, `@from` and `@until` after a rule, and that a
+ * `@size` gate is rejected because no time call reports a byte count
  *   land in its policy, and that a bad qualifier rejects the line.
  *
  * @details A parsed rule starts with `call_size` = `CHAOS_POLICY_NO_SIZE`. Rejected: an
@@ -1363,12 +1364,12 @@ static void test_rule_file_check_is_throttled(void)
 static void test_rule_qualifiers(void)
 {
     static chaos_time_rule_t rules[CHAOS_TIME_MAX_RULES];
-    char qualified[] =
-        "nanosleep:ERRNO:EINTR @first=3 @from=1000 @until=2000 @size>10 @size<99 # owner\n";
+    char qualified[] = "nanosleep:ERRNO:EINTR @first=3 @from=1000 @until=2000 # owner\n";
     char unknown[] = "nanosleep:ERRNO:EINTR @bogus=1\n";
     char lonely[] = "# header\n  @first=3\n";
     char backwards[] = "nanosleep:ERRNO:EINTR @from=2000 @until=1000\n";
     char empty_first[] = "nanosleep:ERRNO:EINTR @first=0\n";
+    char sized[] = "nanosleep:ERRNO:EINTR @size>10\n";
     size_t count = 0U;
 
     assert(chaos_time_config_parse_buffer(qualified, rules, &count) == 0);
@@ -1376,8 +1377,6 @@ static void test_rule_qualifiers(void)
     assert(rules[0].policy.first == 3U);
     assert(rules[0].policy.from_ms == 1000);
     assert(rules[0].policy.until_ms == 2000);
-    assert(rules[0].policy.has_size_above && rules[0].policy.size_above == 10U);
-    assert(rules[0].policy.has_size_below && rules[0].policy.size_below == 99U);
     assert(rules[0].call_size == CHAOS_POLICY_NO_SIZE);
 
     assert(chaos_time_config_parse_buffer(unknown, rules, &count) == -1);
@@ -1386,6 +1385,9 @@ static void test_rule_qualifiers(void)
     assert(chaos_time_config_last_error()->line == 2U);
     assert(chaos_time_config_parse_buffer(backwards, rules, &count) == -1);
     assert(chaos_time_config_parse_buffer(empty_first, rules, &count) == -1);
+    /* No time call reports a byte count, so a size gate could never pass: the rule
+     * would load and never fire, which is the failure this rejection removes. */
+    assert(chaos_time_config_parse_buffer(sized, rules, &count) == -1);
 }
 
 /**

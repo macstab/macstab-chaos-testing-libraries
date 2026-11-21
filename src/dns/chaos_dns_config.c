@@ -1514,6 +1514,14 @@ int chaos_dns_config_parse_buffer(char *buffer, chaos_dns_rule_t *rules, size_t 
             }
             continue;
         }
+        if (chaos_policy_has_size(&policy))
+        {
+            /* No dns call reports a byte count, so a size gate can never pass and the
+             * rule would load and never fire. */
+            chaos_status_reject(&g_chaos_dns_config_error, CHAOS_STATUS_REASON_INVALID);
+            *rule_count = 0U;
+            return -1;
+        }
         parsed.policy = policy;
         parsed.call_size = CHAOS_POLICY_NO_SIZE;
         if (count >= CHAOS_DNS_MAX_RULES)

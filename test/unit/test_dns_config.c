@@ -9,7 +9,7 @@
  *   `rdns://ip` and `rdns://[v6]` selectors; every effect parses its value; numeric limits
  *   (latency and LIMIT up to 4294967295, LIMIT >= 1) and buffer limits reject the first value
  *   past them; reverse selectors accept only GAI, LATENCY, REWRITE and SERVICE; qualifiers
- *   (`@first`, `@from`, `@until`, `@size`) land in the rule's policy and a bad one rejects
+ *   (`@first`, `@from`, `@until`) land in the rule's policy and a bad one rejects
  *   the line; a rejected line fails the whole file;
  * - selection: the most specific selector wins (exact rank 3 > suffix 2 > any 1), the longer
  *   suffix wins a tie whatever the order, and lookup and reverse rules never cross;
@@ -1192,15 +1192,16 @@ static void test_rule_file_check_is_throttled(void)
  *   bad qualifier rejects the line.
  *
  * @details All four qualifier kinds before a comment land in the policy, and a DNS rule
- * carries no byte count (`CHAOS_POLICY_NO_SIZE`), so a `@size` gate never passes for it.
+ * carries no byte count (`CHAOS_POLICY_NO_SIZE`), so a `@size` gate is rejected at parse
+ * time instead of loading a rule that could never fire.
  * Rejected: an unknown qualifier (reported with its full text), a qualifier with no rule
  * before it, `@until` not after `@from`, and `@first=0`.
  */
 static void test_rule_qualifiers(void)
 {
     static chaos_dns_rule_t rules[CHAOS_DNS_MAX_RULES];
-    char qualified[] = "dns://api.example.com:LATENCY:20 @first=3 @from=1000 @until=2000 @size>10 "
-                       "@size<99 # owner\n";
+    char qualified[] = "dns://api.example.com:LATENCY:20 @first=3 @from=1000 @until=2000 # owner\n";
+    char sized[] = "dns://api.example.com:LATENCY:20 @size>10\n";
     char unknown[] = "dns://api.example.com:LATENCY:20 @bogus=1\n";
     char lonely[] = "# header\n  @first=3\n";
     char backwards[] = "dns://api.example.com:LATENCY:20 @from=2000 @until=1000\n";
@@ -1212,8 +1213,6 @@ static void test_rule_qualifiers(void)
     assert(rules[0].policy.first == 3U);
     assert(rules[0].policy.from_ms == 1000);
     assert(rules[0].policy.until_ms == 2000);
-    assert(rules[0].policy.has_size_above && rules[0].policy.size_above == 10U);
-    assert(rules[0].policy.has_size_below && rules[0].policy.size_below == 99U);
     assert(rules[0].call_size == CHAOS_POLICY_NO_SIZE);
 
     assert(chaos_dns_config_parse_buffer(unknown, rules, &count) == -1);
@@ -1225,6 +1224,9 @@ static void test_rule_qualifiers(void)
     assert(chaos_dns_config_last_error()->line == 2U);
     assert(chaos_dns_config_parse_buffer(backwards, rules, &count) == -1);
     assert(chaos_dns_config_parse_buffer(empty_first, rules, &count) == -1);
+    /* No dns call reports a byte count, so a size gate could never pass: the rule
+     * would load and never fire, which is the failure this rejection removes. */
+    assert(chaos_dns_config_parse_buffer(sized, rules, &count) == -1);
 }
 
 /**
