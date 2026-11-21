@@ -403,6 +403,18 @@ static void test_helper_functions(void)
     }
     assert(chaos_net_parse_errno_name(NULL) == -1);
     assert(chaos_net_parse_errno_name("ENOPE") == -1);
+    /* A number the C library has no name for, as the other libraries accept: only the
+     * range is checked. Zero, a negative, a float, trailing text and a value past int are
+     * not errnos. */
+    assert(chaos_net_parse_errno_name("5") == 5);
+    assert(chaos_net_parse_errno_name("2147483647") == 2147483647);
+    assert(chaos_net_parse_errno_name("5 ") == 5);
+    assert(chaos_net_parse_errno_name("0") == -1);
+    assert(chaos_net_parse_errno_name("-5") == -1);
+    assert(chaos_net_parse_errno_name("5.5") == -1);
+    assert(chaos_net_parse_errno_name("5x") == -1);
+    assert(chaos_net_parse_errno_name("2147483648") == -1);
+    assert(chaos_net_parse_errno_name("") == -1);
 
     {
         double probability = 0.0;

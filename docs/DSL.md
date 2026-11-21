@@ -71,7 +71,7 @@ How the libc layer instantiates the triple:
 | Part | libc layer |
 |---|---|
 | S | a path prefix (io), an endpoint (net), a host name or address (dns), a function or function/argument class (time, process, memory), always with `*` as catch-all |
-| E | ERRNO (spelled as the errno name in io and net), GAI (`EAI_*`, dns), LATENCY, TIMEOUT, CORRUPT, TORN, TRICKLE, DUP, RESET, OFFSET, REGRESS, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER |
+| E | ERRNO (an errno name, or a positive number in every library), GAI (`EAI_*`, dns), LATENCY, TIMEOUT, CORRUPT, TORN, TRICKLE, DUP, RESET, OFFSET, REGRESS, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER |
 | P | probability ∧ `@from`/`@until` window ∧ `@size` gate ∧ `@first` budget; for FAIL_AFTER additionally a per-operation call counter |
 | selection | io, net: **one rule per call**, the most specific for the call's operation. dns, time, process, memory: **one rule per effect**, the most specific for each effect, so several effects compose on one call (§8) |
 

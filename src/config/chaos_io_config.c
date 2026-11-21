@@ -433,6 +433,9 @@ static chaos_io_operation_t chaos_io_parse_operation(const char *text)
  */
 static int chaos_io_parse_errno_name(const char *text)
 {
+    char *end = NULL;
+    long value;
+
     if (text == NULL)
     {
         return -1;
@@ -469,7 +472,21 @@ static int chaos_io_parse_errno_name(const char *text)
     {
         return ENOENT;
     }
-    return -1;
+    /* A number the C library has no name for, as the other libraries accept: a io rule can
+     * then reach an errno this build knows nothing about. Only the range is checked, never
+     * the meaning. */
+    value = strtol(text, &end, 10);
+    if (end == text || value <= 0L || value > 0x7fffffffL)
+    {
+        return -1;
+    }
+    /* Trailing blanks are skipped by reading, not by chaos_io_trim(), which terminates the text
+     * it is given: this function takes a const string and must not write through it. */
+    while (*end != '\0' && chaos_io_is_blank_char(*end))
+    {
+        ++end;
+    }
+    return *end == '\0' ? (int)value : -1;
 }
 
 /** @brief Locale-independent probability parser; see chaos_policy_parse_probability(). */
