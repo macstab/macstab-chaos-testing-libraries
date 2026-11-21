@@ -116,6 +116,7 @@ LIB_SRCS_net := \
 	$(SRC_NET_DIR)/chaos_net_config.c \
 	$(SRC_NET_DIR)/chaos_net_endpoint.c \
 	$(SRC_NET_DIR)/chaos_net_extra.c \
+	$(SRC_NET_DIR)/chaos_net_owner.c \
 	$(SRC_NET_DIR)/chaos_net_socket.c \
 	$(SRC_NET_DIR)/chaos_net_wait.c
 
@@ -264,6 +265,7 @@ FDCACHE_TEST := $(BUILD_DIR)/test_fdcache
 CHAOS_IO_TEST := $(BUILD_DIR)/test_chaos_io
 NET_ACTIONS_TEST := $(BUILD_DIR)/test_net_actions
 NET_ENDPOINT_TEST := $(BUILD_DIR)/test_net_endpoint
+NET_OWNER_TEST := $(BUILD_DIR)/test_net_owner
 NET_CONFIG_TEST := $(BUILD_DIR)/test_net_config
 NET_RUNTIME_TEST := $(BUILD_DIR)/test_net_runtime
 CHAOS_NET_TEST := $(BUILD_DIR)/test_chaos_net
@@ -292,7 +294,7 @@ CHAOS_INIT_MEMORY_TEST := $(BUILD_DIR)/test_chaos_init_memory
 CHAOS_INIT_PROCESS_TEST := $(BUILD_DIR)/test_chaos_init_process
 COMMON_TEST := $(BUILD_DIR)/test_common
 UNIT_TESTS := $(CONFIG_TEST) $(ACTIONS_TEST) $(FDCACHE_TEST) $(CHAOS_IO_TEST) \
-	$(NET_ACTIONS_TEST) $(NET_ENDPOINT_TEST) $(NET_CONFIG_TEST) $(NET_RUNTIME_TEST) $(CHAOS_NET_TEST) \
+	$(NET_ACTIONS_TEST) $(NET_ENDPOINT_TEST) $(NET_OWNER_TEST) $(NET_CONFIG_TEST) $(NET_RUNTIME_TEST) $(CHAOS_NET_TEST) \
 	$(DNS_ACTIONS_TEST) $(DNS_CONFIG_TEST) $(DNS_RUNTIME_TEST) $(DNS_OWNED_TEST) $(CHAOS_DNS_TEST) \
 	$(TIME_ACTIONS_TEST) $(TIME_CONFIG_TEST) $(TIME_RUNTIME_TEST) $(CHAOS_TIME_TEST) \
 	$(MEMORY_ACTIONS_TEST) $(MEMORY_CONFIG_TEST) $(MEMORY_RUNTIME_TEST) $(CHAOS_MEMORY_TEST) \
@@ -374,6 +376,7 @@ unit: $(UNIT_TESTS)
 	./$(CHAOS_IO_TEST)
 	./$(NET_ACTIONS_TEST)
 	./$(NET_ENDPOINT_TEST)
+	./$(NET_OWNER_TEST)
 	./$(NET_CONFIG_TEST)
 	./$(NET_RUNTIME_TEST)
 	./$(CHAOS_NET_TEST)

@@ -127,6 +127,7 @@ FDCACHE_GCNO=$(resolve_gcno test_fdcache)
 CHAOS_IO_GCNO=$(resolve_gcno test_chaos_io)
 NET_ACTIONS_GCNO=$(resolve_gcno test_net_actions)
 NET_ENDPOINT_GCNO=$(resolve_gcno test_net_endpoint)
+NET_OWNER_GCNO=$(resolve_gcno test_net_owner)
 NET_CONFIG_GCNO=$(resolve_gcno test_net_config)
 NET_RUNTIME_GCNO=$(resolve_gcno test_net_runtime)
 CHAOS_NET_GCNO=$(resolve_gcno test_chaos_net)
@@ -158,6 +159,7 @@ check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_sync.c" "100.00"
 check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_stdio.c" "100.00"
 check_target "$NET_ACTIONS_GCNO" "src/net/chaos_net_actions.c" "100.00"
 check_target "$NET_ENDPOINT_GCNO" "src/net/chaos_net_endpoint.c" "100.00"
+check_target "$NET_OWNER_GCNO" "src/net/chaos_net_owner.c" "100.00"
 check_target "$NET_CONFIG_GCNO" "src/net/chaos_net_config.c" "100.00"
 check_target "$NET_RUNTIME_GCNO" "src/net/chaos_net.c" "100.00"
 check_target "$CHAOS_NET_GCNO" "src/net/chaos_net_extra.c" "100.00"

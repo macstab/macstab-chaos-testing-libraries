@@ -583,6 +583,22 @@ or killed process, or a load balancer dropping a connection, looks like from the
 other side. `errno` is preserved across the `setsockopt`; the close itself always
 runs, so `libchaos-io`'s descriptor cache still sees it.
 
+`SO_LINGER` belongs to the open file description, not to the descriptor, and a
+close frees the description only when it is the last one referring to it. On a
+socket another descriptor still holds, the option would reset nothing now and
+reset the connection at some later close, in another process, for no rule. The
+effect therefore applies only once this process is the sole owner, which is
+established by looking for the socket's inode in `/proc/<pid>/fd` — so `fork`,
+`dup`, `posix_spawn` and `SCM_RIGHTS` are all covered alike. Anything that cannot
+be read counts as shared, because a wrong "sole owner" is what leaves the option
+behind. Ownership is settled before the rule fires, so a suppressed RESET spends
+neither a hit nor a `@first` claim.
+
+On a pre-forking server this means `close:RESET` takes effect in the process that
+closes last. A rule that only ever matches the parent's close — a Postgres
+postmaster handing the connection to a backend, for instance — does nothing, and
+its hit count stays at zero rather than claiming an RST that never left.
+
 **TRICKLE:N.** A receive asks the kernel for at most N bytes. `recv`, `recvfrom`
 and `read` pass N as the length; `recvmsg` and `readv` pass a copy of the iovec
 array cut to N bytes (arrays of more than 64 entries are left alone), and

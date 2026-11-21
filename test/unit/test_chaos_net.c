@@ -442,9 +442,13 @@ int chaos_net_rule_apply_errno(const chaos_net_rule_t *rule)
     return 1;
 }
 
+/** @brief Times the should-trigger stub was asked; proves a suppressed RESET spends none. */
+static int g_should_trigger_calls = 0;
+
 /** @brief Should-trigger stub: returns `g_should_trigger` for every rule. */
 int chaos_net_rule_should_trigger(const chaos_net_rule_t *rule)
 {
+    ++g_should_trigger_calls;
     (void)rule;
     return g_should_trigger;
 }
@@ -929,10 +933,24 @@ static void chaos_net_test_dup_before_tag(int fd);
 static uint64_t g_dup_socket_epoch = 1U;
 #define CHAOS_NET_DUP_SOCKET(fd)                                                                   \
     (g_dup_socket_epoch == 0U ? 0U : (uint64_t)(fd) + (g_dup_socket_epoch << 32))
+/* Ownership the fake scan reports; the real one reads /proc and has its own test. */
+static int g_stub_ownership = (int)CHAOS_NET_OWNER_SOLE;
+/** @brief Descriptors the fake ownership scan was asked about. */
+static int g_ownership_calls = 0;
+static int chaos_net_test_ownership(int fd);
+#define CHAOS_NET_OWNERSHIP(fd) ((chaos_net_ownership_t)chaos_net_test_ownership(fd))
 #define CHAOS_NET_DUP_BEFORE_TAG(fd) chaos_net_test_dup_before_tag(fd)
 #define CHAOS_NET_DUP_MAP(size) chaos_net_test_dup_map(size)
 #define CHAOS_NET_DUP_UNMAP(address, size) chaos_net_test_dup_unmap((address), (size))
 #include "../../src/net/chaos_net_socket.c"
+
+/** @brief Fake ownership scan: counts the question and reports `g_stub_ownership`. */
+static int chaos_net_test_ownership(int fd)
+{
+    (void)fd;
+    ++g_ownership_calls;
+    return g_stub_ownership;
+}
 
 /** @brief Hook between the DUP close check and the tag: forgets @p fd once when armed. */
 static void chaos_net_test_dup_before_tag(int fd)
@@ -2574,6 +2592,9 @@ static void reset_descriptor_stubs(void)
     g_chaos_net_real_setsockopt = chaos_net_test_next_setsockopt;
     g_descriptor_calls = 0;
     g_setsockopt_calls = 0;
+    g_stub_ownership = (int)CHAOS_NET_OWNER_SOLE;
+    g_ownership_calls = 0;
+    g_should_trigger_calls = 0;
     (void)memset(&g_setsockopt_linger, 0, sizeof(g_setsockopt_linger));
 }
 
@@ -2686,6 +2707,33 @@ static void test_descriptor_calls_on_sockets(void)
     g_should_trigger = 0;
     assert(close(5) == 0);
     assert(g_setsockopt_calls == 1);
+
+    /* A socket another descriptor still holds is left alone: SO_LINGER would reset nothing
+     * now and reset it at some later close, for no rule. Ownership is settled before the
+     * rule fires, so no hit and no `@first` claim is spent either. */
+    g_should_trigger = 1;
+    g_stub_ownership = (int)CHAOS_NET_OWNER_SHARED;
+    g_should_trigger_calls = 0;
+    g_ownership_calls = 0;
+    assert(close(5) == 0);
+    assert(g_setsockopt_calls == 1);
+    assert(g_ownership_calls == 1);
+    assert(g_should_trigger_calls == 0);
+
+    /* An ownership that could not be established counts as shared: a wrong "sole" is what
+     * leaves the option behind. */
+    g_stub_ownership = (int)CHAOS_NET_OWNER_UNKNOWN;
+    assert(close(5) == 0);
+    assert(g_setsockopt_calls == 1);
+    assert(g_should_trigger_calls == 0);
+
+    /* Sole ownership resets as before. */
+    g_stub_ownership = (int)CHAOS_NET_OWNER_SOLE;
+    assert(close(5) == 0);
+    assert(g_setsockopt_calls == 2);
+    assert(g_should_trigger_calls == 1);
+
+    g_should_trigger = 0;
     g_stub_rule.effect = CHAOS_NET_EFFECT_LATENCY;
     assert(close(5) == 0);
     assert(g_latency_calls == 1);

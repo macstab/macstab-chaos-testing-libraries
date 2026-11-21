@@ -282,6 +282,29 @@ extern chaos_net_pselect_fn g_chaos_net_real_pselect;
 extern chaos_net_getsockname_fn g_chaos_net_real_getsockname;
 extern chaos_net_getpeername_fn g_chaos_net_real_getpeername;
 extern chaos_net_getsockopt_fn g_chaos_net_real_getsockopt;
+
+/** @brief How many descriptors hold a socket, as far as this process can tell. */
+typedef enum chaos_net_ownership
+{
+    CHAOS_NET_OWNER_SOLE = 0,   /**< No other descriptor anywhere refers to it. */
+    CHAOS_NET_OWNER_SHARED = 1, /**< Another descriptor, here or in another process, does. */
+    CHAOS_NET_OWNER_UNKNOWN = 2 /**< Could not be established; treat as shared. */
+} chaos_net_ownership_t;
+
+/**
+ * @brief Whether socket @p fd is held by more descriptors than this one.
+ *
+ * @details Reads the state out of `/proc/<pid>/fd`, so it covers every way of sharing an
+ * open file description rather than the ones a tracker would know (chaos_net_owner.c).
+ * Runs only for a close a RESET rule matched. Anything unreadable answers UNKNOWN, which
+ * the caller must treat as shared: a wrong SOLE leaves SO_LINGER behind on a socket that
+ * outlives the close.
+ *
+ * @param fd Socket about to be closed.
+ * @return One of chaos_net_ownership_t.
+ */
+chaos_net_ownership_t chaos_net_socket_ownership(int fd);
+
 extern chaos_net_setsockopt_fn g_chaos_net_real_setsockopt;
 extern chaos_net_read_fn g_chaos_net_real_read;
 extern chaos_net_write_fn g_chaos_net_real_write;

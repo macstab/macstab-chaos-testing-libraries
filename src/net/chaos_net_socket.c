@@ -614,6 +614,11 @@ static uint64_t chaos_net_dup_socket(int fd)
 #define CHAOS_NET_DUP_SOCKET(fd) chaos_net_dup_socket(fd)
 #endif
 
+/* Test seam: the ownership scan reads /proc, which a unit test replaces with an answer. */
+#ifndef CHAOS_NET_OWNERSHIP
+#define CHAOS_NET_OWNERSHIP(fd) chaos_net_socket_ownership(fd)
+#endif
+
 static int chaos_net_is_stream(int fd);
 
 /** @brief The slot table, mapped at the first DUP receive; NULL before, or if mmap failed. */
@@ -1857,8 +1862,12 @@ CHAOS_NET_EXPORT int close(int fd)
         chaos_net_rule_apply_latency(&rule);
     }
     else if (matched && rule.effect == CHAOS_NET_EFFECT_RESET &&
+             CHAOS_NET_OWNERSHIP(fd) == CHAOS_NET_OWNER_SOLE &&
              chaos_net_rule_should_trigger(&rule))
     {
+        /* Ownership is settled before the rule fires, so a suppressed RESET spends neither
+         * a hit nor a `@first` claim: SO_LINGER on a socket another descriptor still holds
+         * would not reset anything now and would reset it later, out of any rule's reach. */
         abort_linger.l_onoff = 1;
         abort_linger.l_linger = 0;
         saved_errno = errno;
