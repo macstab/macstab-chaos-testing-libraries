@@ -1218,6 +1218,7 @@ static void test_rule_qualifiers(void)
         "/data:write:EIO:1.0 @first=3 @from=1000 @until=2000 @size>10 @size<99 # owner\n";
     char sized_open[] = "/data:open:EIO:1.0 @size>10\n";
     char sized_fsync[] = "/data:fsync:EIO:1.0 @size<10\n";
+    char sized_truncate[] = "/data:truncate:EIO:1.0 @size>10\n";
     char unknown[] = "/data:write:EIO:1.0 @bogus=1\n";
     char lonely[] = "# header\n  @first=3\n";
     char backwards[] = "/data:write:EIO:1.0 @from=2000 @until=1000\n";
@@ -1243,6 +1244,8 @@ static void test_rule_qualifiers(void)
      * report one, so the gate stays available there. */
     assert(chaos_io_config_parse_buffer(sized_open, rules, &count) == -1);
     assert(chaos_io_config_parse_buffer(sized_fsync, rules, &count) == -1);
+    /* truncate passes its length, so the gate is meaningful there. */
+    assert(chaos_io_config_parse_buffer(sized_truncate, rules, &count) == 0);
     assert(chaos_io_config_parse_buffer(empty_first, rules, &count) == -1);
 }
 

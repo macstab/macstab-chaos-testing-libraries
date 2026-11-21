@@ -119,9 +119,9 @@ static const chaos_init_io_call_t g_chaos_init_io_calls[] = {
     {__NR_close, CHAOS_IO_OP_CLOSE, CHAOS_INIT_IO_FD, 0, -1},
     {__NR_fsync, CHAOS_IO_OP_FSYNC, CHAOS_INIT_IO_FD, 0, -1},
     {__NR_fdatasync, CHAOS_IO_OP_FDATASYNC, CHAOS_INIT_IO_FD, 0, -1},
-    {__NR_ftruncate, CHAOS_IO_OP_TRUNCATE, CHAOS_INIT_IO_FD, 0, -1},
-    {__NR_truncate, CHAOS_IO_OP_TRUNCATE, CHAOS_INIT_IO_PATH, 0, -1},
-    {__NR_fallocate, CHAOS_IO_OP_ALLOCATE, CHAOS_INIT_IO_FD, 0, -1},
+    {__NR_ftruncate, CHAOS_IO_OP_TRUNCATE, CHAOS_INIT_IO_FD, 0, 1},
+    {__NR_truncate, CHAOS_IO_OP_TRUNCATE, CHAOS_INIT_IO_PATH, 0, 1},
+    {__NR_fallocate, CHAOS_IO_OP_ALLOCATE, CHAOS_INIT_IO_FD, 0, 3},
     {__NR_unlinkat, CHAOS_IO_OP_UNLINK, CHAOS_INIT_IO_PATH_AT, 1, -1},
     {__NR_renameat2, CHAOS_IO_OP_RENAME_FROM, CHAOS_INIT_IO_RENAME_AT, 0, -1},
 #ifdef __NR_openat2

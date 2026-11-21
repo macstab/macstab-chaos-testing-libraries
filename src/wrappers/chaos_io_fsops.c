@@ -301,7 +301,12 @@ CHAOS_IO_EXPORT int ftruncate(int fd, off_t length)
     chaos_io_rule_t rule;
 
     chaos_io_ensure_symbols();
-    if (chaos_io_in_internal() || !chaos_io_match_fd_rule(fd, CHAOS_IO_OP_TRUNCATE, &rule))
+    /* A negative length is not a byte count; the real call rejects it with EINVAL, so the
+     * size gate must not see it. */
+    if (chaos_io_in_internal() ||
+        !chaos_io_match_fd_rule_sized(
+            fd, CHAOS_IO_OP_TRUNCATE, length < 0 ? CHAOS_POLICY_NO_SIZE : (uint64_t)length, &rule
+        ))
     {
         return chaos_io_call_real_ftruncate(fd, length);
     }
@@ -596,6 +601,7 @@ CHAOS_IO_EXPORT int truncate(const char *path, off_t length)
     {
         return chaos_io_call_real_truncate(path, length);
     }
+    rule.call_size = length < 0 ? CHAOS_POLICY_NO_SIZE : (uint64_t)length;
 
     if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
     {

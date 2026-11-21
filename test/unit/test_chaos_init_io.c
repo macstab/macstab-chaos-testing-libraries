@@ -177,6 +177,7 @@ int main(void)
                 "/tmp/initio/w:write:ENOSPC:1.0\n"
                 "/tmp/initio/s:fsync:EIO:1.0\n"
                 "/tmp/initio/t:truncate:EROFS:1.0\n"
+                "/tmp/initio/big:truncate:ENOSPC:1.0 @size>100\n"
                 "/tmp/initio/data:unlink:EACCES:1.0\n"
                 "/tmp/initio/ren:rename_from:EMFILE:1.0\n"
                 "/tmp/initio/ren/from:rename_from:EACCES:1.0\n"
@@ -282,6 +283,10 @@ int main(void)
     assert(PASSES(decide(__NR_truncate, 0U, 0, 0, 0, 0)));                      /* unreadable */
     (void)close(open_file("/tmp/initio/t/f"));
     assert(PASSES(decide(__NR_ftruncate, (uint64_t)full, 0, 0, 0, 0)));
+    /* truncate reports its length (args[1] for both forms), so `@size` decides on it as it
+     * does under LD_PRELOAD. */
+    assert(FAILS(decide(__NR_truncate, P("/tmp/initio/big/f"), 200U, 0, 0, 0), ENOSPC));
+    assert(PASSES(decide(__NR_truncate, P("/tmp/initio/big/f"), 50U, 0, 0, 0)));
     assert(
         FAILS(decide(__NR_unlinkat, (uint64_t)AT_FDCWD, P("/tmp/initio/data/f"), 0, 0, 0), EACCES)
     );
