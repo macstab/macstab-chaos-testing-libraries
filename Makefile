@@ -38,10 +38,21 @@ LDLIBS ?= -ldl
 #                           no .eh_frame or .comment payload; smaller object
 #   -fno-stack-protector    no canary checks, so no __stack_chk_fail import
 #   --build-id=none, --strip-all   no build-id note, no symbol table beyond .dynsym
-#   max-page-size=4096, common-page-size=4096   4 KiB segment alignment instead of the 64 KiB
-#                           aarch64 default, which pads the file; segments then assume 4 KiB pages
+#   max-page-size           segment alignment (p_align). It must be at least the kernel's page
+#                           size or the loader cannot map the object at all. x86_64 is always
+#                           4 KiB; aarch64 kernels run 4, 16 or 64 KiB (RHEL and Oracle Linux on
+#                           aarch64, and Asahi, use 64 KiB), so arm64 objects are aligned to
+#                           64 KiB. common-page-size stays 4 KiB, which keeps the file from being
+#                           padded out to the larger boundary.
 SHARED_CFLAGS := $(CPPFLAGS) $(CFLAGS) -fPIC -fvisibility=hidden -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables -fomit-frame-pointer -fno-ident -fno-stack-protector
-SHARED_LDFLAGS := $(LDFLAGS) -Wl,--gc-sections -Wl,--build-id=none -Wl,--strip-all -Wl,-z,max-page-size=4096 -Wl,-z,common-page-size=4096
+SHARED_LDFLAGS := $(LDFLAGS) -Wl,--gc-sections -Wl,--build-id=none -Wl,--strip-all
+PAGE_LDFLAGS_4K := -Wl,-z,max-page-size=4096 -Wl,-z,common-page-size=4096
+PAGE_LDFLAGS_64K := -Wl,-z,max-page-size=65536 -Wl,-z,common-page-size=4096
+ifneq ($(filter aarch64 arm64,$(HOST_ARCH)),)
+NATIVE_PAGE_LDFLAGS := $(PAGE_LDFLAGS_64K)
+else
+NATIVE_PAGE_LDFLAGS := $(PAGE_LDFLAGS_4K)
+endif
 
 BUILD_DIR := build
 DIST_DIR := dist
@@ -589,23 +600,23 @@ $(BUILD_DIR)/test_%: $(TEST_UNIT_DIR)/test_%.c $(LIB_SRCS_io) $(LIB_HDRS_io) $(L
 define define_lib_rules
 $$(NATIVE_$(1)_LIB): $$(LIB_SRCS_$(1)) $$(LIB_HDRS_$(1)) $$(COMMON_HDRS) | $$(BUILD_DIR)
 ifeq ($$(UNAME_S),Linux)
-	$$(CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(LDLIBS)
+	$$(CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(NATIVE_PAGE_LDFLAGS) $$(LDLIBS)
 else
 	@echo "native shared library build requires Linux (host is $$(UNAME_S))" >&2
 	@exit 1
 endif
 
 $$(DIST_glibc-amd64_$(1)_LIB): $$(LIB_SRCS_$(1)) $$(LIB_HDRS_$(1)) $$(COMMON_HDRS) | $$(DIST_DIR)
-	$$(GLIBC_AMD64_CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(LDLIBS)
+	$$(GLIBC_AMD64_CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(PAGE_LDFLAGS_4K) $$(LDLIBS)
 
 $$(DIST_glibc-arm64_$(1)_LIB): $$(LIB_SRCS_$(1)) $$(LIB_HDRS_$(1)) $$(COMMON_HDRS) | $$(DIST_DIR)
-	$$(GLIBC_ARM64_CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(LDLIBS)
+	$$(GLIBC_ARM64_CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(PAGE_LDFLAGS_64K) $$(LDLIBS)
 
 $$(DIST_musl-amd64_$(1)_LIB): $$(LIB_SRCS_$(1)) $$(LIB_HDRS_$(1)) $$(COMMON_HDRS) | $$(DIST_DIR)
-	$$(MUSL_AMD64_CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(LDLIBS)
+	$$(MUSL_AMD64_CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(PAGE_LDFLAGS_4K) $$(LDLIBS)
 
 $$(DIST_musl-arm64_$(1)_LIB): $$(LIB_SRCS_$(1)) $$(LIB_HDRS_$(1)) $$(COMMON_HDRS) | $$(DIST_DIR)
-	$$(MUSL_ARM64_CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(LDLIBS)
+	$$(MUSL_ARM64_CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(PAGE_LDFLAGS_64K) $$(LDLIBS)
 
 native-$(1): $$(NATIVE_$(1)_LIB)
 cross-glibc-amd64-$(1): $$(DIST_glibc-amd64_$(1)_LIB)
