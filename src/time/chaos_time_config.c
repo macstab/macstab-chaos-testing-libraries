@@ -1129,6 +1129,37 @@ int chaos_time_config_parse_line(char *line, chaos_time_rule_t *rule)
 }
 
 /**
+ * @brief Whether rule @p later can never win against one already accepted.
+ *
+ * @details Selection is rank, then the longer selector text, then the earlier line. Two
+ * rules with the same selector and effect tie on everything but the line, so the earlier
+ * one always wins and the later can never fire. It is a valid rule, so it is kept and the
+ * status file warns about it instead of the file being rejected. The selector holds no
+ * pointers and every rule is zeroed before it is filled, so comparing its bytes is exact.
+ *
+ * @param rules Rules accepted so far.
+ * @param count How many.
+ * @param later The rule about to be accepted.
+ * @return Non-zero when an earlier rule shadows @p later.
+ */
+static int chaos_time_rule_shadowed(
+    const chaos_time_rule_t *rules, size_t count, const chaos_time_rule_t *later
+)
+{
+    size_t index;
+
+    for (index = 0U; index < count; ++index)
+    {
+        if (rules[index].effect == later->effect &&
+            memcmp(&rules[index].selector, &later->selector, sizeof(later->selector)) == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
  * @copydoc chaos_time_config_parse_buffer
  *
  * Line numbers in the error record count from 1, blank and comment lines included.
@@ -1210,10 +1241,18 @@ int chaos_time_config_parse_buffer(char *buffer, chaos_time_rule_t *rules, size_
             g_chaos_time_config_error.text,
             sizeof(g_chaos_time_config_texts[count])
         );
+        if (chaos_time_rule_shadowed(rules, count, &parsed))
+        {
+            chaos_status_warn(
+                &g_chaos_time_config_error,
+                g_chaos_time_config_error.line,
+                CHAOS_STATUS_WARN_SHADOWED
+            );
+        }
         rules[count++] = parsed;
     }
 
-    chaos_status_clear(&g_chaos_time_config_error);
+    chaos_status_clear_rejection(&g_chaos_time_config_error);
     *rule_count = count;
     return 0;
 }
@@ -1476,7 +1515,11 @@ chaos_time_config_report(uint64_t observed_mtime, const chaos_time_config_state_
     }
     else
     {
-        chaos_status_write(CHAOS_TIME_STATUS_PATH, CHAOS_STATUS_OK, state->rule_count, NULL);
+        /* The record is passed on success too: it carries the warnings, and its
+         * rejection fields were cleared when the parse succeeded. */
+        chaos_status_write(
+            CHAOS_TIME_STATUS_PATH, CHAOS_STATUS_OK, state->rule_count, &g_chaos_time_config_error
+        );
     }
 }
 

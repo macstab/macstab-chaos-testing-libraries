@@ -1489,6 +1489,36 @@ static void test_open_errors(void)
     (void)unlink(CHAOS_MEMORY_CONFIG_PATH);
 }
 
+/**
+ * @brief Proves a rule an earlier one always wins against is kept and warned about.
+ *
+ * @details Two rules with the same selector and effect tie on everything but the line, so
+ * the earlier always wins and the later can never fire. It is valid, so the file loads and
+ * the status record names its line. A rule differing in its effect is not shadowed: both
+ * can fire.
+ */
+static void test_shadowed_rules_warn(void)
+{
+    static chaos_memory_rule_t rules[CHAOS_MEMORY_MAX_RULES];
+    char duplicate[] = "mprotect:LATENCY:25\nmprotect:LATENCY:30\n";
+    char distinct[] = "mprotect:LATENCY:25\nmprotect:ERRNO:ENOMEM\n";
+    size_t count = 0U;
+
+    assert(chaos_memory_config_parse_buffer(duplicate, rules, &count) == 0);
+    assert(count == 2U);
+    assert(chaos_memory_config_last_error()->warning_count == 1U);
+    assert(chaos_memory_config_last_error()->warnings[0].line == 2U);
+    assert(
+        strcmp(chaos_memory_config_last_error()->warnings[0].reason, CHAOS_STATUS_WARN_SHADOWED) ==
+        0
+    );
+    assert(chaos_memory_config_last_error()->reason == NULL);
+
+    assert(chaos_memory_config_parse_buffer(distinct, rules, &count) == 0);
+    assert(count == 2U);
+    assert(chaos_memory_config_last_error()->warning_count == 0U);
+}
+
 int main(void)
 {
     /* Look at the rule file on every call; the throttle has its own test. */
@@ -1514,5 +1544,6 @@ int main(void)
     test_pending_hits_written_after_interval();
     test_parse_boundaries();
     test_open_errors();
+    test_shadowed_rules_warn();
     return 0;
 }

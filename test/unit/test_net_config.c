@@ -2053,6 +2053,41 @@ static void test_read_file_open_errors(void)
     free_backup(&backup);
 }
 
+/**
+ * @brief Proves a rule an earlier one always wins against is kept and warned about.
+ *
+ * @details Two rules with the same selector and effect tie on everything but the line, so
+ * the earlier always wins and the later can never fire. It is valid, so the file loads and
+ * the status record names its line. A rule differing in its effect is not shadowed: both
+ * can fire.
+ */
+static void test_shadowed_rules_warn(void)
+{
+    static chaos_net_rule_t rules[CHAOS_NET_MAX_RULES];
+    char duplicate[] = "*:recv:LATENCY:10\n*:recv:LATENCY:20\n";
+    char distinct[] = "*:recv:LATENCY:10\n*:recv:ECONNRESET:1.0\n";
+    char other_operation[] = "*:recv:LATENCY:10\n*:send:LATENCY:10\n";
+    size_t count = 0U;
+
+    assert(chaos_net_config_parse_buffer(duplicate, rules, &count) == 0);
+    assert(count == 2U);
+    assert(chaos_net_config_last_error()->warning_count == 1U);
+    assert(chaos_net_config_last_error()->warnings[0].line == 2U);
+    assert(
+        strcmp(chaos_net_config_last_error()->warnings[0].reason, CHAOS_STATUS_WARN_SHADOWED) == 0
+    );
+    assert(chaos_net_config_last_error()->reason == NULL);
+
+    assert(chaos_net_config_parse_buffer(distinct, rules, &count) == 0);
+    assert(count == 2U);
+    assert(chaos_net_config_last_error()->warning_count == 0U);
+
+    /* The operation counts as much as the selector: recv and send never shadow. */
+    assert(chaos_net_config_parse_buffer(other_operation, rules, &count) == 0);
+    assert(count == 2U);
+    assert(chaos_net_config_last_error()->warning_count == 0U);
+}
+
 int main(void)
 {
     /* Stat the rule file on every call so each write is seen at once; the throttle has its
@@ -2086,5 +2121,6 @@ int main(void)
     test_rule_copies_across_reloads();
     test_rule_checks_and_selection_order();
     test_read_file_open_errors();
+    test_shadowed_rules_warn();
     return 0;
 }

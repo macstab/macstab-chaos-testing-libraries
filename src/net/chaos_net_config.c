@@ -1081,6 +1081,36 @@ int chaos_net_config_parse_line(char *line, chaos_net_rule_t *rule)
 #endif
 
 /**
+ * @brief Whether rule @p later can never win against one already accepted.
+ *
+ * @details Selection is rank, then the longer selector text, then the earlier line. Two
+ * rules with the same selector, operation and effect tie on everything but the line, so the earlier
+ * one always wins and the later can never fire. It is a valid rule, so it is kept and the
+ * status file warns about it instead of the file being rejected. The selector holds no
+ * pointers and every rule is zeroed before it is filled, so comparing its bytes is exact.
+ *
+ * @param rules Rules accepted so far.
+ * @param count How many.
+ * @param later The rule about to be accepted.
+ * @return Non-zero when an earlier rule shadows @p later.
+ */
+static int
+chaos_net_rule_shadowed(const chaos_net_rule_t *rules, size_t count, const chaos_net_rule_t *later)
+{
+    size_t index;
+
+    for (index = 0U; index < count; ++index)
+    {
+        if (rules[index].operation == later->operation && rules[index].effect == later->effect &&
+            memcmp(&rules[index].selector, &later->selector, sizeof(later->selector)) == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
  * @brief Parses a whole rule file (contract in chaos_net_config.h).
  *
  * @details Lines are split on '\n' in place. The line as written is kept in the error
@@ -1168,10 +1198,16 @@ int chaos_net_config_parse_buffer(char *buffer, chaos_net_rule_t *rules, size_t 
             g_chaos_net_config_error.text,
             sizeof(g_chaos_net_config_texts[count])
         );
+        if (chaos_net_rule_shadowed(rules, count, &parsed))
+        {
+            chaos_status_warn(
+                &g_chaos_net_config_error, g_chaos_net_config_error.line, CHAOS_STATUS_WARN_SHADOWED
+            );
+        }
         rules[count++] = parsed;
     }
 
-    chaos_status_clear(&g_chaos_net_config_error);
+    chaos_status_clear_rejection(&g_chaos_net_config_error);
     *rule_count = count;
     return 0;
 }
@@ -1446,7 +1482,11 @@ static void chaos_net_config_report(uint64_t observed_mtime, const chaos_net_con
     }
     else
     {
-        chaos_status_write(CHAOS_NET_STATUS_PATH, CHAOS_STATUS_OK, state->rule_count, NULL);
+        /* The record is passed on success too: it carries the warnings, and its
+         * rejection fields were cleared when the parse succeeded. */
+        chaos_status_write(
+            CHAOS_NET_STATUS_PATH, CHAOS_STATUS_OK, state->rule_count, &g_chaos_net_config_error
+        );
     }
 }
 

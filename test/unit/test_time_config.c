@@ -1620,6 +1620,35 @@ static void test_open_errors(void)
     (void)unlink(CHAOS_TIME_CONFIG_PATH);
 }
 
+/**
+ * @brief Proves a rule an earlier one always wins against is kept and warned about.
+ *
+ * @details Two rules with the same selector and effect tie on everything but the line, so
+ * the earlier always wins and the later can never fire. It is valid, so the file loads and
+ * the status record names its line. A rule differing in its effect is not shadowed: both
+ * can fire.
+ */
+static void test_shadowed_rules_warn(void)
+{
+    static chaos_time_rule_t rules[CHAOS_TIME_MAX_RULES];
+    char duplicate[] = "nanosleep:ERRNO:EINTR\nnanosleep:ERRNO:EAGAIN\n";
+    char distinct[] = "nanosleep:ERRNO:EINTR\nnanosleep:LATENCY:5\n";
+    size_t count = 0U;
+
+    assert(chaos_time_config_parse_buffer(duplicate, rules, &count) == 0);
+    assert(count == 2U);
+    assert(chaos_time_config_last_error()->warning_count == 1U);
+    assert(chaos_time_config_last_error()->warnings[0].line == 2U);
+    assert(
+        strcmp(chaos_time_config_last_error()->warnings[0].reason, CHAOS_STATUS_WARN_SHADOWED) == 0
+    );
+    assert(chaos_time_config_last_error()->reason == NULL);
+
+    assert(chaos_time_config_parse_buffer(distinct, rules, &count) == 0);
+    assert(count == 2U);
+    assert(chaos_time_config_last_error()->warning_count == 0U);
+}
+
 int main(void)
 {
     /* Stat the rule file on every call so each write is seen at once; the throttle has its
@@ -1648,5 +1677,6 @@ int main(void)
     test_pending_hits_written_after_interval();
     test_parse_boundaries();
     test_open_errors();
+    test_shadowed_rules_warn();
     return 0;
 }

@@ -1525,6 +1525,36 @@ static void test_open_errors(void)
     (void)unlink(CHAOS_PROCESS_CONFIG_PATH);
 }
 
+/**
+ * @brief Proves a rule an earlier one always wins against is kept and warned about.
+ *
+ * @details Two rules with the same selector and effect tie on everything but the line, so
+ * the earlier always wins and the later can never fire. It is valid, so the file loads and
+ * the status record names its line. A rule differing in its effect is not shadowed: both
+ * can fire.
+ */
+static void test_shadowed_rules_warn(void)
+{
+    static chaos_process_rule_t rules[CHAOS_PROCESS_MAX_RULES];
+    char duplicate[] = "fork:ERRNO:EAGAIN\nfork:ERRNO:ENOMEM\n";
+    char distinct[] = "fork:ERRNO:EAGAIN\nfork:LATENCY:5\n";
+    size_t count = 0U;
+
+    assert(chaos_process_config_parse_buffer(duplicate, rules, &count) == 0);
+    assert(count == 2U);
+    assert(chaos_process_config_last_error()->warning_count == 1U);
+    assert(chaos_process_config_last_error()->warnings[0].line == 2U);
+    assert(
+        strcmp(chaos_process_config_last_error()->warnings[0].reason, CHAOS_STATUS_WARN_SHADOWED) ==
+        0
+    );
+    assert(chaos_process_config_last_error()->reason == NULL);
+
+    assert(chaos_process_config_parse_buffer(distinct, rules, &count) == 0);
+    assert(count == 2U);
+    assert(chaos_process_config_last_error()->warning_count == 0U);
+}
+
 int main(void)
 {
     /* Interval 0 makes every prepare stat the file, so tests see each write at once; the
@@ -1551,5 +1581,6 @@ int main(void)
     test_pending_hits_written_after_interval();
     test_parse_boundaries();
     test_open_errors();
+    test_shadowed_rules_warn();
     return 0;
 }

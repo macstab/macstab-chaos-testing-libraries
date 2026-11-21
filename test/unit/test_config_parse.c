@@ -1516,6 +1516,54 @@ static void test_long_link_target_is_not_followed(void)
     (void)unlink(CHAOS_IO_CONFIG_PATH);
 }
 
+/**
+ * @brief Proves a rule an earlier one always wins against is kept and warned about.
+ *
+ * @details Selection is rank, then the longer selector text, then the earlier line. Two
+ * rules with the same prefix, operation and effect tie on everything but the line, so the
+ * later one can never fire. It is valid, so the file loads and the status record carries a
+ * warning naming its line instead of a rejection.
+ *
+ * Covered: the duplicate warns and names the later line; three copies warn twice; and a
+ * rule that differs in its effect, its operation or its prefix does not warn, so the
+ * warning marks dead rules rather than every repeated selector.
+ */
+static void test_shadowed_rules_warn(void)
+{
+    static chaos_io_rule_t rules[CHAOS_IO_MAX_RULES];
+    char duplicate[] = "/data:read:EIO:1.0\n/data:read:EIO:0.5\n";
+    char triple[] = "/data:read:EIO:1.0\n/data:read:EIO:0.5\n/data:read:EIO:0.25\n";
+    char other_effect[] = "/data:read:EIO:1.0\n/data:read:LATENCY:5\n";
+    char other_operation[] = "/data:read:EIO:1.0\n/data:write:EIO:1.0\n";
+    char other_prefix[] = "/data:read:EIO:1.0\n/other:read:EIO:1.0\n";
+    size_t count = 0U;
+
+    /* The duplicate is kept -- both rules load -- and its line is named. */
+    assert(chaos_io_config_parse_buffer(duplicate, rules, &count) == 0);
+    assert(count == 2U);
+    assert(chaos_io_config_last_error()->warning_count == 1U);
+    assert(chaos_io_config_last_error()->warnings[0].line == 2U);
+    assert(
+        strcmp(chaos_io_config_last_error()->warnings[0].reason, CHAOS_STATUS_WARN_SHADOWED) == 0
+    );
+    /* A successful parse reports no rejection, only the warning. */
+    assert(chaos_io_config_last_error()->reason == NULL);
+
+    assert(chaos_io_config_parse_buffer(triple, rules, &count) == 0);
+    assert(count == 3U);
+    assert(chaos_io_config_last_error()->warning_count == 2U);
+    assert(chaos_io_config_last_error()->warnings[0].line == 2U);
+    assert(chaos_io_config_last_error()->warnings[1].line == 3U);
+
+    /* Differing in any of the three parts means both rules can fire. */
+    assert(chaos_io_config_parse_buffer(other_effect, rules, &count) == 0);
+    assert(chaos_io_config_last_error()->warning_count == 0U);
+    assert(chaos_io_config_parse_buffer(other_operation, rules, &count) == 0);
+    assert(chaos_io_config_last_error()->warning_count == 0U);
+    assert(chaos_io_config_parse_buffer(other_prefix, rules, &count) == 0);
+    assert(chaos_io_config_last_error()->warning_count == 0U);
+}
+
 int main(void)
 {
     /* Check the rule file on every call; the throttle has its own test. */
@@ -1551,5 +1599,6 @@ int main(void)
     test_matching_edges();
     test_hit_after_interval_is_written();
     test_long_link_target_is_not_followed();
+    test_shadowed_rules_warn();
     return 0;
 }

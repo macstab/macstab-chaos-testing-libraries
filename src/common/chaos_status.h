@@ -152,12 +152,23 @@ typedef struct chaos_status_error
  */
 #define CHAOS_STATUS_REASON_UNSUPPORTED "unsupported in seccomp mode"
 
-/** @brief Resets @p error to "nothing rejected". */
-static inline void chaos_status_clear(chaos_status_error_t *error)
+/**
+ * @brief Forgets the rejection, keeping the warnings.
+ *
+ * @details Used when a parse succeeds: there is no line to report any more, but the
+ * warnings raised along the way describe the rule set that is now in force.
+ */
+static inline void chaos_status_clear_rejection(chaos_status_error_t *error)
 {
     error->line = 0U;
     error->reason = NULL;
     error->text[0] = '\0';
+}
+
+/** @brief Resets @p error to "nothing rejected, nothing warned about". */
+static inline void chaos_status_clear(chaos_status_error_t *error)
+{
+    chaos_status_clear_rejection(error);
     error->warning_count = 0U;
 }
 

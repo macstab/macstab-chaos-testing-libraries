@@ -113,6 +113,11 @@ Rules common to all libraries:
   it opens the line; no selector or value can contain `#`. A `#` glued to the text before
   it (`dns://x:REWRITE:a#b`) is **rejected**, because cutting there would silently shorten
   the value and redirect to `a` instead of reporting the mistake.
+- A rule that is valid but cannot do what its author meant is kept and reported through
+  the status file's `warnings=` and `warn.<n>=` keys rather than rejected. That is where
+  "this rule can never fire" is said: a rule shadowed by an earlier one with the same
+  selector, operation and effect, and an effect suppressed at run time. The keys are
+  absent when nothing was raised, and `state` stays `ok`.
 - Parsing is all-or-nothing: one invalid line (unknown selector, effect, errno,
   illegal effect/selector pair, malformed qualifier, qualifier without a rule)
   leaves the library with **no rules**. The status file

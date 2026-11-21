@@ -738,6 +738,36 @@ static int chaos_io_prefix_covers(const char *prefix, size_t length, const char 
 }
 
 /**
+ * @brief Whether rule @p later can never win against one already accepted.
+ *
+ * @details Rules are selected by rank, then by the longer selector text, then by the
+ * earlier line. Two rules with the same prefix, operation and effect therefore tie on
+ * everything but the line, and the earlier one always wins: the later can never fire. It
+ * is a valid rule, so it is kept and the status file warns about it rather than rejecting
+ * the file.
+ *
+ * @param rules Rules accepted so far.
+ * @param count How many.
+ * @param later The rule about to be accepted.
+ * @return Non-zero when an earlier rule shadows @p later.
+ */
+static int
+chaos_io_rule_shadowed(const chaos_io_rule_t *rules, size_t count, const chaos_io_rule_t *later)
+{
+    size_t index;
+
+    for (index = 0U; index < count; ++index)
+    {
+        if (rules[index].operation == later->operation && rules[index].effect == later->effect &&
+            strcmp(rules[index].path_prefix, later->path_prefix) == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
  * @brief Whether operation @p operation reports a byte count to a rule.
  *
  * @details Only the calls that move bytes do: read, write, pread and pwrite (including
@@ -1137,7 +1167,11 @@ static void chaos_io_config_report(uint64_t observed_mtime, const chaos_io_confi
     }
     else
     {
-        chaos_status_write(CHAOS_IO_STATUS_PATH, CHAOS_STATUS_OK, state->rule_count, NULL);
+        /* The record is passed on success too: it carries the warnings, and its
+         * rejection fields were cleared when the parse succeeded. */
+        chaos_status_write(
+            CHAOS_IO_STATUS_PATH, CHAOS_STATUS_OK, state->rule_count, &g_chaos_io_config_error
+        );
     }
 }
 
@@ -1584,6 +1618,12 @@ int chaos_io_config_parse_buffer(char *buffer, chaos_io_rule_t *rules, size_t *r
             *rule_count = 0U;
             return -1;
         }
+        if (chaos_io_rule_shadowed(rules, count, &parsed))
+        {
+            chaos_status_warn(
+                &g_chaos_io_config_error, g_chaos_io_config_error.line, CHAOS_STATUS_WARN_SHADOWED
+            );
+        }
         (void)memcpy(
             g_chaos_io_config_texts[count],
             g_chaos_io_config_error.text,
@@ -1592,7 +1632,7 @@ int chaos_io_config_parse_buffer(char *buffer, chaos_io_rule_t *rules, size_t *r
         rules[count++] = parsed;
     }
 
-    chaos_status_clear(&g_chaos_io_config_error);
+    chaos_status_clear_rejection(&g_chaos_io_config_error);
     *rule_count = count;
     return 0;
 }
