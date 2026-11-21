@@ -655,7 +655,7 @@ static int chaos_io_config_read_file(size_t *size_out, uint64_t expected_stamp)
     previous = chaos_io_enter_internal();
     do
     {
-        fd = g_chaos_io_real_open(CHAOS_IO_CONFIG_PATH, O_RDONLY);
+        fd = g_chaos_io_real_open(CHAOS_IO_CONFIG_PATH, O_RDONLY | O_CLOEXEC);
     } while (fd < 0 && errno == EINTR);
     if (fd < 0)
     {
