@@ -66,6 +66,7 @@
 #include "chaos_clock.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -328,8 +329,13 @@ static void chaos_time_strip_comment(char *line)
  * Names: realtime, monotonic, and, where the C library defines the constant,
  * monotonic_raw, realtime_coarse, monotonic_coarse, boottime, tai, process_cputime_id,
  * thread_cputime_id. Any other text is read as a decimal id (strtol, trailing blanks
- * allowed, sign allowed) and not range-checked, so dynamic clock ids (negative, e.g.
- * per-process CPU clocks) and newer clocks can be selected; an unused id never matches.
+ * allowed, sign allowed), so dynamic clock ids (negative, e.g. per-process CPU clocks) and
+ * newer clocks can be selected; an unused id never matches.
+ *
+ * The id must fit in clockid_t, which is int on Linux and musl. Only the range is checked,
+ * never the meaning: an id that no clock uses is a valid selector that matches nothing. A
+ * value too large to fit would otherwise be truncated into a real clock -- 4294967297 is
+ * CLOCK_MONOTONIC once cast -- and fault a clock the rule never named.
  *
  * @param text      Clock text; NULL or empty returns 0.
  * @param clock_id  Receives the id.
@@ -404,8 +410,10 @@ static int chaos_time_parse_clock_id(const char *text, clockid_t *clock_id)
     }
 #endif
 
+    errno = 0;
     value = strtol(text, &end, 10);
-    if (end == text || *chaos_time_trim(end) != '\0')
+    if (end == text || *chaos_time_trim(end) != '\0' || errno == ERANGE || value > INT_MAX ||
+        value < INT_MIN)
     {
         return 0;
     }

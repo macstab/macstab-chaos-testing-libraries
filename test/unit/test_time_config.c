@@ -274,10 +274,12 @@ static void write_config_text(const char *text, time_t stamp)
  *   rejects 1 ms more and values beyond int64, which `strtoll` would clamp silently.
  * - `parse_payload_probability`: "42" (probability defaults), "25@0.25"; not "@0.25" or a
  *   probability above 1.0.
- * - `parse_clock_id`: every clock name this platform defines, the number "7"; not
- *   "bad-clock".
- * - `selector_parse` rejects "", "clock_gettime/" (empty clock) and a selector longer than
- *   `CHAOS_TIME_MAX_TEXT` (128).
+ * - `parse_clock_id`: every clock name this platform defines, the number "7" and a
+ *   negative dynamic id; not "bad-clock", and not an id outside clockid_t, which would be
+ *   truncated into a real clock ("4294967297" casts to CLOCK_MONOTONIC).
+ * - `selector_parse` rejects "", "clock_gettime/" (empty clock), a clock id outside
+ *   clockid_t, and a selector longer than `CHAOS_TIME_MAX_TEXT` (128) even when its id is
+ *   valid (trailing blanks are allowed after the number).
  * - `split_rule_fields` needs two colons and all output pointers.
  * - `effect_allowed` permits ERRNO and LATENCY on any selector, never INVALID.
  * - `hash_mtime(NULL)` is MTIME_MISSING; normalisation moves each reserved sentinel off its
@@ -303,8 +305,10 @@ static void test_helper_functions(void)
     chaos_time_config_state_t state;
     clockid_t clock_id = (clockid_t)0;
 
-    (void)memset(overlong_selector, '7', sizeof(overlong_selector));
-    (void)memcpy(overlong_selector, "clock_gettime/", sizeof("clock_gettime/") - 1U);
+    /* A valid id padded with the blanks the parser allows after it: the number is in
+     * range, so the selector is rejected for its length, not for its id. */
+    (void)memset(overlong_selector, ' ', sizeof(overlong_selector));
+    (void)memcpy(overlong_selector, "clock_gettime/7", sizeof("clock_gettime/7") - 1U);
     overlong_selector[sizeof(overlong_selector) - 1U] = '\0';
 
     assert(chaos_time_is_blank_char(' '));
@@ -412,10 +416,26 @@ static void test_helper_functions(void)
 #endif
     assert(chaos_time_parse_clock_id("7", &(clockid_t){0}));
     assert(!chaos_time_parse_clock_id("bad-clock", &(clockid_t){0}));
+    /* Dynamic clock ids are negative and stay valid: only the range is checked. */
+    {
+        clockid_t dynamic_id = 0;
+
+        assert(chaos_time_parse_clock_id("-2147483648", &dynamic_id));
+        assert(dynamic_id == (clockid_t)INT_MIN);
+        assert(chaos_time_parse_clock_id("2147483647", &dynamic_id));
+        assert(dynamic_id == (clockid_t)INT_MAX);
+    }
+    /* Outside clockid_t: the cast would land on a real clock instead of failing. */
+    assert(!chaos_time_parse_clock_id("4294967297", &(clockid_t){0}));
+    assert(!chaos_time_parse_clock_id("2147483648", &(clockid_t){0}));
+    assert(!chaos_time_parse_clock_id("-2147483649", &(clockid_t){0}));
+    assert(!chaos_time_parse_clock_id("99999999999999999999", &(clockid_t){0}));
 
     assert(!chaos_time_selector_parse(NULL, &selector));
     assert(!chaos_time_selector_parse("", &selector));
     assert(!chaos_time_selector_parse("clock_gettime/", NULL));
+    /* The range check reaches the selector, so the rule file is rejected as invalid. */
+    assert(!chaos_time_selector_parse("clock_gettime/4294967297", &selector));
     assert(!chaos_time_selector_parse(overlong_selector, &selector));
     assert(chaos_time_split_rule_fields(split_text, &selector_text, &effect_text, &value_text));
     assert(strcmp(selector_text, "clock_gettime/monotonic") == 0);
