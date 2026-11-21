@@ -87,7 +87,7 @@ the limits and the failure behaviour; they differ in field layout and vocabulary
 ```abnf
 file          = *( line LF ) [ line ]
 line          = [ rule *( 1*WSP qualifier ) ] *WSP [ comment ]
-comment       = "#" *( VCHAR / WSP )         ; "#" starts a comment anywhere
+comment       = "#" *( VCHAR / WSP )         ; at line start or after a blank
 
 ;; Two field layouts (whitespace around each field is trimmed):
 four-field    = selector ":" operation ":" effect-or-errno ":" value     ; io, net
@@ -109,8 +109,10 @@ number        = 1*18DIGIT
 
 Rules common to all libraries:
 
-- One rule per line. A `#` anywhere starts a comment, so no selector or value can
-  contain `#`.
+- One rule per line. A `#` starts a comment when a blank, tab or CR precedes it, or when
+  it opens the line; no selector or value can contain `#`. A `#` glued to the text before
+  it (`dns://x:REWRITE:a#b`) is **rejected**, because cutting there would silently shorten
+  the value and redirect to `a` instead of reporting the mistake.
 - Parsing is all-or-nothing: one invalid line (unknown selector, effect, errno,
   illegal effect/selector pair, malformed qualifier, qualifier without a rule)
   leaves the library with **no rules**. The status file

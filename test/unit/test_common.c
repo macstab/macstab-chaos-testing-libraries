@@ -512,6 +512,11 @@ static void test_policy_grammar(void)
         "/a:open:EIO:1.0 @size=1",
         "/a:open:EIO:1.0 @from=20 @until=20",
         "/a:open:EIO:1.0 @from=20 @until=10",
+        /* A '#' with no blank before it would cut the value short instead of starting
+         * a comment: dns://x:REWRITE:a#b would quietly redirect to `a`. */
+        "/a:open:EIO:1.0#note",
+        "/a:open:EIO:1.0 @first=3#note",
+        "/a:open:EIO:1.0\t@first=3#note",
     };
     chaos_rule_policy_t policy;
     char rule[128];
@@ -533,6 +538,13 @@ static void test_policy_grammar(void)
     assert(extract("/a:open:EIO:1.0 x@first=3", &policy, rule) == 0);
     assert(strcmp(rule, "/a:open:EIO:1.0 x@first=3") == 0 && chaos_policy_is_empty(&policy));
     assert(extract(" \t", &policy, rule) == 0 && chaos_policy_is_empty(&policy));
+
+    /* A comment still starts wherever a blank, tab or CR precedes the '#', and a line
+     * that opens with one is still a comment. */
+    assert(extract("#note", &policy, rule) == 0 && chaos_policy_is_empty(&policy));
+    assert(extract("/a:open:EIO:1.0 #note", &policy, rule) == 0);
+    assert(extract("/a:open:EIO:1.0\t#note", &policy, rule) == 0);
+    assert(extract("/a:open:EIO:1.0\r#note", &policy, rule) == 0);
 
     /* A window open on one side only is valid. */
     assert(extract("/a:open:EIO:1.0 @until=10", &policy, rule) == 0 && policy.until_ms == 10);

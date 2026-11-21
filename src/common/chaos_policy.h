@@ -212,7 +212,8 @@ static inline int chaos_policy_parse_word(const char *word, chaos_rule_policy_t 
  * @param line    Mutable NUL-terminated rule line.
  * @param policy  Reset to all zero, then filled; partially filled on failure.
  * @return 0 on success; -1 for an unknown or malformed qualifier, or for `@until` <=
- *         `@from` when both are given.
+ *         `@from` when both are given, or a '#' that no blank precedes (which would
+ *         otherwise cut a value short).
  */
 static inline int chaos_policy_extract(char *line, chaos_rule_policy_t *policy)
 {
@@ -221,6 +222,15 @@ static inline int chaos_policy_extract(char *line, chaos_rule_policy_t *policy)
     char *cut = NULL;
 
     memset(policy, 0, sizeof(*policy));
+    /* A '#' with no blank before it is an operator error, not a comment. Cutting there
+     * would silently shorten a value -- dns://x:REWRITE:a#b would redirect to `a` -- so the
+     * line is rejected and the status file names it. A comment still starts anywhere a
+     * blank precedes the '#', and a line that begins with one is still a comment. */
+    if (comment != NULL && comment != line && comment[-1] != ' ' && comment[-1] != '\t' &&
+        comment[-1] != '\r')
+    {
+        return -1;
+    }
     for (;;)
     {
         char *word_end = end;
