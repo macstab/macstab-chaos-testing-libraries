@@ -599,6 +599,34 @@ closes last. A rule that only ever matches the parent's close — a Postgres
 postmaster handing the connection to a backend, for instance — does nothing, and
 its hit count stays at zero rather than claiming an RST that never left.
 
+A hit count of zero alone would not say whether the rule never matched or matched
+and was suppressed, so every suppression is counted and published. The hits file
+carries two header lines in front of the rule lines:
+
+```
+suppressed.shared=3
+suppressed.unknown=0
+12	tcp4://127.0.0.1:5432:close:RESET:1 # pg
+```
+
+`shared` means the socket was held elsewhere — a pre-forking server behaving as
+designed. `unknown` means the ownership could not be established at all (a
+process of another user or PID namespace, an unreadable `/proc`), which is an
+environment to fix rather than a result to interpret. Both lines are written even
+while both counts are zero, so "nothing was suppressed" is distinguishable from
+"this library does not report it".
+
+The counts are per matched close, not per fault that would have fired: ownership
+is settled before the probability is drawn, so with the usual `RESET:1` the count
+is exact and below that it is an upper bound. They belong to the process, like
+hit counts, and a `fork` child starts at zero. A suppression also triggers the
+hits-file write on its own cadence, so a rule that is only ever suppressed still
+reports during the test instead of at process exit.
+
+Both lines carry no tab. A reader that splits each line on the first tab and
+skips what has none therefore ignores them without changes — which is why they
+are header lines rather than another column.
+
 **TRICKLE:N.** A receive asks the kernel for at most N bytes. `recv`, `recvfrom`
 and `read` pass N as the length; `recvmsg` and `readv` pass a copy of the iovec
 array cut to N bytes (arrays of more than 64 entries are left alone), and

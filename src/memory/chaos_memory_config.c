@@ -1274,6 +1274,7 @@ static void chaos_memory_config_report_hits(chaos_hit_slot_t *slot)
                 state->hits,
                 (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) state->text,
                 state->rule_count,
+                NULL,
                 g_chaos_memory_hits_buffer,
                 sizeof(g_chaos_memory_hits_buffer)
             );

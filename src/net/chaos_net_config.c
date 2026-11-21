@@ -212,8 +212,25 @@ static long g_chaos_net_hits_file = 0L;
 /** @brief Whether this image created that file (chaos_hits_write_for()). */
 static int g_chaos_net_hits_owned = 0;
 
+/**
+ * @brief Closes on which a matched RESET rule was suppressed because the socket was shared.
+ *
+ * @details Counted per close, not per rule and not per would-be fault: ownership is settled
+ * before the rule fires (chaos_net_socket.c), so whether the probability would have let this
+ * call through is unknown here and must not be guessed. With the usual `RESET:1.0` the count
+ * is exact; below that it is an upper bound. NETWORK.md says so too.
+ */
+static volatile uint64_t g_chaos_net_reset_suppressed_shared = 0U;
+
+/** @brief The same for a socket whose ownership could not be established at all. */
+static volatile uint64_t g_chaos_net_reset_suppressed_unknown = 0U;
+
+/** @brief Longest header block: two `suppressed.*=<20 digits>` lines and their newlines. */
+#define CHAOS_NET_HITS_HEADER_MAX 96U
+
 /** @brief Scratch for formatting the hits file; used only by the hits writer. */
-static char g_chaos_net_hits_buffer[CHAOS_NET_MAX_RULES * CHAOS_HITS_LINE_MAX + 1U];
+static char g_chaos_net_hits_buffer
+    [CHAOS_NET_MAX_RULES * CHAOS_HITS_LINE_MAX + CHAOS_NET_HITS_HEADER_MAX + 1U];
 
 /*---------------------------------------------------------------------------
  * Internal helpers
@@ -1318,6 +1335,29 @@ static void chaos_net_config_reject_file(chaos_net_config_state_t *state, const 
 }
 
 /**
+ * @brief Formats the suppression counters as hits-file header lines.
+ *
+ * @details Written on every report, also as zeros: a reader must be able to tell "no
+ * suppression" from "this library does not report it", and only a present line does that.
+ *
+ * @param out  Buffer of at least CHAOS_NET_HITS_HEADER_MAX bytes.
+ * @param size Its size.
+ * @return @p out, or NULL when it could not be formatted (then no header is written).
+ */
+static const char *chaos_net_hits_header(char *out, size_t size)
+{
+    const int rc = snprintf(
+        out,
+        size,
+        "suppressed.shared=%llu\nsuppressed.unknown=%llu\n",
+        (unsigned long long)g_chaos_net_reset_suppressed_shared,
+        (unsigned long long)g_chaos_net_reset_suppressed_unknown
+    );
+
+    return rc > 0 && (size_t)rc < size ? out : NULL;
+}
+
+/**
  * @brief Writes this process's hit counts after a hit on @p slot (NULL: forced, e.g. at
  *        exit or after an idle interval).
  *
@@ -1328,12 +1368,13 @@ static void chaos_net_config_reject_file(chaos_net_config_state_t *state, const 
  * busy leaves `pending` set, and the writer loops until nothing is pending. Only the pid
  * the counts belong to writes, which keeps a vfork() child, sharing this memory, out.
  */
-static void chaos_net_config_report_hits(chaos_hit_slot_t *slot)
+static void chaos_net_config_report_hits_counted(int counted)
 {
     chaos_net_config_state_t *state;
+    char header[CHAOS_NET_HITS_HEADER_MAX];
     const uint64_t now = chaos_hits_now_ms();
 
-    if (slot != NULL)
+    if (counted)
     {
         ++g_chaos_net_hits_total;
         if (g_chaos_net_hits_pending == 0)
@@ -1377,6 +1418,7 @@ static void chaos_net_config_report_hits(chaos_hit_slot_t *slot)
                 state->hits,
                 (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) state->text,
                 state->rule_count,
+                chaos_net_hits_header(header, sizeof(header)),
                 g_chaos_net_hits_buffer,
                 sizeof(g_chaos_net_hits_buffer)
             );
@@ -1386,6 +1428,31 @@ static void chaos_net_config_report_hits(chaos_hit_slot_t *slot)
         __sync_synchronize();
         /* A hit that found the writer busy after the last check is written now. */
     } while (g_chaos_net_hits_pending != 0);
+}
+
+/** @brief The hit-slot report hook; a NULL slot forces whatever is pending. */
+static void chaos_net_config_report_hits(chaos_hit_slot_t *slot)
+{
+    chaos_net_config_report_hits_counted(slot != NULL);
+}
+
+/**
+ * @copydoc chaos_net_reset_suppressed
+ */
+void chaos_net_reset_suppressed(chaos_net_ownership_t ownership)
+{
+    if (ownership == CHAOS_NET_OWNER_SHARED)
+    {
+        (void)__sync_fetch_and_add(&g_chaos_net_reset_suppressed_shared, 1U);
+    }
+    else
+    {
+        (void)__sync_fetch_and_add(&g_chaos_net_reset_suppressed_unknown, 1U);
+    }
+    /* Reported like a hit, on the same cadence: a rule that only ever gets suppressed
+     * records no hit, so without this the count would reach the test at process exit and
+     * the suppression would be silent for as long as the test runs. */
+    chaos_net_config_report_hits_counted(1);
 }
 
 /**
@@ -1410,6 +1477,9 @@ static void chaos_net_config_after_fork(void)
     CHAOS_STORE_IF_CHANGED(g_chaos_net_hits_pending, 0);
     CHAOS_STORE_IF_CHANGED(g_chaos_net_hits_total, 0U);
     CHAOS_STORE_IF_CHANGED(g_chaos_net_hits_last_ms, 0U);
+    /* Suppressions are the parent's, like its hits: the child reports only its own. */
+    CHAOS_STORE_IF_CHANGED(g_chaos_net_reset_suppressed_shared, 0U);
+    CHAOS_STORE_IF_CHANGED(g_chaos_net_reset_suppressed_unknown, 0U);
     g_chaos_net_hits_pid = (uint64_t)getpid();
     /* The child's own pid, without probing /tmp: a stale file of an earlier process with
      * this pid is caught by the exclusive first write, which then picks another suffix. */

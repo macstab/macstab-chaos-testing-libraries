@@ -619,6 +619,12 @@ static uint64_t chaos_net_dup_socket(int fd)
 #define CHAOS_NET_OWNERSHIP(fd) chaos_net_socket_ownership(fd)
 #endif
 
+/* Test seam: the suppression counter lives in chaos_net_config.c, which the wrapper tests
+ * stub rather than link. */
+#ifndef CHAOS_NET_RESET_SUPPRESSED
+#define CHAOS_NET_RESET_SUPPRESSED(ownership) chaos_net_reset_suppressed(ownership)
+#endif
+
 static int chaos_net_is_stream(int fd);
 
 /** @brief The slot table, mapped at the first DUP receive; NULL before, or if mmap failed. */
@@ -1852,6 +1858,7 @@ CHAOS_NET_EXPORT int close(int fd)
     chaos_net_rule_t rule;
     struct linger abort_linger;
     int matched;
+    chaos_net_ownership_t ownership;
     int saved_errno;
     int rc;
 
@@ -1861,13 +1868,18 @@ CHAOS_NET_EXPORT int close(int fd)
     {
         chaos_net_rule_apply_latency(&rule);
     }
+    /* Ownership is settled before the rule fires, so a suppressed RESET spends neither a hit
+     * nor a `@first` claim: SO_LINGER on a socket another descriptor still holds would not
+     * reset anything now and would reset it later, out of any rule's reach. A suppression is
+     * not silent -- it is counted for the hits file's header lines. */
     else if (matched && rule.effect == CHAOS_NET_EFFECT_RESET &&
-             CHAOS_NET_OWNERSHIP(fd) == CHAOS_NET_OWNER_SOLE &&
+             (ownership = CHAOS_NET_OWNERSHIP(fd)) != CHAOS_NET_OWNER_SOLE)
+    {
+        CHAOS_NET_RESET_SUPPRESSED(ownership);
+    }
+    else if (matched && rule.effect == CHAOS_NET_EFFECT_RESET &&
              chaos_net_rule_should_trigger(&rule))
     {
-        /* Ownership is settled before the rule fires, so a suppressed RESET spends neither
-         * a hit nor a `@first` claim: SO_LINGER on a socket another descriptor still holds
-         * would not reset anything now and would reset it later, out of any rule's reach. */
         abort_linger.l_onoff = 1;
         abort_linger.l_linger = 0;
         saved_errno = errno;

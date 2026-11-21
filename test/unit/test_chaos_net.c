@@ -939,6 +939,12 @@ static int g_stub_ownership = (int)CHAOS_NET_OWNER_SOLE;
 static int g_ownership_calls = 0;
 static int chaos_net_test_ownership(int fd);
 #define CHAOS_NET_OWNERSHIP(fd) ((chaos_net_ownership_t)chaos_net_test_ownership(fd))
+/* Suppressions counted for the hits file; the counter itself lives in chaos_net_config.c,
+ * which this test stubs rather than links. */
+static int g_suppressed_shared = 0;
+static int g_suppressed_unknown = 0;
+static void chaos_net_test_reset_suppressed(chaos_net_ownership_t ownership);
+#define CHAOS_NET_RESET_SUPPRESSED(ownership) chaos_net_test_reset_suppressed(ownership)
 #define CHAOS_NET_DUP_BEFORE_TAG(fd) chaos_net_test_dup_before_tag(fd)
 #define CHAOS_NET_DUP_MAP(size) chaos_net_test_dup_map(size)
 #define CHAOS_NET_DUP_UNMAP(address, size) chaos_net_test_dup_unmap((address), (size))
@@ -950,6 +956,19 @@ static int chaos_net_test_ownership(int fd)
     (void)fd;
     ++g_ownership_calls;
     return g_stub_ownership;
+}
+
+/** @brief Counts a suppressed RESET the way chaos_net_config.c does, split by cause. */
+static void chaos_net_test_reset_suppressed(chaos_net_ownership_t ownership)
+{
+    if (ownership == CHAOS_NET_OWNER_SHARED)
+    {
+        ++g_suppressed_shared;
+    }
+    else
+    {
+        ++g_suppressed_unknown;
+    }
 }
 
 /** @brief Hook between the DUP close check and the tag: forgets @p fd once when armed. */
@@ -2715,23 +2734,42 @@ static void test_descriptor_calls_on_sockets(void)
     g_stub_ownership = (int)CHAOS_NET_OWNER_SHARED;
     g_should_trigger_calls = 0;
     g_ownership_calls = 0;
+    g_suppressed_shared = 0;
+    g_suppressed_unknown = 0;
     assert(close(5) == 0);
     assert(g_setsockopt_calls == 1);
     assert(g_ownership_calls == 1);
     assert(g_should_trigger_calls == 0);
+    /* Not silent: the suppression is counted for the hits file, under its cause. */
+    assert(g_suppressed_shared == 1 && g_suppressed_unknown == 0);
 
     /* An ownership that could not be established counts as shared: a wrong "sole" is what
-     * leaves the option behind. */
+     * leaves the option behind. It is reported apart, because it means a broken environment
+     * rather than a socket a pre-forking server shares on purpose. */
     g_stub_ownership = (int)CHAOS_NET_OWNER_UNKNOWN;
     assert(close(5) == 0);
     assert(g_setsockopt_calls == 1);
     assert(g_should_trigger_calls == 0);
+    assert(g_suppressed_shared == 1 && g_suppressed_unknown == 1);
 
-    /* Sole ownership resets as before. */
+    /* Sole ownership resets as before, and counts no suppression. */
     g_stub_ownership = (int)CHAOS_NET_OWNER_SOLE;
     assert(close(5) == 0);
     assert(g_setsockopt_calls == 2);
     assert(g_should_trigger_calls == 1);
+    assert(g_suppressed_shared == 1 && g_suppressed_unknown == 1);
+
+    /* Negative: a close without a RESET rule neither scans ownership nor counts anything,
+     * however the socket is held -- the counter must not turn into a close counter. */
+    g_stub_ownership = (int)CHAOS_NET_OWNER_SHARED;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_ERRNO;
+    g_errno_trigger = 0;
+    g_ownership_calls = 0;
+    assert(close(5) == 0);
+    assert(g_ownership_calls == 0);
+    assert(g_suppressed_shared == 1 && g_suppressed_unknown == 1);
+    g_stub_rule.effect = CHAOS_NET_EFFECT_RESET;
+    g_stub_ownership = (int)CHAOS_NET_OWNER_SOLE;
 
     g_should_trigger = 0;
     g_stub_rule.effect = CHAOS_NET_EFFECT_LATENCY;

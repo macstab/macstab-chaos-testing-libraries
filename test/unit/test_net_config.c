@@ -1328,12 +1328,22 @@ static void test_prepare_reports_status(void)
     assert(!read_status_file(status, sizeof(status)));
 }
 
-/** @brief Reads this process's hits file into @p buffer (NUL-terminated); 0 when absent. */
+/** @brief Header lines of the last read_hits_file(), without the rule lines. */
+static char g_hits_header[128];
+
+/**
+ * @brief Reads this process's hits file into @p buffer (NUL-terminated); 0 when absent.
+ *
+ * @details The header lines (`suppressed.*`, no tab) are split off into g_hits_header, so
+ * the assertions on the rule lines stay about rule lines. That the header really is in
+ * front, and really carries no tab, is asserted here once for every reader below.
+ */
 static int read_hits_file(char *buffer, size_t size)
 {
     char path[64];
     FILE *file;
     size_t length;
+    const char *rules;
 
     (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_NET_HITS_PREFIX, g_chaos_net_hits_file);
     file = fopen(path, "r");
@@ -1344,6 +1354,19 @@ static int read_hits_file(char *buffer, size_t size)
     length = fread(buffer, 1U, size - 1U, file);
     buffer[length] = '\0';
     assert(fclose(file) == 0);
+
+    /* Two header lines, then the rule lines; the first tab is in the rule lines. */
+    assert(strncmp(buffer, "suppressed.shared=", 18U) == 0);
+    rules = strstr(buffer, "suppressed.unknown=");
+    assert(rules != NULL);
+    rules = strchr(rules, '\n');
+    assert(rules != NULL);
+    ++rules;
+    assert((size_t)(rules - buffer) < sizeof(g_hits_header));
+    (void)memcpy(g_hits_header, buffer, (size_t)(rules - buffer));
+    g_hits_header[rules - buffer] = '\0';
+    assert(strchr(g_hits_header, '\t') == NULL);
+    (void)memmove(buffer, rules, strlen(rules) + 1U);
     return 1;
 }
 
@@ -1479,6 +1502,57 @@ static void test_hits_are_counted_and_reported(void)
     assert(g_chaos_net_hits_pending == 1);
     g_chaos_net_hits_pending = 0;
     g_chaos_net_hits_pid = (uint64_t)getpid();
+
+    (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_NET_HITS_PREFIX, g_chaos_net_hits_file);
+    (void)unlink(path);
+    (void)unlink(CHAOS_NET_CONFIG_PATH);
+}
+
+/**
+ * @brief Proves suppressed RESETs reach the hits file, split by cause and never silently.
+ *
+ * @details A RESET on a socket this process does not own alone applies nothing
+ * (chaos_net_socket.c). What a test must still be able to see is *that* it applied nothing,
+ * which is what these two header lines are for. Asserted here on the file the library really
+ * writes, not on the counters in memory:
+ * - both lines are present while both counts are zero -- "no suppression" has to be
+ *   distinguishable from "this library does not report it";
+ * - a shared socket and an unreadable one are counted apart, because the first is a
+ *   pre-forking server behaving as designed and the second is a broken environment;
+ * - the counts belong to the process, so a fork child starts at zero.
+ */
+static void test_reset_suppressions_are_reported(void)
+{
+    char hits[1024];
+    char path[64];
+    chaos_net_config_state_t *state;
+
+    chaos_net_config_init();
+    write_config_text("tcp4://127.0.0.1:9010:close:RESET:1 # a\n", 71);
+    assert(chaos_net_config_prepare() == 1);
+    state = (chaos_net_config_state_t *)chaos_net_config_active_state();
+
+    /* Zeros are written too, so a reader can tell them from a missing report. */
+    chaos_hit_record(state->rules[0].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(strcmp(g_hits_header, "suppressed.shared=0\nsuppressed.unknown=0\n") == 0);
+    assert(strcmp(hits, "1\ttcp4://127.0.0.1:9010:close:RESET:1 # a\n") == 0);
+
+    /* Each cause counts on its own line, and a suppression writes the file by itself: a
+     * rule that is only ever suppressed records no hit, so nothing else would. The rule's
+     * hit count stays where it was, because a suppressed RESET spends no hit. */
+    chaos_net_reset_suppressed(CHAOS_NET_OWNER_SHARED);
+    chaos_net_reset_suppressed(CHAOS_NET_OWNER_SHARED);
+    chaos_net_reset_suppressed(CHAOS_NET_OWNER_UNKNOWN);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(strcmp(g_hits_header, "suppressed.shared=2\nsuppressed.unknown=1\n") == 0);
+    assert(strcmp(hits, "1\ttcp4://127.0.0.1:9010:close:RESET:1 # a\n") == 0);
+
+    /* A fork child reports its own suppressions only, like its own hits. */
+    chaos_net_config_after_fork();
+    chaos_net_reset_suppressed(CHAOS_NET_OWNER_SHARED);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(strcmp(g_hits_header, "suppressed.shared=1\nsuppressed.unknown=0\n") == 0);
 
     (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_NET_HITS_PREFIX, g_chaos_net_hits_file);
     (void)unlink(path);
@@ -2108,6 +2182,7 @@ int main(void)
     test_parse_buffer_reports_rejected_line();
     test_prepare_reports_status();
     test_hits_are_counted_and_reported();
+    test_reset_suppressions_are_reported();
     test_forked_child_reports_own_hits();
     test_first_budget_is_per_process();
     test_rule_file_check_is_throttled();

@@ -305,6 +305,19 @@ typedef enum chaos_net_ownership
  */
 chaos_net_ownership_t chaos_net_socket_ownership(int fd);
 
+/**
+ * @brief Records that a matched RESET rule was suppressed on a socket this process does not
+ *        own alone.
+ *
+ * @details The count reaches the test through the hits file's header lines
+ * (`suppressed.shared=`, `suppressed.unknown=`), published by the existing write cadence --
+ * no file I/O on the interposition path. Counted per matched close, independent of the
+ * probability draw, because ownership is settled before the rule fires.
+ *
+ * @param ownership What the scan answered; anything but SHARED counts as unknown.
+ */
+void chaos_net_reset_suppressed(chaos_net_ownership_t ownership);
+
 extern chaos_net_setsockopt_fn g_chaos_net_real_setsockopt;
 extern chaos_net_read_fn g_chaos_net_real_read;
 extern chaos_net_write_fn g_chaos_net_real_write;

@@ -394,7 +394,9 @@ static void test_hits(void)
         long number = 1L;
         int owned = 0;
 
-        chaos_hits_write_for(prefix, 1L, &number, &owned, next, texts, 2U, room, sizeof(room));
+        chaos_hits_write_for(
+            prefix, 1L, &number, &owned, next, texts, 2U, NULL, room, sizeof(room)
+        );
         chaos_hits_write_for(
             "/tmp/chaos-common-test/hits",
             1L,
@@ -403,6 +405,7 @@ static void test_hits(void)
             next,
             texts,
             2U,
+            NULL,
             buffer,
             sizeof(buffer)
         );
@@ -413,14 +416,32 @@ static void test_hits(void)
          * it. A stale EEXIST in errno must not be mistaken for a taken name. */
         errno = EEXIST;
         chaos_hits_write_for(
-            "/tmp/chaos-common-test/hits", 1L, &number, &owned, next, texts, 2U, room, sizeof(room)
+            "/tmp/chaos-common-test/hits",
+            1L,
+            &number,
+            &owned,
+            next,
+            texts,
+            2U,
+            NULL,
+            room,
+            sizeof(room)
         );
         assert(number == 1L && owned && errno == EEXIST);
         assert(read_file("/tmp/chaos-common-test/hits.1", contents, sizeof(contents)) > 0L);
         assert(strcmp(contents, "3\t/a:open:EIO:1.0\n0\t/b:open:EIO:1.0\n") == 0);
         pool[0].count = 4U;
         chaos_hits_write_for(
-            "/tmp/chaos-common-test/hits", 1L, &number, &owned, next, texts, 2U, room, sizeof(room)
+            "/tmp/chaos-common-test/hits",
+            1L,
+            &number,
+            &owned,
+            next,
+            texts,
+            2U,
+            NULL,
+            room,
+            sizeof(room)
         );
         assert(read_file("/tmp/chaos-common-test/hits.1", contents, sizeof(contents)) > 0L);
         assert(strncmp(contents, "4\t", 2U) == 0);
@@ -442,6 +463,7 @@ static void test_hits(void)
                 next,
                 texts,
                 2U,
+                NULL,
                 room,
                 sizeof(room)
             );
@@ -468,6 +490,7 @@ static void test_hits(void)
                 next,
                 texts,
                 2U,
+                NULL,
                 room,
                 sizeof(room)
             );
@@ -482,13 +505,93 @@ static void test_hits(void)
         owned = 0;
         g_link_fails = EPERM;
         chaos_hits_write_for(
-            "/tmp/chaos-common-test/hits", 1L, &number, &owned, next, texts, 2U, room, sizeof(room)
+            "/tmp/chaos-common-test/hits",
+            1L,
+            &number,
+            &owned,
+            next,
+            texts,
+            2U,
+            NULL,
+            room,
+            sizeof(room)
         );
         g_link_fails = 0;
         assert(owned && number == 1L);
         assert(read_file("/tmp/chaos-common-test/hits.1", contents, sizeof(contents)) > 0L);
         assert(!staging_left());
         (void)unlink("/tmp/chaos-common-test/hits.1");
+
+        /* Header lines (counts that belong to no rule) go in front of the rule lines, and
+         * carry no tab: that is what lets a reader which splits on the first tab skip what
+         * it does not know. Proven here on the bytes, not on the intent. */
+        number = 1L;
+        owned = 0;
+        pool[0].count = 7U;
+        chaos_hits_write_for(
+            "/tmp/chaos-common-test/hits",
+            1L,
+            &number,
+            &owned,
+            next,
+            texts,
+            2U,
+            "suppressed.shared=2\nsuppressed.unknown=0\n",
+            room,
+            sizeof(room)
+        );
+        {
+            char whole[128];
+
+            assert(read_file("/tmp/chaos-common-test/hits.1", whole, sizeof(whole)) > 0L);
+            assert(
+                strcmp(
+                    whole,
+                    "suppressed.shared=2\nsuppressed.unknown=0\n"
+                    "7\t/a:open:EIO:1.0\n0\t/b:open:EIO:1.0\n"
+                ) == 0
+            );
+            /* The header is in front of every tab, which is what makes it skippable. */
+            assert(strchr(whole, '\t') > strstr(whole, "suppressed.unknown=0"));
+        }
+        (void)unlink("/tmp/chaos-common-test/hits.1");
+
+        /* Negative: no header writes the rule lines alone, byte for byte as before. */
+        chaos_hits_write_for(
+            "/tmp/chaos-common-test/hits",
+            1L,
+            &number,
+            &owned,
+            next,
+            texts,
+            2U,
+            NULL,
+            room,
+            sizeof(room)
+        );
+        assert(read_file("/tmp/chaos-common-test/hits.1", contents, sizeof(contents)) > 0L);
+        assert(strcmp(contents, "7\t/a:open:EIO:1.0\n0\t/b:open:EIO:1.0\n") == 0);
+        (void)unlink("/tmp/chaos-common-test/hits.1");
+
+        /* Negative: a header that does not fit the scratch writes nothing at all -- a
+         * truncated header would be a line a reader cannot classify. */
+        {
+            char tiny[8];
+
+            chaos_hits_write_for(
+                "/tmp/chaos-common-test/hits",
+                1L,
+                &number,
+                &owned,
+                next,
+                texts,
+                2U,
+                "suppressed.shared=2\n",
+                tiny,
+                sizeof(tiny)
+            );
+            assert(access("/tmp/chaos-common-test/hits.1", F_OK) != 0);
+        }
     }
 }
 

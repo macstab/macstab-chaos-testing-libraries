@@ -159,6 +159,7 @@ static void chaos_init_tracee_write(chaos_init_rules_t *rules, int tracee)
         slots,
         (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) texts,
         count < rules->max_rules ? count : rules->max_rules,
+        NULL,
         rules->buffer,
         rules->max_rules * CHAOS_HITS_LINE_MAX + 1U
     );

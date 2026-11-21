@@ -19,6 +19,23 @@
  * suffix `<n>` is normally the pid (chaos_hits_file_number_for() explains when it is
  * not). A reader sums all `/tmp/.chaos-<lib>.hits.*` files to get totals over processes.
  *
+ * @par Header lines
+ * A library may put `key=value` lines in front of the rule lines (the @p header argument of
+ * chaos_hits_write_for()), for counts that belong to no single rule -- libchaos-net reports
+ * the RESET suppressions of NETWORK.md that way:
+ *
+ * @code
+ * suppressed.shared=3
+ * suppressed.unknown=0
+ * 12<TAB>tcp4://127.0.0.1:5432:close:RESET # pg
+ * @endcode
+ *
+ * A header line carries **no tab**, which is what makes it additive: a reader that splits on
+ * the first tab and skips what has none ignores lines it does not know. A second *column* in
+ * a rule line would not be additive -- such a reader takes the first number and the rest of
+ * the line as the rule text, so counts land under a rule that does not exist, silently. New
+ * reports therefore go into header lines, never into a column.
+ *
  * @par Slot pool and reload
  * The counters live in a pool of slots each library keeps beside its two rule snapshots.
  * chaos_hits_assign() gives a rule that survives a reload (same text) the very same
@@ -459,7 +476,10 @@ static inline long chaos_hits_file_number(const char *prefix)
  * @param slots        Counters, @p count entries; a NULL entry is written as 0.
  * @param texts        Rule texts, @p count entries of CHAOS_STATUS_TEXT_MAX + 1 bytes.
  * @param count        Number of rules.
- * @param buffer       Scratch of at least @p count * CHAOS_HITS_LINE_MAX + 1 bytes.
+ * @param header       `key=value` lines (each ending in a newline, no tab) written before the
+ *                     rule lines; NULL or empty for none.
+ * @param buffer       Scratch of at least @p count * CHAOS_HITS_LINE_MAX + 1 bytes, plus the
+ *                     length of @p header.
  * @param buffer_size  Size of @p buffer in bytes.
  */
 static inline void chaos_hits_write_for(
@@ -470,6 +490,7 @@ static inline void chaos_hits_write_for(
     chaos_hit_slot_t *const *slots,
     const char (*texts)[CHAOS_STATUS_TEXT_MAX + 1U],
     size_t count,
+    const char *header,
     char *buffer,
     size_t buffer_size
 )
@@ -479,6 +500,15 @@ static inline void chaos_hits_write_for(
     size_t index;
     unsigned attempt;
 
+    if (header != NULL)
+    {
+        length = strlen(header);
+        if (length >= buffer_size)
+        {
+            return;
+        }
+        memcpy(buffer, header, length);
+    }
     for (index = 0U; index < count; ++index)
     {
         const unsigned long long hits = slots[index] != NULL ? slots[index]->count : 0U;
