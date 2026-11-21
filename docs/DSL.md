@@ -490,7 +490,7 @@ any `# owner` comment:
 | `@first=N` | Fire at most N times per process (N ≥ 1), then go inert: start-up faults that clear by themselves. |
 | `@from=T` | Active only once the wall clock reaches T (Unix milliseconds). |
 | `@until=T` | Active only while the wall clock is before T. With `@from`, the window is `[from, until)`; `@until` must be later than `@from`. One rule file can hold a whole incident timeline. |
-| `@size>N` / `@size<N` | Only calls moving more / fewer than N bytes. Both may be combined. A call without a byte count never matches a size-gated rule. |
+| `@size>N` / `@size<N` | Only calls whose byte count is above / below N. Both may be combined. For the calls that move data this is the number of bytes moved; for `truncate` it is the file's new length and for `allocate` the length of the range, since neither moves bytes. A call without a byte count never matches a size-gated rule. |
 
 ```text
 tcp4://127.0.0.1:5432:connect:ECONNREFUSED:1.0 @first=3 # net

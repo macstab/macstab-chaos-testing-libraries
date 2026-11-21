@@ -691,6 +691,12 @@ wrapper.
 - `@size` for `readv`/`writev`/`preadv`/`pwritev` is the sum of `iov_len`, computed
   in chunks of 64; an unreadable or oversized array has no size (size-gated rules do
   not match).
+- `@size` for `truncate` is the file's new length and for `allocate` the length of the
+  range: neither moves bytes, so the gate reads the length the call names. A negative
+  length is no byte count — the kernel rejects such a call with `EINVAL` — so those calls
+  report no size and a size-gated rule does not match them.
+- `open`, `close`, `fsync`, `fdatasync`, `rename` and `unlink` report no byte count, so a
+  size-gated rule on them is rejected when the file loads ([DSL.md §7.1](DSL.md#71-todays-surface)).
 - TORN on `writev`/`pwritev` applies only to arrays of at most 64 entries
   (`CHAOS_IO_TORN_MAX_IOV`); the shortened array is built on the stack from the
   checked copy. A longer or unreadable array is written whole and counts no hit.

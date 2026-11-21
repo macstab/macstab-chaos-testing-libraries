@@ -18,8 +18,12 @@
  * | `@first=N` | At most N hits per process (N >= 1), then inert: a self-clearing start-up fault. |
  * | `@from=T` | Active only when the wall clock, in Unix ms, is >= T. |
  * | `@until=T` | Active only when the wall clock, in Unix ms, is < T. |
- * | `@size>N` | Applies only to calls that move more than N bytes. |
- * | `@size<N` | Applies only to calls that move fewer than N bytes. |
+ * | `@size>N` | Applies only to calls whose byte count is above N. |
+ * | `@size<N` | Applies only to calls whose byte count is below N. |
+ *
+ * The byte count is what the call moves, except where nothing is moved: for `truncate` it
+ * is the file's new length and for `allocate` the length of the range. A library names per
+ * operation which of its calls report one at all.
  *
  * Why wall-clock windows: one rule file can hold a whole incident timeline and every
  * process agrees on it, which a time relative to each process's own load would not give.
