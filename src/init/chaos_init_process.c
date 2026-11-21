@@ -24,9 +24,9 @@
  * @par FAIL_AFTER counters
  * The core counts calls per operation in one global array, as each preloaded process has
  * its own. Here every process gets its own array, swapped in around each decision. The
- * counters restart from 0 after a reload. A forked child starts with the counts its
- * parent had at the fork, as the library's child inherits them with its memory; a new
- * image (execve) starts from 0.
+ * counters restart from 0 after a reload, and so do a forked child's and a new image's
+ * (execve): the wrappers clear them in their atfork child handler, so that a child never
+ * inherits an exhausted FAIL_AFTER budget, and both modes behave alike.
  *
  * @par Application start
  * The child's execve() of the entrypoint is never faulted (chaos_init_process_start()).
@@ -78,13 +78,6 @@ static uint64_t g_chaos_init_process_counters_load[CHAOS_INIT_MAX_TRACEES];
 /* The process (chaos_init_tracee_serial()) an entry's counters belong to; a mismatch
  * means the entry was reused by another process. */
 static uint64_t g_chaos_init_process_counters_owner[CHAOS_INIT_MAX_TRACEES];
-/* Snapshot of the counters at a process's latest fork, with its load and owner serial,
- * until a child takes it over (owner 0 = taken). One snapshot per parent: if the parent
- * forks again before the first child makes a process call, whichever child comes first
- * takes the newer snapshot and the other starts from 0. */
-static uint64_t g_chaos_init_process_forked[CHAOS_INIT_MAX_TRACEES][CHAOS_PROCESS_OP_COUNT];
-static uint64_t g_chaos_init_process_forked_load[CHAOS_INIT_MAX_TRACEES];
-static uint64_t g_chaos_init_process_forked_owner[CHAOS_INIT_MAX_TRACEES];
 
 /** @brief The child chaos-init forked, while it still runs chaos-init's image; 0 after. */
 static pid_t g_chaos_init_process_application = 0;
@@ -207,12 +200,10 @@ static int chaos_init_process_slot(const chaos_init_call_t *call, chaos_process_
  * @brief Makes the FAIL_AFTER counters of entry @p tracee belong to its current process
  *        and rule load @p load.
  *
- * @details No-op when owner and load already match. Otherwise the counters reset to 0;
- * a process new to the entry instead inherits its parent's fork snapshot when the parent
- * (`/proc/<pid>/status` PPid, so not after reparenting) has an entry, still owns the
- * snapshot, and forked under the same load. The snapshot is consumed: one fork, one heir.
- * Every process call passes here before it is decided, so a child takes its inheritance
- * before an execve() of its own could give it a new identity (which starts from 0).
+ * @details No-op when owner and load already match; otherwise the counters reset to 0.
+ * A forked child is a process of its own here and therefore starts from 0, which is what
+ * the wrappers do: their atfork child handler clears the counters so a child never
+ * inherits an exhausted FAIL_AFTER budget (chaos_process_hooks.c).
  */
 static void chaos_init_process_counters_of(int tracee, uint64_t load)
 {
@@ -224,23 +215,6 @@ static void chaos_init_process_counters_of(int tracee, uint64_t load)
         return;
     }
     memset(g_chaos_init_process_counters[tracee], 0, sizeof(g_chaos_init_process_counters[0]));
-    if (g_chaos_init_process_counters_owner[tracee] != serial)
-    {
-        const int parent =
-            chaos_init_tracee_find(chaos_init_parent_of(chaos_init_tracee_tgid(tracee)));
-
-        if (parent >= 0 &&
-            g_chaos_init_process_forked_owner[parent] == chaos_init_tracee_serial(parent) &&
-            g_chaos_init_process_forked_load[parent] == load)
-        {
-            memcpy(
-                g_chaos_init_process_counters[tracee],
-                g_chaos_init_process_forked[parent],
-                sizeof(g_chaos_init_process_counters[0])
-            );
-            g_chaos_init_process_forked_owner[parent] = 0U;
-        }
-    }
     g_chaos_init_process_counters_owner[tracee] = serial;
     g_chaos_init_process_counters_load[tracee] = load;
 }
@@ -331,18 +305,6 @@ int chaos_init_process_decide(const chaos_init_call_t *call, chaos_init_verdict_
     {
         verdict->action = verdict->action == CHAOS_INIT_DELAY ? CHAOS_INIT_DELAY : CHAOS_INIT_FAIL;
         verdict->error = error;
-    }
-    /* A fork that goes ahead (no error decided, delayed or not): snapshot the counters as
-     * they stand after this decision, for the child to inherit. */
-    if (operation == CHAOS_PROCESS_OP_FORK && tracee >= 0 && error == 0)
-    {
-        memcpy(
-            g_chaos_init_process_forked[tracee],
-            g_chaos_init_process_counters[tracee],
-            sizeof(g_chaos_init_process_forked[0])
-        );
-        g_chaos_init_process_forked_load[tracee] = load;
-        g_chaos_init_process_forked_owner[tracee] = chaos_init_tracee_serial(tracee);
     }
     return 1;
 }

@@ -27,10 +27,9 @@
  * - the application's first execve, and retries of it from chaos-init's own image, are
  *   never faulted; once the image changes, execve is faulted;
  * - LATENCY gives DELAY, ERRNO gives FAIL, both on one call give DELAY carrying the errno;
- * - FAIL_AFTER counts per process and restarts from 0 after a reload; a fork child
- *   inherits its parent's counts at the fork, and only the first child takes them; a
- *   new process on a reused entry starts from 0, as does the child of a fork made under
- *   an earlier rule load;
+ * - FAIL_AFTER counts per process and restarts from 0 after a reload; a fork child starts
+ *   from 0 whether or not its fork was decided, as the wrappers' atfork child handler
+ *   clears the counters; a new process on a reused entry starts from 0 as well;
  * - probability 0, or a caller that cannot be resolved, yields neither delay nor errno;
  * - a posix_spawnp rule rejects the whole rule file in SECCOMP mode (status file names
  *   the line), because the PATH search happens in libc and is invisible here.
@@ -183,53 +182,36 @@ int main(void)
     assert(decide(__NR_wait4, 0U).action == CHAOS_INIT_PASS);
     assert(fails(decide(__NR_wait4, 0U), EINTR));
 
-    /* A fork child starts with its parent's counts at the fork, as an LD_PRELOAD child
-     * inherits them with its memory. One decided fork has one child: `forked` takes the
-     * counts (first wait fails), `later` was never decided as a fork and starts at 0. */
+    /* A forked child starts from 0, whether or not chaos-init decided its fork. The
+     * wrappers clear the counters in their atfork child handler, so a child never inherits
+     * an exhausted FAIL_AFTER budget; both modes agree (chaos_process_hooks.c). */
     {
-        pid_t forked;
-        pid_t later;
+        pid_t decided;
+        pid_t undecided;
 
         assert(fails(decide(__NR_wait4, 0U), EINTR)); /* the parent's count is past 1 */
         assert(decide(__NR_clone, SIGCHLD).action == CHAOS_INIT_PASS);
-        forked = fork();
-        if (forked == 0)
+        decided = fork();
+        if (decided == 0)
         {
             pause();
             _exit(0);
         }
-        later = fork();
-        if (later == 0)
+        undecided = fork();
+        if (undecided == 0)
         {
             pause();
             _exit(0);
         }
-        assert(forked > 0 && later > 0);
-        assert(fails(decide_for(forked, __NR_wait4, 0U), EINTR));
-        assert(decide_for(later, __NR_wait4, 0U).action == CHAOS_INIT_PASS);
-        assert(kill(forked, SIGKILL) == 0 && waitpid(forked, NULL, 0) == forked);
-        assert(kill(later, SIGKILL) == 0 && waitpid(later, NULL, 0) == later);
-    }
-
-    /* Counts of a fork decided under an earlier load are not handed on: after the
-     * reload the child starts from 0, as its parent does. */
-    {
-        pid_t forked;
-
-        assert(fails(decide(__NR_wait4, 0U), EINTR)); /* the parent's count is past 1 */
-        assert(decide(__NR_clone, SIGCHLD).action == CHAOS_INIT_PASS);
-        write_rules("waitpid:FAIL_AFTER:EINTR,1 # reloaded again\n");
-        forked = fork();
-        if (forked == 0)
-        {
-            pause();
-            _exit(0);
-        }
-        assert(forked > 0);
-        assert(decide_for(forked, __NR_wait4, 0U).action == CHAOS_INIT_PASS);
-        assert(fails(decide_for(forked, __NR_wait4, 0U), EINTR));
-        assert(kill(forked, SIGKILL) == 0 && waitpid(forked, NULL, 0) == forked);
-        (void)snprintf(hits, sizeof(hits), "/tmp/.chaos-process.hits.%ld", (long)forked);
+        assert(decided > 0 && undecided > 0);
+        assert(decide_for(decided, __NR_wait4, 0U).action == CHAOS_INIT_PASS);
+        assert(fails(decide_for(decided, __NR_wait4, 0U), EINTR));
+        assert(decide_for(undecided, __NR_wait4, 0U).action == CHAOS_INIT_PASS);
+        assert(kill(decided, SIGKILL) == 0 && waitpid(decided, NULL, 0) == decided);
+        assert(kill(undecided, SIGKILL) == 0 && waitpid(undecided, NULL, 0) == undecided);
+        (void)snprintf(hits, sizeof(hits), "/tmp/.chaos-process.hits.%ld", (long)decided);
+        (void)unlink(hits);
+        (void)snprintf(hits, sizeof(hits), "/tmp/.chaos-process.hits.%ld", (long)undecided);
         (void)unlink(hits);
     }
 
