@@ -212,7 +212,73 @@ typedef struct chaos_net_rule
     chaos_hit_slot_t *hit;
     /** Generation of @c hit when the rule was published; a later one means the rule left. */
     uint64_t hit_generation;
+    /**
+     * Draw key of the rule: `mix(process seed ^ hash(rule text))`, set when the snapshot is
+     * published. From the text, not the slot index: chaos_hits_assign() hands slots out
+     * again and another rule would inherit the key. See chaos_net_rule_draw().
+     */
+    uint64_t key;
+    /**
+     * Base of this call's draws, set by chaos_net_rule_should_trigger() from the key and
+     * the rule's evaluation number; the effects derive their samples from it. Belongs to
+     * the one call this copy was made for, not to the rule as parsed.
+     */
+    uint64_t draw_base;
 } chaos_net_rule_t;
+
+/**
+ * @brief Starts this call's draws: records the rule's evaluation number and derives the
+ *        base every sample of this call comes from.
+ *
+ * @details Two stages, not one. The first turns (rule, evaluation) into a base, the second
+ * turns (base, draw number) into a sample, so a rule that takes three draws cannot collide
+ * with its own next evaluation -- which is what a single `key + n * K + d` does as soon as
+ * `d` reaches K, a constant the next effect added would break silently.
+ *
+ * The evaluation number lives in the hit slot, so it survives a reload that keeps the rule
+ * and restarts in a forked child, whose lineage differs anyway.
+ *
+ * @param rule Rule copy for this call; NULL is a no-op. A rule outside a snapshot (unit
+ *             tests) has no slot and is evaluation 0 every time.
+ */
+static inline void chaos_net_rule_draw_begin(chaos_net_rule_t *rule)
+{
+    uint64_t evaluation = 0U;
+
+    if (rule == NULL)
+    {
+        return;
+    }
+    if (rule->hit != NULL)
+    {
+        evaluation = __sync_fetch_and_add(&rule->hit->evaluations, UINT64_C(1));
+    }
+    rule->draw_base = chaos_net_prng_mix((rule->key ^ g_chaos_net_lineage) + evaluation);
+}
+
+/**
+ * @brief Sample @p draw of this call, uniform in [0, 2^32).
+ *
+ * @param rule Rule copy whose chaos_net_rule_draw_begin() ran.
+ * @param draw Which draw of this call: 0 is the probability, the effects follow.
+ * @return The sample.
+ */
+static inline uint32_t chaos_net_rule_draw(const chaos_net_rule_t *rule, uint64_t draw)
+{
+    return (uint32_t)(chaos_net_prng_mix(rule->draw_base + draw) >> 32);
+}
+
+/** @brief Draw number of the probability decision; effects number their draws after it. */
+#define CHAOS_NET_DRAW_PROBABILITY UINT64_C(0)
+
+/** @brief Draw number of CORRUPT's byte index. */
+#define CHAOS_NET_DRAW_FIRST_EFFECT UINT64_C(1)
+
+/** @brief Draw number of CORRUPT's bit index. */
+#define CHAOS_NET_DRAW_SECOND_EFFECT UINT64_C(2)
+
+/** @brief Draw number selecting one message of a `recvmmsg` batch to corrupt. */
+#define CHAOS_NET_DRAW_MESSAGE UINT64_C(3)
 
 /**
  * @brief Resets the rule subsystem to "nothing loaded yet".

@@ -365,14 +365,16 @@ extern chaos_net_epoll_pwait_fn g_chaos_net_real_epoll_pwait;
 extern __thread int g_chaos_net_tls_guard;
 
 /**
- * @brief Per-thread xorshift64* state; 0 means not yet seeded.
+ * @brief Lineage of this process: 0 in the one that loaded the library, mixed forward in
+ *        every forked child (the atfork handler).
  *
- * @details The first draw on a thread seeds it from the process seed, the thread id and a
- * stack address (chaos_net_prng_ensure_seeded()). Per-thread state needs no lock and
- * gives every thread its own stream. A fork() child zeroes it in its atfork handler so
- * pre-fork workers do not all draw the parent's sequence.
+ * @details XORed into a rule's draw key, so the children of a pre-forking server decide
+ * differently from the parent and from each other without the key itself being rewritten
+ * -- rewriting it would write every snapshot page in each child, the copy-on-write cost
+ * chaos_hits.h goes out of its way to avoid. Deterministic: a child's lineage follows
+ * from how many times this process has forked, which the test controls.
  */
-extern __thread uint64_t g_chaos_net_tls_prng_state;
+extern uint64_t g_chaos_net_lineage;
 
 /**
  * @brief Process-wide seed, the base of every per-thread seed.
@@ -477,33 +479,18 @@ chaos_net_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint64_t d
  * Thread id
  *---------------------------------------------------------------------------*/
 
-/**
- * @brief Kernel thread id of the caller, used only to seed the per-thread PRNG.
- *
- * @details Linux: the raw SYS_gettid system call (glibc exports gettid() only since 2.30,
- * and a raw call cannot be interposed). Elsewhere getpid(), so threads differ only by the
- * stack address mixed into their seed.
- *
- * @return The caller's thread id (Linux) or process id.
- */
-static inline uint64_t chaos_net_current_tid(void)
-{
-#ifdef __linux__
-    return (uint64_t)syscall(SYS_gettid);
-#else
-    return (uint64_t)getpid();
-#endif
-}
-
 /*---------------------------------------------------------------------------
- * PRNG: xorshift64*, seeded through the splitmix64 finaliser
+ * Draws: counter-based, no stream
  *---------------------------------------------------------------------------*/
 
 /**
  * @brief splitmix64 finaliser: maps a 64-bit word to a well-mixed one.
  *
- * @details Seed inputs (process seed, tid, stack address) differ in few bits; this
- * spreads every input bit over the whole output before it becomes xorshift state.
+ * @details This is the whole generator. There is no state to advance: a sample is a pure
+ * function of the rule and the number of the evaluation it belongs to, so no other thread
+ * can shift it and the decision for the nth evaluation of a rule is the same in every run
+ * with the same CHAOS_SEED. Not cryptographic, and it need not be: what is wanted is that
+ * neighbouring counters give unrelated samples, which is splitmix64's avalanche property.
  *
  * @param value Input word.
  * @return Mixed word.
@@ -517,68 +504,29 @@ static inline uint64_t chaos_net_prng_mix(uint64_t value)
 }
 
 /**
- * @brief Seeds the calling thread's PRNG on its first draw.
+ * @brief Hash of a rule's text, for its draw key.
  *
- * @details Called before every draw by chaos_net_prng_next_u32(); a no-op once seeded.
- * The seed mixes:
- *   1. g_chaos_net_process_seed -- differs between processes.
- *   2. chaos_net_current_tid()  -- differs between threads of a process.
- *   3. The address of a local  -- differs with stack placement (ASLR, per-thread stacks).
- * The result is forced odd, so it is never 0, the one state xorshift64* cannot leave.
+ * @details splitmix64 over the bytes. From the text rather than the slot index, because
+ * chaos_hits_assign() hands a slot out again when a rule leaves the file and the next rule
+ * in that slot would inherit its decisions. Two rules with the same text are one rule.
  *
- * @par Thread-safety: thread-local state only; async-signal-safe.
+ * @param text Rule as written; NULL hashes as the empty string.
+ * @return A well-mixed 64-bit hash.
  */
-static inline void chaos_net_prng_ensure_seeded(void)
+static inline uint64_t chaos_net_rule_hash(const char *text)
 {
-    uint64_t seed;
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    size_t index;
 
-    if (g_chaos_net_tls_prng_state != 0U)
+    if (text == NULL)
     {
-        return;
+        return chaos_net_prng_mix(hash);
     }
-
-    seed = g_chaos_net_process_seed;
-    seed ^= chaos_net_current_tid();
-    seed ^= (uint64_t)(uintptr_t)&seed;
-    /* Odd: never 0, the one state xorshift64* cannot leave. */
-    g_chaos_net_tls_prng_state = chaos_net_prng_mix(seed) | 1U;
-}
-
-/**
- * @brief Seeds the calling thread's PRNG with @p seed.
- *
- * @details @p seed passes through chaos_net_prng_mix(); 0 is replaced by 1 first. Called
- * by chaos_net_init() for the thread that runs the constructor.
- *
- * @param seed Seed value.
- * @par Thread-safety: thread-local state only; async-signal-safe.
- */
-static inline void chaos_net_prng_seed_thread(uint64_t seed)
-{
-    g_chaos_net_tls_prng_state = chaos_net_prng_mix(seed == 0U ? UINT64_C(1) : seed);
-}
-
-/**
- * @brief Advances the calling thread's xorshift64* generator and returns 32 bits.
- *
- * @details Marsaglia's xorshift64 step (shifts 12, 25, 27), then the xorshift64*
- * multiplier 0x2545F4914F6CDD1D; the high 32 bits of the product are returned because
- * the low bits of xorshift64* are the weakest. No lock, no allocation, no system call.
- *
- * @return A pseudo-random 32-bit value from the calling thread's stream.
- * @par Thread-safety: thread-local state only; async-signal-safe.
- */
-static inline uint32_t chaos_net_prng_next_u32(void)
-{
-    uint64_t state;
-
-    chaos_net_prng_ensure_seeded();
-    state = g_chaos_net_tls_prng_state;
-    state ^= state >> 12;
-    state ^= state << 25;
-    state ^= state >> 27;
-    g_chaos_net_tls_prng_state = state;
-    return (uint32_t)((state * UINT64_C(0x2545f4914f6cdd1d)) >> 32);
+    for (index = 0U; text[index] != '\0'; ++index)
+    {
+        hash = chaos_net_prng_mix(hash + (uint64_t)(unsigned char)text[index]);
+    }
+    return hash;
 }
 
 #endif

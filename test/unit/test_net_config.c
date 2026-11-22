@@ -1084,9 +1084,11 @@ static void test_fork_takes_over_orphaned_reload(void)
     g_chaos_net_cached_mtime = CHAOS_NET_MTIME_RELOADING;
     (void)chaos_net_config_prepare();
     assert(g_chaos_net_cached_mtime == CHAOS_NET_MTIME_RELOADING);
-    g_chaos_net_tls_prng_state = UINT64_C(42);
+    /* The child's lineage must differ from its parent's, or every backend of a
+     * pre-forking server would make the same decisions. */
+    g_chaos_net_lineage = 0U;
     chaos_net_config_after_fork();
-    assert(g_chaos_net_tls_prng_state == 0U);
+    assert(g_chaos_net_lineage != 0U);
     assert(g_chaos_net_cached_mtime == CHAOS_NET_MTIME_UNKNOWN);
     assert(g_chaos_net_hits_pid == (uint64_t)getpid());
     assert(chaos_net_config_prepare());
@@ -1562,6 +1564,65 @@ static void test_hits_are_counted_and_reported(void)
 
     (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_NET_HITS_PREFIX, g_chaos_net_hits_file);
     (void)unlink(path);
+    (void)unlink(CHAOS_NET_CONFIG_PATH);
+}
+
+/**
+ * @brief Proves a rule's draw key follows its text, not its place in the file.
+ *
+ * @details The key is what makes a fault reproducible, so it has to belong to the rule and
+ * not to the slot it occupies: chaos_hits_assign() hands a slot out again when a rule
+ * leaves the file, and a key from the slot index would make the next rule in that slot
+ * inherit the old one's decisions. Asserted by reloading the same two rules in the other
+ * order -- each text keeps its key -- and by adding one in front, which shifts every index
+ * and must leave the keys alone.
+ */
+static void test_draw_key_follows_the_rule_text(void)
+{
+    uint64_t first_key;
+    uint64_t second_key;
+    const chaos_net_config_state_t *state;
+
+    chaos_net_config_init();
+    write_config_text(
+        "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0\n"
+        "tcp4://127.0.0.1:9011:connect:ECONNREFUSED:1.0\n",
+        81
+    );
+    assert(chaos_net_config_prepare() == 1);
+    state = chaos_net_config_active_state();
+    assert(state->rule_count == 2U);
+    assert(strcmp(state->text[0], "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0") == 0);
+    first_key = state->rules[0].key;
+    second_key = state->rules[1].key;
+    assert(first_key != second_key);
+
+    write_config_text(
+        "tcp4://127.0.0.1:9011:connect:ECONNREFUSED:1.0\n"
+        "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0\n",
+        82
+    );
+    g_chaos_net_cached_mtime = CHAOS_NET_MTIME_UNKNOWN;
+    assert(chaos_net_config_prepare() == 1);
+    state = chaos_net_config_active_state();
+    assert(state->rule_count == 2U);
+    assert(state->rules[0].key == second_key);
+    assert(state->rules[1].key == first_key);
+
+    write_config_text(
+        "tcp4://127.0.0.1:9012:connect:ECONNREFUSED:1.0\n"
+        "tcp4://127.0.0.1:9011:connect:ECONNREFUSED:1.0\n"
+        "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0\n",
+        83
+    );
+    g_chaos_net_cached_mtime = CHAOS_NET_MTIME_UNKNOWN;
+    assert(chaos_net_config_prepare() == 1);
+    state = chaos_net_config_active_state();
+    assert(state->rule_count == 3U);
+    assert(state->rules[1].key == second_key);
+    assert(state->rules[2].key == first_key);
+    assert(state->rules[0].key != first_key && state->rules[0].key != second_key);
+
     (void)unlink(CHAOS_NET_CONFIG_PATH);
 }
 
@@ -2239,6 +2300,7 @@ int main(void)
     test_parse_buffer_reports_rejected_line();
     test_prepare_reports_status();
     test_hits_are_counted_and_reported();
+    test_draw_key_follows_the_rule_text();
     test_reset_suppressions_are_reported();
     test_forked_child_reports_own_hits();
     test_first_budget_is_per_process();

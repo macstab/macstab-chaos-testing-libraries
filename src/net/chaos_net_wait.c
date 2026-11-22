@@ -341,10 +341,7 @@ static int chaos_net_wait_match_epoll(int epfd, chaos_net_rule_t *rule)
  *         real one.
  */
 static int chaos_net_wait_pre_call_masked(
-    const chaos_net_rule_t *rule,
-    int64_t timeout_ms,
-    const sigset_t *sigmask,
-    int *synthetic_timeout
+    chaos_net_rule_t *rule, int64_t timeout_ms, const sigset_t *sigmask, int *synthetic_timeout
 )
 {
     if (synthetic_timeout != NULL)
@@ -389,7 +386,7 @@ static int chaos_net_wait_pre_call_masked(
  *        select, epoll_wait).
  */
 static int
-chaos_net_wait_pre_call(const chaos_net_rule_t *rule, int64_t timeout_ms, int *synthetic_timeout)
+chaos_net_wait_pre_call(chaos_net_rule_t *rule, int64_t timeout_ms, int *synthetic_timeout)
 {
     return chaos_net_wait_pre_call_masked(rule, timeout_ms, NULL, synthetic_timeout);
 }

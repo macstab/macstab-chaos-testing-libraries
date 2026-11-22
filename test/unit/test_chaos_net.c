@@ -422,7 +422,7 @@ int chaos_net_endpoint_from_end_fd(
 }
 
 /** @brief LATENCY stub: counts calls and records the rule's `call_size`; never sleeps. */
-void chaos_net_rule_apply_latency(const chaos_net_rule_t *rule)
+void chaos_net_rule_apply_latency(chaos_net_rule_t *rule)
 {
     assert(rule != NULL);
     ++g_latency_calls;
@@ -431,7 +431,7 @@ void chaos_net_rule_apply_latency(const chaos_net_rule_t *rule)
 
 /** @brief ERRNO stub: fires an ERRNO rule while `g_errno_trigger` is set, mirroring the real
  *   effect check. */
-int chaos_net_rule_apply_errno(const chaos_net_rule_t *rule)
+int chaos_net_rule_apply_errno(chaos_net_rule_t *rule)
 {
     if (rule == NULL || rule->effect != CHAOS_NET_EFFECT_ERRNO || g_errno_trigger == 0)
     {
@@ -446,10 +446,12 @@ int chaos_net_rule_apply_errno(const chaos_net_rule_t *rule)
 static int g_should_trigger_calls = 0;
 
 /** @brief Should-trigger stub: returns `g_should_trigger` for every rule. */
-int chaos_net_rule_should_trigger(const chaos_net_rule_t *rule)
+int chaos_net_rule_should_trigger(chaos_net_rule_t *rule)
 {
     ++g_should_trigger_calls;
-    (void)rule;
+    /* The real one starts this call's draws here, so a wrapper that asks an effect for a
+     * sample without a trigger is visible in the stubbed build too. */
+    chaos_net_rule_draw_begin(rule);
     return g_should_trigger;
 }
 
@@ -470,8 +472,9 @@ void chaos_net_corrupt_buffer_sample(
 }
 
 /** @brief CORRUPT stub without samples: always flips bit 0 of byte 0, a predictable target. */
-void chaos_net_corrupt_buffer(void *buffer, size_t size)
+void chaos_net_corrupt_buffer(const chaos_net_rule_t *rule, void *buffer, size_t size)
 {
+    assert(rule != NULL);
     chaos_net_corrupt_buffer_sample(buffer, size, 0U, 0U);
 }
 
@@ -2063,16 +2066,25 @@ static void test_direct_helper_paths(void)
     second[1] = 'b';
     second[2] = 'c';
     second[3] = 'd';
-    chaos_net_corrupt_iovecs(NULL, 0, 0U);
+    /* The effects draw from this rule; a zeroed one has no slot, so it is evaluation 0. */
+    (void)memset(&rule, 0, sizeof(rule));
+    chaos_net_corrupt_iovecs(&rule, NULL, 0, 0U);
     recv_iov[0].iov_base = first;
     recv_iov[0].iov_len = 1U;
     recv_iov[1].iov_base = second;
     recv_iov[1].iov_len = sizeof(second);
-    for (g_chaos_net_tls_prng_state = 1U; chaos_net_prng_next_u32() % 3U == 0U;
-         ++g_chaos_net_tls_prng_state)
+    /* A key whose byte draw does not land in the first 1-byte segment, so the walk has to
+     * step into the second one; the bound keeps the search finite. */
+    for (rule.key = 1U; rule.key < 256U; ++rule.key)
     {
+        chaos_net_rule_draw_begin(&rule);
+        if (chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_FIRST_EFFECT) % 3U != 0U)
+        {
+            break;
+        }
     }
-    chaos_net_corrupt_iovecs(recv_iov, 2, 3U);
+    assert(rule.key < 256U);
+    chaos_net_corrupt_iovecs(&rule, recv_iov, 2, 3U);
     assert(g_corrupt_calls >= 1);
 
     reset_wrapper_stubs();
@@ -2117,7 +2129,7 @@ static void test_direct_linux_helper_paths(void)
     struct iovec recv_iov[2];
     char first[1] = {0};
     char second[4] = {'a', 'b', 'c', 'd'};
-    struct mmsghdr recv_messages[1];
+    struct mmsghdr recv_messages[2];
     struct epoll_event events[1];
     struct epoll_event event;
     chaos_net_rule_t rule;
@@ -2138,9 +2150,59 @@ static void test_direct_linux_helper_paths(void)
     recv_messages[0].msg_hdr.msg_iov = recv_iov;
     recv_messages[0].msg_hdr.msg_iovlen = 2;
     recv_messages[0].msg_len = 4U;
-    chaos_net_corrupt_mmsghdrs(NULL, 0U);
-    chaos_net_corrupt_mmsghdrs(recv_messages, 1U);
+    /* The effects draw from this rule; a zeroed one has no slot, so it is evaluation 0. */
+    (void)memset(&rule, 0, sizeof(rule));
+    chaos_net_corrupt_mmsghdrs(&rule, NULL, 0U);
+    chaos_net_corrupt_mmsghdrs(&rule, recv_messages, 1U);
     assert(g_corrupt_calls == 1);
+
+    /* Which message of a batch is corrupted comes from its own draw, not from the one the
+     * byte index uses: a rule whose two draws pick different messages must corrupt the one
+     * the message draw names. The search makes the assertion discriminating. */
+    {
+        unsigned char batch_first[4] = {0U, 0U, 0U, 0U};
+        unsigned char batch_second[4] = {0U, 0U, 0U, 0U};
+        struct iovec batch_iov[2];
+
+        batch_iov[0].iov_base = batch_first;
+        batch_iov[0].iov_len = sizeof(batch_first);
+        batch_iov[1].iov_base = batch_second;
+        batch_iov[1].iov_len = sizeof(batch_second);
+        (void)memset(recv_messages, 0, sizeof(recv_messages));
+        recv_messages[0].msg_hdr.msg_iov = &batch_iov[0];
+        recv_messages[0].msg_hdr.msg_iovlen = 1;
+        recv_messages[0].msg_len = (unsigned int)sizeof(batch_first);
+        recv_messages[1].msg_hdr.msg_iov = &batch_iov[1];
+        recv_messages[1].msg_hdr.msg_iovlen = 1;
+        recv_messages[1].msg_len = (unsigned int)sizeof(batch_second);
+
+        for (rule.key = 1U; rule.key < 256U; ++rule.key)
+        {
+            chaos_net_rule_draw_begin(&rule);
+            if (chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_MESSAGE) % 2U !=
+                chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_FIRST_EFFECT) % 2U)
+            {
+                break;
+            }
+        }
+        assert(rule.key < 256U);
+        chaos_net_rule_draw_begin(&rule);
+        {
+            const unsigned int expected = chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_MESSAGE) % 2U;
+            const unsigned char *corrupted = expected == 0U ? batch_first : batch_second;
+            const unsigned char *untouched = expected == 0U ? batch_second : batch_first;
+
+            g_corrupt_calls = 0;
+            chaos_net_corrupt_mmsghdrs(&rule, recv_messages, 2U);
+            assert(g_corrupt_calls == 1);
+            assert(
+                corrupted[0] != 0U || corrupted[1] != 0U || corrupted[2] != 0U || corrupted[3] != 0U
+            );
+            assert(
+                untouched[0] == 0U && untouched[1] == 0U && untouched[2] == 0U && untouched[3] == 0U
+            );
+        }
+    }
 
     reset_wrapper_stubs();
     assert(!chaos_net_wait_match_epoll(-1, NULL));
@@ -3856,27 +3918,29 @@ static void test_receive_helpers_and_vector_shapes(void)
     iov[0].iov_len = 0U;
     iov[1].iov_base = second;
     iov[1].iov_len = 4U;
-    chaos_net_corrupt_iovecs(iov, 0, 4U);
-    chaos_net_corrupt_iovecs(iov, 2, 0U);
+    (void)memset(&rule, 0, sizeof(rule));
+    chaos_net_rule_draw_begin(&rule);
+    chaos_net_corrupt_iovecs(&rule, iov, 0, 4U);
+    chaos_net_corrupt_iovecs(&rule, iov, 2, 0U);
     assert(g_corrupt_calls == 0);
-    chaos_net_corrupt_iovecs(iov, 2, 4U);
+    chaos_net_corrupt_iovecs(&rule, iov, 2, 4U);
     assert(g_corrupt_calls == 1 && g_last_corrupt_size == 4U);
     assert(memcmp(second, "data", 4U) != 0 && strcmp(first, "aaa") == 0);
 
 #ifdef __linux__
     (void)memcpy(second, "data", 4U);
     (void)memset(mmsg, 0, sizeof(mmsg));
-    chaos_net_corrupt_mmsghdrs(mmsg, 0U);
-    chaos_net_corrupt_mmsghdrs(mmsg, 1U); /* msg_len 0: skipped */
+    chaos_net_corrupt_mmsghdrs(&rule, mmsg, 0U);
+    chaos_net_corrupt_mmsghdrs(&rule, mmsg, 1U); /* msg_len 0: skipped */
     mmsg[0].msg_len = 4U;
-    chaos_net_corrupt_mmsghdrs(mmsg, 1U); /* no vector: skipped */
+    chaos_net_corrupt_mmsghdrs(&rule, mmsg, 1U); /* no vector: skipped */
     mmsg[0].msg_hdr.msg_iov = iov;
-    chaos_net_corrupt_mmsghdrs(mmsg, 1U); /* msg_iovlen 0: skipped */
+    chaos_net_corrupt_mmsghdrs(&rule, mmsg, 1U); /* msg_iovlen 0: skipped */
     mmsg[0].msg_hdr.msg_iovlen = 1U;
-    chaos_net_corrupt_mmsghdrs(mmsg, 1U); /* only an empty entry: skipped */
+    chaos_net_corrupt_mmsghdrs(&rule, mmsg, 1U); /* only an empty entry: skipped */
     assert(g_corrupt_calls == 1);
     mmsg[0].msg_hdr.msg_iovlen = 2U;
-    chaos_net_corrupt_mmsghdrs(mmsg, 1U);
+    chaos_net_corrupt_mmsghdrs(&rule, mmsg, 1U);
     assert(g_corrupt_calls == 2 && g_last_corrupt_size == 4U);
     assert(memcmp(second, "data", 4U) != 0);
 #endif

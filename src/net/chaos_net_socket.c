@@ -71,12 +71,15 @@
  * `bit_sample & 7`; the segment holding that byte is found by walking the list. The
  * vector counterpart of chaos_net_corrupt_buffer(), for recvmsg and readv.
  *
+ * @param rule    Firing rule; the byte index is its first effect draw, the bit its second.
  * @param iov     Scatter list the kernel filled; NULL is a no-op.
  * @param iovcnt  Entries in @p iov; <= 0 is a no-op.
  * @param size    Bytes received, already capped at the vector's capacity; 0 is a no-op.
- * @par Thread-safety: advances the calling thread's PRNG by two steps.
+ * @par Thread-safety: no shared state; the samples follow from the rule and the call.
  */
-static void chaos_net_corrupt_iovecs(const struct iovec *iov, int iovcnt, size_t size)
+static void chaos_net_corrupt_iovecs(
+    const chaos_net_rule_t *rule, const struct iovec *iov, int iovcnt, size_t size
+)
 {
     uint32_t index_sample;
     uint32_t bit_sample;
@@ -89,8 +92,8 @@ static void chaos_net_corrupt_iovecs(const struct iovec *iov, int iovcnt, size_t
         return;
     }
 
-    index_sample = chaos_net_prng_next_u32();
-    bit_sample = chaos_net_prng_next_u32();
+    index_sample = chaos_net_rule_draw(rule, CHAOS_NET_DRAW_FIRST_EFFECT);
+    bit_sample = chaos_net_rule_draw(rule, CHAOS_NET_DRAW_SECOND_EFFECT);
     index = (size_t)(index_sample % size);
     for (entry = 0; entry < iovcnt && remaining > 0U; ++entry)
     {
@@ -366,7 +369,7 @@ static ssize_t chaos_net_call_real_recvmsg(int sockfd, struct msghdr *message, i
  * @param rule  Matched rule copy; NULL yields 0.
  * @return 0 to make the real call (after any delay); -1 to return -1 at once, errno set.
  */
-static int chaos_net_apply_pre_call_rule(const chaos_net_rule_t *rule)
+static int chaos_net_apply_pre_call_rule(chaos_net_rule_t *rule)
 {
     if (rule == NULL)
     {
@@ -840,7 +843,7 @@ static void chaos_net_dup_store(
  *         did not fire): the caller then receives normally.
  */
 static ssize_t chaos_net_dup_replay(
-    const chaos_net_rule_t *rule,
+    chaos_net_rule_t *rule,
     int fd,
     const struct iovec *iov,
     int iovcnt,
@@ -932,7 +935,7 @@ static void chaos_net_dup_forget(int fd)
  * the whole buffer, which a shorter kept payload would not give). An empty or unknown-size
  * request is bypassed too: a replay into it would return 0, which reads as EOF.
  */
-static int chaos_net_dups(const chaos_net_rule_t *rule, int flags, uint64_t requested)
+static int chaos_net_dups(chaos_net_rule_t *rule, int flags, uint64_t requested)
 {
     return rule->effect == CHAOS_NET_EFFECT_DUP && (flags & CHAOS_NET_DUP_SKIP_FLAGS) == 0 &&
            requested != 0U && requested != CHAOS_POLICY_NO_SIZE;
@@ -1003,7 +1006,7 @@ static size_t chaos_net_received_bytes(int fd, ssize_t rc, size_t size, int flag
  * MSG_WAITALL asks for the whole count, which the kernel shortens only on a signal, an
  * error or end of stream; such a receive is left alone too.
  */
-static int chaos_net_trickles(const chaos_net_rule_t *rule, int fd, uint64_t requested, int flags)
+static int chaos_net_trickles(chaos_net_rule_t *rule, int fd, uint64_t requested, int flags)
 {
     return rule->effect == CHAOS_NET_EFFECT_TRICKLE && (flags & MSG_WAITALL) == 0 &&
            requested > rule->chunk_bytes && requested != CHAOS_POLICY_NO_SIZE &&
@@ -1244,7 +1247,7 @@ CHAOS_NET_EXPORT ssize_t recv(int sockfd, void *buffer, size_t size, int flags)
 
         if (filled > 0U && chaos_net_rule_should_trigger(&rule))
         {
-            chaos_net_corrupt_buffer(buffer, filled);
+            chaos_net_corrupt_buffer(&rule, buffer, filled);
         }
     }
     return rc;
@@ -1332,7 +1335,7 @@ CHAOS_NET_EXPORT ssize_t recvfrom(
 
         if (filled > 0U && chaos_net_rule_should_trigger(&rule))
         {
-            chaos_net_corrupt_buffer(buffer, filled);
+            chaos_net_corrupt_buffer(&rule, buffer, filled);
         }
     }
     return rc;
@@ -1441,7 +1444,7 @@ CHAOS_NET_EXPORT ssize_t recvmsg(int sockfd, struct msghdr *message, int flags)
 
         if (filled > 0U && chaos_net_rule_should_trigger(&rule))
         {
-            chaos_net_corrupt_iovecs(message->msg_iov, (int)message->msg_iovlen, filled);
+            chaos_net_corrupt_iovecs(&rule, message->msg_iov, (int)message->msg_iovlen, filled);
         }
     }
     return rc;
@@ -1742,7 +1745,7 @@ CHAOS_NET_EXPORT ssize_t read(int fd, void *buffer, size_t size)
     rc = chaos_net_call_real_read(fd, buffer, size);
     if (rc > 0 && rule.effect == CHAOS_NET_EFFECT_CORRUPT && chaos_net_rule_should_trigger(&rule))
     {
-        chaos_net_corrupt_buffer(buffer, (size_t)rc);
+        chaos_net_corrupt_buffer(&rule, buffer, (size_t)rc);
     }
     return rc;
 }
@@ -1797,7 +1800,7 @@ CHAOS_NET_EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
     rc = chaos_net_call_real_readv(fd, iov, iovcnt);
     if (rc > 0 && rule.effect == CHAOS_NET_EFFECT_CORRUPT && chaos_net_rule_should_trigger(&rule))
     {
-        chaos_net_corrupt_iovecs(iov, iovcnt, (size_t)rc);
+        chaos_net_corrupt_iovecs(&rule, iov, iovcnt, (size_t)rc);
     }
     return rc;
 }

@@ -58,6 +58,7 @@ static int chaos_init_net_supported(const struct chaos_net_rule *rule);
 #include "../net/chaos_net_config.c"
 #include "../net/chaos_net_endpoint.c"
 #include "chaos_init_proc.h"
+#include "chaos_init_core.h"
 #include "chaos_init_tracee.h"
 
 #include <poll.h>
@@ -521,7 +522,7 @@ chaos_net_getsockname_fn g_chaos_net_real_getsockname = chaos_init_net_getsockna
 chaos_net_getpeername_fn g_chaos_net_real_getpeername = chaos_init_net_getpeername;
 chaos_net_getsockopt_fn g_chaos_net_real_getsockopt = chaos_init_net_getsockopt;
 __thread int g_chaos_net_tls_guard = 0;
-__thread uint64_t g_chaos_net_tls_prng_state = 0U;
+uint64_t g_chaos_net_lineage = 0U;
 uint64_t g_chaos_net_process_seed = UINT64_C(0x9e3779b97f4a7c15);
 
 /** @brief How a system call names the socket(s) it acts on, i.e. which endpoint is matched. */
@@ -631,13 +632,9 @@ static chaos_init_rules_t g_chaos_init_net_rules = {
 
 void chaos_init_net_start(void)
 {
-    uint64_t seed;
 
     chaos_net_config_init();
-    if (getrandom(&seed, sizeof(seed), 0) == (ssize_t)sizeof(seed))
-    {
-        g_chaos_net_process_seed = seed;
-    }
+    g_chaos_net_process_seed = chaos_init_seed();
     (void)chaos_init_tracee_register(&g_chaos_init_net_rules);
 }
 

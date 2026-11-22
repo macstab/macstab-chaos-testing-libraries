@@ -46,15 +46,6 @@
 int chaos_net_probability_hit_sample(double probability, uint32_t sample);
 
 /**
- * @brief Whether @p probability fires, drawing one sample from the thread's PRNG.
- *
- * @param probability  Probability in [0.0, 1.0].
- * @return Non-zero if the event fires; 0 otherwise.
- * @par Thread-safety: advances only the calling thread's PRNG by one step.
- */
-int chaos_net_probability_hit(double probability);
-
-/**
  * @brief Flips one bit of @p buffer chosen by pre-drawn samples.
  *
  * @details Byte `index_sample % size`, bit `bit_sample & 7`. With uniform samples every
@@ -81,7 +72,7 @@ void chaos_net_corrupt_buffer_sample(
  * @param size    Bytes received; 0 is a no-op.
  * @par Thread-safety: advances only the calling thread's PRNG by two steps.
  */
-void chaos_net_corrupt_buffer(void *buffer, size_t size);
+void chaos_net_corrupt_buffer(const chaos_net_rule_t *rule, void *buffer, size_t size);
 
 /**
  * @brief Sleeps for a LATENCY rule's delay if the rule fires.
@@ -97,7 +88,7 @@ void chaos_net_corrupt_buffer(void *buffer, size_t size);
  * @par Thread-safety: blocks only the calling thread.
  * @par Blocking: latency_ms milliseconds when the rule fires.
  */
-void chaos_net_rule_apply_latency(const chaos_net_rule_t *rule);
+void chaos_net_rule_apply_latency(chaos_net_rule_t *rule);
 
 /**
  * @brief Decides whether a matched rule fires on this call, and counts the hit if so.
@@ -112,7 +103,7 @@ void chaos_net_rule_apply_latency(const chaos_net_rule_t *rule);
  * @return Non-zero if the effect is to be applied now; 0 otherwise.
  * @par Thread-safety: thread-local PRNG and atomic hit-slot updates.
  */
-int chaos_net_rule_should_trigger(const chaos_net_rule_t *rule);
+int chaos_net_rule_should_trigger(chaos_net_rule_t *rule);
 
 /**
  * @brief Applies an ERRNO rule: sets errno and returns 1 when it fires.
@@ -129,6 +120,6 @@ int chaos_net_rule_should_trigger(const chaos_net_rule_t *rule);
  * @post Returns 1: errno == rule->errnum. Returns 0: errno unchanged.
  * @par Thread-safety: errno is thread-local.
  */
-int chaos_net_rule_apply_errno(const chaos_net_rule_t *rule);
+int chaos_net_rule_apply_errno(chaos_net_rule_t *rule);
 
 #endif

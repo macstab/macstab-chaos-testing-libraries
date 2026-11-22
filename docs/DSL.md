@@ -459,8 +459,8 @@ Identity across layers: same definition, same closed interval.
 
 | Layer | State | Seeding | Quality |
 |---|---|---|---|
-| libc, counter-based (io) | None. A sample is `mix(mix((key ⊕ lineage) + n) + d)`: `key` = SplitMix64(process seed ⊕ hash(rule text)), `n` = the rule's evaluation number from its hit slot, `d` = the draw within that evaluation | Process seed: `CHAOS_SEED` (decimal, 64-bit) if set, else 8 bytes of `/dev/urandom` read with raw system calls in the constructor (fallback `0x6a09e667f3bcc909 ^ getpid()`) | SplitMix64 finaliser; every input bit affects every output bit |
-| libc, per-thread (net, dns, time, memory, process) | `__thread uint64_t g_chaos_<lib>_tls_prng_state`, xorshift64* | Process seed as above. Per thread, on its first draw: SplitMix64(process seed ⊕ kernel thread id ⊕ stack address) with the low bit forced to 1 | xorshift64* (period 2^64 − 1); sufficient for fault injection |
+| libc, counter-based (io, net) | None. A sample is `mix(mix((key ⊕ lineage) + n) + d)`: `key` = SplitMix64(process seed ⊕ hash(rule text)), `n` = the rule's evaluation number from its hit slot, `d` = the draw within that evaluation | Process seed: `CHAOS_SEED` (decimal, 64-bit) if set, else 8 bytes of `/dev/urandom` read with raw system calls in the constructor (fallback `0x6a09e667f3bcc909 ^ getpid()`) | SplitMix64 finaliser; every input bit affects every output bit |
+| libc, per-thread (dns, time, memory, process) | `__thread uint64_t g_chaos_<lib>_tls_prng_state`, xorshift64* | Process seed as above. Per thread, on its first draw: SplitMix64(process seed ⊕ kernel thread id ⊕ stack address) with the low bit forced to 1 | xorshift64* (period 2^64 − 1); sufficient for fault injection |
 | JVM | `SplittableRandom` per scenario / per session (per-thread split) | `Thread`-local split from a session seed | L'Ecuyer-class (`SplittableRandom` is well studied) |
 | Orchestration | Server-side (Toxiproxy uses Go's `math/rand`) | Toxiproxy seeds from time at process start | Sufficient for chaos |
 
@@ -504,9 +504,9 @@ range is ignored and the random source takes over: the seed decides which faults
 fire, not whether the rule file is valid, and a test is better served by rules that
 load. `-1` is **not** accepted as `2^64 − 1`.
 
-Migration: libchaos-io is counter-based; the other five still use the per-thread
-stream and `CHAOS_SEED` only fixes their process seed, which on its own does not
-make them reproducible.
+Migration: libchaos-io and libchaos-net are counter-based; dns, time, memory and
+process still use the per-thread stream, where `CHAOS_SEED` only fixes the process
+seed and on its own makes nothing reproducible.
 
 **Why `SplittableRandom` on the JVM.** Steele, Lea, Flood, "Fast splittable
 pseudorandom number generators", OOPSLA 2014. The libc side shares the desiderata

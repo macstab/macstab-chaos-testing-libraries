@@ -135,7 +135,7 @@ Out of scope, by design:
 
 | File | Responsibility |
 |------|----------------|
-| `src/net/chaos_net.c` | constructor, real-symbol table, PRNG seeding |
+| `src/net/chaos_net.c` | constructor, real-symbol table, process seed (`CHAOS_SEED`) |
 | `src/net/chaos_net_config.c` | rule file loading, parsing, reload, status and hits reporting, rule selection |
 | `src/net/chaos_net_endpoint.c` | selector parsing, `sockaddr` and descriptor to endpoint conversion, matching rank |
 | `src/net/chaos_net_actions.c` | probability decision, LATENCY sleep, bit flip, ERRNO |
@@ -306,7 +306,7 @@ title libchaos-net components
 component "Target application" as App
 component "Socket wrappers\n(socket ... close, read/write on sockets)" as Sock
 component "Wait wrappers\n(poll, select, epoll)" as Wait
-component "Runtime core\n(once-resolved symbols, TLS guard, PRNG)" as Core
+component "Runtime core\n(once-resolved symbols, TLS guard, seed)" as Core
 component "Config engine\n(rule file, two snapshots, reload, status, hits)" as Config
 component "Endpoint resolver\n(sockaddr, getsockname, getpeername, SO_TYPE)" as Resolver
 component "Effects\n(ERRNO, LATENCY, CORRUPT, TIMEOUT,\nRESET, TRICKLE, DUP)" as Effects
@@ -416,8 +416,9 @@ acts only on its own descriptor kind and forwards the rest.
   the system call directly (`sendto` for `send`, `recvfrom` for `recv`, `ppoll`
   for `poll`, `pselect6` for `select`, `epoll_pwait` for `epoll_wait`, since
   arm64 lacks the older system calls).
-- The constructor seeds the PRNG from 8 bytes of `/dev/urandom`, read with raw
-  `openat`/`read`/`close` system calls (fallback `0x6a09e667f3bcc909 ^ getpid()`),
+- The constructor takes the process seed from `CHAOS_SEED`, else from 8 bytes of
+  `/dev/urandom` read with raw `openat`/`read`/`close` system calls (fallback
+  `0x6a09e667f3bcc909 ^ getpid()`),
   initialises the config engine and loads the rule file once, so a bad rule file
   is reported in the status file at start-up.
 
@@ -513,8 +514,10 @@ A probability is written `0`, `1`, `0.` followed by digits, or `1.` followed by
 zeros; trailing blanks are allowed. Parsing is independent of `LC_NUMERIC` (the
 JVM calls `setlocale(LC_ALL, "")`, and under a German locale `strtod` would stop
 at the `.`), and rejects `nan`, `inf`, hexadecimal and exponents. The first 15
-decimals are exact. A rule fires when a 32-bit sample from the per-thread PRNG is
-below `probability × 2^32`; 0 never fires and 1 always does.
+decimals are exact. A rule fires when its 32-bit probability sample is below
+`probability × 2^32`; 0 never fires and 1 always does. The sample follows from the
+rule, the number of this evaluation of it and `CHAOS_SEED`, so the same run
+reproduces (`docs/DSL.md` §6.4) -- there is no stream another thread could shift.
 
 ### ERRNO values
 
@@ -550,7 +553,8 @@ preserved. The sleep also happens on non-blocking sockets (`O_NONBLOCK`,
 which is exactly what a slow system call does to such a loop.
 
 **CORRUPT.** After a receive that returned bytes, one bit of the received data is
-inverted: byte index and bit index come from two independent PRNG draws. The
+inverted: the byte index is this evaluation's first effect draw and the bit its
+second. The
 target stays within what the call wrote: for `recv`, `recvfrom` and `recvmsg` the
 smaller of the return value and the buffer size, and nothing at all for a
 `MSG_TRUNC` receive on a stream socket (the kernel discards the data without
@@ -729,7 +733,7 @@ runs inside whichever wrapper call notices the change.
 |-------|-------|-----------------|
 | Rule snapshots (two) | process | single-writer reload claim, sequence counter per snapshot |
 | Reentrancy guard | thread (`__thread int`) | none needed |
-| PRNG state | thread (`__thread uint64_t`) | none needed |
+| Process lineage | process (`uint64_t`) | written only by the atfork child handler |
 | Endpoints | stack, per call | none needed |
 | DUP slot table | process | per-slot try-lock, lock-free close path |
 | Hit counters | process | atomic increments; one writer of the hits file at a time |
@@ -773,9 +777,8 @@ fires nor counts.
 
 - `pthread_atfork` child handlers release a reload claim and the hits-writer flag
   held by threads that do not exist in the child, reset hit counts and `@first`
-  claims, give the child its own hits file, reset the forking thread's PRNG state
-  (it reseeds from its own thread id on the next draw, so pre-fork workers do not
-  all decide alike), and release DUP slot locks.
+  claims, give the child its own hits file, mix the process lineage forward (so
+  pre-fork workers do not all decide alike), and release DUP slot locks.
 - A `vfork()` child and `posix_spawn()` run no atfork handler. They share the
   parent's memory, see its claims as busy, and never write a hits file.
 - After `exec` the new image loads the library afresh if `LD_PRELOAD` is still
