@@ -483,6 +483,7 @@ optional:
 clock_gettime:ERRNO:EFAULT@0.01
 clock_gettime/monotonic:OFFSET:500
 clock_gettime/monotonic:REGRESS:5000
+clock_gettime/realtime:FREEZE:1
 nanosleep:LATENCY:200
 usleep:ERRNO:EINTR@0.1
 ```
@@ -509,12 +510,16 @@ decimal clock id.
 | `LATENCY` | milliseconds | every selector | Sleeps before the real call. |
 | `OFFSET` | signed milliseconds, ±100 years | `clock_gettime[/<clock>]` | Adds the offset to every returned time the probability gate lets through. |
 | `REGRESS` | positive milliseconds, ≤ 100 years | `clock_gettime/<clock>` only | Steps that clock back once: the first read under the rule is real, the next read where the gate fires is that much earlier, and every read after stays shifted, so the clock keeps advancing from the earlier time. `clock_gettime/monotonic:REGRESS:5000` is `CLOCK_MONOTONIC` going back 5 s, as after a VM migration. A clock is required because the jump state is per rule. |
+| `FREEZE` | the probability itself (`FREEZE:1`, `FREEZE:0.25`) | `clock_gettime[/<clock>]` | Stops that clock at the reading of the call that fires the rule: that call returns the real time, every later read returns the same value. It carries no amount, so the one value field is the probability. Standing still is non-decreasing, so unlike `OFFSET` and `REGRESS` it is allowed on `CLOCK_MONOTONIC` without breaking monotonicity — it breaks progress, which is the fault watchdogs, leases and backoff loops are meant to survive. |
 
-- `REGRESS` state is per process and survives a reload that keeps the rule's text; a
-  forked child starts its own.
+- `REGRESS` and `FREEZE` state is per process and survives a reload that keeps the rule's
+  text; a forked child inherits it, so a child of a jumped or frozen parent is jumped or
+  frozen too.
 - A `clock_nanosleep` with `TIMER_ABSTIME` computed from a shifted clock is translated
   back to the real clock (deterministic `OFFSET` at probability 1 and `REGRESS`), so
-  a shifted clock neither stalls nor shortens absolute sleeps.
+  a shifted clock neither stalls nor shortens absolute sleeps. A frozen clock is not
+  translated: it has no shift to undo, so a sleep until "frozen now + 100 ms" is already
+  in the past and returns at once.
 - Not interposed: `alarm`, `setitimer`, timer and `timerfd` APIs, futex timeouts.
 
 ## libchaos-memory

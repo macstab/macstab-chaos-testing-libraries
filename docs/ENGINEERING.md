@@ -105,7 +105,7 @@ Shared mechanisms live in header-only `src/common/` (see
 
 1. [`src/time/chaos_time.c`](../src/time/chaos_time.c) — constructor, real functions, seed, first load
 2. [`src/time/chaos_time_config.c`](../src/time/chaos_time_config.c) — reload, parser, clock selectors
-3. [`src/time/chaos_time_actions.c`](../src/time/chaos_time_actions.c) — probability, latency, `OFFSET` arithmetic (clamped at `{0, 0}`), `REGRESS` state
+3. [`src/time/chaos_time_actions.c`](../src/time/chaos_time_actions.c) — probability, latency, `OFFSET` arithmetic (clamped at `{0, 0}`), `REGRESS` state, `FREEZE` reading
 4. [`src/time/chaos_time_hooks.c`](../src/time/chaos_time_hooks.c) — `clock_gettime`, `gettimeofday`, `time`, `timespec_get`, `nanosleep`, `clock_nanosleep`, `sleep`, `usleep`
 
 ### `libchaos-memory`
@@ -316,20 +316,25 @@ symbols (see [Recursion And Internal Calls](#recursion-and-internal-calls)).
 ### [`src/time/chaos_time_config.c`](../src/time/chaos_time_config.c)
 
 Owns time rule-file ingestion: selectors `*` (rank 1), operation (rank 2),
-`clock_gettime/<clock>` (rank 3). `OFFSET` is valid only on `clock_gettime`
-selectors; `REGRESS` only on `clock_gettime/<clock>` with a positive offset.
+`clock_gettime/<clock>` (rank 3). `OFFSET` and `FREEZE` are valid only on
+`clock_gettime` selectors; `REGRESS` only on `clock_gettime/<clock>` with a
+positive offset. `FREEZE` takes the probability as its value field, having no
+amount of its own.
 
 ### [`src/time/chaos_time_actions.c`](../src/time/chaos_time_actions.c)
 
 Owns `OFFSET` arithmetic on `int64_t` intermediates (no signed overflow),
 normalising `tv_nsec` into `[0, 999 999 999]` and clamping a negative result
-to `{0, 0}`. Neither `OFFSET` nor `REGRESS` keeps `CLOCK_MONOTONIC`
-monotonic; that is their purpose.
+to `{0, 0}`, and the `FREEZE` reading in the hit slot, marked with the top bit
+so it cannot be read as a `REGRESS` state. Neither `OFFSET` nor `REGRESS` keeps
+`CLOCK_MONOTONIC` monotonic; that is their purpose. `FREEZE` does keep it and
+stops progress instead.
 
 ### [`src/time/chaos_time_hooks.c`](../src/time/chaos_time_hooks.c)
 
 Owns the eight time wrappers. Order per wrapper: guard → `LATENCY` →
-`ERRNO` → real call → `OFFSET`/`REGRESS` (clock reads only, on success).
+`ERRNO` → real call → `OFFSET`/`REGRESS`/`FREEZE` (clock reads only, on
+success; `FREEZE` last, so it keeps the value the other two produced).
 `gettimeofday`, `time` and `timespec_get` use the `clock_gettime/realtime`
 rules; `clock_nanosleep` and `sleep` use the `nanosleep` rules.
 

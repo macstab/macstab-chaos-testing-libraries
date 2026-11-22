@@ -377,7 +377,7 @@ else Passthrough to real
         Kernel --> Glibc: ts
     end
     Glibc   --> Wrapper : 0, ts
-    Wrapper ->  Wrapper : maybe OFFSET / REGRESS\n(post-call mutation)
+    Wrapper ->  Wrapper : maybe OFFSET / REGRESS / FREEZE\n(post-call mutation)
     Wrapper --> App     : 0, possibly mutated ts
 end
 

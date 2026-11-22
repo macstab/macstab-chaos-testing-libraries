@@ -25,7 +25,7 @@ in [`docs/PLATFORM.md`](PLATFORM.md).
 |---|---|
 | Wrappers | `clock_gettime()`, `gettimeofday()`, `time()`, `timespec_get()`, `nanosleep()`, `clock_nanosleep()`, `sleep()`, `usleep()` |
 | Selectors | `*`, `clock_gettime`, `clock_gettime/<clock>`, `nanosleep`, `usleep` |
-| Effects | ERRNO, LATENCY, OFFSET, REGRESS |
+| Effects | ERRNO, LATENCY, OFFSET, REGRESS, FREEZE |
 | Qualifiers | `@first`, `@every`, `@from`, `@until`, `@size` (accepted; `@size` never matches, §8.4) |
 | Rule file | `/tmp/.chaos-time.conf` |
 | Status file | `/tmp/.chaos-time.status` |
@@ -43,7 +43,7 @@ without a system call ([SECCOMP.md §6](SECCOMP.md#6-not-possible)).
 2. [vDSO Offload Table per Architecture](#2-vdso-offload-table-per-architecture)
 3. [Hardware Clock Sources — TSC and CNTVCT_EL0](#3-hardware-clock-sources--tsc-and-cntvct_el0)
 4. [clock_gettime Selector Grammar](#4-clock_gettime-selector-grammar)
-5. [OFFSET and REGRESS — Monotonicity Implications](#5-offset-and-regress--monotonicity-implications)
+5. [OFFSET, REGRESS and FREEZE — Monotonicity Implications](#5-offset-regress-and-freeze--monotonicity-implications)
 6. [nanosleep — EINTR and Cancellation Contract](#6-nanosleep--eintr-and-cancellation-contract)
 7. [usleep — Surface and Constraints](#7-usleep--surface-and-constraints)
 8. [DSL Grammar and Rule Semantics](#8-dsl-grammar-and-rule-semantics)
@@ -98,7 +98,8 @@ other is addressed by number.
   one day ahead without waiting. A realtime rule also governs `gettimeofday()`, `time()`
   and `timespec_get(TIME_UTC)` (§12), so the process never sees two wall clocks.
 - **MONOTONIC** carries intervals: timeouts, backoff, rate limiters, latency histograms.
-  OFFSET and REGRESS here break the non-decreasing guarantee on purpose (§5).
+  OFFSET and REGRESS here break the non-decreasing guarantee on purpose (§5); FREEZE does
+  not break it, it stops the clock (§5.6).
 - **MONOTONIC_RAW** is read by benchmark and profiling code that must not see NTP slew.
 - **PROCESS/THREAD_CPUTIME_ID** feed CPU budgets and profilers; they are never served by
   the vDSO (§2.1), but the wrapper sees them like any other `clock_gettime()` call.
@@ -286,7 +287,7 @@ take a LATENCY from `*`, an ERRNO from `clock_gettime` and an OFFSET from
 
 ---
 
-## 5. OFFSET and REGRESS — Monotonicity Implications
+## 5. OFFSET, REGRESS and FREEZE — Monotonicity Implications
 
 ### 5.1 OFFSET Semantics
 
@@ -333,7 +334,8 @@ A realtime rule covers every wall-clock reader the library wraps. glibc and musl
 `clock_gettime`, so each has its own wrapper that reads `CLOCK_REALTIME` through the
 `clock_gettime` rules (§12): LATENCY, ERRNO, OFFSET and REGRESS of
 `clock_gettime/realtime`, `clock_gettime` and `*` apply to them exactly as to
-`clock_gettime(CLOCK_REALTIME)`.
+`clock_gettime(CLOCK_REALTIME)`. FREEZE of the same selectors does too, so a frozen wall
+clock is frozen in every one of those readers.
 
 ### 5.4 Thread Safety of OFFSET
 
@@ -378,6 +380,55 @@ limiters, leases and elapsed-time arithmetic that trust `CLOCK_MONOTONIC`.
 
 When both an OFFSET and a REGRESS rule match a read, OFFSET is applied first, then
 REGRESS.
+
+### 5.6 FREEZE — a Clock That Stands Still
+
+`clock_gettime/realtime:FREEZE:1` keeps the clock at the reading of the call that fired
+the rule: that call returns the real time, and every later read returns the same value.
+
+1. While the rule has not fired, reads pass through unchanged.
+2. The first call that passes the gate (window, `@every`, probability, `@first`) stores
+   its reading and counts **one hit**.
+3. Every read after that returns the stored reading without drawing again.
+
+Rules of the effect:
+
+- **Value is the probability.** FREEZE carries no amount, so its one value field is the
+  probability: `clock_gettime/realtime:FREEZE:1` always freezes, `…:FREEZE:0.25` freezes
+  on the first read in four that the gate lets through. `…:FREEZE:5000` rejects the rule
+  file, because `5000` is not a probability.
+- **A clock is optional**, unlike REGRESS: bare `clock_gettime` freezes every clock the
+  process reads at the reading of the first call that fires, which is one stored value for
+  the rule, not one per clock. `*`, `nanosleep` and `usleep` reject the rule file.
+- **State** (per process, in the rule's hit slot, `chaos_hits.h`): the stored reading in
+  nanoseconds with the top bit set, so a cleared bit, not a zero word, is what "not frozen"
+  means — a clock that reads exactly zero freezes like any other. The bit also keeps the
+  reading clear of the small state machine REGRESS keeps in the same word: a reading of 2 ns,
+  which `CLOCK_PROCESS_CPUTIME_ID` produces at the start of a process, would otherwise be
+  stored as the `3` the fork handler rewrites. One compare-and-swap stores the value, so
+  threads reading the same instant all see the one whichever call won.
+- **Reload:** a reload that keeps the rule's text keeps the frozen reading. Removing the
+  rule ends it: the clock jumps forward to the real time.
+- **Window:** outside `@from`/`@until` the clock runs, also after the rule has fired. The
+  reading stays stored, so a window that opens again freezes at the old value, not at a
+  new one.
+- **fork():** the child inherits the frozen reading, as it inherits a REGRESS jump: a child
+  of a frozen parent sees the same stopped clock. Forking is not a way out of the freeze,
+  which matters for the pre-forking servers this library is pointed at.
+- **Monotonicity:** standing still is non-decreasing, so FREEZE on `CLOCK_MONOTONIC` does
+  not break the guarantee of §5.2 the way OFFSET and REGRESS do. It breaks progress
+  instead: code that waits for an interval to pass waits forever, which is the fault under
+  test for watchdogs, lease renewal and backoff loops.
+- With `@size` the rule never fires (clock reads carry no byte count, §8.4).
+
+FREEZE is applied last, after OFFSET and REGRESS, so the value it keeps is the one those
+rules produced: an `OFFSET:+86400000` and a `FREEZE:1` on the same clock stop it one day
+ahead. A read while the clock is frozen is not shifted a second time.
+
+An absolute `clock_nanosleep()` deadline is **not** converted for FREEZE (§11): a frozen
+clock has no shift that every read carries, and the deadline the program computed from the
+frozen reading is in the kernel's past or future by however long the clock has stood still.
+That is the effect, not a defect — a sleep until "frozen now + 100 ms" returns at once.
 
 ---
 
@@ -451,7 +502,7 @@ nanosleep) bypasses the wrappers.
 - LATENCY delays the call (§6.3).
 - ERRNO returns -1 with the configured `errno`; there is no remaining-time output, so the
   caller cannot know how much elapsed and must measure with a clock if it retries.
-- OFFSET and REGRESS are rejected on `usleep`.
+- OFFSET, REGRESS and FREEZE are rejected on `usleep`.
 
 A rule `usleep:ERRNO:EINTR` exposes callers that ignore `usleep()`'s return value. In new
 code, `nanosleep()` and `clock_nanosleep()` (§11) replace it.
@@ -475,8 +526,9 @@ clock-name   = "realtime" / "monotonic" / "monotonic_raw"
              / "boottime" / "tai"
              / "process_cputime_id" / "thread_cputime_id"
 clock-id     = [ "+" / "-" ] 1*DIGIT                 ; strtol, base 10
-effect       = "ERRNO" / "LATENCY" / "OFFSET" / "REGRESS"
+effect       = "ERRNO" / "LATENCY" / "OFFSET" / "REGRESS" / "FREEZE"
 value        = payload [ "@" probability ]           ; no blank before "@"
+             / probability                           ; FREEZE: the value is the probability
 payload      = errno / latency-ms / offset-ms
 errno        = "EINVAL" / "EFAULT" / "EINTR" / "EPERM" / "ENOSYS" / "EAGAIN"
              / 1*DIGIT                               ; 1 .. 2147483647
@@ -502,13 +554,13 @@ comment      = "#" *( %x01-09 / %x0B-FF )
 
 ### 8.2 Effect Applicability
 
-| Selector                | LATENCY | ERRNO | OFFSET | REGRESS |
-|-------------------------|---------|-------|--------|---------|
-| `*`                     | yes     | yes   | —      | —       |
-| `clock_gettime`         | yes     | yes   | yes    | —       |
-| `clock_gettime/<clock>` | yes     | yes   | yes    | yes     |
-| `nanosleep`             | yes     | yes   | —      | —       |
-| `usleep`                | yes     | yes   | —      | —       |
+| Selector                | LATENCY | ERRNO | OFFSET | REGRESS | FREEZE |
+|-------------------------|---------|-------|--------|---------|--------|
+| `*`                     | yes     | yes   | —      | —       | —      |
+| `clock_gettime`         | yes     | yes   | yes    | —       | yes    |
+| `clock_gettime/<clock>` | yes     | yes   | yes    | yes     | yes    |
+| `nanosleep`             | yes     | yes   | —      | —       | —      |
+| `usleep`                | yes     | yes   | —      | —       | —      |
 
 "—" rejects the rule file. No selector names `gettimeofday`, `time`, `timespec_get`,
 `clock_nanosleep` or `sleep`; each follows the rules of the call it is a form of:
@@ -578,6 +630,7 @@ wrapper entry
   │    on failure → return its result
   ├─ OFFSET rule  → if it fires: value += offset ms (clamped at {0, 0})
   ├─ REGRESS rule → arm / decide / keep shift (§5.5)
+  ├─ FREEZE rule  → store or return the frozen reading (§5.6)
   └─ return 0
 ```
 
@@ -692,6 +745,7 @@ Only a shift that every read carries is converted:
 |---------|-------------------------------------------------------------------------------------------|
 | OFFSET  | probability 1, no `@first`, no `@size`, `@from`/`@until` window open                      |
 | REGRESS | state jumped (`2`) and window open                                                        |
+| FREEZE  | never: a stopped clock is no shift the conversion could undo (§5.6)                       |
 
 A deadline computed from a read the probability gate left unshifted cannot be told apart
 and is passed unchanged. The conversion counts no hit.
@@ -841,8 +895,8 @@ Same two-snapshot design as the other libraries
 - **One reloader.** A CAS of the cached stamp to `RELOADING` elects one thread; others
   keep using the active snapshot without waiting. The winner parses into the inactive
   snapshot, attaches hit slots (rules with unchanged text keep their slot, counts and
-  REGRESS state), writes the status file, then publishes index and stamp behind full
-  barriers.
+  REGRESS state, frozen FREEZE reading), writes the status file, then publishes index and
+  stamp behind full barriers.
 - **Readers.** A rule is copied out of the snapshot under a sequence counter and used
   only if the counter did not change, so a reader preempted across two reloads never
   uses half of one rule.
@@ -884,7 +938,7 @@ reference binds to, so the wrapper calls exactly what the program would have cal
 
 Covered:
 
-- `clock_gettime()`: per clock ID; ERRNO, LATENCY, OFFSET, REGRESS
+- `clock_gettime()`: per clock ID; ERRNO, LATENCY, OFFSET, REGRESS, FREEZE
 - `gettimeofday()`, `time()`, `timespec_get(TIME_UTC)`: the `clock_gettime/realtime` rules
 - `nanosleep()`: ERRNO, LATENCY
 - `clock_nanosleep()`, `sleep()`: the `nanosleep` rules; absolute deadlines converted

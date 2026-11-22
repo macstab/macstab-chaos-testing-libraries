@@ -66,7 +66,7 @@ else Passthrough to real
         Kernel --> Glibc: ts
     end
     Glibc   --> Wrapper : 0, ts
-    Wrapper ->  Wrapper : maybe OFFSET, then REGRESS\n(post-call mutation of the returned value only)
+    Wrapper ->  Wrapper : maybe OFFSET, then REGRESS, then FREEZE\n(post-call mutation of the returned value only)
     Wrapper --> App     : 0, possibly mutated ts
 end
 

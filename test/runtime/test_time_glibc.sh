@@ -4,7 +4,7 @@
 # 2.36).
 #
 # Proves, for one architecture per run, that clock_gettime, gettimeofday, time, timespec_get,
-# nanosleep, clock_nanosleep, usleep and sleep honour ERRNO, LATENCY, OFFSET and REGRESS rules,
+# nanosleep, clock_nanosleep, usleep and sleep honour ERRNO, LATENCY, OFFSET, REGRESS and FREEZE rules,
 # including absolute-deadline conversion under OFFSET; time_probe.c lists every check.
 #
 # Method: docker buildx builds libchaos-time-glibc-<arch>.so (make cross-glibc-<arch>) from

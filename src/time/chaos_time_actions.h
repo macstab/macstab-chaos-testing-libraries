@@ -105,6 +105,18 @@ void chaos_time_rule_apply_offset(chaos_time_rule_t *rule, struct timespec *valu
 void chaos_time_rule_apply_regress(chaos_time_rule_t *rule, struct timespec *value);
 
 /**
+ * @brief FREEZE effect: stops @p value at the reading of the call that fires the rule.
+ *
+ * @details The first call that passes the qualifiers and the probability keeps its reading
+ * in the rule's hit slot; every later call is given that value back. Outside a
+ * `@from`/`@until` window the clock runs, frozen or not, as it does for REGRESS.
+ *
+ * @param[in,out] rule   Matched FREEZE rule; anything else is a no-op.
+ * @param[in,out] value  Reading of a successful clock call; replaced once frozen.
+ */
+void chaos_time_rule_apply_freeze(chaos_time_rule_t *rule, struct timespec *value);
+
+/**
  * Maps a TIMER_ABSTIME deadline from the program's shifted clock back to the real one.
  *
  * The program computed the deadline from a clock shifted by OFFSET and REGRESS; the

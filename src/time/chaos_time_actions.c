@@ -258,6 +258,65 @@ void chaos_time_rule_apply_regress(chaos_time_rule_t *rule, struct timespec *val
     chaos_time_add_offset_ms(value, -rule->offset_ms);
 }
 
+/** @brief Nanoseconds per second, for packing a reading into the slot's state word. */
+#define CHAOS_TIME_NS_PER_SEC UINT64_C(1000000000)
+
+/**
+ * @brief Marks the slot's state word as a frozen reading rather than a REGRESS state.
+ *
+ * @details The top bit, which no clock reaches: 2^63 ns is 292 years of uptime, and the
+ * kernel rejects a realtime value that large. It is not decoration. REGRESS keeps a small
+ * state machine (0, 1, 2, 3) in the same word, and chaos_hits_pool_after_fork() rewrites a
+ * 3 to a 1 for it; a plain `nanoseconds + 1` would alias that at a reading of 2 ns, which
+ * CLOCK_PROCESS_CPUTIME_ID produces at the start of a process. The mark keeps a frozen
+ * reading out of every value the other effect's machine uses.
+ */
+#define CHAOS_TIME_FREEZE_MARK (UINT64_C(1) << 63)
+
+/**
+ * @copydoc chaos_time_rule_apply_freeze
+ *
+ * slot->state holds the frozen reading in nanoseconds with CHAOS_TIME_FREEZE_MARK set, so a
+ * cleared mark means "not frozen" for any reading, including 0. One CAS decides which
+ * concurrent reader's value is kept; the losers read the winner's, so every thread sees the
+ * same frozen time.
+ */
+void chaos_time_rule_apply_freeze(chaos_time_rule_t *rule, struct timespec *value)
+{
+    chaos_hit_slot_t *slot;
+    uint64_t frozen;
+
+    if (rule == NULL || value == NULL || rule->effect != CHAOS_TIME_EFFECT_FREEZE ||
+        rule->hit == NULL || !chaos_hit_slot_current(rule->hit, rule->hit_generation))
+    {
+        return;
+    }
+    /* Outside its @from/@until window the rule stops nothing, before or after the freeze. */
+    if (!chaos_policy_window_open(&rule->policy))
+    {
+        return;
+    }
+    slot = rule->hit;
+    frozen = slot->state;
+    if ((frozen & CHAOS_TIME_FREEZE_MARK) == 0U)
+    {
+        if (!chaos_time_rule_should_trigger(rule))
+        {
+            return;
+        }
+        (void)__sync_bool_compare_and_swap(
+            &slot->state,
+            frozen,
+            ((uint64_t)value->tv_sec * CHAOS_TIME_NS_PER_SEC + (uint64_t)value->tv_nsec) |
+                CHAOS_TIME_FREEZE_MARK
+        );
+        frozen = slot->state;
+    }
+    frozen &= ~CHAOS_TIME_FREEZE_MARK;
+    value->tv_sec = (time_t)(frozen / CHAOS_TIME_NS_PER_SEC);
+    value->tv_nsec = (long)(frozen % CHAOS_TIME_NS_PER_SEC);
+}
+
 /**
  * @copydoc chaos_time_rule_unshift_deadline
  *

@@ -1438,6 +1438,44 @@ static void test_regress_rule(void)
 }
 
 /**
+ * @brief Proves FREEZE needs a clock-read selector and takes the probability as its value.
+ *
+ * @details FREEZE carries no amount, so the one value field is the probability -- the same
+ * shape as net's `close:RESET:1`. A bare `clock_gettime` selector is allowed, unlike REGRESS:
+ * the frozen reading lives in the hit slot per rule, and a rule across all clocks freezing
+ * them all at one reading is the documented behaviour, not an accident. Sleep selectors and
+ * `*` are rejected, as are probabilities outside [0, 1] and a missing value.
+ */
+static void test_freeze_rule(void)
+{
+    chaos_time_rule_t rule;
+    char ok[] = "clock_gettime/realtime:FREEZE:1";
+    char gated[] = "clock_gettime/monotonic:FREEZE:0.25";
+    char every_clock[] = "clock_gettime:FREEZE:1";
+    char sleep_rule[] = "nanosleep:FREEZE:1";
+    char any_rule[] = "*:FREEZE:1";
+    char above_one[] = "clock_gettime/realtime:FREEZE:2";
+    char negative[] = "clock_gettime/realtime:FREEZE:-1";
+    char empty[] = "clock_gettime/realtime:FREEZE:";
+    char with_amount[] = "clock_gettime/realtime:FREEZE:5000@1";
+
+    assert(chaos_time_config_parse_line(ok, &rule) == 1);
+    assert(rule.effect == CHAOS_TIME_EFFECT_FREEZE && rule.probability == 1.0);
+    assert(chaos_time_config_parse_line(gated, &rule) == 1);
+    assert(rule.probability == 0.25);
+    assert(chaos_time_config_parse_line(every_clock, &rule) == 1);
+    assert(rule.effect == CHAOS_TIME_EFFECT_FREEZE);
+    assert(chaos_time_config_parse_line(sleep_rule, &rule) == -1);
+    assert(chaos_time_config_parse_line(any_rule, &rule) == -1);
+    assert(chaos_time_config_parse_line(above_one, &rule) == -1);
+    assert(chaos_time_config_parse_line(negative, &rule) == -1);
+    assert(chaos_time_config_parse_line(empty, &rule) == -1);
+    /* No amount field: `5000@1` is not a probability, so the line is rejected rather than
+     * silently read as a 5000 ms something. */
+    assert(chaos_time_config_parse_line(with_amount, &rule) == -1);
+}
+
+/**
  * @brief Proves a same-size rewrite in place within one mtime tick is still loaded, and that
  *   re-reading an unchanged provisional file keeps its snapshot.
  *
@@ -1784,6 +1822,7 @@ int main(void)
     test_rule_file_check_is_throttled();
     test_rule_qualifiers();
     test_regress_rule();
+    test_freeze_rule();
     test_read_file_rejects_changed_file();
     test_helper_functions();
     test_selector_matching();

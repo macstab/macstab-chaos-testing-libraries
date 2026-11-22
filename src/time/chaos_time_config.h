@@ -111,7 +111,17 @@ typedef enum chaos_time_effect
      * and every read after that stays shifted, so the clock advances again from the
      * earlier time. State lives in the rule's hit slot (chaos_time_rule_apply_regress()).
      */
-    CHAOS_TIME_EFFECT_REGRESS
+    CHAOS_TIME_EFFECT_REGRESS,
+    /**
+     * After a successful clock read: stop the clock at the reading of the call that fired
+     * the rule. Every later read of that clock returns the kept value, so the application
+     * sees time standing still -- a watchdog that waits for a deadline waits for ever, a
+     * cache that expires by wall clock never expires. The probability decides when the
+     * freeze starts, not each read. The kept value lives in the rule's hit slot
+     * (chaos_time_rule_apply_freeze()), so every thread and a reload that keeps the rule
+     * see the same frozen time.
+     */
+    CHAOS_TIME_EFFECT_FREEZE
 } chaos_time_effect_t;
 
 /**

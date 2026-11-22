@@ -71,7 +71,7 @@ How the libc layer instantiates the triple:
 | Part | libc layer |
 |---|---|
 | S | a path prefix (io), an endpoint (net), a host name or address (dns), a function or function/argument class (time, process, memory), always with `*` as catch-all |
-| E | ERRNO (an errno name, or a positive number in every library), GAI (`EAI_*`, dns), LATENCY, TIMEOUT, CORRUPT, TORN, TRICKLE, DUP, RESET, OFFSET, REGRESS, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER |
+| E | ERRNO (an errno name, or a positive number in every library), GAI (`EAI_*`, dns), LATENCY, TIMEOUT, CORRUPT, TORN, TRICKLE, DUP, RESET, OFFSET, REGRESS, FREEZE, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER |
 | P | probability ∧ `@from`/`@until` window ∧ `@size` gate ∧ `@every` evaluation gate ∧ `@first` budget; for FAIL_AFTER additionally a per-operation call counter |
 | selection | io, net: **one rule per call**, the most specific for the call's operation. dns, time, process, memory: **one rule per effect**, the most specific for each effect, so several effects compose on one call (§8) |
 
@@ -216,6 +216,7 @@ time-effect   = "ERRNO" ":" time-errno [ "@" probability ]
               / "LATENCY" ":" ms [ "@" probability ]
               / "OFFSET" ":" offset [ "@" probability ]     ; clock_gettime[/clock] only
               / "REGRESS" ":" offset [ "@" probability ]    ; clock_gettime/clock only, > 0
+              / "FREEZE" ":" probability                    ; clock_gettime[/clock] only
 time-errno    = "EINVAL" / "EFAULT" / "EINTR" / "EPERM" / "ENOSYS" / "EAGAIN"
               / 1*DIGIT                                     ; 1 .. 2147483647
 offset        = [ "-" / "+" ] 1*DIGIT                       ; ms, |offset| <= 3155760000000
@@ -308,8 +309,8 @@ Same caveat as §2.3: a sketch of the surface, not its source of truth.
 |---|---|---|---|
 | **Selector** | Path prefix, endpoint, host name/address, or function selector parsed from a text rule | `ChaosSelector` typed builder — `network()`, `jdbc()`, `dns()`, etc. | `@Chaos(target=…)` annotation parameter; YAML `selector:` block |
 | **Selector match site** | Inside the wrapper, against the call's arguments (descriptors resolved to paths or endpoints) | Inside the ByteBuddy-injected advice at the JDK call site | At the orchestration boundary (Toxiproxy / Testcontainers `withCommand` hook) |
-| **Effect** | ERRNO, GAI, LATENCY, TIMEOUT, CORRUPT, TORN, TRICKLE, DUP, RESET, OFFSET, REGRESS, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER | `ChaosEffect.delay/throw/fail/stress/deadlock/spike/drop` | Toxiproxy toxics / `tc netem` rules / cgroup throttling |
-| **Effect application phase** | Pre-call (ERRNO, GAI, LATENCY, FAIL_AFTER; TORN shortens the count), instead of the call (OVERRIDE), post-call (CORRUPT, OFFSET, REGRESS, result-set transforms) | Same conceptual phases at the bytecode advice level | At the network/cgroup boundary, always pre-effect from the application's perspective |
+| **Effect** | ERRNO, GAI, LATENCY, TIMEOUT, CORRUPT, TORN, TRICKLE, DUP, RESET, OFFSET, REGRESS, FREEZE, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER | `ChaosEffect.delay/throw/fail/stress/deadlock/spike/drop` | Toxiproxy toxics / `tc netem` rules / cgroup throttling |
+| **Effect application phase** | Pre-call (ERRNO, GAI, LATENCY, FAIL_AFTER; TORN shortens the count), instead of the call (OVERRIDE), post-call (CORRUPT, OFFSET, REGRESS, FREEZE, result-set transforms) | Same conceptual phases at the bytecode advice level | At the network/cgroup boundary, always pre-effect from the application's perspective |
 | **Activation policy** | Probability, `@first`, `@every`, `@from`/`@until`, `@size`; FAIL_AFTER's call counter | `ActivationPolicy.always/count/timeWindow/session` | Annotation parameters + scenario lifecycle hooks |
 | **Activation evaluation** | Per call: window, size gate, `@every`, the rule's probability sample, `@first` claim | Per-call dispatcher check + session-scoped state | Lifecycle-driven (apply on `@BeforeEach`, remove on `@AfterEach`) |
 | **Configuration source** | Text file `/tmp/.chaos-<lib>.conf` | Java code (builder) + JSON startup config | YAML / annotations + dynamic Testcontainers calls |
@@ -397,12 +398,13 @@ first, then the failure. In io and net one rule decides the call, so a LATENCY r
 and an ERRNO rule for the same operation and equally specific selector never both
 apply (§8).
 
-### 5.3. Class C — argument and result mutation (TORN, CORRUPT, OFFSET, REGRESS)
+### 5.3. Class C — argument and result mutation (TORN, CORRUPT, OFFSET, REGRESS, FREEZE)
 
 | libc | Phase | JVM | Orchestration |
 |---|---|---|---|
 | `clock_gettime/realtime:OFFSET:500` | after the call: the returned time is shifted | `clockSkew(Duration.ofMillis(500))` | N/A (clocks cannot be mutated at the orchestration boundary) |
 | `clock_gettime/monotonic:REGRESS:1000` | after the call: the clock steps back once | N/A | N/A |
+| `clock_gettime/realtime:FREEZE:1` | after the call: every read returns the reading of the first call that fired | N/A | N/A |
 | `/data:read:CORRUPT:0.1` (io), `…:recv:CORRUPT:0.1` (net) | after a successful read: one bit of the returned bytes flips | `byteCorruption(probability=0.1)` | Toxiproxy `bandwidth` + custom byte mangler (rare) |
 | `/data:write:TORN:0.1` | before the call: the byte count is shortened to `[1, n-1]` | `partialWrite(probability=0.1)` | N/A |
 
@@ -558,7 +560,7 @@ Semantics:
   rule reject the file like any invalid line.
 - **Wall clock.** The window is checked against `CLOCK_REALTIME` read from the vDSO
   (or the raw system call), never through the interposed `clock_gettime`, so a
-  libchaos-time OFFSET rule does not move another rule's window. Absolute times make
+  libchaos-time OFFSET or FREEZE rule does not move another rule's window. Absolute times make
   every process of a container agree on the window; the JVM layer turns relative
   durations into absolute times.
 - **Order of checks.** Window, size gate, `@every`, probability, then the `@first`
@@ -627,7 +629,7 @@ independently; the order is fixed in the wrappers:
 |---|---|
 | memory (`mmap`, `munmap`, `mprotect`, `madvise`, `posix_madvise`) | LATENCY → ERRNO → real call |
 | process (every operation) | LATENCY → ERRNO → FAIL_AFTER → real call |
-| time, clock reads (`clock_gettime`, `gettimeofday`, `time`, `timespec_get`) | LATENCY → ERRNO → real call → OFFSET → REGRESS |
+| time, clock reads (`clock_gettime`, `gettimeofday`, `time`, `timespec_get`) | LATENCY → ERRNO → real call → OFFSET → REGRESS → FREEZE |
 | time, sleeps (`nanosleep`, `sleep`, `clock_nanosleep`, `usleep`) | LATENCY → ERRNO → real call (`clock_nanosleep` with `TIMER_ABSTIME` maps the deadline back through OFFSET/REGRESS) |
 | dns `getaddrinfo` | LATENCY → GAI → REWRITE → SERVICE → OVERRIDE *or* real call → FILTER_FAMILY → SHUFFLE → LIMIT |
 | dns `getnameinfo` | LATENCY → GAI → real call → REWRITE → SERVICE (on the returned host and service) |
@@ -746,7 +748,7 @@ if (Rule selected?) then (yes)
   :Real function
   (TORN: shortened count, OVERRIDE: synthetic list);
   :Post-call effects
-  (CORRUPT, OFFSET, REGRESS,
+  (CORRUPT, OFFSET, REGRESS, FREEZE,
    FILTER_FAMILY, SHUFFLE, LIMIT);
   :Return result;
 else (no)
@@ -760,7 +762,7 @@ legend
   1. "*" is a selector in every library and the least specific one
   2. Specificity is a strict partial order on selectors (§10.3)
   3. io, net: one rule per call; dns, time, process, memory: one rule per effect
-  4. OFFSET, REGRESS, CORRUPT only post-call; ERRNO, GAI, FAIL_AFTER only pre-call
+  4. OFFSET, REGRESS, FREEZE, CORRUPT only post-call; ERRNO, GAI, FAIL_AFTER only pre-call
   5. FAIL_AFTER counts per operation and process, not per thread
   6. Probability 0 never fires but is still selected (it shadows weaker rules)
   7. No rule selected: wrapped(args) == real(args)

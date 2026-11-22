@@ -129,7 +129,7 @@ note across
   libchaos-net also selects one rule per call and adds TIMEOUT, RESET, TRICKLE and DUP
   (docs/NETWORK.md). libchaos-dns, -time, -memory and -process select one rule per effect:
   LATENCY, then ERRNO / EAI_* / FAIL_AFTER, then the real call, then post-call effects
-  (time: OFFSET, REGRESS; dns: FILTER_FAMILY, SHUFFLE, LIMIT), each with its own lookup
+  (time: OFFSET, REGRESS, FREEZE; dns: FILTER_FAMILY, SHUFFLE, LIMIT), each with its own lookup
   and firing decision. libchaos-time sleeps through the real usleep/nanosleep under its
   guard; every other library sleeps with chaos_sleep_ms().
 end note

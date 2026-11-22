@@ -639,8 +639,121 @@ static void test_every_gates_evaluations(void)
     assert(slot.count == 1U);
 }
 
+/**
+ * @brief Proves FREEZE stops the clock at the value of the call that fired it.
+ *
+ * @details FREEZE is the effect §7 of the plan reads out of the state page, so it has to
+ * exist as a rule effect first. Asserted here:
+ * - before the rule fires the clock runs: the reading passes through unchanged;
+ * - the first firing call's reading is kept, and every later read returns it, whatever the
+ *   real clock says -- the probability decides when the freeze starts, not each read;
+ * - the kept value lives in the hit slot, so a second rule copy of the same rule (another
+ *   thread, or a copy taken before a reload) sees the same frozen time;
+ * - outside the `@from`/`@until` window the clock runs, before and after the freeze, which
+ *   is how REGRESS behaves too;
+ * - a reading of 0 freezes as well: the slot keeps the reading with the top bit set, so a
+ *   cleared bit, not a zero word, is what "not frozen" means;
+ * - the top bit keeps a frozen reading clear of REGRESS's state machine in the same word:
+ *   a reading of 2 ns would otherwise store a 3, which the fork handler rewrites to a 1.
+ */
+static void test_freeze_stops_the_clock(void)
+{
+    chaos_time_rule_t rule;
+    chaos_hit_slot_t slot;
+    struct timespec value;
+
+    (void)memset(&rule, 0, sizeof(rule));
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.effect = CHAOS_TIME_EFFECT_FREEZE;
+    rule.hit = &slot;
+    rule.probability = 0.0;
+
+    /* Probability 0: nothing is frozen and the reading is untouched. */
+    value.tv_sec = 100;
+    value.tv_nsec = 5;
+    chaos_time_rule_apply_freeze(&rule, &value);
+    assert(value.tv_sec == 100 && value.tv_nsec == 5);
+    assert(slot.state == 0U);
+
+    /* The first firing call's reading is kept. */
+    rule.probability = 1.0;
+    value.tv_sec = 200;
+    value.tv_nsec = 7;
+    chaos_time_rule_apply_freeze(&rule, &value);
+    assert(value.tv_sec == 200 && value.tv_nsec == 7);
+    assert(slot.state == ((UINT64_C(200) * UINT64_C(1000000000) + 7U) | (UINT64_C(1) << 63)));
+
+    /* Later reads return it, whatever the clock says. */
+    value.tv_sec = 999;
+    value.tv_nsec = 123;
+    chaos_time_rule_apply_freeze(&rule, &value);
+    assert(value.tv_sec == 200 && value.tv_nsec == 7);
+
+    /* Another copy of the same rule sees the same frozen time: it lives in the slot. */
+    {
+        chaos_time_rule_t other = rule;
+
+        other.probability = 0.0;
+        value.tv_sec = 555;
+        value.tv_nsec = 1;
+        chaos_time_rule_apply_freeze(&other, &value);
+        assert(value.tv_sec == 200 && value.tv_nsec == 7);
+    }
+
+    /* Outside the window the clock runs, frozen or not. */
+    rule.policy.from_ms = INT64_C(4000000000000);
+    value.tv_sec = 777;
+    value.tv_nsec = 9;
+    chaos_time_rule_apply_freeze(&rule, &value);
+    assert(value.tv_sec == 777 && value.tv_nsec == 9);
+    (void)memset(&rule.policy, 0, sizeof(rule.policy));
+
+    /* A reading of 0 freezes too, which the mark bit in the slot is there for. */
+    (void)memset(&slot, 0, sizeof(slot));
+    value.tv_sec = 0;
+    value.tv_nsec = 0;
+    chaos_time_rule_apply_freeze(&rule, &value);
+    assert(slot.state == (UINT64_C(1) << 63));
+    value.tv_sec = 42;
+    value.tv_nsec = 42;
+    chaos_time_rule_apply_freeze(&rule, &value);
+    assert(value.tv_sec == 0 && value.tv_nsec == 0);
+
+    /* A reading of 2 ns is the one REGRESS's state machine would claim: stored as a bare
+     * `ns + 1` it is a 3, which chaos_hits_pool_after_fork() rewrites to a 1 and so hands
+     * the child a clock frozen at 0. With the mark it stays 2 ns across the fork reset. */
+    (void)memset(&slot, 0, sizeof(slot));
+    value.tv_sec = 0;
+    value.tv_nsec = 2;
+    chaos_time_rule_apply_freeze(&rule, &value);
+    assert(slot.state != 3U);
+    if (slot.state == 3U)
+    {
+        slot.state = 1U;
+    }
+    value.tv_sec = 42;
+    value.tv_nsec = 42;
+    chaos_time_rule_apply_freeze(&rule, &value);
+    assert(value.tv_sec == 0 && value.tv_nsec == 2);
+
+    /* Not a FREEZE rule, no rule, no value, no slot: all no-ops. */
+    (void)memset(&slot, 0, sizeof(slot));
+    value.tv_sec = 5;
+    value.tv_nsec = 5;
+    rule.effect = CHAOS_TIME_EFFECT_OFFSET;
+    chaos_time_rule_apply_freeze(&rule, &value);
+    rule.effect = CHAOS_TIME_EFFECT_FREEZE;
+    chaos_time_rule_apply_freeze(NULL, &value);
+    chaos_time_rule_apply_freeze(&rule, NULL);
+    rule.hit = NULL;
+    chaos_time_rule_apply_freeze(&rule, &value);
+    assert(value.tv_sec == 5 && value.tv_nsec == 5);
+    assert(slot.state == 0U);
+}
+
 int main(void)
 {
+    test_freeze_stops_the_clock();
     test_every_gates_evaluations();
     test_draws_are_reproducible();
     test_regress_goes_back_once();

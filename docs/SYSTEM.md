@@ -258,7 +258,7 @@ layered fault models.
 | rule file | `/tmp/.chaos-<lib>.conf`, one per library; re-read when its change stamp changes (reload) |
 | rule | one line of a rule file: selector, operation, effect, value, optional probability and qualifiers |
 | selector | what a rule matches: path prefix (io), endpoint (net), DNS name or address (dns), operation[/target] (time, memory, process) |
-| effect | what a matching rule does: `ERRNO`, `LATENCY`, `TIMEOUT`, `CORRUPT`, `TORN`, `TRICKLE`, `DUP`, `RESET`, `OFFSET`, `REGRESS`, `GAI`, `REWRITE`, `OVERRIDE`, `SERVICE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT`, `FAIL_AFTER` |
+| effect | what a matching rule does: `ERRNO`, `LATENCY`, `TIMEOUT`, `CORRUPT`, `TORN`, `TRICKLE`, `DUP`, `RESET`, `OFFSET`, `REGRESS`, `FREEZE`, `GAI`, `REWRITE`, `OVERRIDE`, `SERVICE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT`, `FAIL_AFTER` |
 | probability | chance in [0, 1] that a matching rule fires on a call, sampled from a per-thread PRNG |
 | qualifier | `@first=N`, `@from=T`, `@until=T`, `@size>N`, `@size<N` (`src/common/chaos_policy.h`) |
 | hit | one application of a rule's effect; counted per rule |
@@ -672,8 +672,13 @@ Effects: `ERRNO`, `LATENCY`, `OFFSET` (signed millisecond shift of the
 returned time, clamped at `{0, 0}`), `REGRESS` (one clock per rule: the first
 matching read is real, a later firing read jumps back by the offset, and the
 clock stays shifted from then on; its state survives reloads in the rule's
-hit slot). Neither `OFFSET` nor `REGRESS` preserves monotonicity of
-`CLOCK_MONOTONIC`; stepping a clock backwards is their purpose.
+hit slot), `FREEZE` (the reading of the call that fires the rule is kept in
+the hit slot and returned by every later read; the value field is the
+probability, since the effect carries no amount). Neither `OFFSET` nor
+`REGRESS` preserves monotonicity of `CLOCK_MONOTONIC`; stepping a clock
+backwards is their purpose. `FREEZE` does preserve it — a stopped clock is
+non-decreasing — and stops progress instead, so it is allowed on
+`CLOCK_MONOTONIC` where `REGRESS` is not.
 
 ### `libchaos-process`
 
@@ -880,7 +885,8 @@ intercepted call after it changes (within 1 ms of throttle plus the reload).
 2. The winner marks the inactive snapshot's sequence odd, reads the file with
    raw `openat`/`read`, parses into it, assigns hit slots (a rule whose text
    was already active keeps its slot, so its count, `@first` claims and
-   `REGRESS` state continue), writes the status file, releases slots of rules
+   `REGRESS` state and a frozen `FREEZE` reading continue), writes the status
+   file, releases slots of rules
    that left (bumping their generation), and publishes: full barrier
    (`__sync_synchronize`), flip the active index, store the new stamp.
 3. Readers copy a rule under the snapshot seqlock. Two reloads later the same
@@ -1106,7 +1112,7 @@ their own architecture (`matrix.yml`).
 | `libchaos-io` | `/tmp/.chaos-io.conf` | `ERRNO`, `LATENCY`, `TORN` (write side), `CORRUPT` (read side) |
 | `libchaos-net` | `/tmp/.chaos-net.conf` | `ERRNO`, `LATENCY`, `CORRUPT` (recv), `TIMEOUT` (poll), `RESET` (close), `TRICKLE` (recv, stream), `DUP` (recv) |
 | `libchaos-dns` | `/tmp/.chaos-dns.conf` | `GAI`, `LATENCY`, `REWRITE`, `SERVICE`, `OVERRIDE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT` |
-| `libchaos-time` | `/tmp/.chaos-time.conf` | `ERRNO`, `LATENCY`, `OFFSET` and `REGRESS` (clock_gettime selectors; `REGRESS` needs `clock_gettime/<clock>`) |
+| `libchaos-time` | `/tmp/.chaos-time.conf` | `ERRNO`, `LATENCY`, `OFFSET`, `REGRESS` and `FREEZE` (clock_gettime selectors; `REGRESS` needs `clock_gettime/<clock>`) |
 | `libchaos-memory` | `/tmp/.chaos-memory.conf` | `ERRNO`, `LATENCY` |
 | `libchaos-process` | `/tmp/.chaos-process.conf` | `ERRNO`, `LATENCY`, `FAIL_AFTER` |
 

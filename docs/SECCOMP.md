@@ -344,9 +344,11 @@ first.
 
 - **time.** Programs read clocks through the vDSO, without a system call, so seccomp
   never sees them. Sleeps (`nanosleep`, `clock_nanosleep`) would be visible, but Go
-  sleeps through its own timers, and the clock-shifting effects (OFFSET, REGRESS) change
+  sleeps through its own timers, and the clock effects (OFFSET, REGRESS, FREEZE) change
   results the kernel never returns through a notification. `--libs time` installs no
-  rule for it.
+  rule for it. No rule of the library is supported, so there is no per-rule
+  `CHAOS_TIME_RULE_SUPPORTED` predicate to reject one: the whole library is reported as
+  applying nothing.
 - **dns.** `getaddrinfo` is a library function. A static program resolves names with
   plain UDP/TCP to port 53, which net rules can fail or delay by endpoint, but not by
   the name looked up. `--libs dns` installs no rule for it.

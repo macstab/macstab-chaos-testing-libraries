@@ -786,7 +786,8 @@ chaos_time_effect_allowed(const chaos_time_selector_t *selector, chaos_time_effe
     {
         return 1;
     }
-    if (effect != CHAOS_TIME_EFFECT_OFFSET && effect != CHAOS_TIME_EFFECT_REGRESS)
+    if (effect != CHAOS_TIME_EFFECT_OFFSET && effect != CHAOS_TIME_EFFECT_REGRESS &&
+        effect != CHAOS_TIME_EFFECT_FREEZE)
     {
         return 0;
     }
@@ -1105,6 +1106,17 @@ int chaos_time_config_parse_line(char *line, chaos_time_rule_t *rule)
             return -1;
         }
         return chaos_time_parse_latency(payload, &rule->latency_ms) == 0 ? 1 : -1;
+    }
+    if (strcmp(effect_text, "FREEZE") == 0)
+    {
+        rule->effect = CHAOS_TIME_EFFECT_FREEZE;
+        if (!chaos_time_effect_allowed(&rule->selector, rule->effect))
+        {
+            return -1;
+        }
+        /* The value field is the probability, as net's `close:RESET:1` does it: FREEZE
+         * carries nothing else, and a two-field line is not in the grammar. */
+        return chaos_time_parse_probability(value_text, &rule->probability) == 0 ? 1 : -1;
     }
     if (strcmp(effect_text, "OFFSET") == 0)
     {
