@@ -15,7 +15,8 @@
  *      endpoint does not resolve (not a socket, unsupported family or type) is forwarded
  *      untouched.
  *   3. Match the active snapshot; apply pre-call effects (LATENCY, ERRNO), make the real
- *      call, apply post-call effects (CORRUPT; DUP and TRICKLE reshape the receive).
+ *      call, apply post-call effects (CORRUPT; DUP and TRICKLE reshape the receive). DROP
+ *      replaces the call: the byte count is reported and the datagram is not sent.
  * While no rule is active, step 2 is skipped for the connected-socket and descriptor
  * paths, so an idle library costs one throttled check per call.
  *
@@ -983,6 +984,32 @@ static int chaos_net_is_stream(int fd)
 }
 
 /**
+ * @brief Whether a DROP rule fires for a send of `rule->call_size` bytes on @p fd.
+ *
+ * @details DROP reports a send as done and sends nothing, which is a lost packet. Only a
+ * datagram socket qualifies: datagrams are a lossy medium and a program that uses them
+ * must survive one going missing, while a hole in a TCP stream is not packet loss -- the
+ * kernel retransmits until the bytes arrive or the connection breaks, so a stream with a
+ * silent gap is a state no network produces.
+ *
+ * A send whose byte count is not a value the call could return is left alone: an unreadable
+ * vector reports CHAOS_POLICY_NO_SIZE and an iovec total may exceed SSIZE_MAX, and reporting
+ * either as sent would hand the caller a negative count, i.e. an error with no errno. One
+ * bound covers both, since the sentinel is UINT64_MAX. The kernel rejects such a call with
+ * EINVAL anyway. The rule is asked last, so a call DROP leaves alone counts no hit, as with
+ * TRICKLE.
+ *
+ * @param rule  Matched rule.
+ * @param fd    Socket being written.
+ * @return Non-zero when the real send must be skipped and `rule->call_size` reported.
+ */
+static int chaos_net_drops(chaos_net_rule_t *rule, int fd)
+{
+    return rule->effect == CHAOS_NET_EFFECT_DROP && rule->call_size <= (uint64_t)SSIZE_MAX &&
+           CHAOS_NET_SOCKET_TYPE(fd) == SOCK_DGRAM && chaos_net_rule_should_trigger(rule);
+}
+
+/**
  * @brief Bytes of a @p size-byte buffer that a receive returning @p rc actually filled.
  *
  * @details With MSG_TRUNC, a datagram receive returns the full datagram length, which can
@@ -1088,7 +1115,8 @@ int chaos_net_match_connected(
  * @brief send(2) wrapper: SEND rules on either end of the connection.
  *
  * @details send() has no destination argument; chaos_net_match_connected() searches both
- * ends of the connection, the peer winning ties. `@size` sees @p size.
+ * ends of the connection, the peer winning ties. `@size` sees @p size. A firing DROP on a
+ * datagram socket reports @p size as sent without sending it (chaos_net_drops()).
  */
 CHAOS_NET_EXPORT ssize_t send(int sockfd, const void *buffer, size_t size, int flags)
 {
@@ -1105,6 +1133,10 @@ CHAOS_NET_EXPORT ssize_t send(int sockfd, const void *buffer, size_t size, int f
     if (chaos_net_apply_pre_call_rule(&rule) != 0)
     {
         return -1;
+    }
+    if (chaos_net_drops(&rule, sockfd))
+    {
+        return (ssize_t)size;
     }
     return chaos_net_call_real_send(sockfd, buffer, size, flags);
 }
@@ -1150,6 +1182,10 @@ CHAOS_NET_EXPORT ssize_t sendto(
     {
         return -1;
     }
+    if (chaos_net_drops(&rule, sockfd))
+    {
+        return (ssize_t)size;
+    }
     return chaos_net_call_real_sendto(sockfd, buffer, size, flags, address_ptr, address_length);
 }
 
@@ -1185,6 +1221,10 @@ CHAOS_NET_EXPORT ssize_t sendmsg(int sockfd, const struct msghdr *message, int f
     if (chaos_net_apply_pre_call_rule(&rule) != 0)
     {
         return -1;
+    }
+    if (chaos_net_drops(&rule, sockfd))
+    {
+        return (ssize_t)rule.call_size;
     }
     return chaos_net_call_real_sendmsg(sockfd, message, flags);
 }
@@ -1806,7 +1846,7 @@ CHAOS_NET_EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
 }
 
 /**
- * @brief write(2) wrapper: `send` rules (LATENCY, ERRNO) on sockets; everything else
+ * @brief write(2) wrapper: `send` rules (LATENCY, ERRNO, DROP) on sockets; everything else
  *        forwarded.
  */
 CHAOS_NET_EXPORT ssize_t write(int fd, const void *buffer, size_t size)
@@ -1814,16 +1854,22 @@ CHAOS_NET_EXPORT ssize_t write(int fd, const void *buffer, size_t size)
     chaos_net_rule_t rule;
 
     chaos_net_ensure_symbols();
-    if (chaos_net_match_descriptor_rule(fd, CHAOS_NET_OP_SEND, (uint64_t)size, &rule) &&
-        chaos_net_apply_pre_call_rule(&rule) != 0)
+    if (chaos_net_match_descriptor_rule(fd, CHAOS_NET_OP_SEND, (uint64_t)size, &rule))
     {
-        return -1;
+        if (chaos_net_apply_pre_call_rule(&rule) != 0)
+        {
+            return -1;
+        }
+        if (chaos_net_drops(&rule, fd))
+        {
+            return (ssize_t)size;
+        }
     }
     return chaos_net_call_real_write(fd, buffer, size);
 }
 
 /**
- * @brief writev(2) wrapper: `send` rules (LATENCY, ERRNO) on sockets; everything else
+ * @brief writev(2) wrapper: `send` rules (LATENCY, ERRNO, DROP) on sockets; everything else
  *        forwarded.
  */
 CHAOS_NET_EXPORT ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
@@ -1833,10 +1879,16 @@ CHAOS_NET_EXPORT ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
     chaos_net_ensure_symbols();
     if (chaos_net_match_descriptor_rule(
             fd, CHAOS_NET_OP_SEND, chaos_net_iovec_size(iov, iovcnt), &rule
-        ) &&
-        chaos_net_apply_pre_call_rule(&rule) != 0)
+        ))
     {
-        return -1;
+        if (chaos_net_apply_pre_call_rule(&rule) != 0)
+        {
+            return -1;
+        }
+        if (chaos_net_drops(&rule, fd))
+        {
+            return (ssize_t)rule.call_size;
+        }
     }
     return chaos_net_call_real_writev(fd, iov, iovcnt);
 }

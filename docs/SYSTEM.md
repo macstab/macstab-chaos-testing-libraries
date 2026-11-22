@@ -259,7 +259,7 @@ layered fault models.
 | rule file | `/tmp/.chaos-<lib>.conf`, one per library; re-read when its change stamp changes (reload) |
 | rule | one line of a rule file: selector, operation, effect, value, optional probability and qualifiers |
 | selector | what a rule matches: path prefix (io), endpoint (net), DNS name or address (dns), operation[/target] (time, memory, process) |
-| effect | what a matching rule does: `ERRNO`, `LATENCY`, `TIMEOUT`, `CORRUPT`, `TORN`, `TRICKLE`, `DUP`, `RESET`, `OFFSET`, `REGRESS`, `FREEZE`, `GAI`, `REWRITE`, `OVERRIDE`, `SERVICE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT`, `FAIL_AFTER` |
+| effect | what a matching rule does: `ERRNO`, `LATENCY`, `TIMEOUT`, `CORRUPT`, `TORN`, `DROP`, `TRICKLE`, `DUP`, `RESET`, `OFFSET`, `REGRESS`, `FREEZE`, `GAI`, `REWRITE`, `OVERRIDE`, `SERVICE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT`, `FAIL_AFTER` |
 | probability | chance in [0, 1] that a matching rule fires on a call, sampled from a per-thread PRNG |
 | qualifier | `@first=N`, `@from=T`, `@until=T`, `@size>N`, `@size<N` (`src/common/chaos_policy.h`) |
 | hit | one application of a rule's effect; counted per rule |
@@ -638,7 +638,8 @@ Responsibilities:
 - effects `ERRNO`, `LATENCY`, `CORRUPT` (recv), `TIMEOUT` (poll),
   `RESET` (close: abortive close, the peer receives an RST), `TRICKLE`
   (recv on stream sockets: at most N bytes per call), `DUP` (recv: deliver
-  the previous payload once more)
+  the previous payload once more), `DROP` (send on datagram sockets: the
+  byte count is reported and nothing is sent)
 
 State: two snapshots; no socket identity cache (net shares `close` with io
 and cannot observe every way a descriptor is freed, so identity is derived
@@ -1117,7 +1118,7 @@ their own architecture (`matrix.yml`).
 | Library | Rule file | Effects |
 | --- | --- | --- |
 | `libchaos-io` | `/tmp/.chaos-io.conf` | `ERRNO`, `LATENCY`, `TORN` and `DROP` (write side), `CORRUPT` (read side) |
-| `libchaos-net` | `/tmp/.chaos-net.conf` | `ERRNO`, `LATENCY`, `CORRUPT` (recv), `TIMEOUT` (poll), `RESET` (close), `TRICKLE` (recv, stream), `DUP` (recv) |
+| `libchaos-net` | `/tmp/.chaos-net.conf` | `ERRNO`, `LATENCY`, `CORRUPT` (recv), `TIMEOUT` (poll), `RESET` (close), `TRICKLE` (recv, stream), `DUP` (recv), `DROP` (send, datagram) |
 | `libchaos-dns` | `/tmp/.chaos-dns.conf` | `GAI`, `LATENCY`, `REWRITE`, `SERVICE`, `OVERRIDE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT` |
 | `libchaos-time` | `/tmp/.chaos-time.conf` | `ERRNO`, `LATENCY`, `OFFSET`, `REGRESS` and `FREEZE` (clock_gettime selectors; `REGRESS` needs `clock_gettime/<clock>`) |
 | `libchaos-memory` | `/tmp/.chaos-memory.conf` | `ERRNO`, `LATENCY` |

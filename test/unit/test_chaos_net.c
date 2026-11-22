@@ -2958,6 +2958,105 @@ static void test_wrappers_record_call_size(void)
 }
 
 /**
+ * @brief Proves DROP reports a datagram send that did not happen, and only for datagrams.
+ *
+ * @details A lost packet is what a program using UDP has to survive, and no other effect
+ * produces one: ERRNO is a send the program knows failed. Covered:
+ * - send, sendto, sendmsg, write and writev on a datagram socket report their full byte
+ *   count and make no real call;
+ * - a stream socket is left alone and the draw is not even taken: a silent gap in a TCP
+ *   stream is a state no network produces, since the kernel retransmits until the bytes
+ *   arrive or the connection breaks;
+ * - a draw that misses sends for real;
+ * - a send whose byte count is not a value the call could return (an iovec total above
+ *   SSIZE_MAX, which also covers the unreadable-vector sentinel) is sent: reporting it as
+ *   sent would hand the caller a negative count, i.e. an error with no errno.
+ */
+static void test_drop_datagram_sends(void)
+{
+    char buffer[4] = {'d', 'a', 't', 'a'};
+    struct iovec iov;
+    struct iovec huge;
+    struct msghdr message;
+
+    iov.iov_base = buffer;
+    iov.iov_len = sizeof(buffer);
+    huge.iov_base = buffer;
+    huge.iov_len = (size_t)SSIZE_MAX + 1U;
+    memset(&message, 0, sizeof(message));
+    message.msg_iov = &iov;
+    message.msg_iovlen = 1U;
+
+    /* Every send form on a datagram socket: full count reported, no real call.
+     * reset_wrapper_stubs() leaves the draw counter alone, so it is cleared here. */
+    reset_wrapper_stubs();
+    g_should_trigger_calls = 0;
+    g_test_socket_type = SOCK_DGRAM;
+    g_stub_endpoint_from_peer = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_DROP;
+    g_should_trigger = 1;
+    assert(send(4, buffer, 4U, 0) == 4);
+    assert(g_send_calls == 0);
+    assert(sendto(4, buffer, 4U, 0, NULL, 0U) == 4);
+    assert(g_sendto_calls == 0);
+    assert(sendmsg(4, &message, 0) == 4);
+    assert(g_sendmsg_calls == 0);
+    assert(g_should_trigger_calls == 3);
+
+    /* A stream socket is not dropped, and no draw is spent on it. */
+    reset_wrapper_stubs();
+    g_should_trigger_calls = 0;
+    g_test_socket_type = SOCK_STREAM;
+    g_stub_endpoint_from_peer = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_DROP;
+    g_should_trigger = 1;
+    assert(send(4, buffer, 4U, 0) == 4);
+    assert(g_send_calls == 1);
+    assert(g_should_trigger_calls == 0);
+
+    /* A draw that misses sends for real. */
+    reset_wrapper_stubs();
+    g_test_socket_type = SOCK_DGRAM;
+    g_stub_endpoint_from_peer = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_DROP;
+    g_should_trigger = 0;
+    assert(send(4, buffer, 4U, 0) == 4);
+    assert(g_send_calls == 1);
+
+    /* A message with no readable byte count is sent. */
+    reset_wrapper_stubs();
+    g_test_socket_type = SOCK_DGRAM;
+    g_stub_endpoint_from_peer = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_DROP;
+    g_should_trigger = 1;
+    message.msg_iov = &huge;
+    assert(sendmsg(4, &message, 0) == g_sendmsg_result);
+    assert(g_sendmsg_calls == 1);
+    message.msg_iov = &iov;
+
+    /* write() and writev() on a datagram socket are sends too. */
+    reset_descriptor_stubs();
+    g_test_socket_type = SOCK_DGRAM;
+    g_stub_prepare = 1;
+    g_stub_endpoint_from_peer = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_DROP;
+    g_should_trigger = 1;
+    assert(write(5, buffer, 4U) == 4);
+    assert(writev(5, &iov, 1) == (ssize_t)sizeof(buffer));
+    assert(g_descriptor_calls == 0);
+    g_test_socket_type = SOCK_STREAM;
+    assert(write(5, buffer, 4U) == 4);
+    assert(g_descriptor_calls == 1);
+    reset_wrapper_stubs();
+    g_test_socket_type = SOCK_STREAM;
+}
+
+/**
  * @brief Proves TRICKLE shortens every receive form to the rule's chunk size, and leaves
  *   alone what it must not shorten.
  *
@@ -4285,6 +4384,7 @@ int main(void)
     test_dup_skips_and_close_races();
     test_trickle_and_dup_edges();
     test_dup_replays_the_last_payload();
+    test_drop_datagram_sends();
     test_trickle_shortens_receives();
     test_wrappers_record_call_size();
     test_size_of_vectors_and_messages();

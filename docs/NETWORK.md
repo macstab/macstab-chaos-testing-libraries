@@ -504,6 +504,7 @@ tcp4://*:5432:accept:LATENCY:150
 unix:///var/run/docker.sock:recv:CORRUPT:0.01
 *:poll:TIMEOUT:0.1
 tcp4://127.0.0.1:5432:connect:ECONNREFUSED:1.0 @first=3
+udp4://10.0.0.5:53:send:DROP:0.1
 ```
 
 ### Effects
@@ -517,8 +518,19 @@ tcp4://127.0.0.1:5432:connect:ECONNREFUSED:1.0 @first=3
 | RESET | probability | `close` | before the close |
 | TRICKLE | bytes per receive, 1–4294967295 | `recv` | before the receive |
 | DUP | probability | `recv` | instead of the next receive |
+| DROP | probability | `send` | instead of the send, on datagram sockets |
 
-An effect/operation pair outside this table rejects the rule file. LATENCY takes its
+An effect/operation pair outside this table rejects the rule file.
+
+DROP reports a send as done and sends nothing, which is a lost packet. It applies to
+datagram sockets only, decided per call from `SO_TYPE` rather than from the selector: a
+`*:send:DROP` rule is accepted and leaves stream sends alone, counting no hit for them. A
+hole in a TCP stream is not packet loss -- the kernel retransmits until the bytes arrive
+or the connection breaks, so a stream with a silent gap is a state no network produces,
+and a program could not be written to survive it. `sendmmsg` is left alone as well: its
+result is a message count, not a byte count. A send whose byte count is not a value the
+call could return (an unreadable vector, or an iovec total above `SSIZE_MAX`) is sent for
+real, since reporting it would hand the caller a negative count. LATENCY takes its
 probability as an optional `@probability` after the milliseconds
 (`tcp4://127.0.0.1:6379:recv:LATENCY:200@0.1`); without one it is 1.0 and the rule
 fires on every matching call that passes its qualifiers, which is what `LATENCY:ms`

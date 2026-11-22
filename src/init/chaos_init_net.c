@@ -26,10 +26,14 @@
  * at most CHAOS_INIT_NET_MAX_WAIT (1024) per call.
  *
  * @par Supported effects
- * ERRNO (not on close), LATENCY, and TIMEOUT on the poll family. CORRUPT, TRICKLE and DUP
- * change received data; RESET needs the socket itself (SO_LINGER); ERRNO on close would
- * have to close and fail at once. A rule file with any of them is rejected at parse time
- * via CHAOS_NET_RULE_SUPPORTED (`unsupported in seccomp mode`).
+ * ERRNO (not on close), LATENCY, TIMEOUT on the poll family, and DROP on a datagram send.
+ * CORRUPT, TRICKLE and DUP change received data; RESET needs the socket itself (SO_LINGER);
+ * ERRNO on close would have to close and fail at once. A rule file with any of them is
+ * rejected at parse time via CHAOS_NET_RULE_SUPPORTED (`unsupported in seccomp mode`).
+ * DROP needs nothing from the data: the reply carries the byte count and the call does not
+ * run, which is the whole effect. It is left to the real call for a stream socket, as in
+ * the library, and for `sendmmsg`, whose result is a message count rather than a byte
+ * count.
  *
  * @par Cost
  * Endpoint lookups read /proc files per descriptor, so they run only when a loaded rule
@@ -74,11 +78,12 @@ static int chaos_init_net_supported(const struct chaos_net_rule *rule);
 #include <sys/un.h>
 #include <sys/xattr.h>
 
-/* CHAOS_NET_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, TIMEOUT. */
+/* CHAOS_NET_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, TIMEOUT, DROP. */
 static int chaos_init_net_supported(const struct chaos_net_rule *rule)
 {
     return (rule->effect == CHAOS_NET_EFFECT_ERRNO && rule->operation != CHAOS_NET_OP_CLOSE) ||
-           rule->effect == CHAOS_NET_EFFECT_LATENCY || rule->effect == CHAOS_NET_EFFECT_TIMEOUT;
+           rule->effect == CHAOS_NET_EFFECT_LATENCY || rule->effect == CHAOS_NET_EFFECT_TIMEOUT ||
+           rule->effect == CHAOS_NET_EFFECT_DROP;
 }
 
 /**
@@ -524,6 +529,14 @@ chaos_net_getsockopt_fn g_chaos_net_real_getsockopt = chaos_init_net_getsockopt;
 __thread int g_chaos_net_tls_guard = 0;
 uint64_t g_chaos_net_lineage = 0U;
 uint64_t g_chaos_net_process_seed = UINT64_C(0x9e3779b97f4a7c15);
+
+/** @brief Whether the tracee's descriptor @p fd is a datagram socket; 0 when unknown. */
+static int chaos_init_net_is_datagram(uint64_t fd)
+{
+    const chaos_init_net_protocol_t *protocol = chaos_init_net_protocol((int)fd);
+
+    return protocol != NULL && protocol->type == SOCK_DGRAM;
+}
 
 /** @brief How a system call names the socket(s) it acts on, i.e. which endpoint is matched. */
 typedef enum chaos_init_net_kind
@@ -1245,11 +1258,20 @@ int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *v
     {
         size = chaos_init_net_batch_size(call->args[1], call->args[2]);
     }
-    /* A loaded rule is ERRNO, LATENCY or TIMEOUT only (chaos_init_net_supported()). A
-     * wait without a timeout never times out, so TIMEOUT does not apply to it; checked
+    /* A loaded rule is ERRNO, LATENCY, TIMEOUT or DROP only (chaos_init_net_supported()).
+     * A wait without a timeout never times out, so TIMEOUT does not apply to it; checked
      * before triggering, so such a call counts no hit. */
     if (rule.effect == CHAOS_NET_EFFECT_TIMEOUT &&
         (timeout_ms = chaos_init_net_wait_timeout(call)) < 0)
+    {
+        return 1;
+    }
+    /* DROP answers with the byte count, so it needs a count the call could have returned
+     * and a datagram socket (chaos_net_drops() in the library decides the same two things).
+     * A batch reports a message count instead, which is why sendmmsg is left alone. Also
+     * checked before triggering, so a call it leaves alone counts no hit. */
+    if (rule.effect == CHAOS_NET_EFFECT_DROP && (size > (uint64_t)SSIZE_MAX || entry->size == -4 ||
+                                                 !chaos_init_net_is_datagram(call->args[0])))
     {
         return 1;
     }
@@ -1273,6 +1295,11 @@ int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *v
     {
         verdict->action = CHAOS_INIT_DELAY;
         verdict->delay_ms = rule.latency_ms;
+    }
+    else if (rule.effect == CHAOS_NET_EFFECT_DROP)
+    {
+        verdict->action = CHAOS_INIT_RETURN;
+        verdict->value = (long)size;
     }
     else
     {

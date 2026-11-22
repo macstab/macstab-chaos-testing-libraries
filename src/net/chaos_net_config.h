@@ -88,6 +88,7 @@ typedef enum chaos_net_operation
  *   | RESET   | close      | SO_LINGER {1, 0} before the close: the peer gets an RST |
  *   | TRICKLE | recv       | A stream receive returns at most chunk_bytes |
  *   | DUP     | recv       | The socket's previous payload is delivered once more |
+ *   | DROP    | send       | Datagram sockets: the byte count is reported, nothing is sent |
  *
  * chaos_net_effect_allowed() enforces the Operations column at parse time.
  * CHAOS_NET_EFFECT_INVALID (-1) is the parser's failure value.
@@ -101,7 +102,8 @@ typedef enum chaos_net_effect
     CHAOS_NET_EFFECT_TIMEOUT,      /**< POLL-only: wait out the timeout, return 0. */
     CHAOS_NET_EFFECT_RESET,        /**< CLOSE-only: abortive close, the peer receives an RST. */
     CHAOS_NET_EFFECT_TRICKLE,      /**< RECV-only: return at most chunk_bytes per call. */
-    CHAOS_NET_EFFECT_DUP           /**< RECV-only: deliver the previous payload once more. */
+    CHAOS_NET_EFFECT_DUP,          /**< RECV-only: deliver the previous payload once more. */
+    CHAOS_NET_EFFECT_DROP          /**< SEND-only, datagrams: report the send, send nothing. */
 } chaos_net_effect_t;
 
 /**

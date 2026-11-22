@@ -12,6 +12,7 @@
  *   follow the locale-independent grammar of `chaos_policy_parse_probability()`; qualifiers
  *   land in the rule's policy; a rejected line fails the whole file with its line number;
  * - checks: ERRNO is valid for every operation; CORRUPT, TRICKLE and DUP only for recv,
+ *   DROP only for send,
  *   TIMEOUT only for poll, RESET only for close; `socket` rules take only `*`, a wildcard
  *   host with port 0, or `unix://\*` (no address exists at socket() time); a build hook
  *   (`CHAOS_NET_RULE_SUPPORTED`, defined by `chaos-init`) can reject rules as UNSUPPORTED;
@@ -478,6 +479,9 @@ static void test_helper_functions(void)
     assert(chaos_net_effect_allowed(CHAOS_NET_OP_RECV, CHAOS_NET_EFFECT_ERRNO));
     assert(chaos_net_effect_allowed(CHAOS_NET_OP_RECV, CHAOS_NET_EFFECT_CORRUPT));
     assert(chaos_net_effect_allowed(CHAOS_NET_OP_POLL, CHAOS_NET_EFFECT_TIMEOUT));
+    assert(chaos_net_effect_allowed(CHAOS_NET_OP_SEND, CHAOS_NET_EFFECT_DROP));
+    assert(!chaos_net_effect_allowed(CHAOS_NET_OP_RECV, CHAOS_NET_EFFECT_DROP));
+    assert(!chaos_net_effect_allowed(CHAOS_NET_OP_CLOSE, CHAOS_NET_EFFECT_DROP));
     assert(!chaos_net_effect_allowed(CHAOS_NET_OP_INVALID, CHAOS_NET_EFFECT_LATENCY));
     assert(!chaos_net_effect_allowed(CHAOS_NET_OP_CONNECT, (chaos_net_effect_t)9999));
 
@@ -1948,6 +1952,26 @@ static void test_trickle_rule(void)
         assert(rule.effect == CHAOS_NET_EFFECT_DUP && rule.probability == 0.5);
         assert(chaos_net_config_parse_line(dup_send, &rule) == -1);
         assert(chaos_net_config_parse_line(dup_bad, &rule) == -1);
+    }
+
+    /* DROP is send-only and takes a probability. Whether the socket is a datagram one is
+     * not knowable from the rule text, so it is decided per call, not here. */
+    {
+        char drop[] = "udp4://127.0.0.1:9000:send:DROP:0.25";
+        char drop_any[] = "*:send:DROP:1";
+        char drop_recv[] = "udp4://127.0.0.1:9000:recv:DROP:1";
+        char drop_close[] = "udp4://127.0.0.1:9000:close:DROP:1";
+        char drop_bad[] = "udp4://127.0.0.1:9000:send:DROP:lots";
+        char drop_above_one[] = "udp4://127.0.0.1:9000:send:DROP:1.5";
+
+        assert(chaos_net_config_parse_line(drop, &rule) == 1);
+        assert(rule.effect == CHAOS_NET_EFFECT_DROP && rule.probability == 0.25);
+        assert(chaos_net_config_parse_line(drop_any, &rule) == 1);
+        assert(rule.effect == CHAOS_NET_EFFECT_DROP && rule.probability == 1.0);
+        assert(chaos_net_config_parse_line(drop_recv, &rule) == -1);
+        assert(chaos_net_config_parse_line(drop_close, &rule) == -1);
+        assert(chaos_net_config_parse_line(drop_bad, &rule) == -1);
+        assert(chaos_net_config_parse_line(drop_above_one, &rule) == -1);
     }
 }
 

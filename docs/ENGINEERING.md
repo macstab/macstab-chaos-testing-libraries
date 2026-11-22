@@ -88,7 +88,7 @@ Shared mechanisms live in header-only `src/common/` (see
 1. [`src/net/chaos_net.c`](../src/net/chaos_net.c) — constructor, real functions, seed
 2. [`src/net/chaos_net_config.c`](../src/net/chaos_net_config.c) — reload, parser, endpoint-rank selection
 3. [`src/net/chaos_net_endpoint.c`](../src/net/chaos_net_endpoint.c) — selector parsing; endpoints from `sockaddr`, `getsockname`/`getpeername`, `SO_TYPE`
-4. [`src/net/chaos_net_socket.c`](../src/net/chaos_net_socket.c) — `connect`, `accept`, `send*`/`recv*`, and `read`/`write`/`readv`/`writev`/`close` on sockets; `TRICKLE`, `DUP`, `RESET`
+4. [`src/net/chaos_net_socket.c`](../src/net/chaos_net_socket.c) — `connect`, `accept`, `send*`/`recv*`, and `read`/`write`/`readv`/`writev`/`close` on sockets; `TRICKLE`, `DUP`, `RESET`, `DROP`
 5. [`src/net/chaos_net_extra.c`](../src/net/chaos_net_extra.c) — `socket`, `socketpair`, `shutdown`, `sendmmsg`, `recvmmsg`
 6. [`src/net/chaos_net_wait.c`](../src/net/chaos_net_wait.c) — `poll`, `ppoll`, `select`, `pselect`, `epoll_wait`, `epoll_pwait`; epoll membership from `/proc/self/fdinfo`
 7. [`src/net/chaos_net_actions.c`](../src/net/chaos_net_actions.c) — probability, latency, corruption
@@ -264,7 +264,9 @@ Owns `connect`, `accept`/`accept4`, `send`/`sendto`/`sendmsg`,
 to libc directly. Receive reshaping lives here: `TRICKLE` only on stream
 sockets (shortening a datagram receive truncates the datagram), and only for
 iovec arrays of at most 64 entries; `DUP` skips peeks, `MSG_TRUNC`,
-out-of-band and error-queue reads, `MSG_WAITALL` and empty buffers.
+out-of-band and error-queue reads, `MSG_WAITALL` and empty buffers. `DROP`
+replaces a send on a datagram socket with its own byte count, for the same
+reason mirrored: a gap in a stream is not packet loss.
 
 ### [`src/net/chaos_net_extra.c`](../src/net/chaos_net_extra.c)
 

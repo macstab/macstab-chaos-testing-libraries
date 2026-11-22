@@ -413,6 +413,7 @@ call passes through.
 | `TRICKLE` | bytes per call (≥ 1) | `recv` | Every receive on a stream socket returns at most that many bytes; data stays complete and in order. Not applied to datagram sockets, `MSG_WAITALL` receives, requests no larger than the chunk, or `recvmsg`/`readv` with more than 64 iovecs. No probability. |
 | `DUP` | probability | `recv` | Delivers the socket's previous payload again (with its sender address for datagrams) instead of new data: at-least-once delivery. Payloads are kept per socket up to 4 KiB (longer ones replay truncated) for 64 sockets at once. Skipped for `MSG_PEEK`, `MSG_TRUNC`, `MSG_OOB`, `MSG_WAITALL` and empty buffers. |
 | `RESET` | probability | `close` | Sets `SO_LINGER` to 0 before the close, so the peer receives an RST (`ECONNRESET`) instead of a FIN, as after a crashed process or a load balancer drop. |
+| `DROP` | probability | `send` | Reports the full byte count as sent and sends nothing: a lost packet. Datagram sockets only, decided per call from `SO_TYPE`, so a `*:send:DROP` rule leaves stream sends alone and counts no hit for them — a silent gap in a TCP stream is a state no network produces. Not applied to `sendmmsg`, whose result is a message count. |
 
 **Errnos.** `ECONNREFUSED`, `ETIMEDOUT`, `ECONNRESET`, `EHOSTUNREACH`, `ENETUNREACH`,
 `EADDRINUSE`, `EADDRNOTAVAIL`, `EAFNOSUPPORT`, `EPROTONOSUPPORT`, `EPIPE`, `ENOTCONN`,

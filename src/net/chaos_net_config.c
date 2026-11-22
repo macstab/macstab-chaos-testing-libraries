@@ -685,6 +685,8 @@ chaos_net_parse_latency_value(const char *text, unsigned int *latency_ms, double
  *   - CORRUPT, TRICKLE, DUP: RECV only; they act on received bytes.
  *   - TIMEOUT: POLL only; it fakes a wait that found nothing ready.
  *   - RESET: CLOSE only; it turns the close into an abortive one.
+ *   - DROP: SEND only; it reports a send that did not happen. The socket has to be a
+ *     datagram one, which only the call can tell (chaos_net_drops()).
  *
  * @param operation  The rule's operation.
  * @param effect     The rule's effect.
@@ -716,6 +718,10 @@ static int chaos_net_effect_allowed(chaos_net_operation_t operation, chaos_net_e
     if (effect == CHAOS_NET_EFFECT_RESET)
     {
         return operation == CHAOS_NET_OP_CLOSE;
+    }
+    if (effect == CHAOS_NET_EFFECT_DROP)
+    {
+        return operation == CHAOS_NET_OP_SEND;
     }
     return 0;
 }
@@ -1145,6 +1151,14 @@ int chaos_net_config_parse_line(char *line, chaos_net_rule_t *rule)
     else if (strcmp(effect_text, "RESET") == 0)
     {
         rule->effect = CHAOS_NET_EFFECT_RESET;
+        if (chaos_net_parse_probability(value_text, &rule->probability) != 0)
+        {
+            return -1;
+        }
+    }
+    else if (strcmp(effect_text, "DROP") == 0)
+    {
+        rule->effect = CHAOS_NET_EFFECT_DROP;
         if (chaos_net_parse_probability(value_text, &rule->probability) != 0)
         {
             return -1;

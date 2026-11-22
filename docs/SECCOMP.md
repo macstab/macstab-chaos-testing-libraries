@@ -228,7 +228,7 @@ output `dist/chaos-init-<arch>`; or `make native-init`, output `build/chaos-init
 | Library | Applied | Matched on |
 |---|---|---|
 | io | ERRNO, LATENCY on open, read, write, pread, pwrite, close (LATENCY only), fsync, fdatasync, truncate, allocate, unlink, rename; DROP on pwrite | the path: absolute, or joined lexically to `/proc/<pid>/cwd` or to the directory descriptor's path; descriptors through `/proc/<pid>/fd`. As in the library, descriptors 0–2, paths under `/proc`, `/sys`, `/dev` and the `/tmp/.chaos-*` control files are never faulted |
-| net | ERRNO, LATENCY on socket, bind, listen, connect, accept, shutdown, send, recv, close (LATENCY only), poll; TIMEOUT on the poll family | the endpoint: sockaddr arguments from memory, a socket's own address and peer from `/proc/<pid>/net/*` or sock_diag (§3.2), its type from its `system.sockprotoname` attribute |
+| net | ERRNO, LATENCY on socket, bind, listen, connect, accept, shutdown, send, recv, close (LATENCY only), poll; TIMEOUT on the poll family; DROP on a datagram send (not `sendmmsg`) | the endpoint: sockaddr arguments from memory, a socket's own address and peer from `/proc/<pid>/net/*` or sock_diag (§3.2), its type from its `system.sockprotoname` attribute |
 | memory | ERRNO, LATENCY on mmap (anon/file), munmap, mprotect, madvise | the arguments: operation, `mmap` flags, length for `@size` |
 | process | ERRNO, LATENCY, FAIL_AFTER on pthread_create, fork, posix_spawn, execve, execveat, waitpid | the system call and clone's flags (§5) |
 | dns, time | nothing (§6) | |

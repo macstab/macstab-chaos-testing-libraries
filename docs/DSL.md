@@ -181,6 +181,7 @@ net-effect    = net-errno ":" probability                   ; every operation
               / "DUP" ":" probability                       ; recv only
               / "TIMEOUT" ":" probability                   ; poll only
               / "RESET" ":" probability                     ; close only
+              / "DROP" ":" probability                      ; send only, datagram sockets
 net-errno     = "ECONNREFUSED" / "ETIMEDOUT" / "ECONNRESET" / "EHOSTUNREACH"
               / "ENETUNREACH" / "EADDRINUSE" / "EADDRNOTAVAIL" / "EAFNOSUPPORT"
               / "EPROTONOSUPPORT" / "EPIPE" / "ENOTCONN" / "EOPNOTSUPP" / "EINVAL"
@@ -411,6 +412,7 @@ apply (§8).
 | `/data:read:CORRUPT:0.1` (io), `…:recv:CORRUPT:0.1` (net) | after a successful read: one bit of the returned bytes flips | `byteCorruption(probability=0.1)` | Toxiproxy `bandwidth` + custom byte mangler (rare) |
 | `/data:write:TORN:0.1` | before the call: the byte count is shortened to `[1, n-1]` | `partialWrite(probability=0.1)` | N/A |
 | `/data:write:DROP:0.1` (io) | instead of the call: the full count is reported and nothing is written | N/A | N/A |
+| `udp4://10.0.0.5:53:send:DROP:0.1` (net) | instead of the call: the datagram is reported sent and never leaves | N/A | `tc qdisc ... netem loss 10%` (per interface, not per rule) |
 
 ### 5.4. Class D — result-set transform (DNS)
 
@@ -622,7 +624,8 @@ select one rule
   LATENCY  → sleep, real call
   ERRNO    → fail (no real call; io close: real close, then fail)
   TORN     → real call with shortened count            (io write, pwrite)
-  DROP     → no real call, full count reported         (io write, pwrite)
+  DROP     → no real call, full count reported         (io write, pwrite;
+                                                        net send on datagrams)
   CORRUPT  → real call, then flip one returned bit     (io read, pread; net recv)
   other net effects: see NETWORK.md
 ```

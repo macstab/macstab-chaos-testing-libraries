@@ -1032,6 +1032,30 @@ int main(void)
     assert(PASSES(decide(__NR_listen, (uint64_t)listener, 4U, 0, 0, 0, 0)));
     g_fail_process = 0;
 
+    /* DROP: a datagram send is answered with its byte count and never runs, while the
+     * same rule leaves a stream send alone -- the supervisor decides the two cases exactly
+     * as the library does. sendmmsg reports a message count, so it is left alone too. */
+    (void)snprintf(
+        rules, sizeof(rules), "udp4://127.0.0.1:%u:send:DROP:1.0\n", ntohs(udp_address.sin_port)
+    );
+    write_rules(rules);
+    {
+        chaos_init_verdict_t dropped = decide(
+            __NR_sendto, (uint64_t)udp, P(buffer), 20U, 0, P(&udp_address), sizeof(udp_address)
+        );
+
+        assert(dropped.action == CHAOS_INIT_RETURN && dropped.value == 20L);
+        memset(messages, 0, sizeof(messages));
+        messages[0].msg_hdr.msg_name = &udp_address;
+        messages[0].msg_hdr.msg_namelen = sizeof(udp_address);
+        assert(PASSES(decide(__NR_sendmmsg, (uint64_t)udp, P(messages), 1U, 0, 0, 0)));
+    }
+    (void)snprintf(
+        rules, sizeof(rules), "tcp4://127.0.0.1:%u:send:DROP:1.0\n", ntohs(server_address.sin_port)
+    );
+    write_rules(rules);
+    assert(PASSES(decide(__NR_write, (uint64_t)server, P(buffer), 8U, 0, 0, 0)));
+
     /* A `/N` prefix selector works here too: the supervisor reads the sockaddr out of the
      * tracee and matches it with the same code the library uses, so the Docker bridge
      * network a container is given can be named without knowing its address. */
