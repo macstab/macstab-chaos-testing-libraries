@@ -176,7 +176,64 @@ typedef struct chaos_process_rule
     chaos_hit_slot_t *hit;
     /** Generation of @c hit when the rule was published; a later one means the rule left. */
     uint64_t hit_generation;
+    /**
+     * Draw key of the rule: `mix(process seed ^ hash(rule text))`, set when the snapshot is
+     * published. From the text, not the slot index: chaos_hits_assign() hands slots out
+     * again and another rule would inherit the key.
+     */
+    uint64_t key;
+    /**
+     * Base of this call's draws, set by chaos_process_rule_should_trigger() from the key and the
+     * rule's evaluation number; the effects derive their samples from it. Belongs to the one
+     * call this copy was made for, not to the rule as parsed.
+     */
+    uint64_t draw_base;
 } chaos_process_rule_t;
+
+/**
+ * @brief Starts this call's draws: records the rule's evaluation number and derives the
+ *        base every sample of this call comes from.
+ *
+ * @details Two stages, not one. The first turns (rule, evaluation) into a base, the second
+ * turns (base, draw number) into a sample, so a rule that takes several draws cannot
+ * collide with its own next evaluation -- which is what a single `key + n * K + d` does as
+ * soon as `d` reaches K, a constant the next effect added would break silently.
+ *
+ * @param rule Rule copy for this call; NULL is a no-op. A rule outside a snapshot (unit
+ *             tests) has no slot and is evaluation 0 every time.
+ */
+static inline void chaos_process_rule_draw_begin(chaos_process_rule_t *rule)
+{
+    uint64_t evaluation = 0U;
+
+    if (rule == NULL)
+    {
+        return;
+    }
+    if (rule->hit != NULL)
+    {
+        evaluation = __sync_fetch_and_add(&rule->hit->evaluations, UINT64_C(1));
+    }
+    rule->draw_base = chaos_process_prng_mix((rule->key ^ g_chaos_process_lineage) + evaluation);
+}
+
+/**
+ * @brief Sample @p draw of this call, uniform in [0, 2^32).
+ *
+ * @param rule Rule copy whose chaos_process_rule_draw_begin() ran.
+ * @param draw Which draw of this call: 0 is the probability, the effects follow.
+ * @return The sample.
+ */
+static inline uint32_t chaos_process_rule_draw(const chaos_process_rule_t *rule, uint64_t draw)
+{
+    return (uint32_t)(chaos_process_prng_mix(rule->draw_base + draw) >> 32);
+}
+
+/** @brief Draw number of the probability decision; effects number their draws after it. */
+#define CHAOS_PROCESS_DRAW_PROBABILITY UINT64_C(0)
+
+/** @brief First draw an effect may take after the probability. */
+#define CHAOS_PROCESS_DRAW_FIRST_EFFECT UINT64_C(1)
 
 /**
  * @brief Resets the rule state: both snapshots empty, hit pool and FAIL_AFTER counters

@@ -57,7 +57,7 @@ chaos_process_system_fn g_chaos_process_real_system = NULL;
 chaos_process_popen_fn g_chaos_process_real_popen = NULL;
 chaos_process_waitid_fn g_chaos_process_real_waitid = NULL;
 __thread int g_chaos_process_tls_guard = 0;
-__thread uint64_t g_chaos_process_tls_prng_state = 0U;
+uint64_t g_chaos_process_lineage = 0U;
 uint64_t g_chaos_process_process_seed = UINT64_C(0x2545f4914f6cdd1d);
 volatile uint64_t g_chaos_process_fail_after_counters[CHAOS_PROCESS_OP_COUNT] = {0U};
 
@@ -200,6 +200,42 @@ static uint64_t chaos_process_read_seed_material(void)
 }
 
 /**
+ * @brief The process seed: `CHAOS_SEED` from the environment, else 64 random bits.
+ *
+ * @details `CHAOS_SEED=<decimal u64>` makes every decision of this container reproducible:
+ * a rule's draws follow from the seed, the rule's text and the number of the evaluation,
+ * nothing else. Without it the seed is random, which is what a chaos test wants when it is
+ * not trying to reproduce one particular run.
+ *
+ * `getenv()` is safe here and nowhere else in the library: this runs in the ELF
+ * constructor, before `main`, single-threaded, before the application can call `setenv`.
+ * Anything unusable is ignored rather than rejected -- the seed decides which faults fire,
+ * not whether the rules are valid, and a rule file that loads is worth more to a test than
+ * a refusal over an environment variable. Digits only: strtoull() takes a sign, and "-1"
+ * would wrap silently into UINT64_MAX, a seed nobody asked for.
+ *
+ * @return The seed.
+ */
+static uint64_t chaos_process_seed(void)
+{
+    const char *text = getenv("CHAOS_SEED");
+    char *end = NULL;
+    unsigned long long value;
+
+    if (text == NULL || text[0] < '0' || text[0] > '9')
+    {
+        return chaos_process_read_seed_material();
+    }
+    errno = 0;
+    value = strtoull(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0')
+    {
+        return chaos_process_read_seed_material();
+    }
+    return (uint64_t)value;
+}
+
+/**
  * @brief Resolves `pthread_create`, which may be absent until libpthread is loaded.
  *
  * @details Before glibc 2.34 `pthread_create` lives in libpthread. A program that
@@ -264,8 +300,7 @@ CHAOS_PROCESS_CONSTRUCTOR
 static void chaos_process_init(void)
 {
     chaos_process_ensure_symbols();
-    g_chaos_process_process_seed = chaos_process_read_seed_material();
-    chaos_process_prng_seed_thread(g_chaos_process_process_seed);
+    g_chaos_process_process_seed = chaos_process_seed();
     chaos_process_config_init();
     /* Load now, so a bad rule file shows in the status file at start-up. */
     (void)chaos_process_config_prepare();

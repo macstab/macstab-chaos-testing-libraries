@@ -735,7 +735,7 @@ Named patterns help reviewers find the load-bearing structure.
 | **Reentrancy guard** | `__thread int g_chaos_<lib>_tls_guard`; enter returns the previous value, leave restores it | Common interposer idiom |
 | **Double buffer + seqlock** | Rule snapshots: rewrite the inactive one, publish by index; readers validate a sequence | McKenney, *perfbook* (sequence locks) |
 | **Once-only initialisation** | `chaos_once()` resolves the real-function table on first need | POSIX `pthread_once` semantics |
-| **Per-thread PRNG** | `__thread uint64_t g_chaos_<lib>_tls_prng_state`, xorshift64\* seeded through SplitMix64 | Vigna, "An experimental exploration of Marsaglia's xorshift generators, scrambled" |
+| **Counter-based draws** | No generator state: `mix(mix((key ^ lineage) + n) + d)` with SplitMix64 as the mixer | Steele, Lea, Flood, "Fast splittable pseudorandom number generators", OOPSLA 2014 |
 | **Fail-open / safe default** | Missing, rejected or unreadable rule file → no rules; internal error → real call | Kleppmann, *Designing Data-Intensive Applications*, "Reliability" |
 
 ### 13.1. Specifically-not-used patterns (with reasons)

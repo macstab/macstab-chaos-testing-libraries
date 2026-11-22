@@ -203,15 +203,17 @@ extern chaos_memory_posix_madvise_fn g_chaos_memory_real_posix_madvise;
 extern __thread int g_chaos_memory_tls_guard;
 
 /**
- * @brief Per-thread xorshift64* state; 0 means "not seeded yet".
+ * @brief Lineage of this process: 0 in the one that loaded the library, mixed forward in
+ *        every forked child (the atfork handler).
  *
- * @details Seeded lazily by chaos_memory_prng_ensure_seeded() from the process seed,
- * the thread id and a stack address, without I/O or allocation. The fork child
- * handler resets it to 0 so that a child does not repeat its parent's sequence.
- *
- * @note Thread-local: probability draws need no synchronisation.
+ * @details XORed into a rule's draw key, so the children of a pre-forking server decide
+ * differently from the parent and from each other without the key itself being rewritten
+ * -- rewriting it would write every snapshot page in each child, the copy-on-write cost
+ * chaos_hits.h goes out of its way to avoid. Deterministic: a child's lineage follows from
+ * how many times this process has forked, which the test controls, not from a thread id or
+ * an address, which it does not.
  */
-extern __thread uint64_t g_chaos_memory_tls_prng_state;
+extern uint64_t g_chaos_memory_lineage;
 
 /**
  * @brief Process-wide seed: 8 bytes of /dev/urandom read by the constructor.
@@ -306,21 +308,6 @@ chaos_memory_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint64_
  * =========================================================================
  */
 
-/**
- * @brief Kernel thread id (SYS_gettid) for PRNG seeding; the PID on non-Linux test
- *        builds, where the stack-address term alone separates threads.
- *
- * @details A raw system call: gettid() is a libc function only since glibc 2.30.
- */
-static inline uint64_t chaos_memory_current_tid(void)
-{
-#ifdef __linux__
-    return (uint64_t)syscall(SYS_gettid);
-#else
-    return (uint64_t)getpid();
-#endif
-}
-
 /* =========================================================================
  * PRNG: xorshift64* seeded through the splitmix64 finaliser
  * =========================================================================
@@ -342,61 +329,29 @@ static inline uint64_t chaos_memory_prng_mix(uint64_t value)
 }
 
 /**
- * @brief Seeds this thread's PRNG on its first draw.
+ * @brief Hash of a rule's text, for its draw key.
  *
- * @details The seed is mix(process seed ^ kernel tid ^ address of a local), forced
- * odd so it is never 0, the one state xorshift64* cannot leave and also the
- * "not seeded" marker. No I/O and no allocation: safe inside a wrapper, under the
- * reentrancy guard and in a signal handler.
+ * @details splitmix64 over the bytes. From the text rather than the slot index, because
+ * chaos_hits_assign() hands a slot out again when a rule leaves the file and the next rule
+ * in that slot would inherit its decisions. Two rules with the same text are one rule.
+ *
+ * @param text Rule as written; NULL hashes as the empty string.
+ * @return A well-mixed 64-bit hash.
  */
-static inline void chaos_memory_prng_ensure_seeded(void)
+static inline uint64_t chaos_memory_rule_hash(const char *text)
 {
-    uint64_t seed;
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    size_t index;
 
-    if (g_chaos_memory_tls_prng_state != 0U)
+    if (text == NULL)
     {
-        return;
+        return chaos_memory_prng_mix(hash);
     }
-
-    seed = g_chaos_memory_process_seed;
-    seed ^= chaos_memory_current_tid();
-    seed ^= (uint64_t)(uintptr_t)&seed;
-    /* Odd: never 0, the one state xorshift64* cannot leave. */
-    g_chaos_memory_tls_prng_state = chaos_memory_prng_mix(seed) | 1U;
-}
-
-/**
- * @brief Seeds this thread's PRNG with mix(@p seed); a seed of 0 is replaced by 1.
- *
- * @details Used by the constructor for the main thread and by unit tests for
- * reproducible sequences.
- *
- * @param seed  Raw seed.
- */
-static inline void chaos_memory_prng_seed_thread(uint64_t seed)
-{
-    g_chaos_memory_tls_prng_state = chaos_memory_prng_mix(seed == 0U ? UINT64_C(1) : seed);
-}
-
-/**
- * @brief Next 32-bit value of this thread's xorshift64* stream.
- *
- * @details Shifts 12/25/27 on the 64-bit state, then the upper 32 bits of the
- * product with 0x2545f4914f6cdd1d. Period 2^64 - 1. Seeds the thread lazily.
- *
- * @return A value uniform in [0, 2^32).
- */
-static inline uint32_t chaos_memory_prng_next_u32(void)
-{
-    uint64_t state;
-
-    chaos_memory_prng_ensure_seeded();
-    state = g_chaos_memory_tls_prng_state;
-    state ^= state >> 12;
-    state ^= state << 25;
-    state ^= state >> 27;
-    g_chaos_memory_tls_prng_state = state;
-    return (uint32_t)((state * UINT64_C(0x2545f4914f6cdd1d)) >> 32);
+    for (index = 0U; text[index] != '\0'; ++index)
+    {
+        hash = chaos_memory_prng_mix(hash + (uint64_t)(unsigned char)text[index]);
+    }
+    return hash;
 }
 
 /**

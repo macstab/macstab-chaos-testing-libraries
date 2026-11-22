@@ -46,7 +46,8 @@
  * - chaos_memory_ensure_symbols() as a no-op, so real functions stay what the test assigns.
  * - The five `g_chaos_memory_real_*` real-function pointers, all NULL.
  * - `__thread int g_chaos_memory_tls_guard` (reentrancy guard) = 0.
- * - `__thread uint64_t g_chaos_memory_tls_prng_state` = 0, which makes the per-thread PRNG
+ * - `uint64_t g_chaos_memory_lineage` = 0, the lineage of the process that
+ *   loaded the library; a forked child mixes it forward so it decides on its own.
  *   seed itself on first use.
  * - `uint64_t g_chaos_memory_process_seed` = 1 in place of the /dev/urandom seed.
  */
@@ -58,7 +59,7 @@
     chaos_memory_madvise_fn g_chaos_memory_real_madvise = NULL;                                    \
     chaos_memory_posix_madvise_fn g_chaos_memory_real_posix_madvise = NULL;                        \
     __thread int g_chaos_memory_tls_guard = 0;                                                     \
-    __thread uint64_t g_chaos_memory_tls_prng_state = 0U;                                          \
+    uint64_t g_chaos_memory_lineage = 0U;                                                          \
     uint64_t g_chaos_memory_process_seed = 1U
 
 /**
@@ -76,7 +77,7 @@ static inline void chaos_memory_test_reset_runtime(void)
     g_chaos_memory_real_madvise = NULL;
     g_chaos_memory_real_posix_madvise = NULL;
     g_chaos_memory_tls_guard = 0;
-    g_chaos_memory_tls_prng_state = 0U;
+    g_chaos_memory_lineage = 0U;
     g_chaos_memory_process_seed = 1U;
 }
 

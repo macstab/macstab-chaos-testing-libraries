@@ -195,14 +195,17 @@ extern chaos_dns_gethostbyaddr_r_fn g_chaos_dns_real_gethostbyaddr_r;
 extern __thread int g_chaos_dns_tls_guard;
 
 /**
- * @brief Per-thread xorshift64* state; 0 means not yet seeded.
+ * @brief Lineage of this process: 0 in the one that loaded the library, mixed forward in
+ *        every forked child (the atfork handler).
  *
- * @details Seeded on the first draw by chaos_dns_prng_ensure_seeded() from the process
- * seed, the thread id and a stack address; the result is forced odd, so it is never 0.
- * A fork() child zeroes it in its atfork handler so it does not replay the parent's
- * sequence.
+ * @details XORed into a rule's draw key, so the children of a pre-forking server decide
+ * differently from the parent and from each other without the key itself being rewritten
+ * -- rewriting it would write every snapshot page in each child, the copy-on-write cost
+ * chaos_hits.h goes out of its way to avoid. Deterministic: a child's lineage follows from
+ * how many times this process has forked, which the test controls, not from a thread id or
+ * an address, which it does not.
  */
-extern __thread uint64_t g_chaos_dns_tls_prng_state;
+extern uint64_t g_chaos_dns_lineage;
 
 /**
  * @brief Process-wide seed, the base of every per-thread seed.
@@ -310,26 +313,6 @@ chaos_dns_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint64_t d
  * Thread id
  * ------------------------------------------------------------------------- */
 
-/**
- * @brief Kernel thread id of the caller, used only as PRNG seed material.
- *
- * @details Linux: the raw SYS_gettid system call (glibc exports gettid() only since 2.30,
- * and a raw call cannot be interposed). Elsewhere getpid(): unique per process only,
- * which is enough for seed diversity because the stack address is mixed in too.
- *
- * @return  The thread (Linux) or process id.
- *
- * @threadsafety  No shared state.
- */
-static inline uint64_t chaos_dns_current_tid(void)
-{
-#ifdef __linux__
-    return (uint64_t)syscall(SYS_gettid);
-#else
-    return (uint64_t)getpid();
-#endif
-}
-
 /* -------------------------------------------------------------------------
  * xorshift64* PRNG
  * -------------------------------------------------------------------------
@@ -358,81 +341,29 @@ static inline uint64_t chaos_dns_prng_mix(uint64_t value)
 }
 
 /**
- * @brief Seeds the calling thread's PRNG on its first draw.
+ * @brief Hash of a rule's text, for its draw key.
  *
- * @details Called by chaos_dns_prng_next_u32() before every draw; a no-op once seeded.
- * The seed XORs:
- *   - @c g_chaos_dns_process_seed -- differs between processes;
- *   - @c chaos_dns_current_tid()  -- differs between threads;
- *   - the address of a local      -- differs with stack placement.
- * The mix is ORed with 1, so the state is odd and never 0, the one state xorshift64*
- * cannot leave.
+ * @details splitmix64 over the bytes. From the text rather than the slot index, because
+ * chaos_hits_assign() hands a slot out again when a rule leaves the file and the next rule
+ * in that slot would inherit its decisions. Two rules with the same text are one rule.
  *
- * @post  g_chaos_dns_tls_prng_state != 0.
- *
- * @threadsafety  Reads the process seed (constant after init); writes thread-local state.
+ * @param text Rule as written; NULL hashes as the empty string.
+ * @return A well-mixed 64-bit hash.
  */
-static inline void chaos_dns_prng_ensure_seeded(void)
+static inline uint64_t chaos_dns_rule_hash(const char *text)
 {
-    uint64_t seed;
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    size_t index;
 
-    if (g_chaos_dns_tls_prng_state != 0U)
+    if (text == NULL)
     {
-        return;
+        return chaos_dns_prng_mix(hash);
     }
-
-    seed = g_chaos_dns_process_seed;
-    seed ^= chaos_dns_current_tid();
-    seed ^= (uint64_t)(uintptr_t)&seed;
-    /* Odd: never 0, the one state xorshift64* cannot leave. */
-    g_chaos_dns_tls_prng_state = chaos_dns_prng_mix(seed) | 1U;
-}
-
-/**
- * @brief Seeds the calling thread's PRNG with @p seed.
- *
- * @details Used by chaos_dns_init() for the thread that runs the constructor. @p seed
- * passes through chaos_dns_prng_mix(); 0 is replaced by 1 first.
- *
- * @param seed  Seed value; 0 is treated as 1.
- *
- * @post  g_chaos_dns_tls_prng_state != 0 (for any seed but the rare one that mixes to 0).
- *
- * @threadsafety  Thread-local.
- */
-static inline void chaos_dns_prng_seed_thread(uint64_t seed)
-{
-    g_chaos_dns_tls_prng_state = chaos_dns_prng_mix(seed == 0U ? UINT64_C(1) : seed);
-}
-
-/**
- * @brief Advances the calling thread's PRNG and returns 32 pseudo-random bits.
- *
- * @details xorshift64 step (shifts 12, 25, 27), then the high 32 bits of
- * state * 0x2545F4914F6CDD1D (xorshift64*); the high bits are used because the low
- * bits of the product are the weakest.
- *
- * Used by:
- *   - chaos_dns_probability_hit() -- compared against probability * 2^32.
- *   - chaos_dns_shuffle_result_list() -- Fisher-Yates index selection.
- *
- * @return  A pseudo-random value in [0, 2^32).
- *
- * @post  Advances the PRNG by one step.
- *
- * @threadsafety  Thread-local; safe from any thread and from signal handlers.
- */
-static inline uint32_t chaos_dns_prng_next_u32(void)
-{
-    uint64_t state;
-
-    chaos_dns_prng_ensure_seeded();
-    state = g_chaos_dns_tls_prng_state;
-    state ^= state >> 12;
-    state ^= state << 25;
-    state ^= state >> 27;
-    g_chaos_dns_tls_prng_state = state;
-    return (uint32_t)((state * UINT64_C(0x2545f4914f6cdd1d)) >> 32);
+    for (index = 0U; text[index] != '\0'; ++index)
+    {
+        hash = chaos_dns_prng_mix(hash + (uint64_t)(unsigned char)text[index]);
+    }
+    return hash;
 }
 
 /**

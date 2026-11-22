@@ -55,17 +55,17 @@ static int test_process_of(pid_t tid, pid_t *tgid, uint64_t *start)
 #define CHAOS_INIT_IO_PROC_LINK test_proc_link
 #define CHAOS_INIT_PROCESS_OF(tid, tgid, start) test_process_of((tid), (tgid), (start))
 
-/* The seed source is shared with the other libraries (chaos_init_core.c); the test does
- * not include that translation unit, so it provides the one function it needs. A fixed
- * value keeps the rules' draw keys the same in every run of this test. */
-static uint64_t chaos_init_seed(void)
-{
-    return UINT64_C(0x5eed5eed5eed5eed);
-}
-
 #include "../../src/init/chaos_init_io.c"
 #include "../../src/init/chaos_init_proc.c"
 #include "../../src/init/chaos_init_tracee.c"
+
+/* The seed source lives in chaos_init_core.c, which this test does not include; the
+ * declaration comes from chaos_init_core.h, so the definition may follow the include. A
+ * fixed value keeps the rules' draw keys the same in every run. */
+uint64_t chaos_init_seed(void)
+{
+    return UINT64_C(0x5eed5eed5eed5eed);
+}
 
 #include <assert.h>
 #include <signal.h>

@@ -49,7 +49,8 @@
  *   prove the wrapper retries resolution instead of failing for good.
  * - The thirteen `g_chaos_process_real_*` real-function pointers, all NULL.
  * - `__thread int g_chaos_process_tls_guard` (reentrancy guard) = 0.
- * - `__thread uint64_t g_chaos_process_tls_prng_state` = 0, which makes the per-thread PRNG
+ * - `uint64_t g_chaos_process_lineage` = 0, the lineage of the process that
+ *   loaded the library; a forked child mixes it forward so it decides on its own.
  *   seed itself on first use.
  * - `uint64_t g_chaos_process_process_seed` = 1 in place of the /dev/urandom seed.
  * - `volatile uint64_t g_chaos_process_fail_after_counters[CHAOS_PROCESS_OP_COUNT]` = 0:
@@ -83,7 +84,7 @@
     chaos_process_popen_fn g_chaos_process_real_popen = NULL;                                      \
     chaos_process_waitid_fn g_chaos_process_real_waitid = NULL;                                    \
     __thread int g_chaos_process_tls_guard = 0;                                                    \
-    __thread uint64_t g_chaos_process_tls_prng_state = 0U;                                         \
+    uint64_t g_chaos_process_lineage = 0U;                                                         \
     uint64_t g_chaos_process_process_seed = 1U;                                                    \
     volatile uint64_t g_chaos_process_fail_after_counters[CHAOS_PROCESS_OP_COUNT] = {0U}
 
@@ -113,7 +114,7 @@ static inline void chaos_process_test_reset_runtime(void)
     g_chaos_process_real_popen = NULL;
     g_chaos_process_real_waitid = NULL;
     g_chaos_process_tls_guard = 0;
-    g_chaos_process_tls_prng_state = 0U;
+    g_chaos_process_lineage = 0U;
     g_chaos_process_process_seed = 1U;
     (void)memset(
         (void *)g_chaos_process_fail_after_counters,

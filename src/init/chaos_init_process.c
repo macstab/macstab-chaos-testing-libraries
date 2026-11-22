@@ -45,6 +45,7 @@ static int chaos_init_process_supported(const struct chaos_process_rule *rule);
 #include "../process/chaos_process_actions.c"
 #include "../process/chaos_process_config.c"
 #include "chaos_init_proc.h"
+#include "chaos_init_core.h"
 #include "chaos_init_tracee.h"
 
 #include <linux/sched.h>
@@ -59,7 +60,7 @@ static int chaos_init_process_supported(const struct chaos_process_rule *rule);
  * core's per-process counter set; here it only holds the calling process's counters for
  * the duration of one decision (chaos_init_process_fail_after()). */
 __thread int g_chaos_process_tls_guard = 0;
-__thread uint64_t g_chaos_process_tls_prng_state = 0U;
+uint64_t g_chaos_process_lineage = 0U;
 uint64_t g_chaos_process_process_seed = UINT64_C(0xbb67ae8584caa73b);
 volatile uint64_t g_chaos_process_fail_after_counters[CHAOS_PROCESS_OP_COUNT] = {0U};
 
@@ -125,13 +126,9 @@ static chaos_init_rules_t g_chaos_init_process_rules = {
 
 void chaos_init_process_start(pid_t application)
 {
-    uint64_t seed;
 
     chaos_process_config_init();
-    if (getrandom(&seed, sizeof(seed), 0) == (ssize_t)sizeof(seed))
-    {
-        g_chaos_process_process_seed = seed;
-    }
+    g_chaos_process_process_seed = chaos_init_seed();
     g_chaos_init_process_application = application;
     (void)chaos_init_tracee_register(&g_chaos_init_process_rules);
 }

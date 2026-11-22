@@ -55,12 +55,6 @@ int chaos_memory_probability_hit_sample(double probability, uint32_t sample)
     return (double)sample < threshold;
 }
 
-/** @brief Bernoulli trial of @p probability with the next value of this thread's PRNG. */
-int chaos_memory_probability_hit(double probability)
-{
-    return chaos_memory_probability_hit_sample(probability, chaos_memory_prng_next_u32());
-}
-
 /**
  * @brief Decides whether @p rule fires on this call, and counts the hit if so.
  *
@@ -69,7 +63,7 @@ int chaos_memory_probability_hit(double probability)
  * random sequence; chaos_policy_fire() comes last because it claims an `@first`
  * slot and increments the hit counter.
  */
-int chaos_memory_rule_should_trigger(const chaos_memory_rule_t *rule)
+int chaos_memory_rule_should_trigger(chaos_memory_rule_t *rule)
 {
     if (rule == NULL || !chaos_policy_window_open(&rule->policy) ||
         !chaos_policy_size_ok(&rule->policy, rule->call_size))
@@ -77,7 +71,12 @@ int chaos_memory_rule_should_trigger(const chaos_memory_rule_t *rule)
         return 0;
     }
 
-    if (!chaos_memory_probability_hit(rule->probability))
+    /* Past the gates that cost nothing: this call is an evaluation of the rule, gets its
+     * number, and every sample of it follows from that number. */
+    chaos_memory_rule_draw_begin(rule);
+    if (!chaos_memory_probability_hit_sample(
+            rule->probability, chaos_memory_rule_draw(rule, CHAOS_MEMORY_DRAW_PROBABILITY)
+        ))
     {
         return 0;
     }
@@ -91,7 +90,7 @@ int chaos_memory_rule_should_trigger(const chaos_memory_rule_t *rule)
  * lengthen the delay, and no wrapper is entered, so no reentrancy guard is
  * needed. One decision per call: the whole delay or none.
  */
-void chaos_memory_rule_apply_latency(const chaos_memory_rule_t *rule)
+void chaos_memory_rule_apply_latency(chaos_memory_rule_t *rule)
 {
     if (rule == NULL || rule->effect != CHAOS_MEMORY_EFFECT_LATENCY ||
         !chaos_memory_rule_should_trigger(rule))
@@ -107,7 +106,7 @@ void chaos_memory_rule_apply_latency(const chaos_memory_rule_t *rule)
  * @details Returns 1 so the wrapper returns its failure value without calling the
  * real function; errno is untouched when it returns 0.
  */
-int chaos_memory_rule_apply_errno(const chaos_memory_rule_t *rule)
+int chaos_memory_rule_apply_errno(chaos_memory_rule_t *rule)
 {
     if (rule == NULL || rule->effect != CHAOS_MEMORY_EFFECT_ERRNO ||
         !chaos_memory_rule_should_trigger(rule))

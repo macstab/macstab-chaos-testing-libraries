@@ -159,7 +159,7 @@ int chaos_process_config_match(
 }
 
 /** @brief Replaces LATENCY: counts the call instead of sleeping. */
-void chaos_process_rule_apply_latency(const chaos_process_rule_t *rule)
+void chaos_process_rule_apply_latency(chaos_process_rule_t *rule)
 {
     assert(rule != NULL);
     ++g_latency_calls;
@@ -170,7 +170,7 @@ void chaos_process_rule_apply_latency(const chaos_process_rule_t *rule)
  *
  * Keeps the real helper's contract: writes `*errnum` only when it returns 1.
  */
-int chaos_process_rule_error_number(const chaos_process_rule_t *rule, int *errnum)
+int chaos_process_rule_error_number(chaos_process_rule_t *rule, int *errnum)
 {
     if (rule == NULL || errnum == NULL || rule->effect != CHAOS_PROCESS_EFFECT_ERRNO ||
         g_errno_trigger == 0)
@@ -189,7 +189,7 @@ int chaos_process_rule_error_number(const chaos_process_rule_t *rule, int *errnu
  * ENOENT vs EACCES, ECHILD vs EINTR), so the observed errno identifies which effect fired.
  */
 int chaos_process_rule_fail_after_error(
-    const chaos_process_rule_t *rule, chaos_process_operation_t operation, int *errnum
+    chaos_process_rule_t *rule, chaos_process_operation_t operation, int *errnum
 )
 {
     if (rule == NULL || errnum == NULL || operation < 0 || operation >= CHAOS_PROCESS_OP_COUNT ||

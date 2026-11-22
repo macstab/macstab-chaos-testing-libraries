@@ -940,9 +940,9 @@ static void test_fork_takes_over_orphaned_reload(void)
     g_chaos_time_cached_mtime = CHAOS_TIME_MTIME_RELOADING;
     (void)chaos_time_config_prepare();
     assert(g_chaos_time_cached_mtime == CHAOS_TIME_MTIME_RELOADING);
-    g_chaos_time_tls_prng_state = UINT64_C(42);
+    g_chaos_time_lineage = 0U;
     chaos_time_config_after_fork();
-    assert(g_chaos_time_tls_prng_state == 0U);
+    assert(g_chaos_time_lineage != 0U);
     assert(g_chaos_time_cached_mtime == CHAOS_TIME_MTIME_UNKNOWN);
     assert(g_chaos_time_hits_pid == (uint64_t)getpid());
     assert(chaos_time_config_prepare());
@@ -1649,8 +1649,55 @@ static void test_shadowed_rules_warn(void)
     assert(chaos_time_config_last_error()->warning_count == 0U);
 }
 
+/**
+ * @brief Proves a rule's draw key follows its text, not its place in the file.
+ *
+ * @details The key is what makes a fault reproducible, so it has to belong to the rule and
+ * not to the slot it occupies: chaos_hits_assign() hands a slot out again when a rule
+ * leaves the file, and a key from the slot index would make the next rule in that slot
+ * inherit the old one's decisions. Asserted by reloading the same two rules in the other
+ * order -- each text keeps its key -- and by adding one in front, which shifts every index
+ * and must leave the keys alone.
+ */
+static void test_draw_key_follows_the_rule_text(void)
+{
+    uint64_t first_key;
+    uint64_t second_key;
+    const chaos_time_config_state_t *state;
+
+    chaos_time_config_init();
+    write_config_text("nanosleep:LATENCY:25\nclock_gettime:LATENCY:25\n", 91);
+    assert(chaos_time_config_prepare() == 1);
+    state = chaos_time_config_active_state();
+    assert(state->rule_count == 2U);
+    assert(strcmp(state->text[0], "nanosleep:LATENCY:25") == 0);
+    first_key = state->rules[0].key;
+    second_key = state->rules[1].key;
+    assert(first_key != second_key);
+
+    write_config_text("clock_gettime:LATENCY:25\nnanosleep:LATENCY:25\n", 92);
+    g_chaos_time_cached_mtime = CHAOS_TIME_MTIME_UNKNOWN;
+    assert(chaos_time_config_prepare() == 1);
+    state = chaos_time_config_active_state();
+    assert(state->rule_count == 2U);
+    assert(state->rules[0].key == second_key);
+    assert(state->rules[1].key == first_key);
+
+    write_config_text("usleep:LATENCY:25\nclock_gettime:LATENCY:25\nnanosleep:LATENCY:25\n", 93);
+    g_chaos_time_cached_mtime = CHAOS_TIME_MTIME_UNKNOWN;
+    assert(chaos_time_config_prepare() == 1);
+    state = chaos_time_config_active_state();
+    assert(state->rule_count == 3U);
+    assert(state->rules[1].key == second_key);
+    assert(state->rules[2].key == first_key);
+    assert(state->rules[0].key != first_key && state->rules[0].key != second_key);
+
+    (void)unlink(CHAOS_TIME_CONFIG_PATH);
+}
+
 int main(void)
 {
+    test_draw_key_follows_the_rule_text();
     /* Stat the rule file on every call so each write is seen at once; the throttle has its
      * own test. */
     g_chaos_time_check_interval_ns = 0U;

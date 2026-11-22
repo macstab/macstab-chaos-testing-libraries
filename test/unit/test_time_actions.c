@@ -541,8 +541,66 @@ static void test_unshift_deadline(void)
     assert(chaos_time_rule_unshift_deadline(&offset, &regress, &deadline) == 0);
 }
 
+/**
+ * @brief Proves a sample follows from the rule and the number of the evaluation, and from
+ *        nothing else.
+ *
+ * @details This is what makes a fault reproducible: the same rule at the same evaluation
+ * number gives the same sample; the next evaluation, a rule of different text and a forked
+ * child's lineage each give an unrelated one; and the draws within one evaluation differ
+ * from each other.
+ */
+static void test_draws_are_reproducible(void)
+{
+    chaos_time_rule_t rule;
+    chaos_hit_slot_t slot;
+    uint32_t first;
+
+    (void)memset(&rule, 0, sizeof(rule));
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.hit = &slot;
+    rule.key = chaos_time_prng_mix(g_chaos_time_process_seed ^ chaos_time_rule_hash("a"));
+
+    chaos_time_rule_draw_begin(&rule);
+    assert(slot.evaluations == 1U);
+    first = chaos_time_rule_draw(&rule, CHAOS_TIME_DRAW_PROBABILITY);
+    assert(chaos_time_rule_draw(&rule, CHAOS_TIME_DRAW_PROBABILITY) == first);
+    assert(chaos_time_rule_draw(&rule, CHAOS_TIME_DRAW_FIRST_EFFECT) != first);
+
+    chaos_time_rule_draw_begin(&rule);
+    assert(slot.evaluations == 2U);
+    assert(chaos_time_rule_draw(&rule, CHAOS_TIME_DRAW_PROBABILITY) != first);
+
+    /* A rule whose text differs is a different rule, even in the same slot. */
+    rule.key = chaos_time_prng_mix(g_chaos_time_process_seed ^ chaos_time_rule_hash("b"));
+    slot.evaluations = 0U;
+    chaos_time_rule_draw_begin(&rule);
+    assert(chaos_time_rule_draw(&rule, CHAOS_TIME_DRAW_PROBABILITY) != first);
+
+    /* Same rule, same evaluation, different lineage: a forked child decides on its own. */
+    rule.key = chaos_time_prng_mix(g_chaos_time_process_seed ^ chaos_time_rule_hash("a"));
+    slot.evaluations = 0U;
+    g_chaos_time_lineage = chaos_time_prng_mix(1U);
+    chaos_time_rule_draw_begin(&rule);
+    assert(chaos_time_rule_draw(&rule, CHAOS_TIME_DRAW_PROBABILITY) != first);
+    g_chaos_time_lineage = 0U;
+
+    /* A rule outside a snapshot has no slot: evaluation 0 every time, which is what makes
+     * the unit tests reproducible without seeding anything. */
+    rule.hit = NULL;
+    chaos_time_rule_draw_begin(&rule);
+    first = chaos_time_rule_draw(&rule, CHAOS_TIME_DRAW_PROBABILITY);
+    chaos_time_rule_draw_begin(&rule);
+    assert(chaos_time_rule_draw(&rule, CHAOS_TIME_DRAW_PROBABILITY) == first);
+
+    assert(chaos_time_rule_hash("a") == chaos_time_rule_hash("a"));
+    assert(chaos_time_rule_hash("a") != chaos_time_rule_hash("b"));
+    assert(chaos_time_rule_hash(NULL) != chaos_time_rule_hash("a"));
+}
+
 int main(void)
 {
+    test_draws_are_reproducible();
     test_regress_goes_back_once();
     test_unshift_deadline();
     test_should_trigger_honours_qualifiers();

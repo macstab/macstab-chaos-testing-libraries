@@ -61,16 +61,6 @@
 int chaos_dns_probability_hit_sample(double probability, uint32_t sample);
 
 /**
- * @brief Whether @p probability fires, drawing one sample from the thread's PRNG.
- *
- * @param probability  Probability in [0.0, 1.0].
- * @return  Non-zero if the rule fires; zero otherwise.
- *
- * @threadsafety  Advances only the calling thread's PRNG by one step.
- */
-int chaos_dns_probability_hit(double probability);
-
-/**
  * @brief Sleeps for a LATENCY rule's latency_ms.
  *
  * @details Does not decide: callers run chaos_dns_rule_should_trigger() first, so the
@@ -84,7 +74,7 @@ int chaos_dns_probability_hit(double probability);
  *
  * @threadsafety  Blocks only the calling thread.
  */
-void chaos_dns_rule_apply_latency(const chaos_dns_rule_t *rule);
+void chaos_dns_rule_apply_latency(chaos_dns_rule_t *rule);
 
 /**
  * @brief Decides whether a matched rule fires on this call, and counts the hit if so.
@@ -99,7 +89,7 @@ void chaos_dns_rule_apply_latency(const chaos_dns_rule_t *rule);
  *
  * @threadsafety  Thread-local PRNG and atomic hit-slot updates.
  */
-int chaos_dns_rule_should_trigger(const chaos_dns_rule_t *rule);
+int chaos_dns_rule_should_trigger(chaos_dns_rule_t *rule);
 
 /**
  * @brief Applies a GAI rule: stores its EAI_* code and returns 1 when it fires.
@@ -113,7 +103,7 @@ int chaos_dns_rule_should_trigger(const chaos_dns_rule_t *rule);
  *
  * @threadsafety  See chaos_dns_rule_should_trigger().
  */
-int chaos_dns_rule_apply_gai(const chaos_dns_rule_t *rule, int *gai_error);
+int chaos_dns_rule_apply_gai(chaos_dns_rule_t *rule, int *gai_error);
 
 /**
  * @brief Number of nodes in an addrinfo list.
@@ -178,6 +168,6 @@ void chaos_dns_limit_result_list(struct addrinfo **result, unsigned int limit);
  *
  * @threadsafety  Thread-local PRNG; caller-owned list; one temporary heap allocation.
  */
-void chaos_dns_shuffle_result_list(struct addrinfo **result);
+void chaos_dns_shuffle_result_list(const chaos_dns_rule_t *rule, struct addrinfo **result);
 
 #endif

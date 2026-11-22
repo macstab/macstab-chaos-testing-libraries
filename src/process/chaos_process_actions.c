@@ -42,19 +42,13 @@ int chaos_process_probability_hit_sample(double probability, uint32_t sample)
     return (double)sample < threshold;
 }
 
-/** @copydoc chaos_process_probability_hit */
-int chaos_process_probability_hit(double probability)
-{
-    return chaos_process_probability_hit_sample(probability, chaos_process_prng_next_u32());
-}
-
 /**
  * @copydoc chaos_process_rule_should_trigger
  *
  * Implementation notes: the cheap window and size checks come before the draw; the
  * `@first` claim comes last so a call that loses the draw consumes no budget.
  */
-int chaos_process_rule_should_trigger(const chaos_process_rule_t *rule)
+int chaos_process_rule_should_trigger(chaos_process_rule_t *rule)
 {
     if (rule == NULL || !chaos_policy_window_open(&rule->policy) ||
         !chaos_policy_size_ok(&rule->policy, rule->call_size))
@@ -62,7 +56,12 @@ int chaos_process_rule_should_trigger(const chaos_process_rule_t *rule)
         return 0;
     }
 
-    if (!chaos_process_probability_hit(rule->probability))
+    /* Past the gates that cost nothing: this call is an evaluation of the rule, gets its
+     * number, and every sample of it follows from that number. */
+    chaos_process_rule_draw_begin(rule);
+    if (!chaos_process_probability_hit_sample(
+            rule->probability, chaos_process_rule_draw(rule, CHAOS_PROCESS_DRAW_PROBABILITY)
+        ))
     {
         return 0;
     }
@@ -74,7 +73,7 @@ int chaos_process_rule_should_trigger(const chaos_process_rule_t *rule)
  *
  * Implementation notes: one decision per call; the full delay is applied or none.
  */
-void chaos_process_rule_apply_latency(const chaos_process_rule_t *rule)
+void chaos_process_rule_apply_latency(chaos_process_rule_t *rule)
 {
     if (rule == NULL || rule->effect != CHAOS_PROCESS_EFFECT_LATENCY ||
         !chaos_process_rule_should_trigger(rule))
@@ -85,7 +84,7 @@ void chaos_process_rule_apply_latency(const chaos_process_rule_t *rule)
 }
 
 /** @copydoc chaos_process_rule_error_number */
-int chaos_process_rule_error_number(const chaos_process_rule_t *rule, int *errnum)
+int chaos_process_rule_error_number(chaos_process_rule_t *rule, int *errnum)
 {
     if (rule == NULL || errnum == NULL || rule->effect != CHAOS_PROCESS_EFFECT_ERRNO ||
         !chaos_process_rule_should_trigger(rule))
@@ -105,7 +104,7 @@ int chaos_process_rule_error_number(const chaos_process_rule_t *rule, int *errnu
  * first N consume neither draws nor budget. Wraparound at 2^64 is not guarded.
  */
 int chaos_process_rule_fail_after_error(
-    const chaos_process_rule_t *rule, chaos_process_operation_t operation, int *errnum
+    chaos_process_rule_t *rule, chaos_process_operation_t operation, int *errnum
 )
 {
     uint64_t observed;
@@ -118,7 +117,16 @@ int chaos_process_rule_fail_after_error(
 
     observed =
         chaos_process_atomic_fetch_add_u64(&g_chaos_process_fail_after_counters[operation], 1U);
-    if (observed < rule->fail_after_count || !chaos_process_probability_hit(rule->probability))
+    if (observed < rule->fail_after_count)
+    {
+        return 0;
+    }
+    /* Past the threshold this call is an evaluation of the rule and gets its number; the
+     * calls inside the first N were not, which is why the draw happens here. */
+    chaos_process_rule_draw_begin(rule);
+    if (!chaos_process_probability_hit_sample(
+            rule->probability, chaos_process_rule_draw(rule, CHAOS_PROCESS_DRAW_PROBABILITY)
+        ))
     {
         return 0;
     }

@@ -1315,7 +1315,10 @@ static void chaos_memory_config_after_fork(void)
     CHAOS_STORE_IF_CHANGED(g_chaos_memory_hits_owned, 0);
     /* The child must not draw the parent's numbers (pre-fork workers would all
      * decide alike): its PRNG reseeds from its own thread id on the next draw. */
-    CHAOS_STORE_IF_CHANGED(g_chaos_memory_tls_prng_state, 0U);
+    /* The child decides differently from the parent and from its siblings without the
+     * rules' keys being rewritten: one global instead of every snapshot page. Mixed, not
+     * incremented, so sibling lineages are unrelated rather than adjacent. */
+    g_chaos_memory_lineage = chaos_memory_prng_mix(g_chaos_memory_lineage + UINT64_C(1));
     if (g_chaos_memory_hit_pool_used)
     {
         chaos_hits_pool_after_fork(
@@ -1378,6 +1381,11 @@ static void chaos_memory_config_attach_hits(chaos_memory_config_state_t *next_st
         next_state->rules[index].hit = next_state->hits[index];
         next_state->rules[index].hit_generation =
             next_state->hits[index] != NULL ? next_state->hits[index]->generation : 0U;
+        /* From the text, so a rule keeps its decisions across a reload that keeps it and
+         * the rule that reuses its slot does not inherit them. */
+        next_state->rules[index].key = chaos_memory_prng_mix(
+            g_chaos_memory_process_seed ^ chaos_memory_rule_hash(next_state->text[index])
+        );
     }
 }
 

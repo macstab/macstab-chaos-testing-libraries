@@ -56,7 +56,7 @@ Repository-wide ownership rules live in [`docs/SYSTEM.md`](SYSTEM.md).
 11. [Post-Resolution Transform Pipeline](#post-resolution-transform-pipeline)
 12. [Per-Hook Call Flows](#per-hook-call-flows)
 13. [Reentrancy Guard and TLS State](#reentrancy-guard-and-tls-state)
-14. [PRNG Model](#prng-model)
+14. [Draw Model](#draw-model--counter-based-no-stream)
 15. [Config Reload Protocol — Two-Snapshot CAS](#config-reload-protocol--two-snapshot-cas)
 16. [Failure Behaviour and Observability](#failure-behaviour-and-observability)
 17. [glibc vs musl Divergence](#glibc-vs-musl-divergence)
@@ -165,7 +165,7 @@ four rules.
   before `@` turns it into a qualifier word, which rejects the file.
 - A probability is `0`, `1`, `0.` and digits, or `1.` and zeros, parsed
   independently of `LC_NUMERIC`. A rule fires when a 32-bit sample from the
-  per-thread PRNG is below `p × 2^32`.
+  rule's probability sample is below `p × 2^32`.
 - Text values (REWRITE, SERVICE, OVERRIDE) are at most 511 bytes.
 - `LIMIT:0` is rejected: a limit that discards every answer is written
   `EAI_NONAME`.
@@ -378,11 +378,11 @@ A Fisher–Yates shuffle over a temporary `calloc`ed array of node pointers:
 1. Count the nodes; fewer than two means nothing to do.
 2. Fill the array in list order.
 3. For `i` from `n − 1` down to 1, swap `nodes[i]` with
-   `nodes[prng() % (i + 1)]`.
+   `nodes[draw(i) % (i + 1)]`, one draw per swap.
 4. Move `ai_canonname` onto the new head, relink, terminate the last node, store
    the new head in `*result`, free the array.
 
-One 32-bit PRNG draw per swap. The modulo bias is at most `(i + 1) / 2^32` per
+One 32-bit draw per swap. The modulo bias is at most `(i + 1) / 2^32` per
 draw, negligible for resolver-sized lists; there is no upper bound on the list
 length. If `calloc` fails, the list is returned in its original order. No node is
 allocated or freed.
@@ -512,71 +512,69 @@ it is set.
 `chaos_dns_init()` resolves the symbol table, reads 8 bytes of `/dev/urandom` with
 raw `openat`/`read`/`close` system calls (no interposable libc entry point; the
 guard is set around them; fallback `0x6a09e667f3bcc909 ^ getpid()`), seeds the
-main thread's PRNG, initialises the config engine and loads the rule file once,
+process seed (`CHAOS_SEED`, else `/dev/urandom`), initialises the config engine and loads the rule file once,
 so a bad rule file is reported in the status file at start-up. `errno` is
 preserved across the seed read.
 
 ---
 
-## PRNG Model
+## Draw Model — counter-based, no stream
 
 ### Purpose
 
-The PRNG decides probabilities (one 32-bit draw per decision) and picks SHUFFLE
-swap indices. It is not cryptographic and makes no such claim.
+Draws decide probabilities (one sample per decision) and pick the SHUFFLE swap
+indices (one per swap). Not cryptographic, and no such claim is made.
 
-### Per-thread state
+### No state at all
 
-`__thread uint64_t g_chaos_dns_tls_prng_state` holds one xorshift64* state per
-thread; there is no shared PRNG state and no synchronisation. A thread seeds
-lazily on its first draw:
+There is no generator to advance. A sample is a pure function of four things:
 
 ```c
-seed  = g_chaos_dns_process_seed;      /* /dev/urandom, set once in the constructor */
-seed ^= chaos_dns_current_tid();       /* SYS_gettid on Linux, getpid() elsewhere   */
-seed ^= (uint64_t)(uintptr_t)&seed;    /* stack address: ASLR entropy               */
-g_chaos_dns_tls_prng_state = chaos_dns_prng_mix(seed) | 1U;
+key   = mix(g_chaos_dns_process_seed ^ chaos_dns_rule_hash(rule text));
+base  = mix((key ^ g_chaos_dns_lineage) + n);   /* n: nth evaluation of this rule */
+draw  = mix(base + d) >> 32;                    /* d: 0 probability, 1.. the effects */
 ```
 
-- The process seed alone would give every thread the same stream.
-- The thread id alone is low-entropy: consecutive threads differ in a few bits.
-- The SplitMix64 finaliser (`chaos_dns_prng_mix`) spreads all three inputs over
-  64 bits:
+- **The process seed** comes from `CHAOS_SEED` if set, else from `/dev/urandom`
+  (fallback `0x6a09e667f3bcc909 ^ getpid()`), read once in the constructor.
+- **The key comes from the rule's text**, not its slot or its line.
+  `chaos_hits_assign()` hands a slot out again when a rule leaves the file, and a
+  key tied to the slot would let the next rule inherit the old one's decisions.
+- **`n` is the rule's evaluation number**, counted in its hit slot
+  (`chaos_hits.h`), so it survives a reload that keeps the rule and restarts in a
+  forked child.
+- **`d` numbers the draws of one evaluation.** SHUFFLE takes `N-1` of them for a
+  list of `N` addresses, so the whole permutation is reproducible.
+- **The lineage** is 0 in the process that loaded the library and mixed forward in
+  each forked child, so pre-fork workers do not all decide alike. It sits beside
+  the key rather than inside it: rewriting the keys in the atfork child would
+  write every snapshot page.
 
-  ```c
-  value += UINT64_C(0x9e3779b97f4a7c15);
-  value = (value ^ (value >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
-  value = (value ^ (value >> 27)) * UINT64_C(0x94d049bb133111eb);
-  return value ^ (value >> 31);
-  ```
-
-- `| 1U` makes the state odd, hence never 0, the one state xorshift cannot
-  leave. The constructor seeds the main thread with `chaos_dns_prng_mix(seed)`,
-  mapping a zero seed to 1 first.
-- A `fork()` child clears the forking thread's state in its atfork handler and
-  reseeds from its own thread id on the next draw, so pre-fork workers do not
-  make identical decisions.
-
-### Advance and output
+`chaos_dns_prng_mix()` is the SplitMix64 finaliser:
 
 ```c
-state ^= state >> 12;
-state ^= state << 25;
-state ^= state >> 27;
-return (uint32_t)((state * UINT64_C(0x2545f4914f6cdd1d)) >> 32);
+value += UINT64_C(0x9e3779b97f4a7c15);
+value = (value ^ (value >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+value = (value ^ (value >> 27)) * UINT64_C(0x94d049bb133111eb);
+return value ^ (value >> 31);
 ```
 
-Marsaglia's xorshift64 triple (12, 25, 27), full period 2^64 − 1 over non-zero
-states, with the xorshift64* multiplier; the upper 32 bits of the product are
-returned because they mix better than the lower ones.
+Two stages, not one: `key + n * K + d` would collide as soon as `d` reached `K`,
+a constant the next effect added would break silently.
 
 ### Properties
 
-- Within one thread the sequence is deterministic given the seed; successive
-  outputs are not independent draws.
-- Across threads the streams are unrelated.
+- The nth evaluation of a rule makes the same decision in every run with the same
+  `CHAOS_SEED`, whatever else the process is doing.
+- No thread can shift another's decisions: there is no shared stream, only the
+  rule's evaluation counter.
+- Two rules of different text, and two draws of one evaluation, are unrelated.
 - For probability decisions the long-run firing frequency matches `p`; for
   SHUFFLE the residual modulo bias is bounded as stated above.
+
+What the caller must hold constant is the **order of its own calls**. Two calls
+racing for the same rule may swap their evaluation numbers; that is the caller's
+concern, not something a chaos library can decide for it.
 
 ---
 
@@ -822,7 +820,7 @@ resolver's traffic. Reference: `resolver(3)`.
 | Errors | any of five `EAI_*` codes before the real call; `h_errno` for hostent APIs | errors of the real resolver on passthrough |
 | Latency | LATENCY sleep, millisecond resolution, `clock_nanosleep` on `CLOCK_MONOTONIC` restarted on `EINTR` | network RTT, resolver backoff, scheduler jitter |
 | Reverse text | `host` and `service` overwritten after a successful real call; `h_name` for `gethostbyaddr*` | PTR RRsets, `/etc/hosts` reverse entries, mDNS answers |
-| Threads and processes | per-thread guard and PRNG; single-winner reload; atfork reset of claims, counts and PRNG | signal delivery, the C library's own atfork handlers |
+| Threads and processes | per-thread guard, no draw state; single-winner reload; atfork reset of claims and counts, lineage mixed forward | signal delivery, the C library's own atfork handlers |
 
 ---
 

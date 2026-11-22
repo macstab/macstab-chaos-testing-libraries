@@ -91,17 +91,17 @@ static int test_mptcp_socket(void);
 #define CHAOS_INIT_NET_MPTCP_SOCKET() test_mptcp_socket()
 #define CHAOS_INIT_NET_MPTCP_DIAG g_test_mptcp_diag
 
-/* The seed source is shared with the other libraries (chaos_init_core.c); this test does
- * not include that translation unit, so it provides the one function it needs. A fixed
- * value keeps the rules' draw keys the same in every run. */
-static uint64_t chaos_init_seed(void)
-{
-    return UINT64_C(0x5eed5eed5eed5eed);
-}
-
 #include "../../src/init/chaos_init_net.c"
 #include "../../src/init/chaos_init_proc.c"
 #include "../../src/init/chaos_init_tracee.c"
+
+/* The seed source lives in chaos_init_core.c, which this test does not include; the
+ * declaration comes from chaos_init_core.h, so the definition may follow the include. A
+ * fixed value keeps the rules' draw keys the same in every run. */
+uint64_t chaos_init_seed(void)
+{
+    return UINT64_C(0x5eed5eed5eed5eed);
+}
 
 static int test_mptcp_socket(void)
 {

@@ -489,7 +489,7 @@ static int chaos_dns_resolve_with_rules(
     if (chaos_dns_config_match(CHAOS_DNS_EFFECT_SHUFFLE, node, &shuffle_rule) &&
         chaos_dns_rule_should_trigger(&shuffle_rule))
     {
-        chaos_dns_shuffle_result_list(result);
+        chaos_dns_shuffle_result_list(&shuffle_rule, result);
     }
 
     /* LIMIT last. The parser guarantees limit >= 1; the NULL check covers limit 0. */

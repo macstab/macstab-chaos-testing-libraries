@@ -54,14 +54,6 @@ int chaos_time_probability_hit_sample(double probability, uint32_t sample)
 }
 
 /**
- * @copydoc chaos_time_probability_hit
- */
-int chaos_time_probability_hit(double probability)
-{
-    return chaos_time_probability_hit_sample(probability, chaos_time_prng_next_u32());
-}
-
-/**
  * Sleeps @p usec through the real usleep, else the real nanosleep, under the guard.
  *
  * usleep is not restarted when a signal interrupts it, so the chunk may be shorter;
@@ -142,7 +134,7 @@ static void chaos_time_add_offset_ms(struct timespec *value, int64_t offset_ms)
 /**
  * @copydoc chaos_time_rule_should_trigger
  */
-int chaos_time_rule_should_trigger(const chaos_time_rule_t *rule)
+int chaos_time_rule_should_trigger(chaos_time_rule_t *rule)
 {
     if (rule == NULL || !chaos_policy_window_open(&rule->policy) ||
         !chaos_policy_size_ok(&rule->policy, rule->call_size))
@@ -150,7 +142,12 @@ int chaos_time_rule_should_trigger(const chaos_time_rule_t *rule)
         return 0;
     }
 
-    if (!chaos_time_probability_hit(rule->probability))
+    /* Past the gates that cost nothing: this call is an evaluation of the rule, gets its
+     * number, and every sample of it follows from that number. */
+    chaos_time_rule_draw_begin(rule);
+    if (!chaos_time_probability_hit_sample(
+            rule->probability, chaos_time_rule_draw(rule, CHAOS_TIME_DRAW_PROBABILITY)
+        ))
     {
         return 0;
     }
@@ -162,7 +159,7 @@ int chaos_time_rule_should_trigger(const chaos_time_rule_t *rule)
  *
  * One firing decision per call, before the first chunk.
  */
-void chaos_time_rule_apply_latency(const chaos_time_rule_t *rule)
+void chaos_time_rule_apply_latency(chaos_time_rule_t *rule)
 {
     uint64_t remaining_us;
 
@@ -185,7 +182,7 @@ void chaos_time_rule_apply_latency(const chaos_time_rule_t *rule)
 /**
  * @copydoc chaos_time_rule_apply_errno
  */
-int chaos_time_rule_apply_errno(const chaos_time_rule_t *rule)
+int chaos_time_rule_apply_errno(chaos_time_rule_t *rule)
 {
     if (rule == NULL || rule->effect != CHAOS_TIME_EFFECT_ERRNO ||
         !chaos_time_rule_should_trigger(rule))
@@ -200,7 +197,7 @@ int chaos_time_rule_apply_errno(const chaos_time_rule_t *rule)
 /**
  * @copydoc chaos_time_rule_apply_offset
  */
-void chaos_time_rule_apply_offset(const chaos_time_rule_t *rule, struct timespec *value)
+void chaos_time_rule_apply_offset(chaos_time_rule_t *rule, struct timespec *value)
 {
     if (rule == NULL || value == NULL || rule->effect != CHAOS_TIME_EFFECT_OFFSET ||
         !chaos_time_rule_should_trigger(rule))
@@ -219,7 +216,7 @@ void chaos_time_rule_apply_offset(const chaos_time_rule_t *rule, struct timespec
  * does not; in 2 every read is shifted. A read that meets state 3 on another thread is
  * not shifted. The atfork child handler turns an inherited 3 back into 1.
  */
-void chaos_time_rule_apply_regress(const chaos_time_rule_t *rule, struct timespec *value)
+void chaos_time_rule_apply_regress(chaos_time_rule_t *rule, struct timespec *value)
 {
     chaos_hit_slot_t *slot;
 

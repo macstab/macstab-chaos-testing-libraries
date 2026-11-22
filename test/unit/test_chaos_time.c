@@ -159,7 +159,7 @@ int chaos_time_config_match(
 }
 
 /** @brief LATENCY seam: counts the call and does not sleep. */
-void chaos_time_rule_apply_latency(const chaos_time_rule_t *rule)
+void chaos_time_rule_apply_latency(chaos_time_rule_t *rule)
 {
     assert(rule != NULL);
     ++g_latency_calls;
@@ -169,7 +169,7 @@ void chaos_time_rule_apply_latency(const chaos_time_rule_t *rule)
  * @brief ERRNO seam: for an ERRNO rule while `g_errno_trigger` is set, stores `errnum` in
  *   errno and returns 1; otherwise returns 0 and leaves errno alone.
  */
-int chaos_time_rule_apply_errno(const chaos_time_rule_t *rule)
+int chaos_time_rule_apply_errno(chaos_time_rule_t *rule)
 {
     if (rule == NULL || rule->effect != CHAOS_TIME_EFFECT_ERRNO || g_errno_trigger == 0)
     {
@@ -180,7 +180,7 @@ int chaos_time_rule_apply_errno(const chaos_time_rule_t *rule)
 }
 
 /** @brief REGRESS seam: counts the call and leaves @p value unchanged. */
-void chaos_time_rule_apply_regress(const chaos_time_rule_t *rule, struct timespec *value)
+void chaos_time_rule_apply_regress(chaos_time_rule_t *rule, struct timespec *value)
 {
     assert(rule != NULL);
     assert(value != NULL);
@@ -214,7 +214,7 @@ int chaos_time_rule_unshift_deadline(
  * @brief OFFSET seam: counts the call and adds `offset_ms` to @p value with a forward carry
  *   only, which suffices for the positive offsets used here.
  */
-void chaos_time_rule_apply_offset(const chaos_time_rule_t *rule, struct timespec *value)
+void chaos_time_rule_apply_offset(chaos_time_rule_t *rule, struct timespec *value)
 {
     assert(rule != NULL);
     assert(value != NULL);

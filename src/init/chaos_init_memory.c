@@ -20,6 +20,7 @@
 
 #include "../memory/chaos_memory_actions.c"
 #include "../memory/chaos_memory_config.c"
+#include "chaos_init_core.h"
 #include "chaos_init_tracee.h"
 
 #include <sys/random.h>
@@ -28,7 +29,7 @@
 /* Symbols the rule core expects from the preload library; the seed is replaced from
  * getrandom() in chaos_init_memory_start(). */
 __thread int g_chaos_memory_tls_guard = 0;
-__thread uint64_t g_chaos_memory_tls_prng_state = 0U;
+uint64_t g_chaos_memory_lineage = 0U;
 uint64_t g_chaos_memory_process_seed = UINT64_C(0x6a09e667f3bcc909);
 
 /* Per-process hit slots of the memory rules. */
@@ -71,13 +72,9 @@ static chaos_init_rules_t g_chaos_init_memory_rules = {
 
 void chaos_init_memory_start(void)
 {
-    uint64_t seed;
 
     chaos_memory_config_init();
-    if (getrandom(&seed, sizeof(seed), 0) == (ssize_t)sizeof(seed))
-    {
-        g_chaos_memory_process_seed = seed;
-    }
+    g_chaos_memory_process_seed = chaos_init_seed();
     (void)chaos_init_tracee_register(&g_chaos_init_memory_rules);
 }
 

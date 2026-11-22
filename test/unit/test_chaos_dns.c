@@ -145,21 +145,21 @@ int chaos_dns_config_match_reverse(
 }
 
 /** @brief LATENCY stub: counts calls without sleeping. */
-void chaos_dns_rule_apply_latency(const chaos_dns_rule_t *rule)
+void chaos_dns_rule_apply_latency(chaos_dns_rule_t *rule)
 {
     assert(rule != NULL);
     ++g_latency_calls;
 }
 
 /** @brief Should-trigger stub: returns `g_should_trigger` for every rule. */
-int chaos_dns_rule_should_trigger(const chaos_dns_rule_t *rule)
+int chaos_dns_rule_should_trigger(chaos_dns_rule_t *rule)
 {
     (void)rule;
     return g_should_trigger;
 }
 
 /** @brief GAI stub: fires a GAI rule while `g_gai_trigger` is set, mirroring the real checks. */
-int chaos_dns_rule_apply_gai(const chaos_dns_rule_t *rule, int *gai_error)
+int chaos_dns_rule_apply_gai(chaos_dns_rule_t *rule, int *gai_error)
 {
     if (rule == NULL || gai_error == NULL || rule->effect != CHAOS_DNS_EFFECT_GAI ||
         g_gai_trigger == 0)
@@ -191,8 +191,9 @@ int chaos_dns_filter_result_list(struct addrinfo **result, chaos_dns_family_filt
 }
 
 /** @brief SHUFFLE stub: counts calls and leaves the order alone, so results stay predictable. */
-void chaos_dns_shuffle_result_list(struct addrinfo **result)
+void chaos_dns_shuffle_result_list(const chaos_dns_rule_t *rule, struct addrinfo **result)
 {
+    assert(rule != NULL);
     (void)result;
     ++g_shuffle_calls;
 }

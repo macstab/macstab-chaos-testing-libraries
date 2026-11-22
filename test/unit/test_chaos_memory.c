@@ -132,7 +132,7 @@ int chaos_memory_config_match(
 }
 
 /** @brief Replaces LATENCY: counts the application; the wrapper must pass a rule. */
-void chaos_memory_rule_apply_latency(const chaos_memory_rule_t *rule)
+void chaos_memory_rule_apply_latency(chaos_memory_rule_t *rule)
 {
     assert(rule != NULL);
     ++g_latency_calls;
@@ -142,7 +142,7 @@ void chaos_memory_rule_apply_latency(const chaos_memory_rule_t *rule)
  * @brief Replaces ERRNO with the production contract: under `g_errno_trigger`, stores the
  *        rule's errnum and returns 1; otherwise returns 0 and leaves errno alone.
  */
-int chaos_memory_rule_apply_errno(const chaos_memory_rule_t *rule)
+int chaos_memory_rule_apply_errno(chaos_memory_rule_t *rule)
 {
     if (rule == NULL || rule->effect != CHAOS_MEMORY_EFFECT_ERRNO || g_errno_trigger == 0)
     {

@@ -242,7 +242,7 @@ the host's.
 Stable: the preload model, the rule file path, the rule grammar, the operation
 names, the effect semantics, the status and hits file formats.
 
-Internal: file layout under `src/`, helper names, cache size (32 slots), PRNG
+Internal: file layout under `src/`, helper names, cache size (32 slots), draw
 algorithm, constructor ordering.
 
 ## 3. Key Concepts and Terminology
@@ -390,7 +390,7 @@ title libchaos-io runtime components
 
 component "Target Application" as App
 component "Wrappers\n(open/rw/stdio/sync/fsops)" as Wrappers
-component "Runtime Core\n(symbols, guard, PRNG)" as Core
+component "Runtime Core\n(symbols, guard, seed)" as Core
 component "Config Engine\n(parse, snapshots, match)" as Config
 component "FD Cache\nprocess-wide fd->path" as Cache
 component "Effect Engine\nerrno/latency/torn/corrupt" as Effects

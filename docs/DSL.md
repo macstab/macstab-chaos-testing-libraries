@@ -310,7 +310,7 @@ Same caveat as §2.3: a sketch of the surface, not its source of truth.
 | **Effect** | ERRNO, GAI, LATENCY, TIMEOUT, CORRUPT, TORN, TRICKLE, DUP, RESET, OFFSET, REGRESS, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER | `ChaosEffect.delay/throw/fail/stress/deadlock/spike/drop` | Toxiproxy toxics / `tc netem` rules / cgroup throttling |
 | **Effect application phase** | Pre-call (ERRNO, GAI, LATENCY, FAIL_AFTER; TORN shortens the count), instead of the call (OVERRIDE), post-call (CORRUPT, OFFSET, REGRESS, result-set transforms) | Same conceptual phases at the bytecode advice level | At the network/cgroup boundary, always pre-effect from the application's perspective |
 | **Activation policy** | Probability, `@first`, `@from`/`@until`, `@size`; FAIL_AFTER's call counter | `ActivationPolicy.always/count/timeWindow/session` | Annotation parameters + scenario lifecycle hooks |
-| **Activation evaluation** | Per call: window, size gate, one draw from a per-thread PRNG, `@first` claim | Per-call dispatcher check + session-scoped state | Lifecycle-driven (apply on `@BeforeEach`, remove on `@AfterEach`) |
+| **Activation evaluation** | Per call: window, size gate, the rule's probability sample, `@first` claim | Per-call dispatcher check + session-scoped state | Lifecycle-driven (apply on `@BeforeEach`, remove on `@AfterEach`) |
 | **Configuration source** | Text file `/tmp/.chaos-<lib>.conf` | Java code (builder) + JSON startup config | YAML / annotations + dynamic Testcontainers calls |
 | **Reload semantics** | `stat()` of the rule file at most every 1 ms, two-snapshot publication under a CAS-owned reload | Live registration / deregistration via dispatcher API | Lifecycle hooks; the boundary mutates between phases |
 | **Failure mode on bad config** | Fail-open: no rules, status file names the line | Fail-fast at builder validation (`IllegalArgumentException`) | Fail-fast at YAML parse |
@@ -459,15 +459,16 @@ Identity across layers: same definition, same closed interval.
 
 | Layer | State | Seeding | Quality |
 |---|---|---|---|
-| libc, counter-based (io, net) | None. A sample is `mix(mix((key ⊕ lineage) + n) + d)`: `key` = SplitMix64(process seed ⊕ hash(rule text)), `n` = the rule's evaluation number from its hit slot, `d` = the draw within that evaluation | Process seed: `CHAOS_SEED` (decimal, 64-bit) if set, else 8 bytes of `/dev/urandom` read with raw system calls in the constructor (fallback `0x6a09e667f3bcc909 ^ getpid()`) | SplitMix64 finaliser; every input bit affects every output bit |
-| libc, per-thread (dns, time, memory, process) | `__thread uint64_t g_chaos_<lib>_tls_prng_state`, xorshift64* | Process seed as above. Per thread, on its first draw: SplitMix64(process seed ⊕ kernel thread id ⊕ stack address) with the low bit forced to 1 | xorshift64* (period 2^64 − 1); sufficient for fault injection |
+| libc, counter-based (all six) | None. A sample is `mix(mix((key ⊕ lineage) + n) + d)`: `key` = SplitMix64(process seed ⊕ hash(rule text)), `n` = the rule's evaluation number from its hit slot, `d` = the draw within that evaluation | Process seed: `CHAOS_SEED` (decimal, 64-bit) if set, else 8 bytes of `/dev/urandom` read with raw system calls in the constructor (fallback `0x6a09e667f3bcc909 ^ getpid()`) | SplitMix64 finaliser; every input bit affects every output bit |
 | JVM | `SplittableRandom` per scenario / per session (per-thread split) | `Thread`-local split from a session seed | L'Ecuyer-class (`SplittableRandom` is well studied) |
 | Orchestration | Server-side (Toxiproxy uses Go's `math/rand`) | Toxiproxy seeds from time at process start | Sufficient for chaos |
 
-### 6.3. Why per-thread, lazily seeded (the libraries that still are)
+### 6.3. What the counter-based model replaced
 
-**Per thread.** No shared state and no contention in highly parallel processes;
-each thread evolves its own sequence.
+**Per thread, until 2.1.0.** Each thread evolved its own xorshift64* sequence: no
+shared state and no contention, but no way to reproduce a run either, and a `gettid`
+call per thread. The counter-based derivation keeps the first property (a sample
+touches no shared state but the rule's evaluation counter) and adds the second.
 
 **Lazily seeded.** A thread that never evaluates a probability never pays for
 seeding. The process seed itself is read once in the constructor.
@@ -504,9 +505,9 @@ range is ignored and the random source takes over: the seed decides which faults
 fire, not whether the rule file is valid, and a test is better served by rules that
 load. `-1` is **not** accepted as `2^64 − 1`.
 
-Migration: libchaos-io and libchaos-net are counter-based; dns, time, memory and
-process still use the per-thread stream, where `CHAOS_SEED` only fixes the process
-seed and on its own makes nothing reproducible.
+All six libraries work this way. The per-thread xorshift64* stream, its lazy seeding
+from the thread id and a stack address, and the `gettid` call that went with it are
+gone.
 
 **Why `SplittableRandom` on the JVM.** Steele, Lea, Flood, "Fast splittable
 pseudorandom number generators", OOPSLA 2014. The libc side shares the desiderata

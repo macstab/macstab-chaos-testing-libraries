@@ -50,7 +50,7 @@ differences listed in [SECCOMP.md §5](SECCOMP.md#5-how-calls-map-to-the-librari
 10. [DSL Grammar and Rule Semantics](#10-dsl-grammar-and-rule-semantics)
 11. [Per-Hook Call Flows](#11-per-hook-call-flows)
 12. [Reentrancy Guard and TLS State](#12-reentrancy-guard-and-tls-state)
-13. [PRNG Model](#13-prng-model)
+13. [Draw Model](#13-draw-model)
 14. [Config Reload Protocol](#14-config-reload-protocol)
 15. [Non-Coverage: clone/clone3, vfork, kill, pthread_kill](#15-non-coverage-cloneclone3-vfork-kill-pthread_kill)
 16. [glibc vs musl Divergence per Symbol](#16-glibc-vs-musl-divergence-per-symbol)
@@ -146,7 +146,7 @@ parent/child handlers after it.
   atfork handler, no child.
 - **The child.** The child of a real fork starts with the library state the parent had,
   then the library's atfork child handler gives it its own: FAIL_AFTER counters, hit
-  counts and `@first` claims start at 0, the PRNG reseeds from the child's TID, and the
+  counts and `@first` claims start at 0, the process lineage is mixed forward, and the
   child writes its own hits file (§14).
 - **Not resolved yet.** A `fork()` that arrives while the real pointer is still NULL (a
   call from inside symbol resolution) fails with `ENOSYS`: a bare `clone` would skip
@@ -551,7 +551,7 @@ Same design as `libchaos-memory` ([MEMORY.md §14](MEMORY.md#14-reentrancy-guard
 
 ```c
 extern __thread int g_chaos_process_tls_guard;          /* non-zero: inside the library */
-extern __thread uint64_t g_chaos_process_tls_prng_state; /* 0: not seeded yet */
+extern uint64_t g_chaos_process_lineage;                 /* 0 in the loading process */
 ```
 
 - Every real call runs between `chaos_process_enter_internal()` and
@@ -571,15 +571,23 @@ extern __thread uint64_t g_chaos_process_tls_prng_state; /* 0: not seeded yet */
 
 ---
 
-## 13. PRNG Model
+## 13. Draw Model
 
-xorshift64* per thread, identical across the libraries
-([MEMORY.md §15](MEMORY.md#15-prng-model)): process seed from 8 bytes of `/dev/urandom`
-read with raw system calls in the constructor (fallback `0x6a09e667f3bcc909 ^ getpid()`);
-thread seed `SplitMix64(process seed ^ gettid() ^ &local) | 1`; step
-`>>12, <<25, >>27`, output the upper 32 bits of `x * 0x2545f4914f6cdd1d`; fire when
-`sample < p * 2^32`. The atfork child handler zeroes the forking thread's state so
-pre-fork workers do not decide alike.
+counter-based, identical across the libraries
+([MEMORY.md §15](MEMORY.md#15-draw-model--counter-based-no-stream)):
+
+- Process seed: `CHAOS_SEED=<decimal 64-bit>` if set, else 8 bytes from `/dev/urandom`
+  read with raw system calls in the constructor (fallback `0x6a09e667f3bcc909 ^ getpid()`).
+- A rule's key: `mix(process seed ^ hash(rule text))`, from the text so a slot handed out
+  again does not pass the old rule's decisions on.
+- A sample: `mix(mix((key ^ lineage) + n) + d) >> 32`, with `n` the rule's evaluation
+  number from its hit slot and `d` the draw within that evaluation (0 is the probability).
+- A rule fires when `sample < p * 2^32`; `p ≤ 0` never fires and `p ≥ 1` always fires,
+  both without drawing.
+- In a forked child the atfork handler mixes the process lineage forward, so pre-fork
+  workers do not all decide alike.
+- No per-thread state and no stream: the nth evaluation of a rule decides the same way in
+  every run with the same seed, and no thread can shift another's decisions.
 
 ---
 
@@ -603,7 +611,7 @@ Same two-snapshot design as the other libraries
 - Readers copy a rule under the snapshot's sequence counter and discard a torn copy.
 - A reload leaves the caller's `errno` untouched.
 - In a forked child the atfork handler releases an inherited `RELOADING` claim, resets
-  FAIL_AFTER counters, hit counts and `@first` claims, reseeds the PRNG and picks the
+  FAIL_AFTER counters, hit counts and `@first` claims, mixes the lineage forward and picks the
   child's own hits file.
 
 **Hits file** `/tmp/.chaos-process.hits.<n>`: one `count<TAB>rule text` line per rule;

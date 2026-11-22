@@ -43,18 +43,10 @@
  * (2^-32) from rounding.
  *
  * @param probability  Probability; <= 0.0 never fires, >= 1.0 always fires.
- * @param sample       Value uniform in [0, 2^32), normally chaos_memory_prng_next_u32().
+ * @param sample       Value uniform in [0, 2^32), normally chaos_memory_rule_draw().
  * @return 1 if the trial fires, 0 otherwise.
  */
 int chaos_memory_probability_hit_sample(double probability, uint32_t sample);
-
-/**
- * @brief Bernoulli trial of @p probability with the next value of this thread's PRNG.
- *
- * @param probability  Probability in [0.0, 1.0].
- * @return 1 if the trial fires, 0 otherwise.
- */
-int chaos_memory_probability_hit(double probability);
 
 /**
  * @brief Decides whether @p rule fires on this call; counts the hit when it does.
@@ -67,7 +59,7 @@ int chaos_memory_probability_hit(double probability);
  * @param rule  Matched rule copy; NULL returns 0.
  * @return 1 if the rule fires, 0 otherwise.
  */
-int chaos_memory_rule_should_trigger(const chaos_memory_rule_t *rule);
+int chaos_memory_rule_should_trigger(chaos_memory_rule_t *rule);
 
 /**
  * @brief Sleeps rule->latency_ms milliseconds if @p rule is a LATENCY rule that fires.
@@ -79,7 +71,7 @@ int chaos_memory_rule_should_trigger(const chaos_memory_rule_t *rule);
  *
  * @param rule  Matched rule copy; no-op if NULL, not LATENCY, or not firing.
  */
-void chaos_memory_rule_apply_latency(const chaos_memory_rule_t *rule);
+void chaos_memory_rule_apply_latency(chaos_memory_rule_t *rule);
 
 /**
  * @brief Sets errno to rule->errnum if @p rule is an ERRNO rule that fires.
@@ -91,6 +83,6 @@ void chaos_memory_rule_apply_latency(const chaos_memory_rule_t *rule);
  * @param rule  Matched rule copy; no-op if NULL, not ERRNO, or not firing.
  * @return 1 if errno was set and the call must fail, 0 otherwise (errno untouched).
  */
-int chaos_memory_rule_apply_errno(const chaos_memory_rule_t *rule);
+int chaos_memory_rule_apply_errno(chaos_memory_rule_t *rule);
 
 #endif

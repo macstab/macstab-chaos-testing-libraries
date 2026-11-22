@@ -170,7 +170,7 @@ else AT_SECURE == 0
   Ldso -> Chaos : libchaos constructor
   note right of Chaos
     resolve real functions (RTLD_NEXT)
-    seed PRNG, reset config state
+    take the process seed, reset config state
     load rule file, write status file
   end note
   Ldso -> Caller : _start / main with interposition active
@@ -253,7 +253,6 @@ system calls of their own; an injected ERRNO makes none.
 | `openat`, `read`, `close` | `/dev/urandom` seed | once per library, raw system calls |
 | `openat`, `write`, `fchmod`, `linkat`, `renameat` (`renameat2` on arm64), `unlinkat`, `faccessat` | status and hits files | raw system calls; failures ignored |
 | `clock_nanosleep` | LATENCY | raw system call, restarted on `EINTR` |
-| `gettid` | lazy per-thread PRNG seed | raw system call, first draw per thread |
 | `readlink` or `readlinkat` (via libc `readlink`) | fd → path (`libchaos-io`) | fd-cache miss |
 | `mmap`, `munmap` | fd-cache table (`libchaos-io`) | raw system calls, once per process |
 
@@ -628,7 +627,7 @@ order, after the executable and before its `DT_NEEDED` libraries.
 ELF initialisers run dependencies first. Another object's constructor can therefore call an
 interposed function before a libchaos constructor has run, which is why every wrapper
 resolves the real functions itself (`chaos_<lib>_ensure_symbols()`) instead of relying on
-the constructor. Each libchaos constructor resolves its real functions, seeds its PRNG,
+the constructor. Each libchaos constructor resolves its real functions, takes the process seed,
 registers its atfork handler and loads its rule file; none depends on another libchaos
 library, so their relative order does not affect correctness.
 

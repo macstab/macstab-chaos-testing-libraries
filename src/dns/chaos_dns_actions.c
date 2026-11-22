@@ -58,21 +58,13 @@ int chaos_dns_probability_hit_sample(double probability, uint32_t sample)
 }
 
 /**
- * @brief Fire/no-fire decision with one PRNG draw (contract in the header).
- */
-int chaos_dns_probability_hit(double probability)
-{
-    return chaos_dns_probability_hit_sample(probability, chaos_dns_prng_next_u32());
-}
-
-/**
  * @brief Sleeps for a LATENCY rule (contract in the header).
  *
  * @details No decision here: the wrappers call chaos_dns_rule_should_trigger() first.
  * chaos_sleep_ms() is a raw system call, so no other preloaded library (libchaos-time in
  * particular) can shorten or stretch the delay; errno is preserved.
  */
-void chaos_dns_rule_apply_latency(const chaos_dns_rule_t *rule)
+void chaos_dns_rule_apply_latency(chaos_dns_rule_t *rule)
 {
     if (rule == NULL || rule->effect != CHAOS_DNS_EFFECT_LATENCY)
     {
@@ -88,14 +80,19 @@ void chaos_dns_rule_apply_latency(const chaos_dns_rule_t *rule)
  * call the window or the size gate rejects neither consumes a random number nor claims
  * an `@first` slot.
  */
-int chaos_dns_rule_should_trigger(const chaos_dns_rule_t *rule)
+int chaos_dns_rule_should_trigger(chaos_dns_rule_t *rule)
 {
     if (rule == NULL || !chaos_policy_window_open(&rule->policy) ||
         !chaos_policy_size_ok(&rule->policy, rule->call_size))
     {
         return 0;
     }
-    if (!chaos_dns_probability_hit(rule->probability))
+    /* Past the gates that cost nothing: this call is an evaluation of the rule, gets its
+     * number, and every sample of it follows from that number. */
+    chaos_dns_rule_draw_begin(rule);
+    if (!chaos_dns_probability_hit_sample(
+            rule->probability, chaos_dns_rule_draw(rule, CHAOS_DNS_DRAW_PROBABILITY)
+        ))
     {
         return 0;
     }
@@ -105,7 +102,7 @@ int chaos_dns_rule_should_trigger(const chaos_dns_rule_t *rule)
 /**
  * @brief Applies a GAI rule (contract in the header).
  */
-int chaos_dns_rule_apply_gai(const chaos_dns_rule_t *rule, int *gai_error)
+int chaos_dns_rule_apply_gai(chaos_dns_rule_t *rule, int *gai_error)
 {
     if (rule == NULL || gai_error == NULL || rule->effect != CHAOS_DNS_EFFECT_GAI)
     {
@@ -269,7 +266,7 @@ void chaos_dns_limit_result_list(struct addrinfo **result, unsigned int limit)
  * node `prng % (i + 1)`; canonical name swapped from the old head to the new one (the C
  * libraries set it only on the head); relink; free the array.
  */
-void chaos_dns_shuffle_result_list(struct addrinfo **result)
+void chaos_dns_shuffle_result_list(const chaos_dns_rule_t *rule, struct addrinfo **result)
 {
     struct addrinfo **nodes;
     struct addrinfo *current;
@@ -304,10 +301,12 @@ void chaos_dns_shuffle_result_list(struct addrinfo **result)
     }
 
     /* Descending Fisher-Yates sweep; j uniform in [0, i] up to a modulo bias below
-     * (i + 1) / 2^32. */
+     * (i + 1) / 2^32. Each swap takes the next draw of this evaluation, so a list of N
+     * addresses is permuted the same way in every run with the same CHAOS_SEED. */
     for (index = count - 1U; index > 0U; --index)
     {
-        size_t swap_index = (size_t)(chaos_dns_prng_next_u32() % (uint32_t)(index + 1U));
+        const uint64_t draw = CHAOS_DNS_DRAW_FIRST_EFFECT + (uint64_t)(count - 1U - index);
+        size_t swap_index = (size_t)(chaos_dns_rule_draw(rule, draw) % (uint32_t)(index + 1U));
         struct addrinfo *tmp = nodes[index];
 
         nodes[index] = nodes[swap_index];

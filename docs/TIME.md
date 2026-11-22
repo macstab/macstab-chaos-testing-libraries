@@ -56,7 +56,7 @@ without a system call ([SECCOMP.md §6](SECCOMP.md#6-not-possible)).
 15. [Limit: Futex Timeouts Under a Shifted Clock](#15-limit-futex-timeouts-under-a-shifted-clock)
 16. [Non-Coverage: timerfd](#16-non-coverage-timerfd)
 17. [Reentrancy Guard and TLS State](#17-reentrancy-guard-and-tls-state)
-18. [PRNG Model](#18-prng-model)
+18. [Draw Model](#18-draw-model)
 19. [Config Reload Protocol](#19-config-reload-protocol)
 20. [glibc vs musl Divergence](#20-glibc-vs-musl-divergence)
 21. [Execution Boundary Summary and Limits](#21-execution-boundary-summary-and-limits)
@@ -779,7 +779,7 @@ Same design as `libchaos-memory` ([MEMORY.md §14](MEMORY.md#14-reentrancy-guard
 
 ```c
 extern __thread int g_chaos_time_tls_guard;          /* non-zero: inside the library */
-extern __thread uint64_t g_chaos_time_tls_prng_state; /* 0: not seeded yet */
+extern uint64_t g_chaos_time_lineage;                 /* 0 in the loading process */
 ```
 
 - Every call to a real function, the config `stat()`, and the LATENCY sleep run between
@@ -800,20 +800,23 @@ extern __thread uint64_t g_chaos_time_tls_prng_state; /* 0: not seeded yet */
 
 ---
 
-## 18. PRNG Model
+## 18. Draw Model
 
-xorshift64* per thread, identical across the libraries
-([MEMORY.md §15](MEMORY.md#15-prng-model)):
+counter-based, identical across the libraries
+([MEMORY.md §15](MEMORY.md#15-draw-model--counter-based-no-stream)):
 
-- Process seed: 8 bytes from `/dev/urandom`, read with raw `openat`/`read`/`close` system
-  calls in the constructor; fallback `0x6a09e667f3bcc909 ^ getpid()`.
-- Thread seed: SplitMix64 finaliser of `process seed ^ gettid() ^ &local`, forced odd so
-  the state is never 0. Seeded lazily on the first draw.
-- Step: `x ^= x >> 12; x ^= x << 25; x ^= x >> 27`, output the upper 32 bits of
-  `x * 0x2545f4914f6cdd1d`. A rule fires when `sample < p * 2^32`; `p ≤ 0` never fires and
-  `p ≥ 1` always fires, both without drawing.
-- In a forked child the atfork handler zeroes the calling thread's state, so pre-fork
-  workers do not draw the same sequence.
+- Process seed: `CHAOS_SEED=<decimal 64-bit>` if set, else 8 bytes from `/dev/urandom`
+  read with raw system calls in the constructor (fallback `0x6a09e667f3bcc909 ^ getpid()`).
+- A rule's key: `mix(process seed ^ hash(rule text))`, from the text so a slot handed out
+  again does not pass the old rule's decisions on.
+- A sample: `mix(mix((key ^ lineage) + n) + d) >> 32`, with `n` the rule's evaluation
+  number from its hit slot and `d` the draw within that evaluation (0 is the probability).
+- A rule fires when `sample < p * 2^32`; `p ≤ 0` never fires and `p ≥ 1` always fires,
+  both without drawing.
+- In a forked child the atfork handler mixes the process lineage forward, so pre-fork
+  workers do not all decide alike.
+- No per-thread state and no stream: the nth evaluation of a rule decides the same way in
+  every run with the same seed, and no thread can shift another's decisions.
 
 ---
 

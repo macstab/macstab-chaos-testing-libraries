@@ -59,7 +59,7 @@ chaos_dns_gethostbyaddr_fn g_chaos_dns_real_gethostbyaddr = NULL;
 chaos_dns_gethostbyaddr_r_fn g_chaos_dns_real_gethostbyaddr_r = NULL;
 
 __thread int g_chaos_dns_tls_guard = 0;
-__thread uint64_t g_chaos_dns_tls_prng_state = 0U;
+uint64_t g_chaos_dns_lineage = 0U;
 uint64_t g_chaos_dns_process_seed = UINT64_C(0x2545f4914f6cdd1d);
 /** @endcond */
 
@@ -163,6 +163,42 @@ static uint64_t chaos_dns_read_seed_material(void)
 }
 
 /**
+ * @brief The process seed: `CHAOS_SEED` from the environment, else 64 random bits.
+ *
+ * @details `CHAOS_SEED=<decimal u64>` makes every decision of this container reproducible:
+ * a rule's draws follow from the seed, the rule's text and the number of the evaluation,
+ * nothing else. Without it the seed is random, which is what a chaos test wants when it is
+ * not trying to reproduce one particular run.
+ *
+ * `getenv()` is safe here and nowhere else in the library: this runs in the ELF
+ * constructor, before `main`, single-threaded, before the application can call `setenv`.
+ * Anything unusable is ignored rather than rejected -- the seed decides which faults fire,
+ * not whether the rules are valid, and a rule file that loads is worth more to a test than
+ * a refusal over an environment variable. Digits only: strtoull() takes a sign, and "-1"
+ * would wrap silently into UINT64_MAX, a seed nobody asked for.
+ *
+ * @return The seed.
+ */
+static uint64_t chaos_dns_seed(void)
+{
+    const char *text = getenv("CHAOS_SEED");
+    char *end = NULL;
+    unsigned long long value;
+
+    if (text == NULL || text[0] < '0' || text[0] > '9')
+    {
+        return chaos_dns_read_seed_material();
+    }
+    errno = 0;
+    value = strtoull(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0')
+    {
+        return chaos_dns_read_seed_material();
+    }
+    return (uint64_t)value;
+}
+
+/**
  * @brief Once-control of the resolution.
  *
  * @details chaos_once(), not pthread_once(): before glibc 2.34 the latter lives in
@@ -212,8 +248,7 @@ CHAOS_DNS_CONSTRUCTOR
 static void chaos_dns_init(void)
 {
     chaos_dns_ensure_symbols();
-    g_chaos_dns_process_seed = chaos_dns_read_seed_material();
-    chaos_dns_prng_seed_thread(g_chaos_dns_process_seed);
+    g_chaos_dns_process_seed = chaos_dns_seed();
     chaos_dns_config_init();
     /* Load the rules now so a bad rule file is reported at start-up. */
     (void)chaos_dns_config_prepare();
