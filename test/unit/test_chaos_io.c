@@ -205,9 +205,44 @@ static void test_call_real_open_and_match_fd_rule(void)
 }
 
 /**
- * @brief The constructor resolves every real function, seeds the process and this
- *        thread's PRNG from the seed material, initialises the config once, loads the
- *        rule file once (so a bad file is reported at start-up) and resets the fd cache.
+ * @brief Proves `CHAOS_SEED` fixes the process seed, and that anything unusable falls back
+ *        to the random source rather than refusing to load.
+ *
+ * @details The seed decides which faults fire, so a test that wants to reproduce a run
+ * sets it and a test that does not leaves it unset. A value that cannot be read is the
+ * interesting case: refusing the rule file over an environment variable would cost the
+ * test its rules, so the random source takes over and the rules still load.
+ */
+static void test_seed_from_environment(void)
+{
+    static const char *const unusable[] = {"", "12x", "x", "-1", "99999999999999999999999"};
+    size_t index;
+
+    chaos_test_reset_state();
+    g_sys_open_result = 5;
+    g_sys_read_result = (long)sizeof(uint64_t);
+    g_sys_seed_value = UINT64_C(0xfeedbeef12345678);
+
+    assert(setenv("CHAOS_SEED", "42", 1) == 0);
+    assert(chaos_io_seed() == UINT64_C(42));
+    /* The whole 64-bit range, not just what fits a long. */
+    assert(setenv("CHAOS_SEED", "18446744073709551615", 1) == 0);
+    assert(chaos_io_seed() == UINT64_MAX);
+
+    for (index = 0U; index < sizeof(unusable) / sizeof(unusable[0]); ++index)
+    {
+        assert(setenv("CHAOS_SEED", unusable[index], 1) == 0);
+        assert(chaos_io_seed() == UINT64_C(0xfeedbeef12345678));
+    }
+
+    assert(unsetenv("CHAOS_SEED") == 0);
+    assert(chaos_io_seed() == UINT64_C(0xfeedbeef12345678));
+}
+
+/**
+ * @brief The constructor resolves every real function, takes the process seed, initialises
+ *        the config once, loads the rule file once (so a bad file is reported at start-up)
+ *        and resets the fd cache.
  */
 static void test_init_runtime(void)
 {
@@ -242,7 +277,8 @@ static void test_init_runtime(void)
     assert(g_chaos_io_real_fallocate == chaos_test_real_fallocate_impl);
 #endif
     assert(g_chaos_io_process_seed == UINT64_C(0xfeedbeef12345678));
-    assert(g_chaos_io_tls_prng_state != 0U);
+    /* The lineage starts at 0: this is the process that loaded the library. */
+    assert(g_chaos_io_lineage == 0U);
     assert(g_config_init_calls == 1);
     /* The constructor loads the rules at once so a bad rule file is reported. */
     assert(g_config_prepare_calls == 1);
@@ -843,9 +879,15 @@ static void test_vectored_helpers(void)
     struct iovec target[2];
     char first[4] = {'a', 'b', 'c', 'd'};
     char second[4] = {'e', 'f', 'g', 'h'};
+    /* The torn length and the corruption indices come from this rule's draws; what is
+     * under test here is the vector arithmetic around them. */
+    chaos_io_rule_t torn_rule;
     size_t total = 0U;
     int target_count = 0;
     uint64_t seed = 1U;
+
+    (void)memset(&torn_rule, 0, sizeof(torn_rule));
+    chaos_io_rule_draw_begin(&torn_rule);
 
     source[0].iov_base = first;
     source[0].iov_len = 2U;
@@ -875,50 +917,50 @@ static void test_vectored_helpers(void)
 
     chaos_test_reset_state();
     g_torn_count_result = 0U;
-    assert(chaos_io_build_torn_iovecs(source, 2, target, &target_count) == 0);
+    assert(chaos_io_build_torn_iovecs(&torn_rule, source, 2, target, &target_count) == 0);
     source[0].iov_len = 0U;
     source[1].iov_len = 0U;
-    assert(chaos_io_build_torn_iovecs(source, 2, target, &target_count) == 0);
+    assert(chaos_io_build_torn_iovecs(&torn_rule, source, 2, target, &target_count) == 0);
     source[0].iov_len = 2U;
     source[1].iov_len = 3U;
     g_torn_count_result = 5U;
-    assert(chaos_io_build_torn_iovecs(source, 2, target, &target_count) == 0);
+    assert(chaos_io_build_torn_iovecs(&torn_rule, source, 2, target, &target_count) == 0);
     g_torn_count_result = 3U;
-    assert(chaos_io_build_torn_iovecs(source, 2, target, &target_count) == 1);
+    assert(chaos_io_build_torn_iovecs(&torn_rule, source, 2, target, &target_count) == 1);
     assert(target_count == 2);
     assert(target[0].iov_len == 2U);
     assert(target[1].iov_len == 1U);
 
     chaos_test_reset_state();
-    chaos_io_corrupt_iovecs(NULL, 2, 1U);
-    chaos_io_corrupt_iovecs(source, 0, 1U);
-    chaos_io_corrupt_iovecs(source, 2, 0U);
+    chaos_io_corrupt_iovecs(&torn_rule, NULL, 2, 1U);
+    chaos_io_corrupt_iovecs(&torn_rule, source, 0, 1U);
+    chaos_io_corrupt_iovecs(&torn_rule, source, 2, 0U);
     assert(g_corrupt_sample_calls == 0);
 
     chaos_test_reset_state();
     source[0].iov_len = 4U;
     source[1].iov_len = 4U;
-    chaos_io_corrupt_iovecs(source, 2, 3U);
+    chaos_io_corrupt_iovecs(&torn_rule, source, 2, 3U);
     assert(g_corrupt_sample_calls == 1);
     assert(g_last_corrupt_sample_size == 3U);
 
-    /* Search for a seed whose first draw is odd, so the flip lands in the second of two
-     * 1-byte segments; the bound of 256 seeds keeps the search finite. */
+    /* Search for a rule key whose byte draw is odd, so the flip lands in the second of two
+     * 1-byte segments; the bound of 256 keys keeps the search finite. */
     chaos_test_reset_state();
     source[0].iov_len = 1U;
     source[1].iov_len = 1U;
     while (seed < 256U)
     {
-        chaos_io_prng_seed_thread(seed);
-        if ((chaos_io_prng_next_u32() % 2U) == 1U)
+        torn_rule.key = seed;
+        chaos_io_rule_draw_begin(&torn_rule);
+        if ((chaos_io_rule_draw(&torn_rule, CHAOS_IO_DRAW_FIRST_EFFECT) % 2U) == 1U)
         {
             break;
         }
         ++seed;
     }
     assert(seed < 256U);
-    chaos_io_prng_seed_thread(seed);
-    chaos_io_corrupt_iovecs(source, 2, 2U);
+    chaos_io_corrupt_iovecs(&torn_rule, source, 2, 2U);
     assert(g_corrupt_sample_calls == 1);
     assert(g_last_corrupt_sample_size == 1U);
 }
@@ -2567,7 +2609,6 @@ static void test_stdio_streams_keep_the_cache_right(void)
 static void test_path_filters_join_and_seed(void)
 {
     char path[16];
-    uint64_t state_of_zero;
 
     assert(!chaos_io_is_control_path(NULL));
     assert(chaos_io_is_control_path("/tmp/.chaos-dns.status"));
@@ -2593,12 +2634,6 @@ static void test_path_filters_join_and_seed(void)
     assert(chaos_io_join_paths(path, 8U, "/tmp", "f1") == 1);
     assert(strcmp(path, "/tmp/f1") == 0);
     assert(chaos_io_join_paths(path, 7U, "/tmp", "f1") == 0);
-
-    chaos_io_prng_seed_thread(0U);
-    state_of_zero = g_chaos_io_tls_prng_state;
-    assert(state_of_zero != 0U);
-    chaos_io_prng_seed_thread(1U);
-    assert(g_chaos_io_tls_prng_state == state_of_zero);
 }
 
 /* rmdir() and unlinkat() here are the wrappers over the harness stubs, and syscall() is
@@ -2963,6 +2998,10 @@ static void test_vectored_edge_segments(void)
     struct iovec target[3];
     char bytes[4] = {'a', 'b', 'c', 'd'};
     int target_count = 0;
+    chaos_io_rule_t torn_rule;
+
+    (void)memset(&torn_rule, 0, sizeof(torn_rule));
+    chaos_io_rule_draw_begin(&torn_rule);
 
     /* An empty segment inside the budget is kept, empty. */
     source[0].iov_base = bytes;
@@ -2975,7 +3014,7 @@ static void test_vectored_edge_segments(void)
 
     /* Corruption lands in the segment that holds the bytes, past the empty one. */
     chaos_test_reset_state();
-    chaos_io_corrupt_iovecs(source, 2, 4U);
+    chaos_io_corrupt_iovecs(&torn_rule, source, 2, 4U);
     assert(g_corrupt_sample_calls == 1);
     assert(g_last_corrupt_sample_size == 4U);
 
@@ -2983,7 +3022,7 @@ static void test_vectored_edge_segments(void)
     source[0].iov_len = (size_t)SSIZE_MAX;
     source[1].iov_len = (size_t)SSIZE_MAX;
     g_torn_count_result = 1U;
-    assert(chaos_io_build_torn_iovecs(source, 2, target, &target_count) == 0);
+    assert(chaos_io_build_torn_iovecs(&torn_rule, source, 2, target, &target_count) == 0);
     assert(chaos_io_iovec_size(source, 2) == CHAOS_POLICY_NO_SIZE);
 }
 
@@ -3321,6 +3360,7 @@ int main(void)
     test_call_real_open_and_match_fd_rule();
     test_wrappers_resolve_symbols_before_constructor();
     test_ensure_symbols_is_thread_safe();
+    test_seed_from_environment();
     test_init_runtime();
     test_open_wrapper();
     test_normalize_path();

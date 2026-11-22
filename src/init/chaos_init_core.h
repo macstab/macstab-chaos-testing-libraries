@@ -190,4 +190,21 @@ size_t chaos_init_format_status(
  */
 int chaos_init_godebug_mptcp_off(const char *current, char *out, size_t size);
 
+/**
+ * @brief The process seed a library starts with: `CHAOS_SEED` from the environment, else
+ *        64 random bits.
+ *
+ * @details Same contract as under `LD_PRELOAD` (see the libraries' internal headers), so a
+ * test reproduces the same faults in either mode: `CHAOS_SEED=<decimal u64>` fixes every
+ * decision, nothing else does. A malformed or out-of-range value is ignored rather than
+ * refused -- the seed decides which faults fire, not whether the rules are valid.
+ *
+ * Only the libraries whose draws follow from the rule and the evaluation number honour it
+ * so far; the rest still mix a thread id into their per-thread generator, where a seed
+ * promises nothing.
+ *
+ * @return The seed.
+ */
+uint64_t chaos_init_seed(void);
+
 #endif

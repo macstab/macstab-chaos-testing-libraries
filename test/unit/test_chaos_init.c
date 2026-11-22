@@ -60,6 +60,12 @@ static unsigned long long g_fake_start[TEST_PIDS];
 static int test_process_of(pid_t tid, pid_t *tgid, uint64_t *start);
 #define CHAOS_INIT_PROCESS_OF(tid, tgid, start) test_process_of((tid), (tgid), (start))
 
+/* Seam: the entropy source. -1 models a kernel without getrandom(); a short read models
+ * an interrupted one. */
+static int g_getrandom_fails = 0;
+static ssize_t test_getrandom(void *buffer, size_t size);
+#define CHAOS_INIT_GETRANDOM(buffer, size) test_getrandom((buffer), (size))
+
 #include "../../src/init/chaos_init_core.c"
 #include "../../src/init/chaos_init_delay.c"
 #include "../../src/init/chaos_init_proc.c"
@@ -888,8 +894,55 @@ static void test_tracee_table(void)
     }
 }
 
+/** @brief Entropy stub: fills the buffer with a fixed value, or fails when armed. */
+static ssize_t test_getrandom(void *buffer, size_t size)
+{
+    if (g_getrandom_fails != 0)
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+    (void)memset(buffer, 0x5a, size);
+    return (ssize_t)size;
+}
+
+/**
+ * @brief Proves `CHAOS_SEED` fixes chaos-init's seed exactly as it fixes the libraries',
+ *        and that nothing usable falls back to entropy, then to the pid.
+ *
+ * @details The two modes must agree: a test that reproduces a run under LD_PRELOAD has to
+ * reproduce it under chaos-init too, or the seed is worth nothing. "-1" is rejected rather
+ * than wrapped into UINT64_MAX, which is a seed nobody asked for.
+ */
+static void test_seed_from_environment(void)
+{
+    static const char *const unusable[] = {"", "12x", "x", "-1", "99999999999999999999999"};
+    const uint64_t from_entropy = UINT64_C(0x5a5a5a5a5a5a5a5a);
+    size_t index;
+
+    g_getrandom_fails = 0;
+    assert(setenv("CHAOS_SEED", "42", 1) == 0);
+    assert(chaos_init_seed() == UINT64_C(42));
+    assert(setenv("CHAOS_SEED", "18446744073709551615", 1) == 0);
+    assert(chaos_init_seed() == UINT64_MAX);
+
+    for (index = 0U; index < sizeof(unusable) / sizeof(unusable[0]); ++index)
+    {
+        assert(setenv("CHAOS_SEED", unusable[index], 1) == 0);
+        assert(chaos_init_seed() == from_entropy);
+    }
+    assert(unsetenv("CHAOS_SEED") == 0);
+    assert(chaos_init_seed() == from_entropy);
+
+    /* No entropy source: the pid at least differs between the processes of a container. */
+    g_getrandom_fails = 1;
+    assert(chaos_init_seed() == (uint64_t)getpid());
+    g_getrandom_fails = 0;
+}
+
 int main(void)
 {
+    test_seed_from_environment();
     test_parse_args();
     test_filter_decisions();
     test_exit_code();

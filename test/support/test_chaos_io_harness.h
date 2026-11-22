@@ -657,7 +657,7 @@ void chaos_io_fdcache_invalidate(int fd)
  * @brief Stub for chaos_io_rule_apply_latency(): counts calls and records the rule's
  *        `call_size` (the byte count the @size qualifier is matched against); never sleeps.
  */
-void chaos_io_rule_apply_latency(const chaos_io_rule_t *rule)
+void chaos_io_rule_apply_latency(chaos_io_rule_t *rule)
 {
     assert(rule != NULL);
     ++g_latency_calls;
@@ -675,7 +675,7 @@ void chaos_io_rule_apply_latency(const chaos_io_rule_t *rule)
  * gate because the stub never looked. A zeroed policy opens the window and leaves `@size`
  * ungated, so a test that sets no policy behaves as before.
  */
-int chaos_io_rule_should_trigger(const chaos_io_rule_t *rule)
+int chaos_io_rule_should_trigger(chaos_io_rule_t *rule)
 {
     assert(rule != NULL);
     ++g_rule_should_trigger_calls;
@@ -684,6 +684,9 @@ int chaos_io_rule_should_trigger(const chaos_io_rule_t *rule)
     {
         return 0;
     }
+    /* The real one starts this call's draws here; the effect stubs do not use them, but a
+     * wrapper that asks an effect for a sample without a trigger is then still visible. */
+    chaos_io_rule_draw_begin(rule);
     return g_rule_should_trigger_result;
 }
 
@@ -691,7 +694,7 @@ int chaos_io_rule_should_trigger(const chaos_io_rule_t *rule)
  * @brief Stub for chaos_io_rule_apply_errno(): when `g_rule_apply_errno_result` is non-zero,
  *        sets errno to `rule->errnum`; returns `g_rule_apply_errno_result` either way.
  */
-int chaos_io_rule_apply_errno(const chaos_io_rule_t *rule)
+int chaos_io_rule_apply_errno(chaos_io_rule_t *rule)
 {
     assert(rule != NULL);
     ++g_rule_apply_errno_calls;
@@ -707,8 +710,9 @@ int chaos_io_rule_apply_errno(const chaos_io_rule_t *rule)
  *        `g_torn_count_result`, the shortened transfer size a TORN rule passes to the real
  *        function.
  */
-size_t chaos_io_torn_count(size_t requested)
+size_t chaos_io_torn_count(const chaos_io_rule_t *rule, size_t requested)
 {
+    assert(rule != NULL);
     g_last_torn_requested = requested;
     return g_torn_count_result;
 }
@@ -717,10 +721,11 @@ size_t chaos_io_torn_count(size_t requested)
  * @brief Stub for chaos_io_corrupt_buffer(): records @p size and flips bit 0 of byte 0, a
  *        deterministic corruption tests can assert without the PRNG.
  */
-void chaos_io_corrupt_buffer(void *buffer, size_t size)
+void chaos_io_corrupt_buffer(const chaos_io_rule_t *rule, void *buffer, size_t size)
 {
     unsigned char *bytes = (unsigned char *)buffer;
 
+    assert(rule != NULL);
     ++g_corrupt_calls;
     g_last_corrupt_size = size;
     if (bytes != NULL && size > 0U)
@@ -2008,7 +2013,7 @@ static void chaos_test_reset_state(void)
     g_chaos_io_real_copy_file_range = NULL;
 #endif
     g_chaos_io_tls_guard = 0;
-    g_chaos_io_tls_prng_state = 0U;
+    g_chaos_io_lineage = 0U;
     g_chaos_io_process_seed = 0U;
     chaos_test_bind_real_stdio();
 }

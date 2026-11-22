@@ -225,6 +225,7 @@ static int chaos_io_trim_iovecs(
  * count is not a real tear: a total of 1 byte cannot be torn (chaos_io_torn_count()
  * returns 1), and the check also guards the [1, total-1] contract.
  *
+ * @param[in]  rule          Firing rule; its first effect draw gives the torn length.
  * @param[in]  source        Array (wrapper copy).
  * @param[in]  source_count  Entries.
  * @param[out] target        Room for @p source_count entries.
@@ -232,7 +233,11 @@ static int chaos_io_trim_iovecs(
  * @return Non-zero when a torn vector was built.
  */
 static int chaos_io_build_torn_iovecs(
-    const struct iovec *source, int source_count, struct iovec *target, int *target_count
+    const chaos_io_rule_t *rule,
+    const struct iovec *source,
+    int source_count,
+    struct iovec *target,
+    int *target_count
 )
 {
     size_t total;
@@ -243,7 +248,7 @@ static int chaos_io_build_torn_iovecs(
         return 0;
     }
 
-    torn_total = chaos_io_torn_count(total);
+    torn_total = chaos_io_torn_count(rule, total);
     if (torn_total == 0U || torn_total >= total)
     {
         return 0;
@@ -257,30 +262,37 @@ static int chaos_io_build_torn_iovecs(
  *        CHAOS_IO_TORN_MAX_IOV entries); 0 when it cannot be torn.
  *
  * @details Works on a checked copy (chaos_io_read_iovecs()) of at most 64 entries, so an
- * invalid or long array reaches only the kernel. Draws one PRNG sample when it tears.
+ * invalid or long array reaches only the kernel. The torn length is the rule's first
+ * effect draw.
  */
-static int chaos_io_tear_iovecs(const struct iovec *iov, int iovcnt, struct iovec *torn, int *count)
+static int chaos_io_tear_iovecs(
+    const chaos_io_rule_t *rule, const struct iovec *iov, int iovcnt, struct iovec *torn, int *count
+)
 {
     struct iovec copy[CHAOS_IO_TORN_MAX_IOV];
 
     return iov != NULL && iovcnt > 0 && iovcnt <= CHAOS_IO_TORN_MAX_IOV &&
            chaos_io_read_iovecs(iov, iovcnt, copy) == 0 &&
-           chaos_io_build_torn_iovecs(copy, iovcnt, torn, count);
+           chaos_io_build_torn_iovecs(rule, copy, iovcnt, torn, count);
 }
 
 /**
  * @brief CORRUPT for readv/preadv: flips one bit among the first @p size bytes of the
  *        scattered result, chosen uniformly over the whole stream.
  *
- * @details Draws byte then bit sample, like chaos_io_corrupt_buffer(), maps the byte
- * offset to its segment and flips the bit there. Reads the caller's array directly: the
- * real call just succeeded with it, so it is valid.
+ * @details Takes the byte index from the rule's first effect draw and the bit from its
+ * second, like chaos_io_corrupt_buffer(), maps the byte offset to its segment and flips
+ * the bit there. Reads the caller's array directly: the real call just succeeded with it,
+ * so it is valid.
  *
+ * @param[in] rule    Firing rule, after chaos_io_rule_should_trigger() returned 1.
  * @param[in] iov     Caller's array; the bytes its entries point to are modified.
  * @param[in] iovcnt  Entries.
  * @param[in] size    Bytes the real call returned; may be less than the array's total.
  */
-static void chaos_io_corrupt_iovecs(const struct iovec *iov, int iovcnt, size_t size)
+static void chaos_io_corrupt_iovecs(
+    const chaos_io_rule_t *rule, const struct iovec *iov, int iovcnt, size_t size
+)
 {
     uint32_t index_sample;
     uint32_t bit_sample;
@@ -293,8 +305,8 @@ static void chaos_io_corrupt_iovecs(const struct iovec *iov, int iovcnt, size_t 
         return;
     }
 
-    index_sample = chaos_io_prng_next_u32();
-    bit_sample = chaos_io_prng_next_u32();
+    index_sample = chaos_io_rule_draw(rule, CHAOS_IO_DRAW_FIRST_EFFECT);
+    bit_sample = chaos_io_rule_draw(rule, CHAOS_IO_DRAW_SECOND_EFFECT);
     index = (size_t)(index_sample % size);
     for (entry = 0; entry < iovcnt && remaining > 0U; ++entry)
     {
@@ -500,7 +512,7 @@ CHAOS_IO_EXPORT ssize_t read(int fd, void *buffer, size_t count)
     rc = chaos_io_call_real_read(fd, buffer, count);
     if (rc > 0 && rule.effect == CHAOS_IO_EFFECT_CORRUPT && chaos_io_rule_should_trigger(&rule))
     {
-        chaos_io_corrupt_buffer(buffer, (size_t)rc);
+        chaos_io_corrupt_buffer(&rule, buffer, (size_t)rc);
     }
     return rc;
 }
@@ -539,7 +551,7 @@ CHAOS_IO_EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
     rc = chaos_io_call_real_readv(fd, iov, iovcnt);
     if (rc > 0 && rule.effect == CHAOS_IO_EFFECT_CORRUPT && chaos_io_rule_should_trigger(&rule))
     {
-        chaos_io_corrupt_iovecs(iov, iovcnt, (size_t)rc);
+        chaos_io_corrupt_iovecs(&rule, iov, iovcnt, (size_t)rc);
     }
     return rc;
 }
@@ -576,7 +588,7 @@ CHAOS_IO_EXPORT ssize_t write(int fd, const void *buffer, size_t count)
     }
     else if (rule.effect == CHAOS_IO_EFFECT_TORN && chaos_io_rule_should_trigger(&rule))
     {
-        count = chaos_io_torn_count(count);
+        count = chaos_io_torn_count(&rule, count);
     }
 
     rc = chaos_io_call_real_write(fd, buffer, count);
@@ -620,7 +632,7 @@ CHAOS_IO_EXPORT ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
 
         /* Tear first, decide second: a hit (and an @first allowance) is consumed only
          * when the tear can actually be applied. */
-        if (chaos_io_tear_iovecs(iov, iovcnt, torn_iov, &torn_iovcnt) &&
+        if (chaos_io_tear_iovecs(&rule, iov, iovcnt, torn_iov, &torn_iovcnt) &&
             chaos_io_rule_should_trigger(&rule))
         {
             return chaos_io_call_real_writev(fd, torn_iov, torn_iovcnt);
@@ -681,7 +693,7 @@ CHAOS_IO_EXPORT ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t co
     }
     else if (rule.effect == CHAOS_IO_EFFECT_TORN && chaos_io_rule_should_trigger(&rule))
     {
-        count = chaos_io_torn_count(count);
+        count = chaos_io_torn_count(&rule, count);
     }
 
     return chaos_io_call_real_sendfile(out_fd, in_fd, offset, count);
@@ -748,7 +760,7 @@ CHAOS_IO_EXPORT ssize_t copy_file_range(
     }
     else if (rule.effect == CHAOS_IO_EFFECT_TORN && chaos_io_rule_should_trigger(&rule))
     {
-        count = chaos_io_torn_count(count);
+        count = chaos_io_torn_count(&rule, count);
     }
 
     return chaos_io_call_real_copy_file_range(in_fd, in_offset, out_fd, out_offset, count, flags);
@@ -785,7 +797,7 @@ CHAOS_IO_EXPORT ssize_t pread(int fd, void *buffer, size_t count, off_t offset)
     rc = chaos_io_call_real_pread(fd, buffer, count, offset);
     if (rc > 0 && rule.effect == CHAOS_IO_EFFECT_CORRUPT && chaos_io_rule_should_trigger(&rule))
     {
-        chaos_io_corrupt_buffer(buffer, (size_t)rc);
+        chaos_io_corrupt_buffer(&rule, buffer, (size_t)rc);
     }
     return rc;
 }
@@ -820,7 +832,7 @@ CHAOS_IO_EXPORT ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_
     rc = chaos_io_call_real_preadv(fd, iov, iovcnt, offset);
     if (rc > 0 && rule.effect == CHAOS_IO_EFFECT_CORRUPT && chaos_io_rule_should_trigger(&rule))
     {
-        chaos_io_corrupt_iovecs(iov, iovcnt, (size_t)rc);
+        chaos_io_corrupt_iovecs(&rule, iov, iovcnt, (size_t)rc);
     }
     return rc;
 }
@@ -852,7 +864,7 @@ CHAOS_IO_EXPORT ssize_t pwrite(int fd, const void *buffer, size_t count, off_t o
     }
     else if (rule.effect == CHAOS_IO_EFFECT_TORN && chaos_io_rule_should_trigger(&rule))
     {
-        count = chaos_io_torn_count(count);
+        count = chaos_io_torn_count(&rule, count);
     }
 
     rc = chaos_io_call_real_pwrite(fd, buffer, count, offset);
@@ -889,7 +901,7 @@ CHAOS_IO_EXPORT ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off
         struct iovec torn_iov[CHAOS_IO_TORN_MAX_IOV];
         int torn_iovcnt;
 
-        if (chaos_io_tear_iovecs(iov, iovcnt, torn_iov, &torn_iovcnt) &&
+        if (chaos_io_tear_iovecs(&rule, iov, iovcnt, torn_iov, &torn_iovcnt) &&
             chaos_io_rule_should_trigger(&rule))
         {
             return chaos_io_call_real_pwritev(fd, torn_iov, torn_iovcnt, offset);

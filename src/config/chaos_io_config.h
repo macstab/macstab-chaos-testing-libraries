@@ -132,7 +132,7 @@ typedef struct chaos_io_rule
     chaos_io_operation_t operation; /**< Operation the rule applies to. */
     chaos_io_effect_t effect;       /**< Effect applied when the rule fires. */
     int errnum;                     /**< errno for ERRNO; 0 otherwise. */
-    double probability;      /**< Probability in [0, 1] for ERRNO, TORN, CORRUPT; 0 for LATENCY. */
+    double probability;      /**< Probability in [0, 1]; 1.0 for `LATENCY:ms` without `@p`. */
     unsigned int latency_ms; /**< Delay in ms for LATENCY; 0 otherwise. */
     /** Qualifiers written after the rule (`@first`, `@from`, `@until`, `@size`). */
     chaos_rule_policy_t policy;
@@ -145,7 +145,70 @@ typedef struct chaos_io_rule
     chaos_hit_slot_t *hit;
     /** Slot generation at publication; a newer slot generation means the rule left the file. */
     uint64_t hit_generation;
+    /**
+     * Draw key of the rule: `mix(process seed ^ hash(rule text))`, set when the snapshot is
+     * published. From the text, not the slot index, because chaos_hits_assign() hands slots
+     * out again and another rule would inherit the key. See chaos_io_rule_draw().
+     */
+    uint64_t key;
+    /**
+     * Base of this call's draws, set by chaos_io_rule_should_trigger() from the key and the
+     * rule's evaluation number; the effects derive their samples from it. Not part of the
+     * rule as parsed -- it belongs to the one call this copy was made for.
+     */
+    uint64_t draw_base;
 } chaos_io_rule_t;
+
+/**
+ * @brief Starts this call's draws: records the rule's evaluation number and derives the
+ *        base every sample of this call comes from.
+ *
+ * @details Two stages, not one. The first turns (rule, evaluation) into a base, the second
+ * turns (base, draw number) into a sample, so a rule that takes three draws cannot collide
+ * with the next evaluation of itself -- which is what a single `key + n * K + sub` does as
+ * soon as `sub` reaches K, a constant the next effect added would break silently.
+ *
+ * The evaluation number comes from the hit slot, so it survives a reload that keeps the
+ * rule, and restarts in a forked child, whose lineage differs anyway.
+ *
+ * @param rule  Rule copy for this call; NULL is a no-op. A rule outside a snapshot (unit
+ *              tests) has no slot and evaluates as number 0 every time.
+ */
+static inline void chaos_io_rule_draw_begin(chaos_io_rule_t *rule)
+{
+    uint64_t evaluation = 0U;
+
+    if (rule == NULL)
+    {
+        return;
+    }
+    if (rule->hit != NULL)
+    {
+        evaluation = __sync_fetch_and_add(&rule->hit->evaluations, UINT64_C(1));
+    }
+    rule->draw_base = chaos_io_prng_mix((rule->key ^ g_chaos_io_lineage) + evaluation);
+}
+
+/**
+ * @brief Sample @p draw of this call, uniform in [0, 2^32).
+ *
+ * @param[in] rule  Rule copy whose chaos_io_rule_draw_begin() ran.
+ * @param[in] draw  Which draw of this call: 0 is the probability, the effects follow.
+ * @return The sample.
+ */
+static inline uint32_t chaos_io_rule_draw(const chaos_io_rule_t *rule, uint64_t draw)
+{
+    return (uint32_t)(chaos_io_prng_mix(rule->draw_base + draw) >> 32);
+}
+
+/** @brief Draw number of the probability decision; effects number their draws after it. */
+#define CHAOS_IO_DRAW_PROBABILITY UINT64_C(0)
+
+/** @brief Draw number of TORN's byte count, and of CORRUPT's byte index. */
+#define CHAOS_IO_DRAW_FIRST_EFFECT UINT64_C(1)
+
+/** @brief Draw number of CORRUPT's bit index. */
+#define CHAOS_IO_DRAW_SECOND_EFFECT UINT64_C(2)
 
 /**
  * @brief Resets the rule cache to "no rules" and forces a rule-file read on the next

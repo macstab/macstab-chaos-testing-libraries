@@ -496,12 +496,12 @@ Main takeaway: everything is process-local and namespace-scoped.
 Files: `src/core/chaos_io.c`, `src/core/chaos_io_internal.h`,
 `src/core/chaos_io_wrappers.h`.
 
-- Owns the real-function pointers, the thread-local guard and PRNG state, and the
+- Owns the real-function pointers and the thread-local guard, and the
   process seed.
 - `chaos_io_init()` (constructor) resolves symbols, reads 8 bytes from
   `/dev/urandom` with raw `SYS_openat`/`SYS_read`/`SYS_close` (no interposed call
   during construction; fallback `0x6a09e667f3bcc909 ^ getpid()`), seeds the main
-  thread's PRNG, resets the config, **loads the rule file at once so a bad file is
+  process seed (`CHAOS_SEED`, else `/dev/urandom`), resets the config, **loads the rule file at once so a bad file is
   reported at start-up**, and resets the fd cache.
 - `chaos_io_match_fd_rule()` is the single lookup path for every descriptor-based
   wrapper; `chaos_io_match_fd_rule_sized()` also records the byte count for `@size`.
@@ -731,7 +731,7 @@ Process-wide: real-function pointers (written once), process seed, two snapshots
 stamp, the 256 KiB read buffer, hit slot pool (512 slots), fd cache table and slot
 generations.
 
-Thread-local: recursion guard (`int`), PRNG state (`uint64_t`). Nothing else: the
+Thread-local: recursion guard (`int`). Nothing else: the
 read buffer and fd cache were moved out of TLS because large static TLS objects are
 reserved in every thread and broke runtimes that create threads with small stacks.
 
@@ -804,8 +804,8 @@ portability across the toolchains in the build matrix.
 - `pthread_atfork` child handler (`chaos_io_config_after_fork()`): releases a reload
   claim held by a thread that does not exist in the child, clears the hits writer
   state, resets hit counts and `@first` claims, gives the child its own hits file
-  number, and zeroes the forking thread's PRNG state so the child reseeds from its
-  own thread id (pre-fork workers would otherwise draw identical sequences).
+  number, and mixes the process lineage forward, so the child's rules decide on their
+  own (pre-fork workers would otherwise all fault alike).
 - `vfork` children and `posix_spawn` run no atfork handler. They share the parent's
   memory, see its reload claim as busy, may count into its slots, and never write a
   hits file (the writer checks `getpid()`).
@@ -1124,7 +1124,7 @@ runtime behaviour is validated across all four.
 - all-or-nothing parsing with a status report;
 - one rule per call, longest prefix, file order on ties;
 - exclusion of control files, `/proc`, `/sys`, `/dev` and descriptors 0-2;
-- no heap allocation, no static TLS beyond the guard and PRNG state.
+- no heap allocation, no static TLS beyond the guard.
 
 ## 15. Stack Walkdown
 
@@ -1146,7 +1146,7 @@ native code calls interposed functions; there is no Java-specific contract.
 
 ### Memory and concurrency level
 
-Thread-local: the guard and the PRNG state. Process-wide, lock-free: snapshots
+Thread-local: the guard. Process-wide, lock-free: snapshots
 (CAS-owned reload, seqlock-validated reads), the fd cache (seqlock plus
 generations) and hit slots.
 

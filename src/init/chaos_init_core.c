@@ -15,7 +15,9 @@
 #include <linux/seccomp.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -448,4 +450,36 @@ size_t chaos_init_format_status(
         return 0U;
     }
     return (size_t)written;
+}
+
+/* Test seam: a failing entropy source cannot be provoked from outside. */
+#ifndef CHAOS_INIT_GETRANDOM
+#define CHAOS_INIT_GETRANDOM(buffer, size) getrandom((buffer), (size), 0)
+#endif
+
+/** @copydoc chaos_init_seed */
+uint64_t chaos_init_seed(void)
+{
+    const char *text = getenv("CHAOS_SEED");
+    char *end = NULL;
+    unsigned long long value;
+    uint64_t random_seed;
+
+    /* Digits only: strtoull() accepts a sign and blanks, and "-1" would wrap silently
+     * into UINT64_MAX -- a seed the user did not ask for. */
+    if (text != NULL && text[0] >= '0' && text[0] <= '9')
+    {
+        errno = 0;
+        value = strtoull(text, &end, 10);
+        if (errno == 0 && end != text && *end == '\0')
+        {
+            return (uint64_t)value;
+        }
+    }
+    if (CHAOS_INIT_GETRANDOM(&random_seed, sizeof(random_seed)) == (ssize_t)sizeof(random_seed))
+    {
+        return random_seed;
+    }
+    /* No entropy: the pid at least differs between the processes of a container. */
+    return (uint64_t)getpid();
 }

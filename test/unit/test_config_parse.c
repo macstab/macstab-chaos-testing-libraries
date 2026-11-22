@@ -635,6 +635,58 @@ static void test_reload_prepare_and_match(void)
 }
 
 /**
+ * @brief Proves a rule's draw key follows its text, not its place in the file.
+ *
+ * @details The key is what makes a fault reproducible, so it has to belong to the rule and
+ * not to the slot the rule happens to occupy: chaos_hits_assign() hands a slot out again
+ * when a rule leaves the file, and a key from the slot index would make the next rule in
+ * that slot inherit the old one's decisions. Asserted by reloading the same two rules in
+ * the other order -- each text keeps its key -- and by adding a rule in front, which must
+ * leave the other two keys alone.
+ */
+static void test_draw_key_follows_the_rule_text(void)
+{
+    uint64_t first_key;
+    uint64_t second_key;
+    const chaos_io_config_state_t *state;
+
+    chaos_test_use_real_io();
+    chaos_io_config_init();
+    chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/a:write:EIO:1.0\n/b:read:EIO:1.0\n");
+    assert(chaos_io_config_prepare() == 1);
+    state = chaos_io_config_active_state();
+    assert(state->rule_count == 2U);
+    assert(strcmp(state->text[0], "/a:write:EIO:1.0") == 0);
+    first_key = state->rules[0].key;
+    second_key = state->rules[1].key;
+    assert(first_key != second_key);
+
+    /* Same rules, other order: the keys travel with the texts. */
+    chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/b:read:EIO:1.0\n/a:write:EIO:1.0\n");
+    g_chaos_io_cached_mtime = CHAOS_IO_MTIME_UNKNOWN;
+    assert(chaos_io_config_prepare() == 1);
+    state = chaos_io_config_active_state();
+    assert(state->rule_count == 2U);
+    assert(strcmp(state->text[0], "/b:read:EIO:1.0") == 0);
+    assert(state->rules[0].key == second_key);
+    assert(state->rules[1].key == first_key);
+
+    /* A rule added in front shifts every index; the keys do not move. */
+    chaos_test_write_text_file(
+        CHAOS_IO_CONFIG_PATH, "/c:open:EIO:1.0\n/b:read:EIO:1.0\n/a:write:EIO:1.0\n"
+    );
+    g_chaos_io_cached_mtime = CHAOS_IO_MTIME_UNKNOWN;
+    assert(chaos_io_config_prepare() == 1);
+    state = chaos_io_config_active_state();
+    assert(state->rule_count == 3U);
+    assert(state->rules[1].key == second_key);
+    assert(state->rules[2].key == first_key);
+    assert(state->rules[0].key != first_key && state->rules[0].key != second_key);
+
+    (void)unlink(CHAOS_IO_CONFIG_PATH);
+}
+
+/**
  * @brief A transient read failure keeps the active rules and retries: with open failing
  *        the old single rule stays active and the stamp is not advanced (nor left at
  *        RELOADING); the next call with working I/O loads both new rules.
@@ -690,8 +742,8 @@ static void test_change_stamp_beyond_mtime(void)
  *
  * @details The test name predates this design: a vfork child shares memory with a parent
  * whose reload may still be running, so prepare() must not steal the claim whoever made
- * it. chaos_io_config_after_fork() resets the child's PRNG state, rebinds the hits pid and
- * turns RELOADING into UNKNOWN so the next prepare() reloads; on a settled stamp it
+ * it. chaos_io_config_after_fork() mixes the child's lineage forward, rebinds the hits pid
+ * and turns RELOADING into UNKNOWN so the next prepare() reloads; on a settled stamp it
  * changes nothing.
  */
 static void test_fork_takes_over_orphaned_reload(void)
@@ -705,9 +757,11 @@ static void test_fork_takes_over_orphaned_reload(void)
     g_chaos_io_cached_mtime = CHAOS_IO_MTIME_RELOADING;
     (void)chaos_io_config_prepare();
     assert(g_chaos_io_cached_mtime == CHAOS_IO_MTIME_RELOADING);
-    g_chaos_io_tls_prng_state = UINT64_C(42);
+    /* The child's lineage must differ from its parent's, or every backend of a
+     * pre-forking server would make the same decisions. */
+    g_chaos_io_lineage = 0U;
     chaos_io_config_after_fork();
-    assert(g_chaos_io_tls_prng_state == 0U);
+    assert(g_chaos_io_lineage != 0U);
     assert(g_chaos_io_cached_mtime == CHAOS_IO_MTIME_UNKNOWN);
     assert(g_chaos_io_hits_pid == (uint64_t)getpid());
     assert(chaos_io_config_prepare());
@@ -1610,6 +1664,7 @@ int main(void)
     test_parse_buffer_error_paths();
     test_read_file_paths();
     test_reload_prepare_and_match();
+    test_draw_key_follows_the_rule_text();
     test_read_failure_keeps_rules_and_retries();
     test_change_stamp_beyond_mtime();
     test_fork_takes_over_orphaned_reload();

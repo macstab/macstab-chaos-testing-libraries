@@ -49,6 +49,7 @@ static int chaos_init_io_supported(const struct chaos_io_rule *rule);
 
 #include "../config/chaos_io_config.c"
 #include "../effects/chaos_io_actions.c"
+#include "chaos_init_core.h"
 #include "chaos_init_proc.h"
 #include "chaos_init_tracee.h"
 
@@ -64,7 +65,7 @@ chaos_io_open_fn g_chaos_io_real_open = open;
 chaos_io_read_fn g_chaos_io_real_read = read;
 chaos_io_close_fn g_chaos_io_real_close = close;
 __thread int g_chaos_io_tls_guard = 0;
-__thread uint64_t g_chaos_io_tls_prng_state = 0U;
+uint64_t g_chaos_io_lineage = 0U;
 uint64_t g_chaos_io_process_seed = UINT64_C(0x2545f4914f6cdd1d);
 
 /* CHAOS_IO_RULE_SUPPORTED: ERRNO on anything but close, and LATENCY. */
@@ -190,13 +191,8 @@ static chaos_init_rules_t g_chaos_init_io_rules = {
 
 void chaos_init_io_start(void)
 {
-    uint64_t seed;
-
     chaos_io_config_init();
-    if (getrandom(&seed, sizeof(seed), 0) == (ssize_t)sizeof(seed))
-    {
-        g_chaos_io_process_seed = seed;
-    }
+    g_chaos_io_process_seed = chaos_init_seed();
     (void)chaos_init_tracee_register(&g_chaos_init_io_rules);
 }
 

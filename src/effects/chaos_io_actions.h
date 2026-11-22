@@ -56,14 +56,6 @@
 int chaos_io_probability_hit_sample(double probability, uint32_t sample);
 
 /**
- * @brief Probability gate with one draw from the thread-local PRNG.
- *
- * @param[in] probability  Probability in [0.0, 1.0].
- * @return Non-zero on a hit.
- */
-int chaos_io_probability_hit(double probability);
-
-/**
  * @brief Byte count of a torn write, from an explicit sample.
  *
  * @details
@@ -81,12 +73,13 @@ int chaos_io_probability_hit(double probability);
 size_t chaos_io_torn_count_sample(size_t requested, uint32_t sample);
 
 /**
- * @brief chaos_io_torn_count_sample() with one draw from the thread-local PRNG.
+ * @brief chaos_io_torn_count_sample() with this call's first effect draw.
  *
+ * @param[in] rule       Firing rule, after chaos_io_rule_should_trigger() returned 1.
  * @param[in] requested  Byte count the caller asked to write.
  * @return The count to pass to the real function; <= @p requested.
  */
-size_t chaos_io_torn_count(size_t requested);
+size_t chaos_io_torn_count(const chaos_io_rule_t *rule, size_t requested);
 
 /**
  * @brief Flips bit `bit_sample & 7` of byte `index_sample % size` in @p buffer.
@@ -101,15 +94,17 @@ void chaos_io_corrupt_buffer_sample(
 );
 
 /**
- * @brief CORRUPT effect: flips one random bit among the @p size bytes a read returned.
+ * @brief CORRUPT effect: flips one bit among the @p size bytes a read returned.
  *
  * @details Models silent media or transport corruption that the caller cannot detect
- * from the return value. Draws the byte sample first and the bit sample second.
+ * from the return value. The byte index is this call's first effect draw, the bit its
+ * second.
  *
+ * @param[in]     rule    Firing rule, after chaos_io_rule_should_trigger() returned 1.
  * @param[in,out] buffer  Bytes returned by the real read; NULL is a no-op.
  * @param[in]     size    Bytes actually read (the real function's return value).
  */
-void chaos_io_corrupt_buffer(void *buffer, size_t size);
+void chaos_io_corrupt_buffer(const chaos_io_rule_t *rule, void *buffer, size_t size);
 
 /**
  * @brief LATENCY effect: blocks the calling thread for `rule->latency_ms` when the rule's
@@ -123,20 +118,22 @@ void chaos_io_corrupt_buffer(void *buffer, size_t size);
  *
  * @param[in] rule  Matched rule; NULL or a non-LATENCY effect is a no-op.
  */
-void chaos_io_rule_apply_latency(const chaos_io_rule_t *rule);
+void chaos_io_rule_apply_latency(chaos_io_rule_t *rule);
 
 /**
  * @brief Decides whether a selected rule fires on this call, and counts the hit if so.
  *
  * @details Checks, in order: the `@from`/`@until` window, the `@size` gate against
- * `rule->call_size`, the probability, and finally
- * chaos_policy_fire(), which claims a `@first` allowance and counts the hit. A PRNG
- * sample is drawn only when the window and size gates pass.
+ * `rule->call_size`, the probability, and finally chaos_policy_fire(), which claims a
+ * `@first` allowance and counts the hit. A rule the window or size gate filtered out is
+ * not an evaluation of it and gets no number.
  *
- * @param[in] rule  Selected rule; NULL returns 0.
+ * @param[in,out] rule  Selected rule copy; NULL returns 0. Past the first two gates this
+ *                      call's draw base is written into it (chaos_io_rule_draw_begin()),
+ *                      and the effects derive their samples from it.
  * @return Non-zero when the effect is to be applied; 0 to proceed without injection.
  */
-int chaos_io_rule_should_trigger(const chaos_io_rule_t *rule);
+int chaos_io_rule_should_trigger(chaos_io_rule_t *rule);
 
 /**
  * @brief ERRNO effect: when the rule fires, sets `errno = rule->errnum` and tells the
@@ -146,6 +143,6 @@ int chaos_io_rule_should_trigger(const chaos_io_rule_t *rule);
  * @return Non-zero when the wrapper must return its error value (errno is set); 0 when
  *         the rule did not fire, with errno unchanged.
  */
-int chaos_io_rule_apply_errno(const chaos_io_rule_t *rule);
+int chaos_io_rule_apply_errno(chaos_io_rule_t *rule);
 
 #endif

@@ -450,8 +450,8 @@ connection (RESET). Semantics: [NETWORK.md](NETWORK.md).
 - The probability is checked after the `@from`/`@until` window and the `@size`
   gate and before the `@first` claim; a rule filtered out earlier consumes no draw
   (FAIL_AFTER draws once its threshold is reached, before the other gates).
-- LATENCY and TRICKLE in io and net have no probability. Omitted probability in
-  three-field libraries means 1.0.
+- TRICKLE in net has no probability; LATENCY takes it as an optional `@probability`
+  after the milliseconds. An omitted probability is 1.0 in every library.
 
 Identity across layers: same definition, same closed interval.
 
@@ -459,11 +459,12 @@ Identity across layers: same definition, same closed interval.
 
 | Layer | State | Seeding | Quality |
 |---|---|---|---|
-| libc | `__thread uint64_t g_chaos_<lib>_tls_prng_state`, xorshift64* | Process seed: 8 bytes of `/dev/urandom` read with raw system calls in the constructor (fallback `0x6a09e667f3bcc909 ^ getpid()`). Per thread, on its first draw: SplitMix64(process seed ⊕ kernel thread id ⊕ stack address) with the low bit forced to 1 | xorshift64* (period 2^64 − 1); sufficient for fault injection |
+| libc, counter-based (io) | None. A sample is `mix(mix((key ⊕ lineage) + n) + d)`: `key` = SplitMix64(process seed ⊕ hash(rule text)), `n` = the rule's evaluation number from its hit slot, `d` = the draw within that evaluation | Process seed: `CHAOS_SEED` (decimal, 64-bit) if set, else 8 bytes of `/dev/urandom` read with raw system calls in the constructor (fallback `0x6a09e667f3bcc909 ^ getpid()`) | SplitMix64 finaliser; every input bit affects every output bit |
+| libc, per-thread (net, dns, time, memory, process) | `__thread uint64_t g_chaos_<lib>_tls_prng_state`, xorshift64* | Process seed as above. Per thread, on its first draw: SplitMix64(process seed ⊕ kernel thread id ⊕ stack address) with the low bit forced to 1 | xorshift64* (period 2^64 − 1); sufficient for fault injection |
 | JVM | `SplittableRandom` per scenario / per session (per-thread split) | `Thread`-local split from a session seed | L'Ecuyer-class (`SplittableRandom` is well studied) |
 | Orchestration | Server-side (Toxiproxy uses Go's `math/rand`) | Toxiproxy seeds from time at process start | Sufficient for chaos |
 
-### 6.3. Why per-thread, lazily seeded
+### 6.3. Why per-thread, lazily seeded (the libraries that still are)
 
 **Per thread.** No shared state and no contention in highly parallel processes;
 each thread evolves its own sequence.
@@ -474,6 +475,38 @@ seeding. The process seed itself is read once in the constructor.
 **fork.** The child's atfork handler zeroes the forking thread's state, so the child
 reseeds from its own thread id; pre-fork worker pools would otherwise make identical
 decisions in every worker.
+
+### 6.4. Reproducible faults: `CHAOS_SEED`
+
+A per-thread stream cannot be reproduced. Its seed mixes the kernel thread id, which
+counts every process and thread the container started before, and a stack address,
+which ASLR moves on every start. Fixing the process seed therefore does nothing for
+a multi-threaded target: the same seed gives different faults in the next run.
+
+The counter-based libraries have no stream. A sample is a pure function of
+
+- the **process seed** — `CHAOS_SEED=<decimal 64-bit>`, else random,
+- the **rule**, by a hash of its text rather than its slot or its line,
+- the **evaluation number** of that rule, counted in its hit slot,
+- the **draw** within that evaluation (probability, then each effect's samples),
+- the process **lineage**, 0 in the process that loaded the library and mixed
+  forward in each forked child.
+
+So the nth evaluation of a rule makes the same decision in every run with the same
+seed, whatever else the process is doing, and no thread can shift another's
+decisions. What the caller must hold constant is the **order of its own calls**;
+two calls racing for the same rule may swap their numbers, which is the caller's
+concern and not something a chaos library can decide for it.
+
+`CHAOS_SEED` is read in the ELF constructor, before `main`, and by `chaos-init` at
+start, so both modes reproduce the same run. A value that is not decimal digits in
+range is ignored and the random source takes over: the seed decides which faults
+fire, not whether the rule file is valid, and a test is better served by rules that
+load. `-1` is **not** accepted as `2^64 − 1`.
+
+Migration: libchaos-io is counter-based; the other five still use the per-thread
+stream and `CHAOS_SEED` only fixes their process seed, which on its own does not
+make them reproducible.
 
 **Why `SplittableRandom` on the JVM.** Steele, Lea, Flood, "Fast splittable
 pseudorandom number generators", OOPSLA 2014. The libc side shares the desiderata

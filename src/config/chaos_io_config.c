@@ -1001,8 +1001,10 @@ static void chaos_io_config_after_fork(void)
      * this pid is caught by the exclusive first write, which then picks another suffix. */
     g_chaos_io_hits_file = (long)g_chaos_io_hits_pid;
     CHAOS_STORE_IF_CHANGED(g_chaos_io_hits_owned, 0);
-    /* Zero forces a reseed on the next draw, mixing in the child's own tid. */
-    CHAOS_STORE_IF_CHANGED(g_chaos_io_tls_prng_state, 0U);
+    /* The child decides differently from the parent and from its siblings, without the
+     * rules' keys being rewritten: one global instead of every snapshot page. Mixed, not
+     * incremented, so sibling lineages are unrelated rather than adjacent. */
+    g_chaos_io_lineage = chaos_io_prng_mix(g_chaos_io_lineage + UINT64_C(1));
     if (g_chaos_io_hit_pool_used)
     {
         chaos_hits_pool_after_fork(
@@ -1210,6 +1212,11 @@ static void chaos_io_config_attach_hits(chaos_io_config_state_t *next_state)
         next_state->rules[index].hit = next_state->hits[index];
         next_state->rules[index].hit_generation =
             next_state->hits[index] != NULL ? next_state->hits[index]->generation : 0U;
+        /* From the text, so a rule keeps its decisions across a reload that keeps it and
+         * the rule that reuses its slot does not inherit them. */
+        next_state->rules[index].key = chaos_io_prng_mix(
+            g_chaos_io_process_seed ^ chaos_io_rule_hash(next_state->text[index])
+        );
     }
 }
 

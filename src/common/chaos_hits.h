@@ -36,6 +36,12 @@
  * the line as the rule text, so counts land under a rule that does not exist, silently. New
  * reports therefore go into header lines, never into a column.
  *
+ * @par Evaluations against hits
+ * A slot counts both: `count` is the hits (an applied effect) and `evaluations` is the
+ * calls that reached the probability draw. A rule with a probability below 1 fires on a
+ * fraction of its evaluations, and without the second number a test cannot tell "the
+ * selector never matched" from "it matched and the draw said no".
+ *
  * @par Slot pool and reload
  * The counters live in a pool of slots each library keeps beside its two rule snapshots.
  * chaos_hits_assign() gives a rule that survives a reload (same text) the very same
@@ -114,6 +120,14 @@ struct chaos_hit_slot
 {
     /** Hits of this rule in this process; incremented atomically, reset in a forked child. */
     volatile uint64_t count;
+    /**
+     * Evaluations of this rule in this process: incremented once per call that reached the
+     * probability draw, so `count` over `evaluations` is the fault rate the test actually
+     * got. It is also the counter the reproducible-fault derivation needs -- the nth
+     * evaluation of a rule always makes the same decision (CHAOS_SEED, see the library's
+     * internal header). Reset in a forked child, like `count`.
+     */
+    volatile uint64_t evaluations;
     /**
      * Hits claimed under `@first=N` (chaos_policy_fire()): claim count in the low 32 bits,
      * low 32 bits of the owning generation in the high 32 bits. One word, so one CAS
@@ -332,6 +346,7 @@ static inline void chaos_hits_pool_reset(chaos_hit_slot_t *pool, size_t pool_siz
     {
         pool[index].used = 0U;
         pool[index].count = 0U;
+        pool[index].evaluations = 0U;
         pool[index].state = 0U;
         (void)__sync_fetch_and_add(&pool[index].generation, 1U);
         pool[index].claimed = chaos_hit_claims_none(pool[index].generation);
@@ -359,6 +374,7 @@ static inline void chaos_hits_pool_after_fork(
     for (index = 0U; index < pool_size; ++index)
     {
         CHAOS_STORE_IF_CHANGED(pool[index].count, 0U);
+        CHAOS_STORE_IF_CHANGED(pool[index].evaluations, 0U);
         CHAOS_STORE_IF_CHANGED(pool[index].claimed, chaos_hit_claims_none(pool[index].generation));
         if (pool[index].state == 3U)
         {

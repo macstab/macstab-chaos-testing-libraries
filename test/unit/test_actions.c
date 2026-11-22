@@ -35,8 +35,8 @@ CHAOS_IO_DEFINE_TEST_GLOBALS();
  *        sample (out-of-range values clamp rather than misbehave); in between a sample
  *        hits when it is below p * 2^32.
  *
- * @details The PRNG form must equal the sample form fed the next draw from the same
- * seed, so the gate consumes exactly one 32-bit draw per call.
+ * @details The gate itself takes the sample as a parameter, so it is tested on values.
+ * Where the sample comes from is tested in test_draws_are_reproducible().
  */
 static void test_probability_helpers(void)
 {
@@ -46,15 +46,80 @@ static void test_probability_helpers(void)
     assert(chaos_io_probability_hit_sample(2.0, 0xffffffffU) == 1);
     assert(chaos_io_probability_hit_sample(0.5, 0U) == 1);
     assert(chaos_io_probability_hit_sample(0.5, 0xffffffffU) == 0);
+}
 
-    chaos_io_prng_seed_thread(123456789U);
-    {
-        uint32_t expected_sample = chaos_io_prng_next_u32();
-        int expected_hit = chaos_io_probability_hit_sample(0.25, expected_sample);
+/**
+ * @brief Proves a sample follows from the rule and the number of the evaluation, and from
+ *        nothing else.
+ *
+ * @details This is what makes a fault reproducible. Asserted here:
+ * - the same rule at the same evaluation number gives the same samples, however often it
+ *   is asked and in whatever order the draws are taken;
+ * - the next evaluation of the same rule gives unrelated samples;
+ * - two rules whose text differs give unrelated samples at the same evaluation number,
+ *   which is why the key comes from the text and not from the slot;
+ * - the draws within one evaluation differ from each other, so the probability, TORN's
+ *   count and CORRUPT's two indices are not the same number;
+ * - a child's lineage changes every sample, so the backends of a pre-forking server do
+ *   not all decide alike.
+ */
+static void test_draws_are_reproducible(void)
+{
+    chaos_io_rule_t rule;
+    chaos_hit_slot_t slot;
+    uint32_t first;
+    uint32_t again;
+    uint32_t second_effect;
+    uint32_t next_evaluation;
+    uint32_t other_rule;
+    uint32_t other_lineage;
 
-        chaos_io_prng_seed_thread(123456789U);
-        assert(chaos_io_probability_hit(0.25) == expected_hit);
-    }
+    (void)memset(&rule, 0, sizeof(rule));
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.hit = &slot;
+    rule.key = chaos_io_prng_mix(g_chaos_io_process_seed ^ chaos_io_rule_hash("/a:read:EIO:0.5"));
+
+    chaos_io_rule_draw_begin(&rule);
+    assert(slot.evaluations == 1U);
+    first = chaos_io_rule_draw(&rule, CHAOS_IO_DRAW_PROBABILITY);
+    again = chaos_io_rule_draw(&rule, CHAOS_IO_DRAW_PROBABILITY);
+    second_effect = chaos_io_rule_draw(&rule, CHAOS_IO_DRAW_SECOND_EFFECT);
+    assert(first == again);
+    assert(first != second_effect);
+
+    chaos_io_rule_draw_begin(&rule);
+    assert(slot.evaluations == 2U);
+    next_evaluation = chaos_io_rule_draw(&rule, CHAOS_IO_DRAW_PROBABILITY);
+    assert(next_evaluation != first);
+
+    /* A rule whose text differs is a different rule, even in the same slot. */
+    rule.key = chaos_io_prng_mix(g_chaos_io_process_seed ^ chaos_io_rule_hash("/b:read:EIO:0.5"));
+    slot.evaluations = 0U;
+    chaos_io_rule_draw_begin(&rule);
+    other_rule = chaos_io_rule_draw(&rule, CHAOS_IO_DRAW_PROBABILITY);
+    assert(other_rule != first);
+
+    /* Same rule, same evaluation, different lineage: a forked child decides on its own. */
+    rule.key = chaos_io_prng_mix(g_chaos_io_process_seed ^ chaos_io_rule_hash("/a:read:EIO:0.5"));
+    slot.evaluations = 0U;
+    g_chaos_io_lineage = chaos_io_prng_mix(1U);
+    chaos_io_rule_draw_begin(&rule);
+    other_lineage = chaos_io_rule_draw(&rule, CHAOS_IO_DRAW_PROBABILITY);
+    g_chaos_io_lineage = 0U;
+    assert(other_lineage != first);
+
+    /* A rule outside a snapshot has no slot: it evaluates as number 0 every time, which
+     * is what makes the unit tests below reproducible without seeding anything. */
+    rule.hit = NULL;
+    chaos_io_rule_draw_begin(&rule);
+    again = chaos_io_rule_draw(&rule, CHAOS_IO_DRAW_PROBABILITY);
+    chaos_io_rule_draw_begin(&rule);
+    assert(chaos_io_rule_draw(&rule, CHAOS_IO_DRAW_PROBABILITY) == again);
+
+    /* Two texts hash apart, and the same text hashes the same. */
+    assert(chaos_io_rule_hash("/a:read:EIO:0.5") == chaos_io_rule_hash("/a:read:EIO:0.5"));
+    assert(chaos_io_rule_hash("/a:read:EIO:0.5") != chaos_io_rule_hash("/a:read:EIO:0.6"));
+    assert(chaos_io_rule_hash(NULL) != chaos_io_rule_hash("x"));
 }
 
 /**
@@ -62,18 +127,20 @@ static void test_probability_helpers(void)
  *        [1, n - 1], so a torn write is never empty and never complete; 0 bytes gives 0
  *        and 1 byte gives 1 (the modulus would be zero).
  *
- * @details `torn_count(10)` must equal the sample form fed the next draw from seed 42.
+ * @details `torn_count()` must take its sample from the rule's first effect draw, not from
+ * anywhere else: that is what ties the torn length to the evaluation it belongs to.
  */
 static void test_torn_helpers(void)
 {
-    chaos_io_prng_seed_thread(42U);
-    {
-        uint32_t expected_sample = chaos_io_prng_next_u32();
-        size_t expected_count = chaos_io_torn_count_sample(10U, expected_sample);
+    chaos_io_rule_t rule;
 
-        chaos_io_prng_seed_thread(42U);
-        assert(chaos_io_torn_count(10U) == expected_count);
-    }
+    (void)memset(&rule, 0, sizeof(rule));
+    rule.key = chaos_io_prng_mix(g_chaos_io_process_seed ^ chaos_io_rule_hash("/a:write:TORN:1"));
+    chaos_io_rule_draw_begin(&rule);
+    assert(
+        chaos_io_torn_count(&rule, 10U) ==
+        chaos_io_torn_count_sample(10U, chaos_io_rule_draw(&rule, CHAOS_IO_DRAW_FIRST_EFFECT))
+    );
 
     assert(chaos_io_torn_count_sample(0U, 123U) == 0U);
     assert(chaos_io_torn_count_sample(1U, 123U) == 1U);
@@ -87,16 +154,17 @@ static void test_torn_helpers(void)
  *        (index 1, bit 5 turns {0,0,0} into {0,0x20,0}); a NULL buffer or zero size is a
  *        no-op rather than a fault.
  *
- * @details `corrupt_buffer()` must equal the sample form fed the next two draws from
- * seed 99 in order index, then bit; this pins the draw order the source fixes by
- * capturing both samples before the call.
+ * @details `corrupt_buffer()` must take the byte index from the rule's first effect draw
+ * and the bit from its second, in that order. Asserted by building the expectation from
+ * the two draws by hand: swapping them would move the flipped bit.
  */
 static void test_corrupt_helpers(void)
 {
     unsigned char buffer[] = {0x00U, 0x00U, 0x00U};
     unsigned char expected[] = {0x00U, 0x20U, 0x00U};
-    unsigned char seeded_buffer[] = {0x00U, 0x00U, 0x00U, 0x00U};
-    unsigned char seeded_expected[] = {0x00U, 0x00U, 0x00U, 0x00U};
+    unsigned char drawn_buffer[] = {0x00U, 0x00U, 0x00U, 0x00U};
+    unsigned char drawn_expected[] = {0x00U, 0x00U, 0x00U, 0x00U};
+    chaos_io_rule_t rule;
 
     chaos_io_corrupt_buffer_sample(NULL, sizeof(buffer), 0U, 0U);
     chaos_io_corrupt_buffer_sample(buffer, 0U, 0U, 0U);
@@ -104,19 +172,17 @@ static void test_corrupt_helpers(void)
     chaos_io_corrupt_buffer_sample(buffer, sizeof(buffer), 1U, 5U);
     assert(memcmp(buffer, expected, sizeof(buffer)) == 0);
 
-    chaos_io_prng_seed_thread(99U);
-    {
-        uint32_t expected_index_sample = chaos_io_prng_next_u32();
-        uint32_t expected_bit_sample = chaos_io_prng_next_u32();
-
-        chaos_io_corrupt_buffer_sample(
-            seeded_expected, sizeof(seeded_expected), expected_index_sample, expected_bit_sample
-        );
-    }
-
-    chaos_io_prng_seed_thread(99U);
-    chaos_io_corrupt_buffer(seeded_buffer, sizeof(seeded_buffer));
-    assert(memcmp(seeded_buffer, seeded_expected, sizeof(seeded_buffer)) == 0);
+    (void)memset(&rule, 0, sizeof(rule));
+    rule.key = chaos_io_prng_mix(g_chaos_io_process_seed ^ chaos_io_rule_hash("/a:read:CORRUPT:1"));
+    chaos_io_rule_draw_begin(&rule);
+    chaos_io_corrupt_buffer_sample(
+        drawn_expected,
+        sizeof(drawn_expected),
+        chaos_io_rule_draw(&rule, CHAOS_IO_DRAW_FIRST_EFFECT),
+        chaos_io_rule_draw(&rule, CHAOS_IO_DRAW_SECOND_EFFECT)
+    );
+    chaos_io_corrupt_buffer(&rule, drawn_buffer, sizeof(drawn_buffer));
+    assert(memcmp(drawn_buffer, drawn_expected, sizeof(drawn_buffer)) == 0);
 }
 
 /**
@@ -336,6 +402,7 @@ int main(void)
     test_should_trigger_honours_qualifiers();
     test_should_trigger_counts_hits();
     test_probability_helpers();
+    test_draws_are_reproducible();
     test_torn_helpers();
     test_corrupt_helpers();
     test_latency_and_trigger_helpers();

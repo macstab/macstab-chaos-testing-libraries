@@ -421,13 +421,18 @@ void chaos_io_ensure_symbols(void);
 extern __thread int g_chaos_io_tls_guard;
 
 /**
- * @brief Per-thread xorshift64* state; 0 means "not seeded yet".
+ * @brief Lineage of this process: 0 in the one that loaded the library, mixed forward in
+ *        every forked child (the atfork handler).
  *
- * @details Seeded on first draw (chaos_io_prng_ensure_seeded()) from the process seed,
- * the kernel tid and a stack address, so threads, and forked children (whose state the
- * atfork handler zeroes), draw independent sequences.
+ * @details It is XORed into a rule's draw key, so the children of a pre-forking server
+ * make different decisions from the parent and from each other without the key itself
+ * being rewritten -- rewriting it would mean writing the snapshot pages in every child,
+ * which is the copy-on-write cost chaos_hits.h goes out of its way to avoid.
+ *
+ * Deterministic: a child's lineage follows from how many times this process has forked,
+ * which the test controls, not from a tid or an address, which it does not.
  */
-extern __thread uint64_t g_chaos_io_tls_prng_state;
+extern uint64_t g_chaos_io_lineage;
 
 /**
  * @brief Process-wide seed base for the per-thread PRNGs.
@@ -529,24 +534,17 @@ chaos_io_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint64_t de
  */
 
 /**
- * @brief Kernel thread id (Linux), or the pid on other hosts; PRNG seed material.
- *
- * @details `syscall(SYS_gettid)` rather than gettid(): the libc wrapper exists only since
- * glibc 2.30, and musl added it later still.
- */
-static inline uint64_t chaos_io_current_tid(void)
-{
-#ifdef __linux__
-    return (uint64_t)syscall(SYS_gettid);
-#else
-    return (uint64_t)getpid();
-#endif
-}
-
-/**
- * @brief SplitMix64 step (Steele, Lea, Flood 2014): turns structured seed material (pid,
- *        tid, addresses) into well-mixed PRNG state; every input bit affects every
+ * @brief SplitMix64 step (Steele, Lea, Flood 2014): turns structured input (a seed, a rule
+ *        hash, a counter) into a well-mixed 64-bit value; every input bit affects every
  *        output bit.
+ *
+ * @details This is the whole generator. There is no stream and no state to advance: a
+ * sample is a pure function of the rule and the number of the evaluation it belongs to, so
+ * no other thread can shift it and the decision for the nth evaluation of a rule is the
+ * same in every run with the same CHAOS_SEED.
+ *
+ * Not cryptographic, and it does not need to be: what is wanted is that neighbouring
+ * counters give unrelated samples, which is exactly SplitMix64's avalanche property.
  */
 static inline uint64_t chaos_io_prng_mix(uint64_t value)
 {
@@ -557,63 +555,29 @@ static inline uint64_t chaos_io_prng_mix(uint64_t value)
 }
 
 /**
- * @brief Seeds this thread's PRNG on its first draw.
+ * @brief Hash of a rule's text, for its draw key.
  *
- * @details Lazy, so threads that never draw pay nothing. Seed = process seed XOR tid XOR
- * a stack address (ASLR- and thread-dependent), mixed with SplitMix64 and forced odd, so
- * the state is never 0, the one state xorshift64* cannot leave. One extra gettid system
- * call per thread, once.
+ * @details SplitMix64 over the bytes. From the text rather than the slot index, because
+ * chaos_hits_assign() hands a slot out again when a rule leaves the file and the next rule
+ * in that slot would inherit its decisions. Two rules with the same text are the same rule.
+ *
+ * @param[in] text  Rule as written; NULL hashes as the empty string.
+ * @return A well-mixed 64-bit hash.
  */
-static inline void chaos_io_prng_ensure_seeded(void)
+static inline uint64_t chaos_io_rule_hash(const char *text)
 {
-    uint64_t seed;
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    size_t index;
 
-    if (g_chaos_io_tls_prng_state != 0U)
+    if (text == NULL)
     {
-        return;
+        return chaos_io_prng_mix(hash);
     }
-
-    seed = g_chaos_io_process_seed;
-    seed ^= chaos_io_current_tid();
-    seed ^= (uint64_t)(uintptr_t)&seed;
-    /* Odd: never 0, the one state xorshift64* cannot leave. */
-    g_chaos_io_tls_prng_state = chaos_io_prng_mix(seed) | 1U;
-}
-
-/**
- * @brief Seeds this thread's PRNG from @p seed (mixed with SplitMix64); the constructor
- *        seeds its own thread with it, tests use it for reproducible draws.
- *
- * @param[in] seed  Seed; 0 is replaced by 1 before mixing. The mixed state is not forced
- *                  odd here; a zero result would be reseeded lazily on the next draw.
- */
-static inline void chaos_io_prng_seed_thread(uint64_t seed)
-{
-    g_chaos_io_tls_prng_state = chaos_io_prng_mix(seed == 0U ? UINT64_C(1) : seed);
-}
-
-/**
- * @brief Next 32-bit sample of this thread's xorshift64* generator (shifts 12, 25, 27;
- *        output = high 32 bits of state * 0x2545f4914f6cdd1d).
- *
- * @details A few cycles, no system call after seeding. The multiplied high half has far
- * better low-order statistics than the raw state, which matters for the modulo in torn
- * counts and corruption offsets. Not a cryptographic generator.
- *
- * Signal handlers: a handler that interrupts the update and draws itself may make both
- * draws return related values; the state stays valid. Harmless for fault sampling.
- */
-static inline uint32_t chaos_io_prng_next_u32(void)
-{
-    uint64_t state;
-
-    chaos_io_prng_ensure_seeded();
-    state = g_chaos_io_tls_prng_state;
-    state ^= state >> 12;
-    state ^= state << 25;
-    state ^= state >> 27;
-    g_chaos_io_tls_prng_state = state;
-    return (uint32_t)((state * UINT64_C(0x2545f4914f6cdd1d)) >> 32);
+    for (index = 0U; text[index] != '\0'; ++index)
+    {
+        hash = chaos_io_prng_mix(hash + (uint64_t)(unsigned char)text[index]);
+    }
+    return hash;
 }
 
 /** @} */
