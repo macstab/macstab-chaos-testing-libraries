@@ -254,7 +254,7 @@ algorithm, constructor ordering.
 | operation | The logical operation (`write`, `truncate`, ...); several functions map to one (§1). |
 | effect | ERRNO, LATENCY, TORN or CORRUPT. |
 | probability | Chance in [0, 1] that a matched rule fires. For ERRNO, TORN and CORRUPT it is the value field; for LATENCY the optional `@probability` after the milliseconds, 1.0 without one. |
-| qualifier | `@first`, `@from`, `@until`, `@size` written after the rule ([DSL.md §7.1](DSL.md#71-todays-surface)). |
+| qualifier | `@first`, `@every`, `@from`, `@until`, `@size` written after the rule ([DSL.md §7.1](DSL.md#71-todays-surface)). |
 | hit | One application of a rule's effect; counted per rule in the hits file. |
 | active snapshot | The published rule array readers match against. |
 | inactive snapshot | The second array, rewritten by the thread that owns a reload. |
@@ -716,7 +716,7 @@ wrapper.
 | `errnum` | ERRNO only. |
 | `probability` | ERRNO, TORN, CORRUPT. |
 | `latency_ms` | LATENCY only; 0 to 4 294 967 295. |
-| `policy` | Qualifiers (`@first`, `@from`, `@until`, `@size`). |
+| `policy` | Qualifiers (`@first`, `@every`, `@from`, `@until`, `@size`). |
 | `call_size` | Byte count of the call being decided; set on the caller's copy. |
 | `hit`, `hit_generation` | The rule's hit slot and the slot generation it was published with. |
 

@@ -60,6 +60,7 @@
 typedef struct chaos_rule_policy
 {
     uint64_t first;               /**< `@first=N` hit limit per process; 0 for none. */
+    uint64_t every;               /**< `@every=N`: only every Nth evaluation; 0 for none. */
     int64_t from_ms;              /**< `@from=T`, Unix ms; 0 for no lower bound. */
     int64_t until_ms;             /**< `@until=T`, Unix ms (exclusive); 0 for no upper bound. */
     uint64_t size_above;          /**< `@size>N` in bytes; meaningful when has_size_above. */
@@ -172,6 +173,12 @@ static inline int chaos_policy_parse_word(const char *word, chaos_rule_policy_t 
         value > 0U)
     {
         policy->first = value;
+        return 0;
+    }
+    if (strncmp(word, "@every=", 7U) == 0 && chaos_policy_parse_number(word + 7, &value) == 0 &&
+        value > 0U)
+    {
+        policy->every = value;
         return 0;
     }
     if (strncmp(word, "@from=", 6U) == 0 && chaos_policy_parse_number(word + 6, &value) == 0)
@@ -294,8 +301,8 @@ static inline int chaos_policy_has_size(const chaos_rule_policy_t *policy)
 /** @brief Non-zero when @p policy carries no qualifier, so the rule needs no policy checks. */
 static inline int chaos_policy_is_empty(const chaos_rule_policy_t *policy)
 {
-    return policy->first == 0U && policy->from_ms == 0 && policy->until_ms == 0 &&
-           !policy->has_size_above && !policy->has_size_below;
+    return policy->first == 0U && policy->every == 0U && policy->from_ms == 0 &&
+           policy->until_ms == 0 && !policy->has_size_above && !policy->has_size_below;
 }
 
 /**
@@ -334,6 +341,24 @@ static inline int chaos_policy_size_ok(const chaos_rule_policy_t *policy, uint64
     }
     return (!policy->has_size_above || size > policy->size_above) &&
            (!policy->has_size_below || size < policy->size_below);
+}
+
+/**
+ * @brief Non-zero when @p evaluation is one the rule's `@every=N` lets through.
+ *
+ * @details Counts evaluations, not hits: `@every=10` picks the 10th, 20th, 30th call that
+ * got past the window and size gates, whether or not those calls then fire. That is why
+ * the gate sits before the probability -- `@every=10` with `p=0.5` means "of evaluations
+ * 10, 20, 30... half fire", which a test can reason about, rather than "every tenth of the
+ * calls that happened to pass the draw".
+ *
+ * @param policy      Rule's qualifiers.
+ * @param evaluation  Number of this evaluation of the rule, counting from 1.
+ * @return Non-zero when the rule may go on to its probability.
+ */
+static inline int chaos_policy_every_ok(const chaos_rule_policy_t *policy, uint64_t evaluation)
+{
+    return policy->every == 0U || (evaluation % policy->every) == 0U;
 }
 
 /**

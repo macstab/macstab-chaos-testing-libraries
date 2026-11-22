@@ -72,7 +72,7 @@ How the libc layer instantiates the triple:
 |---|---|
 | S | a path prefix (io), an endpoint (net), a host name or address (dns), a function or function/argument class (time, process, memory), always with `*` as catch-all |
 | E | ERRNO (an errno name, or a positive number in every library), GAI (`EAI_*`, dns), LATENCY, TIMEOUT, CORRUPT, TORN, TRICKLE, DUP, RESET, OFFSET, REGRESS, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER |
-| P | probability ∧ `@from`/`@until` window ∧ `@size` gate ∧ `@first` budget; for FAIL_AFTER additionally a per-operation call counter |
+| P | probability ∧ `@from`/`@until` window ∧ `@size` gate ∧ `@every` evaluation gate ∧ `@first` budget; for FAIL_AFTER additionally a per-operation call counter |
 | selection | io, net: **one rule per call**, the most specific for the call's operation. dns, time, process, memory: **one rule per effect**, the most specific for each effect, so several effects compose on one call (§8) |
 
 ---
@@ -100,6 +100,7 @@ probability   = ( "0" [ "." 1*DIGIT ] ) / ( "1" [ "." 1*"0" ] )   ; [0, 1], loca
 
 ;; Qualifiers: trailing words that start with "@" (chaos_policy.h)
 qualifier     = "@first=" number              ; number > 0
+              / "@every=" number              ; number > 0
               / "@from="  number              ; Unix milliseconds
               / "@until=" number              ; Unix milliseconds; > @from when both are set
               / "@size>"  number
@@ -309,8 +310,8 @@ Same caveat as §2.3: a sketch of the surface, not its source of truth.
 | **Selector match site** | Inside the wrapper, against the call's arguments (descriptors resolved to paths or endpoints) | Inside the ByteBuddy-injected advice at the JDK call site | At the orchestration boundary (Toxiproxy / Testcontainers `withCommand` hook) |
 | **Effect** | ERRNO, GAI, LATENCY, TIMEOUT, CORRUPT, TORN, TRICKLE, DUP, RESET, OFFSET, REGRESS, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER | `ChaosEffect.delay/throw/fail/stress/deadlock/spike/drop` | Toxiproxy toxics / `tc netem` rules / cgroup throttling |
 | **Effect application phase** | Pre-call (ERRNO, GAI, LATENCY, FAIL_AFTER; TORN shortens the count), instead of the call (OVERRIDE), post-call (CORRUPT, OFFSET, REGRESS, result-set transforms) | Same conceptual phases at the bytecode advice level | At the network/cgroup boundary, always pre-effect from the application's perspective |
-| **Activation policy** | Probability, `@first`, `@from`/`@until`, `@size`; FAIL_AFTER's call counter | `ActivationPolicy.always/count/timeWindow/session` | Annotation parameters + scenario lifecycle hooks |
-| **Activation evaluation** | Per call: window, size gate, the rule's probability sample, `@first` claim | Per-call dispatcher check + session-scoped state | Lifecycle-driven (apply on `@BeforeEach`, remove on `@AfterEach`) |
+| **Activation policy** | Probability, `@first`, `@every`, `@from`/`@until`, `@size`; FAIL_AFTER's call counter | `ActivationPolicy.always/count/timeWindow/session` | Annotation parameters + scenario lifecycle hooks |
+| **Activation evaluation** | Per call: window, size gate, `@every`, the rule's probability sample, `@first` claim | Per-call dispatcher check + session-scoped state | Lifecycle-driven (apply on `@BeforeEach`, remove on `@AfterEach`) |
 | **Configuration source** | Text file `/tmp/.chaos-<lib>.conf` | Java code (builder) + JSON startup config | YAML / annotations + dynamic Testcontainers calls |
 | **Reload semantics** | `stat()` of the rule file at most every 1 ms, two-snapshot publication under a CAS-owned reload | Live registration / deregistration via dispatcher API | Lifecycle hooks; the boundary mutates between phases |
 | **Failure mode on bad config** | Fail-open: no rules, status file names the line | Fail-fast at builder validation (`IllegalArgumentException`) | Fail-fast at YAML parse |
@@ -527,6 +528,7 @@ any `# owner` comment:
 | Qualifier | Meaning |
 |---|---|
 | `@first=N` | Fire at most N times per process (N ≥ 1), then go inert: start-up faults that clear by themselves. |
+| `@every=N` | Only every Nth **evaluation** of the rule (N ≥ 1): the 10th, 20th, 30th call that got past the window and size gates. Counts evaluations, not hits, so `@every=10` with `p=0.5` means "of evaluations 10, 20, 30… half fire". `@every=1` is allowed and gates nothing. |
 | `@from=T` | Active only once the wall clock reaches T (Unix milliseconds). |
 | `@until=T` | Active only while the wall clock is before T. With `@from`, the window is `[from, until)`; `@until` must be later than `@from`. One rule file can hold a whole incident timeline. |
 | `@size>N` / `@size<N` | Only calls whose byte count is above / below N. Both may be combined. For the calls that move data this is the number of bytes moved; for `truncate` it is the file's new length and for `allocate` the length of the range, since neither moves bytes. A call without a byte count never matches a size-gated rule. |
@@ -552,14 +554,17 @@ Semantics:
   with `@`; the line is cut before the first of them. A blank before a three-field
   `@probability` therefore turns it into a qualifier word and rejects the line.
 - **Validation.** An unknown or malformed qualifier, a number of more than 18 digits,
-  `@first=0`, `@until` not after `@from`, or qualifiers on a line without a rule
-  reject the file like any invalid line.
+  `@first=0`, `@every=0`, `@until` not after `@from`, or qualifiers on a line without a
+  rule reject the file like any invalid line.
 - **Wall clock.** The window is checked against `CLOCK_REALTIME` read from the vDSO
   (or the raw system call), never through the interposed `clock_gettime`, so a
   libchaos-time OFFSET rule does not move another rule's window. Absolute times make
   every process of a container agree on the window; the JVM layer turns relative
   durations into absolute times.
-- **Order of checks.** Window, size gate, probability, then the `@first` claim. Only
+- **Order of checks.** Window, size gate, `@every`, probability, then the `@first`
+  claim. `@every` sits before the probability because it picks evaluations: a call it
+  rejects is still counted as an evaluation, which is what makes the next Nth one the
+  Nth. Only
   a rule that passes all four fires and records a hit. FAIL_AFTER differs: its call
   counter advances on every matched call first, then the threshold and probability
   are checked, then window, size gate and `@first`.
@@ -678,7 +683,7 @@ note right
     mmap/anon:ERRNO:ENOMEM@0.01
     clock_gettime/monotonic:OFFSET:-500
     pthread_create:FAIL_AFTER:EAGAIN,128
-  qualifiers: @first=N @from=T @until=T @size>N @size<N
+  qualifiers: @first=N @every=N @from=T @until=T @size>N @size<N
 end note
 
 :Extract qualifiers, parse selector, effect, value;

@@ -261,8 +261,50 @@ static void test_draws_are_reproducible(void)
     assert(chaos_memory_rule_hash(NULL) != chaos_memory_rule_hash("a"));
 }
 
+/**
+ * @brief Proves `@every=N` lets only every Nth evaluation through, in the real gate.
+ *
+ * @details The gate itself is tested on values in test_common.c; what is asserted here is
+ * that chaos_memory_rule_should_trigger() actually consults it, and where. `@every` counts
+ * evaluations, so a rule at probability 1.0 and `@every=3` fires on the 3rd, 6th and 9th
+ * call and on no other -- and the two calls in between still count as evaluations, which is
+ * what makes the third one the third.
+ */
+static void test_every_gates_evaluations(void)
+{
+    chaos_memory_rule_t rule;
+    chaos_hit_slot_t slot;
+    unsigned call;
+    unsigned fired = 0U;
+
+    (void)memset(&rule, 0, sizeof(rule));
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.effect = CHAOS_MEMORY_EFFECT_ERRNO;
+    rule.probability = 1.0;
+    rule.hit = &slot;
+    rule.policy.every = 3U;
+
+    for (call = 1U; call <= 9U; ++call)
+    {
+        const int triggered = chaos_memory_rule_should_trigger(&rule) != 0;
+
+        assert(triggered == (call % 3U == 0U));
+        fired += (unsigned)triggered;
+    }
+    assert(fired == 3U);
+    assert(slot.evaluations == 9U);
+    assert(slot.count == 3U);
+
+    /* Without the qualifier every evaluation fires. */
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.policy.every = 0U;
+    assert(chaos_memory_rule_should_trigger(&rule) != 0);
+    assert(slot.count == 1U);
+}
+
 int main(void)
 {
+    test_every_gates_evaluations();
     test_draws_are_reproducible();
     test_should_trigger_honours_qualifiers();
     test_should_trigger_counts_hits();

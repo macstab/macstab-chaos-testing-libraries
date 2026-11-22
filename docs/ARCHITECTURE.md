@@ -642,7 +642,7 @@ end note
 [`src/effects/chaos_io_actions.c`](../src/effects/chaos_io_actions.c)
 
 `libchaos-io` effects (other libraries: see their references). Every effect is gated by the
-qualifiers (`@first`, `@from`, `@until`, `@size`); all but LATENCY also by the probability.
+qualifiers (`@first`, `@every`, `@from`, `@until`, `@size`) and by the probability.
 Probability `p` fires when a 32-bit sample from the thread's xorshift64\* PRNG is below
 `p × 2^32`; 0 never fires, 1 always.
 

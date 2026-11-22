@@ -238,22 +238,25 @@ typedef struct chaos_net_rule
  * The evaluation number lives in the hit slot, so it survives a reload that keeps the rule
  * and restarts in a forked child, whose lineage differs anyway.
  *
- * @param rule Rule copy for this call; NULL is a no-op. A rule outside a snapshot (unit
- *             tests) has no slot and is evaluation 0 every time.
+ * @param rule Rule copy for this call; NULL is a no-op returning 0. A rule outside a
+ *             snapshot (unit tests) has no slot and is evaluation 1 every time.
+ * @return The number of this evaluation of the rule, counting from 1; what `@every=N`
+ *         divides and what the draws are derived from.
  */
-static inline void chaos_net_rule_draw_begin(chaos_net_rule_t *rule)
+static inline uint64_t chaos_net_rule_draw_begin(chaos_net_rule_t *rule)
 {
     uint64_t evaluation = 0U;
 
     if (rule == NULL)
     {
-        return;
+        return 0U;
     }
     if (rule->hit != NULL)
     {
         evaluation = __sync_fetch_and_add(&rule->hit->evaluations, UINT64_C(1));
     }
     rule->draw_base = chaos_net_prng_mix((rule->key ^ g_chaos_net_lineage) + evaluation);
+    return evaluation + 1U;
 }
 
 /**

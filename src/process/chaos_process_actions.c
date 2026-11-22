@@ -56,9 +56,13 @@ int chaos_process_rule_should_trigger(chaos_process_rule_t *rule)
         return 0;
     }
 
-    /* Past the gates that cost nothing: this call is an evaluation of the rule, gets its
-     * number, and every sample of it follows from that number. */
-    chaos_process_rule_draw_begin(rule);
+    /* Past the gates that cost nothing: this call is an evaluation of the rule and gets
+     * its number. `@every=N` picks evaluations, so it gates here, before the draw; every
+     * sample of this call follows from the same number. */
+    if (!chaos_policy_every_ok(&rule->policy, chaos_process_rule_draw_begin(rule)))
+    {
+        return 0;
+    }
     if (!chaos_process_probability_hit_sample(
             rule->probability, chaos_process_rule_draw(rule, CHAOS_PROCESS_DRAW_PROBABILITY)
         ))
@@ -122,8 +126,13 @@ int chaos_process_rule_fail_after_error(
         return 0;
     }
     /* Past the threshold this call is an evaluation of the rule and gets its number; the
-     * calls inside the first N were not, which is why the draw happens here. */
-    chaos_process_rule_draw_begin(rule);
+     * calls inside the first N were not, which is why the draw happens here. `@every=N`
+     * then picks every Nth of those evaluations -- without this the qualifier would parse
+     * on a FAIL_AFTER rule and do nothing. */
+    if (!chaos_policy_every_ok(&rule->policy, chaos_process_rule_draw_begin(rule)))
+    {
+        return 0;
+    }
     if (!chaos_process_probability_hit_sample(
             rule->probability, chaos_process_rule_draw(rule, CHAOS_PROCESS_DRAW_PROBABILITY)
         ))

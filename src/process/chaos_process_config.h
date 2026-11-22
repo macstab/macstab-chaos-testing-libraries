@@ -199,22 +199,25 @@ typedef struct chaos_process_rule
  * collide with its own next evaluation -- which is what a single `key + n * K + d` does as
  * soon as `d` reaches K, a constant the next effect added would break silently.
  *
- * @param rule Rule copy for this call; NULL is a no-op. A rule outside a snapshot (unit
- *             tests) has no slot and is evaluation 0 every time.
+ * @param rule Rule copy for this call; NULL is a no-op returning 0. A rule outside a
+ *             snapshot (unit tests) has no slot and is evaluation 1 every time.
+ * @return The number of this evaluation of the rule, counting from 1; what `@every=N`
+ *         divides and what the draws are derived from.
  */
-static inline void chaos_process_rule_draw_begin(chaos_process_rule_t *rule)
+static inline uint64_t chaos_process_rule_draw_begin(chaos_process_rule_t *rule)
 {
     uint64_t evaluation = 0U;
 
     if (rule == NULL)
     {
-        return;
+        return 0U;
     }
     if (rule->hit != NULL)
     {
         evaluation = __sync_fetch_and_add(&rule->hit->evaluations, UINT64_C(1));
     }
     rule->draw_base = chaos_process_prng_mix((rule->key ^ g_chaos_process_lineage) + evaluation);
+    return evaluation + 1U;
 }
 
 /**

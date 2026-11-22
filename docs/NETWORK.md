@@ -55,7 +55,7 @@ document wins where the two would disagree.
 | Rule grammar | `<selector>:<operation>:<effect>:<value> [qualifier ...]` |
 | Operations | `socket`, `bind`, `listen`, `connect`, `accept`, `shutdown`, `send`, `recv`, `close`, `poll` |
 | Effects | ERRNO, LATENCY, CORRUPT, TIMEOUT, RESET, TRICKLE, DUP |
-| Qualifiers | `@first=N`, `@from=T`, `@until=T`, `@size>N`, `@size<N` |
+| Qualifiers | `@first=N`, `@every=N`, `@from=T`, `@until=T`, `@size>N`, `@size<N` |
 | Limits | 256 rules; rule file under 256 KiB (262 144 bytes) |
 | Failure mode | fail-open: no rule, bad rule file or unresolvable endpoint means passthrough |
 | SECCOMP mode | ERRNO (not on `close`), LATENCY and TIMEOUT only; see [`docs/SECCOMP.md`](SECCOMP.md) |
@@ -196,7 +196,7 @@ a file reaches the io rules in any order.
 - **Effect**: what a firing rule does to the call.
 - **Probability**: the chance, in `[0, 1]`, that a matching rule fires on one
   call.
-- **Qualifier**: a gate after the rule (`@first`, `@from`, `@until`, `@size`)
+- **Qualifier**: a gate after the rule (`@first`, `@every`, `@from`, `@until`, `@size`)
   that every effect must also pass.
 - **Hit**: one firing of a rule, counted in the hits file.
 - **Real function**: the next definition of the symbol, found by
@@ -695,6 +695,7 @@ rule, before any comment. An unknown or malformed qualifier, or `@until` not aft
 | Qualifier | Meaning |
 |-----------|---------|
 | `@first=N` | fire at most N times in this process (N ≥ 1, at most 18 digits), then go inert |
+| `@every=N` | only every Nth evaluation of the rule (N ≥ 1): evaluations, not hits |
 | `@from=T` | active only when the wall clock is at or after T (Unix milliseconds) |
 | `@until=T` | active only before T (Unix milliseconds) |
 | `@size>N`, `@size<N` | apply only to calls that move more (fewer) than N bytes |

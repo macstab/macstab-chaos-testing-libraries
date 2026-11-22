@@ -608,6 +608,10 @@ static void test_policy_grammar(void)
     static const char *const rejected[] = {
         "/a:open:EIO:1.0 @first=0",
         "/a:open:EIO:1.0 @first=x",
+        /* `@every=0` would divide by zero, and `@every=` has no count at all. */
+        "/a:open:EIO:1.0 @every=0",
+        "/a:open:EIO:1.0 @every=",
+        "/a:open:EIO:1.0 @every=x",
         "/a:open:EIO:1.0 @from=x",
         "/a:open:EIO:1.0 @until=",
         "/a:open:EIO:1.0 @size<1/",
@@ -649,16 +653,23 @@ static void test_policy_grammar(void)
     assert(extract("/a:open:EIO:1.0\t#note", &policy, rule) == 0);
     assert(extract("/a:open:EIO:1.0\r#note", &policy, rule) == 0);
 
+    /* `@every=N` counts evaluations, not hits: N >= 1, and 1 is allowed though it gates
+     * nothing. */
+    assert(extract("/a:open:EIO:1.0 @every=3", &policy, rule) == 0 && policy.every == 3U);
+    assert(extract("/a:open:EIO:1.0 @every=1", &policy, rule) == 0 && policy.every == 1U);
+    assert(!chaos_policy_is_empty(&policy));
+
     /* A window open on one side only is valid. */
     assert(extract("/a:open:EIO:1.0 @until=10", &policy, rule) == 0 && policy.until_ms == 10);
     assert(extract("/a:open:EIO:1.0 @from=10", &policy, rule) == 0 && policy.from_ms == 10);
 
     /* A malformed qualifier rejects the line and leaves it unmodified; for the two window
-     * errors (`@until` <= `@from`, entries 7 and 8) only the rejection is asserted. */
+     * errors (`@until` <= `@from`) only the rejection is asserted, since those are found
+     * after the words were cut. */
     for (index = 0U; index < sizeof(rejected) / sizeof(rejected[0]); ++index)
     {
         assert(extract(rejected[index], &policy, rule) != 0);
-        assert(index >= 7U || strcmp(rule, rejected[index]) == 0);
+        assert(index >= 10U || strcmp(rule, rejected[index]) == 0);
     }
 }
 
@@ -708,6 +719,24 @@ static void test_policy_checks(void)
     memset(&policy, 0, sizeof(policy));
     policy.has_size_below = 1U;
     assert(!chaos_policy_is_empty(&policy));
+    memset(&policy, 0, sizeof(policy));
+    policy.every = 2U;
+    assert(!chaos_policy_is_empty(&policy));
+
+    /* `@every=N`: the Nth evaluation of the rule passes, the others do not. The counter
+     * the gate reads is the one chaos_hits.h keeps per rule, so the first evaluation is
+     * number 1. Without the qualifier every evaluation passes. */
+    memset(&policy, 0, sizeof(policy));
+    assert(chaos_policy_every_ok(&policy, 1U) && chaos_policy_every_ok(&policy, 7U));
+    policy.every = 3U;
+    assert(!chaos_policy_every_ok(&policy, 1U));
+    assert(!chaos_policy_every_ok(&policy, 2U));
+    assert(chaos_policy_every_ok(&policy, 3U));
+    assert(!chaos_policy_every_ok(&policy, 4U));
+    assert(chaos_policy_every_ok(&policy, 6U));
+    /* `@every=1` gates nothing, which is why it is allowed rather than rejected. */
+    policy.every = 1U;
+    assert(chaos_policy_every_ok(&policy, 1U) && chaos_policy_every_ok(&policy, 2U));
 
     /* The window is [from, until) in Unix ms on the wall clock. */
     memset(&policy, 0, sizeof(policy));

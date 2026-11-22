@@ -115,9 +115,13 @@ int chaos_net_rule_should_trigger(chaos_net_rule_t *rule)
     {
         return 0;
     }
-    /* Past the gates that cost nothing: this call is an evaluation of the rule, gets its
-     * number, and every sample of it follows from that number. */
-    chaos_net_rule_draw_begin(rule);
+    /* Past the gates that cost nothing: this call is an evaluation of the rule and gets
+     * its number. `@every=N` picks evaluations, so it gates here, before the draw; every
+     * sample of this call follows from the same number. */
+    if (!chaos_policy_every_ok(&rule->policy, chaos_net_rule_draw_begin(rule)))
+    {
+        return 0;
+    }
     if (!chaos_net_probability_hit_sample(
             rule->probability, chaos_net_rule_draw(rule, CHAOS_NET_DRAW_PROBABILITY)
         ))

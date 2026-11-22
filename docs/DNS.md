@@ -176,7 +176,7 @@ four rules.
 
 ### Qualifiers
 
-`@first=N`, `@from=T`, `@until=T`, `@size>N` and `@size<N` follow the rule as
+`@first=N`, `@every=N`, `@from=T`, `@until=T`, `@size>N` and `@size<N` follow the rule as
 separate words, as in every library of the repository (`src/common/chaos_policy.h`).
 `@first` limits firings per process, `@from`/`@until` gate on the wall clock in
 Unix milliseconds. Resolver calls carry no byte count, so a rule with `@size`
