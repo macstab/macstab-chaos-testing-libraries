@@ -259,7 +259,7 @@ layered fault models.
 | rule file | `/tmp/.chaos-<lib>.conf`, one per library; re-read when its change stamp changes (reload) |
 | rule | one line of a rule file: selector, operation, effect, value, optional probability and qualifiers |
 | selector | what a rule matches: path prefix (io), endpoint (net), DNS name or address (dns), operation[/target] (time, memory, process) |
-| effect | what a matching rule does: `ERRNO`, `LATENCY`, `TIMEOUT`, `CORRUPT`, `TORN`, `DROP`, `TRICKLE`, `DUP`, `RESET`, `OFFSET`, `REGRESS`, `FREEZE`, `GAI`, `REWRITE`, `OVERRIDE`, `SERVICE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT`, `FAIL_AFTER` |
+| effect | what a matching rule does: `ERRNO`, `LATENCY`, `TIMEOUT`, `CORRUPT`, `TORN`, `DROP`, `FREE`, `FULL`, `TRICKLE`, `DUP`, `RESET`, `OFFSET`, `REGRESS`, `FREEZE`, `GAI`, `REWRITE`, `OVERRIDE`, `SERVICE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT`, `FAIL_AFTER` |
 | probability | chance in [0, 1] that a matching rule fires on a call, sampled from a per-thread PRNG |
 | qualifier | `@first=N`, `@from=T`, `@until=T`, `@size>N`, `@size<N` (`src/common/chaos_policy.h`) |
 | hit | one application of a rule's effect; counted per rule |
@@ -358,7 +358,8 @@ grammar can express the other's domain.
 ### Distinct Failure Boundaries
 
 `libchaos-io` reasons about path prefixes, descriptor-to-path resolution,
-partial writes (`TORN`), lost writes (`DROP`), read corruption and durability (`fsync`,
+partial writes (`TORN`), lost writes (`DROP`), a filesystem reported full
+(`FREE`, `FULL`), read corruption and durability (`fsync`,
 `fdatasync`). `libchaos-net` reasons about endpoints, receive corruption,
 short and duplicated receives, abortive close (`RESET`) and readiness
 timeouts. Flattening both into one grammar would make each less precise.
@@ -610,7 +611,7 @@ Responsibilities:
   `/data/x`, not `/database`); `*` covers absolute paths except `/memfd:`
 - descriptor-to-path resolution through a process-wide fd cache
 - effects `ERRNO`, `LATENCY`, `TORN` and `DROP` (write side), `CORRUPT` (read
-  side)
+  side), `FREE` and `FULL` (the free-space counts a `statfs` answer reports)
 - stdio streams: `ERRNO` raises the stream's error indicator (bit `0x20` of
   the first word of `FILE` on glibc and musl), so `ferror()` is true as after
   a real failure; `TORN` and `DROP` do not apply
@@ -1117,7 +1118,7 @@ their own architecture (`matrix.yml`).
 
 | Library | Rule file | Effects |
 | --- | --- | --- |
-| `libchaos-io` | `/tmp/.chaos-io.conf` | `ERRNO`, `LATENCY`, `TORN` and `DROP` (write side), `CORRUPT` (read side) |
+| `libchaos-io` | `/tmp/.chaos-io.conf` | `ERRNO`, `LATENCY`, `TORN` and `DROP` (write side), `CORRUPT` (read side), `FREE` and `FULL` (`statfs`) |
 | `libchaos-net` | `/tmp/.chaos-net.conf` | `ERRNO`, `LATENCY`, `CORRUPT` (recv), `TIMEOUT` (poll), `RESET` (close), `TRICKLE` (recv, stream), `DUP` (recv), `DROP` (send, datagram) |
 | `libchaos-dns` | `/tmp/.chaos-dns.conf` | `GAI`, `LATENCY`, `REWRITE`, `SERVICE`, `OVERRIDE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT` |
 | `libchaos-time` | `/tmp/.chaos-time.conf` | `ERRNO`, `LATENCY`, `OFFSET`, `REGRESS` and `FREEZE` (clock_gettime selectors; `REGRESS` needs `clock_gettime/<clock>`) |

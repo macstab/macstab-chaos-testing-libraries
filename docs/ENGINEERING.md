@@ -78,10 +78,11 @@ Shared mechanisms live in header-only `src/common/` (see
 5. [`src/wrappers/chaos_io_rw.c`](../src/wrappers/chaos_io_rw.c) — `read`/`write` families, vectored I/O, `sendfile`, `copy_file_range`
 6. [`src/wrappers/chaos_io_fsops.c`](../src/wrappers/chaos_io_fsops.c) — truncate, allocate, unlink, rename families
 7. [`src/wrappers/chaos_io_sync.c`](../src/wrappers/chaos_io_sync.c) — `close`, `dup2`/`dup3`, `close_range`, `closefrom`, `fsync`, `fdatasync`
-8. [`src/wrappers/chaos_io_stdio.c`](../src/wrappers/chaos_io_stdio.c) — stdio streams
-9. [`src/config/chaos_io_config.c`](../src/config/chaos_io_config.c) — reload, parser, longest-prefix selection
-10. [`src/effects/chaos_io_actions.c`](../src/effects/chaos_io_actions.c) — probability, latency, corruption, torn-write sizing
-11. [`src/config/chaos_io_fdcache.c`](../src/config/chaos_io_fdcache.c) — process-wide 32-slot fd→path cache
+8. [`src/wrappers/chaos_io_statfs.c`](../src/wrappers/chaos_io_statfs.c) — `statfs`, `fstatfs`, `statvfs`, `fstatvfs`; `FREE` and `FULL`
+9. [`src/wrappers/chaos_io_stdio.c`](../src/wrappers/chaos_io_stdio.c) — stdio streams
+10. [`src/config/chaos_io_config.c`](../src/config/chaos_io_config.c) — reload, parser, longest-prefix selection
+11. [`src/effects/chaos_io_actions.c`](../src/effects/chaos_io_actions.c) — probability, latency, corruption, torn-write sizing, free-space counts
+12. [`src/config/chaos_io_fdcache.c`](../src/config/chaos_io_fdcache.c) — process-wide 32-slot fd→path cache
 
 ### `libchaos-net`
 
@@ -189,6 +190,15 @@ Owns `close`, `fsync`, `fdatasync` and the descriptor-recycling calls
 (`dup2`, `dup3`, `close_range`, `closefrom`, `closedir`, `pclose`). `fsync`
 and `fdatasync` take `ERRNO` and `LATENCY` only. Keep these wrappers free of
 effect-specific policy.
+
+### [`src/wrappers/chaos_io_statfs.c`](../src/wrappers/chaos_io_statfs.c)
+
+Owns `statfs`, `fstatfs`, `statvfs`, `fstatvfs` and the glibc `64` aliases. The
+real call always runs and two fields of its answer are rewritten: `f_bfree` and
+`f_bavail`, in the structure's own unit (`f_bsize` for `struct statfs`,
+`f_frsize` for `struct statvfs`). The total is left alone, and a failing real
+call is reported unchanged. The inode counts are not touched: a filesystem out
+of inodes is a different fault, and one rule should not say two things.
 
 ### [`src/wrappers/chaos_io_stdio.c`](../src/wrappers/chaos_io_stdio.c)
 

@@ -430,6 +430,10 @@ static chaos_io_operation_t chaos_io_parse_operation(const char *text)
     {
         return CHAOS_IO_OP_RENAME_TO;
     }
+    if (strcmp(text, "statfs") == 0)
+    {
+        return CHAOS_IO_OP_STATFS;
+    }
     return CHAOS_IO_OP_INVALID;
 }
 
@@ -557,6 +561,61 @@ static int chaos_io_parse_latency_ms(const char *text, unsigned int *latency_ms)
     return 0;
 }
 
+/**
+ * @brief Parses a FREE parameter: `<bytes>[@probability]`.
+ *
+ * @details The byte count is 64 bits, so a rule can name more free space than any file
+ * system has; `strtoull` out of range rejects the line. The `@` form is the same as
+ * LATENCY's and must follow a digit directly, so a blank before it stays a qualifier word.
+ *
+ * @param[in]  text         Field; NULL returns -1.
+ * @param[out] free_bytes   Receives the byte count; NULL returns -1.
+ * @param[out] probability  Receives the probability, 1.0 without one; NULL returns -1.
+ * @return 0 on success; -1 on a syntax or range error.
+ */
+static int chaos_io_parse_free_bytes(const char *text, uint64_t *free_bytes, double *probability)
+{
+    char digits[24];
+    const char *at_sign;
+    char *end = NULL;
+    unsigned long long value;
+    size_t length;
+
+    if (text == NULL || free_bytes == NULL || probability == NULL)
+    {
+        return -1;
+    }
+    *probability = 1.0;
+    at_sign = strrchr(text, '@');
+    if (at_sign != NULL)
+    {
+        length = (size_t)(at_sign - text);
+        if (at_sign == text || at_sign[-1] < '0' || at_sign[-1] > '9' || length >= sizeof(digits))
+        {
+            return -1;
+        }
+        (void)memcpy(digits, text, length);
+        digits[length] = '\0';
+        if (chaos_io_parse_probability(at_sign + 1, probability) != 0)
+        {
+            return -1;
+        }
+        text = digits;
+    }
+    if (*text < '0' || *text > '9')
+    {
+        return -1;
+    }
+    errno = 0;
+    value = strtoull(text, &end, 10);
+    if (end == text || *chaos_io_trim(end) != '\0' || errno == ERANGE)
+    {
+        return -1;
+    }
+    *free_bytes = (uint64_t)value;
+    return 0;
+}
+
 static int chaos_io_parse_latency(const char *text, unsigned int *latency_ms, double *probability)
 {
     char milliseconds[16];
@@ -603,6 +662,8 @@ static int chaos_io_parse_latency(const char *text, unsigned int *latency_ms, do
  * - DROP: `write`, `pwrite` only. It reports a write as fully done without doing it, which
  *   is a lost write; the read side has no counterpart -- a read that reports bytes it did
  *   not read would hand the caller its own stale buffer, which is CORRUPT's territory.
+ * - FREE, FULL: `statfs` only. They rewrite the free-space fields of the answer, which no
+ *   other operation returns.
  */
 static int chaos_io_effect_allowed(chaos_io_operation_t operation, chaos_io_effect_t effect)
 {
@@ -621,6 +682,10 @@ static int chaos_io_effect_allowed(chaos_io_operation_t operation, chaos_io_effe
     if (effect == CHAOS_IO_EFFECT_DROP)
     {
         return operation == CHAOS_IO_OP_WRITE || operation == CHAOS_IO_OP_PWRITE;
+    }
+    if (effect == CHAOS_IO_EFFECT_FREE || effect == CHAOS_IO_EFFECT_FULL)
+    {
+        return operation == CHAOS_IO_OP_STATFS;
     }
     return 0;
 }
@@ -856,9 +921,9 @@ chaos_io_rule_shadowed(const chaos_io_rule_t *rules, size_t count, const chaos_i
  *
  * @details Only the calls that move bytes do: read, write, pread and pwrite (including
  * their iovec forms, sendfile and copy_file_range, which are decided as write), fallocate
- * and truncate, whose lengths are passed. open, close, fsync, fdatasync, rename and unlink
- * pass CHAOS_POLICY_NO_SIZE, so a `@size` gate on them could never pass and the rule would
- * load and never fire.
+ * and truncate, whose lengths are passed. open, close, fsync, fdatasync, rename, unlink and
+ * statfs pass CHAOS_POLICY_NO_SIZE, so a `@size` gate on them could never pass and the rule
+ * would load and never fire.
  *
  * @param operation Operation of the rule.
  * @return Non-zero when the operation reports a byte count.
@@ -1611,6 +1676,24 @@ int chaos_io_config_parse_line(char *line, chaos_io_rule_t *rule)
     else if (strcmp(fields[2], "DROP") == 0)
     {
         rule->effect = CHAOS_IO_EFFECT_DROP;
+        if (chaos_io_parse_probability(fields[3], &probability) != 0)
+        {
+            return -1;
+        }
+        rule->probability = probability;
+    }
+    else if (strcmp(fields[2], "FREE") == 0)
+    {
+        rule->effect = CHAOS_IO_EFFECT_FREE;
+        if (chaos_io_parse_free_bytes(fields[3], &rule->free_bytes, &probability) != 0)
+        {
+            return -1;
+        }
+        rule->probability = probability;
+    }
+    else if (strcmp(fields[2], "FULL") == 0)
+    {
+        rule->effect = CHAOS_IO_EFFECT_FULL;
         if (chaos_io_parse_probability(fields[3], &probability) != 0)
         {
             return -1;

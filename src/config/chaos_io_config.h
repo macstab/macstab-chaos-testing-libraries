@@ -87,7 +87,8 @@ typedef enum chaos_io_operation
     CHAOS_IO_OP_ALLOCATE,     /**< `allocate`: fallocate, posix_fallocate. */
     CHAOS_IO_OP_UNLINK,       /**< `unlink`: unlinkat, unlink, rmdir, remove. */
     CHAOS_IO_OP_RENAME_FROM,  /**< `rename_from`: source of renameat, renameat2, rename. */
-    CHAOS_IO_OP_RENAME_TO     /**< `rename_to`: target of renameat, renameat2, rename. */
+    CHAOS_IO_OP_RENAME_TO,    /**< `rename_to`: target of renameat, renameat2, rename. */
+    CHAOS_IO_OP_STATFS        /**< `statfs`: statfs, fstatfs, statvfs, fstatvfs. */
 } chaos_io_operation_t;
 
 /**
@@ -104,7 +105,9 @@ typedef enum chaos_io_effect
     CHAOS_IO_EFFECT_LATENCY,      /**< Delay the real call by `latency_ms`. */
     CHAOS_IO_EFFECT_TORN,         /**< Real write with a byte count in [1, n-1]. */
     CHAOS_IO_EFFECT_CORRUPT,      /**< Flip one bit of the bytes a read returned. */
-    CHAOS_IO_EFFECT_DROP          /**< Report the whole write as done without writing it. */
+    CHAOS_IO_EFFECT_DROP,         /**< Report the whole write as done without writing it. */
+    CHAOS_IO_EFFECT_FREE,         /**< Report `free_bytes` of free space on the filesystem. */
+    CHAOS_IO_EFFECT_FULL          /**< Report the filesystem as having no free space. */
 } chaos_io_effect_t;
 
 /**
@@ -135,6 +138,7 @@ typedef struct chaos_io_rule
     int errnum;                     /**< errno for ERRNO; 0 otherwise. */
     double probability;      /**< Probability in [0, 1]; 1.0 for `LATENCY:ms` without `@p`. */
     unsigned int latency_ms; /**< Delay in ms for LATENCY; 0 otherwise. */
+    uint64_t free_bytes;     /**< Free space to report for FREE; 0 otherwise (and for FULL). */
     /** Qualifiers written after the rule (`@first`, `@from`, `@until`, `@size`). */
     chaos_rule_policy_t policy;
     /**

@@ -131,7 +131,7 @@ static const long g_chaos_init_io_calls[] = {
     __NR_pread64,   __NR_preadv,   __NR_pwrite64,  __NR_pwritev,         __NR_sendfile,
     __NR_ftruncate, __NR_truncate, __NR_fallocate, __NR_unlinkat,        __NR_renameat2,
     __NR_close,     __NR_fsync,    __NR_fdatasync, __NR_copy_file_range, __NR_preadv2,
-    __NR_pwritev2,
+    __NR_pwritev2,  __NR_statfs,   __NR_fstatfs,
 #ifdef __NR_openat2
     __NR_openat2,
 #endif

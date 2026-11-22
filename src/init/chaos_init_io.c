@@ -25,7 +25,10 @@
  * file: the net decider claims them first.
  *
  * @par Supported effects
- * ERRNO (not on close), LATENCY, and DROP on `pwrite`. TORN and CORRUPT change data the
+ * ERRNO (not on close), LATENCY, and DROP on `pwrite`. FREE and FULL rewrite the structure
+ * the kernel returned, which a reply cannot reach, so they are rejected with the other data
+ * effects; `statfs` and `fstatfs` themselves are notified, so ERRNO and LATENCY apply to
+ * them here as they do in the library. TORN and CORRUPT change data the
  * kernel moves, which a seccomp reply cannot do; ERRNO on close would have to close and
  * fail at once (the wrapper closes, then reports the error), while a notified call either
  * runs or fails. DROP is a reply with the byte count and no call, which is exactly what a
@@ -74,7 +77,9 @@ __thread int g_chaos_io_tls_guard = 0;
 uint64_t g_chaos_io_lineage = 0U;
 uint64_t g_chaos_io_process_seed = UINT64_C(0x2545f4914f6cdd1d);
 
-/* CHAOS_IO_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, and DROP on pwrite. */
+/* CHAOS_IO_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, and DROP on pwrite.
+ * FREE and FULL fall under the data effects: they rewrite the structure the kernel
+ * returned, which a notification reply cannot reach. */
 static int chaos_init_io_supported(const struct chaos_io_rule *rule)
 {
     return (rule->effect == CHAOS_IO_EFFECT_ERRNO && rule->operation != CHAOS_IO_OP_CLOSE) ||
@@ -132,6 +137,8 @@ static const chaos_init_io_call_t g_chaos_init_io_calls[] = {
     {__NR_fallocate, CHAOS_IO_OP_ALLOCATE, CHAOS_INIT_IO_FD, 0, 3},
     {__NR_unlinkat, CHAOS_IO_OP_UNLINK, CHAOS_INIT_IO_PATH_AT, 1, -1},
     {__NR_renameat2, CHAOS_IO_OP_RENAME_FROM, CHAOS_INIT_IO_RENAME_AT, 0, -1},
+    {__NR_statfs, CHAOS_IO_OP_STATFS, CHAOS_INIT_IO_PATH, 0, -1},
+    {__NR_fstatfs, CHAOS_IO_OP_STATFS, CHAOS_INIT_IO_FD, 0, -1},
 #ifdef __NR_openat2
     {__NR_openat2, CHAOS_IO_OP_OPEN, CHAOS_INIT_IO_PATH_AT, 1, -1},
 #endif

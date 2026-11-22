@@ -71,7 +71,7 @@ How the libc layer instantiates the triple:
 | Part | libc layer |
 |---|---|
 | S | a path prefix (io), an endpoint (net), a host name or address (dns), a function or function/argument class (time, process, memory), always with `*` as catch-all |
-| E | ERRNO (an errno name, or a positive number in every library), GAI (`EAI_*`, dns), LATENCY, TIMEOUT, CORRUPT, TORN, DROP, TRICKLE, DUP, RESET, OFFSET, REGRESS, FREEZE, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER |
+| E | ERRNO (an errno name, or a positive number in every library), GAI (`EAI_*`, dns), LATENCY, TIMEOUT, CORRUPT, TORN, DROP, FREE, FULL, TRICKLE, DUP, RESET, OFFSET, REGRESS, FREEZE, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER |
 | P | probability ∧ `@from`/`@until` window ∧ `@size` gate ∧ `@every` evaluation gate ∧ `@first` budget; for FAIL_AFTER additionally a per-operation call counter |
 | selection | io, net: **one rule per call**, the most specific for the call's operation. dns, time, process, memory: **one rule per effect**, the most specific for each effect, so several effects compose on one call (§8) |
 
@@ -150,15 +150,18 @@ io-selector   = "*" / 1*1023( %x21-22 / %x24-39 / %x3B-7E )  ; no ":" or "#"; ab
                                                             ; paths are prefixes
 io-op         = "read" / "write" / "open" / "close" / "fsync" / "fdatasync"
               / "pread" / "pwrite" / "truncate" / "allocate"
-              / "unlink" / "rename_from" / "rename_to"
+              / "unlink" / "rename_from" / "rename_to" / "statfs"
 io-effect     = io-errno ":" probability
               / "LATENCY" ":" ms [ "@" probability ]
               / "TORN" ":" probability                      ; write, pwrite only
               / "DROP" ":" probability                      ; write, pwrite only
+              / "FREE" ":" bytes [ "@" probability ]        ; statfs only
+              / "FULL" ":" probability                      ; statfs only
               / "CORRUPT" ":" probability                   ; read, pread only
 io-errno      = "EIO" / "ENOSPC" / "EDQUOT" / "EROFS" / "EACCES"
               / "EMFILE" / "ENFILE" / "ENOENT"
 ms            = 1*DIGIT                                     ; 0 .. 4294967295
+bytes         = 1*DIGIT                                     ; 0 .. 18446744073709551615
 
 ;; --------------------------------------------------------------- libchaos-net
 ;; /tmp/.chaos-net.conf     fields are split from the RIGHT, so the endpoint
@@ -313,7 +316,7 @@ Same caveat as §2.3: a sketch of the surface, not its source of truth.
 |---|---|---|---|
 | **Selector** | Path prefix, endpoint, host name/address, or function selector parsed from a text rule | `ChaosSelector` typed builder — `network()`, `jdbc()`, `dns()`, etc. | `@Chaos(target=…)` annotation parameter; YAML `selector:` block |
 | **Selector match site** | Inside the wrapper, against the call's arguments (descriptors resolved to paths or endpoints) | Inside the ByteBuddy-injected advice at the JDK call site | At the orchestration boundary (Toxiproxy / Testcontainers `withCommand` hook) |
-| **Effect** | ERRNO, GAI, LATENCY, TIMEOUT, CORRUPT, TORN, DROP, TRICKLE, DUP, RESET, OFFSET, REGRESS, FREEZE, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER | `ChaosEffect.delay/throw/fail/stress/deadlock/spike/drop` | Toxiproxy toxics / `tc netem` rules / cgroup throttling |
+| **Effect** | ERRNO, GAI, LATENCY, TIMEOUT, CORRUPT, TORN, DROP, FREE, FULL, TRICKLE, DUP, RESET, OFFSET, REGRESS, FREEZE, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER | `ChaosEffect.delay/throw/fail/stress/deadlock/spike/drop` | Toxiproxy toxics / `tc netem` rules / cgroup throttling |
 | **Effect application phase** | Pre-call (ERRNO, GAI, LATENCY, FAIL_AFTER; TORN shortens the count), instead of the call (OVERRIDE, DROP), post-call (CORRUPT, OFFSET, REGRESS, FREEZE, result-set transforms) | Same conceptual phases at the bytecode advice level | At the network/cgroup boundary, always pre-effect from the application's perspective |
 | **Activation policy** | Probability, `@first`, `@every`, `@from`/`@until`, `@size`; FAIL_AFTER's call counter | `ActivationPolicy.always/count/timeWindow/session` | Annotation parameters + scenario lifecycle hooks |
 | **Activation evaluation** | Per call: window, size gate, `@every`, the rule's probability sample, `@first` claim | Per-call dispatcher check + session-scoped state | Lifecycle-driven (apply on `@BeforeEach`, remove on `@AfterEach`) |
@@ -413,6 +416,7 @@ apply (§8).
 | `/data:write:TORN:0.1` | before the call: the byte count is shortened to `[1, n-1]` | `partialWrite(probability=0.1)` | N/A |
 | `/data:write:DROP:0.1` (io) | instead of the call: the full count is reported and nothing is written | N/A | N/A |
 | `udp4://10.0.0.5:53:send:DROP:0.1` (net) | instead of the call: the datagram is reported sent and never leaves | N/A | `tc qdisc ... netem loss 10%` (per interface, not per rule) |
+| `/data:statfs:FULL:1` (io) | after the call: the answer reports no free space | N/A | a smaller volume, which changes the total too |
 
 ### 5.4. Class D — result-set transform (DNS)
 
@@ -626,6 +630,7 @@ select one rule
   TORN     → real call with shortened count            (io write, pwrite)
   DROP     → no real call, full count reported         (io write, pwrite;
                                                         net send on datagrams)
+  FREE/FULL→ real call, then the free counts rewritten (io statfs)
   CORRUPT  → real call, then flip one returned bit     (io read, pread; net recv)
   other net effects: see NETWORK.md
 ```

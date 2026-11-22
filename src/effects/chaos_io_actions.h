@@ -145,4 +145,24 @@ int chaos_io_rule_should_trigger(chaos_io_rule_t *rule);
  */
 int chaos_io_rule_apply_errno(chaos_io_rule_t *rule);
 
+/**
+ * @brief FREE and FULL: the free-space counts a `statfs` answer should report.
+ *
+ * @details Both effects change the same two fields, in units of @p unit bytes: FULL
+ * reports no free space at all, FREE the rule's byte count rounded down to whole units.
+ * The total (`f_blocks`) is left alone: a filesystem that shrinks while a program runs is
+ * not what is being modelled, a filling one is.
+ *
+ * The caller passes the unit because the two structures disagree: `struct statfs` counts
+ * blocks in `f_bsize`, `struct statvfs` in `f_frsize`. A unit of 0 is no answer at all
+ * (nothing can be expressed in it) and leaves the counts alone, so the wrapper reports
+ * what the kernel said.
+ *
+ * @param[in]  rule       Firing FREE or FULL rule; anything else leaves the counts alone.
+ * @param[in]  unit       Bytes per block of the structure being filled.
+ * @param[out] blocks     Receives the free-block count; NULL is a no-op.
+ * @return Non-zero when @p blocks was written.
+ */
+int chaos_io_free_blocks(const chaos_io_rule_t *rule, uint64_t unit, uint64_t *blocks);
+
 #endif

@@ -270,6 +270,26 @@ static void test_helper_primitives(void)
     assert(chaos_io_effect_allowed(CHAOS_IO_OP_PWRITE, CHAOS_IO_EFFECT_DROP));
     assert(!chaos_io_effect_allowed(CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_DROP));
     assert(!chaos_io_effect_allowed(CHAOS_IO_OP_FSYNC, CHAOS_IO_EFFECT_DROP));
+    {
+        /* Arguments no line can produce: the parser passes its own fields, so the guard is
+         * proved by calling the helper directly, as the latency helpers above are. */
+        uint64_t bytes = 0U;
+        double chance = 0.0;
+
+        assert(chaos_io_parse_free_bytes(NULL, &bytes, &chance) == -1);
+        assert(chaos_io_parse_free_bytes("4096", NULL, &chance) == -1);
+        assert(chaos_io_parse_free_bytes("4096", &bytes, NULL) == -1);
+        assert(chaos_io_parse_free_bytes("4096", &bytes, &chance) == 0);
+        assert(bytes == 4096U && chance == 1.0);
+    }
+    assert(chaos_io_effect_allowed(CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_FREE));
+    assert(chaos_io_effect_allowed(CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_FULL));
+    assert(chaos_io_effect_allowed(CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_ERRNO));
+    assert(chaos_io_effect_allowed(CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_LATENCY));
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_FREE));
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_FULL));
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_TORN));
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_DROP));
     assert(!chaos_io_effect_allowed(CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_INVALID));
 
     assert(chaos_io_config_normalize_mtime_hash(CHAOS_IO_MTIME_MISSING) != CHAOS_IO_MTIME_MISSING);
@@ -305,28 +325,50 @@ static void test_parse_line_valid_cases(void)
         int errnum;
         double probability;
         unsigned int latency_ms;
+        uint64_t free_bytes;
     } cases[] = {
-        {"/data:read:EIO:0.1", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_ERRNO, EIO, 0.1, 0U},
-        {"/data:write:ENOSPC:0.2", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_ERRNO, ENOSPC, 0.2, 0U},
-        {"/data:open:EMFILE:0.3", CHAOS_IO_OP_OPEN, CHAOS_IO_EFFECT_ERRNO, EMFILE, 0.3, 0U},
-        {"/data:close:EDQUOT:0.4", CHAOS_IO_OP_CLOSE, CHAOS_IO_EFFECT_ERRNO, EDQUOT, 0.4, 0U},
-        {"/data:fsync:EROFS:0.5", CHAOS_IO_OP_FSYNC, CHAOS_IO_EFFECT_ERRNO, EROFS, 0.5, 0U},
-        {"/data:fdatasync:EACCES:0.6", CHAOS_IO_OP_FDATASYNC, CHAOS_IO_EFFECT_ERRNO, EACCES, 0.6, 0U
+        {"/data:read:EIO:0.1", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_ERRNO, EIO, 0.1, 0U, 0U},
+        {"/data:write:ENOSPC:0.2", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_ERRNO, ENOSPC, 0.2, 0U, 0U},
+        {"/data:open:EMFILE:0.3", CHAOS_IO_OP_OPEN, CHAOS_IO_EFFECT_ERRNO, EMFILE, 0.3, 0U, 0U},
+        {"/data:close:EDQUOT:0.4", CHAOS_IO_OP_CLOSE, CHAOS_IO_EFFECT_ERRNO, EDQUOT, 0.4, 0U, 0U},
+        {"/data:fsync:EROFS:0.5", CHAOS_IO_OP_FSYNC, CHAOS_IO_EFFECT_ERRNO, EROFS, 0.5, 0U, 0U},
+        {"/data:fdatasync:EACCES:0.6",
+         CHAOS_IO_OP_FDATASYNC,
+         CHAOS_IO_EFFECT_ERRNO,
+         EACCES,
+         0.6,
+         0U,
+         0U},
+        {"/data:pread:ENOENT:0.7", CHAOS_IO_OP_PREAD, CHAOS_IO_EFFECT_ERRNO, ENOENT, 0.7, 0U, 0U},
+        {"/data:pwrite:ENFILE:0.8", CHAOS_IO_OP_PWRITE, CHAOS_IO_EFFECT_ERRNO, ENFILE, 0.8, 0U, 0U},
+        {"/data:truncate:EIO:0.2", CHAOS_IO_OP_TRUNCATE, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U, 0U},
+        {"/data:allocate:EIO:0.2", CHAOS_IO_OP_ALLOCATE, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U, 0U},
+        {"/data:unlink:EIO:0.2", CHAOS_IO_OP_UNLINK, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U, 0U},
+        {"/data:rename_from:EIO:0.2",
+         CHAOS_IO_OP_RENAME_FROM,
+         CHAOS_IO_EFFECT_ERRNO,
+         EIO,
+         0.2,
+         0U,
+         0U},
+        {"/data:rename_to:EIO:0.2", CHAOS_IO_OP_RENAME_TO, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U, 0U},
+        {"/data:write:LATENCY:25", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_LATENCY, 0, 1.0, 25U, 0U},
+        {"/data:truncate:LATENCY:25", CHAOS_IO_OP_TRUNCATE, CHAOS_IO_EFFECT_LATENCY, 0, 1.0, 25U, 0U
         },
-        {"/data:pread:ENOENT:0.7", CHAOS_IO_OP_PREAD, CHAOS_IO_EFFECT_ERRNO, ENOENT, 0.7, 0U},
-        {"/data:pwrite:ENFILE:0.8", CHAOS_IO_OP_PWRITE, CHAOS_IO_EFFECT_ERRNO, ENFILE, 0.8, 0U},
-        {"/data:truncate:EIO:0.2", CHAOS_IO_OP_TRUNCATE, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U},
-        {"/data:allocate:EIO:0.2", CHAOS_IO_OP_ALLOCATE, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U},
-        {"/data:unlink:EIO:0.2", CHAOS_IO_OP_UNLINK, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U},
-        {"/data:rename_from:EIO:0.2", CHAOS_IO_OP_RENAME_FROM, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U},
-        {"/data:rename_to:EIO:0.2", CHAOS_IO_OP_RENAME_TO, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U},
-        {"/data:write:LATENCY:25", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_LATENCY, 0, 1.0, 25U},
-        {"/data:truncate:LATENCY:25", CHAOS_IO_OP_TRUNCATE, CHAOS_IO_EFFECT_LATENCY, 0, 1.0, 25U},
-        {"/data:read:LATENCY:25@0.5", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_LATENCY, 0, 0.5, 25U},
-        {"/data:write:TORN:0.9", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_TORN, 0, 0.9, 0U},
-        {"/data:read:CORRUPT:1.0", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_CORRUPT, 0, 1.0, 0U},
-        {"/data:write:DROP:0.4", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_DROP, 0, 0.4, 0U},
-        {"/data:pwrite:DROP:1.0", CHAOS_IO_OP_PWRITE, CHAOS_IO_EFFECT_DROP, 0, 1.0, 0U}
+        {"/data:read:LATENCY:25@0.5", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_LATENCY, 0, 0.5, 25U, 0U},
+        {"/data:write:TORN:0.9", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_TORN, 0, 0.9, 0U, 0U},
+        {"/data:read:CORRUPT:1.0", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_CORRUPT, 0, 1.0, 0U, 0U},
+        {"/data:write:DROP:0.4", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_DROP, 0, 0.4, 0U, 0U},
+        {"/data:pwrite:DROP:1.0", CHAOS_IO_OP_PWRITE, CHAOS_IO_EFFECT_DROP, 0, 1.0, 0U, 0U},
+        {"/data:statfs:FULL:1.0", CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_FULL, 0, 1.0, 0U, 0U},
+        {"/data:statfs:FREE:0", CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_FREE, 0, 1.0, 0U, 0U},
+        {"/data:statfs:FREE:1048576@0.5",
+         CHAOS_IO_OP_STATFS,
+         CHAOS_IO_EFFECT_FREE,
+         0,
+         0.5,
+         0U,
+         1048576U}
     };
     size_t index;
 
@@ -350,6 +392,9 @@ static void test_parse_line_valid_cases(void)
         {
             assert(rule.latency_ms == cases[index].latency_ms);
         }
+        /* Asserted for every row, not only the FREE ones: a parser that stores the byte
+         * count on the wrong effect is as wrong as one that forgets it. */
+        assert(rule.free_bytes == cases[index].free_bytes);
     }
 
     {
@@ -388,6 +433,16 @@ static void test_parse_line_invalid_cases(void)
     char invalid_drop_operation[] = "/data:read:DROP:0.2";
     char invalid_drop_fsync[] = "/data:fsync:DROP:1.0";
     char invalid_drop_probability[] = "/data:write:DROP:1.5";
+    char invalid_free_operation[] = "/data:write:FREE:4096";
+    char invalid_full_operation[] = "/data:read:FULL:1";
+    char invalid_free_value[] = "/data:statfs:FREE:plenty";
+    char invalid_free_negative[] = "/data:statfs:FREE:-1";
+    char invalid_free_huge[] = "/data:statfs:FREE:99999999999999999999999";
+    char invalid_free_probability[] = "/data:statfs:FREE:4096@2";
+    char invalid_free_empty[] = "/data:statfs:FREE:";
+    char invalid_free_no_digits[] = "/data:statfs:FREE:@0.5";
+    char invalid_free_long[] = "/data:statfs:FREE:1111111111111111111111111@0.5";
+    char invalid_full_value[] = "/data:statfs:FULL:nope";
     char empty_operation[] = "/data::EIO:0.1";
     char empty_effect[] = "/data:read::0.1";
     char empty_value[] = "/data:read:EIO:";
@@ -410,6 +465,16 @@ static void test_parse_line_invalid_cases(void)
     assert(chaos_io_config_parse_line(invalid_drop_operation, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_drop_fsync, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_drop_probability, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_free_operation, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_full_operation, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_free_value, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_free_negative, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_free_huge, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_free_probability, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_free_empty, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_free_no_digits, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_free_long, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_full_value, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_combination, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_truncate_combination, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_latency, &rule) == -1);
@@ -1336,6 +1401,7 @@ static void test_rule_qualifiers(void)
     char sized_open[] = "/data:open:EIO:1.0 @size>10\n";
     char sized_fsync[] = "/data:fsync:EIO:1.0 @size<10\n";
     char sized_truncate[] = "/data:truncate:EIO:1.0 @size>10\n";
+    char sized_statfs[] = "/data:statfs:EIO:1.0 @size>10\n";
     char unknown[] = "/data:write:EIO:1.0 @bogus=1\n";
     char lonely[] = "# header\n  @first=3\n";
     char backwards[] = "/data:write:EIO:1.0 @from=2000 @until=1000\n";
@@ -1361,6 +1427,9 @@ static void test_rule_qualifiers(void)
      * report one, so the gate stays available there. */
     assert(chaos_io_config_parse_buffer(sized_open, rules, &count) == -1);
     assert(chaos_io_config_parse_buffer(sized_fsync, rules, &count) == -1);
+    /* statfs answers a question about the filesystem and moves no bytes, so it has no
+     * count either: a size-gated statfs rule would load and never fire. */
+    assert(chaos_io_config_parse_buffer(sized_statfs, rules, &count) == -1);
     /* truncate passes its length, so the gate is meaningful there. */
     assert(chaos_io_config_parse_buffer(sized_truncate, rules, &count) == 0);
     assert(chaos_io_config_parse_buffer(empty_first, rules, &count) == -1);

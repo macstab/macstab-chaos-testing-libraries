@@ -480,6 +480,22 @@ int main(void)
     (void)fclose(file);
     assert(strstr(hits, "reason=unsupported in seccomp mode\n") != NULL);
 
+    /* statfs and fstatfs are notified, so ERRNO and LATENCY reach them here as in the
+     * library; FREE and FULL rewrite the structure the kernel returned, which a reply
+     * cannot reach, so they reject the whole file with the other data effects. */
+    write_rules("/tmp/initio/torn:statfs:EIO:1.0\n");
+    assert(FAILS(decide(__NR_fstatfs, (uint64_t)torn, P(buffer), 0, 0, 0), EIO));
+    assert(FAILS(decide(__NR_statfs, P("/tmp/initio/torn/f"), P(buffer), 0, 0, 0), EIO));
+    write_rules("/tmp/initio/torn:statfs:FULL:1.0\n");
+    assert(PASSES(decide(__NR_fstatfs, (uint64_t)torn, P(buffer), 0, 0, 0)));
+    file = fopen("/tmp/.chaos-io.status", "r");
+    assert(file != NULL);
+    hits[fread(hits, 1U, sizeof(hits) - 1U, file)] = '\0';
+    (void)fclose(file);
+    assert(strstr(hits, "reason=unsupported in seccomp mode\n") != NULL);
+    write_rules("/tmp/initio/torn:statfs:FREE:4096\n");
+    assert(PASSES(decide(__NR_statfs, P("/tmp/initio/torn/f"), P(buffer), 0, 0, 0)));
+
     write_rules("/tmp/initio/c:close:EIO:1.0\n");
     assert(PASSES(decide(__NR_close, (uint64_t)closing, 0, 0, 0, 0)));
     write_rules("/tmp/initio/c:close:LATENCY:5\n/tmp/initio/data:read:CORRUPT:1.0\n");

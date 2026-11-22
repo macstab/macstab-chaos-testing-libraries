@@ -307,10 +307,12 @@ Rule file `/tmp/.chaos-io.conf`. Each rule is exactly four fields:
 | `unlink` | `unlink`, `unlinkat`, `rmdir`, `remove` |
 | `rename_from` | `rename`, `renameat`, `renameat2`, matched on the source path |
 | `rename_to` | `rename`, `renameat`, `renameat2`, matched on the destination path |
+| `statfs` | `statfs`, `fstatfs`, `statvfs`, `fstatvfs` |
 
 On 64-bit glibc the large-file names (`open64`, `openat64`, `creat64`, `pread64`,
 `pwrite64`, `preadv64`, `pwritev64`, `truncate64`, `ftruncate64`, `fallocate64`,
-`posix_fallocate64`, `sendfile64`, `fopen64`, `freopen64`, `__open64_2`,
+`posix_fallocate64`, `sendfile64`, `statfs64`, `fstatfs64`, `statvfs64`, `fstatvfs64`,
+`fopen64`, `freopen64`, `__open64_2`,
 `__openat64_2`, `__pread64_chk`) are aliases of the same wrappers. The JDK, Redis,
 nginx and MySQL bind to the `64` names and `_FORTIFY_SOURCE` builds to the `_chk`/`_2`
 names, so each is interposed.
@@ -323,6 +325,8 @@ names, so each is interposed.
 | `LATENCY` | milliseconds | every operation | Sleeps before the real call. Always fires: io `LATENCY` takes no probability. |
 | `TORN` | probability | `write`, `pwrite` (not stdio) | Calls the real function with a shortened count: a short write, the rest of the buffer never written. |
 | `DROP` | probability | `write`, `pwrite` (not stdio, `sendfile`, `copy_file_range`) | Reports the full count as written and writes nothing. On `write` the file offset is moved on by that many bytes, so the caller's next write does not overwrite what it believes it already wrote; `O_APPEND` needs no correction, and a descriptor without an offset (a pipe) keeps the rule from firing. |
+| `FREE` | bytes, optionally `@probability` | `statfs` | Calls the real function, then reports that many bytes free (`f_bfree` and `f_bavail`, rounded down to whole blocks). The total is left as the kernel reported it. |
+| `FULL` | probability | `statfs` | The same two counts report zero: a filesystem with nothing left. For the recipe "full disk, writes still succeed physically", pair it with a `write:ENOSPC` rule — a real filling disk makes a program's own threshold check fail long before the writes do. |
 | `CORRUPT` | probability | `read`, `pread`, stdio reads | Calls the real function, then flips a bit in the bytes it returned. |
 
 ### Supported Errnos

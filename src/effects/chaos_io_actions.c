@@ -102,6 +102,26 @@ void chaos_io_corrupt_buffer(const chaos_io_rule_t *rule, void *buffer, size_t s
     );
 }
 
+/** @copydoc chaos_io_free_blocks */
+int chaos_io_free_blocks(const chaos_io_rule_t *rule, uint64_t unit, uint64_t *blocks)
+{
+    if (rule == NULL || blocks == NULL || unit == 0U)
+    {
+        return 0;
+    }
+    if (rule->effect == CHAOS_IO_EFFECT_FULL)
+    {
+        *blocks = 0U;
+        return 1;
+    }
+    if (rule->effect != CHAOS_IO_EFFECT_FREE)
+    {
+        return 0;
+    }
+    *blocks = rule->free_bytes / unit;
+    return 1;
+}
+
 /** @copydoc chaos_io_rule_apply_latency */
 void chaos_io_rule_apply_latency(chaos_io_rule_t *rule)
 {

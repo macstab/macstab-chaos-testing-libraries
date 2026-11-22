@@ -438,6 +438,52 @@ static void test_every_gates_evaluations(void)
     assert(slot.count == 1U);
 }
 
+/**
+ * @brief FREE and FULL compute the free-block count they report, in the structure's unit.
+ *
+ * @details The unit is what the two structures disagree about (`f_bsize` for
+ * `struct statfs`, `f_frsize` for `struct statvfs`), so the conversion is the rule's byte
+ * count divided by whatever the caller passes, rounded down: 5000 bytes of 4096 is one
+ * block, not two, because reporting a partial block as free would claim space that does
+ * not exist. FULL ignores the byte count and reports nothing free. A unit of 0 cannot
+ * express an answer at all and leaves the caller's count alone, as does any other effect.
+ */
+static void test_free_blocks(void)
+{
+    chaos_io_rule_t rule;
+    uint64_t blocks = 0xdeadU;
+
+    (void)memset(&rule, 0, sizeof(rule));
+    rule.effect = CHAOS_IO_EFFECT_FREE;
+    rule.free_bytes = 5000U;
+    assert(chaos_io_free_blocks(&rule, 4096U, &blocks) != 0);
+    assert(blocks == 1U);
+    assert(chaos_io_free_blocks(&rule, 1024U, &blocks) != 0);
+    assert(blocks == 4U);
+    /* A block size of 1 byte reports the byte count itself. */
+    assert(chaos_io_free_blocks(&rule, 1U, &blocks) != 0);
+    assert(blocks == 5000U);
+    /* Less than one block free is no block free: the space is not usable. */
+    rule.free_bytes = 4095U;
+    assert(chaos_io_free_blocks(&rule, 4096U, &blocks) != 0);
+    assert(blocks == 0U);
+
+    rule.effect = CHAOS_IO_EFFECT_FULL;
+    rule.free_bytes = 5000U;
+    blocks = 0xdeadU;
+    assert(chaos_io_free_blocks(&rule, 4096U, &blocks) != 0);
+    assert(blocks == 0U);
+
+    /* No answer: a zero unit, another effect, no rule, no output. */
+    blocks = 0xdeadU;
+    assert(chaos_io_free_blocks(&rule, 0U, &blocks) == 0);
+    rule.effect = CHAOS_IO_EFFECT_TORN;
+    assert(chaos_io_free_blocks(&rule, 4096U, &blocks) == 0);
+    assert(chaos_io_free_blocks(NULL, 4096U, &blocks) == 0);
+    assert(chaos_io_free_blocks(&rule, 4096U, NULL) == 0);
+    assert(blocks == 0xdeadU);
+}
+
 int main(void)
 {
     test_every_gates_evaluations();
@@ -446,6 +492,7 @@ int main(void)
     test_probability_helpers();
     test_draws_are_reproducible();
     test_torn_helpers();
+    test_free_blocks();
     test_corrupt_helpers();
     test_latency_and_trigger_helpers();
     test_latency_honours_qualifiers();

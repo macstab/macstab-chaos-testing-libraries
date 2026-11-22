@@ -30,6 +30,8 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/statfs.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -245,6 +247,18 @@ typedef int (*chaos_io_ftruncate_fn)(int, off_t);
 /** @brief Type of the real `truncate(2)` libc symbol. */
 typedef int (*chaos_io_truncate_fn)(const char *, off_t);
 
+/** @brief Type of the real `statfs(2)` libc symbol. */
+typedef int (*chaos_io_statfs_fn)(const char *, struct statfs *);
+
+/** @brief Type of the real `fstatfs(2)` libc symbol. */
+typedef int (*chaos_io_fstatfs_fn)(int, struct statfs *);
+
+/** @brief Type of the real `statvfs(3)` libc symbol. */
+typedef int (*chaos_io_statvfs_fn)(const char *, struct statvfs *);
+
+/** @brief Type of the real `fstatvfs(3)` libc symbol. */
+typedef int (*chaos_io_fstatvfs_fn)(int, struct statvfs *);
+
 /** @brief Type of the real `fread` libc symbol. */
 typedef size_t (*chaos_io_fread_fn)(void *, size_t, size_t, FILE *);
 
@@ -356,6 +370,10 @@ extern chaos_io_pwritev_fn g_chaos_io_real_pwritev;     /**< Downstream `pwritev
 extern chaos_io_ftruncate_fn g_chaos_io_real_ftruncate; /**< Downstream `ftruncate`. */
 extern chaos_io_unlinkat_fn g_chaos_io_real_unlinkat;   /**< Downstream `unlinkat`. */
 extern chaos_io_truncate_fn g_chaos_io_real_truncate;   /**< Downstream `truncate`. */
+extern chaos_io_statfs_fn g_chaos_io_real_statfs;       /**< Downstream `statfs`. */
+extern chaos_io_fstatfs_fn g_chaos_io_real_fstatfs;     /**< Downstream `fstatfs`. */
+extern chaos_io_statvfs_fn g_chaos_io_real_statvfs;     /**< Downstream `statvfs`. */
+extern chaos_io_fstatvfs_fn g_chaos_io_real_fstatvfs;   /**< Downstream `fstatvfs`. */
 extern chaos_io_fopen_fn g_chaos_io_real_fopen;         /**< Downstream `fopen`. */
 extern chaos_io_fclose_fn g_chaos_io_real_fclose;       /**< Downstream `fclose`. */
 extern chaos_io_fread_fn g_chaos_io_real_fread;         /**< Downstream `fread`. */

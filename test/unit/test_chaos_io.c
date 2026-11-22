@@ -3117,6 +3117,221 @@ static long chaos_test_file_size(const char *path)
 
     return stat(path, &info) == 0 ? (long)info.st_size : -1L;
 }
+/**
+ * @brief The four free-space wrappers ask the kernel, then rewrite the two free counts.
+ *
+ * @details What has to hold, and what the assertions are built to catch:
+ * - the real call always runs, so the answer is the kernel's with two fields replaced; a
+ *   failing real call is reported unchanged and nothing is rewritten, which keeps a rule
+ *   from turning an error into a fake answer;
+ * - `struct statfs` counts blocks in `f_bsize` and `struct statvfs` in `f_frsize`, so each
+ *   wrapper has to hand its own unit over -- the stub records which one it got;
+ * - the total (`f_blocks`) is never touched: a filling filesystem is modelled, not a
+ *   shrinking one;
+ * - a rule that does not fire, and one whose effect is neither FREE nor FULL, leave the
+ *   kernel's counts in place;
+ * - ERRNO fails without a real call; LATENCY delays and then runs it;
+ * - the path forms resolve and match like every other path rule, the descriptor forms
+ *   through the fd cache.
+ */
+static void test_statfs_wrappers(void)
+{
+    struct statfs answer;
+    struct statvfs vanswer;
+
+    /* FULL through statfs: the real call runs, the free counts become the stub's answer,
+     * the total stays, and the unit handed over is f_bsize. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_match_path_result = 1;
+    g_config_rule.operation = CHAOS_IO_OP_STATFS;
+    g_config_rule.effect = CHAOS_IO_EFFECT_FULL;
+    g_rule_should_trigger_result = 1;
+    g_free_blocks_applies = 1;
+    g_free_blocks_result = 0U;
+    assert(statfs("/tmp/data.bin", &answer) == 0);
+    assert(g_real_statfs_calls == 1);
+    assert(g_real_statfs_guard == 1);
+    assert(g_last_free_unit == 4096U);
+    assert(answer.f_bfree == 0 && answer.f_bavail == 0);
+    assert(answer.f_blocks == 10000);
+
+    /* FREE through fstatfs: the descriptor form reaches the same effect. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/data.bin");
+    g_config_match_loaded_result = 1;
+    g_config_match_path_result = 1;
+    g_config_rule.operation = CHAOS_IO_OP_STATFS;
+    g_config_rule.effect = CHAOS_IO_EFFECT_FREE;
+    g_rule_should_trigger_result = 1;
+    g_free_blocks_applies = 1;
+    g_free_blocks_result = 7U;
+    assert(fstatfs(9, &answer) == 0);
+    assert(g_real_statfs_calls == 1);
+    assert(answer.f_bfree == 7 && answer.f_bavail == 7);
+    assert(answer.f_blocks == 10000);
+
+    /* statvfs hands over f_frsize, not f_bsize: the two differ here on purpose. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_statfs_bsize = 512UL;
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_match_path_result = 1;
+    g_config_rule.operation = CHAOS_IO_OP_STATFS;
+    g_config_rule.effect = CHAOS_IO_EFFECT_FREE;
+    g_rule_should_trigger_result = 1;
+    g_free_blocks_applies = 1;
+    g_free_blocks_result = 3U;
+    assert(statvfs("/tmp/data.bin", &vanswer) == 0);
+    assert(g_real_statvfs_calls == 1);
+    assert(g_last_free_unit == 512U);
+    assert(vanswer.f_bfree == 3 && vanswer.f_bavail == 3);
+    assert(vanswer.f_blocks == 10000);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/data.bin");
+    g_config_match_loaded_result = 1;
+    g_config_match_path_result = 1;
+    g_config_rule.operation = CHAOS_IO_OP_STATFS;
+    g_config_rule.effect = CHAOS_IO_EFFECT_FULL;
+    g_rule_should_trigger_result = 1;
+    g_free_blocks_applies = 1;
+    g_free_blocks_result = 0U;
+    vanswer.f_bfree = 1234U;
+    assert(fstatvfs(9, &vanswer) == 0);
+    assert(g_real_statvfs_calls == 1);
+    assert(vanswer.f_bfree == 0 && vanswer.f_bavail == 0);
+
+    /* A failing real call is reported as it is, and nothing is rewritten. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_match_path_result = 1;
+    g_config_rule.operation = CHAOS_IO_OP_STATFS;
+    g_config_rule.effect = CHAOS_IO_EFFECT_FULL;
+    g_rule_should_trigger_result = 1;
+    g_free_blocks_applies = 1;
+    g_real_statfs_return = -1;
+    assert(statfs("/tmp/data.bin", &answer) == -1);
+    assert(g_free_blocks_calls == 0);
+    g_real_statfs_return = 0;
+
+    /* A draw that misses leaves the kernel's counts alone. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_match_path_result = 1;
+    g_config_rule.operation = CHAOS_IO_OP_STATFS;
+    g_config_rule.effect = CHAOS_IO_EFFECT_FULL;
+    g_rule_should_trigger_result = 0;
+    g_free_blocks_applies = 1;
+    g_free_blocks_result = 0U;
+    assert(statfs("/tmp/data.bin", &answer) == 0);
+    assert(answer.f_bfree == 1000 && answer.f_bavail == 1000);
+
+    /* An effect that is not a free-space one: the counts stay, and no draw is spent. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_match_path_result = 1;
+    g_config_rule.operation = CHAOS_IO_OP_STATFS;
+    g_config_rule.effect = CHAOS_IO_EFFECT_TORN;
+    g_rule_should_trigger_result = 1;
+    g_free_blocks_applies = 0;
+    assert(statvfs("/tmp/data.bin", &vanswer) == 0);
+    assert(g_free_blocks_calls == 1);
+    assert(g_rule_should_trigger_calls == 0);
+    assert(vanswer.f_bfree == 1000 && vanswer.f_bavail == 1000);
+
+    /* ERRNO fails before the real call; LATENCY delays and then makes it. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_match_path_result = 1;
+    g_config_rule.operation = CHAOS_IO_OP_STATFS;
+    g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
+    g_config_rule.errnum = EACCES;
+    g_rule_apply_errno_result = 1;
+    errno = 0;
+    assert(statfs("/tmp/data.bin", &answer) == -1);
+    assert(errno == EACCES);
+    assert(g_real_statfs_calls == 0);
+    errno = 0;
+    assert(statvfs("/tmp/data.bin", &vanswer) == -1);
+    assert(g_real_statvfs_calls == 0);
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/data.bin");
+    assert(fstatfs(9, &answer) == -1);
+    assert(fstatvfs(9, &vanswer) == -1);
+    assert(g_real_statfs_calls == 0 && g_real_statvfs_calls == 0);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_match_path_result = 1;
+    g_config_rule.operation = CHAOS_IO_OP_STATFS;
+    g_config_rule.effect = CHAOS_IO_EFFECT_LATENCY;
+    assert(statfs("/tmp/data.bin", &answer) == 0);
+    assert(g_latency_calls == 1);
+    assert(g_real_statfs_calls == 1);
+    assert(statvfs("/tmp/data.bin", &vanswer) == 0);
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/data.bin");
+    assert(fstatfs(9, &answer) == 0);
+    assert(fstatvfs(9, &vanswer) == 0);
+    assert(g_latency_calls == 4);
+
+    /* Without a rule every form passes through to the real call. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    assert(statfs("/tmp/data.bin", &answer) == 0);
+    assert(statvfs("/tmp/data.bin", &vanswer) == 0);
+    assert(fstatfs(9, &answer) == 0);
+    assert(fstatvfs(9, &vanswer) == 0);
+    assert(g_real_statfs_calls == 2 && g_real_statvfs_calls == 2);
+    assert(g_free_blocks_calls == 0);
+
+    /* Before symbol resolution: statfs and fstatfs issue the system call themselves,
+     * statvfs and fstatvfs have none to issue and report ENOSYS. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    /* Consume the once flag, so the wrappers' own ensure_symbols() does not resolve the
+     * pointers again and the NULLs below stand. */
+    chaos_io_ensure_symbols();
+    g_chaos_io_real_statvfs = NULL;
+    g_chaos_io_real_fstatvfs = NULL;
+    errno = 0;
+    assert(statvfs("/tmp", &vanswer) == -1 && errno == ENOSYS);
+    errno = 0;
+    assert(fstatvfs(9, &vanswer) == -1 && errno == ENOSYS);
+    g_chaos_io_real_statfs = NULL;
+    g_chaos_io_real_fstatfs = NULL;
+    assert(statfs("/tmp", &answer) == 0);
+    {
+        const int fd = (int)chaos_test_raw_syscall(
+            SYS_openat, (long)AT_FDCWD, (long)"/tmp", (long)(O_RDONLY | O_DIRECTORY), 0L
+        );
+
+        assert(fd >= 0);
+        assert(fstatfs(fd, &answer) == 0);
+        chaos_test_raw_close(fd);
+    }
+    chaos_test_reset_state();
+}
 
 /** @brief A temporary file descriptor holding ten bytes, positioned at the start. */
 static int chaos_test_drop_fd(int flags)
@@ -3514,6 +3729,7 @@ int main(void)
     test_path_form_wrappers();
     test_read_and_write_wrappers();
     test_drop_write_wrappers();
+    test_statfs_wrappers();
     test_vectored_helpers();
     test_readv_and_writev_wrappers();
     test_vectored_input_checks();
