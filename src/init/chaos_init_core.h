@@ -24,6 +24,7 @@
 
 #include <linux/filter.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /** @name Library bits for --libs (bit order is also the order of `libs=` in the status file) */
 /**@{*/
