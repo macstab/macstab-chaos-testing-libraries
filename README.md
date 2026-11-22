@@ -385,6 +385,11 @@ both contain an address the longer prefix wins -- a literal address being the `/
 `/128`) case of it. This is how a rule names a Docker bridge network, whose address a
 container is given rather than choosing.
 
+The order of selection is therefore: highest rank, then longest address prefix, then
+longest selector text, then the earlier line. Only the last stage depends on where a rule
+sits in the file, so reordering a file never changes which rule a call gets unless two
+rules are equally specific in all three respects.
+
 **Operations and the address they match.**
 
 | Operation | Calls | Matched address |
@@ -458,7 +463,8 @@ rdns://[::1]:SERVICE:https
 
 **Selectors.** Forward lookups: `*` (same as `dns://*`), `dns://<name>`,
 `dns://*.<suffix>`. Reverse lookups: `rdns://<ipv4>`, `rdns://[<ipv6>]`, `rdns://*`.
-An exact name beats a suffix, a suffix beats `*`.
+An exact name beats a suffix, a suffix beats `*`; between two suffixes that both match,
+the longer one wins, and on a full tie the earlier line does.
 
 **Interposed calls.** `getaddrinfo` and the legacy `gethostbyname`,
 `gethostbyname2`, `gethostbyname_r`, `gethostbyname2_r` use the `dns://` rules, so a
@@ -507,7 +513,8 @@ usleep:ERRNO:EINTR@0.1
 **Selectors.** `*`, `clock_gettime`, `clock_gettime/<clock>`, `nanosleep`, `usleep`.
 `<clock>` is `realtime`, `monotonic`, `monotonic_raw`, `realtime_coarse`,
 `monotonic_coarse`, `boottime`, `tai`, `process_cputime_id`, `thread_cputime_id`, or a
-decimal clock id.
+decimal clock id. `clock_gettime/<clock>` beats `clock_gettime`, which beats `*`; on a
+tie the longer selector text wins, and then the earlier line.
 
 **Interposed calls.**
 

@@ -154,7 +154,7 @@ errno-value = "ENOMEM" / "EINVAL" / "EACCES" / "EPERM" / "EBADF" / "ENODEV"
 latency-ms  = 1*DIGIT                          ; decimal, 0 .. 4294967295
 probability = ( "0" [ "." 1*DIGIT ] ) / ( "1" [ "." 1*"0" ] )
 qualifier   = "@first=" 1*18DIGIT / "@every=" 1*18DIGIT
-            / "@from=" 1*18DIGIT / "@until=" 1*18DIGIT
+            / "@from=" 1*18DIGIT / "@until=" 1*18DIGIT   ; until >= 1, > from
             / "@size>" 1*18DIGIT / "@size<" 1*18DIGIT
                                                ; @first > 0; @until > @from when both set
 comment     = "#" *( VCHAR / WSP )

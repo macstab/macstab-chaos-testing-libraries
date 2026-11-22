@@ -17,7 +17,7 @@
  * |-----------|---------|
  * | `@first=N` | At most N hits per process (N >= 1), then inert: a self-clearing start-up fault. |
  * | `@from=T` | Active only when the wall clock, in Unix ms, is >= T. |
- * | `@until=T` | Active only when the wall clock, in Unix ms, is < T. |
+ * | `@until=T` | Active only when the wall clock, in Unix ms, is < T (T >= 1). |
  * | `@size>N` | Applies only to calls whose byte count is above N. |
  * | `@size<N` | Applies only to calls whose byte count is below N. |
  *
@@ -32,8 +32,10 @@
  *
  * Grammar limits and validation:
  * - Numbers are plain decimal, 1 to 18 digits; no sign, no separators.
- * - An unknown or malformed qualifier, `@first=0`, or `@until` <= `@from` (both given)
- *   rejects the line like any other invalid rule, which rejects the whole rule file.
+ * - An unknown or malformed qualifier, `@first=0`, `@every=0`, `@until=0`, or `@until` <=
+ *   `@from` (both given) rejects the line like any other invalid rule, which rejects the
+ *   whole rule file. `@until=0` in particular: 0 is the stored value for "no upper bound",
+ *   so reading it as written would make a rule that can never be active always active.
  * - A repeated qualifier is accepted; the leftmost occurrence wins, because words are
  *   parsed right to left.
  * - A call without a byte count (CHAOS_POLICY_NO_SIZE) never matches a size-gated rule.
@@ -186,7 +188,12 @@ static inline int chaos_policy_parse_word(const char *word, chaos_rule_policy_t 
         policy->from_ms = (int64_t)value;
         return 0;
     }
-    if (strncmp(word, "@until=", 7U) == 0 && chaos_policy_parse_number(word + 7, &value) == 0)
+    /* `@until=0` is rejected, not read as "no upper bound": 0 is how the absence of the
+     * qualifier is stored, so accepting it would turn "never active" -- the window
+     * [`@from`, 0) is empty -- into "always active", which is the opposite of what it
+     * says. Same reason as `@first=0` and `@every=0`. */
+    if (strncmp(word, "@until=", 7U) == 0 && chaos_policy_parse_number(word + 7, &value) == 0 &&
+        value > 0U)
     {
         policy->until_ms = (int64_t)value;
         return 0;

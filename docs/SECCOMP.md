@@ -161,8 +161,11 @@ load nr
   `MSG_NOSIGNAL | MSG_CMSG_CLOEXEC` passes (a flag combination no program uses;
   `MSG_CMSG_CLOEXEC` only means something to `recvmsg`). The descriptor is opened with
   `SOCK_CLOEXEC` and gone after `execve`. If the handover cannot be sent, the child exits
-  (125) rather than run under a filter nobody answers. Taking the listener from the
-  child instead (`pidfd_getfd()`) would need `CAP_SYS_PTRACE`.
+  (125) rather than run under a filter nobody answers. Taking the listener out of the
+  child instead would mean `pidfd_getfd()`, which does need `CAP_SYS_PTRACE` over the
+  target -- unlike `PTRACE_TRACEME`, which a tracee calls on itself and which needs no
+  capability. The distinction matters because the effects §4 rejects are not blocked by
+  privilege.
 - Argument comparisons read the low 32 bits at the argument's offset; the build refuses
   big-endian targets.
 
@@ -296,8 +299,9 @@ that file applies.
 
 | Rule | Why not |
 |---|---|
-| io TORN, CORRUPT; net CORRUPT, TRICKLE, DUP | They change data the kernel moves. Seccomp can fail, delay or skip a call, not change what it transfers. |
-| net RESET | It needs the socket itself (`SO_LINGER` on the application's descriptor). Taking another process's descriptor (`pidfd_getfd`) needs `CAP_SYS_PTRACE`. |
+| io TORN, CORRUPT, FREE, FULL; net CORRUPT, TRICKLE, DUP | They change data the kernel moves or the structure it returned. A notification reply can fail, delay or skip a call, not rewrite what it transfers or answers. |
+| io `write:DROP` | A reply with the byte count is exactly a drop, but a dropped `write` has to move the descriptor's file offset on with it, which the supervisor cannot do from outside. `pwrite:DROP` carries its own offset and is applied (§3.1). |
+| net RESET | It needs a `setsockopt(SO_LINGER)` to run in the application before its close, and a notification reply either runs the notified call or fails it -- there is no reply that means "run this other call first". Injecting one needs `SECCOMP_RET_TRACE` and ptrace, not a descriptor: `PTRACE_TRACEME` is called by the tracee itself and needs no capability, so this is a question of machinery that does not exist yet, not of privilege. |
 | io and net ERRNO on close | The libraries close, then report the error, as Linux does for a failing close. A notified call either runs or fails, not both. |
 | process `posix_spawnp` selector | The `PATH` search is in the C library; the system calls are those of posix_spawn, whose rules apply to it, so the rule could never fire. A `*` rule is accepted. |
 

@@ -537,7 +537,8 @@ offset-ms    = [ "+" / "-" ] 1*DIGIT                 ; |v| <= 3155760000000; REG
 probability  = "0" / "1" / "0." 1*DIGIT / "1." 1*"0"
 qualifier    = "@first=" 1*18DIGIT                   ; > 0
              / "@every=" 1*18DIGIT                   ; > 0
-             / "@from=" 1*18DIGIT / "@until=" 1*18DIGIT   ; Unix ms, until > from
+             / "@from=" 1*18DIGIT / "@until=" 1*18DIGIT   ; Unix ms, until >= 1
+                                                     ; and > from
              / "@size>" 1*18DIGIT / "@size<" 1*18DIGIT
 comment      = "#" *( %x01-09 / %x0B-FF )
 ```

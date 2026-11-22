@@ -83,6 +83,44 @@ Out of scope:
   inside the target's mount namespace.
 - Correctness means correct on all four tuples, not on the build host.
 
+### What Counts as an Effect
+
+Three rules decide whether a proposed fault belongs in this repository at all.
+They are stated here because every argument about a new effect has turned out
+to be an argument about one of them.
+
+**The effect criterion.** A library changes the result of an intercepted call,
+or performs that call partially. A helper system call is allowed when it only
+parameterises the intercepted call and leaves behind no state that would not
+have existed without it.
+
+The test question is: *what remains after the call has returned?*
+
+| Allowed, and why | |
+|---|---|
+| `OFFSET`, `REGRESS`, `FREEZE` | the returned time is rewritten; the kernel clock is untouched |
+| `TORN`, `DROP` | the call is performed partially, or not at all while reporting that it was |
+| `statfs` `FREE`, `FULL` | the returned structure is rewritten; the filesystem is untouched |
+| `RESET`'s `setsockopt(SO_LINGER)` | it parameterises the close that follows it, and only on a socket this process alone holds -- otherwise the option would outlive the call on a descriptor someone else still owns, which is exactly the state this rule forbids |
+| `DROP`'s `lseek` | it repairs the offset the skipped write would have moved, so nothing is left that a real lost write would not leave |
+
+| Not allowed, and why | |
+|---|---|
+| filling the disk for real | the next process to run sees it; nothing restores it |
+| cgroup limits | they outlive the call and the process |
+| `tc`/`netem` | they act on an interface, not on a call, and reach every process in the namespace |
+
+**The invariant.** An effect follows only from a call the rules selected. There
+is no background thread, no timer and no ambient degradation.
+
+**The safety rule.** `/proc`, `/sys` and `/dev` are never falsified
+([IO.md](IO.md), excluded paths). This is the repository's own rule and not a
+consequence of the criterion: a language runtime configures itself from those
+files -- the JVM sizes its heap from `memory.max`, Go its thread count from the
+cpu quota -- and a lie there changes what the program *is*, not what one of its
+calls returned. It is also why there is no pressure-stall or `memory.current`
+effect: those would be expressible under the criterion and are still refused.
+
 ### Non-Goals
 
 - One preload object that owns every symbol.
@@ -328,11 +366,16 @@ unrelated site; failing at load is diagnosable.
 6. **Gate.** Check `@from`/`@until` against `CLOCK_REALTIME`, `@size` against
    the call's byte count, then the probability, then claim an `@first` slot,
    then count the hit.
-7. **Effect.** Pre-call effects (`LATENCY`, `ERRNO`, `TIMEOUT`, `GAI`, ...)
-   run before the real call; post-call effects (`CORRUPT`, `OFFSET`,
-   `FILTER_FAMILY`, ...) transform its result, and `DROP` replaces it. `TORN`,
-   `TRICKLE` and `DUP`
-   reshape the request or the result.
+7. **Effect**, in full rather than by example, because which side of the real
+   call an effect acts on is what decides whether two of them can combine:
+   - before it: `LATENCY`, `ERRNO`, `GAI`, `FAIL_AFTER`, `TIMEOUT`;
+   - instead of it: `OVERRIDE` (a synthetic answer), `DROP` (success reported,
+     nothing done);
+   - after it: `CORRUPT`, `OFFSET`, `REGRESS`, `FREEZE`, `FREE`, `FULL`,
+     `REWRITE`, `SERVICE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT`;
+   - reshaping the request or the result: `TORN`, `TRICKLE`, `DUP`;
+   - parameterising the call itself: `RESET`, whose `setsockopt` precedes the
+     close it belongs to.
 8. **Return** what libc would return, except for the injected fault. errno is
    left untouched on every path that does not inject.
 

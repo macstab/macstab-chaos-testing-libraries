@@ -102,7 +102,7 @@ probability   = ( "0" [ "." 1*DIGIT ] ) / ( "1" [ "." 1*"0" ] )   ; [0, 1], loca
 qualifier     = "@first=" number              ; number > 0
               / "@every=" number              ; number > 0
               / "@from="  number              ; Unix milliseconds
-              / "@until=" number              ; Unix milliseconds; > @from when both are set
+              / "@until=" number              ; Unix ms; >= 1, and > @from when both are set
               / "@size>"  number
               / "@size<"  number
 number        = 1*18DIGIT
@@ -542,7 +542,7 @@ any `# owner` comment:
 | `@first=N` | Fire at most N times per process (N ≥ 1), then go inert: start-up faults that clear by themselves. |
 | `@every=N` | Only every Nth **evaluation** of the rule (N ≥ 1): the 10th, 20th, 30th call that got past the window and size gates. Counts evaluations, not hits, so `@every=10` with `p=0.5` means "of evaluations 10, 20, 30… half fire". `@every=1` is allowed and gates nothing. |
 | `@from=T` | Active only once the wall clock reaches T (Unix milliseconds). |
-| `@until=T` | Active only while the wall clock is before T. With `@from`, the window is `[from, until)`; `@until` must be later than `@from`. One rule file can hold a whole incident timeline. |
+| `@until=T` | Active only while the wall clock is before T (T >= 1; `@until=0` is rejected, since 0 is how "no upper bound" is stored and the line would mean the opposite of what it says). With `@from`, the window is `[from, until)`; `@until` must be later than `@from`. One rule file can hold a whole incident timeline. |
 | `@size>N` / `@size<N` | Only calls whose byte count is above / below N. Both may be combined. For the calls that move data this is the number of bytes moved; for `truncate` it is the file's new length and for `allocate` the length of the range, since neither moves bytes. A call without a byte count never matches a size-gated rule. |
 
 ```text
@@ -566,8 +566,10 @@ Semantics:
   with `@`; the line is cut before the first of them. A blank before a three-field
   `@probability` therefore turns it into a qualifier word and rejects the line.
 - **Validation.** An unknown or malformed qualifier, a number of more than 18 digits,
-  `@first=0`, `@every=0`, `@until` not after `@from`, or qualifiers on a line without a
-  rule reject the file like any invalid line.
+  `@first=0`, `@every=0`, `@until=0`, `@until` not after `@from`, or qualifiers on a line
+  without a rule reject the file like any invalid line. `@until=0` is rejected rather than
+  read as written: 0 is the stored value for "no upper bound", so a window that can never
+  be open would become one that is always open.
 - **Wall clock.** The window is checked against `CLOCK_REALTIME` read from the vDSO
   (or the raw system call), never through the interposed `clock_gettime`, so a
   libchaos-time OFFSET or FREEZE rule does not move another rule's window. Absolute times make

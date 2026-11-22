@@ -629,6 +629,10 @@ static void test_policy_grammar(void)
         "/a:open:EIO:1.0 @every=x",
         "/a:open:EIO:1.0 @from=x",
         "/a:open:EIO:1.0 @until=",
+        /* `@until=0` is how "no upper bound" is stored, so taking it as written would turn
+         * a window that can never be open into one that is always open. */
+        "/a:open:EIO:1.0 @until=0",
+        "/a:open:EIO:1.0 @from=0 @until=0",
         "/a:open:EIO:1.0 @size<1/",
         "/a:open:EIO:1.0 @size>1:",
         "/a:open:EIO:1.0 @size=1",

@@ -4,9 +4,10 @@
  * negative: the failure every timeout, backoff and rate limiter built on "monotonic never
  * decreases" mishandles. The kernel clock never goes backwards; only the values returned to
  * this process do. libchaos-time looks at the rule file at most once per 1 ms after its
- * first load; if the rewrite and the second read fall inside that window, the old rule
- * still applies and the probe takes the non-negative branch (the printed hint about the
- * jump size does not apply to that case; rerunning does). */
+ * first load, and on a host where both reads fall inside that window the old rule still
+ * applies. That looked like a flaky demo and was really a missing wait, so the probe sleeps
+ * past the interval before reading again. The sleep is real: the rule names
+ * clock_gettime/monotonic, so no nanosleep rule matches it. */
 #include <stdio.h>
 #include <time.h>
 
@@ -17,10 +18,12 @@ static double mono_ms(void) {
 }
 
 int main(void) {
+    struct timespec settle = {0, 5000000};                 /* 5 ms > the 1 ms look interval */
     double t0 = mono_ms();
     FILE *f = fopen("/tmp/.chaos-time.conf", "w");         /* the backward step */
     fputs("clock_gettime/monotonic:OFFSET:-5000\n", f);
     fclose(f);
+    nanosleep(&settle, NULL);
     double t1 = mono_ms();
     double dt = t1 - t0;
     printf("t0=%.1f  t1=%.1f  elapsed=%.1f ms\n", t0, t1, dt);
@@ -28,6 +31,6 @@ int main(void) {
         printf("BROKEN: monotonic went BACKWARD — every timeout/backoff/rate-limiter is now wrong\n");
         return 0;
     }
-    printf("elapsed non-negative (increase the jump if the host coalesced the reads)\n");
+    printf("elapsed non-negative: the rule file was not re-read\n");
     return 0;
 }
