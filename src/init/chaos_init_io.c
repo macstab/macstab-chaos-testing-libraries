@@ -25,9 +25,15 @@
  * file: the net decider claims them first.
  *
  * @par Supported effects
- * ERRNO (not on close) and LATENCY. TORN and CORRUPT change data the kernel moves, which a
- * seccomp reply cannot do; ERRNO on close would have to close and fail at once (the
- * wrapper closes, then reports the error), while a notified call either runs or fails. A
+ * ERRNO (not on close), LATENCY, and DROP on `pwrite`. TORN and CORRUPT change data the
+ * kernel moves, which a seccomp reply cannot do; ERRNO on close would have to close and
+ * fail at once (the wrapper closes, then reports the error), while a notified call either
+ * runs or fails. DROP is a reply with the byte count and no call, which is exactly what a
+ * notification can answer -- but only for a positioned write: a dropped `write` has to
+ * move the descriptor's file offset on, and the supervisor cannot reach another process's
+ * descriptor without CAP_SYS_PTRACE. `write:DROP` is therefore rejected here rather than
+ * applied without the correction, which would damage the file in a way no real lost write
+ * does. A
  * rule file containing any of them is rejected at parse time through the
  * CHAOS_IO_RULE_SUPPORTED hook, so its status file reports `unsupported in seccomp mode`
  * and none of its rules apply.
@@ -68,11 +74,12 @@ __thread int g_chaos_io_tls_guard = 0;
 uint64_t g_chaos_io_lineage = 0U;
 uint64_t g_chaos_io_process_seed = UINT64_C(0x2545f4914f6cdd1d);
 
-/* CHAOS_IO_RULE_SUPPORTED: ERRNO on anything but close, and LATENCY. */
+/* CHAOS_IO_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, and DROP on pwrite. */
 static int chaos_init_io_supported(const struct chaos_io_rule *rule)
 {
     return (rule->effect == CHAOS_IO_EFFECT_ERRNO && rule->operation != CHAOS_IO_OP_CLOSE) ||
-           rule->effect == CHAOS_IO_EFFECT_LATENCY;
+           rule->effect == CHAOS_IO_EFFECT_LATENCY ||
+           (rule->effect == CHAOS_IO_EFFECT_DROP && rule->operation == CHAOS_IO_OP_PWRITE);
 }
 
 /** @brief Test seam: how /proc links are read; unit tests make one unreadable. */
@@ -393,8 +400,8 @@ int chaos_init_io_decide(const chaos_init_call_t *call, chaos_init_verdict_t *ve
         matched = chaos_init_io_rename(call, 1, &rule);
         break;
     }
-    /* A loaded rule is ERRNO or LATENCY only (chaos_init_io_supported() rejected the
-     * rest at parse time). */
+    /* A loaded rule is ERRNO, LATENCY or DROP on pwrite only (chaos_init_io_supported()
+     * rejected the rest at parse time). */
     if (!matched)
     {
         return 1;
@@ -412,6 +419,12 @@ int chaos_init_io_decide(const chaos_init_call_t *call, chaos_init_verdict_t *ve
     /* Swap the snapshot's shared slot for the calling process's, so probability,
      * `@first` and windows count per process as under LD_PRELOAD. No slot (the process
      * ended): do not fire. */
+    /* DROP answers with the byte count, so a call whose count could not be read cannot
+     * be dropped. Checked before the draw, so no hit is spent on it. */
+    if (rule.effect == CHAOS_IO_EFFECT_DROP && rule.call_size == CHAOS_POLICY_NO_SIZE)
+    {
+        return 1;
+    }
     state = chaos_io_config_active_state();
     rule.hit = chaos_init_tracee_hit(
         &g_chaos_init_io_rules, call->tid, state->hits, state->rule_count, rule.hit
@@ -425,6 +438,11 @@ int chaos_init_io_decide(const chaos_init_call_t *call, chaos_init_verdict_t *ve
     {
         verdict->action = CHAOS_INIT_FAIL;
         verdict->error = rule.errnum;
+    }
+    else if (rule.effect == CHAOS_IO_EFFECT_DROP)
+    {
+        verdict->action = CHAOS_INIT_RETURN;
+        verdict->value = (long)rule.call_size;
     }
     else
     {

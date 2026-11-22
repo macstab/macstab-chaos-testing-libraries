@@ -322,6 +322,7 @@ names, so each is interposed.
 | an errno name (`ERRNO`) | probability | every operation | Returns the call's failure value with `errno` set, without calling the real function. On `close` the real close runs first and the error is reported after it. Stdio calls fail as stdio does (0 items, `NULL`, `EOF`, -1) and raise the stream's error indicator, so `ferror()` is true. |
 | `LATENCY` | milliseconds | every operation | Sleeps before the real call. Always fires: io `LATENCY` takes no probability. |
 | `TORN` | probability | `write`, `pwrite` (not stdio) | Calls the real function with a shortened count: a short write, the rest of the buffer never written. |
+| `DROP` | probability | `write`, `pwrite` (not stdio, `sendfile`, `copy_file_range`) | Reports the full count as written and writes nothing. On `write` the file offset is moved on by that many bytes, so the caller's next write does not overwrite what it believes it already wrote; `O_APPEND` needs no correction, and a descriptor without an offset (a pipe) keeps the rule from firing. |
 | `CORRUPT` | probability | `read`, `pread`, stdio reads | Calls the real function, then flips a bit in the bytes it returned. |
 
 ### Supported Errnos

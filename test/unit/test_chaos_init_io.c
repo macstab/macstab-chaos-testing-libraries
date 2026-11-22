@@ -125,6 +125,11 @@ static int PASSES(chaos_init_verdict_t verdict)
     return verdict.action == CHAOS_INIT_PASS;
 }
 
+static int RETURNS(chaos_init_verdict_t verdict, long value)
+{
+    return verdict.action == CHAOS_INIT_RETURN && verdict.value == value;
+}
+
 /** @brief Opens (creating) @p path read-write; stays open so /proc/<pid>/fd resolves it. */
 static int open_file(const char *path)
 {
@@ -450,6 +455,31 @@ int main(void)
             strlen("state=error\nrules=0\nline=2\nreason=unsupported in seccomp mode\n")
         ) == 0
     );
+    /* DROP on pwrite is a reply with the byte count and no call, which a notification can
+     * answer: 10 bytes reported written, nothing written. A positioned write does not use
+     * the descriptor's offset, so there is nothing to correct -- which is exactly why
+     * `write:DROP` is rejected here instead, together with the whole file. */
+    write_rules("/tmp/initio/torn:pwrite:DROP:1.0\n");
+    assert(RETURNS(decide(__NR_pwrite64, (uint64_t)torn, P(buffer), 10U, 0, 0), 10L));
+    {
+        struct iovec vector[2];
+
+        vector[0].iov_base = buffer;
+        vector[0].iov_len = 4U;
+        vector[1].iov_base = buffer;
+        vector[1].iov_len = 3U;
+        assert(RETURNS(decide(__NR_pwritev, (uint64_t)torn, P(vector), 2U, 0, 0), 7L));
+        /* A vector that cannot be read has no count to report, so nothing is dropped. */
+        assert(PASSES(decide(__NR_pwritev, (uint64_t)torn, 8U, 2U, 0, 0)));
+    }
+    write_rules("/tmp/initio/torn:write:DROP:1.0\n");
+    assert(PASSES(decide(__NR_write, (uint64_t)torn, P(buffer), 10U, 0, 0)));
+    file = fopen("/tmp/.chaos-io.status", "r");
+    assert(file != NULL);
+    hits[fread(hits, 1U, sizeof(hits) - 1U, file)] = '\0';
+    (void)fclose(file);
+    assert(strstr(hits, "reason=unsupported in seccomp mode\n") != NULL);
+
     write_rules("/tmp/initio/c:close:EIO:1.0\n");
     assert(PASSES(decide(__NR_close, (uint64_t)closing, 0, 0, 0, 0)));
     write_rules("/tmp/initio/c:close:LATENCY:5\n/tmp/initio/data:read:CORRUPT:1.0\n");

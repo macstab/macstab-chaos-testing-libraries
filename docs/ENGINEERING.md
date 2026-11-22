@@ -201,7 +201,8 @@ all. Read class: `fread`, `fgets`, `fgetc`, `getc`, `getline`, `getdelim`,
 negative count), sets errno and raises the stream's error indicator (bit
 `0x20` of the first word of `FILE` on glibc and musl, set under the stream
 lock). `TORN` does not apply: a short `fwrite` signals an error in stdio, not
-partial success. Not wrapped: `scanf` family, `*_unlocked`, and
+partial success, and `DROP` is ignored for the same reason -- stdio buffers, so
+what it would lose is not the bytes of one system call. Not wrapped: `scanf` family, `*_unlocked`, and
 `printf`/`puts`/`putchar`/`getchar`, which only use descriptors 0–2.
 
 ### [`src/config/chaos_io_config.c`](../src/config/chaos_io_config.c)
@@ -430,11 +431,16 @@ is not offered: the caller cannot tell it from a genuine short read.
 
 ### `write()`, `writev()`, `pwrite()`, `pwritev()`, and Linux `sendfile()` / `copy_file_range()`
 
-May delay before, fail before, or shorten the request (`TORN`). The caller's
-buffer is never modified. For `writev`/`pwritev` the torn byte budget is
-mapped back into a truncated copy of the iovec array (vectors longer than
-`CHAOS_IO_TORN_MAX_IOV` are not torn). `sendfile` and `copy_file_range` match
-on the destination descriptor and support `ERRNO`, `LATENCY`, `TORN`.
+May delay before, fail before, shorten the request (`TORN`) or replace it
+entirely (`DROP`: the full count is reported and nothing is written). The
+caller's buffer is never modified. For `writev`/`pwritev` the torn byte budget
+is mapped back into a truncated copy of the iovec array (vectors longer than
+`CHAOS_IO_TORN_MAX_IOV` are not torn). A dropped `write`/`writev` moves the file
+offset on by the reported count, which is what keeps the next write off the
+bytes the caller believes it already wrote; `O_APPEND` needs no correction and a
+descriptor without an offset does not fire. `sendfile` and `copy_file_range`
+match on the destination descriptor and support `ERRNO`, `LATENCY`, `TORN` --
+not `DROP`, which would have to fake the offsets of two descriptors at once.
 
 Data moved through `splice`, `mmap` or other paths outside the wrapped set is
 not faulted.

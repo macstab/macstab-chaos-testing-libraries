@@ -600,6 +600,9 @@ static int chaos_io_parse_latency(const char *text, unsigned int *latency_ms, do
  *   so a "torn read" would add nothing a caller does not already handle.
  * - CORRUPT: `read`, `pread` only. Flipping a bit in the caller's buffer after a write
  *   changes nothing the caller can observe in the file.
+ * - DROP: `write`, `pwrite` only. It reports a write as fully done without doing it, which
+ *   is a lost write; the read side has no counterpart -- a read that reports bytes it did
+ *   not read would hand the caller its own stale buffer, which is CORRUPT's territory.
  */
 static int chaos_io_effect_allowed(chaos_io_operation_t operation, chaos_io_effect_t effect)
 {
@@ -614,6 +617,10 @@ static int chaos_io_effect_allowed(chaos_io_operation_t operation, chaos_io_effe
     if (effect == CHAOS_IO_EFFECT_CORRUPT)
     {
         return operation == CHAOS_IO_OP_READ || operation == CHAOS_IO_OP_PREAD;
+    }
+    if (effect == CHAOS_IO_EFFECT_DROP)
+    {
+        return operation == CHAOS_IO_OP_WRITE || operation == CHAOS_IO_OP_PWRITE;
     }
     return 0;
 }
@@ -1595,6 +1602,15 @@ int chaos_io_config_parse_line(char *line, chaos_io_rule_t *rule)
     else if (strcmp(fields[2], "CORRUPT") == 0)
     {
         rule->effect = CHAOS_IO_EFFECT_CORRUPT;
+        if (chaos_io_parse_probability(fields[3], &probability) != 0)
+        {
+            return -1;
+        }
+        rule->probability = probability;
+    }
+    else if (strcmp(fields[2], "DROP") == 0)
+    {
+        rule->effect = CHAOS_IO_EFFECT_DROP;
         if (chaos_io_parse_probability(fields[3], &probability) != 0)
         {
             return -1;

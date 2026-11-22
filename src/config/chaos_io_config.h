@@ -103,7 +103,8 @@ typedef enum chaos_io_effect
     CHAOS_IO_EFFECT_ERRNO,        /**< Fail before the real call with `errnum`. */
     CHAOS_IO_EFFECT_LATENCY,      /**< Delay the real call by `latency_ms`. */
     CHAOS_IO_EFFECT_TORN,         /**< Real write with a byte count in [1, n-1]. */
-    CHAOS_IO_EFFECT_CORRUPT       /**< Flip one bit of the bytes a read returned. */
+    CHAOS_IO_EFFECT_CORRUPT,      /**< Flip one bit of the bytes a read returned. */
+    CHAOS_IO_EFFECT_DROP          /**< Report the whole write as done without writing it. */
 } chaos_io_effect_t;
 
 /**

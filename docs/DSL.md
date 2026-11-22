@@ -71,7 +71,7 @@ How the libc layer instantiates the triple:
 | Part | libc layer |
 |---|---|
 | S | a path prefix (io), an endpoint (net), a host name or address (dns), a function or function/argument class (time, process, memory), always with `*` as catch-all |
-| E | ERRNO (an errno name, or a positive number in every library), GAI (`EAI_*`, dns), LATENCY, TIMEOUT, CORRUPT, TORN, TRICKLE, DUP, RESET, OFFSET, REGRESS, FREEZE, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER |
+| E | ERRNO (an errno name, or a positive number in every library), GAI (`EAI_*`, dns), LATENCY, TIMEOUT, CORRUPT, TORN, DROP, TRICKLE, DUP, RESET, OFFSET, REGRESS, FREEZE, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER |
 | P | probability ∧ `@from`/`@until` window ∧ `@size` gate ∧ `@every` evaluation gate ∧ `@first` budget; for FAIL_AFTER additionally a per-operation call counter |
 | selection | io, net: **one rule per call**, the most specific for the call's operation. dns, time, process, memory: **one rule per effect**, the most specific for each effect, so several effects compose on one call (§8) |
 
@@ -154,6 +154,7 @@ io-op         = "read" / "write" / "open" / "close" / "fsync" / "fdatasync"
 io-effect     = io-errno ":" probability
               / "LATENCY" ":" ms [ "@" probability ]
               / "TORN" ":" probability                      ; write, pwrite only
+              / "DROP" ":" probability                      ; write, pwrite only
               / "CORRUPT" ":" probability                   ; read, pread only
 io-errno      = "EIO" / "ENOSPC" / "EDQUOT" / "EROFS" / "EACCES"
               / "EMFILE" / "ENFILE" / "ENOENT"
@@ -311,8 +312,8 @@ Same caveat as §2.3: a sketch of the surface, not its source of truth.
 |---|---|---|---|
 | **Selector** | Path prefix, endpoint, host name/address, or function selector parsed from a text rule | `ChaosSelector` typed builder — `network()`, `jdbc()`, `dns()`, etc. | `@Chaos(target=…)` annotation parameter; YAML `selector:` block |
 | **Selector match site** | Inside the wrapper, against the call's arguments (descriptors resolved to paths or endpoints) | Inside the ByteBuddy-injected advice at the JDK call site | At the orchestration boundary (Toxiproxy / Testcontainers `withCommand` hook) |
-| **Effect** | ERRNO, GAI, LATENCY, TIMEOUT, CORRUPT, TORN, TRICKLE, DUP, RESET, OFFSET, REGRESS, FREEZE, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER | `ChaosEffect.delay/throw/fail/stress/deadlock/spike/drop` | Toxiproxy toxics / `tc netem` rules / cgroup throttling |
-| **Effect application phase** | Pre-call (ERRNO, GAI, LATENCY, FAIL_AFTER; TORN shortens the count), instead of the call (OVERRIDE), post-call (CORRUPT, OFFSET, REGRESS, FREEZE, result-set transforms) | Same conceptual phases at the bytecode advice level | At the network/cgroup boundary, always pre-effect from the application's perspective |
+| **Effect** | ERRNO, GAI, LATENCY, TIMEOUT, CORRUPT, TORN, DROP, TRICKLE, DUP, RESET, OFFSET, REGRESS, FREEZE, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER | `ChaosEffect.delay/throw/fail/stress/deadlock/spike/drop` | Toxiproxy toxics / `tc netem` rules / cgroup throttling |
+| **Effect application phase** | Pre-call (ERRNO, GAI, LATENCY, FAIL_AFTER; TORN shortens the count), instead of the call (OVERRIDE, DROP), post-call (CORRUPT, OFFSET, REGRESS, FREEZE, result-set transforms) | Same conceptual phases at the bytecode advice level | At the network/cgroup boundary, always pre-effect from the application's perspective |
 | **Activation policy** | Probability, `@first`, `@every`, `@from`/`@until`, `@size`; FAIL_AFTER's call counter | `ActivationPolicy.always/count/timeWindow/session` | Annotation parameters + scenario lifecycle hooks |
 | **Activation evaluation** | Per call: window, size gate, `@every`, the rule's probability sample, `@first` claim | Per-call dispatcher check + session-scoped state | Lifecycle-driven (apply on `@BeforeEach`, remove on `@AfterEach`) |
 | **Configuration source** | Text file `/tmp/.chaos-<lib>.conf` | Java code (builder) + JSON startup config | YAML / annotations + dynamic Testcontainers calls |
@@ -409,6 +410,7 @@ apply (§8).
 | `clock_gettime/realtime:FREEZE:1` | after the call: every read returns the reading of the first call that fired | N/A | N/A |
 | `/data:read:CORRUPT:0.1` (io), `…:recv:CORRUPT:0.1` (net) | after a successful read: one bit of the returned bytes flips | `byteCorruption(probability=0.1)` | Toxiproxy `bandwidth` + custom byte mangler (rare) |
 | `/data:write:TORN:0.1` | before the call: the byte count is shortened to `[1, n-1]` | `partialWrite(probability=0.1)` | N/A |
+| `/data:write:DROP:0.1` (io) | instead of the call: the full count is reported and nothing is written | N/A | N/A |
 
 ### 5.4. Class D — result-set transform (DNS)
 
@@ -620,6 +622,7 @@ select one rule
   LATENCY  → sleep, real call
   ERRNO    → fail (no real call; io close: real close, then fail)
   TORN     → real call with shortened count            (io write, pwrite)
+  DROP     → no real call, full count reported         (io write, pwrite)
   CORRUPT  → real call, then flip one returned bit     (io read, pread; net recv)
   other net effects: see NETWORK.md
 ```
@@ -858,8 +861,8 @@ fires(ERRNO ∨ GAI ∨ FAIL_AFTER, e)  ⇒  ¬real_call(e) ∧ ¬post_call_effe
 A pre-call failure suppresses the real call and every later effect (sole exception:
 io `close`, which runs the real close before reporting). LATENCY is orthogonal: in
 dns, time, process and memory it may delay a call that then fails. In io and net
-LATENCY, ERRNO, TORN and CORRUPT are mutually exclusive per call because only one
-rule is selected.
+LATENCY, ERRNO, TORN, DROP and CORRUPT are mutually exclusive per call because only
+one rule is selected.
 
 ---
 
@@ -970,6 +973,7 @@ if (!match(fd, operation, &rule))  return real(args);
 if (rule.effect == LATENCY)        apply_latency(&rule);
 else if (apply_errno(&rule))       return -1;
 else if (rule.effect == TORN && should_trigger(&rule))  count = torn(count);
+else if (rule.effect == DROP && drop_write(&rule, fd, count))  return count;
 rc = real(args);
 if (rc > 0 && rule.effect == CORRUPT && should_trigger(&rule))  corrupt(buf, rc);
 return rc;

@@ -144,7 +144,8 @@ Consequences:
   program uses.
 - Pipes, eventfds, timerfds and memfds (`pipe:[N]`, `anon_inode:[...]`,
   `/memfd:<name>`) belong to neither domain unless an io rule names them
-  explicitly: a TORN or CORRUPT intended for files would break their protocols.
+  explicitly: a TORN, DROP or CORRUPT intended for files would break their
+  protocols.
 - Descriptors 0, 1 and 2 are never decided by `libchaos-io`.
 
 ## 2. Architectural Context
@@ -329,7 +330,8 @@ unrelated site; failing at load is diagnosable.
    then count the hit.
 7. **Effect.** Pre-call effects (`LATENCY`, `ERRNO`, `TIMEOUT`, `GAI`, ...)
    run before the real call; post-call effects (`CORRUPT`, `OFFSET`,
-   `FILTER_FAMILY`, ...) transform its result. `TORN`, `TRICKLE` and `DUP`
+   `FILTER_FAMILY`, ...) transform its result, and `DROP` replaces it. `TORN`,
+   `TRICKLE` and `DUP`
    reshape the request or the result.
 8. **Return** what libc would return, except for the injected fault. errno is
    left untouched on every path that does not inject.
@@ -356,7 +358,7 @@ grammar can express the other's domain.
 ### Distinct Failure Boundaries
 
 `libchaos-io` reasons about path prefixes, descriptor-to-path resolution,
-partial writes (`TORN`), read corruption and durability (`fsync`,
+partial writes (`TORN`), lost writes (`DROP`), read corruption and durability (`fsync`,
 `fdatasync`). `libchaos-net` reasons about endpoints, receive corruption,
 short and duplicated receives, abortive close (`RESET`) and readiness
 timeouts. Flattening both into one grammar would make each less precise.
@@ -607,10 +609,11 @@ Responsibilities:
 - path-prefix selectors; boundary-aware prefix match (`/data` covers
   `/data/x`, not `/database`); `*` covers absolute paths except `/memfd:`
 - descriptor-to-path resolution through a process-wide fd cache
-- effects `ERRNO`, `LATENCY`, `TORN` (write side), `CORRUPT` (read side)
+- effects `ERRNO`, `LATENCY`, `TORN` and `DROP` (write side), `CORRUPT` (read
+  side)
 - stdio streams: `ERRNO` raises the stream's error indicator (bit `0x20` of
   the first word of `FILE` on glibc and musl), so `ferror()` is true as after
-  a real failure; `TORN` does not apply
+  a real failure; `TORN` and `DROP` do not apply
 
 Operations: `read`, `write`, `open`, `close`, `fsync`, `fdatasync`, `pread`,
 `pwrite`, `truncate`, `allocate`, `unlink`, `rename_from`, `rename_to`. Every
@@ -732,7 +735,9 @@ proceed), or continue unchanged, by the rules of the libraries named in
 `--libs`. It requires Linux 5.5 (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`) and uses
 `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` from Linux 5.19. Data effects
 (`CORRUPT`, `TORN`, ...) cannot be applied from outside and are rejected
-with reason `unsupported in seccomp mode`. Details: [SECCOMP.md](SECCOMP.md).
+with reason `unsupported in seccomp mode`; `DROP` is the exception, since
+answering with a byte count needs no access to the data, and it applies on
+`pwrite`, which carries its own offset. Details: [SECCOMP.md](SECCOMP.md).
 
 ### Shared Internal Scaffold
 
@@ -1111,7 +1116,7 @@ their own architecture (`matrix.yml`).
 
 | Library | Rule file | Effects |
 | --- | --- | --- |
-| `libchaos-io` | `/tmp/.chaos-io.conf` | `ERRNO`, `LATENCY`, `TORN` (write side), `CORRUPT` (read side) |
+| `libchaos-io` | `/tmp/.chaos-io.conf` | `ERRNO`, `LATENCY`, `TORN` and `DROP` (write side), `CORRUPT` (read side) |
 | `libchaos-net` | `/tmp/.chaos-net.conf` | `ERRNO`, `LATENCY`, `CORRUPT` (recv), `TIMEOUT` (poll), `RESET` (close), `TRICKLE` (recv, stream), `DUP` (recv) |
 | `libchaos-dns` | `/tmp/.chaos-dns.conf` | `GAI`, `LATENCY`, `REWRITE`, `SERVICE`, `OVERRIDE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT` |
 | `libchaos-time` | `/tmp/.chaos-time.conf` | `ERRNO`, `LATENCY`, `OFFSET`, `REGRESS` and `FREEZE` (clock_gettime selectors; `REGRESS` needs `clock_gettime/<clock>`) |

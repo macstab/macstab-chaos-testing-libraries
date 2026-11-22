@@ -3118,6 +3118,151 @@ static long chaos_test_file_size(const char *path)
     return stat(path, &info) == 0 ? (long)info.st_size : -1L;
 }
 
+/** @brief A temporary file descriptor holding ten bytes, positioned at the start. */
+static int chaos_test_drop_fd(int flags)
+{
+    char path[] = "/tmp/chaos-drop-XXXXXX";
+    const int fd = mkstemp(path);
+    int reopened;
+
+    assert(fd >= 0);
+    assert(chaos_test_raw_syscall(SYS_write, (long)fd, (long)"0123456789", 10L) == 10);
+    reopened = (int)chaos_test_raw_syscall(SYS_openat, (long)AT_FDCWD, (long)path, (long)flags, 0L);
+    assert(reopened >= 0);
+    chaos_test_raw_close(fd);
+    assert(chaos_test_raw_syscall(SYS_unlinkat, (long)AT_FDCWD, (long)path, 0L) == 0);
+    return reopened;
+}
+
+/** @brief The descriptor's file offset, read with the system call. */
+static long chaos_test_offset(int fd)
+{
+    return chaos_test_raw_syscall(SYS_lseek, (long)fd, 0L, (long)SEEK_CUR);
+}
+
+/** @brief Arms a DROP rule on @p operation whose draw hits. */
+static void chaos_test_drop_rule(chaos_io_operation_t operation)
+{
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/drop.bin");
+    g_config_match_loaded_result = 1;
+    g_config_rule.operation = operation;
+    g_config_rule.effect = CHAOS_IO_EFFECT_DROP;
+    g_rule_should_trigger_result = 1;
+}
+
+/**
+ * @brief DROP reports a write as done without doing it, and leaves the offset consistent.
+ *
+ * @details The correction is the whole difficulty of the effect: a lost write that does
+ * not move the file offset makes the caller's next write land on top of the bytes it
+ * believes it already wrote, which damages the file in a way no real loss does. Covered:
+ * - a dropped `write` returns the full count, makes no real call, and advances the offset
+ *   by that many bytes, so two dropped writes leave the second at offset 10, not 5;
+ * - a draw that misses writes for real and moves nothing itself;
+ * - an `O_APPEND` descriptor is dropped without touching the offset: appends never
+ *   overwrite each other, and the offset is not what the kernel uses;
+ * - a descriptor with no offset (a pipe) keeps the rule from firing: the real write runs
+ *   and the draw is not even taken;
+ * - a descriptor whose flags cannot be read at all does not fire. No open descriptor
+ *   refuses F_GETFL, and one below 3 never matches a rule, so the guard is proved by
+ *   calling chaos_io_drop_write() itself rather than through a wrapper;
+ * - `writev` drops the vector's total, and a vector whose size is unknown is written;
+ * - `pwrite` and `pwritev` drop without any correction, since a positioned write does not
+ *   use the descriptor's offset -- asserted by the offset staying where it was.
+ */
+static void test_drop_write_wrappers(void)
+{
+    struct iovec vector[2];
+    struct iovec huge[1];
+    int fd;
+    int pipe_fds[2];
+
+    /* A segment longer than SSIZE_MAX has no usable byte count (the kernel rejects the
+     * call with EINVAL), which is how an unknown size is produced here. */
+    huge[0].iov_base = (void *)"x";
+    huge[0].iov_len = (size_t)SSIZE_MAX + 1U;
+
+    /* A dropped write: nothing written, full count reported, offset advanced. */
+    chaos_test_drop_rule(CHAOS_IO_OP_WRITE);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    assert(write(fd, "abcde", 5U) == 5);
+    assert(g_real_write_calls == 0);
+    assert(g_rule_should_trigger_calls == 1);
+    assert(chaos_test_offset(fd) == 5L);
+    assert(write(fd, "fghij", 5U) == 5);
+    assert(chaos_test_offset(fd) == 10L);
+    chaos_test_raw_close(fd);
+
+    /* A draw that misses: the real write runs and the wrapper moves nothing. */
+    chaos_test_drop_rule(CHAOS_IO_OP_WRITE);
+    g_rule_should_trigger_result = 0;
+    g_real_write_return = 5;
+    fd = chaos_test_drop_fd(O_WRONLY);
+    assert(write(fd, "abcde", 5U) == 5);
+    assert(g_real_write_calls == 1);
+    assert(chaos_test_offset(fd) == 0L);
+    chaos_test_raw_close(fd);
+
+    /* O_APPEND: dropped, and the offset is left alone. */
+    chaos_test_drop_rule(CHAOS_IO_OP_WRITE);
+    fd = chaos_test_drop_fd(O_WRONLY | O_APPEND);
+    assert(write(fd, "abcde", 5U) == 5);
+    assert(g_real_write_calls == 0);
+    assert(chaos_test_offset(fd) == 0L);
+    chaos_test_raw_close(fd);
+
+    /* A pipe has no offset to keep straight: the rule does not fire at all. */
+    chaos_test_drop_rule(CHAOS_IO_OP_WRITE);
+    g_real_write_return = 5;
+    assert(pipe(pipe_fds) == 0);
+    assert(write(pipe_fds[1], "abcde", 5U) == 5);
+    assert(g_real_write_calls == 1);
+    assert(g_rule_should_trigger_calls == 0);
+    chaos_test_raw_close(pipe_fds[0]);
+    chaos_test_raw_close(pipe_fds[1]);
+
+    /* A descriptor whose flags cannot be read: no drop, and no draw spent on it. */
+    chaos_test_drop_rule(CHAOS_IO_OP_WRITE);
+    assert(chaos_io_drop_write(&g_config_rule, -1, 5U) == 0);
+    assert(g_rule_should_trigger_calls == 0);
+
+    /* writev drops the total of the vector. */
+    vector[0].iov_base = (void *)"abc";
+    vector[0].iov_len = 3U;
+    vector[1].iov_base = (void *)"de";
+    vector[1].iov_len = 2U;
+    chaos_test_drop_rule(CHAOS_IO_OP_WRITE);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    assert(writev(fd, vector, 2) == 5);
+    assert(g_real_writev_calls == 0);
+    assert(chaos_test_offset(fd) == 5L);
+    /* A vector the kernel would reject has no byte count, so there is nothing to report
+     * as written: the call goes through untouched. */
+    g_real_writev_return = 4;
+    assert(writev(fd, huge, 1) == 4);
+    assert(g_real_writev_calls == 1);
+    chaos_test_raw_close(fd);
+
+    /* pwrite and pwritev need no correction: the offset stays where it was. */
+    chaos_test_drop_rule(CHAOS_IO_OP_PWRITE);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    assert(pwrite(fd, "abcde", 5U, 3) == 5);
+    assert(g_real_pwrite_calls == 0);
+    assert(chaos_test_offset(fd) == 0L);
+    assert(pwritev(fd, vector, 2, 3) == 5);
+    assert(g_real_pwritev_calls == 0);
+    assert(chaos_test_offset(fd) == 0L);
+    g_real_pwritev_return = 4;
+    assert(pwritev(fd, huge, 1, 3) == 4);
+    assert(g_real_pwritev_calls == 1);
+    chaos_test_raw_close(fd);
+    chaos_test_reset_state();
+}
+
 /**
  * @brief A wrapper whose real function is still unresolved (a call arriving during symbol
  *        resolution) makes the system call itself instead of calling through NULL.
@@ -3368,6 +3513,7 @@ int main(void)
     test_fsops_helpers_and_wrappers();
     test_path_form_wrappers();
     test_read_and_write_wrappers();
+    test_drop_write_wrappers();
     test_vectored_helpers();
     test_readv_and_writev_wrappers();
     test_vectored_input_checks();

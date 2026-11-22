@@ -10,8 +10,8 @@
  * |---------|-----------|-----------------|
  * | read, readv | `read` | ERRNO, LATENCY before; CORRUPT after a read of > 0 bytes |
  * | pread, preadv | `pread` | ERRNO, LATENCY before; CORRUPT after a read of > 0 bytes |
- * | write, writev | `write` | ERRNO, LATENCY before; TORN shortens the request |
- * | pwrite, pwritev | `pwrite` | ERRNO, LATENCY before; TORN shortens the request |
+ * | write, writev | `write` | ERRNO, LATENCY before; TORN shortens the request, DROP skips it |
+ * | pwrite, pwritev | `pwrite` | ERRNO, LATENCY before; TORN shortens the request, DROP skips it |
  * | sendfile, copy_file_range | `write` on the output descriptor | ERRNO, LATENCY, TORN |
  *
  * @par TORN
@@ -19,6 +19,15 @@
  * write, exactly what a kernel may return and what a correct write loop must handle.
  * Vectored writes get a trimmed copy of the iovec array covering that many bytes; vectors
  * longer than CHAOS_IO_TORN_MAX_IOV (64) entries are written whole and count no hit.
+ *
+ * @par DROP
+ * The real call does not run and the full count is reported as written. The file offset is
+ * moved on by that many bytes, so the caller's next write does not land on top of what it
+ * believes it already wrote; an `O_APPEND` descriptor needs no correction, and one without
+ * an offset keeps the rule from firing (chaos_io_drop_write()). `sendfile` and
+ * `copy_file_range` carry a `write` rule but never a DROP: they move bytes between two
+ * descriptors, and faking both sides of that is not a lost write any program can suffer.
+ * The stdio writers ignore DROP as they ignore TORN.
  *
  * @par CORRUPT
  * One bit of the bytes actually returned is flipped after the real call. For readv/preadv
@@ -40,6 +49,7 @@
 #include "chaos_io_internal.h"
 #include "chaos_io_wrappers.h"
 
+#include <fcntl.h>
 #include <limits.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
@@ -557,8 +567,61 @@ CHAOS_IO_EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
 }
 
 /**
+ * @brief Decides a DROP on a write and leaves the descriptor consistent.
+ *
+ * @details DROP reports the whole write as done without doing it, which is the lost write
+ * a buffered writer, a fsync-less commit or a cache flush can suffer. Reporting it needs
+ * one correction: a write advances the file offset, so a dropped one has to advance it too
+ * or the caller's next write lands on top of the bytes it thinks it already wrote, and the
+ * file ends up differently damaged than any real loss would make it.
+ *
+ * - `O_APPEND`: nothing to correct. The kernel ignores the offset and writes at the end,
+ *   so consecutive writes never overwrite each other.
+ * - Otherwise the offset is moved on by @p count. A descriptor with no offset (a pipe, a
+ *   FIFO, a socket) answers ESPIPE and keeps the rule from firing: nothing there is
+ *   inconsistent, but the data would simply be gone, and the operation class `write` is
+ *   not where that case belongs -- net's DROP covers datagrams, which is the version of it
+ *   that models a network.
+ *
+ * The decision comes last, after the correction is known to be possible, so a `@first`
+ * allowance and a hit are spent only on a call that is really dropped -- the same order
+ * the TORN path uses.
+ *
+ * @param rule   Matched DROP rule.
+ * @param fd     Descriptor being written.
+ * @param count  Bytes the caller asked to write.
+ * @return Non-zero when the real write must be skipped and @p count reported as written.
+ */
+static int chaos_io_drop_write(chaos_io_rule_t *rule, int fd, size_t count)
+{
+    const long flags = CHAOS_IO_SYSCALL(SYS_fcntl, fd, F_GETFL, 0);
+    int correct;
+
+    if (flags < 0)
+    {
+        return 0;
+    }
+    correct = (flags & O_APPEND) == 0 && count > 0U;
+    /* Asking where the offset is has no effect of its own, so it is safe before the
+     * probability draw; it is also the only way to learn whether there is one. */
+    if (correct && CHAOS_IO_SYSCALL(SYS_lseek, fd, (long)0, SEEK_CUR) < 0)
+    {
+        return 0;
+    }
+    if (!chaos_io_rule_should_trigger(rule))
+    {
+        return 0;
+    }
+    if (correct)
+    {
+        (void)CHAOS_IO_SYSCALL(SYS_lseek, fd, (long)count, SEEK_CUR);
+    }
+    return 1;
+}
+
+/**
  * @brief Interposed write(2): `write` rules; ERRNO or LATENCY before the call, TORN
- *        shortens it.
+ *        shortens it, DROP skips it.
  *
  * @details TORN passes a count in [1, count-1] to the real write, which succeeds short; a
  * correct caller loops and writes the rest, an incorrect one loses data, which is what
@@ -589,6 +652,10 @@ CHAOS_IO_EXPORT ssize_t write(int fd, const void *buffer, size_t count)
     else if (rule.effect == CHAOS_IO_EFFECT_TORN && chaos_io_rule_should_trigger(&rule))
     {
         count = chaos_io_torn_count(&rule, count);
+    }
+    else if (rule.effect == CHAOS_IO_EFFECT_DROP && chaos_io_drop_write(&rule, fd, count))
+    {
+        return (ssize_t)count;
     }
 
     rc = chaos_io_call_real_write(fd, buffer, count);
@@ -637,6 +704,11 @@ CHAOS_IO_EXPORT ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
         {
             return chaos_io_call_real_writev(fd, torn_iov, torn_iovcnt);
         }
+    }
+    else if (rule.effect == CHAOS_IO_EFFECT_DROP && rule.call_size != CHAOS_POLICY_NO_SIZE &&
+             chaos_io_drop_write(&rule, fd, (size_t)rule.call_size))
+    {
+        return (ssize_t)rule.call_size;
     }
 
     return chaos_io_call_real_writev(fd, iov, iovcnt);
@@ -838,7 +910,11 @@ CHAOS_IO_EXPORT ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_
 }
 
 /**
- * @brief Interposed pwrite(2): write() semantics with `pwrite` rules, TORN included.
+ * @brief Interposed pwrite(2): write() semantics with `pwrite` rules, TORN and DROP
+ *        included.
+ *
+ * @details DROP needs no offset correction here: a positioned write leaves the
+ * descriptor's own offset alone, so dropping it leaves nothing behind to keep straight.
  *
  * @return Bytes written; -1 with errno on a real or injected failure.
  */
@@ -866,6 +942,10 @@ CHAOS_IO_EXPORT ssize_t pwrite(int fd, const void *buffer, size_t count, off_t o
     {
         count = chaos_io_torn_count(&rule, count);
     }
+    else if (rule.effect == CHAOS_IO_EFFECT_DROP && chaos_io_rule_should_trigger(&rule))
+    {
+        return (ssize_t)count;
+    }
 
     rc = chaos_io_call_real_pwrite(fd, buffer, count, offset);
     return rc;
@@ -873,7 +953,7 @@ CHAOS_IO_EXPORT ssize_t pwrite(int fd, const void *buffer, size_t count, off_t o
 
 /**
  * @brief Interposed pwritev(2): writev() semantics with `pwrite` rules, including the
- *        64-entry TORN limit.
+ *        64-entry TORN limit and DROP.
  *
  * @return Bytes written; -1 with errno on a real or injected failure.
  */
@@ -906,6 +986,11 @@ CHAOS_IO_EXPORT ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off
         {
             return chaos_io_call_real_pwritev(fd, torn_iov, torn_iovcnt, offset);
         }
+    }
+    else if (rule.effect == CHAOS_IO_EFFECT_DROP && rule.call_size != CHAOS_POLICY_NO_SIZE &&
+             chaos_io_rule_should_trigger(&rule))
+    {
+        return (ssize_t)rule.call_size;
     }
 
     return chaos_io_call_real_pwritev(fd, iov, iovcnt, offset);

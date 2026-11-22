@@ -266,6 +266,10 @@ static void test_helper_primitives(void)
     assert(chaos_io_effect_allowed(CHAOS_IO_OP_PREAD, CHAOS_IO_EFFECT_CORRUPT));
     assert(!chaos_io_effect_allowed(CHAOS_IO_OP_OPEN, CHAOS_IO_EFFECT_CORRUPT));
     assert(!chaos_io_effect_allowed(CHAOS_IO_OP_UNLINK, CHAOS_IO_EFFECT_CORRUPT));
+    assert(chaos_io_effect_allowed(CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_DROP));
+    assert(chaos_io_effect_allowed(CHAOS_IO_OP_PWRITE, CHAOS_IO_EFFECT_DROP));
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_DROP));
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_FSYNC, CHAOS_IO_EFFECT_DROP));
     assert(!chaos_io_effect_allowed(CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_INVALID));
 
     assert(chaos_io_config_normalize_mtime_hash(CHAOS_IO_MTIME_MISSING) != CHAOS_IO_MTIME_MISSING);
@@ -320,7 +324,9 @@ static void test_parse_line_valid_cases(void)
         {"/data:truncate:LATENCY:25", CHAOS_IO_OP_TRUNCATE, CHAOS_IO_EFFECT_LATENCY, 0, 1.0, 25U},
         {"/data:read:LATENCY:25@0.5", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_LATENCY, 0, 0.5, 25U},
         {"/data:write:TORN:0.9", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_TORN, 0, 0.9, 0U},
-        {"/data:read:CORRUPT:1.0", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_CORRUPT, 0, 1.0, 0U}
+        {"/data:read:CORRUPT:1.0", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_CORRUPT, 0, 1.0, 0U},
+        {"/data:write:DROP:0.4", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_DROP, 0, 0.4, 0U},
+        {"/data:pwrite:DROP:1.0", CHAOS_IO_OP_PWRITE, CHAOS_IO_EFFECT_DROP, 0, 1.0, 0U}
     };
     size_t index;
 
@@ -379,6 +385,9 @@ static void test_parse_line_invalid_cases(void)
     char invalid_latency[] = "/data:write:LATENCY:not-a-number";
     char invalid_corrupt_probability[] = "/data:read:CORRUPT:2.0";
     char invalid_torn_probability[] = "/data:pwrite:TORN:-0.1";
+    char invalid_drop_operation[] = "/data:read:DROP:0.2";
+    char invalid_drop_fsync[] = "/data:fsync:DROP:1.0";
+    char invalid_drop_probability[] = "/data:write:DROP:1.5";
     char empty_operation[] = "/data::EIO:0.1";
     char empty_effect[] = "/data:read::0.1";
     char empty_value[] = "/data:read:EIO:";
@@ -398,6 +407,9 @@ static void test_parse_line_invalid_cases(void)
     assert(chaos_io_config_parse_line(invalid_operation, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_errno_probability, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_effect, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_drop_operation, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_drop_fsync, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_drop_probability, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_combination, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_truncate_combination, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_latency, &rule) == -1);

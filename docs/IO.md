@@ -55,6 +55,7 @@ through `LD_PRELOAD`, matches each call against the rule file
 | ERRNO | before the real call | `-1` (or the function's error value) with one of 8 errno values; the real call does not run (except `close`, §4) |
 | LATENCY | before the real call | the call completes normally, N ms later |
 | TORN | before the real call | a successful short write: the real call runs with a byte count in `[1, n-1]` |
+| DROP | instead of the real call | a successful full write that never happened: the byte count is reported, nothing is written |
 | CORRUPT | after a successful read | the bytes returned, with exactly one bit flipped |
 
 The library is a fault injector for storage paths, not a filesystem simulator: it
@@ -126,7 +127,9 @@ the forms most programs use: the JDK deletes with `unlink()` and moves with
   (`items * size` for `fread`, `strlen(line)` for `fgets`, the returned length for
   `getdelim`, one byte for `fgetc`/`getc`).
 - TORN never applies: a short `fwrite` signals an error in stdio, not a partial
-  success. A TORN rule matched on a stream does nothing and counts no hit.
+  success. A TORN rule matched on a stream does nothing and counts no hit. DROP is
+  ignored the same way: stdio buffers, so what a dropped `fwrite` would lose is not
+  the bytes of one system call.
 - A rule fires once per stdio call, not once per system call the C library makes
   while filling or flushing its buffer.
 - Descriptors 0-2 are never faulted, so `printf`, `puts`, `putchar` and `getchar`,
@@ -252,8 +255,8 @@ algorithm, constructor ordering.
 | rule | One parsed line of `/tmp/.chaos-io.conf`. |
 | selector | The path part of a rule: an absolute path prefix, a literal name such as `pipe:[1234]`, or `*`. |
 | operation | The logical operation (`write`, `truncate`, ...); several functions map to one (§1). |
-| effect | ERRNO, LATENCY, TORN or CORRUPT. |
-| probability | Chance in [0, 1] that a matched rule fires. For ERRNO, TORN and CORRUPT it is the value field; for LATENCY the optional `@probability` after the milliseconds, 1.0 without one. |
+| effect | ERRNO, LATENCY, TORN, DROP or CORRUPT. |
+| probability | Chance in [0, 1] that a matched rule fires. For ERRNO, TORN, DROP and CORRUPT it is the value field; for LATENCY the optional `@probability` after the milliseconds, 1.0 without one. |
 | qualifier | `@first`, `@every`, `@from`, `@until`, `@size` written after the rule ([DSL.md §7.1](DSL.md#71-todays-surface)). |
 | hit | One application of a rule's effect; counted per rule in the hits file. |
 | active snapshot | The published rule array readers match against. |
@@ -288,6 +291,8 @@ For `write(fd, buf, count)` and every other descriptor-based wrapper:
    - ERRNO: if the qualifiers pass and the probability fires, set `errno` and
      return `-1` without calling the real function.
    - TORN (write class): if it fires, call the real function with a shorter count.
+   - DROP (write class): if it fires, skip the real function, report the full count,
+     and move the file offset on where there is one.
    - CORRUPT (read class): call the real function; if it returned `> 0` bytes and
      the rule fires, flip one bit in the returned bytes.
 6. Return the real function's result.
@@ -445,6 +450,9 @@ else ERRNO fires
 else TORN fires
   Wrap -> Effects : torn count in [1, count-1]
   Wrap -> Libc : write(fd, buf, torn)
+else DROP fires
+  Wrap -> Libc : lseek(fd, count, SEEK_CUR)
+  Wrap --> App : count (nothing written)
 end
 Libc --> Wrap : rc
 Wrap --> App : rc
@@ -701,6 +709,9 @@ wrapper.
 - TORN on `writev`/`pwritev` applies only to arrays of at most 64 entries
   (`CHAOS_IO_TORN_MAX_IOV`); the shortened array is built on the stack from the
   checked copy. A longer or unreadable array is written whole and counts no hit.
+- DROP on `writev`/`pwritev` has no such entry limit, because it reports the total
+  rather than rebuilding the array; an array with no readable size is written whole
+  and counts no hit, since there is no count to report as written.
 - CORRUPT on `readv`/`preadv` picks one byte across the returned bytes as one
   logical stream and maps it back to its segment.
 
@@ -714,7 +725,7 @@ wrapper.
 | `resolved_prefix`, `resolved_len` | The prefix with links resolved, when different; NULL otherwise. Points into the owning snapshot. |
 | `operation`, `effect` | Parsed enums; never `INVALID` in a published rule. |
 | `errnum` | ERRNO only. |
-| `probability` | ERRNO, TORN, CORRUPT. |
+| `probability` | ERRNO, TORN, DROP, CORRUPT. |
 | `latency_ms` | LATENCY only; 0 to 4 294 967 295. |
 | `policy` | Qualifiers (`@first`, `@every`, `@from`, `@until`, `@size`). |
 | `call_size` | Byte count of the call being decided; set on the caller's copy. |
@@ -848,7 +859,7 @@ expose. Idempotency is the application's concern.
 /data:read:TORN:1.0
 ```
 
-TORN is legal only for `write` and `pwrite`. The whole file is rejected and the
+TORN is legal only for `write` and `pwrite`, as is DROP. The whole file is rejected and the
 status file names this line.
 
 ```text
@@ -973,13 +984,13 @@ short write counts and corrupted read bytes.
 ### Grammar
 
 ```text
-<selector>:<operation>:<ERRNO-name|LATENCY|TORN|CORRUPT>:<value> [qualifier ...] [# comment]
+<selector>:<operation>:<ERRNO-name|LATENCY|TORN|DROP|CORRUPT>:<value> [qualifier ...] [# comment]
 ```
 
 - Exactly four `:`-separated fields; whitespace around each field is trimmed. The
   selector cannot contain `:` (the first `:` ends it) or `#` (it starts a comment).
 - ERRNO is written as the errno name itself (`EIO`, not `ERRNO:EIO`).
-- `<value>`: a probability for an errno name, TORN and CORRUPT; milliseconds
+- `<value>`: a probability for an errno name, TORN, DROP and CORRUPT; milliseconds
   (decimal, 0 to 4 294 967 295) for LATENCY.
 - Probability: `0`, `1`, `0.` followed by digits, or `1.` followed by zeros, parsed
   independently of `LC_NUMERIC` (a JVM sets it from the environment; `strtod` would
@@ -1009,11 +1020,17 @@ make unit 2>&1 | grep -E 'PROPTEST|test_config|OK'
 
 ### Operations and legal effects
 
-| Operation | ERRNO | LATENCY | TORN | CORRUPT |
-|---|---|---|---|---|
-| `read`, `pread` | yes | yes | — | yes |
-| `write`, `pwrite` | yes | yes | yes | — |
-| `open`, `close`, `fsync`, `fdatasync`, `truncate`, `allocate`, `unlink`, `rename_from`, `rename_to` | yes | yes | — | — |
+| Operation | ERRNO | LATENCY | TORN | DROP | CORRUPT |
+|---|---|---|---|---|---|
+| `read`, `pread` | yes | yes | — | — | yes |
+| `write`, `pwrite` | yes | yes | yes | yes | — |
+| `open`, `close`, `fsync`, `fdatasync`, `truncate`, `allocate`, `unlink`, `rename_from`, `rename_to` | yes | yes | — | — | — |
+
+`DROP` has no read counterpart: a read that reported bytes it did not read would
+hand the caller its own stale buffer, which is what `CORRUPT` does deliberately.
+It is also not offered on `fsync`: a dropped `fsync` is unobservable inside a
+container, since nothing there can take the power away to prove the data was
+never on the disk.
 
 ### Matching rules
 
@@ -1027,9 +1044,10 @@ make unit 2>&1 | grep -E 'PROPTEST|test_config|OK'
   through their link-resolved form (§4).
 - `*` matches every file: an absolute path that is not a memfd (`/memfd:...`). It
   never matches pipes (`pipe:[N]`), sockets (`socket:[N]`) or anonymous inodes
-  (`anon_inode:[eventfd]`, timerfd, ...): a TORN or CORRUPT meant for files would
-  break their protocols (an 8-byte eventfd write). A selector that names them
-  literally still reaches them.
+  (`anon_inode:[eventfd]`, timerfd, ...): a TORN, DROP or CORRUPT meant for files
+  would break their protocols (an 8-byte eventfd write). A selector that names them
+  literally still reaches them -- and a `write:DROP` on one of them does not fire,
+  because such a descriptor has no file offset to keep consistent.
 - `*` counts as length 1 for specificity, so it loses to every longer selector and
   ties with `/` (first in file wins).
 - No globbing, no regular expressions.
@@ -1041,6 +1059,7 @@ make unit 2>&1 | grep -E 'PROPTEST|test_config|OK'
 | ERRNO | yes | before the call; the real call is skipped | `close`: after the real close. `posix_fallocate`: returned, `errno` untouched. stdio: error value plus `ferror()`. |
 | LATENCY | no | before the call | Always fires when matched and the qualifiers pass; raw `clock_nanosleep`, restarted on `EINTR`. |
 | TORN | yes | before the call | Count in `[1, n-1]`; `writev`/`pwritev` only up to 64 entries; no effect on stdio. |
+| DROP | yes | instead of the call | The full count is reported written and nothing is written. On `write`/`writev` the file offset is moved on by that many bytes, so the caller's next write does not land on top of what it believes it already wrote; an `O_APPEND` descriptor needs no correction, and one with no offset at all (a pipe, a FIFO) keeps the rule from firing. `pwrite`/`pwritev` need no correction. No effect on stdio, on `sendfile` or on `copy_file_range`. |
 | CORRUPT | yes, drawn after the call | after a call that returned `> 0` bytes | One bit of one returned byte. |
 
 ### Supported errno names
@@ -1064,9 +1083,13 @@ name and no numeric value is accepted.
 ### SECCOMP mode
 
 `chaos-init` applies io rules to system calls of any process, including static
-binaries, with ERRNO and LATENCY. A rule file containing TORN, CORRUPT or ERRNO on
-`close` is rejected as a whole with `reason=unsupported in seccomp mode`. See
-[SECCOMP.md](SECCOMP.md).
+binaries, with ERRNO, LATENCY and `pwrite:DROP`. A rule file containing TORN,
+CORRUPT, ERRNO on `close` or `write:DROP` is rejected as a whole with
+`reason=unsupported in seccomp mode`. `write:DROP` is the one asymmetry: answering
+a notification with the byte count is exactly a drop, but the descriptor's file
+offset has to move on with it, and the supervisor cannot reach another process's
+descriptor without `CAP_SYS_PTRACE`. A positioned write has no such offset, so
+`pwrite:DROP` applies in both modes. See [SECCOMP.md](SECCOMP.md).
 
 ### Operational guidance
 
