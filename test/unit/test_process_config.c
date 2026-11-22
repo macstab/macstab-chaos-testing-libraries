@@ -1156,6 +1156,9 @@ static void test_prepare_reports_status(void)
     assert(!read_status_file(status, sizeof(status)));
 }
 
+/** @brief Header lines of the last read_hits_file(), without the rule lines. */
+static char g_hits_header[128];
+
 /** @brief Reads this process's hits file into @p buffer; 0 when it does not exist. */
 static int read_hits_file(char *buffer, size_t size)
 {
@@ -1173,6 +1176,22 @@ static int read_hits_file(char *buffer, size_t size)
     length = fread(buffer, 1U, size - 1U, file);
     buffer[length] = '\0';
     assert(fclose(file) == 0);
+
+    /* The header lines (`generation=`, no tab) are split off into g_hits_header, so the
+     * assertions on the rule lines stay about rule lines. That the header really is in
+     * front, and carries no tab, is asserted here for every reader below. */
+    {
+        const char *rules = strchr(buffer, '\n');
+
+        assert(strncmp(buffer, "generation=", 11U) == 0);
+        assert(rules != NULL);
+        ++rules;
+        assert((size_t)(rules - buffer) < sizeof(g_hits_header));
+        (void)memcpy(g_hits_header, buffer, (size_t)(rules - buffer));
+        g_hits_header[rules - buffer] = '\0';
+        assert(strchr(g_hits_header, '\t') == NULL);
+        (void)memmove(buffer, rules, strlen(rules) + 1U);
+    }
     return 1;
 }
 
@@ -1601,8 +1620,67 @@ static void test_draw_key_follows_the_rule_text(void)
     (void)unlink(CHAOS_PROCESS_CONFIG_PATH);
 }
 
+/**
+ * @brief Proves the hits file names the rule-file generation its counts belong to.
+ *
+ * @details A count of 0 after a reload can mean two things: the rule never fired, or the
+ * reload reset it. The generation tells them apart -- it rises with every published
+ * snapshot, so a reader that sees a new number knows the counts below restarted with it.
+ */
+static void test_hits_name_their_generation(void)
+{
+    char hits[1024];
+    char path[64];
+    const chaos_process_config_state_t *state;
+    uint64_t first_generation;
+
+    chaos_process_config_init();
+    write_config_text("fork:LATENCY:5\n", 101);
+    assert(chaos_process_config_prepare() == 1);
+    first_generation = g_chaos_process_config_generation;
+    assert(first_generation > 0U);
+    state = chaos_process_config_active_state();
+    assert(state->rule_count == 1U);
+    chaos_hit_record(state->rules[0].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    {
+        char expected[40];
+
+        (void)snprintf(
+            expected, sizeof(expected), "generation=%llu\n", (unsigned long long)first_generation
+        );
+        assert(strncmp(g_hits_header, expected, strlen(expected)) == 0);
+    }
+
+    /* A reload publishes a new snapshot, so the number rises. */
+    write_config_text("execve:LATENCY:5\n", 102);
+    g_chaos_process_cached_mtime = CHAOS_PROCESS_MTIME_UNKNOWN;
+    assert(chaos_process_config_prepare() == 1);
+    assert(g_chaos_process_config_generation == first_generation + 1U);
+    state = chaos_process_config_active_state();
+    chaos_hit_record(state->rules[0].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    {
+        char expected[40];
+
+        (void)snprintf(
+            expected,
+            sizeof(expected),
+            "generation=%llu\n",
+            (unsigned long long)(first_generation + 1U)
+        );
+        assert(strncmp(g_hits_header, expected, strlen(expected)) == 0);
+    }
+
+    (void
+    )snprintf(path, sizeof(path), "%s.%ld", CHAOS_PROCESS_HITS_PREFIX, g_chaos_process_hits_file);
+    (void)unlink(path);
+    (void)unlink(CHAOS_PROCESS_CONFIG_PATH);
+}
+
 int main(void)
 {
+    test_hits_name_their_generation();
     test_draw_key_follows_the_rule_text();
     /* Interval 0 makes every prepare stat the file, so tests see each write at once; the
      * throttle has its own test. */

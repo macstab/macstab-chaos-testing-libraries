@@ -1393,9 +1393,9 @@ static char g_hits_header[128];
 /**
  * @brief Reads this process's hits file into @p buffer (NUL-terminated); 0 when absent.
  *
- * @details The header lines (`suppressed.*`, no tab) are split off into g_hits_header, so
- * the assertions on the rule lines stay about rule lines. That the header really is in
- * front, and really carries no tab, is asserted here once for every reader below.
+ * @details The header lines (`generation=`, `suppressed.*`, none with a tab) are split off
+ * into g_hits_header, so the assertions on the rule lines stay about rule lines. That the header
+ * really is in front, and really carries no tab, is asserted here once for every reader below.
  */
 static int read_hits_file(char *buffer, size_t size)
 {
@@ -1414,8 +1414,10 @@ static int read_hits_file(char *buffer, size_t size)
     buffer[length] = '\0';
     assert(fclose(file) == 0);
 
-    /* Two header lines, then the rule lines; the first tab is in the rule lines. */
-    assert(strncmp(buffer, "suppressed.shared=", 18U) == 0);
+    /* Three header lines -- the shared generation, then the two suppression counters --
+     * and after them the rule lines; the first tab is in the rule lines. */
+    assert(strncmp(buffer, "generation=", 11U) == 0);
+    assert(strstr(buffer, "\nsuppressed.shared=") != NULL);
     rules = strstr(buffer, "suppressed.unknown=");
     assert(rules != NULL);
     rules = strchr(rules, '\n');
@@ -1653,7 +1655,7 @@ static void test_reset_suppressions_are_reported(void)
     /* Zeros are written too, so a reader can tell them from a missing report. */
     chaos_hit_record(state->rules[0].hit);
     assert(read_hits_file(hits, sizeof(hits)));
-    assert(strcmp(g_hits_header, "suppressed.shared=0\nsuppressed.unknown=0\n") == 0);
+    assert(strstr(g_hits_header, "suppressed.shared=0\nsuppressed.unknown=0\n") != NULL);
     assert(strcmp(hits, "1\ttcp4://127.0.0.1:9010:close:RESET:1 # a\n") == 0);
 
     /* Each cause counts on its own line, and a suppression writes the file by itself: a
@@ -1663,14 +1665,25 @@ static void test_reset_suppressions_are_reported(void)
     chaos_net_reset_suppressed(CHAOS_NET_OWNER_SHARED);
     chaos_net_reset_suppressed(CHAOS_NET_OWNER_UNKNOWN);
     assert(read_hits_file(hits, sizeof(hits)));
-    assert(strcmp(g_hits_header, "suppressed.shared=2\nsuppressed.unknown=1\n") == 0);
+    assert(strstr(g_hits_header, "suppressed.shared=2\nsuppressed.unknown=1\n") != NULL);
     assert(strcmp(hits, "1\ttcp4://127.0.0.1:9010:close:RESET:1 # a\n") == 0);
 
     /* A fork child reports its own suppressions only, like its own hits. */
     chaos_net_config_after_fork();
     chaos_net_reset_suppressed(CHAOS_NET_OWNER_SHARED);
     assert(read_hits_file(hits, sizeof(hits)));
-    assert(strcmp(g_hits_header, "suppressed.shared=1\nsuppressed.unknown=0\n") == 0);
+    assert(strstr(g_hits_header, "suppressed.shared=1\nsuppressed.unknown=0\n") != NULL);
+
+    /* A buffer too small for the header writes none at all rather than a truncated line a
+     * reader cannot classify. Unreachable through the writer, whose buffer is sized for
+     * the whole block, so the formatter is called directly. */
+    {
+        char tiny[4];
+        char room[CHAOS_HITS_HEADER_MAX];
+
+        assert(chaos_net_hits_header(tiny, sizeof(tiny)) == NULL);
+        assert(chaos_net_hits_header(room, sizeof(room)) == room);
+    }
 
     (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_NET_HITS_PREFIX, g_chaos_net_hits_file);
     (void)unlink(path);
@@ -2292,8 +2305,66 @@ static void test_shadowed_rules_warn(void)
     assert(chaos_net_config_last_error()->warning_count == 0U);
 }
 
+/**
+ * @brief Proves the hits file names the rule-file generation its counts belong to.
+ *
+ * @details A count of 0 after a reload can mean two things: the rule never fired, or the
+ * reload reset it. The generation tells them apart -- it rises with every published
+ * snapshot, so a reader that sees a new number knows the counts below restarted with it.
+ */
+static void test_hits_name_their_generation(void)
+{
+    char hits[1024];
+    char path[64];
+    const chaos_net_config_state_t *state;
+    uint64_t first_generation;
+
+    chaos_net_config_init();
+    write_config_text("tcp4://127.0.0.1:9020:connect:ECONNREFUSED:1.0\n", 101);
+    assert(chaos_net_config_prepare() == 1);
+    first_generation = g_chaos_net_config_generation;
+    assert(first_generation > 0U);
+    state = chaos_net_config_active_state();
+    assert(state->rule_count == 1U);
+    chaos_hit_record(state->rules[0].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    {
+        char expected[40];
+
+        (void)snprintf(
+            expected, sizeof(expected), "generation=%llu\n", (unsigned long long)first_generation
+        );
+        assert(strncmp(g_hits_header, expected, strlen(expected)) == 0);
+    }
+
+    /* A reload publishes a new snapshot, so the number rises. */
+    write_config_text("tcp4://127.0.0.1:9021:connect:ECONNREFUSED:1.0\n", 102);
+    g_chaos_net_cached_mtime = CHAOS_NET_MTIME_UNKNOWN;
+    assert(chaos_net_config_prepare() == 1);
+    assert(g_chaos_net_config_generation == first_generation + 1U);
+    state = chaos_net_config_active_state();
+    chaos_hit_record(state->rules[0].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    {
+        char expected[40];
+
+        (void)snprintf(
+            expected,
+            sizeof(expected),
+            "generation=%llu\n",
+            (unsigned long long)(first_generation + 1U)
+        );
+        assert(strncmp(g_hits_header, expected, strlen(expected)) == 0);
+    }
+
+    (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_NET_HITS_PREFIX, g_chaos_net_hits_file);
+    (void)unlink(path);
+    (void)unlink(CHAOS_NET_CONFIG_PATH);
+}
+
 int main(void)
 {
+    test_hits_name_their_generation();
     /* Stat the rule file on every call so each write is seen at once; the throttle has its
      * own test. */
     g_chaos_net_check_interval_ns = 0U;

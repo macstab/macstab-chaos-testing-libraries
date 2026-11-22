@@ -143,6 +143,17 @@ static int g_chaos_io_hit_pool_used = 0;
 static volatile unsigned int g_chaos_io_active_config_index = 0U;
 
 /**
+ * @brief Rule-file snapshots this process has published, reported as the hits file's
+ *        `generation=` line.
+ *
+ * @details Lets a reader tell which rules a count belongs to: after a reload that changed
+ * the file the number differs, so counts that restarted are not mistaken for counts that
+ * stalled. Written only by the reload owner, between the same barriers as the active
+ * index.
+ */
+static volatile uint64_t g_chaos_io_config_generation = 0U;
+
+/**
  * @brief Change stamp of the loaded rule file, or a sentinel (CHAOS_IO_MTIME_*).
  *
  * @details Freshness token and, as CHAOS_IO_MTIME_RELOADING, the reload claim; see the
@@ -215,7 +226,8 @@ static long g_chaos_io_hits_file = 0L;
 static int g_chaos_io_hits_owned = 0;
 
 /** @brief Hits-file scratch, 256 lines of CHAOS_HITS_LINE_MAX; used only by the writer. */
-static char g_chaos_io_hits_buffer[CHAOS_IO_MAX_RULES * CHAOS_HITS_LINE_MAX + 1U];
+static char
+    g_chaos_io_hits_buffer[CHAOS_IO_MAX_RULES * CHAOS_HITS_LINE_MAX + CHAOS_HITS_HEADER_MAX + 1U];
 
 /* --- Internal helpers ------------------------------------------------------------ */
 
@@ -284,6 +296,7 @@ static void chaos_io_config_publish(unsigned int next_index, uint64_t observed_m
     chaos_snapshot_write_end(&g_chaos_io_config_states[next_index].sequence);
     __sync_synchronize();
     g_chaos_io_active_config_index = next_index;
+    ++g_chaos_io_config_generation;
     __sync_synchronize();
     g_chaos_io_cached_mtime = observed_mtime;
 }
@@ -913,6 +926,7 @@ static void chaos_io_config_reject_file(chaos_io_config_state_t *state, const ch
  */
 static void chaos_io_config_report_hits(chaos_hit_slot_t *slot)
 {
+    char header[CHAOS_HITS_HEADER_MAX];
     chaos_io_config_state_t *state;
     const uint64_t now = chaos_hits_now_ms();
 
@@ -959,7 +973,11 @@ static void chaos_io_config_report_hits(chaos_hit_slot_t *slot)
                 state->hits,
                 (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) state->text,
                 state->rule_count,
-                NULL,
+                chaos_hits_header_generation(
+                    header, sizeof(header), g_chaos_io_config_generation
+                ) != 0U
+                    ? header
+                    : NULL,
                 g_chaos_io_hits_buffer,
                 sizeof(g_chaos_io_hits_buffer)
             );

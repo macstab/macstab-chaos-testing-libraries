@@ -20,14 +20,17 @@
  * not). A reader sums all `/tmp/.chaos-<lib>.hits.*` files to get totals over processes.
  *
  * @par Header lines
- * A library may put `key=value` lines in front of the rule lines (the @p header argument of
- * chaos_hits_write_for()), for counts that belong to no single rule -- libchaos-net reports
- * the RESET suppressions of NETWORK.md that way:
+ * `key=value` lines come before the rule lines (the @p header argument of
+ * chaos_hits_write_for()), for anything that belongs to no single rule. Every library
+ * writes `generation=<n>`, the number of rule-file snapshots it has published, so a reader
+ * can tell which rules the counts belong to; libchaos-net adds the RESET suppressions of
+ * NETWORK.md:
  *
  * @code
+ * generation=4
  * suppressed.shared=3
  * suppressed.unknown=0
- * 12<TAB>tcp4://127.0.0.1:5432:close:RESET # pg
+ * 12<TAB>tcp4://127.0.0.1:5432:close:RESET:1 # pg
  * @endcode
  *
  * A header line carries **no tab**, which is what makes it additive: a reader that splits on
@@ -109,6 +112,34 @@
 
 /** @brief Upper bound of one hits-file line: 20-digit count, tab, rule text, newline. */
 #define CHAOS_HITS_LINE_MAX (20U + 1U + CHAOS_STATUS_TEXT_MAX + 1U)
+
+/**
+ * @brief Room for a library's whole header block: the generation line plus the two
+ *        suppression lines libchaos-net adds, each at most `<key>=<20 digits>` and a
+ *        newline.
+ */
+#define CHAOS_HITS_HEADER_MAX 128U
+
+/**
+ * @brief Writes the `generation=<n>` header line, which every library's header starts with.
+ *
+ * @details The generation counts the rule-file snapshots this process has published, so a
+ * reader can tell which rules the counts below belong to: a test that rewrites the rule
+ * file and reads the hits sees the number change and knows the counts restarted. Carries
+ * no tab, like every header line, so a reader that splits on the first tab skips it.
+ *
+ * @param out        Buffer, normally CHAOS_HITS_HEADER_MAX bytes.
+ * @param size       Its size.
+ * @param generation Snapshots published so far.
+ * @return Bytes written, not counting the NUL; 0 when @p out is too small, in which case
+ *         the caller writes no header rather than a truncated one.
+ */
+static inline size_t chaos_hits_header_generation(char *out, size_t size, uint64_t generation)
+{
+    const int rc = snprintf(out, size, "generation=%llu\n", (unsigned long long)generation);
+
+    return rc > 0 && (size_t)rc < size ? (size_t)rc : 0U;
+}
 
 /**
  * @brief Per-rule state that must outlive a reload: hit count, `@first` claims, effect

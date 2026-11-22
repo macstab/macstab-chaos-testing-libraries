@@ -145,6 +145,17 @@ static int g_chaos_net_hit_pool_used = 0;
 static volatile unsigned int g_chaos_net_active_config_index = 0U;
 
 /**
+ * @brief Rule-file snapshots this process has published, reported as the hits file's
+ *        `generation=` line.
+ *
+ * @details Lets a reader tell which rules a count belongs to: after a reload that changed
+ * the file the number differs, so counts that restarted are not mistaken for counts that
+ * stalled. Written only by the reload owner, between the same barriers as the active
+ * index.
+ */
+static volatile uint64_t g_chaos_net_config_generation = 0U;
+
+/**
  * @brief Change stamp of the loaded rule file, and the reload claim.
  *
  * @details Holds a chaos_net_config_hash_mtime() stamp or one of three reserved values:
@@ -225,12 +236,9 @@ static volatile uint64_t g_chaos_net_reset_suppressed_shared = 0U;
 /** @brief The same for a socket whose ownership could not be established at all. */
 static volatile uint64_t g_chaos_net_reset_suppressed_unknown = 0U;
 
-/** @brief Longest header block: two `suppressed.*=<20 digits>` lines and their newlines. */
-#define CHAOS_NET_HITS_HEADER_MAX 96U
-
 /** @brief Scratch for formatting the hits file; used only by the hits writer. */
-static char g_chaos_net_hits_buffer
-    [CHAOS_NET_MAX_RULES * CHAOS_HITS_LINE_MAX + CHAOS_NET_HITS_HEADER_MAX + 1U];
+static char
+    g_chaos_net_hits_buffer[CHAOS_NET_MAX_RULES * CHAOS_HITS_LINE_MAX + CHAOS_HITS_HEADER_MAX + 1U];
 
 /*---------------------------------------------------------------------------
  * Internal helpers
@@ -303,6 +311,7 @@ static void chaos_net_config_publish(unsigned int next_index, uint64_t observed_
     /* Release: the snapshot's contents before the index. */
     __sync_synchronize();
     g_chaos_net_active_config_index = next_index;
+    ++g_chaos_net_config_generation;
     /* The index before the claim release. */
     __sync_synchronize();
     g_chaos_net_cached_mtime = observed_mtime;
@@ -1382,26 +1391,35 @@ static void chaos_net_config_reject_file(chaos_net_config_state_t *state, const 
 }
 
 /**
- * @brief Formats the suppression counters as hits-file header lines.
+ * @brief Formats this library's hits-file header: the generation, then the suppression
+ *        counters.
  *
- * @details Written on every report, also as zeros: a reader must be able to tell "no
- * suppression" from "this library does not report it", and only a present line does that.
+ * @details The suppression counters are written on every report, also as zeros: a reader
+ * must be able to tell "no suppression" from "this library does not report it", and only a
+ * present line does that.
  *
- * @param out  Buffer of at least CHAOS_NET_HITS_HEADER_MAX bytes.
+ * @param out  Buffer of at least CHAOS_HITS_HEADER_MAX bytes.
  * @param size Its size.
  * @return @p out, or NULL when it could not be formatted (then no header is written).
  */
 static const char *chaos_net_hits_header(char *out, size_t size)
 {
-    const int rc = snprintf(
-        out,
-        size,
+    const size_t used = chaos_hits_header_generation(out, size, g_chaos_net_config_generation);
+    int rc;
+
+    if (used == 0U)
+    {
+        return NULL;
+    }
+    rc = snprintf(
+        out + used,
+        size - used,
         "suppressed.shared=%llu\nsuppressed.unknown=%llu\n",
         (unsigned long long)g_chaos_net_reset_suppressed_shared,
         (unsigned long long)g_chaos_net_reset_suppressed_unknown
     );
 
-    return rc > 0 && (size_t)rc < size ? out : NULL;
+    return rc > 0 && (size_t)rc < size - used ? out : NULL;
 }
 
 /**
@@ -1418,7 +1436,7 @@ static const char *chaos_net_hits_header(char *out, size_t size)
 static void chaos_net_config_report_hits_counted(int counted)
 {
     chaos_net_config_state_t *state;
-    char header[CHAOS_NET_HITS_HEADER_MAX];
+    char header[CHAOS_HITS_HEADER_MAX];
     const uint64_t now = chaos_hits_now_ms();
 
     if (counted)

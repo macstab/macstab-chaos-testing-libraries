@@ -146,6 +146,17 @@ static int g_chaos_memory_hit_pool_used = 0;
 static volatile unsigned int g_chaos_memory_active_config_index = 0U;
 
 /**
+ * @brief Rule-file snapshots this process has published, reported as the hits file's
+ *        `generation=` line.
+ *
+ * @details Lets a reader tell which rules a count belongs to: after a reload that changed
+ * the file the number differs, so counts that restarted are not mistaken for counts that
+ * stalled. Written only by the reload owner, between the same barriers as the active
+ * index.
+ */
+static volatile uint64_t g_chaos_memory_config_generation = 0U;
+
+/**
  * @brief Change stamp of the loaded rule file, or a reserved value.
  *
  * @details UNKNOWN before the first load (forces an unthrottled reload); RELOADING
@@ -213,7 +224,8 @@ static long g_chaos_memory_hits_file = 0L;
 static int g_chaos_memory_hits_owned = 0;
 
 /** @brief Scratch for the hits file; used only by the thread that writes it. */
-static char g_chaos_memory_hits_buffer[CHAOS_MEMORY_MAX_RULES * CHAOS_HITS_LINE_MAX + 1U];
+static char g_chaos_memory_hits_buffer
+    [CHAOS_MEMORY_MAX_RULES * CHAOS_HITS_LINE_MAX + CHAOS_HITS_HEADER_MAX + 1U];
 
 /* =========================================================================
  * Internal helpers — state management
@@ -280,6 +292,7 @@ static void chaos_memory_config_publish(unsigned int next_index, uint64_t observ
     chaos_snapshot_write_end(&g_chaos_memory_config_states[next_index].sequence);
     __sync_synchronize();
     g_chaos_memory_active_config_index = next_index;
+    ++g_chaos_memory_config_generation;
     __sync_synchronize();
     g_chaos_memory_cached_mtime = observed_mtime;
 }
@@ -1227,6 +1240,7 @@ static void chaos_memory_config_reject_file(chaos_memory_config_state_t *state, 
  */
 static void chaos_memory_config_report_hits(chaos_hit_slot_t *slot)
 {
+    char header[CHAOS_HITS_HEADER_MAX];
     chaos_memory_config_state_t *state;
     const uint64_t now = chaos_hits_now_ms();
 
@@ -1274,7 +1288,11 @@ static void chaos_memory_config_report_hits(chaos_hit_slot_t *slot)
                 state->hits,
                 (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) state->text,
                 state->rule_count,
-                NULL,
+                chaos_hits_header_generation(
+                    header, sizeof(header), g_chaos_memory_config_generation
+                ) != 0U
+                    ? header
+                    : NULL,
                 g_chaos_memory_hits_buffer,
                 sizeof(g_chaos_memory_hits_buffer)
             );

@@ -573,6 +573,21 @@ static void test_hits(void)
         assert(strcmp(contents, "7\t/a:open:EIO:1.0\n0\t/b:open:EIO:1.0\n") == 0);
         (void)unlink("/tmp/chaos-common-test/hits.1");
 
+        /* The shared generation line: the header a library writes always starts with it,
+         * so a reader can tell which rule file the counts below belong to. */
+        {
+            char header[CHAOS_HITS_HEADER_MAX];
+
+            assert(chaos_hits_header_generation(header, sizeof(header), 7U) == 13U);
+            assert(strcmp(header, "generation=7\n") == 0);
+            assert(chaos_hits_header_generation(header, sizeof(header), 0U) == 13U);
+            assert(strcmp(header, "generation=0\n") == 0);
+            /* No tab, which is what makes it skippable by a reader that splits on one. */
+            assert(strchr(header, '\t') == NULL);
+            /* Too small: nothing is claimed, so the caller writes no header at all. */
+            assert(chaos_hits_header_generation(header, 4U, 7U) == 0U);
+        }
+
         /* Negative: a header that does not fit the scratch writes nothing at all -- a
          * truncated header would be a line a reader cannot classify. */
         {
