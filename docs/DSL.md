@@ -540,7 +540,7 @@ any `# owner` comment:
 | Qualifier | Meaning |
 |---|---|
 | `@first=N` | Fire at most N times per process (N ≥ 1), then go inert: start-up faults that clear by themselves. |
-| `@every=N` | Only every Nth **evaluation** of the rule (N ≥ 1): the 10th, 20th, 30th call that got past the window and size gates. Counts evaluations, not hits, so `@every=10` with `p=0.5` means "of evaluations 10, 20, 30… half fire". `@every=1` is allowed and gates nothing. |
+| `@every=N` | Only every Nth **evaluation** of the rule (N ≥ 1): the 10th, 20th, 30th call that got past the window and size gates. Counts evaluations, not hits, so `@every=10` with `p=0.5` means "of evaluations 10, 20, 30… half fire". `@every=1` is allowed and gates nothing. The count is **per process**, like the `@first` budget: a forked child starts at zero, so on a pre-forking server each worker counts its own evaluations rather than sharing one sequence. |
 | `@from=T` | Active only once the wall clock reaches T (Unix milliseconds). |
 | `@until=T` | Active only while the wall clock is before T (T >= 1; `@until=0` is rejected, since 0 is how "no upper bound" is stored and the line would mean the opposite of what it says). With `@from`, the window is `[from, until)`; `@until` must be later than `@from`. One rule file can hold a whole incident timeline. |
 | `@size>N` / `@size<N` | Only calls whose byte count is above / below N. Both may be combined. For the calls that move data this is the number of bytes moved; for `truncate` it is the file's new length and for `allocate` the length of the range, since neither moves bytes. A call without a byte count never matches a size-gated rule. |

@@ -729,7 +729,7 @@ after `@from`, rejects the rule file.
 | Qualifier | Meaning |
 |-----------|---------|
 | `@first=N` | fire at most N times in this process (N ≥ 1, at most 18 digits), then go inert |
-| `@every=N` | only every Nth evaluation of the rule (N ≥ 1): evaluations, not hits |
+| `@every=N` | only every Nth evaluation of the rule (N ≥ 1): evaluations, not hits, counted per process as the `@first` budget is |
 | `@from=T` | active only when the wall clock is at or after T (Unix milliseconds) |
 | `@until=T` | active only before T (Unix milliseconds, T >= 1: 0 is how "no upper bound" is stored, so it is rejected rather than read as never) |
 | `@size>N`, `@size<N` | apply only to calls that move more (fewer) than N bytes |

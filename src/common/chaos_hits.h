@@ -167,7 +167,10 @@ struct chaos_hit_slot
     volatile uint64_t claimed;
     /**
      * Effect state that must survive reloads. libchaos-time REGRESS: 0 idle, 1 armed,
-     * 3 one thread is deciding the jump, 2 jumped.
+     * 3 one thread is deciding the jump, 2 jumped. Those four values are reserved,
+     * because chaos_hits_pool_after_fork() knows the machine and rewrites a 3; another
+     * effect storing something here must stay clear of them (libchaos-time FREEZE keeps
+     * its reading with the top bit set).
      */
     volatile uint64_t state;
     /** Library hook called after each counted hit to schedule a hits-file write; may be NULL. */
@@ -407,6 +410,11 @@ static inline void chaos_hits_pool_after_fork(
         CHAOS_STORE_IF_CHANGED(pool[index].count, 0U);
         CHAOS_STORE_IF_CHANGED(pool[index].evaluations, 0U);
         CHAOS_STORE_IF_CHANGED(pool[index].claimed, chaos_hit_claims_none(pool[index].generation));
+        /* libchaos-time's REGRESS machine: a decision caught in progress (3) goes back to
+         * armed (1). The values 0, 1, 2 and 3 are therefore reserved in this word, and any
+         * other effect that stores something here must stay clear of them -- FREEZE keeps
+         * its reading with the top bit set for exactly that reason. A plain small integer
+         * would be rewritten here behind its owner's back. */
         if (pool[index].state == 3U)
         {
             pool[index].state = 1U;

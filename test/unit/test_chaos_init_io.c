@@ -471,6 +471,12 @@ int main(void)
         assert(RETURNS(decide(__NR_pwritev, (uint64_t)torn, P(vector), 2U, 0, 0), 7L));
         /* A vector that cannot be read has no count to report, so nothing is dropped. */
         assert(PASSES(decide(__NR_pwritev, (uint64_t)torn, 8U, 2U, 0, 0)));
+        /* Nor one whose total is no value the call could have returned: the supervisor
+         * sums the tracee's vector without bounding it, so a reply built from that total
+         * would be a negative return. The kernel rejects such a call with EINVAL. */
+        vector[0].iov_len = (size_t)SSIZE_MAX;
+        vector[1].iov_len = (size_t)SSIZE_MAX;
+        assert(PASSES(decide(__NR_pwritev, (uint64_t)torn, P(vector), 2U, 0, 0)));
     }
     write_rules("/tmp/initio/torn:write:DROP:1.0\n");
     assert(PASSES(decide(__NR_write, (uint64_t)torn, P(buffer), 10U, 0, 0)));

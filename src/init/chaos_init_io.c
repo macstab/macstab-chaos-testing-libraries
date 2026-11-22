@@ -50,6 +50,8 @@
 
 #include "chaos_init_io.h"
 
+#include <limits.h>
+
 /* Parser hook, defined before the core is included: rules this mode cannot apply reject
  * their file at load time. */
 struct chaos_io_rule;
@@ -426,9 +428,13 @@ int chaos_init_io_decide(const chaos_init_call_t *call, chaos_init_verdict_t *ve
     /* Swap the snapshot's shared slot for the calling process's, so probability,
      * `@first` and windows count per process as under LD_PRELOAD. No slot (the process
      * ended): do not fire. */
-    /* DROP answers with the byte count, so a call whose count could not be read cannot
-     * be dropped. Checked before the draw, so no hit is spent on it. */
-    if (rule.effect == CHAOS_IO_EFFECT_DROP && rule.call_size == CHAOS_POLICY_NO_SIZE)
+    /* DROP answers with the byte count, so it needs a count the call could have returned.
+     * chaos_init_io_iov_size() sums a vector without bounding the total, unlike the
+     * library's own, so the bound is here: reporting more than SSIZE_MAX as written would
+     * hand the tracee a negative return, an error with no errno. One comparison covers the
+     * unreadable case too, since the sentinel is UINT64_MAX. Checked before the draw, so
+     * no hit is spent on a call it leaves alone. */
+    if (rule.effect == CHAOS_IO_EFFECT_DROP && rule.call_size > (uint64_t)SSIZE_MAX)
     {
         return 1;
     }

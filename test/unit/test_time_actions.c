@@ -736,6 +736,20 @@ static void test_freeze_stops_the_clock(void)
     chaos_time_rule_apply_freeze(&rule, &value);
     assert(value.tv_sec == 0 && value.tv_nsec == 2);
 
+    /* A FREEZE rule reaches the absolute-deadline conversion unchanged: a stopped clock is
+     * no shift that could be undone, and TIME.md says so. The conversion checks the effect,
+     * so this holds by construction -- asserted anyway, because a later hook that passed a
+     * FREEZE rule in would otherwise shorten every absolute sleep silently. */
+    {
+        struct timespec deadline;
+
+        deadline.tv_sec = 500;
+        deadline.tv_nsec = 7;
+        rule.effect = CHAOS_TIME_EFFECT_FREEZE;
+        assert(chaos_time_rule_unshift_deadline(&rule, &rule, &deadline) == 0);
+        assert(deadline.tv_sec == 500 && deadline.tv_nsec == 7);
+    }
+
     /* Not a FREEZE rule, no rule, no value, no slot: all no-ops. */
     (void)memset(&slot, 0, sizeof(slot));
     value.tv_sec = 5;
