@@ -148,8 +148,11 @@ typedef enum chaos_net_endpoint_kind
  *     for each NUL (as /proc/net/unix shows it); an unnamed socket has an empty path,
  *     which only the wildcards match.
  *   - `wildcard_host != 0`: only `kind` and `port` take part in matching.
+ *   - `prefix_len`: how many leading address bits a selector compares. 32 or 128 for a
+ *     literal address, the written length for a `/N` prefix, 0 for a wildcard host, ANY
+ *     and UNIX. Unused on runtime endpoints (0).
  *   - `selector_len`: strlen of the selector text; breaks ties between rules of equal
- *     rank (longer = more specific). 0 for runtime endpoints.
+ *     rank and prefix length (longer = more specific). 0 for runtime endpoints.
  *
  * @par Ownership: by value, no heap; runtime endpoints live on the wrapper's stack.
  */
@@ -158,7 +161,16 @@ typedef struct chaos_net_endpoint
     chaos_net_endpoint_kind_t kind; /**< Address family + socket type discriminant. */
     size_t selector_len;            /**< Byte length of the original selector text; tie-breaker. */
     uint16_t port;                  /**< Port in host byte order; 0 for UNIX or ANY endpoints. */
-    int wildcard_host;              /**< Non-zero if the host part is `*` (or no address yet). */
+    /**
+     * @brief Address bits a selector compares: 32/128 for a literal, N for `/N`, 0 otherwise.
+     *
+     * A literal address is the `/32` (or `/128`) case of a prefix, so one masked comparison
+     * serves both and there is no second kind of IP selector. It is also the specificity
+     * stage between rank and selector text: of two prefixes that both contain an address,
+     * the longer one is meant.
+     */
+    unsigned int prefix_len;
+    int wildcard_host; /**< Non-zero if the host part is `*` (or no address yet). */
     /**
      * @brief Non-zero when this endpoint is a dual-stack wildcard listener.
      *
@@ -370,8 +382,9 @@ int chaos_net_config_targets_loaded(chaos_net_operation_t operation);
  * When this returns non-zero, chaos_net_config_match_either_loaded() would pick the same
  * rule whatever the other end is, so the caller need not resolve the other end (two
  * system calls). It returns 0, and the caller searches both ends, when nothing matches or
- * some rule for @p operation has a higher rank (chaos_net_endpoint_selector_rank()) or the
- * same rank with a longer selector than the match.
+ * some rule for @p operation could be more specific than the match on another endpoint:
+ * a higher rank (chaos_net_endpoint_selector_rank()), or the same rank with a longer
+ * address prefix, or both the same with a longer selector text.
  *
  * @param operation The operation class of the intercepted call.
  * @param endpoint  The end that wins ties. Must not be NULL.

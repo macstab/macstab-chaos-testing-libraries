@@ -651,6 +651,134 @@ static void test_endpoint_resolution_from_sockaddr_and_fd(void)
     assert(!chaos_net_endpoint_from_activity_fd(7, NULL));
 }
 
+/** @brief Builds a runtime endpoint of @p kind for @p ip and @p port, as a socket would. */
+static void endpoint_of(
+    chaos_net_endpoint_t *endpoint, chaos_net_endpoint_kind_t kind, const char *ip, uint16_t port
+)
+{
+    (void)memset(endpoint, 0, sizeof(*endpoint));
+    endpoint->kind = kind;
+    endpoint->port = port;
+    if (kind == CHAOS_NET_ENDPOINT_TCP4 || kind == CHAOS_NET_ENDPOINT_UDP4)
+    {
+        assert(inet_pton(AF_INET, ip, &endpoint->value.ipv4) == 1);
+    }
+    else
+    {
+        assert(inet_pton(AF_INET6, ip, &endpoint->value.ipv6) == 1);
+    }
+}
+
+/**
+ * @brief Proves a `/N` prefix selects a network, and how specific it is.
+ *
+ * @details A test that names one container's address cannot name a Docker bridge network,
+ * whose address a container is given rather than choosing. Covered:
+ * - a prefix matches every address it contains and nothing outside it, on the named port
+ *   only -- there is still no port wildcard;
+ * - a literal address is the full-width case of the same comparison, so it keeps rank 3,
+ *   and `/32` and `/128` are accepted spellings of it;
+ * - `/0` matches any address of its family on that port, and is still rank 3, so it beats
+ *   a wildcard host;
+ * - a non-canonical prefix is rejected rather than masked, as are a prefix wider than the
+ *   family, an empty one, and one with a sign, a blank or trailing text;
+ * - a prefix on a wildcard host is rejected: there are no address bits to compare;
+ * - a prefix selector does not reach a dual-stack `[::]` listener, which only a wildcard
+ *   host does: the listener has no IPv4 address to compare against.
+ */
+static void test_cidr_selectors(void)
+{
+    chaos_net_endpoint_t selector;
+    chaos_net_endpoint_t endpoint;
+    unsigned int rank = 0U;
+
+    /* An IPv4 prefix contains what it should and nothing else. */
+    assert(chaos_net_endpoint_parse_selector("tcp4://10.0.0.0/8:5432", &selector));
+    assert(selector.kind == CHAOS_NET_ENDPOINT_TCP4 && selector.prefix_len == 8U);
+    assert(selector.wildcard_host == 0 && selector.port == 5432U);
+    endpoint_of(&endpoint, CHAOS_NET_ENDPOINT_TCP4, "10.255.255.254", 5432U);
+    assert(chaos_net_endpoint_matches(&selector, &endpoint, &rank) && rank == 3U);
+    endpoint_of(&endpoint, CHAOS_NET_ENDPOINT_TCP4, "11.0.0.1", 5432U);
+    assert(!chaos_net_endpoint_matches(&selector, &endpoint, &rank) && rank == 0U);
+    /* The port is not part of the prefix and is still compared exactly. */
+    endpoint_of(&endpoint, CHAOS_NET_ENDPOINT_TCP4, "10.0.0.1", 5433U);
+    assert(!chaos_net_endpoint_matches(&selector, &endpoint, NULL));
+
+    /* A prefix that is not a whole number of bytes compares the partial byte too. */
+    assert(chaos_net_endpoint_parse_selector("udp4://192.168.4.0/22:53", &selector));
+    assert(selector.prefix_len == 22U);
+    endpoint_of(&endpoint, CHAOS_NET_ENDPOINT_UDP4, "192.168.7.255", 53U);
+    assert(chaos_net_endpoint_matches(&selector, &endpoint, NULL));
+    endpoint_of(&endpoint, CHAOS_NET_ENDPOINT_UDP4, "192.168.8.0", 53U);
+    assert(!chaos_net_endpoint_matches(&selector, &endpoint, NULL));
+
+    /* A literal address is the full-width prefix, and /32 is the same selector. */
+    assert(chaos_net_endpoint_parse_selector("tcp4://10.1.2.3:5432", &selector));
+    assert(selector.prefix_len == 32U);
+    endpoint_of(&endpoint, CHAOS_NET_ENDPOINT_TCP4, "10.1.2.3", 5432U);
+    assert(chaos_net_endpoint_matches(&selector, &endpoint, &rank) && rank == 3U);
+    endpoint_of(&endpoint, CHAOS_NET_ENDPOINT_TCP4, "10.1.2.4", 5432U);
+    assert(!chaos_net_endpoint_matches(&selector, &endpoint, NULL));
+    assert(chaos_net_endpoint_parse_selector("tcp4://10.1.2.3/32:5432", &selector));
+    assert(selector.prefix_len == 32U);
+    endpoint_of(&endpoint, CHAOS_NET_ENDPOINT_TCP4, "10.1.2.3", 5432U);
+    assert(chaos_net_endpoint_matches(&selector, &endpoint, NULL));
+
+    /* /0 is every address of the family, and still an address selector. */
+    assert(chaos_net_endpoint_parse_selector("tcp4://0.0.0.0/0:5432", &selector));
+    assert(selector.prefix_len == 0U && selector.wildcard_host == 0);
+    endpoint_of(&endpoint, CHAOS_NET_ENDPOINT_TCP4, "203.0.113.9", 5432U);
+    assert(chaos_net_endpoint_matches(&selector, &endpoint, &rank) && rank == 3U);
+
+    /* IPv6: the prefix sits outside the brackets, which hold the address. */
+    assert(chaos_net_endpoint_parse_selector("tcp6://[2001:db8::]/32:443", &selector));
+    assert(selector.kind == CHAOS_NET_ENDPOINT_TCP6 && selector.prefix_len == 32U);
+    assert(selector.port == 443U);
+    endpoint_of(&endpoint, CHAOS_NET_ENDPOINT_TCP6, "2001:db8:1:2::9", 443U);
+    assert(chaos_net_endpoint_matches(&selector, &endpoint, &rank) && rank == 3U);
+    endpoint_of(&endpoint, CHAOS_NET_ENDPOINT_TCP6, "2001:db9::1", 443U);
+    assert(!chaos_net_endpoint_matches(&selector, &endpoint, NULL));
+    assert(chaos_net_endpoint_parse_selector("udp6://[fe80::]/10:53", &selector));
+    assert(selector.prefix_len == 10U);
+    endpoint_of(&endpoint, CHAOS_NET_ENDPOINT_UDP6, "febf::1", 53U);
+    assert(chaos_net_endpoint_matches(&selector, &endpoint, NULL));
+    endpoint_of(&endpoint, CHAOS_NET_ENDPOINT_UDP6, "fec0::1", 53U);
+    assert(!chaos_net_endpoint_matches(&selector, &endpoint, NULL));
+    assert(chaos_net_endpoint_parse_selector("tcp6://[::1]:443", &selector));
+    assert(selector.prefix_len == 128U);
+    assert(chaos_net_endpoint_parse_selector("tcp6://[::1]/128:443", &selector));
+    assert(selector.prefix_len == 128U);
+    endpoint_of(&endpoint, CHAOS_NET_ENDPOINT_TCP6, "::1", 443U);
+    assert(chaos_net_endpoint_matches(&selector, &endpoint, NULL));
+
+    /* Rejections: host bits outside the prefix, a width the family has not got, and
+     * everything that is not a bare decimal. */
+    assert(!chaos_net_endpoint_parse_selector("tcp4://10.0.0.1/8:5432", &selector));
+    assert(!chaos_net_endpoint_parse_selector("tcp6://[2001:db8::1]/32:443", &selector));
+    assert(!chaos_net_endpoint_parse_selector("tcp4://10.0.0.0/33:5432", &selector));
+    assert(!chaos_net_endpoint_parse_selector("tcp6://[2001:db8::]/129:443", &selector));
+    assert(!chaos_net_endpoint_parse_selector("tcp4://10.0.0.0/:5432", &selector));
+    assert(!chaos_net_endpoint_parse_selector("tcp6://[2001:db8::]/:443", &selector));
+    assert(!chaos_net_endpoint_parse_selector("tcp4://10.0.0.0/+8:5432", &selector));
+    assert(!chaos_net_endpoint_parse_selector("tcp4://10.0.0.0/ 8:5432", &selector));
+    assert(!chaos_net_endpoint_parse_selector("tcp4://10.0.0.0/8x:5432", &selector));
+    assert(!chaos_net_endpoint_parse_selector("tcp4://10.0.0.0/8", &selector));
+    assert(!chaos_net_endpoint_parse_selector("tcp6://[2001:db8::]/32", &selector));
+    /* A wildcard host takes no prefix: `*` compares no address bits at all. */
+    assert(!chaos_net_endpoint_parse_selector("tcp4://*/8:5432", &selector));
+    assert(!chaos_net_endpoint_parse_selector("tcp6://*/32:443", &selector));
+
+    /* A dual-stack listener is reached by a wildcard host, not by a prefix. */
+    (void)memset(&endpoint, 0, sizeof(endpoint));
+    endpoint.kind = CHAOS_NET_ENDPOINT_TCP6;
+    endpoint.port = 8080U;
+    endpoint.dual_stack_wildcard = 1;
+    assert(chaos_net_endpoint_parse_selector("tcp4://*:8080", &selector));
+    assert(chaos_net_endpoint_matches(&selector, &endpoint, &rank) && rank == 2U);
+    assert(chaos_net_endpoint_parse_selector("tcp4://0.0.0.0/0:8080", &selector));
+    assert(!chaos_net_endpoint_matches(&selector, &endpoint, NULL));
+}
+
 /**
  * @brief Proves the remaining selector rejections, that only `::ffff:0:0/96` is treated as
  *   IPv4, and that descriptor lookups fail before the real functions are resolved.
@@ -816,6 +944,7 @@ int main(void)
 {
     test_selector_parsing_and_matching();
     test_endpoint_resolution_from_sockaddr_and_fd();
+    test_cidr_selectors();
     test_selector_rejections_and_unresolved_lookups();
     test_dual_stack_wildcard_listener();
     return 0;

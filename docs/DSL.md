@@ -164,10 +164,12 @@ ms            = 1*DIGIT                                     ; 0 .. 4294967295
 ;; may contain ":"
 net-rule      = endpoint ":" net-op ":" net-effect
 endpoint      = "*"
-              / ( "tcp4" / "udp4" ) "://" ( ipv4 / "*" ) ":" port
-              / ( "tcp6" / "udp6" ) "://" ( "[" ipv6 "]" / "*" ) ":" port
+              / ( "tcp4" / "udp4" ) "://" ( ipv4 [ "/" v4-prefix ] / "*" ) ":" port
+              / ( "tcp6" / "udp6" ) "://" ( "[" ipv6 "]" [ "/" v6-prefix ] / "*" ) ":" port
               / "unix://" unix-path                         ; exact path, "@name" for
                                                             ; abstract sockets, or "*"
+v4-prefix     = 1*2DIGIT                                    ; 0 .. 32; host bits must be 0
+v6-prefix     = 1*3DIGIT                                    ; 0 .. 128; host bits must be 0
 port          = 1*5DIGIT                                    ; 0 .. 65535, exact: no wildcard
 net-op        = "socket" / "bind" / "listen" / "connect" / "accept"
               / "shutdown" / "poll" / "send" / "recv" / "close"
@@ -725,7 +727,7 @@ note right
   others: highest rank, longer text, first in file
   mmap/anon > mmap > *
   dns:~//api.example.com > dns:~//*.example.com > dns:~//* > *
-  tcp4:~//10.0.0.15:5432 > tcp4:~//*:5432 > *
+  tcp4:~//10.0.0.15:5432 > tcp4:~//10.0.0.0/8:5432 > tcp4:~//*:5432 > *
   clock_gettime/monotonic > clock_gettime > *
 end note
 
@@ -1022,6 +1024,13 @@ the implementation prefers it.
   additionally the host. `tcp4://10.0.0.2:5432` matches only the former. So
   `* ≺ tcp4://*:5432 ≺ tcp4://10.0.0.15:5432`, matching ranks 1 < 2 < 3. Exact
   `unix://` paths (4) are more specific than `unix://*` (2). □
+- A `/N` prefix (`tcp4://10.0.0.0/8:5432`, `tcp6://[2001:db8::]/32:443`) is an address
+  selector like any other, so it has rank 3, and the prefix length orders two of them:
+  `tcp4://10.0.0.0/8:5432 ≺ tcp4://10.1.0.0/16:5432 ≺ tcp4://10.1.2.3:5432`, because a
+  literal address is the `/32` (or `/128`) case of the same comparison. A prefix must be
+  written canonically -- every bit after it zero -- so `10.0.0.1/8` is rejected rather than
+  read as `10.0.0.0/8`: the selector text is a rule's identity, and two spellings of one
+  network would be two rules that match the same traffic. `*` takes no prefix. □
 
 **dns — name rank and suffix length:**
 

@@ -85,14 +85,126 @@ static int chaos_net_parse_port(const char *text, uint16_t *port)
 }
 
 /**
+ * @brief Splits a `/N` prefix off the end of @p host and reports N.
+ *
+ * @details In place: the `/` becomes the NUL, so the caller parses the address from the
+ * same buffer. Without a `/` the address is a literal and N is @p bits, the full width.
+ *
+ * @param host  NUL-terminated host text, modified when it carries a prefix.
+ * @param bits  Width of the family, 32 or 128.
+ * @param out   Output: the prefix length.
+ * @return 1 on success; 0 for an empty, non-numeric or too-large prefix.
+ */
+static int chaos_net_split_prefix(char *host, unsigned int bits, unsigned int *out)
+{
+    char *slash = strchr(host, '/');
+    char *end = NULL;
+    unsigned long value;
+
+    if (slash == NULL)
+    {
+        *out = bits;
+        return 1;
+    }
+    *slash = '\0';
+    if (slash[1] == '\0')
+    {
+        return 0;
+    }
+    value = strtoul(slash + 1, &end, 10);
+    /* No blanks, no sign, no trailing text: "/ 8", "/+8" and "/8x" are not prefixes. */
+    if (*end != '\0' || slash[1] < '0' || slash[1] > '9' || value > bits)
+    {
+        return 0;
+    }
+    *out = (unsigned int)value;
+    return 1;
+}
+
+/**
+ * @brief Whether @p address has no bits set below its first @p prefix_len bits.
+ *
+ * @details A prefix is written canonically or not at all: `10.0.0.0/8` is accepted,
+ * `10.0.0.1/8` is rejected rather than quietly masked. Masking would make two rules with
+ * different text match exactly the same traffic, and the text is a rule's identity here --
+ * it keys its hit slot and breaks specificity ties. A rejected line also catches the real
+ * mistake behind it, which is a prefix length the author did not mean.
+ *
+ * @param address     Address bytes in network order.
+ * @param size        Number of bytes, 4 or 16.
+ * @param prefix_len  Bits that belong to the prefix.
+ * @return Non-zero when every bit after the prefix is zero.
+ */
+static int
+chaos_net_prefix_is_canonical(const unsigned char *address, size_t size, unsigned int prefix_len)
+{
+    size_t index;
+
+    for (index = 0U; index < size; ++index)
+    {
+        const unsigned int bit = (unsigned int)index * 8U;
+        unsigned char mask;
+
+        if (prefix_len >= bit + 8U)
+        {
+            continue;
+        }
+        mask = prefix_len <= bit ? 0xFFU : (unsigned char)(0xFFU >> (prefix_len - bit));
+        if ((address[index] & mask) != 0U)
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/**
+ * @brief Whether @p selector and @p endpoint agree on their first @p prefix_len bits.
+ *
+ * @param selector    Selector address bytes in network order.
+ * @param endpoint    Endpoint address bytes in network order.
+ * @param size        Number of bytes, 4 or 16.
+ * @param prefix_len  Bits to compare; the full width is an exact comparison.
+ * @return Non-zero when the prefixes are equal.
+ */
+static int chaos_net_prefix_matches(
+    const unsigned char *selector,
+    const unsigned char *endpoint,
+    size_t size,
+    unsigned int prefix_len
+)
+{
+    const size_t whole = prefix_len / 8U;
+    const unsigned int rest = prefix_len % 8U;
+
+    /* The parser bounds prefix_len by the family width, so whole <= size always. */
+    (void)size;
+    if (whole > 0U && memcmp(selector, endpoint, whole) != 0)
+    {
+        return 0;
+    }
+    if (rest == 0U)
+    {
+        return 1;
+    }
+    {
+        const unsigned char mask = (unsigned char)(0xFFU << (8U - rest));
+
+        return (selector[whole] & mask) == (endpoint[whole] & mask);
+    }
+}
+
+/**
  * @brief Parses the part of a `tcp4://` or `udp4://` selector after the scheme.
  *
- * @details `HOST:PORT`, split at the last `:`. HOST is `*` (wildcard host) or a
- * dotted-quad address accepted by inet_pton(AF_INET); an empty HOST is rejected.
+ * @details `HOST:PORT`, split at the last `:`. HOST is `*` (wildcard host), a dotted-quad
+ * address accepted by inet_pton(AF_INET), or such an address with a `/N` prefix; an empty
+ * HOST is rejected. `*` takes no prefix: a wildcard host compares no address bits at all.
  *
  * @param body      Text after the scheme.
  * @param kind      CHAOS_NET_ENDPOINT_TCP4 or CHAOS_NET_ENDPOINT_UDP4.
- * @param endpoint  Output (already zeroed); kind, wildcard_host or value.ipv4, and port.
+ * @param endpoint  Output (already zeroed); kind, wildcard_host or value.ipv4 with
+ *                  prefix_len, and port.
  * @return 1 on success; 0 on any parse error.
  */
 static int chaos_net_parse_ipv4_selector(
@@ -122,7 +234,13 @@ static int chaos_net_parse_ipv4_selector(
         }
         (void)memcpy(host, body, host_len);
         host[host_len] = '\0';
-        if (inet_pton(AF_INET, host, &endpoint->value.ipv4) != 1)
+        if (!chaos_net_split_prefix(host, 32U, &endpoint->prefix_len) ||
+            inet_pton(AF_INET, host, &endpoint->value.ipv4) != 1 ||
+            !chaos_net_prefix_is_canonical(
+                (const unsigned char *)&endpoint->value.ipv4,
+                sizeof(endpoint->value.ipv4),
+                endpoint->prefix_len
+            ))
         {
             return 0;
         }
@@ -137,8 +255,10 @@ static int chaos_net_parse_ipv4_selector(
  *
  * @details Two forms:
  *   - `*:PORT`      -- wildcard host.
- *   - `[ADDR]:PORT` -- an address accepted by inet_pton(AF_INET6); the `]` must be
- *                      followed directly by `:`.
+ *   - `[ADDR]:PORT` or `[ADDR]/N:PORT` -- an address accepted by inet_pton(AF_INET6),
+ *                      optionally with a prefix length; the `]` must be followed directly
+ *                      by `:` or by the prefix. The prefix sits outside the brackets,
+ *                      which hold the address a `:` belongs to.
  * A bare `*` (no port) is rejected: there is no port wildcard.
  *
  * @param body      Text after the scheme.
@@ -150,9 +270,11 @@ static int chaos_net_parse_ipv6_selector(
     const char *body, chaos_net_endpoint_kind_t kind, chaos_net_endpoint_t *endpoint
 )
 {
+    const char *close_text;
     const char *port_text;
-    char host[INET6_ADDRSTRLEN];
+    char host[INET6_ADDRSTRLEN + 4U];
     size_t host_len;
+    size_t prefix_len;
 
     endpoint->kind = kind;
     if (strcmp(body, "*") == 0)
@@ -174,26 +296,51 @@ static int chaos_net_parse_ipv6_selector(
         return 0;
     }
 
-    port_text = strchr(body, ']');
-    if (port_text == NULL || port_text[1] != ':')
+    close_text = strchr(body, ']');
+    if (close_text == NULL)
+    {
+        return 0;
+    }
+    if (close_text[1] == ':')
+    {
+        port_text = close_text + 1;
+    }
+    else if (close_text[1] == '/')
+    {
+        port_text = strchr(close_text + 2, ':');
+        if (port_text == NULL)
+        {
+            return 0;
+        }
+    }
+    else
     {
         return 0;
     }
 
-    host_len = (size_t)(port_text - (body + 1));
-    if (host_len == 0U || host_len >= sizeof(host))
+    host_len = (size_t)(close_text - (body + 1));
+    prefix_len = (size_t)(port_text - (close_text + 1));
+    if (host_len == 0U || host_len + prefix_len >= sizeof(host))
     {
         return 0;
     }
 
     (void)memcpy(host, body + 1, host_len);
-    host[host_len] = '\0';
-    if (inet_pton(AF_INET6, host, &endpoint->value.ipv6) != 1)
+    /* The prefix is copied on behind the address so one buffer holds "ADDR/N". */
+    (void)memcpy(host + host_len, close_text + 1, prefix_len);
+    host[host_len + prefix_len] = '\0';
+    if (!chaos_net_split_prefix(host, 128U, &endpoint->prefix_len) ||
+        inet_pton(AF_INET6, host, &endpoint->value.ipv6) != 1 ||
+        !chaos_net_prefix_is_canonical(
+            (const unsigned char *)&endpoint->value.ipv6,
+            sizeof(endpoint->value.ipv6),
+            endpoint->prefix_len
+        ))
     {
         return 0;
     }
 
-    return chaos_net_parse_port(port_text + 2, &endpoint->port);
+    return chaos_net_parse_port(port_text + 1, &endpoint->port);
 }
 
 /**
@@ -342,9 +489,12 @@ int chaos_net_endpoint_matches(
                 rank = 2U;
                 break;
             }
-            if (memcmp(
-                    &selector->value.ipv4, &endpoint->value.ipv4, sizeof(selector->value.ipv4)
-                ) != 0)
+            if (!chaos_net_prefix_matches(
+                    (const unsigned char *)&selector->value.ipv4,
+                    (const unsigned char *)&endpoint->value.ipv4,
+                    sizeof(selector->value.ipv4),
+                    selector->prefix_len
+                ))
             {
                 return 0;
             }
@@ -361,10 +511,13 @@ int chaos_net_endpoint_matches(
                 rank = 2U;
                 break;
             }
-            /* in6_addr is 16 bytes without padding: memcmp compares the address. */
-            if (memcmp(
-                    &selector->value.ipv6, &endpoint->value.ipv6, sizeof(selector->value.ipv6)
-                ) != 0)
+            /* in6_addr is 16 bytes without padding: the bytes are the address. */
+            if (!chaos_net_prefix_matches(
+                    (const unsigned char *)&selector->value.ipv6,
+                    (const unsigned char *)&endpoint->value.ipv6,
+                    sizeof(selector->value.ipv6),
+                    selector->prefix_len
+                ))
             {
                 return 0;
             }

@@ -1311,17 +1311,52 @@ const chaos_status_error_t *chaos_net_config_last_error(void)
 typedef struct chaos_net_best_rule
 {
     unsigned int rank;
+    unsigned int prefix;
     size_t length;
     int found;
 } chaos_net_best_rule_t;
 
 /**
  * @brief Updates @p rule and @p best with any rule for @p operation that matches
- *        @p endpoint more specifically (higher rank, then longer selector) than @p best.
+ *        @p endpoint more specifically (higher rank, then longer address prefix, then
+ *        longer selector text) than @p best.
  *
  * @details Strict comparisons: on a full tie the rule found first is kept. That makes the
  * first endpoint passed by chaos_net_config_match_either_loaded() win ties.
+ *
+ * The prefix stage is what orders `tcp4://10.1.0.0/16:5432` above `tcp4://10.0.0.0/8:5432`
+ * for an address both contain. Comparing prefixes of different families never arises: a
+ * rule only reaches this point with a kind the endpoint's own kind allows, and the one
+ * cross-family case (a dual-stack listener) is reserved to wildcard hosts, whose prefix is
+ * 0 on both sides. Selector text alone would order `10.0.0.0/8` above `10.1.0.0/16`,
+ * because it is one character longer.
  */
+/**
+ * @brief Whether a rule that matched at @p rank beats @p best.
+ *
+ * @details The order is rank, then address prefix length, then selector text length; each
+ * stage decides only when the one before it ties, and a full tie keeps the earlier rule.
+ *
+ * @param selector  Selector of the candidate rule.
+ * @param rank      Rank it matched the endpoint at.
+ * @param best      Current best.
+ * @return Non-zero when the candidate is more specific.
+ */
+static int chaos_net_config_is_more_specific(
+    const chaos_net_endpoint_t *selector, unsigned int rank, const chaos_net_best_rule_t *best
+)
+{
+    if (rank != best->rank)
+    {
+        return rank > best->rank;
+    }
+    if (selector->prefix_len != best->prefix)
+    {
+        return selector->prefix_len > best->prefix;
+    }
+    return selector->selector_len > best->length;
+}
+
 static void chaos_net_config_select_better(
     const chaos_net_rule_t *rules,
     size_t rule_count,
@@ -1345,12 +1380,11 @@ static void chaos_net_config_select_better(
         {
             continue;
         }
-        /* Higher rank wins; equal rank, the longer (more specific) selector text. */
-        if (!best->found || rank > best->rank ||
-            (rank == best->rank && rules[index].selector.selector_len > best->length))
+        if (!best->found || chaos_net_config_is_more_specific(&rules[index].selector, rank, best))
         {
             *rule = rules[index];
             best->rank = rank;
+            best->prefix = rules[index].selector.prefix_len;
             best->length = rules[index].selector.selector_len;
             best->found = 1;
         }
@@ -1365,7 +1399,7 @@ int chaos_net_config_select_endpoint_rule(
     chaos_net_rule_t *rule
 )
 {
-    chaos_net_best_rule_t best = {0U, 0U, 0};
+    chaos_net_best_rule_t best = {0U, 0U, 0U, 0};
 
     if (rules == NULL || endpoint == NULL || rule == NULL)
     {
@@ -1865,7 +1899,7 @@ int chaos_net_config_match_final_loaded(
 {
     const chaos_net_config_state_t *state = chaos_net_config_active_state();
     const uint64_t sequence = chaos_snapshot_read_begin(&state->sequence);
-    chaos_net_best_rule_t best = {0U, 0U, 0};
+    chaos_net_best_rule_t best = {0U, 0U, 0U, 0};
     size_t index;
 
     if (state->parse_ok == 0)
@@ -1885,8 +1919,7 @@ int chaos_net_config_match_final_loaded(
         const unsigned int rank = chaos_net_endpoint_selector_rank(&state->rules[index].selector);
 
         if (state->rules[index].operation == operation &&
-            (rank > best.rank ||
-             (rank == best.rank && state->rules[index].selector.selector_len > best.length)))
+            chaos_net_config_is_more_specific(&state->rules[index].selector, rank, &best))
         {
             return 0;
         }
@@ -1903,7 +1936,7 @@ int chaos_net_config_match_either_loaded(
 {
     const chaos_net_config_state_t *state = chaos_net_config_active_state();
     const uint64_t sequence = chaos_snapshot_read_begin(&state->sequence);
-    chaos_net_best_rule_t best = {0U, 0U, 0};
+    chaos_net_best_rule_t best = {0U, 0U, 0U, 0};
 
     if (state->parse_ok == 0)
     {

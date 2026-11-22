@@ -1032,6 +1032,31 @@ int main(void)
     assert(PASSES(decide(__NR_listen, (uint64_t)listener, 4U, 0, 0, 0, 0)));
     g_fail_process = 0;
 
+    /* A `/N` prefix selector works here too: the supervisor reads the sockaddr out of the
+     * tracee and matches it with the same code the library uses, so the Docker bridge
+     * network a container is given can be named without knowing its address. */
+    (void)snprintf(
+        rules,
+        sizeof(rules),
+        "tcp4://127.0.0.0/8:%u:connect:EHOSTUNREACH:1.0\n",
+        ntohs(server_address.sin_port)
+    );
+    write_rules(rules);
+    assert(FAILS(
+        decide(
+            __NR_connect, (uint64_t)unbound, P(&server_address), sizeof(server_address), 0, 0, 0
+        ),
+        EHOSTUNREACH
+    ));
+    /* Outside the prefix, nothing matches: the port alone does not carry the rule. */
+    {
+        struct sockaddr_in outside = server_address;
+
+        assert(inet_pton(AF_INET, "10.1.2.3", &outside.sin_addr) == 1);
+        assert(PASSES(decide(__NR_connect, (uint64_t)unbound, P(&outside), sizeof(outside), 0, 0, 0)
+        ));
+    }
+
     /* With rules only for connect, recv and poll calls must not touch /proc at all
      * (zero protocol lookups), so a busy event loop costs nothing; connect still does. */
     write_rules("*:connect:ECONNREFUSED:1.0\n");

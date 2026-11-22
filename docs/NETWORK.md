@@ -236,12 +236,18 @@ gets a rank:
 | Rank | Selector |
 |------|----------|
 | 4 | `unix://<path>`, exact path |
-| 3 | `tcp4://`, `tcp6://`, `udp4://`, `udp6://` with exact address and port |
+| 3 | `tcp4://`, `tcp6://`, `udp4://`, `udp6://` with an address and exact port; a `/N` prefix counts as an address |
 | 2 | `<scheme>://*:<port>` (any host, exact port) or `unix://*` |
 | 1 | `*` |
 
-The highest rank wins. A tie goes to the longer selector text, then to the rule
-that comes first in the file.
+The highest rank wins. A tie goes to the longer address prefix, then to the longer
+selector text, then to the rule that comes first in the file.
+
+The prefix stage sits above the text stage because the text would order the wrong way
+round: `tcp4://10.0.0.0/8:5432` is written one byte longer than `tcp4://10.1.0.0/16:5432`
+is not, and for an address both contain the `/16` rule is the one meant. A literal address
+is the `/32` (or `/128`) case of the same comparison, so it beats every shorter prefix
+without a rule of its own.
 
 For `send` and `recv` on a connected socket both ends are searched in one pass,
 so a wildcard for one end never shadows a more specific rule for the other. A
@@ -454,8 +460,10 @@ with the socket's inode and device and is cleared on `close()`.
 | Selector | Matches |
 |----------|---------|
 | `tcp4://10.0.0.15:5432` | TCP over IPv4 to/from that address and port (also IPv4-mapped IPv6) |
+| `tcp4://10.0.0.0/8:5432` | TCP over IPv4 to/from any address in that network, port 5432 |
 | `tcp4://*:5432` | TCP over IPv4, any address, port 5432 |
 | `tcp6://[::1]:443` | TCP over IPv6, that address and port; brackets are required |
+| `tcp6://[2001:db8::]/32:443` | TCP over IPv6 in that network; the prefix sits outside the brackets |
 | `tcp6://*:443` | TCP over IPv6, any address, port 443 |
 | `udp4://8.8.8.8:53`, `udp6://[2001:db8::1]:53` | the UDP equivalents |
 | `unix:///var/run/docker.sock` | a UNIX socket with exactly that path |
@@ -467,6 +475,15 @@ with the socket's inode and device and is cleared on `close()`.
   wildcard the port. `tcp4://*:0` therefore matches only endpoints with port 0
   (unbound sockets, and the endpoint built at `socket()` time).
 - The kind must match: `tcp4://` never matches UDP or IPv6 traffic.
+- A `/N` prefix is 0 to 32 bits for IPv4 and 0 to 128 for IPv6, and must be written
+  canonically: every bit after the prefix has to be zero, so `10.0.0.0/8` is accepted and
+  `10.0.0.1/8` rejects the rule file rather than being read as the network containing it.
+  A selector's text is a rule's identity -- it keys the rule's hit slot and breaks
+  specificity ties -- so two spellings of one network would be two rules matching exactly
+  the same traffic. The rejection also catches the mistake behind it, which is usually a
+  prefix length the author did not mean. `*` takes no prefix: it compares no address bits.
+- A prefix selector does not reach a dual-stack `[::]` listener (§4.6). That listener has
+  no IPv4 address to compare against; only a wildcard host matches it across families.
 - A UNIX path may be up to 255 bytes. It cannot contain `#` (comment start).
 - `socket` rules accept only selectors that describe no address: `*`,
   `<scheme>://*:0` and `unix://*`. Anything else rejects the rule file.

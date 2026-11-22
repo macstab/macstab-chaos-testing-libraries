@@ -683,6 +683,60 @@ static void test_selection_and_buffer_edges(void)
 }
 
 /**
+ * @brief Proves the longer address prefix wins, whatever the selector texts are.
+ *
+ * @details The prefix stage sits between rank and selector text, so the two have to be
+ * made to disagree. The `/8` rule is given a selector text longer than any real selector
+ * while keeping its parsed prefix: text length alone would then pick it for an address both
+ * prefixes contain, and the prefix stage picks the `/16` anyway. A literal address is the
+ * full-width prefix and beats both. On a full tie the earlier rule stands.
+ */
+static void test_prefix_beats_selector_text(void)
+{
+    chaos_net_rule_t rules[3];
+    chaos_net_rule_t rule;
+    chaos_net_endpoint_t endpoint = {0};
+    size_t index;
+
+    (void)memset(rules, 0, sizeof(rules));
+    assert(chaos_net_endpoint_parse_selector("tcp4://10.0.0.0/8:80", &rules[0].selector));
+    assert(chaos_net_endpoint_parse_selector("tcp4://10.1.0.0/16:80", &rules[1].selector));
+    assert(chaos_net_endpoint_parse_selector("tcp4://10.1.2.3:80", &rules[2].selector));
+    assert(rules[0].selector.prefix_len == 8U && rules[1].selector.prefix_len == 16U);
+    assert(rules[2].selector.prefix_len == 32U);
+    for (index = 0U; index < 3U; ++index)
+    {
+        rules[index].operation = CHAOS_NET_OP_CONNECT;
+        rules[index].effect = CHAOS_NET_EFFECT_LATENCY;
+        rules[index].latency_ms = (uint32_t)rules[index].selector.prefix_len;
+    }
+    /* Longer than any selector text in the file, so the text stage would pick this rule. */
+    rules[0].selector.selector_len = 200U;
+
+    assert(chaos_net_endpoint_parse_selector("tcp4://10.1.2.3:80", &endpoint));
+    assert(chaos_net_config_select_endpoint_rule(rules, 2U, CHAOS_NET_OP_CONNECT, &endpoint, &rule)
+    );
+    assert(rule.latency_ms == 16U);
+    assert(chaos_net_config_select_endpoint_rule(rules, 3U, CHAOS_NET_OP_CONNECT, &endpoint, &rule)
+    );
+    assert(rule.latency_ms == 32U);
+
+    /* An address only the /8 contains falls back to it, long text and all. */
+    assert(chaos_net_endpoint_parse_selector("tcp4://10.9.9.9:80", &endpoint));
+    assert(chaos_net_config_select_endpoint_rule(rules, 3U, CHAOS_NET_OP_CONNECT, &endpoint, &rule)
+    );
+    assert(rule.latency_ms == 8U);
+
+    /* Equal rank, equal prefix, equal text: the earlier rule stands. */
+    rules[2] = rules[1];
+    rules[2].latency_ms = 99U;
+    assert(chaos_net_endpoint_parse_selector("tcp4://10.1.2.3:80", &endpoint));
+    assert(chaos_net_config_select_endpoint_rule(rules, 3U, CHAOS_NET_OP_CONNECT, &endpoint, &rule)
+    );
+    assert(rule.latency_ms == 16U);
+}
+
+/**
  * @brief Proves every malformed line is rejected with -1 and a comment-only line returns 0.
  *
  * @details Rejected: missing fields; an empty selector, operation, effect or value; an
@@ -895,6 +949,24 @@ static void test_file_and_state_edges(void)
         g_chaos_net_cached_mtime = CHAOS_NET_MTIME_UNKNOWN;
         assert(chaos_net_config_prepare());
         assert(!chaos_net_config_match_final_loaded(CHAOS_NET_OP_RECV, &local, &rule));
+
+        /* Equal rank, shorter selector text, but a longer address prefix: the other end
+         * could still win, so the match is not final. Without the prefix stage here the
+         * caller would skip resolving the other end and apply the /8 rule where the
+         * exact rule belongs -- the text comparison alone calls it final. */
+        write_config_text(
+            "tcp4://10.0.0.0/8:5433:recv:ECONNRESET:1.0\n"
+            "tcp4://10.9.9.9:5433:recv:ETIMEDOUT:1.0\n",
+            36
+        );
+        g_chaos_net_cached_mtime = CHAOS_NET_MTIME_UNKNOWN;
+        assert(chaos_net_config_prepare());
+        {
+            chaos_net_endpoint_t inside;
+
+            assert(chaos_net_endpoint_parse_selector("tcp4://10.1.1.1:5433", &inside));
+            assert(!chaos_net_config_match_final_loaded(CHAOS_NET_OP_RECV, &inside, &rule));
+        }
 
         /* Wildcard rules only: any match is final. */
         write_config_text("*:recv:LATENCY:10\n", 35);
@@ -2382,6 +2454,7 @@ int main(void)
     test_read_file_rejects_changed_file();
     test_helper_functions();
     test_parse_and_select_rules();
+    test_prefix_beats_selector_text();
     test_selection_and_buffer_edges();
     test_invalid_lines();
     test_latency_probability();

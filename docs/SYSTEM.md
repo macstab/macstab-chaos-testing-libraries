@@ -320,8 +320,10 @@ unrelated site; failing at load is diagnosable.
    or the `openat` directory), endpoint (net), name or address (dns),
    operation and target (time, memory, process).
 5. **Select.** Scan the active snapshot linearly (at most 256 rules) for the
-   most specific matching rule per effect class; ties go to the longer
-   selector text, so line order never changes the outcome.
+   most specific matching rule per effect class. Ties go to the longer
+   address prefix in net (`tcp4://10.1.0.0/16:…` over `tcp4://10.0.0.0/8:…`,
+   a literal address being the full-width case), then to the longer selector
+   text, so line order never changes the outcome.
 6. **Gate.** Check `@from`/`@until` against `CLOCK_REALTIME`, `@size` against
    the call's byte count, then the probability, then claim an `@first` slot,
    then count the hit.
@@ -627,7 +629,7 @@ domain is unambiguously another library's.
 Responsibilities:
 
 - endpoint selectors: `*`, `tcp4://`, `tcp6://`, `udp4://`, `udp6://`,
-  `unix://`, with wildcard host and port
+  `unix://`, with wildcard host and port, and `/N` address prefixes
 - operations `socket`, `bind`, `listen`, `connect`, `accept`, `shutdown`,
   `poll`, `send`, `recv`, `close`
 - effects `ERRNO`, `LATENCY`, `CORRUPT` (recv), `TIMEOUT` (poll),

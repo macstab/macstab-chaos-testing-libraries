@@ -360,15 +360,25 @@ tcp4://127.0.0.1:9000:recv:CORRUPT:0.1
 tcp4://127.0.0.1:6379:recv:TRICKLE:1
 tcp4://127.0.0.1:9092:recv:DUP:0.05
 tcp4://*:5432:close:RESET:1.0
+tcp4://10.0.0.0/8:5432:connect:ECONNREFUSED:0.1
 *:connect:ETIMEDOUT:0.05
 ```
 
-**Endpoint selectors.** `*`; `tcp4://<ipv4>:<port>`, `tcp4://*:<port>`;
-`tcp6://[<ipv6>]:<port>`, `tcp6://*:<port>`; the same for `udp4`/`udp6`;
+**Endpoint selectors.** `*`; `tcp4://<ipv4>[/<prefix>]:<port>`, `tcp4://*:<port>`;
+`tcp6://[<ipv6>][/<prefix>]:<port>`, `tcp6://*:<port>`; the same for `udp4`/`udp6`;
 `unix://<path>`, `unix://*`, and `unix://@name` for abstract sockets. The port is a
 decimal number 0–65535; there is no port wildcard. Rank, lowest to highest: `*`, a
-wildcard host or `unix://*`, an exact address and port, an exact UNIX path. The
+wildcard host or `unix://*`, an address and port, an exact UNIX path. The
 family must match: `tcp4` never matches a `tcp6` or UDP socket.
+
+`/<prefix>` selects a network: `tcp4://10.0.0.0/8:5432` is every address in `10.0.0.0/8`
+on port 5432, `tcp6://[2001:db8::]/32:443` the IPv6 equivalent, with the prefix outside
+the brackets. It is 0–32 bits for IPv4 and 0–128 for IPv6 and must be canonical: every
+bit after it zero, so `10.0.0.1/8` rejects the rule file instead of being read as the
+network around it. A prefix has the same rank as a literal address, and between two that
+both contain an address the longer prefix wins -- a literal address being the `/32` (or
+`/128`) case of it. This is how a rule names a Docker bridge network, whose address a
+container is given rather than choosing.
 
 **Operations and the address they match.**
 
