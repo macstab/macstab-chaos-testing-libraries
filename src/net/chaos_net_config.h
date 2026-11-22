@@ -41,6 +41,7 @@
 #include "chaos_policy.h"
 #include "chaos_status.h"
 
+#include <limits.h>
 #include <netinet/in.h>
 #include <sys/uio.h>
 
@@ -528,6 +529,12 @@ int chaos_net_config_select_endpoint_rule(
  *
  * @details An array longer than the kernel accepts is not read: the call fails
  * anyway, and its count need not describe memory the caller owns.
+ *
+ * A total above SSIZE_MAX is no byte count either, for the same reason: the call returns
+ * `ssize_t`, so the kernel rejects it with EINVAL and it transfers nothing. Summing it
+ * anyway would wrap and hand the gates a small number for a huge request -- `@size<10`
+ * would match a call asking for 2^64 bytes. The bound is checked per segment, before the
+ * addition that would wrap.
  */
 static inline uint64_t chaos_net_iovec_size(const struct iovec *iov, int iovcnt)
 {
@@ -540,6 +547,10 @@ static inline uint64_t chaos_net_iovec_size(const struct iovec *iov, int iovcnt)
     }
     for (index = 0; index < iovcnt; ++index)
     {
+        if ((uint64_t)iov[index].iov_len > (uint64_t)SSIZE_MAX - total)
+        {
+            return CHAOS_POLICY_NO_SIZE;
+        }
         total += (uint64_t)iov[index].iov_len;
     }
     return total;

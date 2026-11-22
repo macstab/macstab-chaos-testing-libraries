@@ -741,6 +741,18 @@ int main(void)
     assert(FAILS(decide(__NR_sendto, (uint64_t)client, P(buffer), 20U, 0, 0, 0), EPIPE));
     assert(FAILS(decide(__NR_sendmsg, (uint64_t)client, P(&message), 0, 0, 0, 0), EPIPE));
     assert(PASSES(decide(__NR_sendmsg, (uint64_t)client, 0U, 0, 0, 0, 0))); /* size unknown */
+    /* So is a total above SSIZE_MAX: the call returns ssize_t and the kernel rejects it,
+     * and a wrapping sum would have handed `@size>10` a small number for a request larger
+     * than the address space. */
+    {
+        struct iovec huge[2];
+
+        huge[0].iov_base = buffer;
+        huge[0].iov_len = (size_t)SSIZE_MAX;
+        huge[1].iov_base = buffer;
+        huge[1].iov_len = (size_t)SSIZE_MAX;
+        assert(PASSES(decide(__NR_writev, (uint64_t)client, P(huge), 2U, 0, 0, 0)));
+    }
     /* The accepted socket's peer (client port) matches nothing; its local end does. */
     assert(FAILS(decide(__NR_write, (uint64_t)server, P(buffer), 20U, 0, 0, 0), EPIPE));
     /* A socket of a protocol chaos-init does not resolve (netlink): neither end

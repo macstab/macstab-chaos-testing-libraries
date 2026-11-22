@@ -293,6 +293,13 @@ static uint64_t chaos_init_io_iov_size(pid_t tid, uint64_t address, uint64_t cou
         }
         for (index = 0U; index < chunk; ++index)
         {
+            /* A total above SSIZE_MAX is no byte count: the call returns ssize_t, so the
+             * kernel rejects it with EINVAL. Summing it anyway would wrap and hand the
+             * gates a small number for a huge request. Checked before the addition. */
+            if ((uint64_t)vector[index].iov_len > (uint64_t)SSIZE_MAX - total)
+            {
+                return CHAOS_POLICY_NO_SIZE;
+            }
             total += (uint64_t)vector[index].iov_len;
         }
         done += chunk;

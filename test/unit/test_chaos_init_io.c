@@ -275,6 +275,14 @@ int main(void)
     assert(PASSES(decide(__NR_readv, (uint64_t)big, P(vector), 1U, 0, 0)));
     assert(PASSES(decide(__NR_readv, (uint64_t)big, P(vector), 2000U, 0, 0)));
     assert(PASSES(decide(__NR_readv, (uint64_t)big, 0U, 3U, 0, 0)));
+    /* A total above SSIZE_MAX is no byte count either: the call returns ssize_t and the
+     * kernel rejects it, and a wrapping sum would have handed `@size>100` a small number
+     * for a request larger than the address space. */
+    vector[0].iov_len = (size_t)SSIZE_MAX;
+    vector[1].iov_len = (size_t)SSIZE_MAX;
+    assert(PASSES(decide(__NR_readv, (uint64_t)big, P(vector), 2U, 0, 0)));
+    vector[0].iov_len = 100U;
+    vector[1].iov_len = 100U;
     assert(PASSES(decide(__NR_read, 1U, P(buffer), 500U, 0, 0)));
     assert(PASSES(decide(__NR_read, (uint64_t)pipe_fds[0], P(buffer), 500U, 0, 0)));
     assert(PASSES(decide(__NR_read, 999U, P(buffer), 500U, 0, 0))); /* not open */

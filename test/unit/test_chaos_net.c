@@ -2897,8 +2897,15 @@ static void test_fortified_read_and_poll(void)
 
 /**
  * @brief Proves the `@size` byte count of a vector or message is the sum of all its iovecs,
- *   and unknown (`CHAOS_POLICY_NO_SIZE`) for NULL, a negative count, or more than
- *   `CHAOS_NET_IOV_MAX` entries, which the kernel rejects before reading them.
+ *   and unknown (`CHAOS_POLICY_NO_SIZE`) for NULL, a negative count, more than
+ *   `CHAOS_NET_IOV_MAX` entries (which the kernel rejects before reading them), or a total
+ *   above `SSIZE_MAX`.
+ *
+ * @details The last case is the one that cannot be allowed to wrap: two segments of
+ * `SSIZE_MAX` sum to 2^64 - 2, which is not the sentinel and would pass every gate as a
+ * plausible huge number; one more byte and it wraps to 0, so `@size<10` would match a call
+ * asking for more than the address space. Such a call returns `ssize_t` and the kernel
+ * rejects it with EINVAL, so it has no byte count at all.
  */
 static void test_size_of_vectors_and_messages(void)
 {
@@ -2919,6 +2926,18 @@ static void test_size_of_vectors_and_messages(void)
     assert(chaos_net_message_size(NULL) == CHAOS_POLICY_NO_SIZE);
     assert(chaos_net_iovec_size(iov, CHAOS_NET_IOV_MAX + 1) == CHAOS_POLICY_NO_SIZE);
     message.msg_iovlen = (size_t)CHAOS_NET_IOV_MAX + 1U;
+    assert(chaos_net_message_size(&message) == CHAOS_POLICY_NO_SIZE);
+
+    /* Exactly SSIZE_MAX is still a count; one byte more, in one segment or across two, is
+     * not. The second segment is what a wrapping sum would hide. */
+    iov[0].iov_len = (size_t)SSIZE_MAX;
+    iov[1].iov_len = 0U;
+    assert(chaos_net_iovec_size(iov, 2) == (uint64_t)SSIZE_MAX);
+    iov[1].iov_len = 1U;
+    assert(chaos_net_iovec_size(iov, 2) == CHAOS_POLICY_NO_SIZE);
+    iov[1].iov_len = (size_t)SSIZE_MAX;
+    assert(chaos_net_iovec_size(iov, 2) == CHAOS_POLICY_NO_SIZE);
+    message.msg_iovlen = 2U;
     assert(chaos_net_message_size(&message) == CHAOS_POLICY_NO_SIZE);
 }
 
