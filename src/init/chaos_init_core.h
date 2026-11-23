@@ -91,19 +91,40 @@ int chaos_init_parse_args(int argc, char **argv, chaos_init_options_t *options);
  * 2. x86_64 only: nr >= 0x40000000 (x32 ABI): ALLOW.
  * 3. When sendmsg is among the calls: the handover exemption (see CHAOS_INIT_HANDOVER_FLAGS),
  *    otherwise USER_NOTIF for every sendmsg.
- * 4. One JEQ per remaining system call number, each jumping to the trailing USER_NOTIF.
- * 5. ALLOW, then USER_NOTIF.
+ * 4. One JEQ per traced number, each jumping to the trailing TRACE.
+ * 5. One JEQ per remaining system call number, each jumping to the trailing USER_NOTIF.
+ * 6. ALLOW, USER_NOTIF, and TRACE when anything is traced.
  *
  * Numbers shared by several libraries (read, readv, write, writev, close) appear once.
- * The tests form a linear JEQ chain of at most CHAOS_INIT_MAX_FILTER - 16 entries; that
+ * The tests form a linear JEQ chain of at most CHAOS_INIT_MAX_FILTER - 17 entries; that
  * bound also keeps every forward jump within classic BPF's 8-bit jt/jf offsets.
  *
- * @param handover_fd  The child's descriptor of the handover socketpair.
- * @param out          Output program of @p capacity instructions.
+ * @par Why two groups
+ * A notification reply can fail a call, delay it or return a value, but cannot reach the
+ * tracee's registers, which the data effects need (TORN shortens a length, CORRUPT acts
+ * after the call). Those need `SECCOMP_RET_TRACE` and a ptrace stop. The two cannot be
+ * combined per call: across stacked filters USER_NOTIF outranks TRACE, so a notified
+ * number can never also be traced, and every number belongs to exactly one group. A
+ * traced number therefore carries *all* of its effects through ptrace, errno and latency
+ * included. Details and the measurements behind the choice:
+ * [docs/development/SECCOMP-PTRACE.md](../../docs/development/SECCOMP-PTRACE.md).
+ *
+ * @param handover_fd   The child's descriptor of the handover socketpair.
+ * @param traced        Numbers to answer with TRACE, read only when @p traced_count is
+ *                      above 0, so NULL with 0 builds the program this supervisor built
+ *                      before traced effects existed.
+ * @param traced_count  Entries in @p traced.
+ * @param out           Output program of @p capacity instructions.
  * @return Number of instructions written, or 0 if @p capacity is too small.
  */
-size_t
-chaos_init_build_filter(unsigned libs, int handover_fd, struct sock_filter *out, size_t capacity);
+size_t chaos_init_build_filter(
+    unsigned libs,
+    int handover_fd,
+    const long *traced,
+    size_t traced_count,
+    struct sock_filter *out,
+    size_t capacity
+);
 
 /**
  * @brief Converts a waitpid() status to the exit code chaos-init returns: the child's own

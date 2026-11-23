@@ -281,8 +281,8 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *in
     int error = 0;
     int listener = -1;
 
-    program.len =
-        (unsigned short)chaos_init_build_filter(libs, handover, filter, CHAOS_INIT_MAX_FILTER);
+    program.len = (unsigned short
+    )chaos_init_build_filter(libs, handover, NULL, 0U, filter, CHAOS_INIT_MAX_FILTER);
     program.filter = filter;
     if (uname(&name) != 0 || !chaos_init_kernel_supported(CHAOS_INIT_RELEASE(&name)))
     {

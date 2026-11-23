@@ -150,15 +150,25 @@ run_filter(const struct sock_filter *filter, size_t length, const struct seccomp
 static int g_test_handover = 1000;
 
 /**
- * @brief Builds the filter for @p libs and returns its verdict for system call @p nr on
- *        architecture @p arch, with @p fd as args[0] and @p flags as args[2] (sendmsg).
+ * @brief Builds the filter for @p libs, with @p traced answered by TRACE, and returns its
+ *        verdict for system call @p nr on architecture @p arch, with @p fd as args[0] and
+ *        @p flags as args[2] (sendmsg).
  */
-static uint32_t decide(unsigned libs, long nr, uint64_t fd, uint64_t flags, uint32_t arch)
+static uint32_t decide_traced(
+    unsigned libs,
+    const long *traced,
+    size_t traced_count,
+    long nr,
+    uint64_t fd,
+    uint64_t flags,
+    uint32_t arch
+)
 {
     struct sock_filter filter[CHAOS_INIT_MAX_FILTER];
     struct seccomp_data data;
-    const size_t length =
-        chaos_init_build_filter(libs, g_test_handover, filter, CHAOS_INIT_MAX_FILTER);
+    const size_t length = chaos_init_build_filter(
+        libs, g_test_handover, traced, traced_count, filter, CHAOS_INIT_MAX_FILTER
+    );
 
     assert(length > 0U);
     memset(&data, 0, sizeof(data));
@@ -169,6 +179,13 @@ static uint32_t decide(unsigned libs, long nr, uint64_t fd, uint64_t flags, uint
     return run_filter(filter, length, &data);
 }
 
+/** @brief decide_traced() with nothing traced. */
+static uint32_t decide(unsigned libs, long nr, uint64_t fd, uint64_t flags, uint32_t arch)
+{
+    return decide_traced(libs, NULL, 0U, nr, fd, flags, arch);
+}
+
+#define TRACE SECCOMP_RET_TRACE
 #define NOTIFY SECCOMP_RET_USER_NOTIF
 #define ALLOW SECCOMP_RET_ALLOW
 #define ARCH CHAOS_INIT_AUDIT_ARCH
@@ -249,7 +266,101 @@ static void test_filter_decisions(void)
 #endif
 
     /* An output buffer too small for the program returns 0 rather than overrunning. */
-    assert(chaos_init_build_filter(0x3fU, 4, small, sizeof(small) / sizeof(small[0])) == 0U);
+    assert(
+        chaos_init_build_filter(0x3fU, 4, NULL, 0U, small, sizeof(small) / sizeof(small[0])) == 0U
+    );
+}
+
+/**
+ * @brief Proves the traced group: a traced number answers TRACE, the rest of its library
+ *   stays notified, and a number in both groups is traced rather than notified.
+ *
+ * @details The two cannot be combined for one number -- across stacked filters USER_NOTIF
+ * outranks TRACE -- so the builder has to resolve the overlap itself, and the direction it
+ * resolves it in is what the data effects need: a traced call carries all of its effects
+ * through ptrace. Also asserted: with nothing traced the program contains no TRACE at all,
+ * which is what keeps a run without data effects at exactly the old cost; a traced set
+ * naming a number the library does not filter leaves everything else alone; and the
+ * capacity bound still refuses a buffer that is too small once the traced tests are added.
+ */
+static void test_traced_group(void)
+{
+    static const long write_only[] = {__NR_write};
+    static const long two[] = {__NR_write, __NR_read};
+    static const long foreign[] = {__NR_getpid};
+    struct sock_filter filter[CHAOS_INIT_MAX_FILTER];
+    struct sock_filter small[22];
+    size_t length;
+    size_t index;
+
+    assert(decide_traced(CHAOS_INIT_LIB_IO, write_only, 1U, __NR_write, 0U, 0U, ARCH) == TRACE);
+    /* Everything else of the library is still notified, and non-members still pass. */
+    assert(decide_traced(CHAOS_INIT_LIB_IO, write_only, 1U, __NR_read, 0U, 0U, ARCH) == NOTIFY);
+    assert(decide_traced(CHAOS_INIT_LIB_IO, write_only, 1U, __NR_openat, 0U, 0U, ARCH) == NOTIFY);
+    assert(decide_traced(CHAOS_INIT_LIB_IO, write_only, 1U, __NR_connect, 0U, 0U, ARCH) == ALLOW);
+    /* The handover exemption survives a traced set. */
+    assert(
+        decide_traced(
+            CHAOS_INIT_LIB_NET,
+            write_only,
+            1U,
+            __NR_sendmsg,
+            (uint64_t)g_test_handover,
+            CHAOS_INIT_HANDOVER_FLAGS,
+            ARCH
+        ) == ALLOW
+    );
+    /* A foreign architecture passes before either group is reached. */
+    assert(
+        decide_traced(CHAOS_INIT_LIB_IO, write_only, 1U, __NR_write, 0U, 0U, 0x12345678U) == ALLOW
+    );
+
+    assert(decide_traced(CHAOS_INIT_LIB_IO, two, 2U, __NR_write, 0U, 0U, ARCH) == TRACE);
+    assert(decide_traced(CHAOS_INIT_LIB_IO, two, 2U, __NR_read, 0U, 0U, ARCH) == TRACE);
+    assert(decide_traced(CHAOS_INIT_LIB_IO, two, 2U, __NR_writev, 0U, 0U, ARCH) == NOTIFY);
+
+    /* A traced number the library does not filter is traced; its neighbours are untouched. */
+    assert(decide_traced(CHAOS_INIT_LIB_IO, foreign, 1U, __NR_getpid, 0U, 0U, ARCH) == TRACE);
+    assert(decide_traced(CHAOS_INIT_LIB_IO, foreign, 1U, __NR_openat, 0U, 0U, ARCH) == NOTIFY);
+
+    /* Nothing traced: no TRACE instruction exists in the program at all. */
+    length =
+        chaos_init_build_filter(0x3fU, g_test_handover, NULL, 0U, filter, CHAOS_INIT_MAX_FILTER);
+    assert(length > 0U);
+    for (index = 0U; index < length; ++index)
+    {
+        assert(!(filter[index].code == (BPF_RET | BPF_K) && filter[index].k == SECCOMP_RET_TRACE));
+    }
+    /* And with something traced it does. */
+    length =
+        chaos_init_build_filter(0x3fU, g_test_handover, two, 2U, filter, CHAOS_INIT_MAX_FILTER);
+    assert(length > 0U);
+    {
+        int found = 0;
+
+        for (index = 0U; index < length; ++index)
+        {
+            if (filter[index].code == (BPF_RET | BPF_K) && filter[index].k == SECCOMP_RET_TRACE)
+            {
+                found = 1;
+            }
+        }
+        assert(found);
+    }
+
+    /* The capacity bound counts the traced tests too: `small` is big enough for memory's
+     * four calls plus the fixed part, and too small once two traced tests are added. A
+     * bound that forgot them would overrun it. */
+    assert(
+        chaos_init_build_filter(
+            CHAOS_INIT_LIB_MEMORY, 4, NULL, 0U, small, sizeof(small) / sizeof(small[0])
+        ) > 0U
+    );
+    assert(
+        chaos_init_build_filter(
+            CHAOS_INIT_LIB_MEMORY, 4, two, 2U, small, sizeof(small) / sizeof(small[0])
+        ) == 0U
+    );
 }
 
 /** @brief Wait status maps to the shell convention: exit status, or 128 + signal. */
@@ -945,6 +1056,7 @@ int main(void)
     test_seed_from_environment();
     test_parse_args();
     test_filter_decisions();
+    test_traced_group();
     test_exit_code();
     test_kernel_and_reasons();
     test_status_text();

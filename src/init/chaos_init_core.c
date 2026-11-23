@@ -212,8 +212,29 @@ static const long g_chaos_init_process_calls[] = {
         }                                                                                          \
     } while (0)
 
-size_t
-chaos_init_build_filter(unsigned libs, int handover_fd, struct sock_filter *out, size_t capacity)
+/** @brief Whether @p nr is one of the @p count numbers in @p table. */
+static int chaos_init_in_set(long nr, const long *table, size_t count)
+{
+    size_t index;
+
+    for (index = 0U; index < count; ++index)
+    {
+        if (table[index] == nr)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+size_t chaos_init_build_filter(
+    unsigned libs,
+    int handover_fd,
+    const long *traced,
+    size_t traced_count,
+    struct sock_filter *out,
+    size_t capacity
+)
 {
     long calls[CHAOS_INIT_MAX_FILTER];
     size_t count = 0U;
@@ -247,9 +268,23 @@ chaos_init_build_filter(unsigned libs, int handover_fd, struct sock_filter *out,
             break;
         }
     }
-    /* Fixed part: 4 (arch, nr) + 2 (x32) + 7 (handover) + 2 (tail) = 15 at most. The
-     * bound also keeps (count - index) within the 8-bit jt field. */
-    if (count + 16U > capacity)
+    /* A traced call is not also notified: USER_NOTIF outranks TRACE across filters, and
+     * within one filter the first matching test decides, so a number in both sets would
+     * only waste an instruction. Removed from the notified set, not from the traced one. */
+    for (index = 0U; index < count;)
+    {
+        if (chaos_init_in_set(calls[index], traced, traced_count))
+        {
+            calls[index] = calls[--count];
+        }
+        else
+        {
+            ++index;
+        }
+    }
+    /* Fixed part: 4 (arch, nr) + 2 (x32) + 7 (handover) + 3 (tail) = 16 at most. The
+     * bound also keeps the longest forward jump within the 8-bit jt field. */
+    if (count + traced_count + 17U > capacity)
     {
         return 0U;
     }
@@ -284,6 +319,18 @@ chaos_init_build_filter(unsigned libs, int handover_fd, struct sock_filter *out,
         out[length++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
         out[length++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF);
     }
+    /* Traced tests first, then notified ones, so the tail is ALLOW, USER_NOTIF, TRACE and
+     * every test is a forward jump. A traced test at `index` jumps over the remaining
+     * traced tests, every notified test, the ALLOW and the USER_NOTIF. */
+    for (index = 0U; index < traced_count; ++index)
+    {
+        out[length++] = (struct sock_filter)BPF_JUMP(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            (unsigned)traced[index],
+            (unsigned char)(traced_count - index + count + 1U),
+            0
+        );
+    }
     for (index = 0U; index < count; ++index)
     {
         /* Test `index` jumps count - index instructions: over the remaining tests and the ALLOW,
@@ -294,6 +341,13 @@ chaos_init_build_filter(unsigned libs, int handover_fd, struct sock_filter *out,
     }
     out[length++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
     out[length++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF);
+    /* Only when something is traced: without it the program is byte for byte the one this
+     * supervisor built before traced effects existed, which is the property that keeps a
+     * run with no data effect at exactly today's cost. */
+    if (traced_count > 0U)
+    {
+        out[length++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE);
+    }
     return length;
 }
 
