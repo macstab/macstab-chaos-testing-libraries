@@ -145,10 +145,74 @@ shared container and belongs in SECCOMP.md once built.
    absolute numbers here are not a budget. The shape to measure in CI: one notified call,
    one traced call (two stops), and `TRICKLE:1` on a busy reader, which is the case the
    plan names as critical.
-3. **Which syscalls get `SECCOMP_RET_TRACE`.** A filter is fixed when it is installed, and
-   the child installs it before the parent has read any rule file. Tracing the whole io/net
-   syscall set would put two stops on every read and write for users who load no data
-   effect at all. The intended answer is to let the parent read the rule files first and
-   hand the needed set to the child over the socketpair it already has, so a run without
-   data effects keeps today's cost exactly. This is the next decision to settle, and it is
-   the one that decides whether §7 is cheap or expensive in practice.
+3. **amd64 register map.** The entry stop was proven on arm64 (`NT_PRSTATUS`,
+   `struct user_pt_regs`, args in `regs[0..5]`, number in `regs[8]`). x86_64 needs
+   `user_regs_struct`, args in `rdi, rsi, rdx, r10, r8, r9` and the number in `orig_rax`,
+   and the rule that the number may not be changed to another call through `orig_rax` at a
+   `RET_TRACE` stop. Same shape, different table; measured in CI.
+
+---
+
+## 6. Which syscalls get `SECCOMP_RET_TRACE` — decided
+
+### 6.1 The constraint that settles it
+
+Filters stack, and the kernel takes the highest-precedence action of all of them:
+`KILL_PROCESS > KILL_THREAD > TRAP > ERRNO > USER_NOTIF > TRACE > LOG > ALLOW`
+([kernel documentation](https://docs.kernel.org/userspace-api/seccomp_filter.html)).
+
+**`USER_NOTIF` outranks `TRACE`.** Two consequences, and they decide the design:
+
+1. A syscall that any filter notifies can never be traced. Installing a second filter later
+   to "add tracing" to an already notified call does nothing.
+2. Every notified syscall must therefore be assigned to exactly one of the two paths when
+   the filter is installed — and the filter is installed by the child, before it execs.
+
+### 6.2 The options, measured against that
+
+| | Cost per intercepted call | Verdict |
+|---|---|---|
+| **A. Trace set from the loaded rules** | today's cost when no data effect is loaded; two stops only on syscalls that have one | **chosen** |
+| B. Trace the whole `--libs` set | two stops on every read and write, for everyone | rejected |
+| C. Rewrite syscall sites in the tracee (zpoline class) | ~200–500 ns | rejected for 2.1.0 |
+| D. Notification only, no ptrace | cannot do it at all | not an option |
+
+Published figures for the orders of magnitude: a user-space monitor reached through ptrace
+or seccomp user notification costs **2658–12019 ns per call**, while mechanisms that stay
+in the process (`LD_PRELOAD`, binary rewriting) or in the kernel cost **198–487 ns**
+([lazypoline, 2024](https://gulmezmerve.github.io/files/2024-lazypoline.pdf)). So option B
+is a factor of 10 to 60 on every read of every process in the container, which no chaos
+test is worth. Option C is the fast one, but
+[zpoline](https://www.usenix.org/system/files/atc23-yasukata.pdf) is x86-64 only — it needs
+address 0 mapped and rewrites the two-byte `syscall` instruction — and the arm64 equivalent
+is [a 2024 paper](https://arxiv.org/pdf/2412.05784), not something a C99 library with no
+dependencies ships on four tuples. It is also the mechanism `LD_PRELOAD` mode already
+covers; chaos-init exists for the static and Go cases, where the per-call cost is paid only
+by calls a rule actually names.
+
+### 6.3 What option A means concretely
+
+- The **parent** reads the rule files before the go signal — it already reads them, just
+  later — works out which operations carry a traced effect, and hands that syscall set to
+  the child over the socketpair that already carries the listener.
+- The child builds one filter: `TRACE` for those numbers, `USER_NOTIF` for the rest of its
+  `--libs` set, `ALLOW` for everything else.
+- For a syscall on the trace path, **every** effect runs from the ptrace stop, including
+  `ERRNO` and `LATENCY`: the precedence rule leaves no way to split them. Failing a call
+  from the entry stop is setting the return register and skipping the call; delaying it is
+  the existing delay queue, with the continue issued when due, because the loop must not
+  block (§2.1).
+- A run that loads no traced effect installs exactly the filter it installs today and
+  behaves identically. That is the property worth having.
+
+### 6.4 The limitation this buys, stated plainly
+
+A filter cannot be changed after it is installed. A rule file that **gains** its first data
+effect for an operation while the container runs cannot start tracing that operation: the
+rule loads, and it is reported `unsupported in seccomp mode` until the container restarts.
+Reload keeps working for everything else, including adding more rules of an effect already
+on the trace path.
+
+This is seccomp's design, not a shortcut. The alternative is option B's cost for every user
+on every call, which is worse, and tracing a set that a later rule file might need is
+guesswork that costs the same.
