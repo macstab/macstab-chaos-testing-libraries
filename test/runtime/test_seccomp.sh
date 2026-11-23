@@ -28,7 +28,8 @@
 # - a rule SECCOMP mode cannot apply (CORRUPT) rejects the whole file, named in the status;
 # - TORN is applied through a ptrace stop: the returned count and the file size both drop
 #   below ten and agree, and a fork of the traced application still runs; TRICKLE cuts a
-#   stream receive to its chunk and leaves the rest in the socket;
+#   stream receive to its chunk and leaves the rest in the socket; CORRUPT flips one bit of
+#   what a read delivered, decided at the stop after the call;
 # - without chaos-init the same rules change nothing.
 #
 # Under emulation (a foreign architecture through QEMU) seccomp user notification is unavailable:
@@ -265,7 +266,7 @@ expect "Go: without chaos-init os/exec works" "$($go spawn)" "ok"
 rm -f /tmp/.chaos-process.conf
 expect "all libraries at once" "$($init --libs io,net,memory,process -- $go dial 7777)" "ECONNREFUSED"
 
-printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/data:read:CORRUPT:1.0 # t" > /tmp/.chaos-io.conf
+printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/data:statfs:FULL:1.0 # t" > /tmp/.chaos-io.conf
 expect "a rule SECCOMP mode cannot apply rejects the file" "$($init --libs io -- /tmp/probe open /tmp/sec/data/x)" "ok"
 expect "the status file names it" "$(sed -n 3,4p /tmp/.chaos-io.status | tr "\n" " ")" \
     "line=2 reason=unsupported in seccomp mode "
@@ -288,6 +289,15 @@ expect "C: TRICKLE shortens every receive" "$($init --libs net -- /tmp/probe tri
 expect "C: the TRICKLE rule is applied, not rejected" \
     "$(sed -n 1,2p /tmp/.chaos-net.status | tr "\n" " ")" "state=ok rules=1 "
 rm -f /tmp/.chaos-net.conf
+
+# CORRUPT through the stop after the call: the entry stop cannot know how many bytes a read
+# will deliver, so the thread runs on into its syscall-exit stop and one bit of what it
+# delivered is flipped there. Exactly one byte differs and exactly one of its bits.
+printf "%s\n" "/tmp/sec/data:read:CORRUPT:1.0 # t" > /tmp/.chaos-io.conf
+expect "C: CORRUPT flips one bit of a read" \
+    "$($init --libs io -- /tmp/probe corrupt /tmp/sec/data/c)" "changed=1 onebit=1"
+expect "C: the CORRUPT rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-io.status | tr "\n" " ")" "state=ok rules=1 "
 
 # A forked child of the tracee is traced too: without PTRACE_O_TRACEFORK its filtered calls
 # would fail with ENOSYS, because a RET_TRACE with no tracer does.

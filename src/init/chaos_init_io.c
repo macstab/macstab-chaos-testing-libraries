@@ -25,21 +25,19 @@
  * file: the net decider claims them first.
  *
  * @par Supported effects
- * ERRNO (not on close), LATENCY, and DROP on `pwrite`. FREE and FULL rewrite the structure
- * the kernel returned, which a reply cannot reach, so they are rejected with the other data
- * effects; `statfs` and `fstatfs` themselves are notified, so ERRNO and LATENCY apply to
- * them here as they do in the library. TORN and CORRUPT change data the
- * kernel moves, which a seccomp reply cannot do; ERRNO on close would have to close and
- * fail at once (the wrapper closes, then reports the error), while a notified call either
- * runs or fails. DROP is a reply with the byte count and no call, which is exactly what a
- * notification can answer -- but only for a positioned write: a dropped `write` has to
- * move the descriptor's file offset on, and the supervisor cannot reach another process's
- * descriptor without CAP_SYS_PTRACE. `write:DROP` is therefore rejected here rather than
- * applied without the correction, which would damage the file in a way no real lost write
- * does. A
- * rule file containing any of them is rejected at parse time through the
- * CHAOS_IO_RULE_SUPPORTED hook, so its status file reports `unsupported in seccomp mode`
- * and none of its rules apply.
+ * ERRNO (not on close), LATENCY, DROP on `pwrite`, and TORN and CORRUPT through a ptrace
+ * stop. FREE and FULL rewrite the structure the kernel returned, which neither a reply nor
+ * a register reaches, so they stay rejected; `statfs` and `fstatfs` themselves are
+ * notified, so ERRNO and LATENCY apply to them here as they do in the library. TORN and CORRUPT
+ * change data the kernel moves, which a seccomp reply cannot do; ERRNO on close would have to close
+ * and fail at once (the wrapper closes, then reports the error), while a notified call either runs
+ * or fails. DROP is a reply with the byte count and no call, which is exactly what a notification
+ * can answer -- but only for a positioned write: a dropped `write` has to move the descriptor's
+ * file offset on, and the supervisor cannot reach another process's descriptor without
+ * CAP_SYS_PTRACE. `write:DROP` is therefore rejected here rather than applied without the
+ * correction, which would damage the file in a way no real lost write does. A rule file containing
+ * any of them is rejected at parse time through the CHAOS_IO_RULE_SUPPORTED hook, so its status
+ * file reports `unsupported in seccomp mode` and none of its rules apply.
  *
  * @par Failure behaviour
  * Fail-open: any argument or /proc entry that cannot be read means no match, and the
@@ -82,19 +80,20 @@ uint64_t g_chaos_io_process_seed = UINT64_C(0x2545f4914f6cdd1d);
 /**
  * @brief Whether @p rule's effect needs the tracee's registers rather than a reply.
  *
- * @details Only TORN so far: it shortens the byte count before the kernel reads it, which
- * a notification cannot do. The predicate is what puts a system call in the filter's
- * traced group (chaos_init_io_traced_calls()), so adding an effect here without teaching
- * the trace path to apply it would load a rule that never fires.
+ * @details TORN shortens the byte count before the kernel reads it; CORRUPT changes a byte
+ * the call wrote, which needs the stop after it. A notification can do neither. The predicate is
+ * what puts a system call in the filter's traced group (chaos_init_io_traced_calls()), so adding an
+ * effect here without teaching the trace path to apply it would load a rule that never fires.
  */
 static int chaos_init_io_traced_effect(const struct chaos_io_rule *rule)
 {
-    return rule->effect == CHAOS_IO_EFFECT_TORN;
+    return rule->effect == CHAOS_IO_EFFECT_TORN || rule->effect == CHAOS_IO_EFFECT_CORRUPT;
 }
 
-/* CHAOS_IO_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, DROP on pwrite, and TORN,
- * which the trace path shortens in the tracee's registers. FREE and FULL stay out: they
- * rewrite the structure the kernel returned, which is neither a register nor an argument. */
+/* CHAOS_IO_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, DROP on pwrite, and the
+ * traced effects TORN and CORRUPT, which the trace path applies through the registers and
+ * the tracee's memory. FREE and FULL stay out: they rewrite the structure the kernel
+ * returned, which is neither. */
 static int chaos_init_io_supported(const struct chaos_io_rule *rule)
 {
     return (rule->effect == CHAOS_IO_EFFECT_ERRNO && rule->operation != CHAOS_IO_OP_CLOSE) ||
@@ -177,6 +176,9 @@ static const chaos_init_io_call_t g_chaos_init_io_calls[] = {
     {__NR_renameat, CHAOS_IO_OP_RENAME_FROM, CHAOS_INIT_IO_RENAME_AT, 0, -1},
 #endif
 };
+
+/** @brief Result value that means "the call has not run yet" (the entry stop). */
+#define CHAOS_INIT_IO_NO_RESULT LONG_MIN
 
 /** @copydoc chaos_init_io_traced_calls */
 size_t chaos_init_io_traced_calls(long *out, size_t capacity)
@@ -428,7 +430,16 @@ static int chaos_init_io_rename(const chaos_init_call_t *call, int at, chaos_io_
 
 /* Decode by table, build the path, match, then let the core's trigger decide (probability,
  * qualifiers, hit counting) on the per-process slot. */
-int chaos_init_io_decide(const chaos_init_call_t *call, chaos_init_verdict_t *verdict)
+/**
+ * @brief chaos_init_io_decide() and chaos_init_io_decide_result() in one body.
+ *
+ * @details The two stops of a traced call have to select the same rule, so they share the
+ * selection rather than repeating it. @p result is CHAOS_INIT_IO_NO_RESULT at the entry
+ * stop and the call's return value at the exit stop; the argument registers hold the same
+ * values at both, so the path, the match and the `@size` input are identical.
+ */
+static int
+chaos_init_io_decide_at(const chaos_init_call_t *call, long result, chaos_init_verdict_t *verdict)
 {
     const chaos_init_io_call_t *entry = NULL;
     const chaos_io_config_state_t *state;
@@ -521,6 +532,33 @@ int chaos_init_io_decide(const chaos_init_call_t *call, chaos_init_verdict_t *ve
     {
         return 1;
     }
+    if (rule.effect == CHAOS_IO_EFFECT_CORRUPT && result <= 0 && result != CHAOS_INIT_IO_NO_RESULT)
+    {
+        /* The read failed or hit end of file: there are no bytes to corrupt, and turning a
+         * detectable error into silent corruption would change what is being tested. No
+         * draw, so no hit -- as in the library. */
+        return 1;
+    }
+    if (rule.effect == CHAOS_IO_EFFECT_CORRUPT)
+    {
+        /* Nothing to decide yet at the entry stop: how many bytes there are to corrupt is
+         * the call's result. The thread is continued into its exit stop and this runs
+         * again, so the draw happens where the library's does -- after the call -- and a
+         * read that returned nothing counts no hit. A vectored read keeps its bytes across
+         * segments; finding the one that holds byte N would mean walking the iovec in the
+         * tracee, so those are left alone and count no hit either. */
+        if (result == CHAOS_INIT_IO_NO_RESULT)
+        {
+            verdict->action = entry->size < 0 ? CHAOS_INIT_PASS : CHAOS_INIT_AFTER;
+            return 1;
+        }
+    }
+    else if (result != CHAOS_INIT_IO_NO_RESULT)
+    {
+        /* Every other effect was applied at the entry stop; the exit stop has nothing to
+         * add, and must not draw again. */
+        return 1;
+    }
     state = chaos_io_config_active_state();
     rule.hit = chaos_init_tracee_hit(
         &g_chaos_init_io_rules, call->tid, state->hits, state->rule_count, rule.hit
@@ -530,7 +568,25 @@ int chaos_init_io_decide(const chaos_init_call_t *call, chaos_init_verdict_t *ve
     {
         return 1;
     }
-    if (rule.effect == CHAOS_IO_EFFECT_ERRNO)
+    if (rule.effect == CHAOS_IO_EFFECT_CORRUPT)
+    {
+        /* One byte of what the read delivered, chosen as chaos_io_corrupt_buffer_sample()
+         * chooses it: the first draw picks the byte, the second its bit. The byte is read
+         * out of the tracee, flipped and written back, which is the same edit the library
+         * makes in its own address space. */
+        const uint64_t length = (uint64_t)result;
+        const uint64_t offset =
+            (uint64_t)chaos_io_rule_draw(&rule, CHAOS_IO_DRAW_FIRST_EFFECT) % length;
+        const unsigned bit = chaos_io_rule_draw(&rule, CHAOS_IO_DRAW_SECOND_EFFECT) & 7U;
+        unsigned char byte = 0U;
+
+        if (chaos_init_read_memory(call->tid, call->args[1] + offset, &byte, sizeof(byte)) == 0)
+        {
+            byte ^= (unsigned char)(1U << bit);
+            (void)chaos_init_write_memory(call->tid, call->args[1] + offset, &byte, sizeof(byte));
+        }
+    }
+    else if (rule.effect == CHAOS_IO_EFFECT_ERRNO)
     {
         verdict->action = CHAOS_INIT_FAIL;
         verdict->error = rule.errnum;
@@ -555,4 +611,18 @@ int chaos_init_io_decide(const chaos_init_call_t *call, chaos_init_verdict_t *ve
         verdict->delay_ms = rule.latency_ms;
     }
     return 1;
+}
+
+/** @copydoc chaos_init_io_decide */
+int chaos_init_io_decide(const chaos_init_call_t *call, chaos_init_verdict_t *verdict)
+{
+    return chaos_init_io_decide_at(call, CHAOS_INIT_IO_NO_RESULT, verdict);
+}
+
+/** @copydoc chaos_init_io_decide_result */
+int chaos_init_io_decide_result(const chaos_init_call_t *call, long result)
+{
+    chaos_init_verdict_t verdict;
+
+    return chaos_init_io_decide_at(call, result, &verdict);
 }

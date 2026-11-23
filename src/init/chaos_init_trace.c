@@ -17,6 +17,7 @@
 
 #include <elf.h>
 #include <errno.h>
+#include <signal.h>
 #include <string.h>
 #include <sys/ptrace.h>
 #include <sys/uio.h>
@@ -97,6 +98,81 @@ long chaos_init_trace_number(const chaos_init_trace_regs_t *regs)
 #else
     return (long)block->orig_rax;
 #endif
+}
+
+/**
+ * @brief Threads that can be inside a traced call needing its result at the same time.
+ *
+ * @details One entry per thread, added at the entry stop and taken at the exit stop, so
+ * the table holds as many as there are threads stopped at once. An unordered array: every
+ * operation is a scan of at most this many entries, and only calls with such an effect
+ * reach it.
+ */
+#define CHAOS_INIT_TRACE_PENDING 256U
+
+static chaos_init_call_t g_chaos_init_trace_pending[CHAOS_INIT_TRACE_PENDING];
+static size_t g_chaos_init_trace_pending_count = 0U;
+
+/** @copydoc chaos_init_trace_park */
+int chaos_init_trace_park(const chaos_init_call_t *call)
+{
+    size_t index;
+
+    for (index = 0U; index < g_chaos_init_trace_pending_count; ++index)
+    {
+        if (g_chaos_init_trace_pending[index].tid == call->tid)
+        {
+            g_chaos_init_trace_pending[index] = *call;
+            return 0;
+        }
+    }
+    if (g_chaos_init_trace_pending_count == CHAOS_INIT_TRACE_PENDING)
+    {
+        return -1;
+    }
+    g_chaos_init_trace_pending[g_chaos_init_trace_pending_count++] = *call;
+    return 0;
+}
+
+/** @copydoc chaos_init_trace_unpark */
+int chaos_init_trace_unpark(pid_t tid, chaos_init_call_t *call)
+{
+    size_t index;
+
+    for (index = 0U; index < g_chaos_init_trace_pending_count; ++index)
+    {
+        if (g_chaos_init_trace_pending[index].tid == tid)
+        {
+            *call = g_chaos_init_trace_pending[index];
+            g_chaos_init_trace_pending[index] =
+                g_chaos_init_trace_pending[--g_chaos_init_trace_pending_count];
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/** @copydoc chaos_init_trace_result */
+long chaos_init_trace_result(const chaos_init_trace_regs_t *regs)
+{
+    const chaos_init_trace_block_t *block =
+        chaos_init_trace_block((chaos_init_trace_regs_t *)(uintptr_t)regs);
+
+    if (block == NULL)
+    {
+        return -1;
+    }
+#if defined(__aarch64__)
+    return (long)block->regs[0];
+#else
+    return (long)block->rax;
+#endif
+}
+
+/** @copydoc chaos_init_trace_is_syscall_stop */
+int chaos_init_trace_is_syscall_stop(int status)
+{
+    return ((status >> 8) & 0xff) == (SIGTRAP | 0x80);
 }
 
 /** @copydoc chaos_init_trace_arg */

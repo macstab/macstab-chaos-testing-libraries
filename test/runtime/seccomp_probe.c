@@ -27,6 +27,8 @@
  *                       file's resulting size, for TORN under a trace stop.
  *   trickle <port>      - sends ten bytes over a loopback stream pair and prints what the
  *                       first recv returned and how much was left, for TRICKLE.
+ *   corrupt <path>      - writes eight known bytes to <path>, reads them back and prints
+ *                       how many differ and whether exactly one bit changed, for CORRUPT.
  * - fork                fork + waitpid: "ok" or the errno name.
  * - exec                execl("/bin/true"); prints the errno name only when it fails.
  *
@@ -126,6 +128,42 @@ int main(int argc, char **argv)
         }
         (void)printf("%s\n", read(fd, &byte, 1U) >= 0 ? "ok" : try_open_errno_name(errno));
         (void)close(fd);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "corrupt") == 0)
+    {
+        /* Writes eight known bytes to <path>, reads them back and prints how many of them
+         * came back different and whether exactly one bit changed. A CORRUPT rule flips
+         * one bit of what the read delivered, which only the stop after the call can do. */
+        const int fd = open(argv[2], O_RDWR | O_CREAT | O_TRUNC, 0644);
+        unsigned char got[8];
+        int differences = 0;
+        int single_bit = 1;
+        size_t index;
+
+        if (fd < 0 || write(fd, "AAAAAAAA", (size_t)8) != 8 || lseek(fd, 0, SEEK_SET) != 0)
+        {
+            (void)printf("setup=failed\n");
+            return 0;
+        }
+        if (read(fd, got, sizeof(got)) != 8)
+        {
+            (void)printf("read=%s\n", try_open_errno_name(errno));
+            (void)close(fd);
+            return 0;
+        }
+        (void)close(fd);
+        for (index = 0U; index < sizeof(got); ++index)
+        {
+            const unsigned char changed = (unsigned char)(got[index] ^ 'A');
+
+            if (changed != 0U)
+            {
+                ++differences;
+                single_bit = single_bit && (changed & (unsigned char)(changed - 1U)) == 0U;
+            }
+        }
+        (void)printf("changed=%d onebit=%d\n", differences, differences > 0 && single_bit);
         return 0;
     }
     if (argc == 3 && strcmp(argv[1], "torn") == 0)

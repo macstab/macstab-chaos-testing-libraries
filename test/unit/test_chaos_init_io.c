@@ -506,11 +506,120 @@ int main(void)
         assert(chaos_init_io_traced_calls(NULL, 4U) == 0U);
     }
 
-    /* CORRUPT still rejects the whole rule file: it rewrites data the kernel moved, which
-     * is neither a register nor an argument. No rule of a rejected file applies, and the
-     * status names the offending line. */
-    write_rules("/tmp/initio/data:open:EIO:1.0\n/tmp/initio/torn:read:CORRUPT:1.0\n");
-    assert(PASSES(decide(__NR_read, (uint64_t)torn, P(buffer), 10U, 0, 0)));
+    /* CORRUPT is applied here now, but only at the exit stop: the entry stop cannot know
+     * how many bytes there will be to corrupt, so it asks to be called again and draws
+     * nothing. A read that returns nothing is left alone and counts no hit, and a vectored
+     * read is left alone too -- its bytes are spread over segments. */
+    write_rules("/tmp/initio/torn:read:CORRUPT:1.0\n");
+    assert(decide(__NR_read, (uint64_t)torn, P(buffer), 10U, 0, 0).action == CHAOS_INIT_AFTER);
+    assert(PASSES(decide(__NR_readv, (uint64_t)torn, P(buffer), 2U, 0, 0)));
+    {
+        chaos_init_call_t after;
+        char buffer2[64];
+        /* Larger than any read reported below, so the bytes past the result can be
+         * checked: an effect that corrupts outside what the call delivered would be
+         * writing memory the call never touched. */
+        unsigned char read_area[128];
+
+        memset(&after, 0, sizeof(after));
+        after.tid = getpid();
+        after.nr = __NR_read;
+        after.args[0] = (uint64_t)torn;
+        after.args[1] = P(read_area);
+        after.args[2] = sizeof(read_area);
+        /* Nothing returned: nothing to corrupt, and -- the point of the guard -- no draw,
+         * so no hit. The hits file is what shows it: a count above zero here would mean a
+         * read that delivered nothing was charged for an effect it never got. */
+        (void)memset(read_area, 'A', sizeof(read_area));
+        assert(chaos_init_io_decide_result(&after, 0) == 1);
+        assert(chaos_init_io_decide_result(&after, -1) == 1);
+        assert(read_area[0] == 'A');
+        /* Eight bytes returned: exactly one bit inside those eight flips, and nothing
+         * beyond them is touched -- the call wrote eight bytes, so neither may the effect.
+         * Twelve rounds, because one would not show that the byte is drawn rather than
+         * fixed: each round must change exactly one byte below eight, and over the twelve
+         * at least two different bytes and two different bits must be hit. The draws are
+         * seeded from getrandom(),
+         * so twelve identical ones have a chance of about 2e-10 -- below the rate at which
+         * the hardware running this would be the likelier explanation. */
+        {
+            size_t round;
+            size_t first_offset = sizeof(read_area);
+            unsigned char first_mask = 0U;
+            int saw_another = 0;
+            int saw_another_bit = 0;
+
+            for (round = 0U; round < 12U; ++round)
+            {
+                size_t index;
+                size_t offset = sizeof(read_area);
+                unsigned char mask = 0U;
+                int differences = 0;
+
+                (void)memset(read_area, 'A', sizeof(read_area));
+                assert(chaos_init_io_decide_result(&after, 8) == 1);
+                for (index = 0U; index < sizeof(read_area); ++index)
+                {
+                    const unsigned char changed = (unsigned char)(read_area[index] ^ 'A');
+
+                    if (changed != 0U)
+                    {
+                        ++differences;
+                        offset = index;
+                        mask = changed;
+                        assert(index < 8U);
+                        /* One bit, not a byte rewritten. */
+                        assert((changed & (unsigned char)(changed - 1U)) == 0U);
+                    }
+                }
+                assert(differences == 1);
+                if (round == 0U)
+                {
+                    first_offset = offset;
+                    first_mask = mask;
+                }
+                saw_another = saw_another || offset != first_offset;
+                saw_another_bit = saw_another_bit || mask != first_mask;
+            }
+            /* Both the byte and the bit within it are drawn, so over twelve rounds each
+             * must have taken more than one value. */
+            assert(saw_another);
+            assert(saw_another_bit);
+        }
+        /* Twelve hits, not fourteen: the two calls that returned nothing drew nothing. The
+         * hits file is rewritten by each hit, so this reads the count they left. */
+        (void)snprintf(buffer2, sizeof(buffer2), "/tmp/.chaos-io.hits.%ld", (long)getpid());
+        file = fopen(buffer2, "r");
+        assert(file != NULL);
+        hits[fread(hits, 1U, sizeof(hits) - 1U, file)] = '\0';
+        (void)fclose(file);
+        assert(strncmp(hits, "12\t/tmp/initio/torn:read:CORRUPT:1.0\n", 37U) == 0);
+
+        /* An effect that is not CORRUPT can only reach the exit stop if the rule file
+         * changed between the two stops. It must do nothing there: the call has already
+         * run, and drawing again would charge a hit for an effect nobody can apply. */
+        write_rules("/tmp/initio/torn:read:EIO:1.0\n");
+        (void)memset(read_area, 'A', sizeof(read_area));
+        assert(chaos_init_io_decide_result(&after, 8) == 1);
+        assert(chaos_init_io_decide_result(&after, 8) == 1);
+        assert(read_area[0] == 'A' && read_area[7] == 'A');
+        /* One real hit through the entry stop, and the two exit-stop calls above added
+         * none: a count of three here would mean the guard let them draw. */
+        assert(FAILS(decide(__NR_read, (uint64_t)torn, P(buffer), 10U, 0, 0), EIO));
+        file = fopen(buffer2, "r");
+        assert(file != NULL);
+        hits[fread(hits, 1U, sizeof(hits) - 1U, file)] = '\0';
+        (void)fclose(file);
+        assert(strncmp(hits, "1\t/tmp/initio/torn:read:EIO:1.0\n", 33U) == 0);
+        /* A call of another kind is not io's at the exit stop either. */
+        after.nr = __NR_getpid;
+        assert(chaos_init_io_decide_result(&after, 8) == 0);
+    }
+
+    /* FREE still rejects the whole rule file: it rewrites the structure the kernel
+     * returned, which is neither a register nor the bytes a call wrote. No rule of a
+     * rejected file applies, and the status names the offending line. */
+    write_rules("/tmp/initio/data:open:EIO:1.0\n/tmp/initio/torn:statfs:FULL:1.0\n");
     assert(PASSES(decide(__NR_openat, (uint64_t)AT_FDCWD, P("/tmp/initio/data/x"), 0, 0, 0)));
     file = fopen("/tmp/.chaos-io.status", "r");
     assert(file != NULL);
@@ -578,7 +687,9 @@ int main(void)
 
     write_rules("/tmp/initio/c:close:EIO:1.0\n");
     assert(PASSES(decide(__NR_close, (uint64_t)closing, 0, 0, 0, 0)));
-    write_rules("/tmp/initio/c:close:LATENCY:5\n/tmp/initio/data:read:CORRUPT:1.0\n");
+    /* One unsupported effect disables every rule of the file, the valid LATENCY included.
+     * FULL is the unsupported one here; CORRUPT is applied now. */
+    write_rules("/tmp/initio/c:close:LATENCY:5\n/tmp/initio/data:statfs:FULL:1.0\n");
     assert(PASSES(decide(__NR_close, (uint64_t)closing, 0, 0, 0, 0)));
     write_rules("/tmp/initio/c:close:LATENCY:5\n");
     assert(decide(__NR_close, (uint64_t)closing, 0, 0, 0, 0).action == CHAOS_INIT_DELAY);

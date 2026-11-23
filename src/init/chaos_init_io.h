@@ -45,4 +45,18 @@ int chaos_init_io_decide(const chaos_init_call_t *call, chaos_init_verdict_t *ve
  */
 size_t chaos_init_io_traced_calls(long *out, size_t capacity);
 
+/**
+ * @brief Decides @p call again at its syscall-exit stop, where @p result is what it
+ *        returned, and applies an effect that needed it (CORRUPT).
+ *
+ * @details Reached only for a call whose entry stop answered CHAOS_INIT_AFTER. The same
+ * rule is selected as at the entry stop -- the argument registers still hold the caller's
+ * values -- and the draw happens here, so a read that returned nothing counts no hit.
+ * There is no verdict: the call has already run, and the effect is a byte of the tracee's
+ * buffer.
+ *
+ * @return 1 when it is an io system call, else 0.
+ */
+int chaos_init_io_decide_result(const chaos_init_call_t *call, long result);
+
 #endif

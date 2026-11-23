@@ -28,12 +28,22 @@ typedef enum chaos_init_action
     CHAOS_INIT_FAIL,     /**< Reply -`error`: returns -1/`error` without running. */
     CHAOS_INIT_DELAY,    /**< Park for `delay_ms`, then answer per chaos_init_delay_answer(). */
     CHAOS_INIT_RETURN,   /**< Reply `value` without running (poll-family TIMEOUT: 0). */
-    CHAOS_INIT_SHORTEN   /**< Run it with argument `arg_index` replaced by `value` (TORN). */
+    CHAOS_INIT_SHORTEN,  /**< Run it with argument `arg_index` replaced by `value` (TORN). */
+    CHAOS_INIT_AFTER     /**< Run it, then decide again with its result (CORRUPT). */
 } chaos_init_action_t;
 
 /**
  * @brief Verdict of a decider. Zero-initialised plus `action = CHAOS_INIT_PASS` is the
  *        neutral verdict. `delay_ms` is the hold time of a DELAY in milliseconds.
+ *
+ * @par Deciding after the call
+ * CHAOS_INIT_AFTER means the effect depends on what the call returned, which the entry
+ * stop cannot know: the thread is continued into its syscall-exit stop and the deciders
+ * are asked again, this time with the result. Nothing is parked in between -- the kernel
+ * saves the argument registers at entry and restores them on return, so the exit stop
+ * reads the same descriptor, buffer and count the entry stop saw, and selects the same
+ * rule. No draw happens at the entry stop for such an effect, so a call that returns
+ * nothing to change counts no hit, exactly as in the library.
  *
  * @par Which verdicts reach which path
  * A notification reply can PASS, FAIL, DELAY or RETURN. SHORTEN needs the tracee's

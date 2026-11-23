@@ -601,7 +601,9 @@ static void chaos_init_trace_answer(pid_t tid, const chaos_init_verdict_t *verdi
 /**
  * @brief Handles one ptrace stop of @p tid reported by @p status.
  *
- * @details Three kinds arrive here. A seccomp stop is a call the filter answered with
+ * @details Four kinds arrive here. A syscall-exit stop belongs to a call whose entry stop
+ * answered CHAOS_INIT_AFTER; it is told apart by PTRACE_O_TRACESYSGOOD and asks the
+ * deciders again with the call's result. A seccomp stop is a call the filter answered with
  * TRACE: its arguments are read out of the registers, the deciders see the same
  * chaos_init_call_t a notification would produce, and the verdict is applied to the
  * registers. A new descendant appears in a stop of its own, and a fork or clone stops its
@@ -616,6 +618,19 @@ static void chaos_init_trace_stop(unsigned libs, pid_t tid, int status)
     chaos_init_verdict_t verdict;
     unsigned index;
 
+    /* The exit stop of a call whose entry stop asked for it. Nothing was parked: the
+     * argument registers still hold the caller's values, so the same rule is selected,
+     * and the result is the one register that changed. */
+    if (chaos_init_trace_is_syscall_stop(status))
+    {
+        if (chaos_init_trace_unpark(tid, &call) && chaos_init_trace_read(tid, &regs) == 0 &&
+            (libs & CHAOS_INIT_LIB_IO) != 0U)
+        {
+            (void)chaos_init_io_decide_result(&call, chaos_init_trace_result(&regs));
+        }
+        (void)ptrace(PTRACE_CONT, tid, 0, 0);
+        return;
+    }
     if ((status >> 8) != (SIGTRAP | (PTRACE_EVENT_SECCOMP << 8)))
     {
         const int signal = (status >> 8) == SIGTRAP ? 0 : WSTOPSIG(status);
@@ -638,6 +653,15 @@ static void chaos_init_trace_stop(unsigned libs, pid_t tid, int status)
         call.args[index] = chaos_init_trace_arg(&regs, index);
     }
     chaos_init_decide(libs, &call, &verdict);
+    /* The effect depends on what the call returns, so it runs and stops again. The call is
+     * parked because the exit stop cannot read it back: on aarch64 the result arrives in
+     * the register that held the first argument. A table too full to park it runs the call
+     * without the effect rather than acting on the wrong descriptor. */
+    if (verdict.action == CHAOS_INIT_AFTER && chaos_init_trace_park(&call) == 0)
+    {
+        (void)ptrace(PTRACE_SYSCALL, tid, 0, 0);
+        return;
+    }
     if (verdict.action == CHAOS_INIT_DELAY)
     {
         const chaos_init_verdict_t answer = chaos_init_delay_answer(&verdict);
@@ -992,8 +1016,8 @@ int main(int argc, char **argv)
                 PTRACE_SETOPTIONS,
                 child,
                 0,
-                (void *)(long)(PTRACE_O_TRACESECCOMP | PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
-                               PTRACE_O_TRACECLONE)
+                (void *)(long)(PTRACE_O_TRACESECCOMP | PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK |
+                               PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE)
             ) != 0)
         {
             (void)kill(child, SIGKILL);

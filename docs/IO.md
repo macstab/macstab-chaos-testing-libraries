@@ -1097,9 +1097,11 @@ so ERRNO and LATENCY reach them there too. TORN applies as well, on `write` and
 `pwrite`: the byte count sits in a register, so those calls are answered with
 `SECCOMP_RET_TRACE` and shortened at the stop ([SECCOMP.md
 §3.3](SECCOMP.md#33-effects-that-need-the-registers-not-a-reply)). The vectored forms keep
-their count in memory and are written whole, counting no hit, as they are here. A rule
-file containing CORRUPT, FREE, FULL, ERRNO on `close` or `write:DROP` is rejected as a
-whole with
+their count in memory and are written whole, counting no hit, as they are here. CORRUPT
+applies on `read` and `pread` as well, decided at the stop *after* the call, since how many
+bytes there are to corrupt is its result; a read that delivered nothing counts no hit, and
+a vectored read is left alone because its bytes are spread over segments. A rule file
+containing FREE, FULL, ERRNO on `close` or `write:DROP` is rejected as a whole with
 `reason=unsupported in seccomp mode`. `write:DROP` is the one asymmetry: answering
 a notification with the byte count is exactly a drop, but the descriptor's file
 offset has to move on with it, and the supervisor cannot reach another process's
