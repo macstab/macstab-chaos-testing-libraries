@@ -27,7 +27,8 @@
 #   refused, a fork rule fails fork (C), a posix_spawn rule fails Go os/exec;
 # - a rule SECCOMP mode cannot apply (CORRUPT) rejects the whole file, named in the status;
 # - TORN is applied through a ptrace stop: the returned count and the file size both drop
-#   below ten and agree, and a fork of the traced application still runs;
+#   below ten and agree, and a fork of the traced application still runs; TRICKLE cuts a
+#   stream receive to its chunk and leaves the rest in the socket;
 # - without chaos-init the same rules change nothing.
 #
 # Under emulation (a foreign architecture through QEMU) seccomp user notification is unavailable:
@@ -278,6 +279,16 @@ expect "C: TORN reports a shortened count" "$(echo "$torn" | sed -n "s/^wrote=\\
 expect "C: TORN really shortened the write" "$(echo "$torn" | sed -n "s/^wrote=\\([1-9]\\) file=\\1$/match/p")" "match"
 expect "C: the TORN rule is applied, not rejected" \
     "$(sed -n 1,2p /tmp/.chaos-io.status | tr "\n" " ")" "state=ok rules=1 "
+# TRICKLE through a trace stop: every receive is cut to the chunk, so the first returns 4
+# of the ten bytes sent and the second -- which asks for the remaining 6 -- is cut to 4 as
+# well. Both numbers below the request is what shows the register was shortened.
+printf "%s\n" "*:recv:TRICKLE:4 # t" > /tmp/.chaos-net.conf
+expect "C: TRICKLE shortens every receive" "$($init --libs net -- /tmp/probe trickle 7801)" \
+    "first=4 rest=4"
+expect "C: the TRICKLE rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-net.status | tr "\n" " ")" "state=ok rules=1 "
+rm -f /tmp/.chaos-net.conf
+
 # A forked child of the tracee is traced too: without PTRACE_O_TRACEFORK its filtered calls
 # would fail with ENOSYS, because a RET_TRACE with no tracer does.
 printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/data:write:TORN:1.0 # t" > /tmp/.chaos-io.conf

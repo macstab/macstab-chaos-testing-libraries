@@ -304,6 +304,13 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *in
         chaos_init_io_start();
         traced_count = chaos_init_io_traced_calls(traced, sizeof(traced) / sizeof(traced[0]));
     }
+    if ((libs & CHAOS_INIT_LIB_NET) != 0U)
+    {
+        chaos_init_net_start();
+        traced_count += chaos_init_net_traced_calls(
+            traced + traced_count, sizeof(traced) / sizeof(traced[0]) - traced_count
+        );
+    }
     program.len = (unsigned short
     )chaos_init_build_filter(libs, handover, traced, traced_count, filter, CHAOS_INIT_MAX_FILTER);
     program.filter = filter;

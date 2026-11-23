@@ -522,6 +522,12 @@ udp4://10.0.0.5:53:send:DROP:0.1
 
 An effect/operation pair outside this table rejects the rule file.
 
+Under `chaos-init`, `TRICKLE` applies to `recv`, `recvfrom` and `read` on a stream socket:
+their length sits in a register, so those calls are answered with `SECCOMP_RET_TRACE` and
+shortened at the stop ([SECCOMP.md
+§3.3](SECCOMP.md#33-effects-that-need-the-registers-not-a-reply)). `recvmsg` and the
+batches keep their length in memory and run whole, counting no hit, as they do here.
+
 DROP reports a send as done and sends nothing, which is a lost packet. It applies to
 datagram sockets only, decided per call from `SO_TYPE` rather than from the selector: a
 `*:send:DROP` rule is accepted and leaves stream sends alone, counting no hit for them. A

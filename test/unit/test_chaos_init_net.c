@@ -1140,7 +1140,65 @@ int main(void)
         (void)fclose(file);
         assert(strstr(status, "line=2\nreason=unsupported in seccomp mode\n") != NULL);
     }
+    /* TRICKLE is applied here now: the requested length sits in a register, so the filter
+     * answers the call with TRACE and the stop shortens it to the chunk. The library's
+     * limits hold -- a stream socket only, not MSG_WAITALL, and only a request larger than
+     * the chunk -- and the forms that keep their length in memory stay notified. */
+    write_rules("*:recv:TRICKLE:4\n");
+    {
+        const chaos_init_verdict_t shortened =
+            decide(__NR_recvfrom, (uint64_t)server, P(buffer), 32U, 0, 0, 0);
+
+        assert(shortened.action == CHAOS_INIT_SHORTEN);
+        assert(shortened.arg_index == 2U);
+        assert(shortened.value == 4);
+    }
+    /* read on a socket is a recv, and carries its length in a register too. */
+    assert(
+        decide(__NR_read, (uint64_t)server, P(buffer), 32U, 0, 0, 0).action == CHAOS_INIT_SHORTEN
+    );
+    /* A request already within the chunk is left alone, as is MSG_WAITALL. */
+    assert(PASSES(decide(__NR_recvfrom, (uint64_t)server, P(buffer), 4U, 0, 0, 0)));
+    assert(
+        PASSES(decide(__NR_recvfrom, (uint64_t)server, P(buffer), 32U, (uint64_t)MSG_WAITALL, 0, 0))
+    );
+    /* A datagram socket is left alone: a shorter buffer truncates the datagram. */
+    assert(PASSES(decide(__NR_recvfrom, (uint64_t)udp, P(buffer), 32U, 0, 0, 0)));
+    /* recvmsg keeps its length in the message, so one argument cannot shorten it. */
+    assert(PASSES(decide(__NR_recvmsg, (uint64_t)server, P(&message), 0, 0, 0, 0)));
+    /* The traced set names exactly the register-length receives, each once. Three rules on
+     * purpose: a second recv rule must not name the same calls twice, and the connect rule
+     * must not contribute at all. */
+    write_rules("*:recv:TRICKLE:4\n"
+                "tcp4://127.0.0.1:9999:recv:TRICKLE:8\n"
+                "*:connect:ECONNREFUSED:1.0\n");
+    {
+        long traced[8];
+        const size_t count =
+            chaos_init_net_traced_calls(traced, sizeof(traced) / sizeof(traced[0]));
+        size_t index;
+        int saw_recvfrom = 0;
+        int saw_read = 0;
+        int saw_recvmsg = 0;
+
+        for (index = 0U; index < count; ++index)
+        {
+            saw_recvfrom = saw_recvfrom || traced[index] == __NR_recvfrom;
+            saw_read = saw_read || traced[index] == __NR_read;
+            saw_recvmsg = saw_recvmsg || traced[index] == __NR_recvmsg;
+        }
+        assert(count == 2U && saw_recvfrom && saw_read && !saw_recvmsg);
+        assert(chaos_init_net_traced_calls(traced, 1U) == 1U);
+        assert(chaos_init_net_traced_calls(traced, 0U) == 0U);
+        assert(chaos_init_net_traced_calls(NULL, 4U) == 0U);
+    }
+    /* With nothing traced the set is empty, so the filter stays the one it always was. */
     write_rules("*:close:ECONNRESET:1.0\n");
+    {
+        long traced[8];
+
+        assert(chaos_init_net_traced_calls(traced, sizeof(traced) / sizeof(traced[0])) == 0U);
+    }
     assert(PASSES(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0)));
     write_rules("*:close:RESET:1.0\n");
     assert(PASSES(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0)));

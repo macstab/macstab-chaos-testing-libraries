@@ -11,6 +11,8 @@
 
 #include "chaos_init_call.h"
 
+#include <stddef.h>
+
 /**
  * @brief Initialises the net rule core (the rule file is read lazily, on the first
  *        decision), seeds its PRNG from getrandom() and registers its per-process slots.
@@ -69,5 +71,23 @@ int chaos_init_net_mptcp_diag_available(void);
  * A small window remains between that check and the write.
  */
 void chaos_init_net_commit(const chaos_init_call_t *call, const chaos_init_verdict_t *verdict);
+
+/**
+ * @brief The system call numbers the filter must answer with TRACE for the rules currently
+ *        in `/tmp/.chaos-net.conf`.
+ *
+ * @details Reads the rule file (as a decision would) and names, for every rule whose
+ * effect needs the tracee's registers, the calls of that operation whose length sits in a
+ * register. Called in the child before it installs the filter; see
+ * chaos_init_io_traced_calls() for why it happens there and what it costs.
+ *
+ * `read` is shared with io, so a rule that traces it moves every read onto the trace path,
+ * file reads included: a filter has one action per system call number.
+ *
+ * @param out       Receives the numbers; NULL yields 0.
+ * @param capacity  Entries @p out can hold; the result is truncated to it.
+ * @return How many numbers were written.
+ */
+size_t chaos_init_net_traced_calls(long *out, size_t capacity);
 
 #endif

@@ -25,6 +25,8 @@
  *                       writes "ok" or the errno name to <out>.
  *   torn <path>         - writes ten bytes to <path> and prints the returned count and the
  *                       file's resulting size, for TORN under a trace stop.
+ *   trickle <port>      - sends ten bytes over a loopback stream pair and prints what the
+ *                       first recv returned and how much was left, for TRICKLE.
  * - fork                fork + waitpid: "ok" or the errno name.
  * - exec                execl("/bin/true"); prints the errno name only when it fails.
  *
@@ -222,6 +224,40 @@ int main(int argc, char **argv)
             _exit(0);
         }
         return child > 0 ? 3 : 1;
+    }
+    if (argc == 3 && strcmp(argv[1], "trickle") == 0)
+    {
+        /* A loopback stream pair: ten bytes are sent, one recv asks for all ten, and the
+         * count it returns is printed. A TRICKLE rule shortens the request in the register
+         * before the kernel reads it, so the count drops below ten while the rest stays in
+         * the socket -- which the second recv shows, cut to the chunk as well. */
+        struct sockaddr_in address;
+        char buffer[16];
+        const int listener = socket(AF_INET, SOCK_STREAM, 0);
+        const int client = socket(AF_INET, SOCK_STREAM, 0);
+        int server;
+        ssize_t first;
+        ssize_t second;
+
+        memset(&address, 0, sizeof(address));
+        address.sin_family = AF_INET;
+        address.sin_port = htons((uint16_t)atoi(argv[2]));
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+            listen(listener, 1) != 0 ||
+            connect(client, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+            (server = accept(listener, NULL, NULL)) < 0 ||
+            write(client, "0123456789", (size_t)10) != 10)
+        {
+            return 1;
+        }
+        first = recv(server, buffer, sizeof(buffer) > 10U ? 10U : sizeof(buffer), 0);
+        second = first > 0 && first < 10 ? recv(server, buffer, (size_t)(10 - first), 0) : 0;
+        (void)printf("first=%ld rest=%ld\n", (long)first, (long)second);
+        (void)close(server);
+        (void)close(client);
+        (void)close(listener);
+        return 0;
     }
     if (argc == 3 && strcmp(argv[1], "waits") == 0)
     {

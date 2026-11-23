@@ -79,12 +79,26 @@ static int chaos_init_net_supported(const struct chaos_net_rule *rule);
 #include <sys/un.h>
 #include <sys/xattr.h>
 
-/* CHAOS_NET_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, TIMEOUT, DROP. */
+/**
+ * @brief Whether @p rule's effect needs the tracee's registers rather than a reply.
+ *
+ * @details Only TRICKLE so far: it shortens the requested length before the kernel reads
+ * it, which a notification cannot do. The predicate decides the filter's traced group
+ * (chaos_init_net_traced_calls()), so adding an effect here without teaching the trace
+ * path to apply it would load a rule that never fires.
+ */
+static int chaos_init_net_traced_effect(const struct chaos_net_rule *rule)
+{
+    return rule->effect == CHAOS_NET_EFFECT_TRICKLE;
+}
+
+/* CHAOS_NET_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, TIMEOUT, DROP, and
+ * TRICKLE, which the trace path shortens in the tracee's registers. */
 static int chaos_init_net_supported(const struct chaos_net_rule *rule)
 {
     return (rule->effect == CHAOS_NET_EFFECT_ERRNO && rule->operation != CHAOS_NET_OP_CLOSE) ||
            rule->effect == CHAOS_NET_EFFECT_LATENCY || rule->effect == CHAOS_NET_EFFECT_TIMEOUT ||
-           rule->effect == CHAOS_NET_EFFECT_DROP;
+           rule->effect == CHAOS_NET_EFFECT_DROP || chaos_init_net_traced_effect(rule);
 }
 
 /**
@@ -539,6 +553,14 @@ static int chaos_init_net_is_datagram(uint64_t fd)
     return protocol != NULL && protocol->type == SOCK_DGRAM;
 }
 
+/** @brief Whether the tracee's descriptor @p fd is a stream socket; 0 when unknown. */
+static int chaos_init_net_is_stream(uint64_t fd)
+{
+    const chaos_init_net_protocol_t *protocol = chaos_init_net_protocol((int)fd);
+
+    return protocol != NULL && protocol->type == SOCK_STREAM;
+}
+
 /** @brief How a system call names the socket(s) it acts on, i.e. which endpoint is matched. */
 typedef enum chaos_init_net_kind
 {
@@ -605,6 +627,60 @@ static const chaos_init_net_call_t g_chaos_init_net_calls[] = {
     {__NR_epoll_pwait2, CHAOS_NET_OP_POLL, CHAOS_INIT_NET_EPOLL, 0, -1},
 #endif
 };
+
+/** @copydoc chaos_init_net_traced_calls */
+size_t chaos_init_net_traced_calls(long *out, size_t capacity)
+{
+    const chaos_net_config_state_t *state;
+    size_t count = 0U;
+    size_t rule_index;
+
+    if (out == NULL || !chaos_net_config_prepare())
+    {
+        return 0U;
+    }
+    state = chaos_net_config_active_state();
+    for (rule_index = 0U; rule_index < state->rule_count; ++rule_index)
+    {
+        size_t entry;
+
+        if (!chaos_init_net_traced_effect(&state->rules[rule_index]))
+        {
+            continue;
+        }
+        for (entry = 0U; entry < sizeof(g_chaos_init_net_calls) / sizeof(g_chaos_init_net_calls[0]);
+             ++entry)
+        {
+            size_t seen;
+
+            /* Only a call whose length sits in a register: recvmsg and the batches keep it
+             * in memory, so one argument cannot shorten them and they stay notified, as
+             * the library leaves them alone too. */
+            if (g_chaos_init_net_calls[entry].operation != state->rules[rule_index].operation ||
+                g_chaos_init_net_calls[entry].size < 0)
+            {
+                continue;
+            }
+            for (seen = 0U; seen < count; ++seen)
+            {
+                if (out[seen] == g_chaos_init_net_calls[entry].nr)
+                {
+                    break;
+                }
+            }
+            if (seen < count)
+            {
+                continue;
+            }
+            if (count == capacity)
+            {
+                return count;
+            }
+            out[count++] = g_chaos_init_net_calls[entry].nr;
+        }
+    }
+    return count;
+}
 
 /* Per-process hit slots of the net rules. */
 CHAOS_INIT_RULES_STORAGE(g_chaos_init_net, CHAOS_NET_MAX_RULES);
@@ -1283,6 +1359,21 @@ int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *v
     {
         return 1;
     }
+    /* TRICKLE shortens the requested length where it sits in a register, and only where
+     * the library shortens it: a stream socket (a shorter buffer truncates a datagram),
+     * not MSG_WAITALL (the caller asked for the whole count), and only a request larger
+     * than the chunk. Of the traced calls only recvfrom carries flags; read has none.
+     * Checked before the draw, so a call it leaves alone counts no hit. */
+    if (rule.effect == CHAOS_NET_EFFECT_TRICKLE)
+    {
+        const uint64_t flags = entry->nr == __NR_recvfrom ? call->args[3] : 0U;
+
+        if (entry->size < 0 || size == CHAOS_POLICY_NO_SIZE || size <= rule.chunk_bytes ||
+            (flags & (uint64_t)MSG_WAITALL) != 0U || !chaos_init_net_is_stream(call->args[0]))
+        {
+            return 1;
+        }
+    }
     /* Swap the snapshot's shared slot for the calling process's (see chaos_init_io.c). */
     state = chaos_net_config_active_state();
     rule.call_size = size;
@@ -1308,6 +1399,14 @@ int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *v
     {
         verdict->action = CHAOS_INIT_RETURN;
         verdict->value = (long)size;
+    }
+    else if (rule.effect == CHAOS_NET_EFFECT_TRICKLE)
+    {
+        /* Always the chunk, never a draw: TRICKLE carries a byte count, not a
+         * probability, and fires on every call it applies to. */
+        verdict->action = CHAOS_INIT_SHORTEN;
+        verdict->arg_index = (unsigned)entry->size;
+        verdict->value = (long)rule.chunk_bytes;
     }
     else
     {
