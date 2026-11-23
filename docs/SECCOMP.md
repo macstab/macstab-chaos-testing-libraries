@@ -230,7 +230,7 @@ output `dist/chaos-init-<arch>`; or `make native-init`, output `build/chaos-init
 
 | Library | Applied | Matched on |
 |---|---|---|
-| io | ERRNO, LATENCY on open, read, write, pread, pwrite, close (LATENCY only), fsync, fdatasync, truncate, allocate, unlink, rename; DROP on pwrite | the path: absolute, or joined lexically to `/proc/<pid>/cwd` or to the directory descriptor's path; descriptors through `/proc/<pid>/fd`. As in the library, descriptors 0–2, paths under `/proc`, `/sys`, `/dev` and the `/tmp/.chaos-*` control files are never faulted |
+| io | ERRNO, LATENCY on open, read, write, pread, pwrite, close (LATENCY only), fsync, fdatasync, truncate, allocate, unlink, rename; DROP on pwrite; TORN on write and pwrite, through a ptrace stop (§3.3) | the path: absolute, or joined lexically to `/proc/<pid>/cwd` or to the directory descriptor's path; descriptors through `/proc/<pid>/fd`. As in the library, descriptors 0–2, paths under `/proc`, `/sys`, `/dev` and the `/tmp/.chaos-*` control files are never faulted |
 | net | ERRNO, LATENCY on socket, bind, listen, connect, accept, shutdown, send, recv, close (LATENCY only), poll; TIMEOUT on the poll family; DROP on a datagram send (not `sendmmsg`) | the endpoint: sockaddr arguments from memory, a socket's own address and peer from `/proc/<pid>/net/*` or sock_diag (§3.2), its type from its `system.sockprotoname` attribute |
 | memory | ERRNO, LATENCY on mmap (anon/file), munmap, mprotect, madvise | the arguments: operation, `mmap` flags, length for `@size` |
 | process | ERRNO, LATENCY, FAIL_AFTER on pthread_create, fork, posix_spawn, execve, execveat, waitpid | the system call and clone's flags (§5) |
@@ -291,6 +291,38 @@ sock_diag where `mptcp_diag` exists; their fallback connections stay unresolvabl
 
 ---
 
+### 3.3 Effects that need the registers, not a reply
+
+A notification reply can fail a call, delay it or return a value. It cannot reach the
+tracee's registers, and `TORN` lives exactly there: it shortens the byte count *before*
+the kernel reads it. Such a call is answered by the filter with `SECCOMP_RET_TRACE`
+instead, which stops the thread with its registers readable and writable.
+
+- The set of traced calls comes from the **rule file**, read by the child before it
+  installs the filter. A run whose rules need no register gets byte for byte the filter
+  this supervisor always built, so it costs exactly what it used to.
+- A call cannot be both notified and traced: across stacked seccomp filters `USER_NOTIF`
+  outranks `TRACE`. A traced number therefore carries **all** of its effects through the
+  stop -- an `ERRNO` rule on a traced call is injected by setting its return register, a
+  `LATENCY` rule by leaving the thread stopped until its delay is up.
+- `PTRACE_TRACEME` is called by the child on itself, so **no capability and no container
+  change are needed**. The tracer is the same process that owns the listener and runs the
+  serve loop.
+- The filter survives `fork` and `exec`, and a `RET_TRACE` with no tracer fails the call
+  with `ENOSYS`. Descendants are therefore attached as they appear
+  (`PTRACE_O_TRACEFORK`, `TRACEVFORK`, `TRACECLONE`), which is what keeps a forked child
+  of the application working.
+- **A filter cannot be changed after it is installed.** A rule file that gains its first
+  such effect for an operation while the container runs cannot start tracing it: the rule
+  loads and does not fire until the container restarts. Everything else still reloads.
+- While the application is traced, `strace` and debuggers cannot attach to it: a process
+  has one tracer.
+
+The design, the measurements behind it and the rejected alternatives are in
+[docs/development/SECCOMP-PTRACE.md](development/SECCOMP-PTRACE.md).
+
+---
+
 ## 4. Rejected rules
 
 A rule the parser accepts but seccomp cannot carry out rejects its whole file, like an
@@ -299,7 +331,8 @@ that file applies.
 
 | Rule | Why not |
 |---|---|
-| io TORN, CORRUPT, FREE, FULL; net CORRUPT, TRICKLE, DUP | They change data the kernel moves or the structure it returned. A notification reply can fail, delay or skip a call, not rewrite what it transfers or answers. |
+| io CORRUPT, FREE, FULL; net CORRUPT, TRICKLE, DUP | They change data the kernel moves or the structure it returned. Neither a notification reply nor a register can reach it. |
+| io TORN on a vectored write | The byte count of `writev`/`pwritev` is in the iovec array, not in a register, so one argument cannot shorten it. The call is written whole and counts no hit, as in the library. |
 | io `write:DROP` | A reply with the byte count is exactly a drop, but a dropped `write` has to move the descriptor's file offset on with it, which the supervisor cannot do from outside. `pwrite:DROP` carries its own offset and is applied (§3.1). |
 | net RESET | It needs a `setsockopt(SO_LINGER)` to run in the application before its close, and a notification reply either runs the notified call or fails it -- there is no reply that means "run this other call first". Injecting one needs `SECCOMP_RET_TRACE` and ptrace, not a descriptor: `PTRACE_TRACEME` is called by the tracee itself and needs no capability, so this is a question of machinery that does not exist yet, not of privilege. |
 | io and net ERRNO on close | The libraries close, then report the error, as Linux does for a failing close. A notified call either runs or fails, not both. |

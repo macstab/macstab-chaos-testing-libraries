@@ -30,7 +30,7 @@
  *   as long as the source's; an unreadable side leaves the other to decide;
  * - `@first` and hit counts are per process and land in that process's hits file;
  *   counts follow rule texts across reloads, also when a reload reuses a snapshot buffer;
- * - TORN, CORRUPT and ERRNO on close reject the whole rule file in SECCOMP mode, with
+ * - CORRUPT and ERRNO on close reject the whole rule file in SECCOMP mode, with
  *   the status file naming the line;
  * - /proc is never faulted, also as a rename source a rule names explicitly.
  */
@@ -443,14 +443,74 @@ int main(void)
     );
     (void)unlink(buffer);
 
-    /* Effects SECCOMP mode cannot apply reject the whole rule file: TORN and CORRUPT
-     * rewrite data the kernel moves, and ERRNO on close would need the descriptor closed
-     * and the call failed at once. No rule of a rejected file applies (the valid open
-     * rule on line 1 passes too) and the status file names the offending line. */
+    /* TORN is applied here now: the byte count sits in a register, so the filter answers
+     * the call with TRACE and the stop shortens it. The verdict names the argument to
+     * replace and the count to put there, which must be a real tear -- at least one byte
+     * and less than the request. */
     torn = open_file("/tmp/initio/torn/f");
     closing = open_file("/tmp/initio/c/f");
-    write_rules("/tmp/initio/data:open:EIO:1.0\n/tmp/initio/torn:write:TORN:1.0\n");
-    assert(PASSES(decide(__NR_write, (uint64_t)torn, P(buffer), 10U, 0, 0)));
+    write_rules("/tmp/initio/torn:write:TORN:1.0\n");
+    {
+        const chaos_init_verdict_t shortened =
+            decide(__NR_write, (uint64_t)torn, P(buffer), 10U, 0, 0);
+
+        assert(shortened.action == CHAOS_INIT_SHORTEN);
+        assert(shortened.arg_index == 2U);
+        assert(shortened.value >= 1 && shortened.value < 10);
+    }
+    /* The vectored forms keep their count in memory, so one argument cannot shorten them:
+     * they stay on the notification path and are written whole, as in the library. */
+    {
+        struct iovec whole[2];
+
+        whole[0].iov_base = buffer;
+        whole[0].iov_len = 6U;
+        whole[1].iov_base = buffer;
+        whole[1].iov_len = 6U;
+        assert(PASSES(decide(__NR_writev, (uint64_t)torn, P(whole), 2U, 0, 0)));
+    }
+    /* The traced set names exactly the register-count calls of the operations that carry a
+     * traced effect, each once. Three rules on purpose: a second `write` rule must not
+     * name the same calls twice, and the `open` rule must not contribute at all. */
+    write_rules("/tmp/initio/torn:write:TORN:1.0\n"
+                "/tmp/initio/other:write:TORN:0.5\n"
+                "/tmp/initio/data:open:EIO:1.0\n");
+    {
+        long traced[8];
+        const size_t count = chaos_init_io_traced_calls(traced, sizeof(traced) / sizeof(traced[0]));
+        size_t index;
+        int saw_write = 0;
+        int saw_sendfile = 0;
+        int saw_copy = 0;
+        int saw_writev = 0;
+        int saw_openat = 0;
+
+        for (index = 0U; index < count; ++index)
+        {
+            saw_write = saw_write || traced[index] == __NR_write;
+            saw_sendfile = saw_sendfile || traced[index] == __NR_sendfile;
+            saw_copy = saw_copy || traced[index] == __NR_copy_file_range;
+            saw_writev = saw_writev || traced[index] == __NR_writev;
+            saw_openat = saw_openat || traced[index] == __NR_openat;
+        }
+        /* write, sendfile and copy_file_range are the `write` operation's register-count
+         * calls; the vectored forms and the untraced operation are absent, and the two
+         * rules of the same operation do not double the set. */
+        assert(saw_write && saw_sendfile && saw_copy);
+        assert(!saw_writev && !saw_openat);
+        assert(count == 3U);
+        /* Truncated to the capacity rather than overrunning it, and a NULL destination is
+         * no request at all. */
+        assert(chaos_init_io_traced_calls(traced, 2U) == 2U);
+        assert(chaos_init_io_traced_calls(traced, 0U) == 0U);
+        assert(chaos_init_io_traced_calls(NULL, 4U) == 0U);
+    }
+
+    /* CORRUPT still rejects the whole rule file: it rewrites data the kernel moved, which
+     * is neither a register nor an argument. No rule of a rejected file applies, and the
+     * status names the offending line. */
+    write_rules("/tmp/initio/data:open:EIO:1.0\n/tmp/initio/torn:read:CORRUPT:1.0\n");
+    assert(PASSES(decide(__NR_read, (uint64_t)torn, P(buffer), 10U, 0, 0)));
     assert(PASSES(decide(__NR_openat, (uint64_t)AT_FDCWD, P("/tmp/initio/data/x"), 0, 0, 0)));
     file = fopen("/tmp/.chaos-io.status", "r");
     assert(file != NULL);
@@ -463,6 +523,12 @@ int main(void)
             strlen("state=error\nrules=0\nline=2\nreason=unsupported in seccomp mode\n")
         ) == 0
     );
+    /* With nothing traced the set is empty, so the filter stays the one it always was. */
+    {
+        long traced[8];
+
+        assert(chaos_init_io_traced_calls(traced, sizeof(traced) / sizeof(traced[0])) == 0U);
+    }
     /* DROP on pwrite is a reply with the byte count and no call, which a notification can
      * answer: 10 bytes reported written, nothing written. A positioned write does not use
      * the descriptor's offset, so there is nothing to correct -- which is exactly why

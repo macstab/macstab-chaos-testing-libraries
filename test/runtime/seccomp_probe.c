@@ -23,6 +23,8 @@
  *                       forever=<rc>"; "waited" means >= 150 ms elapsed.
  * - orphan <path> <out> exits 3 at once, leaving a child that opens <path> 300 ms later and
  *                       writes "ok" or the errno name to <out>.
+ *   torn <path>         - writes ten bytes to <path> and prints the returned count and the
+ *                       file's resulting size, for TORN under a trace stop.
  * - fork                fork + waitpid: "ok" or the errno name.
  * - exec                execl("/bin/true"); prints the errno name only when it fails.
  *
@@ -45,6 +47,7 @@
 #include <signal.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -121,6 +124,35 @@ int main(int argc, char **argv)
         }
         (void)printf("%s\n", read(fd, &byte, 1U) >= 0 ? "ok" : try_open_errno_name(errno));
         (void)close(fd);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "torn") == 0)
+    {
+        /* Writes ten bytes to <path> and prints what write() returned, plus the bytes the
+         * file ended up holding. A TORN rule shortens the count in the register before the
+         * kernel reads it, so both numbers drop together -- a count the supervisor faked
+         * without the call being shortened would show as a mismatch. */
+        const int fd = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        ssize_t written;
+        struct stat info;
+
+        if (fd < 0)
+        {
+            (void)printf("open=%s\n", try_open_errno_name(errno));
+            return 0;
+        }
+        written = write(fd, "0123456789", (size_t)10);
+        (void)close(fd);
+        if (written < 0)
+        {
+            (void)printf("write=%s\n", try_open_errno_name(errno));
+            return 0;
+        }
+        (void)printf(
+            "wrote=%ld file=%ld\n",
+            (long)written,
+            stat(argv[2], &info) == 0 ? (long)info.st_size : -1L
+        );
         return 0;
     }
     if (argc == 3 && strcmp(argv[1], "openms") == 0)

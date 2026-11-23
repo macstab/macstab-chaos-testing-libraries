@@ -25,7 +25,9 @@
 # - process: an execve rule never blocks the start of the application itself (direct, PATH
 #   search, #!-less script via /bin/sh), a non-executable command exits 126, a later exec is
 #   refused, a fork rule fails fork (C), a posix_spawn rule fails Go os/exec;
-# - a rule SECCOMP mode cannot apply (TORN) rejects the whole file, named in the status;
+# - a rule SECCOMP mode cannot apply (CORRUPT) rejects the whole file, named in the status;
+# - TORN is applied through a ptrace stop: the returned count and the file size both drop
+#   below ten and agree, and a fork of the traced application still runs;
 # - without chaos-init the same rules change nothing.
 #
 # Under emulation (a foreign architecture through QEMU) seccomp user notification is unavailable:
@@ -262,10 +264,25 @@ expect "Go: without chaos-init os/exec works" "$($go spawn)" "ok"
 rm -f /tmp/.chaos-process.conf
 expect "all libraries at once" "$($init --libs io,net,memory,process -- $go dial 7777)" "ECONNREFUSED"
 
-printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/data:write:TORN:1.0 # t" > /tmp/.chaos-io.conf
+printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/data:read:CORRUPT:1.0 # t" > /tmp/.chaos-io.conf
 expect "a rule SECCOMP mode cannot apply rejects the file" "$($init --libs io -- /tmp/probe open /tmp/sec/data/x)" "ok"
 expect "the status file names it" "$(sed -n 3,4p /tmp/.chaos-io.status | tr "\n" " ")" \
     "line=2 reason=unsupported in seccomp mode "
+
+# TORN through a ptrace stop: the count is shortened in the register before the kernel reads
+# it, so the returned count and the file size drop together and both stay under ten. A
+# supervisor that faked the count without shortening the call would leave ten bytes behind.
+printf "%s\n" "/tmp/sec/data:write:TORN:1.0 # t" > /tmp/.chaos-io.conf
+torn=$($init --libs io -- /tmp/probe torn /tmp/sec/data/torn)
+expect "C: TORN reports a shortened count" "$(echo "$torn" | sed -n "s/^wrote=\\([1-9]\\) file=.*/short/p")" "short"
+expect "C: TORN really shortened the write" "$(echo "$torn" | sed -n "s/^wrote=\\([1-9]\\) file=\\1$/match/p")" "match"
+expect "C: the TORN rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-io.status | tr "\n" " ")" "state=ok rules=1 "
+# A forked child of the tracee is traced too: without PTRACE_O_TRACEFORK its filtered calls
+# would fail with ENOSYS, because a RET_TRACE with no tracer does.
+printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/data:write:TORN:1.0 # t" > /tmp/.chaos-io.conf
+expect "C: a fork of a traced application still runs" \
+    "$($init --libs io -- /tmp/probe first /tmp/sec/data/x)" "parent=EIO,EIO child=EIO"
 [ "$failures" -eq 0 ]
 '
 

@@ -21,6 +21,7 @@ typedef struct chaos_init_delayed
     chaos_init_call_t call;
     uint64_t due_ms;
     chaos_init_verdict_t answer;
+    int traced; /**< `id` is a tracee's tid, not a notification id. */
 } chaos_init_delayed_t;
 
 static chaos_init_delayed_t g_chaos_init_delayed[CHAOS_INIT_MAX_DELAYED];
@@ -38,7 +39,11 @@ chaos_init_verdict_t chaos_init_delay_answer(const chaos_init_verdict_t *verdict
 }
 
 int chaos_init_delay_add(
-    uint64_t id, const chaos_init_call_t *call, uint64_t due_ms, const chaos_init_verdict_t *answer
+    uint64_t id,
+    const chaos_init_call_t *call,
+    uint64_t due_ms,
+    const chaos_init_verdict_t *answer,
+    int traced
 )
 {
     if (g_chaos_init_delayed_count == CHAOS_INIT_MAX_DELAYED)
@@ -49,6 +54,7 @@ int chaos_init_delay_add(
     g_chaos_init_delayed[g_chaos_init_delayed_count].call = *call;
     g_chaos_init_delayed[g_chaos_init_delayed_count].due_ms = due_ms;
     g_chaos_init_delayed[g_chaos_init_delayed_count].answer = *answer;
+    g_chaos_init_delayed[g_chaos_init_delayed_count].traced = traced;
     ++g_chaos_init_delayed_count;
     return 0;
 }
@@ -92,7 +98,7 @@ int chaos_init_delay_next(uint64_t *due_ms)
     return 1;
 }
 
-int chaos_init_delay_pop(uint64_t now_ms, uint64_t *id, chaos_init_verdict_t *answer)
+int chaos_init_delay_pop(uint64_t now_ms, uint64_t *id, chaos_init_verdict_t *answer, int *traced)
 {
     size_t index;
 
@@ -102,6 +108,7 @@ int chaos_init_delay_pop(uint64_t now_ms, uint64_t *id, chaos_init_verdict_t *an
         {
             *id = g_chaos_init_delayed[index].id;
             *answer = g_chaos_init_delayed[index].answer;
+            *traced = g_chaos_init_delayed[index].traced;
             g_chaos_init_delayed[index] = g_chaos_init_delayed[--g_chaos_init_delayed_count];
             return 1;
         }

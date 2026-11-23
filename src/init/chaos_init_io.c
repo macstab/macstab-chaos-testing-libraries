@@ -79,14 +79,28 @@ __thread int g_chaos_io_tls_guard = 0;
 uint64_t g_chaos_io_lineage = 0U;
 uint64_t g_chaos_io_process_seed = UINT64_C(0x2545f4914f6cdd1d);
 
-/* CHAOS_IO_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, and DROP on pwrite.
- * FREE and FULL fall under the data effects: they rewrite the structure the kernel
- * returned, which a notification reply cannot reach. */
+/**
+ * @brief Whether @p rule's effect needs the tracee's registers rather than a reply.
+ *
+ * @details Only TORN so far: it shortens the byte count before the kernel reads it, which
+ * a notification cannot do. The predicate is what puts a system call in the filter's
+ * traced group (chaos_init_io_traced_calls()), so adding an effect here without teaching
+ * the trace path to apply it would load a rule that never fires.
+ */
+static int chaos_init_io_traced_effect(const struct chaos_io_rule *rule)
+{
+    return rule->effect == CHAOS_IO_EFFECT_TORN;
+}
+
+/* CHAOS_IO_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, DROP on pwrite, and TORN,
+ * which the trace path shortens in the tracee's registers. FREE and FULL stay out: they
+ * rewrite the structure the kernel returned, which is neither a register nor an argument. */
 static int chaos_init_io_supported(const struct chaos_io_rule *rule)
 {
     return (rule->effect == CHAOS_IO_EFFECT_ERRNO && rule->operation != CHAOS_IO_OP_CLOSE) ||
            rule->effect == CHAOS_IO_EFFECT_LATENCY ||
-           (rule->effect == CHAOS_IO_EFFECT_DROP && rule->operation == CHAOS_IO_OP_PWRITE);
+           (rule->effect == CHAOS_IO_EFFECT_DROP && rule->operation == CHAOS_IO_OP_PWRITE) ||
+           chaos_init_io_traced_effect(rule);
 }
 
 /** @brief Test seam: how /proc links are read; unit tests make one unreadable. */
@@ -163,6 +177,60 @@ static const chaos_init_io_call_t g_chaos_init_io_calls[] = {
     {__NR_renameat, CHAOS_IO_OP_RENAME_FROM, CHAOS_INIT_IO_RENAME_AT, 0, -1},
 #endif
 };
+
+/** @copydoc chaos_init_io_traced_calls */
+size_t chaos_init_io_traced_calls(long *out, size_t capacity)
+{
+    const chaos_io_config_state_t *state;
+    size_t count = 0U;
+    size_t rule_index;
+
+    if (out == NULL || !chaos_io_config_prepare())
+    {
+        return 0U;
+    }
+    state = chaos_io_config_active_state();
+    for (rule_index = 0U; rule_index < state->rule_count; ++rule_index)
+    {
+        size_t entry;
+
+        if (!chaos_init_io_traced_effect(&state->rules[rule_index]))
+        {
+            continue;
+        }
+        for (entry = 0U; entry < sizeof(g_chaos_init_io_calls) / sizeof(g_chaos_init_io_calls[0]);
+             ++entry)
+        {
+            size_t seen;
+
+            /* Only a call whose byte count sits in a register: the vectored forms keep it
+             * in memory, so the count cannot be shortened by rewriting one argument and
+             * they stay on the notification path, as the library leaves them whole too. */
+            if (g_chaos_init_io_calls[entry].operation != state->rules[rule_index].operation ||
+                g_chaos_init_io_calls[entry].size < 0)
+            {
+                continue;
+            }
+            for (seen = 0U; seen < count; ++seen)
+            {
+                if (out[seen] == g_chaos_init_io_calls[entry].nr)
+                {
+                    break;
+                }
+            }
+            if (seen < count)
+            {
+                continue;
+            }
+            if (count == capacity)
+            {
+                return count;
+            }
+            out[count++] = g_chaos_init_io_calls[entry].nr;
+        }
+    }
+    return count;
+}
 
 /* Per-process hit slots of the io rules. */
 CHAOS_INIT_RULES_STORAGE(g_chaos_init_io, CHAOS_IO_MAX_RULES);
@@ -445,6 +513,14 @@ int chaos_init_io_decide(const chaos_init_call_t *call, chaos_init_verdict_t *ve
     {
         return 1;
     }
+    /* TORN shortens the count where it sits in a register. The vectored forms keep it in
+     * memory, so one argument cannot shorten them and they are written whole -- the same
+     * answer the library gives a vector it cannot tear. Checked before the draw, so such
+     * a call counts no hit. */
+    if (rule.effect == CHAOS_IO_EFFECT_TORN && entry->size < 0)
+    {
+        return 1;
+    }
     state = chaos_io_config_active_state();
     rule.hit = chaos_init_tracee_hit(
         &g_chaos_init_io_rules, call->tid, state->hits, state->rule_count, rule.hit
@@ -458,6 +534,15 @@ int chaos_init_io_decide(const chaos_init_call_t *call, chaos_init_verdict_t *ve
     {
         verdict->action = CHAOS_INIT_FAIL;
         verdict->error = rule.errnum;
+    }
+    else if (rule.effect == CHAOS_IO_EFFECT_TORN)
+    {
+        /* The count is in a register, so the filter traced this call and the stop can
+         * rewrite it. chaos_io_torn_count() draws from the same slot the notification path
+         * uses, so a torn write counts one hit like everywhere else. */
+        verdict->action = CHAOS_INIT_SHORTEN;
+        verdict->arg_index = (unsigned)entry->size;
+        verdict->value = (long)chaos_io_torn_count(&rule, (size_t)rule.call_size);
     }
     else if (rule.effect == CHAOS_IO_EFFECT_DROP)
     {

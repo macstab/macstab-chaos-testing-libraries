@@ -10,6 +10,8 @@
 
 #include "chaos_init_call.h"
 
+#include <stddef.h>
+
 /**
  * @brief Initialises the io rule core (the rule file is read lazily, on the first
  *        decision), seeds its PRNG from getrandom() and registers its per-process slots.
@@ -24,5 +26,23 @@ void chaos_init_io_start(void);
  *         else 0.
  */
 int chaos_init_io_decide(const chaos_init_call_t *call, chaos_init_verdict_t *verdict);
+
+/**
+ * @brief The system call numbers the filter must answer with TRACE for the rules currently
+ *        in `/tmp/.chaos-io.conf`.
+ *
+ * @details Reads the rule file (as a decision would) and names, for every rule whose
+ * effect needs the tracee's registers, the calls of that operation whose byte count sits
+ * in a register. Called in the child before it installs the filter, because a filter is
+ * fixed once installed: a rule file that gains its first such effect later cannot start
+ * tracing until the container restarts, and says so.
+ *
+ * Duplicates are removed, so the result can be handed to chaos_init_build_filter() as is.
+ *
+ * @param out       Receives the numbers; NULL yields 0.
+ * @param capacity  Entries @p out can hold; the result is truncated to it.
+ * @return How many numbers were written.
+ */
+size_t chaos_init_io_traced_calls(long *out, size_t capacity);
 
 #endif

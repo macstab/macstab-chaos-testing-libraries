@@ -506,6 +506,7 @@ static void test_delays(void)
     chaos_init_call_t call;
     chaos_init_call_t other;
     uint64_t due = 0U;
+    int traced = 0;
     uint64_t id = 0U;
     chaos_init_verdict_t answer;
     chaos_init_verdict_t eio;
@@ -527,28 +528,28 @@ static void test_delays(void)
      * call and in no guaranteed order (8 and 9 are both due by 250); a full queue of
      * CHAOS_INIT_MAX_DELAYED refuses the next add. */
     assert(chaos_init_delay_next(&due) == 0);
-    assert(chaos_init_delay_pop(1000U, &id, &answer) == 0);
-    assert(chaos_init_delay_add(7U, &call, 300U, &run) == 0);
-    assert(chaos_init_delay_add(8U, &call, 100U, &eio) == 0);
-    assert(chaos_init_delay_add(9U, &call, 200U, &run) == 0);
+    assert(chaos_init_delay_pop(1000U, &id, &answer, &traced) == 0);
+    assert(chaos_init_delay_add(7U, &call, 300U, &run, 0) == 0);
+    assert(chaos_init_delay_add(8U, &call, 100U, &eio, 0) == 0);
+    assert(chaos_init_delay_add(9U, &call, 200U, &run, 0) == 0);
     assert(chaos_init_delay_next(&due) == 1 && due == 100U);
-    assert(chaos_init_delay_pop(50U, &id, &answer) == 0);
+    assert(chaos_init_delay_pop(50U, &id, &answer, &traced) == 0);
     assert(
-        chaos_init_delay_pop(250U, &id, &answer) == 1 &&
+        chaos_init_delay_pop(250U, &id, &answer, &traced) == 1 &&
         (id == 8U ? answer.error == EIO : id == 9U && answer.action == CHAOS_INIT_PASS)
     );
     assert(
-        chaos_init_delay_pop(250U, &id, &answer) == 1 &&
+        chaos_init_delay_pop(250U, &id, &answer, &traced) == 1 &&
         (id == 8U ? answer.error == EIO : id == 9U && answer.action == CHAOS_INIT_PASS)
     );
-    assert(chaos_init_delay_pop(250U, &id, &answer) == 0);
-    assert(chaos_init_delay_pop(300U, &id, &answer) == 1 && id == 7U);
+    assert(chaos_init_delay_pop(250U, &id, &answer, &traced) == 0);
+    assert(chaos_init_delay_pop(300U, &id, &answer, &traced) == 1 && id == 7U);
     for (index = 0U; index < CHAOS_INIT_MAX_DELAYED; ++index)
     {
-        assert(chaos_init_delay_add(index, &call, 1U, &run) == 0);
+        assert(chaos_init_delay_add(index, &call, 1U, &run, 0) == 0);
     }
-    assert(chaos_init_delay_add(1U, &call, 1U, &run) == -1);
-    while (chaos_init_delay_pop(1U, &id, &answer))
+    assert(chaos_init_delay_add(1U, &call, 1U, &run, 0) == -1);
+    while (chaos_init_delay_pop(1U, &id, &answer, &traced))
     {
     }
 
@@ -556,7 +557,7 @@ static void test_delays(void)
      * matches it by tid, number and all six arguments and rebinds the id, keeping the
      * due time and answer. A different tid, number or argument is a new call. */
     assert(chaos_init_delay_resume(&call, 20U) == 0);
-    assert(chaos_init_delay_add(10U, &call, 500U, &eio) == 0);
+    assert(chaos_init_delay_add(10U, &call, 500U, &eio, 0) == 0);
     other = call;
     other.tid = 42;
     assert(chaos_init_delay_resume(&other, 21U) == 0);
@@ -568,8 +569,10 @@ static void test_delays(void)
     assert(chaos_init_delay_resume(&other, 21U) == 0);
     assert(chaos_init_delay_resume(&call, 22U) == 1);
     assert(chaos_init_delay_next(&due) == 1 && due == 500U);
-    assert(chaos_init_delay_pop(499U, &id, &answer) == 0);
-    assert(chaos_init_delay_pop(500U, &id, &answer) == 1 && id == 22U && answer.error == EIO);
+    assert(chaos_init_delay_pop(499U, &id, &answer, &traced) == 0);
+    assert(
+        chaos_init_delay_pop(500U, &id, &answer, &traced) == 1 && id == 22U && answer.error == EIO
+    );
     assert(chaos_init_delay_next(&due) == 0);
 
     /* The answer sent when a delay expires, delay cleared: FAIL if an errno is set,
