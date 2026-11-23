@@ -119,6 +119,7 @@ CONFIG_GCNO=$(resolve_gcno test_config_parse)
 CHAOS_INIT_GCNO=$(resolve_gcno test_chaos_init)
 DNS_OWNED_GCNO=$(resolve_gcno test_dns_owned)
 CHAOS_INIT_IO_GCNO=$(resolve_gcno test_chaos_init_io)
+CHAOS_INIT_TRACE_GCNO=$(resolve_gcno test_chaos_init_trace)
 CHAOS_INIT_NET_GCNO=$(resolve_gcno test_chaos_init_net)
 CHAOS_INIT_MEMORY_GCNO=$(resolve_gcno test_chaos_init_memory)
 CHAOS_INIT_PROCESS_GCNO=$(resolve_gcno test_chaos_init_process)
@@ -188,6 +189,7 @@ check_target "$CHAOS_INIT_GCNO" "src/init/chaos_init_core.c" "100.00"
 check_target "$CHAOS_INIT_GCNO" "src/init/chaos_init_delay.c" "100.00"
 check_target "$CHAOS_INIT_GCNO" "src/init/chaos_init_proc.c" "100.00"
 check_target "$CHAOS_INIT_GCNO" "src/init/chaos_init_tracee.c" "100.00"
+check_target "$CHAOS_INIT_TRACE_GCNO" "src/init/chaos_init_trace.c" "100.00"
 check_target "$CHAOS_INIT_IO_GCNO" "src/init/chaos_init_io.c" "100.00"
 check_target "$CHAOS_INIT_NET_GCNO" "src/init/chaos_init_net.c" "100.00"
 check_target "$CHAOS_INIT_MEMORY_GCNO" "src/init/chaos_init_memory.c" "100.00"

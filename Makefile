@@ -181,6 +181,7 @@ INIT_SRCS := \
 	$(SRC_INIT_DIR)/chaos_init_delay.c \
 	$(SRC_INIT_DIR)/chaos_init_proc.c \
 	$(SRC_INIT_DIR)/chaos_init_tracee.c \
+	$(SRC_INIT_DIR)/chaos_init_trace.c \
 	$(SRC_INIT_DIR)/chaos_init_io.c \
 	$(SRC_INIT_DIR)/chaos_init_net.c \
 	$(SRC_INIT_DIR)/chaos_init_memory.c \
@@ -191,6 +192,7 @@ INIT_HDRS := \
 	$(SRC_INIT_DIR)/chaos_init_delay.h \
 	$(SRC_INIT_DIR)/chaos_init_proc.h \
 	$(SRC_INIT_DIR)/chaos_init_tracee.h \
+	$(SRC_INIT_DIR)/chaos_init_trace.h \
 	$(SRC_INIT_DIR)/chaos_init_io.h \
 	$(SRC_INIT_DIR)/chaos_init_net.h \
 	$(SRC_INIT_DIR)/chaos_init_memory.h \
@@ -293,6 +295,7 @@ CHAOS_INIT_IO_TEST := $(BUILD_DIR)/test_chaos_init_io
 CHAOS_INIT_NET_TEST := $(BUILD_DIR)/test_chaos_init_net
 CHAOS_INIT_MEMORY_TEST := $(BUILD_DIR)/test_chaos_init_memory
 CHAOS_INIT_PROCESS_TEST := $(BUILD_DIR)/test_chaos_init_process
+CHAOS_INIT_TRACE_TEST := $(BUILD_DIR)/test_chaos_init_trace
 COMMON_TEST := $(BUILD_DIR)/test_common
 UNIT_TESTS := $(CONFIG_TEST) $(ACTIONS_TEST) $(FDCACHE_TEST) $(CHAOS_IO_TEST) \
 	$(NET_ACTIONS_TEST) $(NET_ENDPOINT_TEST) $(NET_OWNER_TEST) $(NET_CONFIG_TEST) $(NET_RUNTIME_TEST) $(CHAOS_NET_TEST) \
@@ -301,7 +304,8 @@ UNIT_TESTS := $(CONFIG_TEST) $(ACTIONS_TEST) $(FDCACHE_TEST) $(CHAOS_IO_TEST) \
 	$(MEMORY_ACTIONS_TEST) $(MEMORY_CONFIG_TEST) $(MEMORY_RUNTIME_TEST) $(CHAOS_MEMORY_TEST) \
 	$(PROCESS_ACTIONS_TEST) $(PROCESS_CONFIG_TEST) $(PROCESS_RUNTIME_TEST) $(CHAOS_PROCESS_TEST) \
 	$(PROPTEST_TEST) $(CHAOS_INIT_TEST) $(CHAOS_INIT_IO_TEST) \
-	$(CHAOS_INIT_NET_TEST) $(CHAOS_INIT_MEMORY_TEST) $(CHAOS_INIT_PROCESS_TEST) $(COMMON_TEST)
+	$(CHAOS_INIT_NET_TEST) $(CHAOS_INIT_MEMORY_TEST) $(CHAOS_INIT_PROCESS_TEST) \
+	$(CHAOS_INIT_TRACE_TEST) $(COMMON_TEST)
 # Runtime suites run by `make test` against the native build on the host. Several start Docker
 # containers; a suite that cannot run exits with ${CHAOS_SKIP_EXIT:-0}, i.e. it passes as
 # skipped unless the caller sets CHAOS_SKIP_EXIT=1 (as CI does). ci.yml keeps its own copy of
@@ -404,6 +408,7 @@ unit: $(UNIT_TESTS)
 	./$(CHAOS_INIT_NET_TEST)
 	./$(CHAOS_INIT_MEMORY_TEST)
 	./$(CHAOS_INIT_PROCESS_TEST)
+	./$(CHAOS_INIT_TRACE_TEST)
 	./$(COMMON_TEST)
 
 # Coverage gate: check_coverage.sh rebuilds the unit tests with --coverage -O0 in
