@@ -315,6 +315,16 @@ expect "C: the DUP rule is applied, not rejected" \
     "$(sed -n 1,2p /tmp/.chaos-net.status | tr "\n" " ")" "state=ok rules=1 "
 rm -f /tmp/.chaos-net.conf
 
+# write:DROP needs a call of the supervisor in the tracee: the write is replaced by
+# the lseek that moves the offset on by the count it reports, so the next write lands past
+# the hole. The second write is the one that proves it -- its bytes are at offset ten.
+printf "%s\n" "/tmp/sec/data:write:DROP:1.0 @first=1 # t" > /tmp/.chaos-io.conf
+expect "C: a dropped write moves the offset on" \
+    "$($init --libs io -- /tmp/probe drop /tmp/sec/data/dropped)" \
+    "wrote=10,4 zeros=1 tenth=B"
+expect "C: the write DROP rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-io.status | tr "\n" " ")" "state=ok rules=1 "
+
 # A forked child of the tracee is traced too: without PTRACE_O_TRACEFORK its filtered calls
 # would fail with ENOSYS, because a RET_TRACE with no tracer does.
 printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/data:write:TORN:1.0 # t" > /tmp/.chaos-io.conf

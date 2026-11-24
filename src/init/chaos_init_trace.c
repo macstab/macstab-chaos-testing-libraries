@@ -152,6 +152,56 @@ int chaos_init_trace_unpark(pid_t tid, chaos_init_call_t *call)
     return 0;
 }
 
+/** @brief One promised return value per thread, see chaos_init_trace_promise(). */
+typedef struct chaos_init_trace_promise
+{
+    pid_t tid;
+    long value;
+} chaos_init_trace_promise_t;
+
+static chaos_init_trace_promise_t g_chaos_init_trace_promises[CHAOS_INIT_TRACE_PENDING];
+static size_t g_chaos_init_trace_promise_count = 0U;
+
+/** @copydoc chaos_init_trace_promise */
+int chaos_init_trace_promise(pid_t tid, long value)
+{
+    size_t index;
+
+    for (index = 0U; index < g_chaos_init_trace_promise_count; ++index)
+    {
+        if (g_chaos_init_trace_promises[index].tid == tid)
+        {
+            g_chaos_init_trace_promises[index].value = value;
+            return 0;
+        }
+    }
+    if (g_chaos_init_trace_promise_count == CHAOS_INIT_TRACE_PENDING)
+    {
+        return -1;
+    }
+    g_chaos_init_trace_promises[g_chaos_init_trace_promise_count].tid = tid;
+    g_chaos_init_trace_promises[g_chaos_init_trace_promise_count++].value = value;
+    return 0;
+}
+
+/** @copydoc chaos_init_trace_claim */
+int chaos_init_trace_claim(pid_t tid, long *value)
+{
+    size_t index;
+
+    for (index = 0U; index < g_chaos_init_trace_promise_count; ++index)
+    {
+        if (g_chaos_init_trace_promises[index].tid == tid)
+        {
+            *value = g_chaos_init_trace_promises[index].value;
+            g_chaos_init_trace_promises[index] =
+                g_chaos_init_trace_promises[--g_chaos_init_trace_promise_count];
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /** @copydoc chaos_init_trace_result */
 long chaos_init_trace_result(const chaos_init_trace_regs_t *regs)
 {
@@ -239,6 +289,62 @@ void chaos_init_trace_set_arg(chaos_init_trace_regs_t *regs, unsigned index, uin
         block->r9 = value;
         break;
     }
+#endif
+}
+
+/** @copydoc chaos_init_trace_set_result */
+int chaos_init_trace_set_result(pid_t tid, chaos_init_trace_regs_t *regs, long value)
+{
+    chaos_init_trace_block_t *block = chaos_init_trace_block(regs);
+
+    if (block == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+#if defined(__aarch64__)
+    block->regs[0] = (uint64_t)value;
+#else
+    block->rax = (unsigned long long)value;
+#endif
+    return chaos_init_trace_write(tid, regs);
+}
+
+/** @copydoc chaos_init_trace_instead */
+int chaos_init_trace_instead(
+    pid_t tid, chaos_init_trace_regs_t *regs, long number, const uint64_t *args
+)
+{
+    unsigned index;
+#if defined(__aarch64__)
+    int wanted = (int)number;
+    struct iovec area;
+#else
+    chaos_init_trace_block_t *block = chaos_init_trace_block(regs);
+#endif
+
+    if (chaos_init_trace_block(regs) == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    for (index = 0U; index < CHAOS_INIT_TRACE_ARGS; ++index)
+    {
+        chaos_init_trace_set_arg(regs, index, args[index]);
+    }
+#if defined(__aarch64__)
+    /* As in chaos_init_trace_skip(): the number the kernel dispatches on lives in its own
+     * regset here, and x8 is not read again after the stop. */
+    if (chaos_init_trace_write(tid, regs) != 0)
+    {
+        return -1;
+    }
+    area.iov_base = &wanted;
+    area.iov_len = sizeof(wanted);
+    return ptrace(PTRACE_SETREGSET, tid, (void *)(long)NT_ARM_SYSTEM_CALL, &area) != 0 ? -1 : 0;
+#else
+    block->orig_rax = (unsigned long long)number;
+    return chaos_init_trace_write(tid, regs);
 #endif
 }
 

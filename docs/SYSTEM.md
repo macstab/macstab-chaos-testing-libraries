@@ -779,10 +779,13 @@ answers each notification: fail, delay (held in a queue so other threads
 proceed), or continue unchanged, by the rules of the libraries named in
 `--libs`. It requires Linux 5.5 (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`) and uses
 `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` from Linux 5.19. Data effects
-(`CORRUPT`, `TORN`, ...) cannot be applied from outside and are rejected
-with reason `unsupported in seccomp mode`; `DROP` is the exception, since
-answering with a byte count needs no access to the data, and it applies on
-`pwrite`, which carries its own offset. Details: [SECCOMP.md](SECCOMP.md).
+(`TORN`, `CORRUPT`, `TRICKLE`, `DUP`, `DROP`) are applied through a ptrace stop
+instead of a notification, which reaches the tracee's registers, its memory and a
+system call of the supervisor's choosing; the vectored forms are left out of it and
+count no hit. What remains rejected with reason `unsupported in seccomp mode` is what
+rewrites a structure the kernel returned (io `FREE`/`FULL`) or needs a second call to
+run before the original (net `RESET`, errno on `close`).
+Details: [SECCOMP.md](SECCOMP.md).
 
 ### Shared Internal Scaffold
 

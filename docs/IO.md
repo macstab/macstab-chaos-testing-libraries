@@ -1092,7 +1092,7 @@ name and no numeric value is accepted.
 ### SECCOMP mode
 
 `chaos-init` applies io rules to system calls of any process, including static
-binaries, with ERRNO, LATENCY and `pwrite:DROP`. `statfs` and `fstatfs` are notified,
+binaries, with ERRNO, LATENCY and DROP. `statfs` and `fstatfs` are notified,
 so ERRNO and LATENCY reach them there too. TORN applies as well, on `write` and
 `pwrite`: the byte count sits in a register, so those calls are answered with
 `SECCOMP_RET_TRACE` and shortened at the stop ([SECCOMP.md
@@ -1100,13 +1100,20 @@ so ERRNO and LATENCY reach them there too. TORN applies as well, on `write` and
 their count in memory and are written whole, counting no hit, as they are here. CORRUPT
 applies on `read` and `pread` as well, decided at the stop *after* the call, since how many
 bytes there are to corrupt is its result; a read that delivered nothing counts no hit, and
-a vectored read is left alone because its bytes are spread over segments. A rule file
-containing FREE, FULL, ERRNO on `close` or `write:DROP` is rejected as a whole with
-`reason=unsupported in seccomp mode`. `write:DROP` is the one asymmetry: answering
-a notification with the byte count is exactly a drop, but the descriptor's file
-offset has to move on with it, and the supervisor cannot reach another process's
-descriptor without `CAP_SYS_PTRACE`. A positioned write has no such offset, so
-`pwrite:DROP` applies in both modes. See [SECCOMP.md](SECCOMP.md).
+a vectored read is left alone because its bytes are spread over segments.
+
+`write:DROP` and `writev:DROP` apply there too, with the offset correction they need
+here: the write is replaced by the `lseek` that moves the offset on, which runs in the
+tracee itself, and the count is reported once it has. An `O_APPEND` descriptor needs no
+correction and is answered without a second call. What differs from this mode is how the
+descriptor is asked: the supervisor reads its flags from `/proc/<pid>/fdinfo/<fd>` and its
+type from the `/proc/<pid>/fd/<fd>` link rather than probing with an `lseek` of its own,
+so a regular file and a block device have an offset there, while a character device is
+left alone even where its own `lseek` would work. `pwrite:DROP` needs no correction in
+either mode.
+
+A rule file containing FREE, FULL or ERRNO on `close` is rejected as a whole with
+`reason=unsupported in seccomp mode`. See [SECCOMP.md](SECCOMP.md).
 
 ### Operational guidance
 

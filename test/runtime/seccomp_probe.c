@@ -32,6 +32,8 @@
  *   netcorrupt <port>   - the same count over a loopback stream pair, for net CORRUPT.
  *   dup <port>          - sends "one", receives it, sends "two", then reads twice and
  *                       prints the three payloads, for net DUP.
+ *   drop <path>         - writes ten bytes to <path>, then four, and prints what the two
+ *                       writes returned and where the four landed, for write DROP.
  * - fork                fork + waitpid: "ok" or the errno name.
  * - exec                execl("/bin/true"); prints the errno name only when it fails.
  *
@@ -386,6 +388,45 @@ int main(int argc, char **argv)
         (void)close(server);
         (void)close(client);
         (void)close(listener);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "drop") == 0)
+    {
+        /* Ten bytes, then four. A DROP rule with `@first=1` drops the first write and has
+         * to move the file offset on all the same, so the four bytes land at offset ten
+         * with a hole in front of them -- which is what a lost write looks like. A
+         * supervisor that reported the count without moving the offset would put the four
+         * bytes at offset zero. */
+        const int fd = open(argv[2], O_RDWR | O_CREAT | O_TRUNC, 0644);
+        unsigned char got[16];
+        ssize_t first;
+        ssize_t second;
+        int zeros = 1;
+        size_t index;
+
+        if (fd < 0)
+        {
+            (void)printf("setup=%s\n", try_open_errno_name(errno));
+            return 0;
+        }
+        first = write(fd, "AAAAAAAAAA", (size_t)10);
+        second = write(fd, "BBBB", (size_t)4);
+        (void)memset(got, 0xff, sizeof(got));
+        if (lseek(fd, 0, SEEK_SET) != 0 || read(fd, got, sizeof(got)) != 14)
+        {
+            (void)printf(
+                "wrote=%ld,%ld read=%s\n", (long)first, (long)second, try_open_errno_name(errno)
+            );
+            (void)close(fd);
+            return 0;
+        }
+        (void)close(fd);
+        for (index = 0U; index < 10U; ++index)
+        {
+            zeros = zeros && got[index] == 0U;
+        }
+        (void
+        )printf("wrote=%ld,%ld zeros=%d tenth=%c\n", (long)first, (long)second, zeros, got[10]);
         return 0;
     }
     if (argc == 3 && strcmp(argv[1], "waits") == 0)

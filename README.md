@@ -690,15 +690,16 @@ chaos-init --libs io,net,memory,process -- /usr/local/bin/nats-server -js
 
 | Library | Applied in SECCOMP mode |
 |---|---|
-| io | errno and `LATENCY` on every operation (`close`: `LATENCY` only) |
-| net | errno and `LATENCY` on every operation (`close`: `LATENCY` only); `TIMEOUT` on `poll` |
+| io | errno and `LATENCY` on every operation (`close`: `LATENCY` only); `TORN`, `CORRUPT` and `DROP` through a ptrace stop |
+| net | errno and `LATENCY` on every operation (`close`: `LATENCY` only); `TIMEOUT` on `poll`, `DROP` on a datagram send; `TRICKLE`, `CORRUPT` and `DUP` through a ptrace stop |
 | memory | `ERRNO`, `LATENCY` |
 | process | `ERRNO`, `LATENCY`, `FAIL_AFTER`; `clone` is classified as `pthread_create` (`CLONE_THREAD`), `posix_spawn` (`CLONE_VFORK`) or `fork` |
 | dns, time | nothing: name resolution is a library function, clocks are read from the vDSO |
 
 - Rules seccomp cannot carry out reject their whole file with
-  `reason=unsupported in seccomp mode`: io `TORN`/`CORRUPT`, net
-  `CORRUPT`/`TRICKLE`/`DUP`/`RESET`, errno on `close`, and any `posix_spawnp` rule.
+  `reason=unsupported in seccomp mode`: io `FREE`/`FULL`, net `RESET`, errno on
+  `close`, and any `posix_spawnp` rule. The data effects are applied through a ptrace
+  stop, which the vectored forms are left out of, counting no hit.
 - Per-process state follows the libraries (hits, `@first`, a new count after
   `execve`), with one difference: a forked child continues its parent's `FAIL_AFTER`
   counts, where the library's atfork handler resets them to 0.

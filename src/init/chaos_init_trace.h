@@ -163,4 +163,58 @@ void chaos_init_trace_set_arg(chaos_init_trace_regs_t *regs, unsigned index, uin
  */
 int chaos_init_trace_skip(pid_t tid, chaos_init_trace_regs_t *regs, long value);
 
+/**
+ * @brief Makes @p tid run @p number with @p args in place of the call it stopped on.
+ *
+ * @details The arguments go into the argument registers and the number where the kernel
+ * reads it for dispatch, so the thread runs another call entirely when it is continued
+ * with `PTRACE_SYSCALL`. The seccomp filter has already run for this entry, so the
+ * substituted call is not filtered again and stops only on its way out.
+ *
+ * The caller does not call chaos_init_trace_write() afterwards; this does it.
+ *
+ * @param tid     Stopped tracee.
+ * @param regs    Registers read at the stop; modified.
+ * @param number  System call to run instead.
+ * @param args    CHAOS_INIT_TRACE_ARGS arguments for it.
+ * @return 0 on success; -1 with errno.
+ */
+int chaos_init_trace_instead(
+    pid_t tid, chaos_init_trace_regs_t *regs, long number, const uint64_t *args
+);
+
+/**
+ * @brief Sets what the finished call at @p tid's exit stop returns.
+ *
+ * @details Only the return register, because at an exit stop the call is over and its
+ * number no longer decides anything. The caller does not call chaos_init_trace_write()
+ * afterwards; this does it.
+ *
+ * @param tid    Stopped tracee.
+ * @param regs   Registers read at the exit stop; modified.
+ * @param value  Return value for the tracee.
+ * @return 0 on success; -1 with errno.
+ */
+int chaos_init_trace_set_result(pid_t tid, chaos_init_trace_regs_t *regs, long value);
+
+/**
+ * @brief Remembers the value @p tid's next exit stop has to report to the tracee.
+ *
+ * @details What a substituted call (chaos_init_trace_instead()) returns is the other
+ * call's business, not the tracee's: the promise is the value the original call would
+ * have had. One per thread, as parking is.
+ *
+ * @return 0, or -1 when the table is full, in which case the caller must not substitute.
+ */
+int chaos_init_trace_promise(pid_t tid, long value);
+
+/**
+ * @brief Takes @p tid's promised value, if it has one.
+ *
+ * @param tid    The thread at its exit stop.
+ * @param value  Output; untouched when nothing was promised.
+ * @return 1 when a value was promised for @p tid, else 0.
+ */
+int chaos_init_trace_claim(pid_t tid, long *value);
+
 #endif

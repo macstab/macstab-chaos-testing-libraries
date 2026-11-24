@@ -81,19 +81,23 @@ uint64_t g_chaos_io_process_seed = UINT64_C(0x2545f4914f6cdd1d);
  * @brief Whether @p rule's effect needs the tracee's registers rather than a reply.
  *
  * @details TORN shortens the byte count before the kernel reads it; CORRUPT changes a byte
- * the call wrote, which needs the stop after it. A notification can do neither. The predicate is
+ * the call wrote, which needs the stop after it; DROP on a `write` needs an `lseek` to run
+ * in the tracee, which needs the registers twice over. A notification can do none of
+ * them. The predicate is
  * what puts a system call in the filter's traced group (chaos_init_io_traced_calls()), so adding an
  * effect here without teaching the trace path to apply it would load a rule that never fires.
  */
 static int chaos_init_io_traced_effect(const struct chaos_io_rule *rule)
 {
-    return rule->effect == CHAOS_IO_EFFECT_TORN || rule->effect == CHAOS_IO_EFFECT_CORRUPT;
+    return rule->effect == CHAOS_IO_EFFECT_TORN || rule->effect == CHAOS_IO_EFFECT_CORRUPT ||
+           (rule->effect == CHAOS_IO_EFFECT_DROP && rule->operation == CHAOS_IO_OP_WRITE);
 }
 
-/* CHAOS_IO_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, DROP on pwrite, and the
- * traced effects TORN and CORRUPT, which the trace path applies through the registers and
- * the tracee's memory. FREE and FULL stay out: they rewrite the structure the kernel
- * returned, which is neither. */
+/* CHAOS_IO_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, DROP on pwrite (whose
+ * offset is its own argument), and the traced effects TORN, CORRUPT and DROP on write,
+ * which the trace path applies through the registers, the tracee's memory and a call of
+ * its own. FREE and FULL stay out: they rewrite the structure the kernel returned, which
+ * is none of those. */
 static int chaos_init_io_supported(const struct chaos_io_rule *rule)
 {
     return (rule->effect == CHAOS_IO_EFFECT_ERRNO && rule->operation != CHAOS_IO_OP_CLOSE) ||
@@ -105,6 +109,16 @@ static int chaos_init_io_supported(const struct chaos_io_rule *rule)
 /** @brief Test seam: how /proc links are read; unit tests make one unreadable. */
 #ifndef CHAOS_INIT_IO_PROC_LINK
 #define CHAOS_INIT_IO_PROC_LINK chaos_init_proc_link
+#endif
+
+/** @brief Test seam: how a tracee's fdinfo is opened; unit tests make it fail. */
+#ifndef CHAOS_INIT_IO_FDINFO_OPEN
+#define CHAOS_INIT_IO_FDINFO_OPEN fopen
+#endif
+
+/** @brief Test seam: how a tracee's descriptor is stat'ed; unit tests make it fail. */
+#ifndef CHAOS_INIT_IO_FD_STAT
+#define CHAOS_INIT_IO_FD_STAT stat
 #endif
 
 /** @brief How a system call names what it acts on, i.e. how its target path is derived. */
@@ -180,6 +194,30 @@ static const chaos_init_io_call_t g_chaos_init_io_calls[] = {
 /** @brief Result value that means "the call has not run yet" (the entry stop). */
 #define CHAOS_INIT_IO_NO_RESULT LONG_MIN
 
+/**
+ * @brief Whether @p rule needs a trace stop for @p entry in particular.
+ *
+ * @details TORN and CORRUPT need the byte count or the buffer in a register, which the
+ * vectored forms keep in memory: they stay on the notification path, as the library leaves
+ * them whole too. DROP needs no register of the call, only a stop to put an `lseek` in its
+ * place, so it takes the vectored form as well -- but not `sendfile` and
+ * `copy_file_range`, which carry a `write` rule and never a DROP: they move bytes between
+ * two descriptors, and dropping one would need both offsets.
+ */
+static int
+chaos_init_io_traced_call(const struct chaos_io_rule *rule, const chaos_init_io_call_t *entry)
+{
+    if (rule->operation != entry->operation)
+    {
+        return 0;
+    }
+    if (rule->effect == CHAOS_IO_EFFECT_DROP)
+    {
+        return entry->nr == __NR_write || entry->nr == __NR_writev;
+    }
+    return entry->size >= 0;
+}
+
 /** @copydoc chaos_init_io_traced_calls */
 size_t chaos_init_io_traced_calls(long *out, size_t capacity)
 {
@@ -205,11 +243,9 @@ size_t chaos_init_io_traced_calls(long *out, size_t capacity)
         {
             size_t seen;
 
-            /* Only a call whose byte count sits in a register: the vectored forms keep it
-             * in memory, so the count cannot be shortened by rewriting one argument and
-             * they stay on the notification path, as the library leaves them whole too. */
-            if (g_chaos_init_io_calls[entry].operation != state->rules[rule_index].operation ||
-                g_chaos_init_io_calls[entry].size < 0)
+            if (!chaos_init_io_traced_call(
+                    &state->rules[rule_index], &g_chaos_init_io_calls[entry]
+                ))
             {
                 continue;
             }
@@ -298,6 +334,65 @@ static int chaos_init_io_fd_path(pid_t tid, uint64_t fd, char *out, size_t size)
     }
     (void)snprintf(name, sizeof(name), "fd/%d", (int)fd);
     return CHAOS_INIT_IO_PROC_LINK(tid, name, out, size) > 0 && out[0] == '/';
+}
+
+/** @brief What a dropped write has to do about the file offset of a tracee descriptor. */
+typedef enum chaos_init_io_offset
+{
+    CHAOS_INIT_IO_OFFSET_NONE = 0, /**< No offset to move: leave the call alone. */
+    CHAOS_INIT_IO_OFFSET_MOVE,     /**< Move it on by the byte count (an `lseek`). */
+    CHAOS_INIT_IO_OFFSET_KEEP      /**< `O_APPEND`: the kernel ignores it, nothing to do. */
+} chaos_init_io_offset_t;
+
+/**
+ * @brief Whether descriptor @p fd of thread @p tid has an offset a dropped write must
+ *        move on, as chaos_io_drop_write() asks the descriptor itself.
+ *
+ * @details The flags come from `/proc/<tid>/fdinfo/<fd>` (octal, as the kernel prints
+ * them) and the file type from the `/proc/<tid>/fd/<fd>` link, because the supervisor
+ * cannot ask the descriptor with an `lseek` without moving the offset it is asking about.
+ * That is the one difference to the library: a regular file and a block device have an
+ * offset here, a character device is left alone even where its own `lseek` would work.
+ * An unreadable descriptor is left alone too, as a failing `fcntl` leaves it there.
+ */
+static chaos_init_io_offset_t chaos_init_io_offset_of(pid_t tid, uint64_t fd)
+{
+    char name[64];
+    char line[128];
+    struct stat status;
+    FILE *file;
+    long flags = -1;
+
+    (void)snprintf(name, sizeof(name), "/proc/%ld/fdinfo/%d", (long)tid, (int)fd);
+    file = CHAOS_INIT_IO_FDINFO_OPEN(name, "r");
+    if (file == NULL)
+    {
+        return CHAOS_INIT_IO_OFFSET_NONE;
+    }
+    while (fgets(line, sizeof(line), file) != NULL)
+    {
+        if (strncmp(line, "flags:", 6U) == 0)
+        {
+            flags = strtol(line + 6, NULL, 8);
+            break;
+        }
+    }
+    (void)fclose(file);
+    if (flags < 0)
+    {
+        return CHAOS_INIT_IO_OFFSET_NONE;
+    }
+    if ((flags & O_APPEND) != 0)
+    {
+        return CHAOS_INIT_IO_OFFSET_KEEP;
+    }
+    (void)snprintf(name, sizeof(name), "/proc/%ld/fd/%d", (long)tid, (int)fd);
+    if (CHAOS_INIT_IO_FD_STAT(name, &status) != 0)
+    {
+        return CHAOS_INIT_IO_OFFSET_NONE;
+    }
+    return S_ISREG(status.st_mode) || S_ISBLK(status.st_mode) ? CHAOS_INIT_IO_OFFSET_MOVE
+                                                              : CHAOS_INIT_IO_OFFSET_NONE;
 }
 
 /**
@@ -447,6 +542,7 @@ chaos_init_io_decide_at(const chaos_init_call_t *call, long result, chaos_init_v
     chaos_io_rule_t rule;
     size_t index;
     int matched = 0;
+    int drop_offset = 0;
 
     for (index = 0U; index < sizeof(g_chaos_init_io_calls) / sizeof(g_chaos_init_io_calls[0]);
          ++index)
@@ -523,6 +619,25 @@ chaos_init_io_decide_at(const chaos_init_call_t *call, long result, chaos_init_v
     if (rule.effect == CHAOS_IO_EFFECT_DROP && rule.call_size > (uint64_t)SSIZE_MAX)
     {
         return 1;
+    }
+    /* A dropped `write` has to move the file offset on by what it claims to have written,
+     * or the caller's next write lands on top of bytes it believes are already there.
+     * `pwrite` carries its own offset and moves none. The correction is an `lseek` run in
+     * the tracee, so the call is replaced by it (CHAOS_INIT_INSTEAD) and the tracee is
+     * told the byte count afterwards. Nothing to move -- `O_APPEND`, or a zero-byte write
+     * -- needs no second call. A descriptor with no offset is left alone, as in the
+     * library: the data would simply be gone, and that case belongs to net's DROP on a
+     * datagram. All of it before the draw, so a call left alone counts no hit. */
+    if (rule.effect == CHAOS_IO_EFFECT_DROP && rule.operation == CHAOS_IO_OP_WRITE)
+    {
+        const chaos_init_io_offset_t offset = chaos_init_io_offset_of(call->tid, call->args[0]);
+
+        if (offset == CHAOS_INIT_IO_OFFSET_NONE ||
+            (entry->nr != __NR_write && entry->nr != __NR_writev))
+        {
+            return 1;
+        }
+        drop_offset = offset == CHAOS_INIT_IO_OFFSET_MOVE && rule.call_size > 0U;
     }
     /* TORN shortens the count where it sits in a register. The vectored forms keep it in
      * memory, so one argument cannot shorten them and they are written whole -- the same
@@ -602,8 +717,12 @@ chaos_init_io_decide_at(const chaos_init_call_t *call, long result, chaos_init_v
     }
     else if (rule.effect == CHAOS_IO_EFFECT_DROP)
     {
-        verdict->action = CHAOS_INIT_RETURN;
+        verdict->action = drop_offset ? CHAOS_INIT_INSTEAD : CHAOS_INIT_RETURN;
         verdict->value = (long)rule.call_size;
+        verdict->instead_nr = __NR_lseek;
+        verdict->instead_args[0] = call->args[0];
+        verdict->instead_args[1] = rule.call_size;
+        verdict->instead_args[2] = (uint64_t)SEEK_CUR;
     }
     else
     {

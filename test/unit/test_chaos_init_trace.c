@@ -17,13 +17,17 @@
  *   failure);
  * - a register block that was never read reports no number and no arguments, and writing
  *   it back fails instead of handing the kernel a zeroed register file;
- * - a skip on a thread that died between the read and the write reports the failure rather
- *   than claiming an effect it never applied;
+ * - a skip, a substitution or a faked result on a thread that died between the read and
+ *   the write reports the failure rather than claiming an effect it never applied;
  * - an entry stop can be continued into the syscall-exit stop, where the result and the
  *   bytes the call wrote are reachable, and continuing from there does not leave the thread
  *   stopping at every later system call;
  * - a call parked at the entry stop comes back at the exit stop exactly once, which is how
- *   the exit stop knows the descriptor the result register overwrote.
+ *   the exit stop knows the descriptor the result register overwrote;
+ * - a call can be replaced by another one entirely: a write becomes the `lseek` that moves
+ *   the file offset on, nothing is written, and the tracee is told the count the write
+ *   would have returned (this is write DROP's whole mechanism);
+ * - a promised result comes back once per thread, as a parked call does.
  */
 
 #ifndef _GNU_SOURCE
@@ -39,6 +43,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -430,6 +435,18 @@ static void test_skip_on_a_dead_tracee(void)
     errno = 0;
     assert(chaos_init_trace_skip(child, &regs, 10) == -1);
     assert(errno == ESRCH);
+    /* Substituting a call reports the same way: a thread that is gone gets no effect, and
+     * the caller is told rather than left believing one was applied. */
+    {
+        const uint64_t args[CHAOS_INIT_TRACE_ARGS] = {0U, 0U, 0U, 0U, 0U, 0U};
+
+        errno = 0;
+        assert(chaos_init_trace_instead(child, &regs, __NR_lseek, args) == -1);
+        assert(errno == ESRCH);
+        errno = 0;
+        assert(chaos_init_trace_set_result(child, &regs, 10) == -1);
+        assert(errno == ESRCH);
+    }
     (void)close(pipe_fds[0]);
 }
 
@@ -440,6 +457,109 @@ static void test_skip_on_a_dead_tracee(void)
  * it leaves behind must not look like a usable register file: a zeroed one written back
  * would set every register of the tracee to 0.
  */
+/**
+ * @brief Proves a stopped call can be replaced by another one, and its result faked.
+ *
+ * @details The child writes ten bytes to a file. The supervisor turns that write into an
+ * `lseek(fd, 7, SEEK_CUR)`, which is the shape of the correction a dropped write needs,
+ * and reports 10 to the child at the exit stop. The two numbers are kept apart on purpose:
+ * the offset must be the one the substituted call set, and the return value the one the
+ * supervisor promised, so neither can stand in for the other. The file stays empty.
+ */
+static void test_running_another_call_instead(void)
+{
+    chaos_init_trace_regs_t regs;
+    char path[] = "/tmp/chaos-instead-XXXXXX";
+    pid_t child;
+    int status = 0;
+    int fd = mkstemp(path);
+
+    assert(fd >= 0);
+    child = fork();
+    assert(child >= 0);
+    if (child == 0)
+    {
+        struct stat info;
+
+        assert(ptrace(PTRACE_TRACEME, 0, NULL, NULL) == 0);
+        install_trace_filter(__NR_write);
+        (void)raise(SIGSTOP);
+        if (syscall(SYS_write, fd, "0123456789", (size_t)10) != 10)
+        {
+            _exit(4);
+        }
+        /* The write never happened, but the offset moved where the supervisor put it. */
+        if (lseek(fd, 0, SEEK_CUR) != 7 || fstat(fd, &info) != 0 || info.st_size != 0)
+        {
+            _exit(5);
+        }
+        _exit(0);
+    }
+    await_trace_stop(child, &regs);
+    assert(
+        ptrace(
+            PTRACE_SETOPTIONS,
+            child,
+            0,
+            (void *)(long)(PTRACE_O_TRACESECCOMP | PTRACE_O_TRACESYSGOOD)
+        ) == 0
+    );
+    {
+        uint64_t args[CHAOS_INIT_TRACE_ARGS] = {0U, 0U, 0U, 0U, 0U, 0U};
+
+        args[0] = chaos_init_trace_arg(&regs, 0U);
+        args[1] = 7U;
+        args[2] = (uint64_t)SEEK_CUR;
+        assert(chaos_init_trace_instead(child, &regs, __NR_lseek, args) == 0);
+        assert(ptrace(PTRACE_SYSCALL, child, 0, 0) == 0);
+        assert(waitpid(child, &status, 0) == child && WIFSTOPPED(status));
+        assert(chaos_init_trace_is_syscall_stop(status));
+        assert(chaos_init_trace_read(child, &regs) == 0);
+        /* The substituted call ran: lseek answers with the offset it set. */
+        assert(chaos_init_trace_result(&regs) == 7);
+        assert(chaos_init_trace_set_result(child, &regs, 10) == 0);
+        assert(ptrace(PTRACE_CONT, child, 0, 0) == 0);
+    }
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status));
+    assert(WEXITSTATUS(status) == 0);
+    (void)close(fd);
+    (void)unlink(path);
+}
+
+/** @brief Proves a promised result is kept per thread and handed out once. */
+static void test_promising_a_result(void)
+{
+    long value = 0;
+    size_t index;
+
+    assert(chaos_init_trace_claim(4322, &value) == 0);
+    assert(chaos_init_trace_promise(4322, 77) == 0);
+    assert(chaos_init_trace_claim(4322, &value) == 1 && value == 77);
+    /* Taken means gone. */
+    value = 0;
+    assert(chaos_init_trace_claim(4322, &value) == 0 && value == 0);
+
+    /* One per thread: the second promise replaces the first. */
+    assert(chaos_init_trace_promise(4322, 1) == 0);
+    assert(chaos_init_trace_promise(4322, 2) == 0);
+    assert(chaos_init_trace_claim(4322, &value) == 1 && value == 2);
+
+    /* A full table refuses, so the caller leaves the call alone instead of handing the
+     * tracee the substituted call's own result. */
+    for (index = 0U; index < CHAOS_INIT_TRACE_PENDING; ++index)
+    {
+        assert(chaos_init_trace_promise((pid_t)(2000 + index), (long)index) == 0);
+    }
+    assert(chaos_init_trace_promise(1999, 0) == -1);
+    for (index = 0U; index < CHAOS_INIT_TRACE_PENDING; ++index)
+    {
+        assert(chaos_init_trace_claim((pid_t)(2000 + index), &value) == 1);
+        assert(value == (long)index);
+    }
+    assert(chaos_init_trace_promise(1999, 5) == 0);
+    assert(chaos_init_trace_claim(1999, &value) == 1 && value == 5);
+}
+
 static void test_unread_registers_are_refused(void)
 {
     chaos_init_trace_regs_t regs;
@@ -452,6 +572,16 @@ static void test_unread_registers_are_refused(void)
     chaos_init_trace_set_arg(&regs, 0U, 1U);
     errno = 0;
     assert(chaos_init_trace_skip(getpid(), &regs, 1) == -1 && errno == EINVAL);
+    errno = 0;
+    assert(chaos_init_trace_set_result(getpid(), &regs, 1) == -1 && errno == EINVAL);
+    errno = 0;
+    {
+        const uint64_t none[CHAOS_INIT_TRACE_ARGS] = {0U, 0U, 0U, 0U, 0U, 0U};
+
+        assert(
+            chaos_init_trace_instead(getpid(), &regs, __NR_lseek, none) == -1 && errno == EINVAL
+        );
+    }
     errno = 0;
     assert(chaos_init_trace_write(getpid(), &regs) == -1 && errno == EINVAL);
     errno = 0;
@@ -467,6 +597,8 @@ int main(void)
     test_skipping_a_call();
     test_exit_stop_reaches_the_result();
     test_parking_a_call();
+    test_running_another_call_instead();
+    test_promising_a_result();
     test_skip_on_a_dead_tracee();
     test_unread_registers_are_refused();
     return 0;

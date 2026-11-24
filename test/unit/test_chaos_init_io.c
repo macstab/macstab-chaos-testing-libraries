@@ -36,6 +36,8 @@
  */
 
 #include <stdint.h>
+#include <stdio.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 
 /* Seams: an unreadable `cwd` link (any link name starting with 'c'; the code under test
@@ -52,7 +54,28 @@ static int test_process_of(pid_t tid, pid_t *tgid, uint64_t *start)
 {
     return g_fail_process ? -1 : chaos_init_process_of(tid, tgid, start);
 }
+/* Seams for what a dropped write needs to know about a descriptor: its fdinfo, which can
+ * be unreadable or hold no flags line, and its type. Neither failure is reachable through
+ * a real descriptor -- a closed one has no /proc/<pid>/fd link either, so the decision
+ * stops before this. */
+static int g_fail_fdinfo = 0;
+static const char *g_fdinfo_instead = NULL;
+static int g_fail_fd_stat = 0;
+static FILE *test_fdinfo_open(const char *path, const char *mode)
+{
+    if (g_fail_fdinfo)
+    {
+        return NULL;
+    }
+    return fopen(g_fdinfo_instead != NULL ? g_fdinfo_instead : path, mode);
+}
+static int test_fd_stat(const char *path, struct stat *out)
+{
+    return g_fail_fd_stat ? -1 : stat(path, out);
+}
 #define CHAOS_INIT_IO_PROC_LINK test_proc_link
+#define CHAOS_INIT_IO_FDINFO_OPEN test_fdinfo_open
+#define CHAOS_INIT_IO_FD_STAT test_fd_stat
 #define CHAOS_INIT_PROCESS_OF(tid, tgid, start) test_process_of((tid), (tgid), (start))
 
 #include "../../src/init/chaos_init_io.c"
@@ -160,7 +183,7 @@ int main(void)
     assert(
         system("rm -rf /tmp/initio && mkdir -p /tmp/initio/data /tmp/initio/big "
                "/tmp/initio/torn /tmp/initio/w /tmp/initio/c /tmp/initio/s /tmp/initio/ren/to "
-               "/tmp/initio/ren/from /tmp/initio/t") == 0
+               "/tmp/initio/ren/from /tmp/initio/t && mkfifo /tmp/initio/torn/pipe") == 0
     );
     chaos_init_io_start();
     g_chaos_io_check_interval_ns = 0U;
@@ -640,8 +663,7 @@ int main(void)
     }
     /* DROP on pwrite is a reply with the byte count and no call, which a notification can
      * answer: 10 bytes reported written, nothing written. A positioned write does not use
-     * the descriptor's offset, so there is nothing to correct -- which is exactly why
-     * `write:DROP` is rejected here instead, together with the whole file. */
+     * the descriptor's offset, so there is nothing to correct. */
     write_rules("/tmp/initio/torn:pwrite:DROP:1.0\n");
     assert(RETURNS(decide(__NR_pwrite64, (uint64_t)torn, P(buffer), 10U, 0, 0), 10L));
     {
@@ -661,13 +683,86 @@ int main(void)
         vector[1].iov_len = (size_t)SSIZE_MAX;
         assert(PASSES(decide(__NR_pwritev, (uint64_t)torn, P(vector), 2U, 0, 0)));
     }
+    /* DROP on a plain write has to move the descriptor's offset on by the count it
+     * reports, which is a call of its own: the write is replaced by that `lseek` and the
+     * tracee is told the count once it has run. The vectored form takes it too -- the
+     * correction needs no register of the call, only its total. */
     write_rules("/tmp/initio/torn:write:DROP:1.0\n");
-    assert(PASSES(decide(__NR_write, (uint64_t)torn, P(buffer), 10U, 0, 0)));
-    file = fopen("/tmp/.chaos-io.status", "r");
-    assert(file != NULL);
-    hits[fread(hits, 1U, sizeof(hits) - 1U, file)] = '\0';
-    (void)fclose(file);
-    assert(strstr(hits, "reason=unsupported in seccomp mode\n") != NULL);
+    {
+        chaos_init_verdict_t dropped = decide(__NR_write, (uint64_t)torn, P(buffer), 10U, 0, 0);
+
+        assert(dropped.action == CHAOS_INIT_INSTEAD && dropped.value == 10L);
+        assert(dropped.instead_nr == __NR_lseek);
+        assert(dropped.instead_args[0] == (uint64_t)torn && dropped.instead_args[1] == 10U);
+        assert(dropped.instead_args[2] == (uint64_t)SEEK_CUR);
+
+        vector[0].iov_base = buffer;
+        vector[0].iov_len = 4U;
+        vector[1].iov_base = buffer;
+        vector[1].iov_len = 3U;
+        dropped = decide(__NR_writev, (uint64_t)torn, P(vector), 2U, 0, 0);
+        assert(dropped.action == CHAOS_INIT_INSTEAD && dropped.value == 7L);
+        assert(dropped.instead_args[1] == 7U);
+        /* Both forms are traced for it, and nothing else of the operation: `sendfile` and
+         * `copy_file_range` move bytes between two descriptors, so dropping one would have
+         * to correct two offsets. They are left alone and count no hit. */
+        {
+            long traced[8];
+            const size_t count =
+                chaos_init_io_traced_calls(traced, sizeof(traced) / sizeof(traced[0]));
+
+            assert(count == 2U);
+            assert(
+                (traced[0] == __NR_write && traced[1] == __NR_writev) ||
+                (traced[0] == __NR_writev && traced[1] == __NR_write)
+            );
+        }
+        assert(PASSES(decide(__NR_sendfile, (uint64_t)torn, (uint64_t)big, 0, 10U, 0)));
+        /* A zero-byte write has no offset to move, so it needs no second call. */
+        assert(RETURNS(decide(__NR_write, (uint64_t)torn, P(buffer), 0U, 0, 0), 0L));
+        /* A descriptor with no offset is left alone: the bytes would simply be gone, and
+         * that is net's DROP on a datagram, not this one. A FIFO has a path, so the rule
+         * does match it -- what stops the drop is the missing offset. */
+        {
+            const int fifo = open("/tmp/initio/torn/pipe", O_RDWR);
+
+            assert(fifo > 2);
+            assert(PASSES(decide(__NR_write, (uint64_t)fifo, P(buffer), 10U, 0, 0)));
+            (void)close(fifo);
+        }
+        /* What the descriptor cannot be asked about is left alone too: unreadable fdinfo,
+         * fdinfo without a flags line, and an unreadable type. */
+        g_fail_fdinfo = 1;
+        assert(PASSES(decide(__NR_write, (uint64_t)torn, P(buffer), 10U, 0, 0)));
+        g_fail_fdinfo = 0;
+        g_fdinfo_instead = "/tmp/initio/torn/f";
+        assert(PASSES(decide(__NR_write, (uint64_t)torn, P(buffer), 10U, 0, 0)));
+        g_fdinfo_instead = NULL;
+        g_fail_fd_stat = 1;
+        assert(PASSES(decide(__NR_write, (uint64_t)torn, P(buffer), 10U, 0, 0)));
+        g_fail_fd_stat = 0;
+        /* None of those counted a hit: the drop was decided before the draw. */
+        {
+            char path[64];
+
+            (void)snprintf(path, sizeof(path), "/tmp/.chaos-io.hits.%ld", (long)getpid());
+            file = fopen(path, "r");
+            assert(file != NULL);
+            hits[fread(hits, 1U, sizeof(hits) - 1U, file)] = '\0';
+            (void)fclose(file);
+            assert(strcmp(hits, "3\t/tmp/initio/torn:write:DROP:1.0\n") == 0);
+        }
+    }
+    /* O_APPEND writes at the end whatever the offset says, so a dropped one corrects
+     * nothing and is answered by the reply alone. */
+    {
+        const int appending = open("/tmp/initio/torn/a", O_CREAT | O_WRONLY | O_APPEND, 0644);
+
+        assert(appending > 2);
+        write_rules("/tmp/initio/torn:write:DROP:1.0\n");
+        assert(RETURNS(decide(__NR_write, (uint64_t)appending, P(buffer), 10U, 0, 0), 10L));
+        (void)close(appending);
+    }
 
     /* statfs and fstatfs are notified, so ERRNO and LATENCY reach them here as in the
      * library; FREE and FULL rewrite the structure the kernel returned, which a reply

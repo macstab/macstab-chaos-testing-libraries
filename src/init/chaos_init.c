@@ -623,6 +623,20 @@ static void chaos_init_trace_stop(unsigned libs, pid_t tid, int status)
      * first argument on aarch64; only the result itself is read here. */
     if (chaos_init_trace_is_syscall_stop(status))
     {
+        long promised = 0;
+
+        /* The exit stop of a call the supervisor put there itself: what that call returned
+         * is none of the tracee's business, which is told the value the call it asked for
+         * would have reported. */
+        if (chaos_init_trace_claim(tid, &promised))
+        {
+            if (chaos_init_trace_read(tid, &regs) == 0)
+            {
+                (void)chaos_init_trace_set_result(tid, &regs, promised);
+            }
+            (void)ptrace(PTRACE_CONT, tid, 0, 0);
+            return;
+        }
         if (chaos_init_trace_unpark(tid, &call) && chaos_init_trace_read(tid, &regs) == 0)
         {
             const long result = chaos_init_trace_result(&regs);
@@ -672,6 +686,18 @@ static void chaos_init_trace_stop(unsigned libs, pid_t tid, int status)
     {
         (void)ptrace(PTRACE_SYSCALL, tid, 0, 0);
         return;
+    }
+    /* Another call in its place, and the value the tracee is told once that call has run.
+     * The promise is made first: with no room for it the call runs unchanged rather than
+     * returning whatever the substituted one did. */
+    if (verdict.action == CHAOS_INIT_INSTEAD && chaos_init_trace_promise(tid, verdict.value) == 0)
+    {
+        if (chaos_init_trace_instead(tid, &regs, verdict.instead_nr, verdict.instead_args) == 0)
+        {
+            (void)ptrace(PTRACE_SYSCALL, tid, 0, 0);
+            return;
+        }
+        (void)chaos_init_trace_claim(tid, &verdict.value);
     }
     if (verdict.action == CHAOS_INIT_DELAY)
     {
