@@ -730,9 +730,12 @@ chaos-init --libs io,net,memory,process -- /usr/local/bin/nats-server -js
   `mmap` and the allocator's mappings. Narrow paths, `@size`, `@first` or `@from`
   keep a rule to the calls meant.
 - Requires kernel 5.5 or newer, x86_64 or aarch64 (native, not emulated), and no
-  privilege beyond Docker's default seccomp profile. One notified call costs about
-  2.5 µs instead of 0.2 µs (Docker Desktop, kernel 6.10); only the requested
-  libraries' system calls are notified.
+  privilege beyond Docker's default seccomp profile. A notified call costs tens of
+  microseconds where a plain one costs hundreds of nanoseconds, and a trace stop
+  1.1-1.5× a notification; the measurements, and what follows from them for a budget,
+  are in [`docs/SECCOMP.md` §7.1](docs/SECCOMP.md#71-what-it-costs-measured). Only the
+  requested libraries' system calls are notified -- and a clock rule costs a system
+  call per clock read (+195 ns), not a notification, unless the rule names that clock.
 
 ## Limits
 

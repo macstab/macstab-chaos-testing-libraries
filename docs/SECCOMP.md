@@ -569,8 +569,46 @@ first.
 | Calls the filter does not see | io_uring, where the container's profile allows it (recent Docker default profiles do not), submits I/O without the system calls the filter knows, so its reads, writes and opens are never faulted. On x86_64, 32-bit calls (`int 0x80`, i386 programs) and x32 calls pass unfiltered. |
 | Asynchronous submission | `io_submit(2)` (libaio) and `io_uring_enter(2)` hand the kernel a batch of operations in one call, so a rule on them acts on the **submission**, not on the reads and writes inside it: `ERRNO` fails the whole batch, and "every tenth read" cannot be expressed. Neither is in the filter, and neither is interposed under `LD_PRELOAD` -- `io_submit` lives in libaio rather than libc, and io_uring makes no per-operation call at all. A test that needs per-operation faults has to use an engine that issues one system call per operation (`libaio` off, `io_uring` off), which both PostgreSQL and MySQL can be told to do. |
 | An application's own listener | A process can hold one seccomp notification listener per filter chain. An application that installs its own filter with a listener (a sandbox, a container runtime inside the container) gets `EBUSY` under chaos-init. |
-| Cost | One notified call takes about 2.5 µs instead of 0.2 µs (Docker Desktop, kernel 6.10). Only the requested libraries' system calls pay it. Matching a socket's endpoint reads `/proc/<pid>/net/*` once per socket, and a wait call does it for each of its descriptors (up to 1024): net does so only for operations a loaded rule is for, so rules on connect alone leave recv and epoll at the base cost. One supervisor thread serialises all decisions. |
+| Cost | Measured below (§7.1). Only the requested libraries' system calls pay it. Matching a socket's endpoint reads `/proc/<pid>/net/*` once per socket, and a wait call does it for each of its descriptors (up to 1024): net does so only for operations a loaded rule is for, so rules on connect alone leave recv and epoll at the base cost. One supervisor thread serialises all decisions. |
 | Capacity | 128 processes with counts at once (when full, the state of an ended process is written and dropped first, then that of the one unused longest), 1024 delayed calls (beyond that a call runs without its delay), 1024 descriptors scanned per wait call, 1024 iovec entries and 1024 `sendmmsg` messages measured for `@size`, 128 filter instructions. |
+
+### 7.1 What it costs, measured
+
+Nanoseconds per call, a loop of one system call, three runs each; Docker Desktop on
+aarch64, kernel 6.10.14-linuxkit, 12 vCPU. The absolute numbers belong to that host -- a
+virtual machine pays more for the two context switches of a notification than bare metal
+does, and an earlier release reported about 2.5 µs for a notified call, which this host
+does not reproduce. What carries over is the **relations**, and that is what a budget
+should be built from, after one measurement on the target host.
+
+| Path | ns/call | |
+|---|---|---|
+| `clock_gettime(CLOCK_REALTIME)`, no supervisor | 16 | the vDSO |
+| the same, `--libs time` with a rule on another clock | 210 | the vDSO lookups are blinded, so it is a plain system call: **+195 ns** |
+| the same, with a rule on that clock | ~48 000 | a notification, and the effect written into the caller |
+| `mmap`+`munmap`, no supervisor | ~1 000 | |
+| the same, `--libs memory`, rule matches nothing | ~57 000 | two notifications, each deciding without reading `/proc`: **~28 µs per notification** |
+| `write(1 byte)`, no supervisor | 285 | |
+| the same, notified, rule matches nothing | ~31 000 | the decision resolves the path through `/proc` |
+| the same, **traced** (a TORN rule elsewhere) | ~35 000 | a trace stop costs about 1.1× a notification |
+| `read` of a socketpair, no supervisor | 500 | |
+| the same, notified, rule matches nothing | ~58 000 | the decision resolves the socket's endpoint |
+| the same, **traced** (a `TRICKLE` rule elsewhere) | ~89 000 | ~1.5× the notification; this is the `TRICKLE:1` case on a many-reads loop |
+| `sendto`, no supervisor | 1 290 | |
+| the same, `--libs dns`, no query in the payload | ~33 000 | the dns round trip: every send is notified, the parser rejects what is no query |
+
+Three things follow for a test:
+
+- **a rule file costs what it notifies.** A library whose calls the program does not make
+  is free, and `--libs dns` means every send pays the round trip even though only a query
+  can match -- measure before putting it on a send-heavy service.
+- **a trace stop is not dramatically dearer than a notification** (1.1-1.5×), so the data
+  effects cost about what the other effects cost; what makes `TRICKLE:1` expensive is the
+  number of reads it multiplies, not the stop.
+- **the clock is the exception that pays almost nothing.** `--libs time` blinds the vDSO,
+  which turns a clock read into a system call (+195 ns); only the clock ids a rule names
+  are notified, so a rule on `CLOCK_REALTIME` leaves a Go program's `nanotime` --
+  `CLOCK_MONOTONIC` -- at 210 ns.
 
 ---
 
