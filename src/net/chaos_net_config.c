@@ -715,6 +715,12 @@ static int chaos_net_effect_allowed(chaos_net_operation_t operation, chaos_net_e
     {
         return operation == CHAOS_NET_OP_POLL;
     }
+    if (effect == CHAOS_NET_EFFECT_THROTTLE)
+    {
+        /* The send side only: a receive is already allowed to return less than asked for,
+         * and TRICKLE is the chunking effect for that direction. */
+        return operation == CHAOS_NET_OP_SEND;
+    }
     if (effect == CHAOS_NET_EFFECT_RESET)
     {
         return operation == CHAOS_NET_OP_CLOSE;
@@ -1139,6 +1145,22 @@ int chaos_net_config_parse_line(char *line, chaos_net_rule_t *rule)
         {
             return -1;
         }
+    }
+    else if (strcmp(effect_text, "THROTTLE") == 0)
+    {
+        /* A rate in bytes per second, and nothing else: a probability on a rate would have
+         * to mean "every other call is limited", which is not a rate -- TRICKLE, the other
+         * effect that carries a byte count, says the same. The upper bound is what the
+         * token bucket can hold (chaos_bucket.h). */
+        unsigned int rate = 0U;
+
+        rule->effect = CHAOS_NET_EFFECT_THROTTLE;
+        rule->probability = 1.0;
+        if (chaos_net_parse_latency(value_text, &rate) != 0 || rate == 0U)
+        {
+            return -1;
+        }
+        rule->rate_bps = rate;
     }
     else if (strcmp(effect_text, "DUP") == 0)
     {

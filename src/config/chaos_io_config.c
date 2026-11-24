@@ -616,6 +616,34 @@ static int chaos_io_parse_free_bytes(const char *text, uint64_t *free_bytes, dou
     return 0;
 }
 
+/**
+ * @brief Parses a THROTTLE rate: digits only, 1 to 4294967295 bytes per second.
+ *
+ * @details No probability: see the parser's THROTTLE branch. The upper bound is what the
+ * token bucket can hold (chaos_bucket.h).
+ *
+ * @return 0 with @p rate written, or -1.
+ */
+static int chaos_io_parse_rate(const char *text, uint64_t *rate)
+{
+    char *end = NULL;
+    unsigned long long value;
+
+    if (text == NULL || *text < '0' || *text > '9')
+    {
+        return -1;
+    }
+    errno = 0;
+    value = strtoull(text, &end, 10);
+    if (end == text || *chaos_io_trim(end) != '\0' || errno == ERANGE || value == 0U ||
+        value > 0xffffffffULL)
+    {
+        return -1;
+    }
+    *rate = (uint64_t)value;
+    return 0;
+}
+
 static int chaos_io_parse_latency(const char *text, unsigned int *latency_ms, double *probability)
 {
     char milliseconds[16];
@@ -664,6 +692,9 @@ static int chaos_io_parse_latency(const char *text, unsigned int *latency_ms, do
  *   not read would hand the caller its own stale buffer, which is CORRUPT's territory.
  * - FREE, FULL: `statfs` only. They rewrite the free-space fields of the answer, which no
  *   other operation returns.
+ * - THROTTLE: `write`, `pwrite` only. It holds the write side to a byte rate by writing
+ *   less per call; a read is already allowed to return less than asked for, and limiting
+ *   how much a caller may read is not a failure any device produces.
  */
 static int chaos_io_effect_allowed(chaos_io_operation_t operation, chaos_io_effect_t effect)
 {
@@ -686,6 +717,10 @@ static int chaos_io_effect_allowed(chaos_io_operation_t operation, chaos_io_effe
     if (effect == CHAOS_IO_EFFECT_FREE || effect == CHAOS_IO_EFFECT_FULL)
     {
         return operation == CHAOS_IO_OP_STATFS;
+    }
+    if (effect == CHAOS_IO_EFFECT_THROTTLE)
+    {
+        return operation == CHAOS_IO_OP_WRITE || operation == CHAOS_IO_OP_PWRITE;
     }
     return 0;
 }
@@ -1681,6 +1716,20 @@ int chaos_io_config_parse_line(char *line, chaos_io_rule_t *rule)
             return -1;
         }
         rule->probability = probability;
+    }
+    else if (strcmp(fields[2], "THROTTLE") == 0)
+    {
+        rule->effect = CHAOS_IO_EFFECT_THROTTLE;
+        /* A rate in bytes per second, and nothing else: a probability on a rate would
+         * have to mean "every other call is limited", which is not a rate. TRICKLE, the
+         * other effect that carries a byte count, says the same. The bucket keeps its
+         * tokens in 32 bits, so a rate it could not hold is rejected rather than quietly
+         * reduced. */
+        if (chaos_io_parse_rate(fields[3], &rule->rate_bps) != 0)
+        {
+            return -1;
+        }
+        rule->probability = 1.0;
     }
     else if (strcmp(fields[2], "FREE") == 0)
     {

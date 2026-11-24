@@ -236,8 +236,8 @@ output `dist/chaos-init-<arch>`; or `make native-init`, output `build/chaos-init
 
 | Library | Applied | Matched on |
 |---|---|---|
-| io | ERRNO, LATENCY on open, read, write, pread, pwrite, close (LATENCY only), fsync, fdatasync, truncate, allocate, unlink, rename; DROP on pwrite; TORN on write and pwrite, CORRUPT on read and pread and DROP on write and writev, through a ptrace stop (§3.3) | the path: absolute, or joined lexically to `/proc/<pid>/cwd` or to the directory descriptor's path; descriptors through `/proc/<pid>/fd`. As in the library, descriptors 0–2, paths under `/proc`, `/sys`, `/dev` and the `/tmp/.chaos-*` control files are never faulted |
-| net | ERRNO, LATENCY on socket, bind, listen, connect, accept, shutdown, send, recv, close (LATENCY only), poll; TIMEOUT on the poll family; DROP on a datagram send (not `sendmmsg`); TRICKLE on a stream receive, CORRUPT and DUP on a receive, RESET on close, through a ptrace stop (§3.3) | the endpoint: sockaddr arguments from memory, a socket's own address and peer from `/proc/<pid>/net/*` or sock_diag (§3.2), its type from its `system.sockprotoname` attribute |
+| io | ERRNO, LATENCY on open, read, write, pread, pwrite, close (LATENCY only), fsync, fdatasync, truncate, allocate, unlink, rename; DROP on pwrite; TORN and THROTTLE on write and pwrite, CORRUPT on read and pread and DROP on write and writev, through a ptrace stop (§3.3) | the path: absolute, or joined lexically to `/proc/<pid>/cwd` or to the directory descriptor's path; descriptors through `/proc/<pid>/fd`. As in the library, descriptors 0–2, paths under `/proc`, `/sys`, `/dev` and the `/tmp/.chaos-*` control files are never faulted |
+| net | ERRNO, LATENCY on socket, bind, listen, connect, accept, shutdown, send, recv, close (LATENCY only), poll; TIMEOUT on the poll family; DROP on a datagram send (not `sendmmsg`); THROTTLE on a send, TRICKLE on a stream receive, CORRUPT and DUP on a receive, RESET on close, through a ptrace stop (§3.3) | the endpoint: sockaddr arguments from memory, a socket's own address and peer from `/proc/<pid>/net/*` or sock_diag (§3.2), its type from its `system.sockprotoname` attribute |
 | memory | ERRNO, LATENCY on mmap (anon/file), munmap, mprotect, madvise | the arguments: operation, `mmap` flags, length for `@size` |
 | process | ERRNO, LATENCY, FAIL_AFTER on pthread_create, fork, posix_spawn, execve, execveat, waitpid | the system call and clone's flags (§5) |
 | time | ERRNO, LATENCY on a clock read and on nanosleep; OFFSET, REGRESS, FREEZE on a clock read, which the supervisor answers with a value of its own (§3.4) | the operation and, for a clock read, the clock in `args[0]`; a `usleep` rule is rejected, because libc sleeps through nanosleep |
@@ -302,8 +302,9 @@ sock_diag where `mptcp_diag` exists; their fallback connections stay unresolvabl
 
 A notification reply can fail a call, delay it or return a value. It cannot reach the
 tracee's registers, and `TORN` lives exactly there: it shortens the byte count *before*
-the kernel reads it. Such a call is answered by the filter with `SECCOMP_RET_TRACE`
-instead, which stops the thread with its registers readable and writable.
+the kernel reads it, as `TRICKLE` and `THROTTLE` do. Such a call is answered by the
+filter with `SECCOMP_RET_TRACE` instead, which stops the thread with its registers
+readable and writable.
 
 - The set of traced calls comes from the **rule file**, read by the child before it
   installs the filter. `read` is shared between io and net, so a net `TRICKLE` rule puts
@@ -348,6 +349,17 @@ instead, which stops the thread with its registers readable and writable.
   filtered again, and a per-thread mark lets it through rather than deciding it twice.
   Everything the second stop needs is reserved before the substitution, so a table too
   full leaves the call alone instead of losing it.
+- `THROTTLE` shortens the count like `TORN`, to what its token bucket allows, and needs
+  one thing more than a register: somewhere to wait when the bucket is empty. The call is
+  put in the delay queue of the supervisor, and the answer that delay turns into is a
+  shortened call rather than a whole one -- the bytes the wait bought. They are charged to
+  the bucket when the call is parked, not when it is let go, so two threads waiting on one
+  descriptor are told to wait one after the other and the rate comes out the same as the
+  rate the library enforces. The thread stays stopped meanwhile, so the other threads of
+  the process keep being served, which is the one way this mode is better than sleeping
+  inside the call. A non-blocking descriptor is told `EAGAIN` instead, as in the library;
+  whether it is non-blocking is read from `/proc/<pid>/fdinfo/<fd>`, and a descriptor
+  whose flags cannot be read counts as blocking.
 - The ownership check `close:RESET` needs (`NETWORK.md` §RESET) reads the tracee's
   descriptor table rather than the supervisor's: the socket inode comes from the
   `/proc/<pid>/fd` link, and the table searched first is the thread's group leader's,
@@ -449,7 +461,7 @@ loads, and only the call forms named there are left alone -- the operation is th
 | Rule | Why not |
 |---|---|
 | io FREE, FULL | They rewrite the structure the kernel returned, which neither a notification reply nor a register reaches. |
-| io TORN on a vectored write, net TRICKLE on `recvmsg` or a batch | The byte count of `writev`, `pwritev`, `recvmsg` and `recvmmsg` is in memory, not in a register, so one argument cannot shorten it. The call runs whole and counts no hit, as in the library. |
+| io TORN or THROTTLE on a vectored write, net TRICKLE or THROTTLE on `recvmsg`, `sendmsg` or a batch | The byte count of `writev`, `pwritev`, `sendmsg`, `recvmsg` and the batches is in memory, not in a register, so one argument cannot shorten it. The call runs whole and counts no hit, as in the library. |
 | io CORRUPT on a vectored read, net CORRUPT or DUP on `recvmsg` or a batch | The bytes `readv` and `recvmsg` delivered are spread over segments, and finding the one that holds byte N, or filling them from a kept payload, would mean walking the iovec in the tracee. Left alone, counting no hit. |
 | io and net ERRNO on close | The libraries close, then report the error, as Linux does for a failing close. A notified call either runs or fails, not both. |
 | process `posix_spawnp` selector | The `PATH` search is in the C library; the system calls are those of posix_spawn, whose rules apply to it, so the rule could never fire. A `*` rule is accepted. |

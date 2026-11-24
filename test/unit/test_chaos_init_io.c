@@ -122,6 +122,9 @@ decide_for(pid_t tid, int nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3
     call.args[2] = a2;
     call.args[3] = a3;
     call.args[4] = a4;
+    /* Zeroed as chaos_init_decide() zeroes it, then pre-set to FAIL/-1 so a PASS proves
+     * the decider wrote it. */
+    memset(&verdict, 0, sizeof(verdict));
     verdict.action = CHAOS_INIT_FAIL;
     verdict.error = -1;
     assert(chaos_init_io_decide(&call, &verdict) == 1);
@@ -762,6 +765,61 @@ int main(void)
         write_rules("/tmp/initio/torn:write:DROP:1.0\n");
         assert(RETURNS(decide(__NR_write, (uint64_t)appending, P(buffer), 10U, 0, 0), 10L));
         (void)close(appending);
+    }
+
+    /* THROTTLE: the same bucket arithmetic as the library's, applied through the
+     * registers. The rate is 10 bytes per second, so a byte takes 100 ms to arrive and
+     * the bucket holds 10 -- small enough that the test does not depend on how fast this
+     * machine is. */
+    write_rules("/tmp/initio/torn:write:THROTTLE:10\n");
+    {
+        chaos_init_verdict_t held;
+
+        /* A full bucket covers the whole call: it passes, and the rule is not even asked,
+         * so an allowance that changes nothing spends no hit. */
+        assert(PASSES(decide(__NR_write, (uint64_t)torn, P(buffer), 7U, 0, 0)));
+        /* Three bytes left of the ten: the call is shortened to exactly those. */
+        held = decide(__NR_write, (uint64_t)torn, P(buffer), 10U, 0, 0);
+        assert(held.action == CHAOS_INIT_SHORTEN);
+        assert(held.arg_index == 2U && held.value == 3L);
+        /* Nothing left: the call is parked rather than slept in, which is the one
+         * difference from the library -- the tracee's other threads keep being served.
+         * A tenth of a second's worth is one byte at this rate, 100 ms away. */
+        held = decide(__NR_write, (uint64_t)torn, P(buffer), 10U, 0, 0);
+        assert(held.action == CHAOS_INIT_DELAY);
+        assert(held.delay_ms == 100U && held.shortens && held.value == 1L);
+        assert(held.arg_index == 2U);
+        /* What that delay turns into when it is due -- a shortened call, not a whole one
+         * -- is chaos_init_delay_answer()'s own test in test_chaos_init.c. */
+        /* The byte is charged when the call is parked, so the next caller waits for the
+         * one after it: a second wait on top of what is left of the first. Without the
+         * charge both would be told 100 ms and the rate would come out double. */
+        held = decide(__NR_write, (uint64_t)torn, P(buffer), 10U, 0, 0);
+        assert(held.action == CHAOS_INIT_DELAY);
+        assert(held.delay_ms > 100U && held.delay_ms <= 200U);
+        /* A non-blocking descriptor is told EAGAIN instead of being parked, as in the
+         * library: its event loop is written for that answer. Its own bucket, because a
+         * slot is keyed by the descriptor. */
+        {
+            const int impatient = open("/tmp/initio/torn/n", O_CREAT | O_WRONLY | O_NONBLOCK, 0644);
+
+            assert(impatient > 2);
+            assert(PASSES(decide(__NR_write, (uint64_t)impatient, P(buffer), 10U, 0, 0)));
+            assert(FAILS(decide(__NR_write, (uint64_t)impatient, P(buffer), 10U, 0, 0), EAGAIN));
+            (void)close(impatient);
+        }
+        /* The vectored form keeps its count in memory, so no register can shorten it: it
+         * stays notified and is written whole, as in the library. */
+        vector[0].iov_base = buffer;
+        vector[0].iov_len = 6U;
+        vector[1].iov_base = buffer;
+        vector[1].iov_len = 6U;
+        assert(PASSES(decide(__NR_writev, (uint64_t)torn, P(vector), 2U, 0, 0)));
+        /* A process the supervisor cannot identify has no bucket to charge, so the call
+         * goes through rather than being held back by a rate nobody is keeping. */
+        g_fail_process = 1;
+        assert(PASSES(decide(__NR_write, (uint64_t)torn, P(buffer), 10U, 0, 0)));
+        g_fail_process = 0;
     }
 
     /* statfs and fstatfs are notified, so ERRNO and LATENCY reach them here as in the

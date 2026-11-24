@@ -104,7 +104,8 @@ typedef enum chaos_net_effect
     CHAOS_NET_EFFECT_RESET,        /**< CLOSE-only: abortive close, the peer receives an RST. */
     CHAOS_NET_EFFECT_TRICKLE,      /**< RECV-only: return at most chunk_bytes per call. */
     CHAOS_NET_EFFECT_DUP,          /**< RECV-only: deliver the previous payload once more. */
-    CHAOS_NET_EFFECT_DROP          /**< SEND-only, datagrams: report the send, send nothing. */
+    CHAOS_NET_EFFECT_DROP,         /**< SEND-only, datagrams: report the send, send nothing. */
+    CHAOS_NET_EFFECT_THROTTLE      /**< SEND-only, streams: hold the send to a byte rate. */
 } chaos_net_effect_t;
 
 /**
@@ -216,6 +217,7 @@ typedef struct chaos_net_rule
     double probability;              /**< Firing probability [0.0, 1.0]; unused for LATENCY. */
     unsigned int latency_ms;         /**< LATENCY: delay in ms, at most UINT32_MAX. */
     unsigned int chunk_bytes;        /**< TRICKLE: most bytes one receive call returns. */
+    uint64_t rate_bps;               /**< THROTTLE: bytes per second, 1 .. 4294967295. */
     /** Qualifiers written after the rule (`@first`, `@from`, `@until`, `@size`). */
     chaos_rule_policy_t policy;
     /**

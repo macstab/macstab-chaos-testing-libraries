@@ -695,6 +695,24 @@ static void test_delays(void)
         assert(chaos_init_delay_answer(&verdict).delay_ms == 0U);
         verdict.error = EIO;
         assert(chaos_init_delay_answer(&verdict).action == CHAOS_INIT_FAIL);
+        /* A delay a rate parked (THROTTLE) ends in a shortened call, not a whole one: the
+         * answer carries the count the wait bought and the argument to put it in. A PASS
+         * here would let the whole call through and leave the rate unenforced. */
+        memset(&verdict, 0, sizeof(verdict));
+        verdict.action = CHAOS_INIT_DELAY;
+        verdict.delay_ms = 100U;
+        verdict.shortens = 1;
+        verdict.arg_index = 2U;
+        verdict.value = 64L;
+        assert(chaos_init_delay_answer(&verdict).action == CHAOS_INIT_SHORTEN);
+        assert(chaos_init_delay_answer(&verdict).value == 64L);
+        assert(chaos_init_delay_answer(&verdict).arg_index == 2U);
+        assert(chaos_init_delay_answer(&verdict).delay_ms == 0U);
+        /* FAIL and RETURN still outrank it: an error is an error however the call ends. */
+        verdict.returns = 1;
+        assert(chaos_init_delay_answer(&verdict).action == CHAOS_INIT_RETURN);
+        verdict.error = EIO;
+        assert(chaos_init_delay_answer(&verdict).action == CHAOS_INIT_FAIL);
     }
 }
 

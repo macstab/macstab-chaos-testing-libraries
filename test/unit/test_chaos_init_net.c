@@ -1615,6 +1615,102 @@ int main(void)
             assert(strstr(lines, "suppressed.unknown=3\n") != NULL);
         }
     }
+    /* THROTTLE: the same bucket arithmetic as the library's, applied through the
+     * registers. Ten bytes per second, so the bucket holds ten and a byte takes 100 ms to
+     * arrive -- slow enough that the test does not depend on how fast this machine is. */
+    (void)snprintf(
+        rules,
+        sizeof(rules),
+        "tcp4://127.0.0.1:%u:send:THROTTLE:10\n",
+        ntohs(server_address.sin_port)
+    );
+    write_rules(rules);
+    {
+        chaos_init_verdict_t held;
+
+        /* A full bucket covers the whole send: it passes, and the rule is not even asked,
+         * so an allowance that changes nothing spends no hit. */
+        assert(PASSES(decide(__NR_write, (uint64_t)server, P(buffer), 7U, 0, 0, 0)));
+        /* Three bytes left of the ten: a stream send is shortened to exactly those. */
+        held = decide(__NR_write, (uint64_t)server, P(buffer), 10U, 0, 0, 0);
+        assert(held.action == CHAOS_INIT_SHORTEN);
+        assert(held.arg_index == 2U && held.value == 3L);
+        /* Nothing left: the call is parked rather than slept in, so the tracee's other
+         * threads keep being served, and the answer when it is due shortens it to the one
+         * byte the wait bought. */
+        held = decide(__NR_write, (uint64_t)server, P(buffer), 10U, 0, 0, 0);
+        assert(held.action == CHAOS_INIT_DELAY);
+        assert(held.delay_ms == 100U && held.shortens && held.value == 1L);
+        assert(held.arg_index == 2U);
+        /* The byte is charged when the call is parked, so the next caller waits for the
+         * one after it rather than for the same one: a second wait on top of what is left
+         * of the first. Without the charge both would be told 100 ms and the rate would
+         * come out double. */
+        held = decide(__NR_write, (uint64_t)server, P(buffer), 10U, 0, 0, 0);
+        assert(held.action == CHAOS_INIT_DELAY);
+        assert(held.delay_ms > 100U && held.delay_ms <= 200U);
+        /* sendmsg keeps its length in the message, so no register can shorten it: left
+         * alone and charged nothing, as in the library. */
+        assert(PASSES(decide(__NR_sendmsg, (uint64_t)server, P(&message), 0, 0, 0, 0)));
+    }
+    /* A datagram is never cut -- half a datagram is not a datagram -- so it waits for its
+     * whole message and then sends it whole. Five bytes per second: the first message
+     * takes three of the five in the bucket, the second waits for the eight it is short
+     * of, 1600 ms, and keeps its length. */
+    (void)snprintf(
+        rules, sizeof(rules), "udp4://127.0.0.1:%u:send:THROTTLE:5\n", ntohs(udp_address.sin_port)
+    );
+    write_rules(rules);
+    {
+        chaos_init_verdict_t held = decide(
+            __NR_sendto, (uint64_t)udp, P(buffer), 3U, 0, P(&udp_address), sizeof(udp_address)
+        );
+
+        assert(PASSES(held));
+        held = decide(
+            __NR_sendto, (uint64_t)udp, P(buffer), 10U, 0, P(&udp_address), sizeof(udp_address)
+        );
+        assert(held.action == CHAOS_INIT_DELAY);
+        assert(held.delay_ms == 1600U);
+        /* And no shortening: the message goes out as the caller wrote it. */
+        assert(!held.shortens);
+        /* A non-blocking socket is told EAGAIN instead of being parked, as in the
+         * library: its event loop is written for that answer. */
+        {
+            const int impatient = (int)syscall(SYS_socket, AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+            struct sockaddr_in bound;
+            socklen_t bound_length = sizeof(bound);
+
+            assert(impatient > 2);
+            memset(&bound, 0, sizeof(bound));
+            bound.sin_family = AF_INET;
+            bound.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            assert(bind(impatient, (struct sockaddr *)&bound, sizeof(bound)) == 0);
+            assert(getsockname(impatient, (struct sockaddr *)&bound, &bound_length) == 0);
+            (void)snprintf(
+                rules,
+                sizeof(rules),
+                "udp4://127.0.0.1:%u:send:THROTTLE:20\n",
+                ntohs(bound.sin_port)
+            );
+            write_rules(rules);
+            assert(PASSES(decide(
+                __NR_sendto, (uint64_t)impatient, P(buffer), 20U, 0, P(&bound), sizeof(bound)
+            )));
+            assert(FAILS(
+                decide(
+                    __NR_sendto, (uint64_t)impatient, P(buffer), 20U, 0, P(&bound), sizeof(bound)
+                ),
+                EAGAIN
+            ));
+            (void)close(impatient);
+            /* The descriptor is closed now, so its flags cannot be read: that counts as
+             * blocking rather than as non-blocking, so a rate holds the call back instead
+             * of refusing a socket whose mode nobody knows. */
+            assert(chaos_init_net_nonblocking(getpid(), (uint64_t)impatient) == 0);
+        }
+    }
+
     write_rules("*:close:LATENCY:5\n");
     assert(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0).action == CHAOS_INIT_DELAY);
 

@@ -23,7 +23,8 @@ set -eu
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 BUILD_DIR=${BUILD_DIR:-build-coverage}
 CC=${CC:-cc}
-CPPFLAGS=${CPPFLAGS:--D_GNU_SOURCE -Isrc -Isrc/core -Isrc/config -Isrc/effects -Isrc/wrappers}
+# The same list the Makefile's CPPFLAGS has, so a run without `make coverage` compiles too.
+CPPFLAGS=${CPPFLAGS:--D_GNU_SOURCE -Isrc -Isrc/common -Isrc/core -Isrc/config -Isrc/effects -Isrc/wrappers -Isrc/net -Isrc/dns -Isrc/time -Isrc/process -Isrc/memory}
 CFLAGS=${CFLAGS:--std=c99 -Wall -Wextra -Werror -pedantic -Os}
 
 cd "$ROOT_DIR"
@@ -200,8 +201,9 @@ check_target "$CHAOS_INIT_IO_GCNO" "src/init/chaos_init_io.c" "100.00"
 check_target "$CHAOS_INIT_NET_GCNO" "src/init/chaos_init_net.c" "100.00"
 check_target "$CHAOS_INIT_MEMORY_GCNO" "src/init/chaos_init_memory.c" "100.00"
 check_target "$CHAOS_INIT_PROCESS_GCNO" "src/init/chaos_init_process.c" "100.00"
-for header in src/common/chaos_clock.h src/common/chaos_hits.h src/common/chaos_once.h \
-    src/common/chaos_policy.h src/common/chaos_sleep.h src/common/chaos_status.h \
+for header in src/common/chaos_bucket.h src/common/chaos_clock.h src/common/chaos_hits.h \
+    src/common/chaos_once.h src/common/chaos_policy.h src/common/chaos_sleep.h \
+    src/common/chaos_status.h \
     src/core/chaos_io_internal.h src/net/chaos_net_internal.h src/dns/chaos_dns_internal.h \
     src/time/chaos_time_internal.h src/memory/chaos_memory_internal.h \
     src/process/chaos_process_internal.h; do

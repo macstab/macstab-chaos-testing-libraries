@@ -53,6 +53,8 @@
 
 #include "chaos_init_net.h"
 
+#include "chaos_bucket.h"
+
 /** @brief Test seam: the /proc identity lookup, as in chaos_init_tracee.c. */
 #ifndef CHAOS_INIT_PROCESS_OF
 #define CHAOS_INIT_PROCESS_OF(tid, tgid, start) chaos_init_process_of((tid), (tgid), (start))
@@ -91,21 +93,23 @@ static int chaos_init_net_supported(const struct chaos_net_rule *rule);
  *
  * @details TRICKLE shortens the requested length before the kernel reads it; CORRUPT
  * changes a byte the receive wrote and DUP keeps the bytes it wrote, both of which need
- * the stop after it; RESET needs a `setsockopt` to run in the tracee before its close. A
- * notification can do none of them. The predicate decides the filter's traced group
+ * the stop after it; RESET needs a `setsockopt` to run in the tracee before its close;
+ * THROTTLE shortens the length to what its rate allows. A notification can do none of
+ * them. The predicate decides the filter's traced group
  * (chaos_init_net_traced_calls()), so adding an effect here without teaching the trace
  * path to apply it would load a rule that never fires.
  */
 static int chaos_init_net_traced_effect(const struct chaos_net_rule *rule)
 {
     return rule->effect == CHAOS_NET_EFFECT_TRICKLE || rule->effect == CHAOS_NET_EFFECT_CORRUPT ||
-           rule->effect == CHAOS_NET_EFFECT_DUP || rule->effect == CHAOS_NET_EFFECT_RESET;
+           rule->effect == CHAOS_NET_EFFECT_DUP || rule->effect == CHAOS_NET_EFFECT_RESET ||
+           rule->effect == CHAOS_NET_EFFECT_THROTTLE;
 }
 
 /* CHAOS_NET_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, TIMEOUT, DROP, and the
- * traced effects TRICKLE, CORRUPT, DUP and RESET, which the trace path applies through the
- * registers, the tracee's memory and a call of its own. ERRNO on close stays out: the
- * library closes and then reports the error, which is two answers to one call. */
+ * traced effects TRICKLE, CORRUPT, DUP, RESET and THROTTLE, which the trace path applies
+ * through the registers, the tracee's memory and a call of its own. ERRNO on close stays
+ * out: the library closes and then reports the error, which is two answers to one call. */
 static int chaos_init_net_supported(const struct chaos_net_rule *rule)
 {
     return (rule->effect == CHAOS_NET_EFFECT_ERRNO && rule->operation != CHAOS_NET_OP_CLOSE) ||
@@ -1324,6 +1328,73 @@ static void chaos_init_net_clear_ready(const chaos_init_call_t *call)
     }
 }
 
+/*---------------------------------------------------------------------------*
+ * THROTTLE: the same token bucket as the library's, one per tracee socket
+ *---------------------------------------------------------------------------*/
+
+/** @brief Sockets whose send rate the supervisor tracks at once. */
+#define CHAOS_INIT_NET_THROTTLE_SLOTS 64U
+
+/**
+ * @brief One socket's bucket, keyed by the process and the descriptor number.
+ *
+ * @details As in libchaos-io's supervisor side: the library keys by descriptor alone
+ * because its buckets belong to one process, and the supervisor serves a container, so the
+ * thread group is part of the key. A colliding entry takes the slot over.
+ */
+typedef struct chaos_init_net_throttle
+{
+    pid_t tgid;
+    int fd;
+    uint64_t rate;
+    chaos_bucket_t bucket;
+} chaos_init_net_throttle_t;
+
+static chaos_init_net_throttle_t g_chaos_init_net_throttles[CHAOS_INIT_NET_THROTTLE_SLOTS];
+
+/** @brief The bucket of (@p tgid, @p fd, @p rate), reset when the slot held something else. */
+static chaos_bucket_t *chaos_init_net_throttle_bucket(pid_t tgid, uint64_t fd, uint64_t rate)
+{
+    chaos_init_net_throttle_t *entry =
+        &g_chaos_init_net_throttles
+            [((unsigned)fd + (unsigned)tgid) % CHAOS_INIT_NET_THROTTLE_SLOTS];
+
+    if (entry->tgid != tgid || entry->fd != (int)fd || entry->rate != rate)
+    {
+        entry->bucket.state = 0U;
+        entry->rate = rate;
+        entry->fd = (int)fd;
+        entry->tgid = tgid;
+    }
+    return &entry->bucket;
+}
+
+/** @brief Whether socket @p fd of @p tid is non-blocking; 0 when its flags are unreadable. */
+static int chaos_init_net_nonblocking(pid_t tid, uint64_t fd)
+{
+    char name[64];
+    char line[128];
+    FILE *file;
+    long flags = -1;
+
+    (void)snprintf(name, sizeof(name), "/proc/%ld/fdinfo/%d", (long)tid, (int)fd);
+    file = fopen(name, "r");
+    if (file == NULL)
+    {
+        return 0;
+    }
+    while (fgets(line, sizeof(line), file) != NULL)
+    {
+        if (strncmp(line, "flags:", 6U) == 0)
+        {
+            flags = strtol(line + 6, NULL, 8);
+            break;
+        }
+    }
+    (void)fclose(file);
+    return flags >= 0 && (flags & O_NONBLOCK) != 0;
+}
+
 /**
  * @brief Who holds the socket behind descriptor @p fd of thread @p tid.
  *
@@ -1705,6 +1776,16 @@ chaos_init_net_decide_at(const chaos_init_call_t *call, long result, chaos_init_
             return 1;
         }
     }
+    /* THROTTLE shortens the length where it sits in a register, or waits for a whole
+     * datagram; either way it needs that register. recvmsg and the batches keep the
+     * length in memory and are left alone, as in the library. A send whose byte count is
+     * not knowable cannot be charged to a rate either. Before the draw, so such a call
+     * counts no hit and no tokens. */
+    if (rule.effect == CHAOS_NET_EFFECT_THROTTLE &&
+        (entry->size < 0 || size == CHAOS_POLICY_NO_SIZE || size == 0U))
+    {
+        return 1;
+    }
     /* Swap the snapshot's shared slot for the calling process's (see chaos_init_io.c). */
     state = chaos_net_config_active_state();
     rule.call_size = size;
@@ -1730,6 +1811,54 @@ chaos_init_net_decide_at(const chaos_init_call_t *call, long result, chaos_init_
     {
         verdict->action = CHAOS_INIT_RETURN;
         verdict->value = (long)size;
+    }
+    else if (rule.effect == CHAOS_NET_EFFECT_THROTTLE)
+    {
+        /* The same bucket arithmetic as the library's, and the same two answers: a stream
+         * is shortened to what the rate allows, a datagram is never cut -- half a datagram
+         * is not a datagram -- and waits for its whole message instead. What the supervisor
+         * does differently is the waiting: it holds the call in its delay queue rather than
+         * sleeping in the thread, so the tracee's other threads keep being served, and
+         * reserves the bytes when it parks the call, so the rate is the same on both
+         * paths. A non-blocking socket is told EAGAIN, as in the library. */
+        pid_t tgid = 0;
+        uint64_t image = 0U;
+        chaos_bucket_t *bucket =
+            CHAOS_INIT_PROCESS_OF(call->tid, &tgid, &image) == 0
+                ? chaos_init_net_throttle_bucket(tgid, call->args[0], rule.rate_bps)
+                : NULL;
+        const int stream = chaos_init_net_is_stream(call->args[0]);
+        const uint64_t allowed =
+            bucket != NULL ? chaos_bucket_take(bucket, rule.rate_bps, size, chaos_hits_now_ms())
+                           : size;
+
+        if (allowed >= size)
+        {
+            verdict->action = CHAOS_INIT_PASS;
+        }
+        else if (allowed > 0U && stream)
+        {
+            verdict->action = CHAOS_INIT_SHORTEN;
+            verdict->arg_index = (unsigned)entry->size;
+            verdict->value = (long)allowed;
+        }
+        else if (chaos_init_net_nonblocking(call->tid, call->args[0]))
+        {
+            verdict->action = CHAOS_INIT_FAIL;
+            verdict->error = EAGAIN;
+        }
+        else
+        {
+            const uint64_t chunk = chaos_bucket_chunk(rule.rate_bps);
+            const uint64_t held = !stream ? size : (chunk < size ? chunk : size);
+
+            verdict->action = CHAOS_INIT_DELAY;
+            verdict->delay_ms = (unsigned
+            )chaos_bucket_reserve(bucket, rule.rate_bps, held - allowed, chaos_hits_now_ms());
+            verdict->shortens = held < size;
+            verdict->arg_index = (unsigned)entry->size;
+            verdict->value = (long)held;
+        }
     }
     else if (rule.effect == CHAOS_NET_EFFECT_TRICKLE)
     {

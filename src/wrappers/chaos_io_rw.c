@@ -45,7 +45,9 @@
  * inside the kernel and never passes through a user buffer.
  */
 
+#include "chaos_bucket.h"
 #include "chaos_io_actions.h"
+#include "chaos_sleep.h"
 #include "chaos_io_internal.h"
 #include "chaos_io_wrappers.h"
 
@@ -566,6 +568,145 @@ CHAOS_IO_EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
     return rc;
 }
 
+/*---------------------------------------------------------------------------*
+ * THROTTLE: hold the write side to a byte rate
+ *---------------------------------------------------------------------------*/
+
+/** @brief Descriptors whose write rate is tracked at once (slots indexed by fd % 64). */
+#define CHAOS_IO_THROTTLE_SLOTS 64U
+
+/**
+ * @brief One descriptor's token bucket.
+ *
+ * @details Slot `fd % CHAOS_IO_THROTTLE_SLOTS`, tagged with the descriptor and the rate it
+ * was armed with. A colliding descriptor takes the slot over, so two heavily written
+ * descriptors that land on the same slot share one bucket and are held to one rate
+ * together rather than to one each; a changed rate starts a fresh bucket, because the
+ * tokens of the old rate say nothing about the new one.
+ *
+ * Plain statics, not a mapping: a bucket is three words, and a fork child inheriting its
+ * parent's buckets is right -- the rate belongs to the descriptor, which it inherited too.
+ */
+typedef struct chaos_io_throttle
+{
+    volatile int fd;
+    volatile uint64_t rate;
+    chaos_bucket_t bucket;
+} chaos_io_throttle_t;
+
+static chaos_io_throttle_t g_chaos_io_throttles[CHAOS_IO_THROTTLE_SLOTS];
+
+/** @brief The bucket of (@p fd, @p rate), reset when the slot held something else. */
+static chaos_bucket_t *chaos_io_throttle_bucket(int fd, uint64_t rate)
+{
+    chaos_io_throttle_t *entry = &g_chaos_io_throttles[(unsigned)fd % CHAOS_IO_THROTTLE_SLOTS];
+
+    if (entry->fd != fd || entry->rate != rate)
+    {
+        entry->bucket.state = 0U;
+        entry->rate = rate;
+        entry->fd = fd;
+    }
+    return &entry->bucket;
+}
+
+/** @brief Whether @p fd was opened non-blocking; 0 when the flags cannot be read. */
+static int chaos_io_nonblocking(int fd)
+{
+    const long flags = CHAOS_IO_SYSCALL(SYS_fcntl, fd, F_GETFL, 0);
+
+    return flags >= 0 && (flags & O_NONBLOCK) != 0;
+}
+
+/**
+ * @brief How many of @p count bytes the rule's rate lets through now.
+ *
+ * @details The bucket is charged first and the rule asked second, as the TORN path does:
+ * an allowance that covers the whole call changes nothing, so it spends neither a hit nor
+ * a `@first` claim. When the bucket is empty the caller is not left waiting for a whole
+ * second: a non-blocking descriptor is told `EAGAIN`, which is what its event loop is
+ * written for, and a blocking one reserves a tenth of a second's worth, waits for exactly
+ * that reservation and writes it. Reserving rather than sleeping and taking again is what
+ * keeps the rate the rate when several threads write to one descriptor: each of them is
+ * charged what it will write, so no two of them wait for the same bytes.
+ *
+ * @param refuse  Output: non-zero when the caller must report EAGAIN instead of writing.
+ * @return Bytes to pass to the real call; @p count when the rule does not hold it back.
+ */
+static size_t chaos_io_throttle_count(chaos_io_rule_t *rule, int fd, size_t count, int *refuse)
+{
+    chaos_bucket_t *bucket = chaos_io_throttle_bucket(fd, rule->rate_bps);
+    uint64_t allowed = chaos_bucket_take(bucket, rule->rate_bps, count, chaos_hits_now_ms());
+
+    *refuse = 0;
+    if (allowed == (uint64_t)count)
+    {
+        return count;
+    }
+    if (allowed == 0U)
+    {
+        const uint64_t chunk = chaos_bucket_chunk(rule->rate_bps);
+
+        if (chaos_io_nonblocking(fd))
+        {
+            if (!chaos_io_rule_should_trigger(rule))
+            {
+                return count;
+            }
+            *refuse = 1;
+            return 0U;
+        }
+        /* Asked before the wait, unlike the partial allowance below: there is nothing to
+         * hand out, so a rule that does not fire must not cost the caller the wait. */
+        if (!chaos_io_rule_should_trigger(rule))
+        {
+            return count;
+        }
+        allowed = chunk < (uint64_t)count ? chunk : (uint64_t)count;
+        chaos_sleep_ms(chaos_bucket_reserve(bucket, rule->rate_bps, allowed, chaos_hits_now_ms()));
+        return (size_t)allowed;
+    }
+    return chaos_io_rule_should_trigger(rule) ? (size_t)allowed : count;
+}
+
+/**
+ * @brief The vectored form of chaos_io_throttle_count(): trims the vector to the allowance.
+ *
+ * @details A vector too long for the stack copy, or one that cannot be read, is written
+ * whole and counts no hit, as a vector that cannot be torn is.
+ *
+ * @param refuse  Output: non-zero when the caller must report EAGAIN instead of writing.
+ * @return Non-zero when @p target holds the trimmed vector to write instead.
+ */
+static int chaos_io_throttle_iovecs(
+    chaos_io_rule_t *rule,
+    int fd,
+    const struct iovec *iov,
+    int iovcnt,
+    struct iovec *target,
+    int *target_count,
+    int *refuse
+)
+{
+    struct iovec copy[CHAOS_IO_TORN_MAX_IOV];
+    size_t total;
+    size_t allowed;
+
+    *refuse = 0;
+    if (iov == NULL || iovcnt <= 0 || iovcnt > CHAOS_IO_TORN_MAX_IOV ||
+        chaos_io_read_iovecs(iov, iovcnt, copy) != 0 ||
+        !chaos_io_iovec_total_bytes(copy, iovcnt, &total) || total == 0U)
+    {
+        return 0;
+    }
+    allowed = chaos_io_throttle_count(rule, fd, total, refuse);
+    if (*refuse || allowed >= total)
+    {
+        return 0;
+    }
+    return chaos_io_trim_iovecs(copy, iovcnt, allowed, target, target_count);
+}
+
 /**
  * @brief Decides a DROP on a write and leaves the descriptor consistent.
  *
@@ -657,6 +798,17 @@ CHAOS_IO_EXPORT ssize_t write(int fd, const void *buffer, size_t count)
     {
         return (ssize_t)count;
     }
+    else if (rule.effect == CHAOS_IO_EFFECT_THROTTLE)
+    {
+        int refuse = 0;
+
+        count = chaos_io_throttle_count(&rule, fd, count, &refuse);
+        if (refuse)
+        {
+            errno = EAGAIN;
+            return -1;
+        }
+    }
 
     rc = chaos_io_call_real_write(fd, buffer, count);
     return rc;
@@ -709,6 +861,22 @@ CHAOS_IO_EXPORT ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
              chaos_io_drop_write(&rule, fd, (size_t)rule.call_size))
     {
         return (ssize_t)rule.call_size;
+    }
+    else if (rule.effect == CHAOS_IO_EFFECT_THROTTLE)
+    {
+        struct iovec held_iov[CHAOS_IO_TORN_MAX_IOV];
+        int held_iovcnt;
+        int refuse = 0;
+
+        if (chaos_io_throttle_iovecs(&rule, fd, iov, iovcnt, held_iov, &held_iovcnt, &refuse))
+        {
+            return chaos_io_call_real_writev(fd, held_iov, held_iovcnt);
+        }
+        if (refuse)
+        {
+            errno = EAGAIN;
+            return -1;
+        }
     }
 
     return chaos_io_call_real_writev(fd, iov, iovcnt);
@@ -766,6 +934,20 @@ CHAOS_IO_EXPORT ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t co
     else if (rule.effect == CHAOS_IO_EFFECT_TORN && chaos_io_rule_should_trigger(&rule))
     {
         count = chaos_io_torn_count(&rule, count);
+    }
+    else if (rule.effect == CHAOS_IO_EFFECT_THROTTLE)
+    {
+        int refuse = 0;
+
+        /* The same shortening TORN does here: the kernel moves both offsets on by the
+         * count it transferred, so a shortened transfer is a short one, not a lost one.
+         * The bucket is the destination descriptor's, as the rule is. */
+        count = chaos_io_throttle_count(&rule, out_fd, count, &refuse);
+        if (refuse)
+        {
+            errno = EAGAIN;
+            return -1;
+        }
     }
 
     return chaos_io_call_real_sendfile(out_fd, in_fd, offset, count);
@@ -833,6 +1015,17 @@ CHAOS_IO_EXPORT ssize_t copy_file_range(
     else if (rule.effect == CHAOS_IO_EFFECT_TORN && chaos_io_rule_should_trigger(&rule))
     {
         count = chaos_io_torn_count(&rule, count);
+    }
+    else if (rule.effect == CHAOS_IO_EFFECT_THROTTLE)
+    {
+        int refuse = 0;
+
+        count = chaos_io_throttle_count(&rule, out_fd, count, &refuse);
+        if (refuse)
+        {
+            errno = EAGAIN;
+            return -1;
+        }
     }
 
     return chaos_io_call_real_copy_file_range(in_fd, in_offset, out_fd, out_offset, count, flags);
@@ -946,6 +1139,17 @@ CHAOS_IO_EXPORT ssize_t pwrite(int fd, const void *buffer, size_t count, off_t o
     {
         return (ssize_t)count;
     }
+    else if (rule.effect == CHAOS_IO_EFFECT_THROTTLE)
+    {
+        int refuse = 0;
+
+        count = chaos_io_throttle_count(&rule, fd, count, &refuse);
+        if (refuse)
+        {
+            errno = EAGAIN;
+            return -1;
+        }
+    }
 
     rc = chaos_io_call_real_pwrite(fd, buffer, count, offset);
     return rc;
@@ -991,6 +1195,22 @@ CHAOS_IO_EXPORT ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off
              chaos_io_rule_should_trigger(&rule))
     {
         return (ssize_t)rule.call_size;
+    }
+    else if (rule.effect == CHAOS_IO_EFFECT_THROTTLE)
+    {
+        struct iovec held_iov[CHAOS_IO_TORN_MAX_IOV];
+        int held_iovcnt;
+        int refuse = 0;
+
+        if (chaos_io_throttle_iovecs(&rule, fd, iov, iovcnt, held_iov, &held_iovcnt, &refuse))
+        {
+            return chaos_io_call_real_pwritev(fd, held_iov, held_iovcnt, offset);
+        }
+        if (refuse)
+        {
+            errno = EAGAIN;
+            return -1;
+        }
     }
 
     return chaos_io_call_real_pwritev(fd, iov, iovcnt, offset);

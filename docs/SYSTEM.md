@@ -99,7 +99,8 @@ The test question is: *what remains after the call has returned?*
 | Allowed, and why | |
 |---|---|
 | `OFFSET`, `REGRESS`, `FREEZE` | the returned time is rewritten; the kernel clock is untouched |
-| `TORN`, `DROP` | the call is performed partially, or not at all while reporting that it was |
+| `TORN`, `DROP`, `THROTTLE` | the call is performed partially, or not at all while reporting that it was |
+| `THROTTLE`'s wait | it delays one call and leaves nothing behind; the rate lives in the process, not in the kernel, so no other process is slowed down |
 | `statfs` `FREE`, `FULL` | the returned structure is rewritten; the filesystem is untouched |
 | `RESET`'s `setsockopt(SO_LINGER)` | it parameterises the close that follows it, and only on a socket this process alone holds -- otherwise the option would outlive the call on a descriptor someone else still owns, which is exactly the state this rule forbids |
 | `DROP`'s `lseek` | it repairs the offset the skipped write would have moved, so nothing is left that a real lost write would not leave |
@@ -182,7 +183,7 @@ Consequences:
   program uses.
 - Pipes, eventfds, timerfds and memfds (`pipe:[N]`, `anon_inode:[...]`,
   `/memfd:<name>`) belong to neither domain unless an io rule names them
-  explicitly: a TORN, DROP or CORRUPT intended for files would break their
+  explicitly: a TORN, DROP, THROTTLE or CORRUPT intended for files would break their
   protocols.
 - Descriptors 0, 1 and 2 are never decided by `libchaos-io`.
 
@@ -297,7 +298,7 @@ layered fault models.
 | rule file | `/tmp/.chaos-<lib>.conf`, one per library; re-read when its change stamp changes (reload) |
 | rule | one line of a rule file: selector, operation, effect, value, optional probability and qualifiers |
 | selector | what a rule matches: path prefix (io), endpoint (net), DNS name or address (dns), operation[/target] (time, memory, process) |
-| effect | what a matching rule does: `ERRNO`, `LATENCY`, `TIMEOUT`, `CORRUPT`, `TORN`, `DROP`, `FREE`, `FULL`, `TRICKLE`, `DUP`, `RESET`, `OFFSET`, `REGRESS`, `FREEZE`, `GAI`, `REWRITE`, `OVERRIDE`, `SERVICE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT`, `FAIL_AFTER` |
+| effect | what a matching rule does: `ERRNO`, `LATENCY`, `TIMEOUT`, `CORRUPT`, `TORN`, `DROP`, `THROTTLE`, `FREE`, `FULL`, `TRICKLE`, `DUP`, `RESET`, `OFFSET`, `REGRESS`, `FREEZE`, `GAI`, `REWRITE`, `OVERRIDE`, `SERVICE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT`, `FAIL_AFTER` |
 | probability | chance in [0, 1] that a matching rule fires on a call, sampled from a per-thread PRNG |
 | qualifier | `@first=N`, `@from=T`, `@until=T`, `@size>N`, `@size<N` (`src/common/chaos_policy.h`) |
 | hit | one application of a rule's effect; counted per rule |
@@ -373,7 +374,7 @@ unrelated site; failing at load is diagnosable.
      nothing done);
    - after it: `CORRUPT`, `OFFSET`, `REGRESS`, `FREEZE`, `FREE`, `FULL`,
      `REWRITE`, `SERVICE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT`;
-   - reshaping the request or the result: `TORN`, `TRICKLE`, `DUP`;
+   - reshaping the request or the result: `TORN`, `THROTTLE`, `TRICKLE`, `DUP`;
    - parameterising the call itself: `RESET`, whose `setsockopt` precedes the
      close it belongs to.
 8. **Return** what libc would return, except for the injected fault. errno is

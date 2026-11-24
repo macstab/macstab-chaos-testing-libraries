@@ -290,6 +290,7 @@ Rule file `/tmp/.chaos-io.conf`. Each rule is exactly four fields:
 /data:write:LATENCY:200
 /data:write:TORN:0.1
 /data:read:CORRUPT:0.5
+/data:write:THROTTLE:65536
 *:open:EMFILE:0.05
 ```
 
@@ -328,6 +329,7 @@ names, so each is interposed.
 | `LATENCY` | milliseconds | every operation | Sleeps before the real call. Always fires: io `LATENCY` takes no probability. |
 | `TORN` | probability | `write`, `pwrite` (not stdio) | Calls the real function with a shortened count: a short write, the rest of the buffer never written. |
 | `DROP` | probability | `write`, `pwrite` (not stdio, `sendfile`, `copy_file_range`) | Reports the full count as written and writes nothing. On `write` the file offset is moved on by that many bytes, so the caller's next write does not overwrite what it believes it already wrote; `O_APPEND` needs no correction, and a descriptor without an offset (a pipe) keeps the rule from firing. |
+| `THROTTLE` | bytes per second, no probability | `write`, `pwrite`, `sendfile`, `copy_file_range` (not stdio) | Holds the descriptor to that rate: each call writes what a token bucket of one second's worth allows, so the first second passes untouched and only a caller that keeps going is slowed down. An empty bucket returns `EAGAIN` on a non-blocking descriptor and otherwise waits for a tenth of a second's worth and writes that. |
 | `FREE` | bytes, optionally `@probability` | `statfs` | Calls the real function, then reports that many bytes free (`f_bfree` and `f_bavail`, rounded down to whole blocks). The total is left as the kernel reported it. |
 | `FULL` | probability | `statfs` | The same two counts report zero: a filesystem with nothing left. For the recipe "full disk, writes still succeed physically", pair it with a `write:ENOSPC` rule — a real filling disk makes a program's own threshold check fail long before the writes do. |
 | `CORRUPT` | probability | `read`, `pread`, stdio reads | Calls the real function, then flips a bit in the bytes it returned. |
@@ -348,7 +350,8 @@ names, so each is interposed.
   (`/lib` matches `/usr/lib` where `/lib` links there).
 - `*` matches regular paths only. Pipes, sockets, anonymous inodes and memfds
   (`pipe:[N]`, `socket:[N]`, `anon_inode:[…]`, `/memfd:…`) are left to rules that
-  name them, so a `*` `TORN` rule cannot break an eventfd or a socket protocol.
+  name them, so a `*` `TORN` or `THROTTLE` rule cannot break an eventfd or a socket
+  protocol.
 - Never faulted: descriptors 0–2, every libchaos control file (`/tmp/.chaos-*`), and
   anything under `/proc`, `/sys` or `/dev`.
 
@@ -366,6 +369,7 @@ tcp4://*:8080:listen:LATENCY:250
 udp4://127.0.0.1:5353:send:EHOSTUNREACH:0.2
 tcp4://127.0.0.1:9000:recv:CORRUPT:0.1
 tcp4://127.0.0.1:6379:recv:TRICKLE:1
+tcp4://127.0.0.1:9000:send:THROTTLE:65536
 tcp4://127.0.0.1:9092:recv:DUP:0.05
 tcp4://*:5432:close:RESET:1.0
 tcp4://10.0.0.0/8:5432:connect:ECONNREFUSED:0.1
@@ -426,6 +430,8 @@ call passes through.
 | `DUP` | probability | `recv` | Delivers the socket's previous payload again (with its sender address for datagrams) instead of new data: at-least-once delivery. Payloads are kept per socket up to 4 KiB (longer ones replay truncated) for 64 sockets at once. Skipped for `MSG_PEEK`, `MSG_TRUNC`, `MSG_OOB`, `MSG_WAITALL` and empty buffers. |
 | `RESET` | probability | `close` | Sets `SO_LINGER` to 0 before the close, so the peer receives an RST (`ECONNRESET`) instead of a FIN, as after a crashed process or a load balancer drop. |
 | `DROP` | probability | `send` | Reports the full byte count as sent and sends nothing: a lost packet. Datagram sockets only, decided per call from `SO_TYPE`, so a `*:send:DROP` rule leaves stream sends alone and counts no hit for them — a silent gap in a TCP stream is a state no network produces. Not applied to `sendmmsg`, whose result is a message count. |
+
+| `THROTTLE` | bytes per second, no probability | `send` | Holds the send side to that rate: each send moves what a token bucket of one second's worth allows, so the first second passes untouched. A stream send comes back short; a datagram is never cut and waits for its whole message instead. An empty bucket returns `EAGAIN` on a non-blocking socket and otherwise waits for a tenth of a second's worth. Not applied to `sendmsg` or `sendmmsg`, whose length is in memory. |
 
 **Errnos.** `ECONNREFUSED`, `ETIMEDOUT`, `ECONNRESET`, `EHOSTUNREACH`, `ENETUNREACH`,
 `EADDRINUSE`, `EADDRNOTAVAIL`, `EAFNOSUPPORT`, `EPROTONOSUPPORT`, `EPIPE`, `ENOTCONN`,
@@ -693,8 +699,8 @@ chaos-init --libs io,net,memory,process -- /usr/local/bin/nats-server -js
 
 | Library | Applied in SECCOMP mode |
 |---|---|
-| io | errno and `LATENCY` on every operation (`close`: `LATENCY` only); `TORN`, `CORRUPT` and `DROP` through a ptrace stop |
-| net | errno and `LATENCY` on every operation (`close`: `LATENCY` only); `TIMEOUT` on `poll`, `DROP` on a datagram send; `TRICKLE`, `CORRUPT`, `DUP` and `RESET` through a ptrace stop |
+| io | errno and `LATENCY` on every operation (`close`: `LATENCY` only); `TORN`, `THROTTLE`, `CORRUPT` and `DROP` through a ptrace stop |
+| net | errno and `LATENCY` on every operation (`close`: `LATENCY` only); `TIMEOUT` on `poll`, `DROP` on a datagram send; `THROTTLE`, `TRICKLE`, `CORRUPT`, `DUP` and `RESET` through a ptrace stop |
 | memory | `ERRNO`, `LATENCY` |
 | process | `ERRNO`, `LATENCY`, `FAIL_AFTER`; `clone` is classified as `pthread_create` (`CLONE_THREAD`), `posix_spawn` (`CLONE_VFORK`) or `fork` |
 | time | `ERRNO`, `LATENCY` on a clock read and on `nanosleep`; `OFFSET`, `REGRESS`, `FREEZE` on a clock read. The vDSO lookups of each image are made to fail first, so the reads become system calls; a `usleep` rule is rejected |
@@ -737,7 +743,8 @@ chaos-init --libs io,net,memory,process -- /usr/local/bin/nats-server -js
 ```text
 src/
   common/      shared headers: qualifiers (chaos_policy.h), status file (chaos_status.h),
-               hits files and seqlock (chaos_hits.h), vDSO clock (chaos_clock.h), sleep
+               hits files and seqlock (chaos_hits.h), vDSO clock (chaos_clock.h), sleep,
+               token bucket (chaos_bucket.h)
   core/        libchaos-io runtime state, symbol resolution, path filters
   config/      libchaos-io rule parser and reload; fd-to-path cache
   effects/     libchaos-io effect decisions (ERRNO, LATENCY, TORN, CORRUPT)

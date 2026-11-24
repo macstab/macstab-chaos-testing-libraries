@@ -6,7 +6,7 @@
  * Proves that rules in the rule file `/tmp/.chaos-net.conf`
  * (`<selector>:<operation>:<ERRNO-name | effect>:<value>`) are matched against real loopback
  * sockets and fault every wrapped socket call with the documented result. Each check uses its
- * own 127.0.0.1 port (41001-41036) so a rule can only match the socket under test. Exit code of
+ * own 127.0.0.1 port (41001-41038) so a rule can only match the socket under test. Exit code of
  * each check, in main()'s order:
  *
  * - 10-11   bind:EMFILE; bind returns -1/EMFILE.
@@ -18,6 +18,8 @@
  * - 50-51   the accept rule also fails accept4 (one operation covers both).
  * - 60-64   send:LATENCY:200; send in a forked client takes >= 150 ms, the data arrives.
  * - 70-75   recv:CORRUPT:1.0; 4 bytes arrive but differ from what was sent.
+ * - 250-254 send:THROTTLE:4096 holds 8 KiB of stream sends to about a second and makes them
+ *           short, while the same rate on another port leaves them whole and immediate.
  * - 180-183 recv:TRICKLE:3; recv, read, readv and recvmsg each return 1-3 bytes and the pieces
  *           reassemble to the sent bytes exactly.
  * - 190-194 recv:DUP:1.0; a payload is delivered, then delivered again on the next read
@@ -1315,6 +1317,98 @@ static int probe_recvmmsg_corrupt(void)
 }
 
 /**
+ * @brief Sends @p total bytes on @p fd in one loop and reports the milliseconds it took,
+ *        with @p short_send set when any send moved less than it was given.
+ *
+ * @return 0, or the exit code of the failing step.
+ */
+static int send_timed(int fd, size_t total, long long *elapsed_ms, int *short_send)
+{
+    static char block[8192];
+    struct timespec start;
+    struct timespec end;
+    size_t done = 0U;
+
+    *short_send = 0;
+    memset(block, 'x', sizeof(block));
+    if (total > sizeof(block) || clock_gettime(CLOCK_MONOTONIC, &start) != 0)
+    {
+        return 251;
+    }
+    while (done < total)
+    {
+        const ssize_t sent = send(fd, block + done, total - done, 0);
+
+        if (sent <= 0)
+        {
+            return 252;
+        }
+        if ((size_t)sent < total - done)
+        {
+            *short_send = 1;
+        }
+        done += (size_t)sent;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0)
+    {
+        return 251;
+    }
+    *elapsed_ms =
+        (long long)(end.tv_sec - start.tv_sec) * 1000 + (end.tv_nsec - start.tv_nsec) / 1000000;
+    return 0;
+}
+
+/**
+ * @brief send:THROTTLE:4096 on a stream socket: 8 KiB takes about a second and arrives in
+ *        short sends, while the same rate on another port leaves them whole and immediate
+ *        (exit 250-254).
+ */
+static int probe_send_throttle(void)
+{
+    long long elapsed_ms = 0;
+    int short_send = 0;
+    int server;
+    int client;
+    int rc;
+
+    rc = write_config("tcp4://127.0.0.1:41037:send:THROTTLE:4096");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    if (create_tcp_pair(41037U, &server, &client) != 0)
+    {
+        return 250;
+    }
+    /* The bucket starts full, so the first 4 KiB go at once and the second take a second,
+     * in tenth-of-a-second pieces. */
+    rc = send_timed(client, 8192U, &elapsed_ms, &short_send);
+    if (rc != 0)
+    {
+        return rc;
+    }
+    if (elapsed_ms < 700 || !short_send)
+    {
+        return 253;
+    }
+    /* The same sends with the rate on another port: immediate and whole, so the check
+     * above measured the rule and not this machine. */
+    rc = write_config("tcp4://127.0.0.1:41038:send:THROTTLE:4096");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    rc = send_timed(client, 8192U, &elapsed_ms, &short_send);
+    if (rc != 0)
+    {
+        return rc;
+    }
+    close(client);
+    close(server);
+    return elapsed_ms < 300 && !short_send ? 0 : 254;
+}
+
+/**
  * @brief TRICKLE:3 on recv: recv, read, readv (split 2+6 iovec) and recvmsg, in rotation, each
  *        return 1-3 bytes, and the pieces reassemble to the sent bytes (exit 180-183).
  */
@@ -1629,6 +1723,9 @@ int main(void)
     if (rc != 0)
         return rc;
     rc = probe_recv_corrupt();
+    if (rc != 0)
+        return rc;
+    rc = probe_send_throttle();
     if (rc != 0)
         return rc;
     rc = probe_recv_trickle();

@@ -48,6 +48,8 @@
 
 #include "chaos_init_io.h"
 
+#include "chaos_bucket.h"
+
 #include <limits.h>
 
 /* Parser hook, defined before the core is included: rules this mode cannot apply reject
@@ -82,22 +84,23 @@ uint64_t g_chaos_io_process_seed = UINT64_C(0x2545f4914f6cdd1d);
  *
  * @details TORN shortens the byte count before the kernel reads it; CORRUPT changes a byte
  * the call wrote, which needs the stop after it; DROP on a `write` needs an `lseek` to run
- * in the tracee, which needs the registers twice over. A notification can do none of
- * them. The predicate is
+ * in the tracee, which needs the registers twice over; THROTTLE shortens the count like
+ * TORN, to whatever its rate allows. A notification can do none of them. The predicate is
  * what puts a system call in the filter's traced group (chaos_init_io_traced_calls()), so adding an
  * effect here without teaching the trace path to apply it would load a rule that never fires.
  */
 static int chaos_init_io_traced_effect(const struct chaos_io_rule *rule)
 {
     return rule->effect == CHAOS_IO_EFFECT_TORN || rule->effect == CHAOS_IO_EFFECT_CORRUPT ||
+           rule->effect == CHAOS_IO_EFFECT_THROTTLE ||
            (rule->effect == CHAOS_IO_EFFECT_DROP && rule->operation == CHAOS_IO_OP_WRITE);
 }
 
 /* CHAOS_IO_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, DROP on pwrite (whose
- * offset is its own argument), and the traced effects TORN, CORRUPT and DROP on write,
- * which the trace path applies through the registers, the tracee's memory and a call of
- * its own. FREE and FULL stay out: they rewrite the structure the kernel returned, which
- * is none of those. */
+ * offset is its own argument), and the traced effects TORN, CORRUPT, THROTTLE and DROP on
+ * write, which the trace path applies through the registers, the tracee's memory and a
+ * call of its own. FREE and FULL stay out: they rewrite the structure the kernel returned,
+ * which is none of those. */
 static int chaos_init_io_supported(const struct chaos_io_rule *rule)
 {
     return (rule->effect == CHAOS_IO_EFFECT_ERRNO && rule->operation != CHAOS_IO_OP_CLOSE) ||
@@ -105,6 +108,11 @@ static int chaos_init_io_supported(const struct chaos_io_rule *rule)
            (rule->effect == CHAOS_IO_EFFECT_DROP && rule->operation == CHAOS_IO_OP_PWRITE) ||
            chaos_init_io_traced_effect(rule);
 }
+
+/** @brief Test seam: the /proc identity lookup, as in chaos_init_tracee.c. */
+#ifndef CHAOS_INIT_PROCESS_OF
+#define CHAOS_INIT_PROCESS_OF(tid, tgid, start) chaos_init_process_of((tid), (tgid), (start))
+#endif
 
 /** @brief Test seam: how /proc links are read; unit tests make one unreadable. */
 #ifndef CHAOS_INIT_IO_PROC_LINK
@@ -191,16 +199,56 @@ static const chaos_init_io_call_t g_chaos_init_io_calls[] = {
 #endif
 };
 
+/*---------------------------------------------------------------------------*
+ * THROTTLE: the same token bucket as the library's, one per tracee descriptor
+ *---------------------------------------------------------------------------*/
+
+/** @brief Descriptors whose write rate the supervisor tracks at once. */
+#define CHAOS_INIT_IO_THROTTLE_SLOTS 64U
+
+/**
+ * @brief One descriptor's bucket, keyed by the process and the descriptor number.
+ *
+ * @details The library keys its buckets by descriptor alone, because they belong to one
+ * process; the supervisor serves a container, so the thread group is part of the key.
+ * A colliding entry takes the slot over, as in the library.
+ */
+typedef struct chaos_init_io_throttle
+{
+    pid_t tgid;
+    int fd;
+    uint64_t rate;
+    chaos_bucket_t bucket;
+} chaos_init_io_throttle_t;
+
+static chaos_init_io_throttle_t g_chaos_init_io_throttles[CHAOS_INIT_IO_THROTTLE_SLOTS];
+
+/** @brief The bucket of (@p tgid, @p fd, @p rate), reset when the slot held something else. */
+static chaos_bucket_t *chaos_init_io_throttle_bucket(pid_t tgid, uint64_t fd, uint64_t rate)
+{
+    chaos_init_io_throttle_t *entry =
+        &g_chaos_init_io_throttles[((unsigned)fd + (unsigned)tgid) % CHAOS_INIT_IO_THROTTLE_SLOTS];
+
+    if (entry->tgid != tgid || entry->fd != (int)fd || entry->rate != rate)
+    {
+        entry->bucket.state = 0U;
+        entry->rate = rate;
+        entry->fd = (int)fd;
+        entry->tgid = tgid;
+    }
+    return &entry->bucket;
+}
+
 /** @brief Result value that means "the call has not run yet" (the entry stop). */
 #define CHAOS_INIT_IO_NO_RESULT LONG_MIN
 
 /**
  * @brief Whether @p rule needs a trace stop for @p entry in particular.
  *
- * @details TORN and CORRUPT need the byte count or the buffer in a register, which the
- * vectored forms keep in memory: they stay on the notification path, as the library leaves
- * them whole too. DROP needs no register of the call, only a stop to put an `lseek` in its
- * place, so it takes the vectored form as well -- but not `sendfile` and
+ * @details TORN, CORRUPT and THROTTLE need the byte count or the buffer in a register,
+ * which the vectored forms keep in memory: they stay on the notification path, as the
+ * library leaves them whole too. DROP needs no register of the call, only a stop to put an
+ * `lseek` in its place, so it takes the vectored form as well -- but not `sendfile` and
  * `copy_file_range`, which carry a `write` rule and never a DROP: they move bytes between
  * two descriptors, and dropping one would need both offsets.
  */
@@ -356,11 +404,18 @@ typedef enum chaos_init_io_offset
  * offset here, a character device is left alone even where its own `lseek` would work.
  * An unreadable descriptor is left alone too, as a failing `fcntl` leaves it there.
  */
-static chaos_init_io_offset_t chaos_init_io_offset_of(pid_t tid, uint64_t fd)
+/**
+ * @brief The open flags of descriptor @p fd of thread @p tid, from its fdinfo.
+ *
+ * @details `/proc/<tid>/fdinfo/<fd>` prints them in octal, which is the only way to learn
+ * them from outside: `fcntl` would have to run in the tracee.
+ *
+ * @return The flags, or -1 when they cannot be read.
+ */
+static long chaos_init_io_flags(pid_t tid, uint64_t fd)
 {
     char name[64];
     char line[128];
-    struct stat status;
     FILE *file;
     long flags = -1;
 
@@ -368,7 +423,7 @@ static chaos_init_io_offset_t chaos_init_io_offset_of(pid_t tid, uint64_t fd)
     file = CHAOS_INIT_IO_FDINFO_OPEN(name, "r");
     if (file == NULL)
     {
-        return CHAOS_INIT_IO_OFFSET_NONE;
+        return -1;
     }
     while (fgets(line, sizeof(line), file) != NULL)
     {
@@ -379,6 +434,23 @@ static chaos_init_io_offset_t chaos_init_io_offset_of(pid_t tid, uint64_t fd)
         }
     }
     (void)fclose(file);
+    return flags;
+}
+
+/** @brief Whether @p fd of @p tid is non-blocking; 0 when its flags cannot be read. */
+static int chaos_init_io_nonblocking(pid_t tid, uint64_t fd)
+{
+    const long flags = chaos_init_io_flags(tid, fd);
+
+    return flags >= 0 && (flags & O_NONBLOCK) != 0;
+}
+
+static chaos_init_io_offset_t chaos_init_io_offset_of(pid_t tid, uint64_t fd)
+{
+    char name[64];
+    struct stat status;
+    const long flags = chaos_init_io_flags(tid, fd);
+
     if (flags < 0)
     {
         return CHAOS_INIT_IO_OFFSET_NONE;
@@ -640,11 +712,12 @@ chaos_init_io_decide_at(const chaos_init_call_t *call, long result, chaos_init_v
         }
         drop_offset = offset == CHAOS_INIT_IO_OFFSET_MOVE && rule.call_size > 0U;
     }
-    /* TORN shortens the count where it sits in a register. The vectored forms keep it in
-     * memory, so one argument cannot shorten them and they are written whole -- the same
-     * answer the library gives a vector it cannot tear. Checked before the draw, so such
-     * a call counts no hit. */
-    if (rule.effect == CHAOS_IO_EFFECT_TORN && entry->size < 0)
+    /* TORN and THROTTLE shorten the count where it sits in a register. The vectored forms
+     * keep it in memory, so one argument cannot shorten them and they are written whole --
+     * the same answer the library gives a vector it cannot tear or hold back. Checked
+     * before the draw, so such a call counts no hit and no tokens. */
+    if ((rule.effect == CHAOS_IO_EFFECT_TORN || rule.effect == CHAOS_IO_EFFECT_THROTTLE) &&
+        entry->size < 0)
     {
         return 1;
     }
@@ -715,6 +788,53 @@ chaos_init_io_decide_at(const chaos_init_call_t *call, long result, chaos_init_v
         verdict->action = CHAOS_INIT_SHORTEN;
         verdict->arg_index = (unsigned)entry->size;
         verdict->value = (long)chaos_io_torn_count(&rule, (size_t)rule.call_size);
+    }
+    else if (rule.effect == CHAOS_IO_EFFECT_THROTTLE)
+    {
+        /* The same bucket arithmetic as the library's, with one difference in what it can
+         * do when nothing is left: the supervisor reserves a tenth of a second's worth and
+         * holds the call in its delay queue rather than sleeping in the thread, so the
+         * tracee's other threads keep being served. The reservation is why both paths
+         * enforce the same rate: the bytes are charged when the call is parked, not when it
+         * is let go. A non-blocking descriptor is told EAGAIN, as in the library. */
+        pid_t tgid = 0;
+        uint64_t image = 0U;
+        chaos_bucket_t *bucket =
+            CHAOS_INIT_PROCESS_OF(call->tid, &tgid, &image) == 0
+                ? chaos_init_io_throttle_bucket(tgid, call->args[0], rule.rate_bps)
+                : NULL;
+        const uint64_t allowed =
+            bucket != NULL
+                ? chaos_bucket_take(bucket, rule.rate_bps, rule.call_size, chaos_hits_now_ms())
+                : rule.call_size;
+
+        if (allowed >= rule.call_size)
+        {
+            verdict->action = CHAOS_INIT_PASS;
+        }
+        else if (allowed > 0U)
+        {
+            verdict->action = CHAOS_INIT_SHORTEN;
+            verdict->arg_index = (unsigned)entry->size;
+            verdict->value = (long)allowed;
+        }
+        else if (chaos_init_io_nonblocking(call->tid, call->args[0]))
+        {
+            verdict->action = CHAOS_INIT_FAIL;
+            verdict->error = EAGAIN;
+        }
+        else
+        {
+            const uint64_t chunk = chaos_bucket_chunk(rule.rate_bps);
+            const uint64_t held = chunk < rule.call_size ? chunk : rule.call_size;
+
+            verdict->action = CHAOS_INIT_DELAY;
+            verdict->delay_ms =
+                (unsigned)chaos_bucket_reserve(bucket, rule.rate_bps, held, chaos_hits_now_ms());
+            verdict->shortens = 1;
+            verdict->arg_index = (unsigned)entry->size;
+            verdict->value = (long)held;
+        }
     }
     else if (rule.effect == CHAOS_IO_EFFECT_DROP)
     {

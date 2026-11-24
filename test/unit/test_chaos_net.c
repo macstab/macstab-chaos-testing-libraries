@@ -44,6 +44,25 @@
  * (`test_net_runtime.c`).
  */
 
+#include <time.h>
+
+/** @brief Milliseconds the last chaos_sleep_ms() asked for; -1 when it was not called. */
+static long g_slept_ms = -1;
+
+/**
+ * @brief Test seam for chaos_sleep.h: records the request instead of sleeping.
+ *
+ * @details Only THROTTLE reaches it -- the LATENCY stub below never sleeps -- so the
+ * recorded value is the wait a rate asked for.
+ */
+static int chaos_net_test_sleep(const struct timespec *request, struct timespec *remaining)
+{
+    (void)remaining;
+    g_slept_ms = (long)request->tv_sec * 1000L + request->tv_nsec / 1000000L;
+    return 0;
+}
+#define CHAOS_SLEEP_SYSCALL(request, remaining) chaos_net_test_sleep((request), (remaining))
+
 #include "../support/test_net_support.h"
 
 #include <fcntl.h>
@@ -570,14 +589,17 @@ chaos_net_test_accept4(int sockfd, struct sockaddr *address, socklen_t *address_
 }
 #endif
 
+/** @brief Bytes the last fake send() was given, which is what THROTTLE shortens. */
+static size_t g_send_size = 0U;
+
 /** @brief Fake real send(); reports 4 bytes by default. */
 static ssize_t chaos_net_test_send(int sockfd, const void *buffer, size_t size, int flags)
 {
     (void)sockfd;
     (void)buffer;
-    (void)size;
     (void)flags;
     ++g_send_calls;
+    g_send_size = size;
     return g_send_result;
 }
 
@@ -1134,6 +1156,7 @@ static void reset_wrapper_stubs(void)
     g_socketpair_calls = 0;
     g_shutdown_calls = 0;
     g_send_calls = 0;
+    g_send_size = 0U;
     g_sendto_calls = 0;
     g_sendmsg_calls = 0;
     g_recv_calls = 0;
@@ -2976,6 +2999,140 @@ static void test_wrappers_record_call_size(void)
     (void)rc;
 }
 
+/** @brief Arms a THROTTLE rule of @p rate bytes per second on send, for @p type sockets. */
+static void arm_throttle_rule(int type, uint64_t rate)
+{
+    reset_wrapper_stubs();
+    g_should_trigger_calls = 0;
+    g_slept_ms = -1;
+    g_test_socket_type = type;
+    g_stub_endpoint_from_peer = 1;
+    g_stub_match_endpoint = 1;
+    memset(&g_stub_rule, 0, sizeof(g_stub_rule));
+    g_stub_rule.effect = CHAOS_NET_EFFECT_THROTTLE;
+    g_stub_rule.rate_bps = rate;
+    g_should_trigger = 1;
+}
+
+/**
+ * @brief Proves THROTTLE holds the send side to a byte rate, and never cuts a datagram.
+ *
+ * @details The rates are tiny so that a token takes long enough to arrive for the test not
+ * to depend on the machine: at 10 bytes per second the bucket is a reliable 100 ms away
+ * from its next byte. Each case uses a rate of its own, which gives it a fresh bucket --
+ * a slot is keyed by descriptor and rate. Covered:
+ * - a full bucket passes the whole send and does not even ask the rule, so an allowance
+ *   that changes nothing spends neither a hit nor a `@first` claim;
+ * - an empty bucket shortens a stream send to a tenth of a second's worth and waits for
+ *   exactly that;
+ * - a datagram is never shortened: it waits for its whole message, because half a
+ *   datagram is not a datagram;
+ * - a non-blocking socket is told EAGAIN instead of being made to wait;
+ * - a rule that does not fire costs neither bytes nor the wait.
+ */
+static void test_throttle_sends(void)
+{
+    char buffer[32];
+    int nonblocking;
+
+    memset(buffer, 'x', sizeof(buffer));
+
+    /* A full bucket is one second's worth: the first 10 bytes go whole. */
+    arm_throttle_rule(SOCK_STREAM, 10U);
+    assert(send(4, buffer, 10U, 0) == g_send_result);
+    assert(g_send_size == 10U);
+    assert(g_should_trigger_calls == 0);
+    assert(g_slept_ms == -1);
+
+    /* Empty now: a stream send is cut to a tenth of a second's worth -- the floor of that
+     * is one byte at this rate -- and waits the 100 ms that byte takes to arrive. */
+    assert(send(4, buffer, 10U, 0) == g_send_result);
+    assert(g_send_size == 1U);
+    assert(g_slept_ms == 100);
+    assert(g_should_trigger_calls == 1);
+    /* The byte was charged when the wait started, so the send after it waits again rather
+     * than finding that byte in the bucket -- otherwise two sends would move two bytes in
+     * the time one takes to arrive and the rate would come out double. */
+    g_slept_ms = -1;
+    assert(send(4, buffer, 10U, 0) == g_send_result);
+    assert(g_slept_ms > 100);
+
+    /* A datagram keeps its length. Three of the five bytes in the bucket first, so that
+     * the next message meets a part of what it needs. */
+    arm_throttle_rule(SOCK_DGRAM, 5U);
+    assert(sendto(4, buffer, 3U, 0, NULL, 0U) == g_sendto_result);
+    assert(g_slept_ms == -1);
+    /* Ten bytes with two left: the message is sent whole and waits for the eight that are
+     * missing, 1600 ms at this rate -- not for all ten, which would charge the two the
+     * bucket already handed out a second time and make the rate come out too low. */
+    assert(send(4, buffer, 10U, 0) == g_send_result);
+    assert(g_send_size == 10U);
+    assert(g_slept_ms == 1600);
+
+    /* A non-blocking socket: EAGAIN, nothing sent, no wait. A real descriptor is needed
+     * because the flags are read from the kernel, not from the rule. */
+    nonblocking = (int)syscall(SYS_socket, AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    assert(nonblocking >= 0);
+    arm_throttle_rule(SOCK_DGRAM, 20U);
+    assert(send(nonblocking, buffer, 16U, 0) == g_send_result);
+    errno = 0;
+    assert(send(nonblocking, buffer, 16U, 0) == -1);
+    assert(errno == EAGAIN);
+    assert(g_send_calls == 1);
+    assert(g_slept_ms == -1);
+    /* sendto refuses the same way, and so does write on a socket: one rule, one answer,
+     * whichever call the application reaches for. */
+    arm_throttle_rule(SOCK_DGRAM, 23U);
+    assert(sendto(nonblocking, buffer, 16U, 0, NULL, 0U) == g_sendto_result);
+    errno = 0;
+    assert(sendto(nonblocking, buffer, 16U, 0, NULL, 0U) == -1);
+    assert(errno == EAGAIN);
+    assert(g_sendto_calls == 1);
+    {
+        reset_descriptor_stubs();
+        g_slept_ms = -1;
+        g_test_socket_type = SOCK_DGRAM;
+        g_stub_prepare = 1;
+        g_stub_endpoint_from_peer = 1;
+        g_stub_match_endpoint = 1;
+        memset(&g_stub_rule, 0, sizeof(g_stub_rule));
+        g_stub_rule.effect = CHAOS_NET_EFFECT_THROTTLE;
+        g_stub_rule.rate_bps = 24U;
+        g_should_trigger = 1;
+        assert(write(nonblocking, buffer, 16U) == 16);
+        errno = 0;
+        assert(write(nonblocking, buffer, 16U) == -1);
+        assert(errno == EAGAIN);
+        assert(g_descriptor_calls == 1);
+    }
+
+    /* A rule that does not fire costs neither bytes nor the wait. Three places ask it:
+     * with a part of the call's bytes in the bucket, with none and a blocking socket, and
+     * with none and a non-blocking one -- which must not be told EAGAIN either, because
+     * that is an answer only a rule that fires may give. */
+    arm_throttle_rule(SOCK_STREAM, 30U);
+    assert(send(4, buffer, 16U, 0) == g_send_result);
+    g_should_trigger = 0;
+    assert(send(4, buffer, 16U, 0) == g_send_result);
+    assert(g_send_size == 16U);
+    assert(g_slept_ms == -1);
+    arm_throttle_rule(SOCK_STREAM, 31U);
+    assert(send(4, buffer, 31U, 0) == g_send_result);
+    g_should_trigger = 0;
+    assert(send(4, buffer, 31U, 0) == g_send_result);
+    assert(g_send_size == 31U);
+    assert(g_slept_ms == -1);
+    arm_throttle_rule(SOCK_DGRAM, 22U);
+    assert(send(nonblocking, buffer, 16U, 0) == g_send_result);
+    g_should_trigger = 0;
+    assert(send(nonblocking, buffer, 16U, 0) == g_send_result);
+    assert(g_send_size == 16U);
+    assert(g_slept_ms == -1);
+    (void)syscall(SYS_close, nonblocking);
+    reset_wrapper_stubs();
+    g_test_socket_type = SOCK_STREAM;
+}
+
 /**
  * @brief Proves DROP reports a datagram send that did not happen, and only for datagrams.
  *
@@ -4404,6 +4561,7 @@ int main(void)
     test_trickle_and_dup_edges();
     test_dup_replays_the_last_payload();
     test_drop_datagram_sends();
+    test_throttle_sends();
     test_trickle_shortens_receives();
     test_wrappers_record_call_size();
     test_size_of_vectors_and_messages();

@@ -1922,10 +1922,12 @@ static void test_rule_qualifiers(void)
 }
 
 /**
- * @brief Proves TRICKLE and DUP are recv-only and validate their values.
+ * @brief Proves TRICKLE and DUP are recv-only, DROP and THROTTLE send-only, and that all
+ *        four validate their values.
  *
  * @details TRICKLE takes a chunk size >= 1 in bytes and always fires (probability 1.0); 0 and
- * text are rejected. DUP takes a probability. Both are rejected on send.
+ * text are rejected. DUP takes a probability. Both are rejected on send. THROTTLE takes a
+ * rate in bytes per second and no probability.
  */
 static void test_trickle_rule(void)
 {
@@ -1972,6 +1974,34 @@ static void test_trickle_rule(void)
         assert(chaos_net_config_parse_line(drop_close, &rule) == -1);
         assert(chaos_net_config_parse_line(drop_bad, &rule) == -1);
         assert(chaos_net_config_parse_line(drop_above_one, &rule) == -1);
+    }
+
+    /* THROTTLE is send-only and takes a rate in bytes per second, no probability: a rate
+     * that fires on every other call is not a rate. Whether the socket is a stream is
+     * decided per call, as DROP's datagram test is. */
+    {
+        char throttle[] = "tcp4://127.0.0.1:9000:send:THROTTLE:65536";
+        char top[] = "*:send:THROTTLE:4294967295";
+        char recv_rule[] = "tcp4://127.0.0.1:9000:recv:THROTTLE:65536";
+        char close_rule[] = "tcp4://127.0.0.1:9000:close:THROTTLE:65536";
+        char zero_rate[] = "tcp4://127.0.0.1:9000:send:THROTTLE:0";
+        char text_rate[] = "tcp4://127.0.0.1:9000:send:THROTTLE:slowly";
+        char with_probability[] = "tcp4://127.0.0.1:9000:send:THROTTLE:65536@0.5";
+        char above_bucket[] = "tcp4://127.0.0.1:9000:send:THROTTLE:4294967296";
+
+        assert(chaos_net_config_parse_line(throttle, &rule) == 1);
+        assert(rule.effect == CHAOS_NET_EFFECT_THROTTLE);
+        assert(rule.rate_bps == 65536U);
+        assert(rule.probability == 1.0);
+        assert(chaos_net_config_parse_line(top, &rule) == 1);
+        assert(rule.rate_bps == 4294967295U);
+        assert(chaos_net_config_parse_line(recv_rule, &rule) == -1);
+        assert(chaos_net_config_parse_line(close_rule, &rule) == -1);
+        assert(chaos_net_config_parse_line(zero_rate, &rule) == -1);
+        assert(chaos_net_config_parse_line(text_rate, &rule) == -1);
+        assert(chaos_net_config_parse_line(with_probability, &rule) == -1);
+        /* One above what the bucket's token half holds: rejected, not truncated. */
+        assert(chaos_net_config_parse_line(above_bucket, &rule) == -1);
     }
 }
 

@@ -29,7 +29,9 @@
 # - TORN is applied through a ptrace stop: the returned count and the file size both drop
 #   below ten and agree, and a fork of the traced application still runs; TRICKLE cuts a
 #   stream receive to its chunk and leaves the rest in the socket; CORRUPT flips one bit of
-#   what a read delivered, decided at the stop after the call;
+#   what a read delivered, decided at the stop after the call; THROTTLE holds 512 KiB of
+#   writes to about a second and shortens them, while the same writes without a matching
+#   rule stay immediate;
 # - without chaos-init the same rules change nothing.
 #
 # Under emulation (a foreign architecture through QEMU) seccomp user notification is unavailable:
@@ -304,6 +306,25 @@ expect "C: TORN reports a shortened count" "$(echo "$torn" | sed -n "s/^wrote=\\
 expect "C: TORN really shortened the write" "$(echo "$torn" | sed -n "s/^wrote=\\([1-9]\\) file=\\1$/match/p")" "match"
 expect "C: the TORN rule is applied, not rejected" \
     "$(sed -n 1,2p /tmp/.chaos-io.status | tr "\n" " ")" "state=ok rules=1 "
+# THROTTLE through a trace stop: the count is shortened to what the rate allows, and once
+# the bucket is empty the call waits in the delay queue of the supervisor rather than in
+# the thread. 512 KiB against 256 KiB per second therefore takes about a second and the
+# writes come back short, which is what the library does too.
+printf "%s\n" "/tmp/sec/data:write:THROTTLE:262144 # t" > /tmp/.chaos-io.conf
+throttled=$($init --libs io -- /tmp/probe throttle /tmp/sec/data/rate)
+at_least "C: THROTTLE holds the writes to the rate" \
+    "$(echo "$throttled" | sed -n "s/^ms=\\([0-9]*\\) short=[01]$/\\1/p")" 700
+expect "C: THROTTLE shortens the writes" \
+    "$(echo "$throttled" | sed -n "s/^ms=[0-9]* short=1$/short/p")" "short"
+expect "C: the THROTTLE rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-io.status | tr "\n" " ")" "state=ok rules=1 "
+# The same writes with the rate on another path are immediate and whole, so what the check
+# above measured is the rule and not the machine.
+printf "%s\n" "/tmp/sec/other:write:THROTTLE:262144 # t" > /tmp/.chaos-io.conf
+quick=$($init --libs io -- /tmp/probe throttle /tmp/sec/data/rate)
+quick_ms=$(echo "$quick" | sed -n "s/^ms=\\([0-9]*\\) short=0$/\\1/p")
+expect "C: and only where a rule matches" "$(( ${quick_ms:-99999} < 300 ? 1 : 0 ))" "1"
+
 # TRICKLE through a trace stop: every receive is cut to the chunk, so the first returns 4
 # of the ten bytes sent and the second -- which asks for the remaining 6 -- is cut to 4 as
 # well. Both numbers below the request is what shows the register was shortened.
@@ -398,11 +419,13 @@ expect "C: REGRESS steps the clock back" \
     "stepped"
 # The same against a static Go binary, which is the case LD_PRELOAD cannot reach at all:
 # time.Now() takes both clocks from the vDSO, so the offset has to show in the wall second
-# while time.Since stays right.
+# while time.Since stays right. The sleep it measures is 20 ms, and anything up to three
+# digits proves the point: an hour of offset in that difference would be seven of them.
+# A tighter bound would be measuring the load on the machine, not the rule.
 printf "%s\n" "clock_gettime/realtime:OFFSET:3600000 # t" > /tmp/.chaos-time.conf
 go_clock=$($init --libs time -- $go clock)
 expect "Go: the wall clock is shifted and time.Since is not" \
-    "$(echo "$go_clock" | sed -n "s/^sec=[0-9]* same=true since=2[0-9]ms$/shifted/p")" "shifted"
+    "$(echo "$go_clock" | sed -n "s/^sec=[0-9]* same=true since=[0-9]\\{2,3\\}ms$/shifted/p")" "shifted"
 expect "Go: the vDSO of the Go image was blinded" \
     "$(grep -c "^vdso=failed$" /tmp/.chaos-init.status)" "0"
 rm -f /tmp/.chaos-time.conf
@@ -422,13 +445,16 @@ expect "C: a rule with @at fires only after its delay" \
 printf "%s\n" "dns://slow.example.com:LATENCY:200 # t" > /tmp/.chaos-dns.conf
 at_least "C: a dns rule holds the query for its name" \
     "$($init --libs dns -- /tmp/probe dnsquery slow.example.com)" 200
-expect "C: and lets another name through" \
-    "$($init --libs dns -- /tmp/probe dnsquery fast.example.com)" "0"
+# Under the 200 ms of the rule, not exactly zero: the query still goes through a
+# notification, and a millisecond of that is the machine rather than the rule.
+fast_ms=$($init --libs dns -- /tmp/probe dnsquery fast.example.com)
+expect "C: and lets another name through" "$(( ${fast_ms:-99999} < 100 ? 1 : 0 ))" "1"
 expect "C: the dns rule is applied, not rejected" \
     "$(sed -n 1,2p /tmp/.chaos-dns.status | tr "\n" " ")" "state=ok rules=1 "
 printf "%s\n" "dns://slow.example.com:EAI_NONAME:1.0 # t" > /tmp/.chaos-dns.conf
+rejected_ms=$($init --libs dns -- /tmp/probe dnsquery slow.example.com)
 expect "C: an answer-changing dns rule rejects the file" \
-    "$($init --libs dns -- /tmp/probe dnsquery slow.example.com)" "0"
+    "$(( ${rejected_ms:-99999} < 100 ? 1 : 0 ))" "1"
 expect "C: and says why" \
     "$(sed -n 3,4p /tmp/.chaos-dns.status | tr "\n" " ")" \
     "line=1 reason=unsupported in seccomp mode "

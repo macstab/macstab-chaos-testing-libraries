@@ -270,6 +270,22 @@ static void test_helper_primitives(void)
     assert(chaos_io_effect_allowed(CHAOS_IO_OP_PWRITE, CHAOS_IO_EFFECT_DROP));
     assert(!chaos_io_effect_allowed(CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_DROP));
     assert(!chaos_io_effect_allowed(CHAOS_IO_OP_FSYNC, CHAOS_IO_EFFECT_DROP));
+    assert(chaos_io_effect_allowed(CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_THROTTLE));
+    assert(chaos_io_effect_allowed(CHAOS_IO_OP_PWRITE, CHAOS_IO_EFFECT_THROTTLE));
+    /* The read side is left out on purpose: a read may always return less than it was
+     * asked for, so holding one back is no fault a device produces. */
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_THROTTLE));
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_PREAD, CHAOS_IO_EFFECT_THROTTLE));
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_THROTTLE));
+    {
+        /* Arguments no line can produce, as with the free-space helper above. */
+        uint64_t rate = 0U;
+
+        assert(chaos_io_parse_rate(NULL, &rate) == -1);
+        assert(chaos_io_parse_rate("", &rate) == -1);
+        assert(chaos_io_parse_rate(" 4096", &rate) == -1);
+        assert(chaos_io_parse_rate("4096", &rate) == 0 && rate == 4096U);
+    }
     {
         /* Arguments no line can produce: the parser passes its own fields, so the guard is
          * proved by calling the helper directly, as the latency helpers above are. */
@@ -326,49 +342,97 @@ static void test_parse_line_valid_cases(void)
         double probability;
         unsigned int latency_ms;
         uint64_t free_bytes;
+        uint64_t rate_bps;
     } cases[] = {
-        {"/data:read:EIO:0.1", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_ERRNO, EIO, 0.1, 0U, 0U},
-        {"/data:write:ENOSPC:0.2", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_ERRNO, ENOSPC, 0.2, 0U, 0U},
-        {"/data:open:EMFILE:0.3", CHAOS_IO_OP_OPEN, CHAOS_IO_EFFECT_ERRNO, EMFILE, 0.3, 0U, 0U},
-        {"/data:close:EDQUOT:0.4", CHAOS_IO_OP_CLOSE, CHAOS_IO_EFFECT_ERRNO, EDQUOT, 0.4, 0U, 0U},
-        {"/data:fsync:EROFS:0.5", CHAOS_IO_OP_FSYNC, CHAOS_IO_EFFECT_ERRNO, EROFS, 0.5, 0U, 0U},
+        {"/data:read:EIO:0.1", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_ERRNO, EIO, 0.1, 0U, 0U, 0U},
+        {"/data:write:ENOSPC:0.2", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_ERRNO, ENOSPC, 0.2, 0U, 0U, 0U
+        },
+        {"/data:open:EMFILE:0.3", CHAOS_IO_OP_OPEN, CHAOS_IO_EFFECT_ERRNO, EMFILE, 0.3, 0U, 0U, 0U},
+        {"/data:close:EDQUOT:0.4", CHAOS_IO_OP_CLOSE, CHAOS_IO_EFFECT_ERRNO, EDQUOT, 0.4, 0U, 0U, 0U
+        },
+        {"/data:fsync:EROFS:0.5", CHAOS_IO_OP_FSYNC, CHAOS_IO_EFFECT_ERRNO, EROFS, 0.5, 0U, 0U, 0U},
         {"/data:fdatasync:EACCES:0.6",
          CHAOS_IO_OP_FDATASYNC,
          CHAOS_IO_EFFECT_ERRNO,
          EACCES,
          0.6,
          0U,
+         0U,
          0U},
-        {"/data:pread:ENOENT:0.7", CHAOS_IO_OP_PREAD, CHAOS_IO_EFFECT_ERRNO, ENOENT, 0.7, 0U, 0U},
-        {"/data:pwrite:ENFILE:0.8", CHAOS_IO_OP_PWRITE, CHAOS_IO_EFFECT_ERRNO, ENFILE, 0.8, 0U, 0U},
-        {"/data:truncate:EIO:0.2", CHAOS_IO_OP_TRUNCATE, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U, 0U},
-        {"/data:allocate:EIO:0.2", CHAOS_IO_OP_ALLOCATE, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U, 0U},
-        {"/data:unlink:EIO:0.2", CHAOS_IO_OP_UNLINK, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U, 0U},
+        {"/data:pread:ENOENT:0.7", CHAOS_IO_OP_PREAD, CHAOS_IO_EFFECT_ERRNO, ENOENT, 0.7, 0U, 0U, 0U
+        },
+        {"/data:pwrite:ENFILE:0.8",
+         CHAOS_IO_OP_PWRITE,
+         CHAOS_IO_EFFECT_ERRNO,
+         ENFILE,
+         0.8,
+         0U,
+         0U,
+         0U},
+        {"/data:truncate:EIO:0.2", CHAOS_IO_OP_TRUNCATE, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U, 0U, 0U
+        },
+        {"/data:allocate:EIO:0.2", CHAOS_IO_OP_ALLOCATE, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U, 0U, 0U
+        },
+        {"/data:unlink:EIO:0.2", CHAOS_IO_OP_UNLINK, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U, 0U, 0U},
         {"/data:rename_from:EIO:0.2",
          CHAOS_IO_OP_RENAME_FROM,
          CHAOS_IO_EFFECT_ERRNO,
          EIO,
          0.2,
          0U,
+         0U,
          0U},
-        {"/data:rename_to:EIO:0.2", CHAOS_IO_OP_RENAME_TO, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U, 0U},
-        {"/data:write:LATENCY:25", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_LATENCY, 0, 1.0, 25U, 0U},
-        {"/data:truncate:LATENCY:25", CHAOS_IO_OP_TRUNCATE, CHAOS_IO_EFFECT_LATENCY, 0, 1.0, 25U, 0U
+        {"/data:rename_to:EIO:0.2",
+         CHAOS_IO_OP_RENAME_TO,
+         CHAOS_IO_EFFECT_ERRNO,
+         EIO,
+         0.2,
+         0U,
+         0U,
+         0U},
+        {"/data:write:LATENCY:25", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_LATENCY, 0, 1.0, 25U, 0U, 0U},
+        {"/data:truncate:LATENCY:25",
+         CHAOS_IO_OP_TRUNCATE,
+         CHAOS_IO_EFFECT_LATENCY,
+         0,
+         1.0,
+         25U,
+         0U,
+         0U},
+        {"/data:read:LATENCY:25@0.5", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_LATENCY, 0, 0.5, 25U, 0U, 0U
         },
-        {"/data:read:LATENCY:25@0.5", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_LATENCY, 0, 0.5, 25U, 0U},
-        {"/data:write:TORN:0.9", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_TORN, 0, 0.9, 0U, 0U},
-        {"/data:read:CORRUPT:1.0", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_CORRUPT, 0, 1.0, 0U, 0U},
-        {"/data:write:DROP:0.4", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_DROP, 0, 0.4, 0U, 0U},
-        {"/data:pwrite:DROP:1.0", CHAOS_IO_OP_PWRITE, CHAOS_IO_EFFECT_DROP, 0, 1.0, 0U, 0U},
-        {"/data:statfs:FULL:1.0", CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_FULL, 0, 1.0, 0U, 0U},
-        {"/data:statfs:FREE:0", CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_FREE, 0, 1.0, 0U, 0U},
+        {"/data:write:TORN:0.9", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_TORN, 0, 0.9, 0U, 0U, 0U},
+        {"/data:read:CORRUPT:1.0", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_CORRUPT, 0, 1.0, 0U, 0U, 0U},
+        {"/data:write:DROP:0.4", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_DROP, 0, 0.4, 0U, 0U, 0U},
+        {"/data:pwrite:DROP:1.0", CHAOS_IO_OP_PWRITE, CHAOS_IO_EFFECT_DROP, 0, 1.0, 0U, 0U, 0U},
+        {"/data:statfs:FULL:1.0", CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_FULL, 0, 1.0, 0U, 0U, 0U},
+        {"/data:statfs:FREE:0", CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_FREE, 0, 1.0, 0U, 0U, 0U},
         {"/data:statfs:FREE:1048576@0.5",
          CHAOS_IO_OP_STATFS,
          CHAOS_IO_EFFECT_FREE,
          0,
          0.5,
          0U,
-         1048576U}
+         1048576U,
+         0U},
+        /* THROTTLE carries a rate and no probability, so its probability is the 1.0 every
+         * matched call is held to; a rate the parser forgot would throttle to nothing. */
+        {"/data:write:THROTTLE:65536",
+         CHAOS_IO_OP_WRITE,
+         CHAOS_IO_EFFECT_THROTTLE,
+         0,
+         1.0,
+         0U,
+         0U,
+         65536U},
+        {"/data:pwrite:THROTTLE:4294967295",
+         CHAOS_IO_OP_PWRITE,
+         CHAOS_IO_EFFECT_THROTTLE,
+         0,
+         1.0,
+         0U,
+         0U,
+         4294967295U}
     };
     size_t index;
 
@@ -395,6 +459,9 @@ static void test_parse_line_valid_cases(void)
         /* Asserted for every row, not only the FREE ones: a parser that stores the byte
          * count on the wrong effect is as wrong as one that forgets it. */
         assert(rule.free_bytes == cases[index].free_bytes);
+        /* And for every row again: a rate stored on the wrong effect is as wrong as one
+         * that was never stored. */
+        assert(rule.rate_bps == cases[index].rate_bps);
     }
 
     {
@@ -443,6 +510,14 @@ static void test_parse_line_invalid_cases(void)
     char invalid_free_no_digits[] = "/data:statfs:FREE:@0.5";
     char invalid_free_long[] = "/data:statfs:FREE:1111111111111111111111111@0.5";
     char invalid_full_value[] = "/data:statfs:FULL:nope";
+    char invalid_throttle_operation[] = "/data:read:THROTTLE:4096";
+    char invalid_throttle_statfs[] = "/data:statfs:THROTTLE:4096";
+    char invalid_throttle_zero[] = "/data:write:THROTTLE:0";
+    char invalid_throttle_text[] = "/data:write:THROTTLE:fast";
+    char invalid_throttle_negative[] = "/data:write:THROTTLE:-4096";
+    char invalid_throttle_empty[] = "/data:write:THROTTLE:";
+    char invalid_throttle_huge[] = "/data:write:THROTTLE:4294967296";
+    char invalid_throttle_probability[] = "/data:write:THROTTLE:4096@0.5";
     char empty_operation[] = "/data::EIO:0.1";
     char empty_effect[] = "/data:read::0.1";
     char empty_value[] = "/data:read:EIO:";
@@ -475,6 +550,17 @@ static void test_parse_line_invalid_cases(void)
     assert(chaos_io_config_parse_line(invalid_free_no_digits, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_free_long, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_full_value, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_throttle_operation, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_throttle_statfs, &rule) == -1);
+    /* A rate of 0 would be "no bytes ever", which is a hang and not a rate. */
+    assert(chaos_io_config_parse_line(invalid_throttle_zero, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_throttle_text, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_throttle_negative, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_throttle_empty, &rule) == -1);
+    /* One above what the bucket's token half holds: rejected, not truncated. */
+    assert(chaos_io_config_parse_line(invalid_throttle_huge, &rule) == -1);
+    /* A probability on a rate would have to mean "every other call is limited". */
+    assert(chaos_io_config_parse_line(invalid_throttle_probability, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_combination, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_truncate_combination, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_latency, &rule) == -1);

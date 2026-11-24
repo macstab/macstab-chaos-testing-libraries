@@ -53,11 +53,15 @@
  * @par Stability: private / internal
  */
 
+#include "chaos_bucket.h"
 #include "chaos_net_actions.h"
 #include "chaos_net_config.h"
 #include "chaos_net_endpoint.h"
 #include "chaos_net_internal.h"
 
+#include "chaos_sleep.h"
+
+#include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
 #include <string.h>
@@ -921,6 +925,126 @@ static void chaos_net_dup_forget(int fd)
     (void)__sync_bool_compare_and_swap(&table[fd % CHAOS_NET_DUP_SLOTS].fd, fd, -1);
 }
 
+/*---------------------------------------------------------------------------*
+ * THROTTLE: hold the send side to a byte rate
+ *---------------------------------------------------------------------------*/
+
+/** @brief Sockets whose send rate is tracked at once (slots indexed by fd % 64). */
+#define CHAOS_NET_THROTTLE_SLOTS 64U
+
+/**
+ * @brief One socket's token bucket.
+ *
+ * @details Slot `fd % CHAOS_NET_THROTTLE_SLOTS`, tagged with the descriptor and the rate
+ * it was armed with: a colliding descriptor takes the slot over and the two then share one
+ * rate, and a changed rate starts a fresh bucket. Plain statics, as libchaos-io's are: a
+ * bucket is three words, and a fork child inheriting them is right, because it inherited
+ * the sockets too.
+ */
+typedef struct chaos_net_throttle
+{
+    volatile int fd;
+    volatile uint64_t rate;
+    chaos_bucket_t bucket;
+} chaos_net_throttle_t;
+
+static chaos_net_throttle_t g_chaos_net_throttles[CHAOS_NET_THROTTLE_SLOTS];
+
+/**
+ * @brief Whether @p fd is non-blocking; 0 when the flags cannot be read.
+ *
+ * @details A raw `fcntl` so no wrapper sees it, with errno preserved as the other
+ * descriptor queries here do.
+ */
+static int chaos_net_nonblocking(int fd)
+{
+    const int saved_errno = errno;
+    const long flags = syscall(SYS_fcntl, fd, F_GETFL, 0);
+
+    errno = saved_errno;
+    return flags >= 0 && (flags & O_NONBLOCK) != 0;
+}
+
+/** @brief The bucket of (@p fd, @p rate), reset when the slot held something else. */
+static chaos_bucket_t *chaos_net_throttle_bucket(int fd, uint64_t rate)
+{
+    chaos_net_throttle_t *entry = &g_chaos_net_throttles[(unsigned)fd % CHAOS_NET_THROTTLE_SLOTS];
+
+    if (entry->fd != fd || entry->rate != rate)
+    {
+        entry->bucket.state = 0U;
+        entry->rate = rate;
+        entry->fd = fd;
+    }
+    return &entry->bucket;
+}
+
+/**
+ * @brief How many of @p size bytes the rule's rate lets through now.
+ *
+ * @details Only a stream carries a partial send: a datagram is one message, so shortening
+ * it would deliver something the application never sent -- such a send waits for its whole
+ * message instead. A socket in non-blocking mode is told `EAGAIN` rather than slept on,
+ * which is what its event loop is written for.
+ *
+ * The bucket is charged first and the rule asked second, as the TRICKLE path does: an
+ * allowance that covers the whole call changes nothing and spends no hit. A send that has
+ * to wait reserves what it will send, so that two threads on one socket are charged
+ * separately and wait one after the other instead of both for the same bytes.
+ *
+ * @param refuse  Output: non-zero when the caller must report EAGAIN instead of sending.
+ * @return Bytes to pass to the real call; @p size when the rule does not hold it back.
+ */
+static size_t chaos_net_throttle_size(chaos_net_rule_t *rule, int fd, size_t size, int *refuse)
+{
+    chaos_bucket_t *bucket;
+    const int stream = chaos_net_is_stream(fd);
+    uint64_t allowed;
+
+    *refuse = 0;
+    if (rule->effect != CHAOS_NET_EFFECT_THROTTLE || size == 0U ||
+        size == (size_t)CHAOS_POLICY_NO_SIZE)
+    {
+        return size;
+    }
+    bucket = chaos_net_throttle_bucket(fd, rule->rate_bps);
+    allowed = chaos_bucket_take(bucket, rule->rate_bps, size, chaos_hits_now_ms());
+    if (allowed == (uint64_t)size)
+    {
+        return size;
+    }
+    if (allowed == 0U || !stream)
+    {
+        /* A stream sends a tenth of a second's worth; a datagram sends its whole
+         * message, because half a datagram is not a datagram. Only what the first take
+         * did not already hand out is reserved, so the message is charged once. */
+        const uint64_t chunk = chaos_bucket_chunk(rule->rate_bps);
+        const uint64_t target =
+            !stream ? (uint64_t)size : (chunk < (uint64_t)size ? chunk : (uint64_t)size);
+
+        if (chaos_net_nonblocking(fd))
+        {
+            if (!chaos_net_rule_should_trigger(rule))
+            {
+                return size;
+            }
+            *refuse = 1;
+            return 0U;
+        }
+        /* Asked before the wait, unlike the partial allowance below: a rule that does not
+         * fire must not cost the caller the wait it was about to take. */
+        if (!chaos_net_rule_should_trigger(rule))
+        {
+            return size;
+        }
+        chaos_sleep_ms(
+            chaos_bucket_reserve(bucket, rule->rate_bps, target - allowed, chaos_hits_now_ms())
+        );
+        return stream ? (size_t)target : size;
+    }
+    return chaos_net_rule_should_trigger(rule) ? (size_t)allowed : size;
+}
+
 /** @brief Receive flags that bypass DUP (the call is made for real, nothing is kept). */
 #ifdef MSG_ERRQUEUE
 #define CHAOS_NET_DUP_SKIP_FLAGS (MSG_PEEK | MSG_TRUNC | MSG_OOB | MSG_WAITALL | MSG_ERRQUEUE)
@@ -1138,6 +1262,16 @@ CHAOS_NET_EXPORT ssize_t send(int sockfd, const void *buffer, size_t size, int f
     {
         return (ssize_t)size;
     }
+    {
+        int refuse = 0;
+
+        size = chaos_net_throttle_size(&rule, sockfd, size, &refuse);
+        if (refuse)
+        {
+            errno = EAGAIN;
+            return -1;
+        }
+    }
     return chaos_net_call_real_send(sockfd, buffer, size, flags);
 }
 
@@ -1185,6 +1319,16 @@ CHAOS_NET_EXPORT ssize_t sendto(
     if (chaos_net_drops(&rule, sockfd))
     {
         return (ssize_t)size;
+    }
+    {
+        int refuse = 0;
+
+        size = chaos_net_throttle_size(&rule, sockfd, size, &refuse);
+        if (refuse)
+        {
+            errno = EAGAIN;
+            return -1;
+        }
     }
     return chaos_net_call_real_sendto(sockfd, buffer, size, flags, address_ptr, address_length);
 }
@@ -1863,6 +2007,16 @@ CHAOS_NET_EXPORT ssize_t write(int fd, const void *buffer, size_t size)
         if (chaos_net_drops(&rule, fd))
         {
             return (ssize_t)size;
+        }
+        {
+            int refuse = 0;
+
+            size = chaos_net_throttle_size(&rule, fd, size, &refuse);
+            if (refuse)
+            {
+                errno = EAGAIN;
+                return -1;
+            }
         }
     }
     return chaos_net_call_real_write(fd, buffer, size);

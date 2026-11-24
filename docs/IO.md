@@ -56,6 +56,7 @@ through `LD_PRELOAD`, matches each call against the rule file
 | LATENCY | before the real call | the call completes normally, N ms later |
 | TORN | before the real call | a successful short write: the real call runs with a byte count in `[1, n-1]` |
 | DROP | instead of the real call | a successful full write that never happened: the byte count is reported, nothing is written |
+| THROTTLE | before the real call | a successful short write, again and again: the real call runs with what the rate allows, and a call that would get nothing waits for a tenth of a second's worth or is told `EAGAIN` |
 | FREE | after a successful `statfs` | the free-space counts of the answer, as if that many bytes were left |
 | FULL | after a successful `statfs` | the free-space counts of the answer as zero: no space left |
 | CORRUPT | after a successful read | the bytes returned, with exactly one bit flipped |
@@ -131,7 +132,9 @@ the forms most programs use: the JDK deletes with `unlink()` and moves with
 - TORN never applies: a short `fwrite` signals an error in stdio, not a partial
   success. A TORN rule matched on a stream does nothing and counts no hit. DROP is
   ignored the same way: stdio buffers, so what a dropped `fwrite` would lose is not
-  the bytes of one system call.
+  the bytes of one system call. THROTTLE is ignored for both reasons at once -- a
+  short `fwrite` is an error, and the bytes of an `fwrite` are not the bytes of a
+  write.
 - A rule fires once per stdio call, not once per system call the C library makes
   while filling or flushing its buffer.
 - Descriptors 0-2 are never faulted, so `printf`, `puts`, `putchar` and `getchar`,
@@ -257,8 +260,10 @@ algorithm, constructor ordering.
 | rule | One parsed line of `/tmp/.chaos-io.conf`. |
 | selector | The path part of a rule: an absolute path prefix, a literal name such as `pipe:[1234]`, or `*`. |
 | operation | The logical operation (`write`, `truncate`, ...); several functions map to one (§1). |
-| effect | ERRNO, LATENCY, TORN, DROP, FREE, FULL or CORRUPT. |
-| probability | Chance in [0, 1] that a matched rule fires. For ERRNO, TORN, DROP and CORRUPT it is the value field; for LATENCY the optional `@probability` after the milliseconds, 1.0 without one. |
+| effect | ERRNO, LATENCY, TORN, DROP, THROTTLE, FREE, FULL or CORRUPT. |
+| probability | Chance in [0, 1] that a matched rule fires. For ERRNO, TORN, DROP and CORRUPT it is the value field; for LATENCY the optional `@probability` after the milliseconds, 1.0 without one. THROTTLE has none: a rate that applies to every other call is not a rate. |
+| rate | THROTTLE's value field: bytes per second, 1 to 4294967295. |
+| token bucket | Where a rate is kept: one per (rule, descriptor), holding at most one second's worth of bytes and refilling at the rate. |
 | qualifier | `@first`, `@every`, `@at`, `@from`, `@until`, `@size` written after the rule ([DSL.md §7.1](DSL.md#71-todays-surface)). |
 | hit | One application of a rule's effect; counted per rule in the hits file. |
 | active snapshot | The published rule array readers match against. |
@@ -267,6 +272,7 @@ algorithm, constructor ordering.
 | fd cache | Process-wide, 32-slot, direct-mapped map from descriptor number to path. |
 | excluded path | Never faulted: any `/tmp/.chaos-*` control file of any library, anything under `/proc`, `/sys`, `/dev`, an empty or unresolvable path; also descriptors 0-2. |
 | torn write | A successful write of fewer bytes than requested. Not an error, not corruption. |
+| throttled write | A torn write with a reason: the rate had no more bytes to give this call. |
 | corrupt read | A successful read whose returned bytes have one bit flipped after the real call. |
 
 ## 4. End-to-End Behavior
@@ -295,6 +301,11 @@ For `write(fd, buf, count)` and every other descriptor-based wrapper:
    - TORN (write class): if it fires, call the real function with a shorter count.
    - DROP (write class): if it fires, skip the real function, report the full count,
      and move the file offset on where there is one.
+   - THROTTLE (write class): take the call's bytes from the bucket; if it covers
+     them, call the real function unchanged and count no hit. Otherwise, if it fires,
+     call the real function with what the bucket held -- and if that was nothing,
+     either return `EAGAIN` (a non-blocking descriptor) or wait for a tenth of a
+     second's worth and write that.
    - FREE, FULL (statfs class): after a successful call, rewrite the two free-space
      counts of the answer.
    - CORRUPT (read class): call the real function; if it returned `> 0` bytes and
@@ -716,6 +727,9 @@ wrapper.
 - DROP on `writev`/`pwritev` has no such entry limit, because it reports the total
   rather than rebuilding the array; an array with no readable size is written whole
   and counts no hit, since there is no count to report as written.
+- THROTTLE on `writev`/`pwritev` trims the array to the allowance with the same
+  64-entry stack copy TORN uses; a longer or unreadable array is written whole and
+  counts no hit.
 - CORRUPT on `readv`/`preadv` picks one byte across the returned bytes as one
   logical stream and maps it back to its segment.
 
@@ -731,6 +745,7 @@ wrapper.
 | `errnum` | ERRNO only. |
 | `probability` | ERRNO, TORN, DROP, CORRUPT. |
 | `latency_ms` | LATENCY only; 0 to 4 294 967 295. |
+| `rate_bps` | THROTTLE only; 1 to 4 294 967 295 bytes per second. |
 | `policy` | Qualifiers (`@first`, `@every`, `@at`, `@from`, `@until`, `@size`). |
 | `call_size` | Byte count of the call being decided; set on the caller's copy. |
 | `hit`, `hit_generation` | The rule's hit slot and the slot generation it was published with. |
@@ -743,8 +758,9 @@ matching.
 
 Process-wide: real-function pointers (written once), process seed, two snapshots
 (256 rules each, with rule texts and resolved paths), active index, cached change
-stamp, the 256 KiB read buffer, hit slot pool (512 slots), fd cache table and slot
-generations.
+stamp, the 256 KiB read buffer, hit slot pool (512 slots), fd cache table, slot
+generations and the 64 token buckets THROTTLE keeps its rates in (one 64-bit word
+each, keyed by descriptor and rate).
 
 Thread-local: recursion guard (`int`). Nothing else: the
 read buffer and fd cache were moved out of TLS because large static TLS objects are
@@ -850,7 +866,8 @@ active.
 
 The library never leaks its own `errno`: rule-file checks, `getcwd`, `readlink`,
 `fileno` on descriptor-less streams, seed reads and sleeps all save and restore it.
-`errno` changes only when an ERRNO rule fires (or the real function sets it).
+`errno` changes only when an ERRNO rule fires, when a THROTTLE rule refuses a
+non-blocking write with `EAGAIN` (or the real function sets it).
 
 ### Retry and idempotency
 
@@ -863,9 +880,17 @@ expose. Idempotency is the application's concern.
 /data:read:TORN:1.0
 ```
 
-TORN is legal only for `write` and `pwrite`, as is DROP, and FREE and FULL only for
-`statfs`. The whole file is rejected and the
+TORN is legal only for `write` and `pwrite`, as are DROP and THROTTLE, and FREE and
+FULL only for `statfs`. The whole file is rejected and the
 status file names this line.
+
+```text
+/data:write:THROTTLE:65536@0.5
+```
+
+THROTTLE takes a rate and nothing else: a rate that applies to half the calls is
+not a rate. So is `THROTTLE:0`, which would be a hang, and a rate above
+4 294 967 295, which the token bucket cannot hold. All three reject the file.
 
 ```text
 /database:write:EIO:0.5
@@ -989,7 +1014,7 @@ short write counts and corrupted read bytes.
 ### Grammar
 
 ```text
-<selector>:<operation>:<ERRNO-name|LATENCY|TORN|DROP|FREE|FULL|CORRUPT>:<value> [qualifier ...] [# comment]
+<selector>:<operation>:<ERRNO-name|LATENCY|TORN|DROP|THROTTLE|FREE|FULL|CORRUPT>:<value> [qualifier ...] [# comment]
 ```
 
 - Exactly four `:`-separated fields; whitespace around each field is trimmed. The
@@ -997,7 +1022,8 @@ short write counts and corrupted read bytes.
 - ERRNO is written as the errno name itself (`EIO`, not `ERRNO:EIO`).
 - `<value>`: a probability for an errno name, TORN, DROP, FULL and CORRUPT; a byte count
   with an optional `@probability` for FREE; milliseconds
-  (decimal, 0 to 4 294 967 295) for LATENCY.
+  (decimal, 0 to 4 294 967 295) for LATENCY; bytes per second
+  (1 to 4 294 967 295, no probability) for THROTTLE.
 - Probability: `0`, `1`, `0.` followed by digits, or `1.` followed by zeros, parsed
   independently of `LC_NUMERIC` (a JVM sets it from the environment; `strtod` would
   stop at the `.` under a German locale). No `nan`, `inf`, exponents or hex.
@@ -1014,6 +1040,7 @@ Examples:
 /data:pwrite:LATENCY:200
 /data/seg:write:TORN:0.1
 /data:read:CORRUPT:0.5
+/data:write:THROTTLE:65536 # 64 KiB/s on the write side
 *:open:EMFILE:0.05
 /data:write:ENOSPC:1.0 @first=3 # disk fills, then recovers
 ```
@@ -1026,12 +1053,12 @@ make unit 2>&1 | grep -E 'PROPTEST|test_config|OK'
 
 ### Operations and legal effects
 
-| Operation | ERRNO | LATENCY | TORN | DROP | FREE, FULL | CORRUPT |
-|---|---|---|---|---|---|---|
-| `read`, `pread` | yes | yes | — | — | — | yes |
-| `write`, `pwrite` | yes | yes | yes | yes | — | — |
-| `statfs` | yes | yes | — | — | yes | — |
-| `open`, `close`, `fsync`, `fdatasync`, `truncate`, `allocate`, `unlink`, `rename_from`, `rename_to` | yes | yes | — | — | — | — |
+| Operation | ERRNO | LATENCY | TORN | DROP | THROTTLE | FREE, FULL | CORRUPT |
+|---|---|---|---|---|---|---|---|
+| `read`, `pread` | yes | yes | — | — | — | — | yes |
+| `write`, `pwrite` | yes | yes | yes | yes | yes | — | — |
+| `statfs` | yes | yes | — | — | — | yes | — |
+| `open`, `close`, `fsync`, `fdatasync`, `truncate`, `allocate`, `unlink`, `rename_from`, `rename_to` | yes | yes | — | — | — | — | — |
 
 `DROP` has no read counterpart: a read that reported bytes it did not read would
 hand the caller its own stale buffer, which is what `CORRUPT` does deliberately.
@@ -1069,6 +1096,7 @@ never on the disk.
 | FREE | yes | after a successful call | The free-space counts (`f_bfree`, `f_bavail`) report the rule's byte count, rounded down to whole blocks; the total is untouched. |
 | FULL | yes | after a successful call | The same two counts report zero. |
 | DROP | yes | instead of the call | The full count is reported written and nothing is written. On `write`/`writev` the file offset is moved on by that many bytes, so the caller's next write does not land on top of what it believes it already wrote; an `O_APPEND` descriptor needs no correction, and one with no offset at all (a pipe, a FIFO) keeps the rule from firing. `pwrite`/`pwritev` need no correction. No effect on stdio, on `sendfile` or on `copy_file_range`. |
+| THROTTLE | no (a rate, not a chance) | before the call | The call runs with what the (rule, descriptor) token bucket allows: a full bucket is one second's worth, so the rate only bites once a caller keeps going. An allowance covering the whole call changes nothing and counts no hit. An empty bucket means `EAGAIN` on a non-blocking descriptor and otherwise a wait for a tenth of a second's worth, which is then written. `writev`/`pwritev` are trimmed up to 64 entries; `sendfile` and `copy_file_range` are shortened as TORN shortens them, since the kernel moves both offsets by what it transferred; no effect on stdio. |
 | CORRUPT | yes, drawn after the call | after a call that returned `> 0` bytes | One bit of one returned byte. |
 
 ### Supported errno names
@@ -1101,6 +1129,14 @@ their count in memory and are written whole, counting no hit, as they are here. 
 applies on `read` and `pread` as well, decided at the stop *after* the call, since how many
 bytes there are to corrupt is its result; a read that delivered nothing counts no hit, and
 a vectored read is left alone because its bytes are spread over segments.
+
+THROTTLE applies there too, on the same two operations and with the same token-bucket
+arithmetic: the count is shortened in the register, and a call the rate cannot serve at
+all is held in the delay queue of the supervisor rather than slept in the thread, so the
+other threads of the process keep being served. A non-blocking descriptor is told `EAGAIN`
+as it is here. The rate a process sees is therefore the same under both modes; what
+differs is only where the waiting happens. The vectored forms keep their count in memory
+and are written whole.
 
 `write:DROP` and `writev:DROP` apply there too, with the offset correction they need
 here: the write is replaced by the `lseek` that moves the offset on, which runs in the

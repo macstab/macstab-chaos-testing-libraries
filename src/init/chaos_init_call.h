@@ -71,10 +71,17 @@ typedef struct chaos_init_verdict
     chaos_init_action_t action;
     int error; /**< FAIL, or DELAY that fails when due: positive errno. */
     unsigned delay_ms;
-    long value;      /**< RETURN, or DELAY with `returns`: the return value. SHORTEN: the count. */
-    int returns;     /**< DELAY: when due, return `value` instead of running. */
-    long instead_nr; /**< INSTEAD, BEFORE: the system call to run in its place or first. */
-    uint64_t instead_args[6];      /**< INSTEAD, BEFORE: that call's arguments. */
+    long value;  /**< RETURN, or DELAY with `returns`: the return value. SHORTEN: the count. */
+    int returns; /**< DELAY: when due, return `value` instead of running. */
+    /**
+     * DELAY: when due, shorten argument `arg_index` to `value` instead of running whole --
+     * what THROTTLE does once its bucket is empty. A shortened call needs the tracee's
+     * registers, so this only arises on the traced path, which is the only path a rule
+     * that can shorten is applied on anyway.
+     */
+    int shortens;
+    long instead_nr;          /**< INSTEAD, BEFORE: the system call to run in its place or first. */
+    uint64_t instead_args[6]; /**< INSTEAD, BEFORE: that call's arguments. */
     unsigned char instead_data[8]; /**< BEFORE: bytes for the tracee's scratch. */
     unsigned instead_size;         /**< BEFORE: how many of them; 0 when it needs none. */
     unsigned instead_arg;          /**< BEFORE: the argument the scratch address goes into. */

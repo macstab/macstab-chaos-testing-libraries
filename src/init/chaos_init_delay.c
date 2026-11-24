@@ -33,6 +33,7 @@ chaos_init_verdict_t chaos_init_delay_answer(const chaos_init_verdict_t *verdict
 
     answer.action = verdict->error != 0 ? CHAOS_INIT_FAIL
                     : verdict->returns  ? CHAOS_INIT_RETURN
+                    : verdict->shortens ? CHAOS_INIT_SHORTEN
                                         : CHAOS_INIT_PASS;
     answer.delay_ms = 0U;
     return answer;

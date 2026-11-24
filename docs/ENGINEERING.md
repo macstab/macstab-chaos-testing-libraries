@@ -89,7 +89,7 @@ Shared mechanisms live in header-only `src/common/` (see
 1. [`src/net/chaos_net.c`](../src/net/chaos_net.c) — constructor, real functions, seed
 2. [`src/net/chaos_net_config.c`](../src/net/chaos_net_config.c) — reload, parser, endpoint-rank selection
 3. [`src/net/chaos_net_endpoint.c`](../src/net/chaos_net_endpoint.c) — selector parsing; endpoints from `sockaddr`, `getsockname`/`getpeername`, `SO_TYPE`
-4. [`src/net/chaos_net_socket.c`](../src/net/chaos_net_socket.c) — `connect`, `accept`, `send*`/`recv*`, and `read`/`write`/`readv`/`writev`/`close` on sockets; `TRICKLE`, `DUP`, `RESET`, `DROP`
+4. [`src/net/chaos_net_socket.c`](../src/net/chaos_net_socket.c) — `connect`, `accept`, `send*`/`recv*`, and `read`/`write`/`readv`/`writev`/`close` on sockets; `TRICKLE`, `DUP`, `RESET`, `DROP`, `THROTTLE`
 5. [`src/net/chaos_net_extra.c`](../src/net/chaos_net_extra.c) — `socket`, `socketpair`, `shutdown`, `sendmmsg`, `recvmmsg`
 6. [`src/net/chaos_net_wait.c`](../src/net/chaos_net_wait.c) — `poll`, `ppoll`, `select`, `pselect`, `epoll_wait`, `epoll_pwait`; epoll membership from `/proc/self/fdinfo`
 7. [`src/net/chaos_net_actions.c`](../src/net/chaos_net_actions.c) — probability, latency, corruption
@@ -211,8 +211,8 @@ all. Read class: `fread`, `fgets`, `fgetc`, `getc`, `getline`, `getdelim`,
 negative count), sets errno and raises the stream's error indicator (bit
 `0x20` of the first word of `FILE` on glibc and musl, set under the stream
 lock). `TORN` does not apply: a short `fwrite` signals an error in stdio, not
-partial success, and `DROP` is ignored for the same reason -- stdio buffers, so
-what it would lose is not the bytes of one system call. Not wrapped: `scanf` family, `*_unlocked`, and
+partial success, and `DROP` and `THROTTLE` are ignored for the same reason --
+stdio buffers, so what they would hold back is not the bytes of one system call. Not wrapped: `scanf` family, `*_unlocked`, and
 `printf`/`puts`/`putchar`/`getchar`, which only use descriptors 0–2.
 
 ### [`src/config/chaos_io_config.c`](../src/config/chaos_io_config.c)
@@ -276,7 +276,11 @@ sockets (shortening a datagram receive truncates the datagram), and only for
 iovec arrays of at most 64 entries; `DUP` skips peeks, `MSG_TRUNC`,
 out-of-band and error-queue reads, `MSG_WAITALL` and empty buffers. `DROP`
 replaces a send on a datagram socket with its own byte count, for the same
-reason mirrored: a gap in a stream is not packet loss.
+reason mirrored: a gap in a stream is not packet loss. Send reshaping lives here
+too: `THROTTLE` takes each send's bytes from a token bucket
+([`src/common/chaos_bucket.h`](../src/common/chaos_bucket.h)) kept per descriptor
+and rate, shortens a stream send to what is left and makes a datagram wait for its
+whole message rather than cutting it.
 
 ### [`src/net/chaos_net_extra.c`](../src/net/chaos_net_extra.c)
 
@@ -443,16 +447,19 @@ is not offered: the caller cannot tell it from a genuine short read.
 
 ### `write()`, `writev()`, `pwrite()`, `pwritev()`, and Linux `sendfile()` / `copy_file_range()`
 
-May delay before, fail before, shorten the request (`TORN`) or replace it
-entirely (`DROP`: the full count is reported and nothing is written). The
+May delay before, fail before, shorten the request (`TORN`, or `THROTTLE` to what
+its token bucket allows) or replace it entirely (`DROP`: the full count is reported
+and nothing is written). The
 caller's buffer is never modified. For `writev`/`pwritev` the torn byte budget
 is mapped back into a truncated copy of the iovec array (vectors longer than
 `CHAOS_IO_TORN_MAX_IOV` are not torn). A dropped `write`/`writev` moves the file
 offset on by the reported count, which is what keeps the next write off the
 bytes the caller believes it already wrote; `O_APPEND` needs no correction and a
 descriptor without an offset does not fire. `sendfile` and `copy_file_range`
-match on the destination descriptor and support `ERRNO`, `LATENCY`, `TORN` --
-not `DROP`, which would have to fake the offsets of two descriptors at once.
+match on the destination descriptor and support `ERRNO`, `LATENCY`, `TORN` and
+`THROTTLE` -- a shortened transfer moves both offsets by what it transferred, so it
+is short rather than lost -- but not `DROP`, which would have to fake the offsets of
+two descriptors at once.
 
 Data moved through `splice`, `mmap` or other paths outside the wrapped set is
 not faulted.

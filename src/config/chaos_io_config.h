@@ -107,7 +107,8 @@ typedef enum chaos_io_effect
     CHAOS_IO_EFFECT_CORRUPT,      /**< Flip one bit of the bytes a read returned. */
     CHAOS_IO_EFFECT_DROP,         /**< Report the whole write as done without writing it. */
     CHAOS_IO_EFFECT_FREE,         /**< Report `free_bytes` of free space on the filesystem. */
-    CHAOS_IO_EFFECT_FULL          /**< Report the filesystem as having no free space. */
+    CHAOS_IO_EFFECT_FULL,         /**< Report the filesystem as having no free space. */
+    CHAOS_IO_EFFECT_THROTTLE      /**< Hold a write to `rate_bps` bytes per second. */
 } chaos_io_effect_t;
 
 /**
@@ -139,6 +140,7 @@ typedef struct chaos_io_rule
     double probability;      /**< Probability in [0, 1]; 1.0 for `LATENCY:ms` without `@p`. */
     unsigned int latency_ms; /**< Delay in ms for LATENCY; 0 otherwise. */
     uint64_t free_bytes;     /**< Free space to report for FREE; 0 otherwise (and for FULL). */
+    uint64_t rate_bps;       /**< THROTTLE: bytes per second, 1 .. 4294967295; 0 otherwise. */
     /** Qualifiers written after the rule (`@first`, `@from`, `@until`, `@size`). */
     chaos_rule_policy_t policy;
     /**

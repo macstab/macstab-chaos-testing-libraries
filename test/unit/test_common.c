@@ -5,7 +5,8 @@
  *        slot pools, concurrent initialisers, and the qualifier grammar all libraries use.
  *
  * @details Units under test: `chaos_policy.h`, `chaos_clock.h`, `chaos_status.h`,
- * `chaos_hits.h`, `chaos_once.h`, `chaos_sleep.h`, included header-only.
+ * `chaos_hits.h`, `chaos_bucket.h`, `chaos_once.h`, `chaos_sleep.h`, included
+ * header-only.
  *
  * Isolation: every system call the headers make goes through an overridable macro, which
  * this file defines before the includes:
@@ -33,6 +34,9 @@
  * - hits files are created exclusively (link, or rename where hard links fail), never
  *   overwrite another process's file of the same pid, and are skipped when the name or
  *   contents do not fit; slots follow rule texts across reloads and forks;
+ * - a token bucket starts full, refills at its rate, holds at most one second's worth,
+ *   and hands out bytes it does not have only against a wait that no second caller is
+ *   given again;
  * - a second thread entering an initialiser that is running waits for it;
  * - an interrupted sleep resumes with the remaining time; errno is preserved.
  */
@@ -86,6 +90,21 @@ static struct timespec g_sleep_request;
 static long test_sleep(struct timespec *request, struct timespec *remaining);
 #define CHAOS_SLEEP_SYSCALL(request, remaining) test_sleep((request), (remaining))
 
+/* Bucket seam: `g_bucket_cas_fails` makes that many compare-and-swap attempts fail, which
+ * is what a thread losing the race to another one sees. */
+static unsigned g_bucket_cas_fails = 0U;
+static int test_bucket_cas(volatile uint64_t *state, uint64_t seen, uint64_t next)
+{
+    if (g_bucket_cas_fails > 0U)
+    {
+        --g_bucket_cas_fails;
+        return 0;
+    }
+    return __sync_bool_compare_and_swap(state, seen, next);
+}
+#define CHAOS_BUCKET_CAS(state, seen, next) test_bucket_cas((state), (seen), (next))
+
+#include "../../src/common/chaos_bucket.h"
 #include "../../src/common/chaos_hits.h"
 #include "../../src/common/chaos_once.h"
 #include "../../src/common/chaos_policy.h"
@@ -1377,6 +1396,97 @@ static void test_once_waits(void)
     assert(pthread_join(releaser, NULL) == 0);
 }
 
+/**
+ * @brief The token bucket: what it hands out, what it refills, and what it reserves.
+ *
+ * @details The bucket is a pure function of its state word and the millisecond it is
+ * asked at, so every property is checked by asking at chosen times rather than by
+ * sleeping. The rate is 1000 bytes per second throughout, which makes a millisecond worth
+ * exactly one byte and the arithmetic readable.
+ */
+static void test_bucket(void)
+{
+    chaos_bucket_t bucket;
+
+    /* No rate, nothing wanted, or no clock: the call is not held back at all. A bucket
+     * that throttled when the clock is unreadable would block a process for ever. */
+    bucket.state = 0U;
+    assert(chaos_bucket_take(&bucket, 0U, 500U, 1000U) == 500U);
+    assert(chaos_bucket_take(&bucket, 1000U, 0U, 1000U) == 0U);
+    assert(chaos_bucket_take(&bucket, 1000U, 500U, 0U) == 500U);
+    assert(chaos_bucket_reserve(&bucket, 0U, 500U, 1000U) == 0U);
+    assert(chaos_bucket_reserve(&bucket, 1000U, 0U, 1000U) == 0U);
+    assert(chaos_bucket_reserve(&bucket, 1000U, 500U, 0U) == 0U);
+    assert(bucket.state == 0U);
+
+    /* A bucket nobody has used is full: the first second's worth passes at once, and only
+     * a caller that keeps going is slowed down. */
+    assert(chaos_bucket_take(&bucket, 1000U, 1000U, 10000U) == 1000U);
+    assert(chaos_bucket_take(&bucket, 1000U, 1000U, 10000U) == 0U);
+    /* Refill is the elapsed milliseconds, one byte each, and what is asked for bounds it. */
+    assert(chaos_bucket_take(&bucket, 1000U, 1000U, 10400U) == 400U);
+    assert(chaos_bucket_take(&bucket, 1000U, 100U, 10900U) == 100U);
+    /* Never more than one second's worth, however long the bucket stood idle. */
+    assert(chaos_bucket_take(&bucket, 1000U, 5000U, 20000U) == 1000U);
+
+    /* A tenth of a second's worth is what a caller that has to wait asks for, and it
+     * never rounds down to nothing: below ten bytes per second the chunk is one byte. */
+    assert(chaos_bucket_chunk(1000U) == 100U);
+    assert(chaos_bucket_chunk(10U) == 1U);
+    assert(chaos_bucket_chunk(9U) == 1U);
+    assert(chaos_bucket_chunk(1U) == 1U);
+
+    /* The wait for what is not there yet, rounded up so it is never short of a token. */
+    assert(chaos_bucket_wait_ms(1000U, 100U) == 100U);
+    assert(chaos_bucket_wait_ms(1000U, 1U) == 1U);
+    assert(chaos_bucket_wait_ms(1000000U, 1U) == 1U);
+    assert(chaos_bucket_wait_ms(0U, 100U) == 0U);
+    assert(chaos_bucket_wait_ms(1000U, 0U) == 0U);
+
+    /* A reservation hands out bytes that have not arrived and returns the wait for them.
+     * The empty bucket of the line above is at 20000 with nothing left. */
+    assert(chaos_bucket_reserve(&bucket, 1000U, 100U, 20000U) == 100U);
+    /* The bytes are charged, so a call at the moment the wait is over gets nothing more
+     * than what arrived meanwhile: without the charge the rate would double. */
+    assert(chaos_bucket_take(&bucket, 1000U, 100U, 20100U) == 0U);
+    /* And a second reservation made while the first one waits is told to wait for both,
+     * which is what holds the rate when several threads share a descriptor. */
+    assert(chaos_bucket_reserve(&bucket, 1000U, 100U, 20000U) == 200U);
+    assert(chaos_bucket_reserve(&bucket, 1000U, 100U, 20000U) == 300U);
+    /* A reservation covered by what is in the bucket waits not at all and empties it. */
+    bucket.state = 0U;
+    assert(chaos_bucket_reserve(&bucket, 1000U, 400U, 30000U) == 0U);
+    assert(chaos_bucket_take(&bucket, 1000U, 1000U, 30000U) == 600U);
+
+    /* A lost race: the attempt fails, the loop looks again and hands out the same bytes,
+     * because nothing but the bucket's own word is involved. */
+    bucket.state = 0U;
+    g_bucket_cas_fails = 1U;
+    assert(chaos_bucket_take(&bucket, 1000U, 400U, 40000U) == 400U);
+    assert(g_bucket_cas_fails == 0U);
+    g_bucket_cas_fails = 1U;
+    assert(chaos_bucket_reserve(&bucket, 1000U, 1000U, 40000U) == 400U);
+    assert(g_bucket_cas_fails == 0U);
+
+    /* The millisecond is truncated to 32 bits and every comparison is a signed
+     * difference, so the wrap after 49 days is not a special case: a stamp just below it
+     * and a reading just above it are 2 ms apart, not 4294967294. */
+    assert(chaos_bucket_later(UINT64_C(0x100000001), UINT64_C(0xffffffff)));
+    assert(!chaos_bucket_later(UINT64_C(0xffffffff), UINT64_C(0x100000001)));
+    bucket.state = 0U;
+    assert(chaos_bucket_take(&bucket, 1000U, 1000U, UINT64_C(0xffffffff)) == 1000U);
+    assert(chaos_bucket_take(&bucket, 1000U, 1000U, UINT64_C(0x100000001)) == 2U);
+    /* And what is stored is the truncated millisecond: a whole reading would spill into
+     * the token half of the word and hand out tokens nobody refilled. A monotonic clock
+     * passes 2^32 ms after 49 days of uptime, so this is the ordinary case, not an edge. */
+    bucket.state = 0U;
+    assert(chaos_bucket_take(&bucket, 1000U, 1000U, UINT64_C(0x1000003e8)) == 1000U);
+    assert((bucket.state >> 32) == 0U);
+    bucket.state = 0U;
+    assert(chaos_bucket_reserve(&bucket, 1000U, 2000U, UINT64_C(0x1000003e8)) == 1000U);
+    assert((bucket.state >> 32) == 0U);
+}
+
 int main(void)
 {
     test_policy_numbers();
@@ -1397,6 +1507,7 @@ int main(void)
     test_hits_reload();
     test_hits_file_number();
     test_once_waits();
+    test_bucket();
     (void)rmdir("/tmp/chaos-common-test");
     return 0;
 }

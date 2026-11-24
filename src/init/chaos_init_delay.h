@@ -28,7 +28,11 @@
 
 /**
  * @brief The answer a DELAY verdict turns into when due: FAIL with `error` if set, else
- *        RETURN `value` if `returns`, else PASS. `delay_ms` is cleared.
+ *        RETURN `value` if `returns`, else SHORTEN if `shortens`, else PASS. `delay_ms` is
+ *        cleared.
+ *
+ * @details SHORTEN reaches the tracee through its registers, so a delay that ends in one
+ * only arises for a traced call -- which is every call a THROTTLE rule can act on.
  */
 chaos_init_verdict_t chaos_init_delay_answer(const chaos_init_verdict_t *verdict);
 

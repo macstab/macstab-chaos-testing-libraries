@@ -54,6 +54,18 @@ static long chaos_test_raw_syscall(long number, ...)
 }
 #define CHAOS_IO_SYSCALL chaos_test_raw_syscall
 
+/** @brief Milliseconds the last chaos_sleep_ms() asked for; -1 when it was not called. */
+static long g_slept_ms = -1;
+
+/** @brief Test seam for chaos_sleep.h: records the request instead of sleeping. */
+static int chaos_test_sleep(const struct timespec *request, struct timespec *remaining)
+{
+    (void)remaining;
+    g_slept_ms = (long)request->tv_sec * 1000L + request->tv_nsec / 1000000L;
+    return 0;
+}
+#define CHAOS_SLEEP_SYSCALL(request, remaining) chaos_test_sleep((request), (remaining))
+
 #include "../support/test_chaos_io_harness.h"
 
 #include <dirent.h>
@@ -3479,6 +3491,262 @@ static void test_drop_write_wrappers(void)
 }
 
 /**
+ * @brief Arms a THROTTLE rule of @p rate bytes per second on write (or pwrite).
+ *
+ * @details Each case uses a rate of its own, which is also what gives it a bucket of its
+ * own: a slot is keyed by descriptor and rate and resets when either differs, and the
+ * bucket table outlives chaos_test_reset_state() -- it is the wrapper's own state, not the
+ * harness's.
+ */
+static void chaos_test_throttle_rule(chaos_io_operation_t operation, uint64_t rate)
+{
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/throttle.bin");
+    g_config_match_loaded_result = 1;
+    g_config_rule.operation = operation;
+    g_config_rule.effect = CHAOS_IO_EFFECT_THROTTLE;
+    g_config_rule.rate_bps = rate;
+    g_rule_should_trigger_result = 1;
+    g_slept_ms = -1;
+}
+
+/**
+ * @brief THROTTLE holds the write side to a byte rate by writing less per call.
+ *
+ * @details The rates here are tiny on purpose: at 10 bytes per second a token takes 100 ms
+ * to arrive, so a call that follows another is reliably met by an empty bucket without the
+ * test depending on how fast the machine is. A tenth of a second's worth is what a call
+ * that has to wait gets, which is 1 byte at that rate and 100 ms of waiting. Covered:
+ * - the first call finds a full bucket, passes whole, and does not even ask the rule: an
+ *   allowance that changes nothing spends neither a hit nor a `@first` claim;
+ * - the next call finds it empty, waits for a tenth of a second's worth and writes that;
+ * - a non-blocking descriptor is told EAGAIN instead of being made to wait;
+ * - a rule that does not fire costs neither bytes nor the wait;
+ * - `writev` is trimmed to the allowance, and a vector whose size is unknown is written
+ *   whole;
+ * - `pwrite` is throttled the same way, which is the other operation the effect allows.
+ */
+static void test_throttle_write_wrappers(void)
+{
+    static const char block[64] = {0};
+    struct iovec vector[2];
+    struct iovec huge[1];
+    int fd;
+
+    huge[0].iov_base = (void *)"x";
+    huge[0].iov_len = (size_t)SSIZE_MAX + 1U;
+
+    /* A full bucket is one second's worth, so the first 10 bytes pass untouched. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 10U);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    g_real_write_return = 10;
+    assert(write(fd, block, 10U) == 10);
+    assert(g_real_write_calls == 1 && g_real_write_count == 10U);
+    assert(g_rule_should_trigger_calls == 0);
+    assert(g_slept_ms == -1);
+
+    /* Empty now: the next call waits 100 ms for one byte and writes exactly that. */
+    g_real_write_return = 1;
+    assert(write(fd, block, 10U) == 1);
+    assert(g_real_write_count == 1U);
+    assert(g_slept_ms == 100);
+    assert(g_rule_should_trigger_calls == 1);
+    /* The byte it waited for was charged when the wait started, so the call after it
+     * waits again instead of finding that byte in the bucket: without the charge the two
+     * calls would move two bytes in the time one byte takes to arrive, and the rate would
+     * come out double. */
+    g_slept_ms = -1;
+    g_real_write_return = 1;
+    assert(write(fd, block, 10U) == 1);
+    assert(g_slept_ms > 100);
+    chaos_test_raw_close(fd);
+
+    /* A part of what the call asked for is there: it writes that part and waits not at
+     * all, which is the short call the effect is built around. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 12U);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    g_real_write_return = 8;
+    assert(write(fd, block, 8U) == 8);
+    g_real_write_return = 4;
+    assert(write(fd, block, 12U) == 4);
+    assert(g_real_write_count == 4U);
+    assert(g_slept_ms == -1);
+    /* The same partial allowance with a rule that does not fire writes everything: the
+     * three bytes stay charged, but nothing is held back. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 11U);
+    g_real_write_return = 8;
+    assert(write(fd, block, 8U) == 8);
+    g_rule_should_trigger_result = 0;
+    g_real_write_return = 10;
+    assert(write(fd, block, 10U) == 10);
+    assert(g_real_write_count == 10U);
+    chaos_test_raw_close(fd);
+
+    /* A non-blocking descriptor: EAGAIN, no wait, nothing written. Its event loop is
+     * written for exactly that answer. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 20U);
+    fd = chaos_test_drop_fd(O_WRONLY | O_NONBLOCK);
+    g_real_write_return = 20;
+    assert(write(fd, block, 20U) == 20);
+    errno = 0;
+    assert(write(fd, block, 20U) == -1);
+    assert(errno == EAGAIN);
+    assert(g_real_write_calls == 1);
+    assert(g_slept_ms == -1);
+    chaos_test_raw_close(fd);
+
+    /* A non-blocking descriptor whose rule does not fire is not refused either: EAGAIN
+     * is an answer only a rule that fires may give. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 21U);
+    fd = chaos_test_drop_fd(O_WRONLY | O_NONBLOCK);
+    g_real_write_return = 21;
+    assert(write(fd, block, 21U) == 21);
+    g_rule_should_trigger_result = 0;
+    assert(write(fd, block, 21U) == 21);
+    assert(g_real_write_calls == 2);
+    chaos_test_raw_close(fd);
+
+    /* A rule that does not fire: the whole call goes through and nobody waits. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 30U);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    g_real_write_return = 30;
+    assert(write(fd, block, 30U) == 30);
+    g_rule_should_trigger_result = 0;
+    assert(write(fd, block, 30U) == 30);
+    assert(g_real_write_count == 30U);
+    assert(g_slept_ms == -1);
+    chaos_test_raw_close(fd);
+
+    /* writev: the vector is trimmed to the allowance, segment by segment. */
+    vector[0].iov_base = (void *)"abc";
+    vector[0].iov_len = 3U;
+    vector[1].iov_base = (void *)"de";
+    vector[1].iov_len = 2U;
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 5U);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    g_real_writev_return = 5;
+    assert(writev(fd, vector, 2) == 5);
+    assert(g_real_writev_iovcnt == 2);
+    g_real_writev_return = 1;
+    assert(writev(fd, vector, 2) == 1);
+    /* A tenth of 5 bytes per second is none, and the floor of the allowance is one byte:
+     * the vector is cut to the first segment's first byte, and the wait is the 200 ms that
+     * byte takes to arrive. */
+    assert(g_real_writev_iovcnt == 1 && g_real_writev_lengths[0] == 1U);
+    assert(g_slept_ms == 200);
+    /* A vector the kernel would reject has no byte count: written as it stands. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 50U);
+    g_real_writev_return = 4;
+    assert(writev(fd, huge, 1) == 4);
+    assert(g_real_writev_iovcnt == 1);
+    assert(g_rule_should_trigger_calls == 0);
+    chaos_test_raw_close(fd);
+
+    /* A non-blocking descriptor refuses a vectored write too. A plain write of the whole
+     * bucket empties it first: both forms carry the same `write` rule, so they share the
+     * descriptor's bucket. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 13U);
+    fd = chaos_test_drop_fd(O_WRONLY | O_NONBLOCK);
+    g_real_write_return = 13;
+    assert(write(fd, block, 13U) == 13);
+    errno = 0;
+    assert(writev(fd, vector, 2) == -1);
+    assert(errno == EAGAIN);
+    assert(g_real_writev_calls == 0);
+    chaos_test_raw_close(fd);
+
+    /* sendfile and copy_file_range carry a `write` rule on the destination and are
+     * shortened like TORN shortens them: the kernel moves both offsets on by what it
+     * transferred, so a shortened transfer is short, not lost. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 16U);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    g_real_sendfile_return = 16;
+    assert(sendfile(fd, 0, NULL, 16U) == 16);
+    assert(g_real_sendfile_count == 16U);
+    g_real_sendfile_return = 1;
+    assert(sendfile(fd, 0, NULL, 16U) == 1);
+    assert(g_real_sendfile_count == 1U);
+    /* One byte of sixteen per second: 63 ms, rounded up. */
+    assert(g_slept_ms == 63);
+    chaos_test_raw_close(fd);
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 17U);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    g_real_copy_file_range_return = 17;
+    assert(copy_file_range(0, NULL, fd, NULL, 17U, 0U) == 17);
+    g_real_copy_file_range_return = 1;
+    assert(copy_file_range(0, NULL, fd, NULL, 17U, 0U) == 1);
+    assert(g_real_copy_file_range_count == 1U);
+    chaos_test_raw_close(fd);
+    /* And both refuse a non-blocking destination, as write does. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 18U);
+    fd = chaos_test_drop_fd(O_WRONLY | O_NONBLOCK);
+    g_real_write_return = 18;
+    assert(write(fd, block, 18U) == 18);
+    errno = 0;
+    assert(sendfile(fd, 0, NULL, 18U) == -1);
+    assert(errno == EAGAIN);
+    errno = 0;
+    assert(copy_file_range(0, NULL, fd, NULL, 18U, 0U) == -1);
+    assert(errno == EAGAIN);
+    assert(g_real_sendfile_calls == 0 && g_real_copy_file_range_calls == 0);
+    chaos_test_raw_close(fd);
+
+    /* pwrite: the same bucket arithmetic, and the offset is the caller's own. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_PWRITE, 60U);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    g_real_pwrite_return = 60;
+    assert(pwrite(fd, block, 60U, 7) == 60);
+    assert(g_real_pwrite_count == 60U && g_real_pwrite_offset == 7);
+    g_real_pwrite_return = 6;
+    assert(pwrite(fd, block, 60U, 7) == 6);
+    assert(g_real_pwrite_count == 6U);
+    assert(g_slept_ms == 100);
+    chaos_test_raw_close(fd);
+
+    /* And pwrite refuses a non-blocking descriptor like write does. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_PWRITE, 61U);
+    fd = chaos_test_drop_fd(O_WRONLY | O_NONBLOCK);
+    g_real_pwrite_return = 61;
+    assert(pwrite(fd, block, 61U, 0) == 61);
+    errno = 0;
+    assert(pwrite(fd, block, 61U, 0) == -1);
+    assert(errno == EAGAIN);
+    assert(g_real_pwrite_calls == 1);
+    chaos_test_raw_close(fd);
+
+    /* pwritev is the vectored form of the same rule: trimmed to the allowance, refused on
+     * a non-blocking descriptor, and written whole when the size is unknown. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_PWRITE, 14U);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    g_real_pwrite_return = 14;
+    assert(pwrite(fd, block, 14U, 9) == 14);
+    g_real_pwritev_return = 1;
+    assert(pwritev(fd, vector, 2, 9) == 1);
+    assert(g_real_pwritev_iovcnt == 1 && g_real_pwritev_lengths[0] == 1U);
+    assert(g_real_pwritev_offset == 9);
+    /* One byte of fourteen per second: 72 ms, rounded up so the wait is never short. */
+    assert(g_slept_ms == 72);
+    chaos_test_raw_close(fd);
+    chaos_test_throttle_rule(CHAOS_IO_OP_PWRITE, 15U);
+    fd = chaos_test_drop_fd(O_WRONLY | O_NONBLOCK);
+    g_real_pwrite_return = 15;
+    assert(pwrite(fd, block, 15U, 0) == 15);
+    errno = 0;
+    assert(pwritev(fd, vector, 2, 0) == -1);
+    assert(errno == EAGAIN);
+    assert(g_real_pwritev_calls == 0);
+    /* A vector the kernel would reject has no byte count: written as it stands. */
+    g_real_pwritev_return = 4;
+    assert(pwritev(fd, huge, 1, 0) == 4);
+    assert(g_real_pwritev_calls == 1);
+    chaos_test_raw_close(fd);
+    chaos_test_reset_state();
+}
+
+/**
  * @brief A wrapper whose real function is still unresolved (a call arriving during symbol
  *        resolution) makes the system call itself instead of calling through NULL.
  *
@@ -3729,6 +3997,7 @@ int main(void)
     test_path_form_wrappers();
     test_read_and_write_wrappers();
     test_drop_write_wrappers();
+    test_throttle_write_wrappers();
     test_statfs_wrappers();
     test_vectored_helpers();
     test_readv_and_writev_wrappers();

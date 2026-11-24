@@ -43,6 +43,8 @@
  *                       elapsed ms, for the dns LATENCY rules.
  *   atwait <path>       - opens <path>, waits 600 ms, opens it again: "before=<r>
  *                       after=<r>", for the `@at=+N` delay.
+ *   throttle <path>     - writes 512 KiB to <path> in two rounds and prints the elapsed ms
+ *                       and whether any write came back short, for THROTTLE.
  *   setuid <path>       - drops to uid 65534, then opens <path> and maps 4 MiB:
  *                       "open=<r> mmap=<r>", for what a rule can still match after a
  *                       user switch.
@@ -444,6 +446,56 @@ int main(int argc, char **argv)
         }
         (void
         )printf("wrote=%ld,%ld zeros=%d tenth=%c\n", (long)first, (long)second, zeros, got[10]);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "throttle") == 0)
+    {
+        /* Two rounds of 256 KiB against a rate of 256 KiB per second. The bucket starts
+         * full, so the first round goes at once and the second takes about a second,
+         * arriving in short writes -- whether the supervisor shortens the call in the
+         * register or holds it in its delay queue, the rate is what shows. */
+        static char block[262144];
+        const int fd = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        struct timespec start;
+        struct timespec end;
+        int shortened = 0;
+        int round;
+
+        if (fd < 0)
+        {
+            (void)printf("setup=%s\n", try_open_errno_name(errno));
+            return 0;
+        }
+        (void)memset(block, 'x', sizeof(block));
+        (void)clock_gettime(CLOCK_MONOTONIC, &start);
+        for (round = 0; round < 2; ++round)
+        {
+            size_t done = 0U;
+
+            while (done < sizeof(block))
+            {
+                const ssize_t wrote = write(fd, block + done, sizeof(block) - done);
+
+                if (wrote <= 0)
+                {
+                    (void)printf("write=%s\n", try_open_errno_name(errno));
+                    (void)close(fd);
+                    return 0;
+                }
+                if ((size_t)wrote < sizeof(block) - done)
+                {
+                    shortened = 1;
+                }
+                done += (size_t)wrote;
+            }
+        }
+        (void)clock_gettime(CLOCK_MONOTONIC, &end);
+        (void)close(fd);
+        (void)printf(
+            "ms=%ld short=%d\n",
+            (long)((end.tv_sec - start.tv_sec) * 1000 + (end.tv_nsec - start.tv_nsec) / 1000000),
+            shortened
+        );
         return 0;
     }
     if (argc == 3 && strcmp(argv[1], "atwait") == 0)

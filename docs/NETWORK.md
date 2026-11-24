@@ -54,11 +54,11 @@ document wins where the two would disagree.
 | Hits file | `/tmp/.chaos-net.hits.<n>` |
 | Rule grammar | `<selector>:<operation>:<effect>:<value> [qualifier ...]` |
 | Operations | `socket`, `bind`, `listen`, `connect`, `accept`, `shutdown`, `send`, `recv`, `close`, `poll` |
-| Effects | ERRNO, LATENCY, CORRUPT, TIMEOUT, RESET, TRICKLE, DUP |
+| Effects | ERRNO, LATENCY, CORRUPT, TIMEOUT, RESET, TRICKLE, DUP, DROP, THROTTLE |
 | Qualifiers | `@first=N`, `@every=N`, `@at=+N`, `@from=T`, `@until=T`, `@size>N`, `@size<N` |
 | Limits | 256 rules; rule file under 256 KiB (262 144 bytes) |
 | Failure mode | fail-open: no rule, bad rule file or unresolvable endpoint means passthrough |
-| SECCOMP mode | ERRNO (not on `close`), LATENCY, TIMEOUT, DROP on a datagram send, TRICKLE, CORRUPT and DUP on a receive, RESET on close; see [`docs/SECCOMP.md`](SECCOMP.md) |
+| SECCOMP mode | ERRNO (not on `close`), LATENCY, TIMEOUT, DROP on a datagram send, THROTTLE on a send, TRICKLE, CORRUPT and DUP on a receive, RESET on close; see [`docs/SECCOMP.md`](SECCOMP.md) |
 
 ## 1. Overview
 
@@ -220,8 +220,8 @@ Every wrapper runs the same sequence:
    With no rules, or no resolvable endpoint, call the real function.
 4. Select the single best rule for `(operation, endpoint)`. If none, call the
    real function.
-5. Apply the effect: pre-call (ERRNO, LATENCY, TIMEOUT, RESET, TRICKLE, DUP
-   replay) or post-call (CORRUPT, DUP store, ERRNO on `close`).
+5. Apply the effect: pre-call (ERRNO, LATENCY, TIMEOUT, RESET, TRICKLE, THROTTLE,
+   DROP, DUP replay) or post-call (CORRUPT, DUP store, ERRNO on `close`).
 
 Exactly one rule applies to a call. Two rules for the same operation and endpoint
 do not compose; the more specific one wins (see below). To combine, for example,
@@ -443,15 +443,19 @@ and `getsockopt` it issues runs under the reentrancy guard and preserves `errno`
 ### Effects (`chaos_net_actions.c` and the wrappers)
 
 ERRNO, LATENCY and the probability decision are shared. CORRUPT, TIMEOUT, RESET,
-TRICKLE and DUP are implemented where the call's buffers are, in the wrappers.
+TRICKLE, DROP, THROTTLE and DUP are implemented where the call's buffers are, in the
+wrappers.
 
 ### Why there is no socket cache
 
 A cache of descriptor → endpoint would need `close()`, `dup2()`, `fork()` and
 `exec` invalidation to stay correct, and descriptor numbers are reused within
-microseconds. The library resolves endpoints per call instead and keeps only one
-piece of per-descriptor state, the DUP payload table, which tags each payload
-with the socket's inode and device and is cleared on `close()`.
+microseconds. The library resolves endpoints per call instead and keeps
+little per-descriptor state: the DUP payload table, which tags each payload with the
+socket's inode and device and is cleared on `close()`, and the THROTTLE bucket table,
+whose entries are tagged with the descriptor and the rate and are taken over by whatever
+pair lands in the slot next -- a bucket holds no data, so a stale one costs at most one
+second of allowance.
 
 ## 7. Data Model and State
 
@@ -519,6 +523,7 @@ udp4://10.0.0.5:53:send:DROP:0.1
 | TRICKLE | bytes per receive, 1–4294967295 | `recv` | before the receive |
 | DUP | probability | `recv` | instead of the next receive |
 | DROP | probability | `send` | instead of the send, on datagram sockets |
+| THROTTLE | bytes per second, 1–4294967295 | `send` | before the send |
 
 An effect/operation pair outside this table rejects the rule file.
 
@@ -556,7 +561,23 @@ probability as an optional `@probability` after the milliseconds
 (`tcp4://127.0.0.1:6379:recv:LATENCY:200@0.1`); without one it is 1.0 and the rule
 fires on every matching call that passes its qualifiers, which is what `LATENCY:ms`
 has always meant. TRICKLE takes a byte count, not a probability, and fires whenever
-it applies.
+it applies, and THROTTLE takes a rate on the same terms.
+
+THROTTLE holds the send side of a socket to a byte rate. Each send takes its bytes from a
+token bucket of one second's worth, kept per rule and per descriptor: a full bucket lets
+the first second's worth through untouched, so only a sender that keeps going is slowed
+down, and an allowance that covers the whole send changes nothing and counts no hit.
+A stream send that gets part of what it asked for sends that part, which is what a
+socket under back pressure does anyway. A datagram is never cut -- half a datagram is not
+a datagram, and the kernel would deliver the shortened message as the whole one -- so such
+a send waits until its whole message is paid for and then goes out intact. When the bucket
+is empty, a non-blocking socket is told `EAGAIN`, which is what its event loop is written
+for, and a blocking one waits for a tenth of a second's worth: short sends rather than
+long sleeps, so a rate does not stall an event loop that shares the thread. `sendmsg` and
+the batches keep their length in memory and are left alone, counting no hit, as TRICKLE
+leaves `recvmsg` alone. The receive side has no THROTTLE: holding back data the kernel has
+already buffered would not be a rate, and TRICKLE is the chunking effect for that
+direction.
 
 ### Probability
 
@@ -751,6 +772,29 @@ rarely tested (double charges, double writes, repeated side effects).
   address the kernel cut to fit the caller's buffer is kept only as far as that
   buffer reached. A `fork()` child releases slot locks that other threads held at
   the fork.
+
+**THROTTLE:rate.** A byte rate on the send side, in bytes per second. Each send takes
+what it needs from a token bucket; the bucket holds one second's worth and refills at
+the rate, as a single 64-bit word per (rule, descriptor) updated with one compare and
+swap, so threads sharing a socket share the rate without waiting for each other.
+
+- A full bucket -- which is what a rule that has just been loaded finds -- passes the
+  whole send untouched and counts no hit. The rate therefore only bites a sender that
+  keeps going, and a test that sends one message never sees it.
+- A stream send takes what is there and sends that; the caller sees a short send, which
+  is what a socket under back pressure gives it anyway.
+- A datagram is sent whole or waited for: a shortened buffer would be delivered as the
+  whole message. Such a send waits for the bytes it is short of and then goes out intact.
+- An empty bucket means `EAGAIN` on a non-blocking socket and otherwise a wait for a
+  tenth of a second's worth, which bounds the wait at about 100 ms. The bytes are charged
+  when the wait starts, so two threads waiting on one socket are told to wait one after
+  the other instead of both for the same bytes.
+- `sendmsg`, `sendmmsg` and `writev` keep their length in memory rather than in the
+  length argument and are left alone, counting no hit.
+- Under `chaos-init` the same arithmetic runs in the supervisor, which parks the call in
+  its delay queue instead of sleeping in the thread, so the other threads of the traced
+  process keep being served. The rate a process sees is the same; only the place where
+  the waiting happens differs.
 
 ### Qualifiers
 
@@ -1029,6 +1073,9 @@ tcp4://*:8443:accept:LATENCY:200
 # Redis replies arrive one byte at a time (client side: the server is the peer).
 tcp4://10.0.0.5:6379:recv:TRICKLE:1
 
+# The link to the object store gives 64 KiB/s on the send side.
+tcp4://10.0.0.7:9000:send:THROTTLE:65536
+
 # 5 % of Kafka fetch responses are delivered twice.
 tcp4://10.0.0.9:9092:recv:DUP:0.05
 
@@ -1087,7 +1134,8 @@ any service-mesh sidecar connection in the process.
 ### Private
 
 - helper names and file layout, endpoint representation, snapshot layout;
-- the DUP table geometry (64 slots, 4096 bytes);
+- the DUP table geometry (64 slots, 4096 bytes), and the THROTTLE bucket table
+  (64 slots) with the tenth of a second a waiting send asks for;
 - the reload throttle (1 ms) and racy window (20 ms).
 
 ### Adding an effect
@@ -1112,7 +1160,7 @@ any service-mesh sidecar connection in the process.
 - **Dynamic linker.** Interposition requires a dynamically linked target that
   honours `LD_PRELOAD` (not set-uid under `AT_SECURE`). Statically linked
   programs and runtimes with their own system-call layer bypass the library;
-  SECCOMP mode covers them for ERRNO, LATENCY, TIMEOUT, DROP, TRICKLE, CORRUPT, DUP
+  SECCOMP mode covers them for ERRNO, LATENCY, TIMEOUT, DROP, THROTTLE, TRICKLE, CORRUPT, DUP
   and RESET.
 - **Kernel.** Endpoint identity comes from `getsockname`, `getpeername` and
   `SO_TYPE`; `epoll` membership from `/proc/self/fdinfo`. TIMEOUT waits with
