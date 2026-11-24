@@ -44,7 +44,9 @@
  *   (rounded up to ms, capped at INT32_MAX) and returns 0 with the ready sets cleared at
  *   commit; a wait without a timeout, or with one the kernel would refuse (EINVAL), is
  *   left to the real call;
- * - CORRUPT, RESET and ERRNO on close reject the whole rule file in SECCOMP mode.
+ * - TRICKLE shortens a receive in the register, CORRUPT flips a bit of what one
+ *   delivered and DUP delivers a kept payload again, all through a trace stop;
+ * - RESET and ERRNO on close reject the whole rule file in SECCOMP mode.
  */
 
 #include <stddef.h>
@@ -1141,10 +1143,9 @@ int main(void)
     );
 
     /* Effects SECCOMP mode cannot apply reject the whole rule file, status naming the
-     * line: DUP (needs a payload kept from an earlier call), ERRNO on close (would need
-     * close and fail at once), RESET (needs the socket itself). LATENCY on close is
-     * allowed. */
-    write_rules("*:connect:ECONNREFUSED:1.0\n*:recv:DUP:1.0\n");
+     * line: ERRNO on close (would need close and fail at once) and RESET (needs a second
+     * call to run inside the tracee). LATENCY on close is allowed. */
+    write_rules("*:connect:ECONNREFUSED:1.0\n*:close:ECONNRESET:1.0\n");
     assert(PASSES(
         decide(__NR_connect, (uint64_t)unbound, P(&server_address), sizeof(server_address), 0, 0, 0)
     ));
@@ -1307,6 +1308,214 @@ int main(void)
         assert(chaos_init_net_traced_calls(NULL, 4U) == 0U);
     }
     /* With nothing traced the set is empty, so the filter stays the one it always was. */
+    /* DUP keeps what a receive delivered and hands it to the next one: the entry stop
+     * lets the call run because nothing is kept yet, the exit stop keeps the bytes, and
+     * the next entry stop returns them without the call running. Each payload replays
+     * once. Only the replay is a hit -- keeping is not. */
+    write_rules("*:recv:DUP:1.0\n");
+    {
+        unsigned char area[16];
+        chaos_init_call_t after;
+        chaos_init_verdict_t replay;
+
+        memset(&after, 0, sizeof(after));
+        after.tid = getpid();
+        after.nr = __NR_recvfrom;
+        after.args[0] = (uint64_t)server;
+        after.args[1] = P(area);
+        after.args[2] = sizeof(area);
+
+        assert(
+            decide(__NR_recvfrom, (uint64_t)server, P(area), sizeof(area), 0, 0, 0).action ==
+            CHAOS_INIT_AFTER
+        );
+        /* Nothing delivered is nothing to keep, so the next receive still finds no
+         * payload. */
+        assert(chaos_init_net_decide_result(&after, 0) == 1);
+        assert(
+            decide(__NR_recvfrom, (uint64_t)server, P(area), sizeof(area), 0, 0, 0).action ==
+            CHAOS_INIT_AFTER
+        );
+        memcpy(area, "payload!", 8U);
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        (void)memset(area, 'A', sizeof(area));
+        replay = decide(__NR_recvfrom, (uint64_t)server, P(area), sizeof(area), 0, 0, 0);
+        assert(replay.action == CHAOS_INIT_RETURN && replay.value == 8);
+        assert(memcmp(area, "payload!", 8U) == 0 && area[8] == 'A');
+        /* Replayed once: the slot is empty, so the next receive runs again. */
+        assert(
+            decide(__NR_recvfrom, (uint64_t)server, P(area), sizeof(area), 0, 0, 0).action ==
+            CHAOS_INIT_AFTER
+        );
+        /* The forms DUP does not take, each counting no hit: MSG_PEEK (consumes nothing),
+         * a zero-length request (a replay into it would read as EOF), recvmsg (its buffer
+         * is an iovec) and a descriptor without a socket behind it. */
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        assert(PASSES(decide(__NR_recvfrom, (uint64_t)server, P(area), sizeof(area), MSG_PEEK, 0, 0)
+        ));
+        assert(PASSES(decide(__NR_recvfrom, (uint64_t)server, P(area), 0, 0, 0, 0)));
+        assert(PASSES(decide(__NR_recvmsg, (uint64_t)server, P(&message), 0, 0, 0, 0)));
+        {
+            char hits[256] = {0};
+            char path[64];
+            FILE *file;
+
+            (void)snprintf(path, sizeof(path), "/tmp/.chaos-net.hits.%ld", (long)getpid());
+            file = fopen(path, "r");
+            assert(file != NULL);
+            hits[fread(hits, 1U, sizeof(hits) - 1U, file)] = '\0';
+            (void)fclose(file);
+            assert(strcmp(hits, "1\t*:recv:DUP:1.0\n") == 0);
+        }
+        /* A buffer the supervisor cannot read keeps nothing, and one it cannot write
+         * leaves the verdict at AFTER: the receive runs for real. */
+        after.args[1] = 0U;
+        after.args[2] = 8U;
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        assert(decide(__NR_recvfrom, (uint64_t)server, 0, 8U, 0, 0, 0).action == CHAOS_INIT_AFTER);
+        after.args[1] = P(area);
+        after.args[2] = sizeof(area);
+        memcpy(area, "payload!", 8U);
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        assert(decide(__NR_recvfrom, (uint64_t)server, 0, 8U, 0, 0, 0).action == CHAOS_INIT_AFTER);
+    }
+    /* A stream payload longer than the cap is kept cut, a datagram that long is not kept
+     * at all: replayed cut it would be another message. */
+    {
+        static unsigned char wide[CHAOS_INIT_NET_DUP_MAX_BYTES * 2U];
+        chaos_init_call_t after;
+        chaos_init_verdict_t replay;
+
+        memset(&after, 0, sizeof(after));
+        after.tid = getpid();
+        after.nr = __NR_read;
+        after.args[0] = (uint64_t)server;
+        after.args[1] = P(wide);
+        after.args[2] = sizeof(wide);
+        (void)memset(wide, 'B', sizeof(wide));
+        assert(chaos_init_net_decide_result(&after, (long)sizeof(wide)) == 1);
+        replay = decide(__NR_read, (uint64_t)server, P(wide), sizeof(wide), 0, 0, 0);
+        assert(
+            replay.action == CHAOS_INIT_RETURN && replay.value == (long)CHAOS_INIT_NET_DUP_MAX_BYTES
+        );
+
+        after.args[0] = (uint64_t)udp;
+        assert(chaos_init_net_decide_result(&after, (long)sizeof(wide)) == 1);
+        assert(
+            decide(__NR_read, (uint64_t)udp, P(wide), sizeof(wide), 0, 0, 0).action ==
+            CHAOS_INIT_AFTER
+        );
+    }
+    /* A datagram replay carries the sender address the kept receive reported, truncated to
+     * the caller's capacity with the full length reported, as the kernel does. */
+    {
+        unsigned char area[16];
+        struct sockaddr_in sender;
+        socklen_t sender_length = sizeof(sender);
+        chaos_init_call_t after;
+        chaos_init_verdict_t replay;
+
+        sender = udp_address;
+        memset(&after, 0, sizeof(after));
+        after.tid = getpid();
+        after.nr = __NR_recvfrom;
+        after.args[0] = (uint64_t)udp;
+        after.args[1] = P(area);
+        after.args[2] = sizeof(area);
+        after.args[4] = P(&sender);
+        after.args[5] = P(&sender_length);
+        memcpy(area, "datagram", 8U);
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+
+        memset(&sender, 0, sizeof(sender));
+        sender_length = sizeof(sender);
+        replay = decide(
+            __NR_recvfrom, (uint64_t)udp, P(area), sizeof(area), 0, P(&sender), P(&sender_length)
+        );
+        assert(replay.action == CHAOS_INIT_RETURN && replay.value == 8);
+        assert(sender_length == (socklen_t)sizeof(struct sockaddr_in));
+        assert(sender.sin_port == udp_address.sin_port);
+        /* Room for half the address gets half of it and nothing past that, and the full
+         * length is reported all the same. */
+        memcpy(area, "datagram", 8U);
+        sender_length = sizeof(sender);
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        {
+            unsigned char room[sizeof(struct sockaddr_in) * 2U];
+            const socklen_t half = (socklen_t)(sizeof(struct sockaddr_in) / 2U);
+
+            (void)memset(room, 'Z', sizeof(room));
+            sender_length = half;
+            replay = decide(
+                __NR_recvfrom, (uint64_t)udp, P(area), sizeof(area), 0, P(room), P(&sender_length)
+            );
+            assert(replay.action == CHAOS_INIT_RETURN);
+            assert(sender_length == (socklen_t)sizeof(struct sockaddr_in));
+            assert(memcmp(room, &udp_address, (size_t)half) == 0);
+            assert(untouched(room + half, sizeof(room) - (size_t)half, 'Z'));
+        }
+        /* No room at all for the address: the length is still reported. */
+        memcpy(area, "datagram", 8U);
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        sender_length = 0;
+        replay = decide(
+            __NR_recvfrom, (uint64_t)udp, P(area), sizeof(area), 0, P(&sender), P(&sender_length)
+        );
+        assert(replay.action == CHAOS_INIT_RETURN);
+        assert(sender_length == (socklen_t)sizeof(struct sockaddr_in));
+    }
+    /* More sockets with a payload at once than there are slots: the oldest gives way, so
+     * the newest payloads are the ones that replay. */
+    {
+        unsigned char area[16];
+        int sockets[CHAOS_INIT_NET_DUP_SLOTS + 1U];
+        chaos_init_call_t after;
+        size_t index;
+
+        memset(&after, 0, sizeof(after));
+        after.tid = getpid();
+        after.nr = __NR_read;
+        after.args[1] = P(area);
+        after.args[2] = sizeof(area);
+        memcpy(area, "payload!", 8U);
+        for (index = 0U; index < sizeof(sockets) / sizeof(sockets[0]); ++index)
+        {
+            sockets[index] = socket(AF_INET, SOCK_DGRAM, 0);
+            assert(sockets[index] >= 0);
+            after.args[0] = (uint64_t)sockets[index];
+            assert(chaos_init_net_decide_result(&after, 8) == 1);
+        }
+        /* The first socket's payload was evicted by the last one's. */
+        assert(
+            decide(__NR_read, (uint64_t)sockets[0], P(area), sizeof(area), 0, 0, 0).action ==
+            CHAOS_INIT_AFTER
+        );
+        index = sizeof(sockets) / sizeof(sockets[0]) - 1U;
+        assert(
+            decide(__NR_read, (uint64_t)sockets[index], P(area), sizeof(area), 0, 0, 0).action ==
+            CHAOS_INIT_RETURN
+        );
+        /* Age decides, not position: the first socket's slot is the newest again once it
+         * keeps another payload, so the next store takes the second socket's. */
+        memcpy(area, "payload!", 8U);
+        after.args[0] = (uint64_t)sockets[0];
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        after.args[0] = (uint64_t)sockets[index];
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        assert(
+            decide(__NR_read, (uint64_t)sockets[1], P(area), sizeof(area), 0, 0, 0).action ==
+            CHAOS_INIT_AFTER
+        );
+        assert(
+            decide(__NR_read, (uint64_t)sockets[0], P(area), sizeof(area), 0, 0, 0).action ==
+            CHAOS_INIT_RETURN
+        );
+        for (index = 0U; index < sizeof(sockets) / sizeof(sockets[0]); ++index)
+        {
+            (void)close(sockets[index]);
+        }
+    }
+
     write_rules("*:close:ECONNRESET:1.0\n");
     {
         long traced[8];

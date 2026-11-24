@@ -84,19 +84,20 @@ static int chaos_init_net_supported(const struct chaos_net_rule *rule);
  * @brief Whether @p rule's effect needs the tracee's registers rather than a reply.
  *
  * @details TRICKLE shortens the requested length before the kernel reads it; CORRUPT
- * changes a byte the receive wrote, which needs the stop after it. A notification can do
- * neither. The predicate decides the filter's traced group
+ * changes a byte the receive wrote and DUP keeps the bytes it wrote, both of which need
+ * the stop after it. A notification can do neither. The predicate decides the filter's traced group
  * (chaos_init_net_traced_calls()), so adding an effect here without teaching the trace
  * path to apply it would load a rule that never fires.
  */
 static int chaos_init_net_traced_effect(const struct chaos_net_rule *rule)
 {
-    return rule->effect == CHAOS_NET_EFFECT_TRICKLE || rule->effect == CHAOS_NET_EFFECT_CORRUPT;
+    return rule->effect == CHAOS_NET_EFFECT_TRICKLE || rule->effect == CHAOS_NET_EFFECT_CORRUPT ||
+           rule->effect == CHAOS_NET_EFFECT_DUP;
 }
 
 /* CHAOS_NET_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, TIMEOUT, DROP, and the
- * traced effects TRICKLE and CORRUPT, which the trace path applies through the registers
- * and the tracee's memory. DUP stays out: it needs a payload kept from an earlier call. */
+ * traced effects TRICKLE, CORRUPT and DUP, which the trace path applies through the
+ * registers and the tracee's memory. ERRNO on close and RESET stay out. */
 static int chaos_init_net_supported(const struct chaos_net_rule *rule)
 {
     return (rule->effect == CHAOS_NET_EFFECT_ERRNO && rule->operation != CHAOS_NET_OP_CLOSE) ||
@@ -1296,6 +1297,180 @@ static void chaos_init_net_clear_ready(const chaos_init_call_t *call)
     }
 }
 
+/*---------------------------------------------------------------------------*
+ * DUP: keep what a receive delivered and deliver it again
+ *---------------------------------------------------------------------------*/
+
+/** @brief Sockets whose last payload the supervisor keeps at once. */
+#define CHAOS_INIT_NET_DUP_SLOTS 16U
+
+/** @brief Longest kept payload, as in the library (CHAOS_NET_DUP_MAX_BYTES). */
+#define CHAOS_INIT_NET_DUP_MAX_BYTES 4096U
+
+/** @brief Receive flags that bypass DUP, as in the library (CHAOS_NET_DUP_SKIP_FLAGS). */
+#ifdef MSG_ERRQUEUE
+#define CHAOS_INIT_NET_DUP_SKIP (MSG_PEEK | MSG_TRUNC | MSG_OOB | MSG_WAITALL | MSG_ERRQUEUE)
+#else
+#define CHAOS_INIT_NET_DUP_SKIP (MSG_PEEK | MSG_TRUNC | MSG_OOB | MSG_WAITALL)
+#endif
+
+/**
+ * @brief The last payload received on one socket, kept for a DUP rule.
+ *
+ * @details Keyed by the socket inode rather than by descriptor and process: the inode
+ * names the socket itself, so a descriptor that was closed and reused no longer finds the
+ * payload, and two processes that share the socket share one -- they share the byte stream
+ * too. The library keeps its table per address space instead, which is the one difference
+ * (NETWORK.md).
+ */
+typedef struct chaos_init_net_dup
+{
+    unsigned long inode;   /**< The socket the payload came from; 0 when the slot is empty. */
+    uint64_t stamp;        /**< Store order, for evicting the oldest slot. */
+    size_t length;         /**< Bytes kept in `data`. */
+    socklen_t name_length; /**< Sender address length (datagrams); 0 when none. */
+    struct sockaddr_storage name;
+    unsigned char data[CHAOS_INIT_NET_DUP_MAX_BYTES];
+} chaos_init_net_dup_t;
+
+static chaos_init_net_dup_t g_chaos_init_net_dups[CHAOS_INIT_NET_DUP_SLOTS];
+static uint64_t g_chaos_init_net_dup_stamp = 0U;
+
+/** @brief The slot holding @p inode's payload, or NULL when none does. */
+static chaos_init_net_dup_t *chaos_init_net_dup_find(unsigned long inode)
+{
+    size_t index;
+
+    for (index = 0U; index < CHAOS_INIT_NET_DUP_SLOTS; ++index)
+    {
+        if (g_chaos_init_net_dups[index].inode == inode)
+        {
+            return &g_chaos_init_net_dups[index];
+        }
+    }
+    return NULL;
+}
+
+/**
+ * @brief Keeps the bytes @p result reports as @p inode's payload.
+ *
+ * @details Called at the exit stop of a receive the entry stop let run, which is where
+ * @p inode was established as a socket's. A datagram longer
+ * than the cap is not kept at all (replayed cut it would be another message), a stream
+ * payload is kept cut, exactly as in the library. The oldest slot gives way when all are
+ * taken, so a container with more such sockets than slots keeps the newest payloads.
+ */
+static void chaos_init_net_dup_store(
+    const chaos_init_call_t *call,
+    const chaos_init_net_call_t *entry,
+    unsigned long inode,
+    long result,
+    uint64_t size
+)
+{
+    chaos_init_net_dup_t *slot;
+    uint64_t length;
+    size_t index;
+
+    if (result <= 0)
+    {
+        return;
+    }
+    length = (uint64_t)result < size ? (uint64_t)result : size;
+    if (length > CHAOS_INIT_NET_DUP_MAX_BYTES)
+    {
+        if (!chaos_init_net_is_stream(call->args[0]))
+        {
+            return;
+        }
+        length = CHAOS_INIT_NET_DUP_MAX_BYTES;
+    }
+    slot = chaos_init_net_dup_find(inode);
+    if (slot == NULL)
+    {
+        slot = chaos_init_net_dup_find(0U);
+    }
+    if (slot == NULL)
+    {
+        slot = &g_chaos_init_net_dups[0];
+        for (index = 1U; index < CHAOS_INIT_NET_DUP_SLOTS; ++index)
+        {
+            if (g_chaos_init_net_dups[index].stamp < slot->stamp)
+            {
+                slot = &g_chaos_init_net_dups[index];
+            }
+        }
+    }
+    slot->inode = 0U;
+    if (chaos_init_read_memory(call->tid, call->args[1], slot->data, (size_t)length) != 0)
+    {
+        return;
+    }
+    slot->length = (size_t)length;
+    slot->name_length = 0;
+    /* The sender address of a datagram, for a recvfrom replay. The kernel reports the
+     * full length even when it cut the address to the caller's buffer, so only what it
+     * wrote is kept. Of the traced calls only recvfrom has an address at all. */
+    if (entry->nr == __NR_recvfrom && call->args[4] != 0U && call->args[5] != 0U)
+    {
+        socklen_t reported = 0;
+
+        if (chaos_init_read_memory(call->tid, call->args[5], &reported, sizeof(reported)) == 0 &&
+            reported > 0 && (size_t)reported <= sizeof(slot->name) &&
+            chaos_init_read_memory(call->tid, call->args[4], &slot->name, (size_t)reported) == 0)
+        {
+            slot->name_length = reported;
+        }
+    }
+    slot->inode = inode;
+    slot->stamp = ++g_chaos_init_net_dup_stamp;
+}
+
+/**
+ * @brief Delivers @p slot's payload into the receive's buffer and empties the slot.
+ *
+ * @details Each payload replays at most once, so the next receive reads the socket again.
+ * The sender address is written back truncated to the caller's capacity with the full
+ * length reported, as the kernel does.
+ *
+ * @return The bytes delivered, or -1 when the tracee's buffer could not be written, in
+ *         which case the call has to run for real.
+ */
+static long chaos_init_net_dup_replay(
+    const chaos_init_call_t *call,
+    const chaos_init_net_call_t *entry,
+    chaos_init_net_dup_t *slot,
+    uint64_t size
+)
+{
+    const uint64_t delivered = (uint64_t)slot->length < size ? (uint64_t)slot->length : size;
+
+    if (chaos_init_write_memory(call->tid, call->args[1], slot->data, (size_t)delivered) != 0)
+    {
+        return -1;
+    }
+    if (entry->nr == __NR_recvfrom && call->args[4] != 0U && call->args[5] != 0U)
+    {
+        const void *name = &slot->name;
+        socklen_t capacity = 0;
+
+        if (chaos_init_read_memory(call->tid, call->args[5], &capacity, sizeof(capacity)) == 0)
+        {
+            const socklen_t copied = capacity < slot->name_length ? capacity : slot->name_length;
+
+            if (copied > 0)
+            {
+                (void)chaos_init_write_memory(call->tid, call->args[4], name, (size_t)copied);
+            }
+            (void)chaos_init_write_memory(
+                call->tid, call->args[5], &slot->name_length, sizeof(slot->name_length)
+            );
+        }
+    }
+    slot->inode = 0U;
+    return (long)delivered;
+}
+
 /** @brief Result value that means "the call has not run yet" (the entry stop). */
 #define CHAOS_INIT_NET_NO_RESULT LONG_MIN
 
@@ -1312,6 +1487,7 @@ chaos_init_net_decide_at(const chaos_init_call_t *call, long result, chaos_init_
     const chaos_init_net_call_t *entry = NULL;
     const chaos_net_config_state_t *state;
     chaos_net_rule_t rule;
+    chaos_init_net_dup_t *kept = NULL;
     uint64_t size = CHAOS_POLICY_NO_SIZE;
     int64_t timeout_ms = -1;
     size_t index;
@@ -1390,6 +1566,37 @@ chaos_init_net_decide_at(const chaos_init_call_t *call, long result, chaos_init_
             return 1;
         }
     }
+    else if (rule.effect == CHAOS_NET_EFFECT_DUP)
+    {
+        /* chaos_net_dups(): a request of zero or unknown length, the forms that keep their
+         * buffer in an iovec, and the flags that are not the plain data stream are left
+         * alone. An unreadable descriptor is too -- the payload belongs to a socket, and
+         * without its inode there is nothing to tie it to. All checked before the draw, so
+         * such a call counts no hit. */
+        const uint64_t flags = entry->nr == __NR_recvfrom ? call->args[3] : 0U;
+        const unsigned long inode = chaos_init_net_inode((int)call->args[0]);
+
+        if (entry->size < 0 || size == CHAOS_POLICY_NO_SIZE || size == 0U || inode == 0U ||
+            (flags & (uint64_t)CHAOS_INIT_NET_DUP_SKIP) != 0U)
+        {
+            return 1;
+        }
+        if (result != CHAOS_INIT_NET_NO_RESULT)
+        {
+            /* The exit stop of a receive that ran: keep what it delivered and draw
+             * nothing. A hit is a delivered duplicate, and only a replay is one. */
+            chaos_init_net_dup_store(call, entry, inode, result, size);
+            return 1;
+        }
+        /* Let the receive run whatever the draw decides: it either replaces the payload it
+         * did not get, or leaves the first one behind. */
+        verdict->action = CHAOS_INIT_AFTER;
+        kept = chaos_init_net_dup_find(inode);
+        if (kept == NULL)
+        {
+            return 1;
+        }
+    }
     else if (result != CHAOS_INIT_NET_NO_RESULT)
     {
         /* Every other effect was applied at the entry stop; the exit stop must not draw
@@ -1444,6 +1651,19 @@ chaos_init_net_decide_at(const chaos_init_call_t *call, long result, chaos_init_
         verdict->action = CHAOS_INIT_SHORTEN;
         verdict->arg_index = (unsigned)entry->size;
         verdict->value = (long)rule.chunk_bytes;
+    }
+    else if (rule.effect == CHAOS_NET_EFFECT_DUP)
+    {
+        /* The kept payload instead of a receive, which the reply can return without the
+         * call running. A buffer the supervisor cannot write leaves the verdict at AFTER:
+         * the receive then runs for real, as a busy slot makes it in the library. */
+        const long delivered = chaos_init_net_dup_replay(call, entry, kept, size);
+
+        if (delivered >= 0)
+        {
+            verdict->action = CHAOS_INIT_RETURN;
+            verdict->value = delivered;
+        }
     }
     else if (rule.effect == CHAOS_NET_EFFECT_CORRUPT)
     {

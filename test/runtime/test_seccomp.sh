@@ -304,6 +304,15 @@ expect "C: CORRUPT flips one bit of a receive" \
     "$($init --libs net -- /tmp/probe netcorrupt 7802)" "changed=1 onebit=1"
 expect "C: the net CORRUPT rule is applied, not rejected" \
     "$(sed -n 1,2p /tmp/.chaos-net.status | tr "\n" " ")" "state=ok rules=1 "
+
+# DUP needs both stops: the first receive runs and its bytes are kept at the exit stop, the
+# next read is answered with them without running, and the payload that arrived meanwhile
+# follows. A replay that did not happen would show as first=one second=two.
+printf "%s\n" "*:recv:DUP:1.0 # t" > /tmp/.chaos-net.conf
+expect "C: DUP replays the kept payload once" "$($init --libs net -- /tmp/probe dup 7803)" \
+    "first=one second=one third=two"
+expect "C: the DUP rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-net.status | tr "\n" " ")" "state=ok rules=1 "
 rm -f /tmp/.chaos-net.conf
 
 # A forked child of the tracee is traced too: without PTRACE_O_TRACEFORK its filtered calls

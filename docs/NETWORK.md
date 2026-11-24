@@ -58,7 +58,7 @@ document wins where the two would disagree.
 | Qualifiers | `@first=N`, `@every=N`, `@from=T`, `@until=T`, `@size>N`, `@size<N` |
 | Limits | 256 rules; rule file under 256 KiB (262 144 bytes) |
 | Failure mode | fail-open: no rule, bad rule file or unresolvable endpoint means passthrough |
-| SECCOMP mode | ERRNO (not on `close`), LATENCY, TIMEOUT, DROP on a datagram send, TRICKLE and CORRUPT on a receive; see [`docs/SECCOMP.md`](SECCOMP.md) |
+| SECCOMP mode | ERRNO (not on `close`), LATENCY, TIMEOUT, DROP on a datagram send, TRICKLE, CORRUPT and DUP on a receive; see [`docs/SECCOMP.md`](SECCOMP.md) |
 
 ## 1. Overview
 
@@ -534,6 +534,14 @@ byte and the bit are drawn at the second stop and written into the tracee's buff
 keeps the rule's own promise -- a receive that delivered nothing counts no hit. The same
 two limits hold as here: `MSG_TRUNC` on a stream socket wrote nothing, and `recvmsg` and
 the batches keep their buffer in an iovec and are left alone, counting no hit.
+
+`DUP` applies there too, across both stops: the receive that finds no kept payload runs and
+its bytes are kept at the exit stop, and the next one is answered with them without running.
+The bypassed flags, the replay-once rule and the sender address of a datagram are the same
+as here. One difference: the supervisor keeps a payload per **socket** (by inode, 16 at a
+time, the oldest giving way), where the library keeps one per descriptor in the table of its
+own address space. Two processes that share the descriptor therefore share one kept payload
+under `chaos-init`, and a `fork` child does not inherit a copy of it.
 
 DROP reports a send as done and sends nothing, which is a lost packet. It applies to
 datagram sockets only, decided per call from `SO_TYPE` rather than from the selector: a
@@ -1092,7 +1100,7 @@ any service-mesh sidecar connection in the process.
 - **Dynamic linker.** Interposition requires a dynamically linked target that
   honours `LD_PRELOAD` (not set-uid under `AT_SECURE`). Statically linked
   programs and runtimes with their own system-call layer bypass the library;
-  SECCOMP mode covers them for ERRNO, LATENCY, TIMEOUT, DROP, TRICKLE and CORRUPT.
+  SECCOMP mode covers them for ERRNO, LATENCY, TIMEOUT, DROP, TRICKLE, CORRUPT and DUP.
 - **Kernel.** Endpoint identity comes from `getsockname`, `getpeername` and
   `SO_TYPE`; `epoll` membership from `/proc/self/fdinfo`. TIMEOUT waits with
   `ppoll` and the kernel's 8-byte signal set.

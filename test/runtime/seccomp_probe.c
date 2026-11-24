@@ -30,6 +30,8 @@
  *   corrupt <path>      - writes eight known bytes to <path>, reads them back and prints
  *                       how many differ and whether exactly one bit changed, for CORRUPT.
  *   netcorrupt <port>   - the same count over a loopback stream pair, for net CORRUPT.
+ *   dup <port>          - sends "one", receives it, sends "two", then reads twice and
+ *                       prints the three payloads, for net DUP.
  * - fork                fork + waitpid: "ok" or the errno name.
  * - exec                execl("/bin/true"); prints the errno name only when it fails.
  *
@@ -342,6 +344,45 @@ int main(int argc, char **argv)
             }
         }
         (void)printf("changed=%d onebit=%d\n", differences, differences > 0 && single_bit);
+        (void)close(server);
+        (void)close(client);
+        (void)close(listener);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "dup") == 0)
+    {
+        /* "one" is sent and received, "two" is sent, and the next read is the one a DUP
+         * rule answers with the kept payload: it prints "one" again without the call
+         * running, and "two" is still pending for the read after it. The last read asks
+         * with MSG_DONTWAIT so a rule that did not replay cannot block the suite. */
+        struct sockaddr_in address;
+        const int listener = socket(AF_INET, SOCK_STREAM, 0);
+        const int client = socket(AF_INET, SOCK_STREAM, 0);
+        int server;
+        char first[8] = {0};
+        char second[8] = {0};
+        char third[8] = {0};
+
+        memset(&address, 0, sizeof(address));
+        address.sin_family = AF_INET;
+        address.sin_port = htons((uint16_t)atoi(argv[2]));
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+            listen(listener, 1) != 0 ||
+            connect(client, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+            (server = accept(listener, NULL, NULL)) < 0 || send(client, "one", (size_t)3, 0) != 3 ||
+            recv(server, first, (size_t)3, 0) != 3 || send(client, "two", (size_t)3, 0) != 3)
+        {
+            (void)printf("setup=failed\n");
+            return 0;
+        }
+        if (read(server, second, (size_t)3) != 3 ||
+            recv(server, third, (size_t)3, MSG_DONTWAIT) != 3)
+        {
+            (void)printf("first=%s short=%s\n", first, try_open_errno_name(errno));
+            return 0;
+        }
+        (void)printf("first=%s second=%s third=%s\n", first, second, third);
         (void)close(server);
         (void)close(client);
         (void)close(listener);
