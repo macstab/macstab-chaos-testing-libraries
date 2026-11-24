@@ -520,6 +520,12 @@ first.
   paths, `@size`, `@first` or `@from` keep a rule to the calls meant.
 - `pthread_create` failures surface as the error the C library reports for a failed
   `clone`, normally the injected errno returned by `pthread_create()`.
+- **net REDIRECT overwrites the caller's sockaddr**, where the library passes a copy and
+  leaves it alone: the kernel reads that argument from the tracee's memory, and only a
+  register could point it elsewhere. A program that keeps the sockaddr and dials it again
+  reaches the target a second time, with no rule firing and no hit counted. Every runtime
+  builds the address per connect, so this is a difference to know rather than one to
+  work around (NETWORK.md, REDIRECT).
 
 ---
 

@@ -807,6 +807,13 @@ that answers and is the wrong one, a sidecar that has moved.
   writes it there once the notification is confirmed and then lets the call run, because a
   reply of CONTINUE makes the kernel read the arguments again. A write that fails leaves
   the original address in place, and the connection goes where the program meant.
+- That write is the one way the two modes differ, and it is visible: under `LD_PRELOAD` the
+  wrapper passes a copy and the caller's sockaddr is untouched, while the supervisor has to
+  overwrite the caller's own buffer -- the kernel reads the argument from there and nothing
+  but a register could point it elsewhere. A program that keeps the sockaddr and dials it
+  again therefore reaches the target a second time under `chaos-init`, with no rule firing
+  and no hit counted, where under `LD_PRELOAD` it would reach the address it stored. Build
+  the sockaddr per connect, as every runtime does, and the difference does not arise.
 
 **THROTTLE:rate.** A byte rate on the send side, in bytes per second. Each send takes
 what it needs from a token bucket; the bucket holds one second's worth and refills at
