@@ -520,14 +520,24 @@ static int chaos_net_test_listen(int sockfd, int backlog)
     return g_listen_result;
 }
 
+/** @brief The address the last fake connect() was given, which is what REDIRECT rewrites. */
+static struct sockaddr_storage g_connect_address;
+/** @brief Its length, which a redirect must leave as the caller passed it. */
+static socklen_t g_connect_address_length = 0;
+
 /** @brief Fake real connect(). */
 static int
 chaos_net_test_connect(int sockfd, const struct sockaddr *address, socklen_t address_length)
 {
     (void)sockfd;
-    (void)address;
-    (void)address_length;
     ++g_connect_calls;
+    (void)memset(&g_connect_address, 0, sizeof(g_connect_address));
+    if (address != NULL && address_length > 0 &&
+        (size_t)address_length <= sizeof(g_connect_address))
+    {
+        (void)memcpy(&g_connect_address, address, (size_t)address_length);
+    }
+    g_connect_address_length = address_length;
     return g_connect_result;
 }
 
@@ -1151,6 +1161,7 @@ static void reset_wrapper_stubs(void)
     g_bind_calls = 0;
     g_listen_calls = 0;
     g_connect_calls = 0;
+    g_connect_address_length = 0;
     g_accept_calls = 0;
     g_socket_calls = 0;
     g_socketpair_calls = 0;
@@ -1248,6 +1259,116 @@ static void test_bind_and_connect_paths(void)
     reset_wrapper_stubs();
     assert(connect(3, (const struct sockaddr *)&address, (socklen_t)sizeof(address)) == 0);
     assert(g_connect_calls == 1);
+}
+
+/**
+ * @brief Proves REDIRECT connects to the address of the rule instead of the one the
+ *   caller named, and only where that address fits the socket.
+ *
+ * @details The kernel then treats the new address as the one the connection was made to,
+ * so `getpeername` reports it and every later rule matches it -- which is why the rule
+ * has to be written for the address the program asks for, not for the one it reaches.
+ * Covered:
+ * - an IPv4 target over an IPv4 address: the real connect sees the target, with the
+ *   length the caller passed;
+ * - an IPv4 target over an IPv6 address: the IPv4-mapped form, which is how an AF_INET6
+ *   socket reaches an IPv4 host;
+ * - an IPv6 target over an IPv6 address: the target as it stands;
+ * - an IPv6 target over an IPv4 address: nothing fits, so the rule does not fire and no
+ *   draw is spent on it -- the call goes where the caller sent it;
+ * - a draw that misses: the same.
+ */
+static void test_connect_redirect(void)
+{
+    static const unsigned char mapped_prefix[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    struct sockaddr_in address;
+    struct sockaddr_in6 address6;
+    struct in_addr target4;
+    struct in6_addr target6;
+
+    assert(inet_pton(AF_INET, "10.0.0.7", &target4) == 1);
+    assert(inet_pton(AF_INET6, "2001:db8::7", &target6) == 1);
+    chaos_net_test_set_ipv4(&address, "127.0.0.1", 5432U);
+    memset(&address6, 0, sizeof(address6));
+    address6.sin6_family = AF_INET6;
+    address6.sin6_port = htons(5432U);
+
+    /* An IPv4 target over an IPv4 address. */
+    reset_wrapper_stubs();
+    g_should_trigger_calls = 0;
+    g_stub_endpoint_from_sockaddr = 1;
+    g_stub_match_endpoint = 1;
+    memset(&g_stub_rule, 0, sizeof(g_stub_rule));
+    g_stub_rule.effect = CHAOS_NET_EFFECT_REDIRECT;
+    g_stub_rule.redirect.family = AF_INET;
+    g_stub_rule.redirect.port = 5433U;
+    g_stub_rule.redirect.value.ipv4 = target4;
+    g_should_trigger = 1;
+    assert(connect(3, (const struct sockaddr *)&address, (socklen_t)sizeof(address)) == 0);
+    assert(g_connect_calls == 1);
+    assert(g_connect_address_length == (socklen_t)sizeof(struct sockaddr_in));
+    {
+        const struct sockaddr_in *sent =
+            (const struct sockaddr_in *)(const void *)&g_connect_address;
+
+        assert(sent->sin_family == AF_INET);
+        assert(ntohs(sent->sin_port) == 5433U);
+        assert(memcmp(&sent->sin_addr, &target4, sizeof(target4)) == 0);
+    }
+    assert(g_should_trigger_calls == 1);
+
+    /* The same target over an IPv6 address: the IPv4-mapped form. */
+    g_connect_calls = 0;
+    assert(connect(3, (const struct sockaddr *)&address6, (socklen_t)sizeof(address6)) == 0);
+    assert(g_connect_address_length == (socklen_t)sizeof(struct sockaddr_in6));
+    {
+        const struct sockaddr_in6 *sent =
+            (const struct sockaddr_in6 *)(const void *)&g_connect_address;
+        const unsigned char *bytes = (const unsigned char *)&sent->sin6_addr;
+
+        assert(sent->sin6_family == AF_INET6);
+        assert(ntohs(sent->sin6_port) == 5433U);
+        assert(memcmp(bytes, mapped_prefix, sizeof(mapped_prefix)) == 0);
+        assert(memcmp(bytes + 12, &target4, sizeof(target4)) == 0);
+    }
+
+    /* An IPv6 target over an IPv6 address. */
+    g_stub_rule.redirect.family = AF_INET6;
+    g_stub_rule.redirect.value.ipv6 = target6;
+    g_connect_calls = 0;
+    assert(connect(3, (const struct sockaddr *)&address6, (socklen_t)sizeof(address6)) == 0);
+    {
+        const struct sockaddr_in6 *sent =
+            (const struct sockaddr_in6 *)(const void *)&g_connect_address;
+
+        assert(memcmp(&sent->sin6_addr, &target6, sizeof(target6)) == 0);
+    }
+
+    /* An IPv6 target over an IPv4 address fits nowhere: the call goes where the caller
+     * sent it, and the rule is not even asked. */
+    g_connect_calls = 0;
+    g_should_trigger_calls = 0;
+    assert(connect(3, (const struct sockaddr *)&address, (socklen_t)sizeof(address)) == 0);
+    {
+        const struct sockaddr_in *sent =
+            (const struct sockaddr_in *)(const void *)&g_connect_address;
+
+        assert(ntohs(sent->sin_port) == 5432U);
+    }
+    assert(g_should_trigger_calls == 0);
+
+    /* A draw that misses: the caller's address again. */
+    g_stub_rule.redirect.family = AF_INET;
+    g_should_trigger = 0;
+    g_connect_calls = 0;
+    assert(connect(3, (const struct sockaddr *)&address, (socklen_t)sizeof(address)) == 0);
+    {
+        const struct sockaddr_in *sent =
+            (const struct sockaddr_in *)(const void *)&g_connect_address;
+
+        assert(ntohs(sent->sin_port) == 5432U);
+    }
+    reset_wrapper_stubs();
 }
 
 /**
@@ -4566,6 +4687,7 @@ int main(void)
     test_wrappers_record_call_size();
     test_size_of_vectors_and_messages();
     test_bind_and_connect_paths();
+    test_connect_redirect();
     test_accept_and_send_paths();
     test_recv_paths();
     test_descriptor_calls_on_sockets();

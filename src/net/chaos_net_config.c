@@ -725,6 +725,13 @@ static int chaos_net_effect_allowed(chaos_net_operation_t operation, chaos_net_e
     {
         return operation == CHAOS_NET_OP_CLOSE;
     }
+    if (effect == CHAOS_NET_EFFECT_REDIRECT)
+    {
+        /* The destination is an argument of `connect` and of nothing else: `bind` names a
+         * local address, and a datagram send names its destination per call, which a rule
+         * cannot rewrite without also rewriting what the caller believes it sent. */
+        return operation == CHAOS_NET_OP_CONNECT;
+    }
     if (effect == CHAOS_NET_EFFECT_DROP)
     {
         return operation == CHAOS_NET_OP_SEND;
@@ -956,10 +963,95 @@ static int chaos_net_config_read_file(size_t *size_out, uint64_t expected_stamp)
 }
 
 /**
+ * @brief Parses a REDIRECT address: `ADDRESS:PORT`, or `[ADDRESS]:PORT` for IPv6.
+ *
+ * @details Parsed by the selector parser itself, with a scheme put in front, so that an
+ * address and a port are read and bounded in exactly one place. What a selector allows and
+ * a target does not: a wildcard host, a `/N` prefix and port 0 -- a redirect needs one
+ * address and a port `connect` can use. The family follows the notation, so `[::1]:443` is
+ * IPv6 and `127.0.0.1:443` IPv4.
+ *
+ * @return 0 with @p target written, or -1.
+ */
+static int chaos_net_parse_redirect_address(const char *text, chaos_net_redirect_t *target)
+{
+    char scheme[CHAOS_NET_MAX_TEXT];
+    chaos_net_endpoint_t endpoint;
+    const int ipv6 = *text == '[';
+
+    if ((size_t)snprintf(scheme, sizeof(scheme), "%s%s", ipv6 ? "tcp6://" : "tcp4://", text) >=
+        sizeof(scheme))
+    {
+        return -1;
+    }
+    if (!chaos_net_endpoint_parse_selector(scheme, &endpoint) || endpoint.wildcard_host ||
+        endpoint.port == 0U || endpoint.prefix_len != (ipv6 ? 128U : 32U))
+    {
+        return -1;
+    }
+    (void)memset(target, 0, sizeof(*target));
+    target->family = ipv6 ? AF_INET6 : AF_INET;
+    target->port = endpoint.port;
+    if (ipv6)
+    {
+        target->value.ipv6 = endpoint.value.ipv6;
+    }
+    else
+    {
+        target->value.ipv4 = endpoint.value.ipv4;
+    }
+    return 0;
+}
+
+/**
+ * @brief Parses a REDIRECT value: an address with a port, optionally `@probability`.
+ *
+ * @details The probability is written after the address as LATENCY writes it after the
+ * milliseconds, and is 1.0 without one. No address of either family contains an `@`, so
+ * the last one in the value is the separator.
+ *
+ * @return 0 with @p target and @p probability written, or -1.
+ */
+static int
+chaos_net_parse_redirect(const char *text, chaos_net_redirect_t *target, double *probability)
+{
+    const char *at;
+
+    if (text == NULL || target == NULL || probability == NULL || *text == '\0')
+    {
+        return -1;
+    }
+    *probability = 1.0;
+    at = strrchr(text, '@');
+    if (at == NULL)
+    {
+        return chaos_net_parse_redirect_address(text, target);
+    }
+    {
+        char address[CHAOS_NET_MAX_TEXT];
+
+        if ((size_t)(at - text) >= sizeof(address) ||
+            chaos_net_parse_probability(at + 1, probability) != 0)
+        {
+            return -1;
+        }
+        (void)memcpy(address, text, (size_t)(at - text));
+        address[at - text] = '\0';
+        return chaos_net_parse_redirect_address(address, target);
+    }
+}
+
+/**
  * @brief Splits a rule line into selector, operation, effect and value.
  *
  * @details Splits right to left at the last three `:` so that colons inside the selector
  * (`tcp6://[::1]:443`, the port separator) stay in it. Each field is trimmed.
+ *
+ * REDIRECT is the one effect whose **value** carries a colon as well (`ADDRESS:PORT`), so
+ * a line that holds the keyword `:REDIRECT:` is split there instead: everything after it
+ * is the value, and the part in front is split from the right once for the operation. A
+ * right-to-left split would read the port as the value and the address as the effect, and
+ * reject the line.
  *
  * @param line            Writable NUL-terminated rule line; modified in place.
  * @param selector_text   Output: selector field.
@@ -982,6 +1074,26 @@ static int chaos_net_split_rule_fields(
         return 0;
     }
 
+    value_sep = strstr(line, ":REDIRECT:");
+    if (value_sep != NULL)
+    {
+        char *keyword = value_sep + 1;
+        char *target = value_sep + sizeof(":REDIRECT:") - 1U;
+
+        *value_sep = '\0';
+        target[-1] = '\0';
+        operation_sep = strrchr(line, ':');
+        if (operation_sep == NULL)
+        {
+            return 0;
+        }
+        *operation_sep++ = '\0';
+        *selector_text = chaos_net_trim(line);
+        *operation_text = chaos_net_trim(operation_sep);
+        *effect_text = keyword;
+        *value_text = chaos_net_trim(target);
+        return 1;
+    }
     value_sep = strrchr(line, ':');
     if (value_sep == NULL)
     {
@@ -1174,6 +1286,14 @@ int chaos_net_config_parse_line(char *line, chaos_net_rule_t *rule)
     {
         rule->effect = CHAOS_NET_EFFECT_RESET;
         if (chaos_net_parse_probability(value_text, &rule->probability) != 0)
+        {
+            return -1;
+        }
+    }
+    else if (strcmp(effect_text, "REDIRECT") == 0)
+    {
+        rule->effect = CHAOS_NET_EFFECT_REDIRECT;
+        if (chaos_net_parse_redirect(value_text, &rule->redirect, &rule->probability) != 0)
         {
             return -1;
         }

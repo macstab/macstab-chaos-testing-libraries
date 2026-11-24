@@ -913,8 +913,10 @@ chaos_init_answer(int listener, unsigned libs, void *request, void *response, si
     }
     chaos_init_decide(libs, &call, &verdict);
     /* The decision read memory and /proc by tid: act on it only if that notification is
-     * still pending, i.e. the tid still names the waiting thread and not a reused pid. */
-    if (verdict.action != CHAOS_INIT_PASS &&
+     * still pending, i.e. the tid still names the waiting thread and not a reused pid. A
+     * PASS is checked too when the verdict writes the tracee's memory (REDIRECT): the
+     * reply cannot misfire, but the write would. */
+    if ((verdict.action != CHAOS_INIT_PASS || verdict.redirect_size > 0U) &&
         chaos_init_ioctl(listener, SECCOMP_IOCTL_NOTIF_ID_VALID, &notification->id) != 0 &&
         chaos_init_caller_gone(errno))
     {

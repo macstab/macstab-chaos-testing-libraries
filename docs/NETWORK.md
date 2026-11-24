@@ -54,11 +54,11 @@ document wins where the two would disagree.
 | Hits file | `/tmp/.chaos-net.hits.<n>` |
 | Rule grammar | `<selector>:<operation>:<effect>:<value> [qualifier ...]` |
 | Operations | `socket`, `bind`, `listen`, `connect`, `accept`, `shutdown`, `send`, `recv`, `close`, `poll` |
-| Effects | ERRNO, LATENCY, CORRUPT, TIMEOUT, RESET, TRICKLE, DUP, DROP, THROTTLE |
+| Effects | ERRNO, LATENCY, CORRUPT, TIMEOUT, RESET, TRICKLE, DUP, DROP, THROTTLE, REDIRECT |
 | Qualifiers | `@first=N`, `@every=N`, `@at=+N`, `@from=T`, `@until=T`, `@size>N`, `@size<N` |
 | Limits | 256 rules; rule file under 256 KiB (262 144 bytes) |
 | Failure mode | fail-open: no rule, bad rule file or unresolvable endpoint means passthrough |
-| SECCOMP mode | ERRNO (not on `close`), LATENCY, TIMEOUT, DROP on a datagram send, THROTTLE on a send, TRICKLE, CORRUPT and DUP on a receive, RESET on close; see [`docs/SECCOMP.md`](SECCOMP.md) |
+| SECCOMP mode | ERRNO (not on `close`), LATENCY, TIMEOUT, REDIRECT on connect, DROP on a datagram send, THROTTLE on a send, TRICKLE, CORRUPT and DUP on a receive, RESET on close; see [`docs/SECCOMP.md`](SECCOMP.md) |
 
 ## 1. Overview
 
@@ -221,7 +221,7 @@ Every wrapper runs the same sequence:
 4. Select the single best rule for `(operation, endpoint)`. If none, call the
    real function.
 5. Apply the effect: pre-call (ERRNO, LATENCY, TIMEOUT, RESET, TRICKLE, THROTTLE,
-   DROP, DUP replay) or post-call (CORRUPT, DUP store, ERRNO on `close`).
+   REDIRECT, DROP, DUP replay) or post-call (CORRUPT, DUP store, ERRNO on `close`).
 
 Exactly one rule applies to a call. Two rules for the same operation and endpoint
 do not compose; the more specific one wins (see below). To combine, for example,
@@ -443,8 +443,8 @@ and `getsockopt` it issues runs under the reentrancy guard and preserves `errno`
 ### Effects (`chaos_net_actions.c` and the wrappers)
 
 ERRNO, LATENCY and the probability decision are shared. CORRUPT, TIMEOUT, RESET,
-TRICKLE, DROP, THROTTLE and DUP are implemented where the call's buffers are, in the
-wrappers.
+TRICKLE, DROP, THROTTLE, REDIRECT and DUP are implemented where the call's buffers and
+addresses are, in the wrappers.
 
 ### Why there is no socket cache
 
@@ -524,8 +524,13 @@ udp4://10.0.0.5:53:send:DROP:0.1
 | DUP | probability | `recv` | instead of the next receive |
 | DROP | probability | `send` | instead of the send, on datagram sockets |
 | THROTTLE | bytes per second, 1–4294967295 | `send` | before the send |
+| REDIRECT | `ADDRESS:PORT`, optionally `@probability` | `connect` | instead of the address |
 
 An effect/operation pair outside this table rejects the rule file.
+
+`REDIRECT` is the one effect whose value carries a `:` of its own, so a line holding the
+keyword `:REDIRECT:` is split there rather than from the right. An IPv6 target needs its
+brackets, as an IPv6 selector does: `[2001:db8::1]:443`.
 
 Under `chaos-init`, `TRICKLE` applies to `recv`, `recvfrom` and `read` on a stream socket:
 their length sits in a register, so those calls are answered with `SECCOMP_RET_TRACE` and
@@ -778,6 +783,30 @@ rarely tested (double charges, double writes, repeated side effects).
   address the kernel cut to fit the caller's buffer is kept only as far as that
   buffer reached. A `fork()` child releases slot locks that other threads held at
   the fork.
+
+**REDIRECT:address:port.** The connection is made to that address instead of the one the
+program asked for -- the misconfiguration no errno models: the staging database, a service
+that answers and is the wrong one, a sidecar that has moved.
+
+- The real `connect` is called with the address of the rule, so the kernel treats it as the
+  destination: `getpeername` reports it, and so does `ss`. Nothing in the program is told
+  that the address it passed was replaced, which is the point.
+- **Every later rule matches the redirected address.** A rule on the original destination
+  fires once, on the connect; the sends and receives that follow match rules for the
+  address the connection actually reached. Writing both is how a test says "the connection
+  goes there, and there it is slow".
+- The family of the address the program passed decides what can be written into it: an
+  IPv4 target over an `AF_INET6` address becomes the IPv4-mapped form
+  (`::ffff:a.b.c.d`), which is how such a socket reaches an IPv4 host; an IPv6 target over
+  an `AF_INET` address fits nowhere, so the rule does not fire and counts no hit -- decided
+  per call, before the draw, as DROP decides stream against datagram.
+- `connect` is the only operation: `bind` names a local address, and a datagram send names
+  its destination per call, which a rule cannot rewrite without also rewriting what the
+  caller believes it sent.
+- Under `chaos-init` the address lives in the memory of the traced process. The supervisor
+  writes it there once the notification is confirmed and then lets the call run, because a
+  reply of CONTINUE makes the kernel read the arguments again. A write that fails leaves
+  the original address in place, and the connection goes where the program meant.
 
 **THROTTLE:rate.** A byte rate on the send side, in bytes per second. Each send takes
 what it needs from a token bucket; the bucket holds one second's worth and refills at
@@ -1079,6 +1108,9 @@ tcp4://*:8443:accept:LATENCY:200
 # Redis replies arrive one byte at a time (client side: the server is the peer).
 tcp4://10.0.0.5:6379:recv:TRICKLE:1
 
+# The connection to the primary lands on the read replica instead.
+tcp4://10.0.0.15:5432:connect:REDIRECT:10.0.0.16:5432
+
 # The link to the object store gives 64 KiB/s on the send side.
 tcp4://10.0.0.7:9000:send:THROTTLE:65536
 
@@ -1166,7 +1198,7 @@ any service-mesh sidecar connection in the process.
 - **Dynamic linker.** Interposition requires a dynamically linked target that
   honours `LD_PRELOAD` (not set-uid under `AT_SECURE`). Statically linked
   programs and runtimes with their own system-call layer bypass the library;
-  SECCOMP mode covers them for ERRNO, LATENCY, TIMEOUT, DROP, THROTTLE, TRICKLE, CORRUPT, DUP
+  SECCOMP mode covers them for ERRNO, LATENCY, TIMEOUT, DROP, THROTTLE, REDIRECT, TRICKLE, CORRUPT, DUP
   and RESET.
 - **Kernel.** Endpoint identity comes from `getsockname`, `getpeername` and
   `SO_TYPE`; `epoll` membership from `/proc/self/fdinfo`. TIMEOUT waits with

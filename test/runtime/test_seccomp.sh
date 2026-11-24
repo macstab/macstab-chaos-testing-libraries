@@ -31,7 +31,8 @@
 # - a rule SECCOMP mode cannot apply (CORRUPT) rejects the whole file, named in the status;
 # - TORN is applied through a ptrace stop: the returned count and the file size both drop
 #   below ten and agree, and a fork of the traced application still runs; TRICKLE cuts a
-#   stream receive to its chunk and leaves the rest in the socket; CORRUPT flips one bit of
+#   stream receive to its chunk and leaves the rest in the socket; REDIRECT lands a connect
+#   on the address of the rule, which getpeername then reports; CORRUPT flips one bit of
 #   what a read delivered, decided at the stop after the call; THROTTLE holds 512 KiB of
 #   writes to about a second and shortens them, while the same writes without a matching
 #   rule stay immediate;
@@ -361,6 +362,22 @@ expect "C: TRICKLE shortens every receive" "$($init --libs net -- /tmp/probe tri
     "first=4 rest=4"
 expect "C: the TRICKLE rule is applied, not rejected" \
     "$(sed -n 1,2p /tmp/.chaos-net.status | tr "\n" " ")" "state=ok rules=1 "
+rm -f /tmp/.chaos-net.conf
+
+# REDIRECT: the address `connect` was given is in the memory of the tracee, and a reply of
+# CONTINUE makes the kernel read it from there after the answer -- so the supervisor writes
+# the new address and lets the call run. Nothing listens on the port the probe dials, so a
+# connection at all is the redirect, and the port getpeername reports is where it landed.
+printf "%s\n" "tcp4://127.0.0.1:7902:connect:REDIRECT:127.0.0.1:7901 # t" > /tmp/.chaos-net.conf
+expect "C: REDIRECT lands the connection on the address of the rule" \
+    "$($init --libs net -- /tmp/probe redirect 7901)" "peer=7901"
+expect "C: the REDIRECT rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-net.status | tr "\n" " ")" "state=ok rules=1 "
+# Without the rule the same dial fails, which is what tells a redirect from a port that
+# was open anyway.
+printf "%s\n" "tcp4://127.0.0.1:7903:connect:REDIRECT:127.0.0.1:7901 # t" > /tmp/.chaos-net.conf
+expect "C: and only where a rule matches" \
+    "$($init --libs net -- /tmp/probe redirect 7901)" "peer=ECONNREFUSED"
 rm -f /tmp/.chaos-net.conf
 
 # CORRUPT through the stop after the call: the entry stop cannot know how many bytes a read

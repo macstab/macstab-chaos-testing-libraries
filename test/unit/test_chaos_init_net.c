@@ -1615,6 +1615,83 @@ int main(void)
             assert(strstr(lines, "suppressed.unknown=3\n") != NULL);
         }
     }
+    /* REDIRECT: the address `connect` was given is in the tracee, and a notification
+     * answered with CONTINUE makes the kernel read it from there again -- so the verdict
+     * carries the new address and the call is let through. Here the tracee is this
+     * process, so the write can be read back from the buffer that was passed. */
+    (void)snprintf(
+        rules,
+        sizeof(rules),
+        "tcp4://127.0.0.1:%u:connect:REDIRECT:10.0.0.7:5433\n",
+        ntohs(server_address.sin_port)
+    );
+    write_rules(rules);
+    {
+        struct sockaddr_in wanted = server_address;
+        struct in_addr target;
+        chaos_net_redirect_t rule_target;
+        chaos_init_call_t call;
+        chaos_init_verdict_t verdict;
+
+        assert(inet_pton(AF_INET, "10.0.0.7", &target) == 1);
+        memset(&rule_target, 0, sizeof(rule_target));
+        rule_target.family = AF_INET;
+        rule_target.port = 5433U;
+        rule_target.value.ipv4 = target;
+        memset(&call, 0, sizeof(call));
+        call.tid = getpid();
+        call.nr = __NR_connect;
+        call.args[0] = (uint64_t)unbound;
+        call.args[1] = P(&wanted);
+        call.args[2] = sizeof(wanted);
+        memset(&verdict, 0, sizeof(verdict));
+        verdict.action = CHAOS_INIT_FAIL;
+        verdict.error = -1;
+        assert(chaos_init_net_decide(&call, &verdict) == 1);
+        /* The call runs: the kernel is to connect to the address the commit writes. */
+        assert(verdict.action == CHAOS_INIT_PASS);
+        assert(verdict.redirect_size == sizeof(wanted));
+        /* Nothing is written before the notification is confirmed, which the supervisor
+         * does between the decision and the commit. */
+        assert(wanted.sin_addr.s_addr == server_address.sin_addr.s_addr);
+        chaos_init_net_commit(&call, &verdict);
+        assert(memcmp(&wanted.sin_addr, &target, sizeof(target)) == 0);
+        assert(ntohs(wanted.sin_port) == 5433U);
+        /* An address the supervisor cannot read builds nothing. Not reachable through a
+         * decision -- the endpoint the rule matched was resolved from that same sockaddr
+         * -- so the guard is proved by calling the builder itself, as the io tests prove
+         * theirs. */
+        {
+            unsigned char built[sizeof(struct sockaddr_storage)];
+            unsigned built_size = 1U;
+            chaos_init_call_t unreadable = call;
+
+            unreadable.args[1] = 8U;
+            assert(chaos_init_net_redirect(&unreadable, &rule_target, built, &built_size) == 0);
+            assert(built_size == 0U);
+            /* And an address that would not fit the length the caller passed. */
+            unreadable = call;
+            unreadable.args[2] = 1U;
+            assert(chaos_init_net_redirect(&unreadable, &rule_target, built, &built_size) == 0);
+        }
+    }
+    /* A target of the other family fits no sockaddr this socket can pass: the rule does
+     * not fire, and the draw is not spent on it. */
+    (void)snprintf(
+        rules,
+        sizeof(rules),
+        "tcp4://127.0.0.1:%u:connect:REDIRECT:[2001:db8::7]:5433\n",
+        ntohs(server_address.sin_port)
+    );
+    write_rules(rules);
+    {
+        struct sockaddr_in wanted = server_address;
+
+        assert(PASSES(decide(__NR_connect, (uint64_t)unbound, P(&wanted), sizeof(wanted), 0, 0, 0))
+        );
+        assert(wanted.sin_addr.s_addr == server_address.sin_addr.s_addr);
+    }
+
     /* THROTTLE: the same bucket arithmetic as the library's, applied through the
      * registers. Ten bytes per second, so the bucket holds ten and a byte takes 100 ms to
      * arrive -- slow enough that the test does not depend on how fast this machine is. */

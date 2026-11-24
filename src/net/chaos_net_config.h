@@ -105,7 +105,8 @@ typedef enum chaos_net_effect
     CHAOS_NET_EFFECT_TRICKLE,      /**< RECV-only: return at most chunk_bytes per call. */
     CHAOS_NET_EFFECT_DUP,          /**< RECV-only: deliver the previous payload once more. */
     CHAOS_NET_EFFECT_DROP,         /**< SEND-only, datagrams: report the send, send nothing. */
-    CHAOS_NET_EFFECT_THROTTLE      /**< SEND-only, streams: hold the send to a byte rate. */
+    CHAOS_NET_EFFECT_THROTTLE,     /**< SEND-only, streams: hold the send to a byte rate. */
+    CHAOS_NET_EFFECT_REDIRECT      /**< CONNECT-only: connect to another address instead. */
 } chaos_net_effect_t;
 
 /**
@@ -201,6 +202,8 @@ typedef struct chaos_net_endpoint
  *   - CORRUPT, TIMEOUT, DUP, RESET: `probability`.
  *   - LATENCY: `latency_ms`; `probability` is unused (0). The qualifiers still gate it.
  *   - TRICKLE: `chunk_bytes` (>= 1); `probability` is fixed at 1.0.
+ *   - THROTTLE: `rate_bps` (>= 1); `probability` is fixed at 1.0.
+ *   - REDIRECT: `redirect` and `probability`.
  *
  * Probabilities are sampled per call from the calling thread's PRNG. Wrappers copy the
  * rule out of the snapshot (seqlock-validated) and may set `call_size` on their copy.
@@ -218,6 +221,7 @@ typedef struct chaos_net_rule
     unsigned int latency_ms;         /**< LATENCY: delay in ms, at most UINT32_MAX. */
     unsigned int chunk_bytes;        /**< TRICKLE: most bytes one receive call returns. */
     uint64_t rate_bps;               /**< THROTTLE: bytes per second, 1 .. 4294967295. */
+    chaos_net_redirect_t redirect;   /**< REDIRECT: where the connect goes instead. */
     /** Qualifiers written after the rule (`@first`, `@from`, `@until`, `@size`). */
     chaos_rule_policy_t policy;
     /**

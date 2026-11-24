@@ -71,7 +71,7 @@ How the libc layer instantiates the triple:
 | Part | libc layer |
 |---|---|
 | S | a path prefix (io), an endpoint (net), a host name or address (dns), a function or function/argument class (time, process, memory), always with `*` as catch-all |
-| E | ERRNO (an errno name, or a positive number in every library), GAI (`EAI_*`, dns), LATENCY, TIMEOUT, CORRUPT, TORN, DROP, THROTTLE, FREE, FULL, TRICKLE, DUP, RESET, OFFSET, REGRESS, FREEZE, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER |
+| E | ERRNO (an errno name, or a positive number in every library), GAI (`EAI_*`, dns), LATENCY, TIMEOUT, CORRUPT, TORN, DROP, THROTTLE, REDIRECT, FREE, FULL, TRICKLE, DUP, RESET, OFFSET, REGRESS, FREEZE, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER |
 | P | probability ∧ `@from`/`@until` window ∧ `@size` gate ∧ `@every` evaluation gate ∧ `@first` budget; for FAIL_AFTER additionally a per-operation call counter |
 | selection | io, net: **one rule per call**, the most specific for the call's operation. dns, time, process, memory: **one rule per effect**, the most specific for each effect, so several effects compose on one call (§8) |
 
@@ -216,6 +216,8 @@ net-effect    = net-errno ":" probability                   ; every operation
               / "RESET" ":" probability                     ; close only
               / "DROP" ":" probability                      ; send only, datagram sockets
               / "THROTTLE" ":" rate                         ; send only
+              / "REDIRECT" ":" target [ "@" probability ]   ; connect only
+target        = ipv4 ":" port / "[" ipv6 "]" ":" port       ; one address, port >= 1
 net-errno     = "ECONNREFUSED" / "ETIMEDOUT" / "ECONNRESET" / "EHOSTUNREACH"
               / "ENETUNREACH" / "EADDRINUSE" / "EADDRNOTAVAIL" / "EAFNOSUPPORT"
               / "EPROTONOSUPPORT" / "EPIPE" / "ENOTCONN" / "EOPNOTSUPP" / "EINVAL"
@@ -223,6 +225,8 @@ net-errno     = "ECONNREFUSED" / "ETIMEDOUT" / "ECONNRESET" / "EHOSTUNREACH"
               / 1*DIGIT                                     ; 1 .. 2147483647
 ;; socket rules accept only "*", a wildcard host with port 0 ("tcp4://*:0"),
 ;; or "unix://*": a new socket has no address yet.
+;; REDIRECT is the one effect whose value carries a ":" of its own, so a line that
+;; holds the keyword ":REDIRECT:" is split there rather than from the right.
 
 ;; --------------------------------------------------------------- libchaos-dns
 ;; /tmp/.chaos-dns.conf
@@ -348,8 +352,8 @@ Same caveat as §2.3: a sketch of the surface, not its source of truth.
 |---|---|---|---|
 | **Selector** | Path prefix, endpoint, host name/address, or function selector parsed from a text rule | `ChaosSelector` typed builder — `network()`, `jdbc()`, `dns()`, etc. | `@Chaos(target=…)` annotation parameter; YAML `selector:` block |
 | **Selector match site** | Inside the wrapper, against the call's arguments (descriptors resolved to paths or endpoints) | Inside the ByteBuddy-injected advice at the JDK call site | At the orchestration boundary (Toxiproxy / Testcontainers `withCommand` hook) |
-| **Effect** | ERRNO, GAI, LATENCY, TIMEOUT, CORRUPT, TORN, DROP, THROTTLE, FREE, FULL, TRICKLE, DUP, RESET, OFFSET, REGRESS, FREEZE, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER | `ChaosEffect.delay/throw/fail/stress/deadlock/spike/drop` | Toxiproxy toxics / `tc netem` rules / cgroup throttling |
-| **Effect application phase** | Pre-call (ERRNO, GAI, LATENCY, FAIL_AFTER; TORN and THROTTLE shorten the count), instead of the call (OVERRIDE, DROP), post-call (CORRUPT, OFFSET, REGRESS, FREEZE, result-set transforms) | Same conceptual phases at the bytecode advice level | At the network/cgroup boundary, always pre-effect from the application's perspective |
+| **Effect** | ERRNO, GAI, LATENCY, TIMEOUT, CORRUPT, TORN, DROP, THROTTLE, REDIRECT, FREE, FULL, TRICKLE, DUP, RESET, OFFSET, REGRESS, FREEZE, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER | `ChaosEffect.delay/throw/fail/stress/deadlock/spike/drop` | Toxiproxy toxics / `tc netem` rules / cgroup throttling |
+| **Effect application phase** | Pre-call (ERRNO, GAI, LATENCY, FAIL_AFTER; TORN and THROTTLE shorten the count, REDIRECT replaces the address), instead of the call (OVERRIDE, DROP), post-call (CORRUPT, OFFSET, REGRESS, FREEZE, result-set transforms) | Same conceptual phases at the bytecode advice level | At the network/cgroup boundary, always pre-effect from the application's perspective |
 | **Activation policy** | Probability, `@first`, `@every`, `@from`/`@until`, `@size`; FAIL_AFTER's call counter | `ActivationPolicy.always/count/timeWindow/session` | Annotation parameters + scenario lifecycle hooks |
 | **Activation evaluation** | Per call: window, size gate, `@every`, the rule's probability sample, `@first` claim | Per-call dispatcher check + session-scoped state | Lifecycle-driven (apply on `@BeforeEach`, remove on `@AfterEach`) |
 | **Configuration source** | Text file `/tmp/.chaos-<lib>.conf` | Java code (builder) + JSON startup config | YAML / annotations + dynamic Testcontainers calls |
@@ -492,6 +496,23 @@ nothing waits for a tenth of a second's worth -- or, on a non-blocking descripto
 is told `EAGAIN`. The bucket is per descriptor and per rule, so two rules do not
 share a rate and two descriptors are limited separately. There is no probability
 (§2.1). Semantics: [IO.md](IO.md), [NETWORK.md](NETWORK.md).
+
+### 5.8. Sending a connection elsewhere (REDIRECT)
+
+`REDIRECT:<address>:<port>` on net `connect` connects to that address instead of the one
+the program asked for, which is the misconfiguration no errno models: the port of the
+staging database, a service that answers but is the wrong one, a sidecar that has moved.
+The kernel then treats the new address as the one the connection was made to, and three
+consequences follow from that, all of them intended:
+
+- `getpeername` reports the address the rule named, not the one the program passed;
+- every later rule matches the **redirected** address, so a rule on the original one
+  never fires again for that connection;
+- a rule naming the original destination is therefore the only place to write the
+  redirect: a second rule on the target decides what the connection then meets.
+
+An optional `@probability` after the port makes it occasional, as LATENCY's does.
+Semantics: [NETWORK.md](NETWORK.md).
 
 ---
 
@@ -681,6 +702,7 @@ select one rule
   THROTTLE → real call with the count the rate allows  (io write, pwrite;
                                                         net send; a datagram is
                                                         never cut, it waits)
+  REDIRECT → real call with another destination        (net connect)
   FREE/FULL→ real call, then the free counts rewritten (io statfs)
   CORRUPT  → real call, then flip one returned bit     (io read, pread; net recv)
   other net effects: see NETWORK.md

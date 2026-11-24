@@ -457,7 +457,9 @@ CHAOS_NET_EXPORT int listen(int sockfd, int backlog)
  *
  * @details Endpoint from the destination sockaddr plus SO_TYPE, e.g.
  * `tcp4://10.0.0.1:6379 : connect : ECONNREFUSED : 1.0`. An ERRNO firing never reaches
- * the kernel: no SYN is sent and the socket stays unconnected.
+ * the kernel: no SYN is sent and the socket stays unconnected. A REDIRECT firing sends
+ * the connect to another address instead, which the kernel then treats as the one the
+ * caller asked for: `getpeername` reports it, and every later rule matches it.
  */
 CHAOS_NET_EXPORT int
 connect(int sockfd, CHAOS_NET_CONST_SOCKADDR_PARAM address, socklen_t address_length)
@@ -478,6 +480,20 @@ connect(int sockfd, CHAOS_NET_CONST_SOCKADDR_PARAM address, socklen_t address_le
     if (chaos_net_apply_pre_call_rule(&rule) != 0)
     {
         return -1;
+    }
+    if (rule.effect == CHAOS_NET_EFFECT_REDIRECT)
+    {
+        struct sockaddr_storage target;
+        socklen_t target_length = 0;
+
+        /* Built before the draw, so a target this socket cannot reach spends no hit. */
+        if (chaos_net_redirect_sockaddr(&rule.redirect, address_ptr, &target, &target_length) &&
+            chaos_net_rule_should_trigger(&rule))
+        {
+            return chaos_net_call_real_connect(
+                sockfd, (const struct sockaddr *)(const void *)&target, target_length
+            );
+        }
     }
     return chaos_net_call_real_connect(sockfd, address_ptr, address_length);
 }

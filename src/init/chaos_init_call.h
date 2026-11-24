@@ -91,6 +91,14 @@ typedef struct chaos_init_verdict
      * vectored forms carry their count in memory and are never shortened.
      */
     unsigned arg_index;
+    /**
+     * REDIRECT: the address to write over the one `connect` was given, and how many bytes
+     * of it; 0 when the verdict redirects nothing. Written by chaos_init_net_commit()
+     * once the notification is confirmed -- a reused pid must not receive it -- and the
+     * call is then let through, so the kernel reads the new address from the tracee.
+     */
+    unsigned char redirect[128];
+    unsigned redirect_size;
     /** TIMEOUT on a wait: write "nothing ready" into the caller's buffers. Done by
      *  chaos_init_net_commit() only after SECCOMP_IOCTL_NOTIF_ID_VALID confirmed the
      *  thread still waits, so a reused pid is never written to. */

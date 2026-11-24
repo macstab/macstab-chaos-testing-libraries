@@ -377,6 +377,7 @@ udp4://127.0.0.1:5353:send:EHOSTUNREACH:0.2
 tcp4://127.0.0.1:9000:recv:CORRUPT:0.1
 tcp4://127.0.0.1:6379:recv:TRICKLE:1
 tcp4://127.0.0.1:9000:send:THROTTLE:65536
+tcp4://127.0.0.1:5432:connect:REDIRECT:127.0.0.1:5433
 tcp4://127.0.0.1:9092:recv:DUP:0.05
 tcp4://*:5432:close:RESET:1.0
 tcp4://10.0.0.0/8:5432:connect:ECONNREFUSED:0.1
@@ -438,6 +439,7 @@ call passes through.
 | `RESET` | probability | `close` | Sets `SO_LINGER` to 0 before the close, so the peer receives an RST (`ECONNRESET`) instead of a FIN, as after a crashed process or a load balancer drop. |
 | `DROP` | probability | `send` | Reports the full byte count as sent and sends nothing: a lost packet. Datagram sockets only, decided per call from `SO_TYPE`, so a `*:send:DROP` rule leaves stream sends alone and counts no hit for them — a silent gap in a TCP stream is a state no network produces. Not applied to `sendmmsg`, whose result is a message count. |
 
+| `REDIRECT` | `ADDRESS:PORT`, optionally `@probability` | `connect` | Connects to that address instead of the one the program asked for: the misconfiguration no errno models. The kernel treats the new address as the destination, so `getpeername` reports it and every later rule matches it; a rule on the original destination fires only on the connect. An IPv4 target over an `AF_INET6` address becomes the IPv4-mapped form; an IPv6 target over an `AF_INET` address fits nowhere and the rule does not fire. |
 | `THROTTLE` | bytes per second, no probability | `send` | Holds the send side to that rate: each send moves what a token bucket of one second's worth allows, so the first second passes untouched. A stream send comes back short; a datagram is never cut and waits for its whole message instead. An empty bucket returns `EAGAIN` on a non-blocking socket and otherwise waits for a tenth of a second's worth. Not applied to `sendmsg` or `sendmmsg`, whose length is in memory. |
 
 **Errnos.** `ECONNREFUSED`, `ETIMEDOUT`, `ECONNRESET`, `EHOSTUNREACH`, `ENETUNREACH`,
@@ -711,7 +713,7 @@ chaos-init --libs io,net,memory,process -- /usr/local/bin/nats-server -js
 | Library | Applied in SECCOMP mode |
 |---|---|
 | io | errno and `LATENCY` on every operation (`close`: `LATENCY` only); `TORN`, `THROTTLE`, `CORRUPT` and `DROP` through a ptrace stop |
-| net | errno and `LATENCY` on every operation (`close`: `LATENCY` only); `TIMEOUT` on `poll`, `DROP` on a datagram send; `THROTTLE`, `TRICKLE`, `CORRUPT`, `DUP` and `RESET` through a ptrace stop |
+| net | errno and `LATENCY` on every operation (`close`: `LATENCY` only); `TIMEOUT` on `poll`, `REDIRECT` on `connect`, `DROP` on a datagram send; `THROTTLE`, `TRICKLE`, `CORRUPT`, `DUP` and `RESET` through a ptrace stop |
 | memory | `ERRNO`, `LATENCY` |
 | process | `ERRNO`, `LATENCY`, `FAIL_AFTER`; `clone` is classified as `pthread_create` (`CLONE_THREAD`), `posix_spawn` (`CLONE_VFORK`) or `fork` |
 | time | `ERRNO`, `LATENCY` on a clock read and on `nanosleep`; `OFFSET`, `REGRESS`, `FREEZE` on a clock read. The vDSO lookups of each image are made to fail first, so the reads become system calls; a `usleep` rule is rejected |

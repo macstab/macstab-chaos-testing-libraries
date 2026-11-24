@@ -106,15 +106,18 @@ static int chaos_init_net_traced_effect(const struct chaos_net_rule *rule)
            rule->effect == CHAOS_NET_EFFECT_THROTTLE;
 }
 
-/* CHAOS_NET_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, TIMEOUT, DROP, and the
- * traced effects TRICKLE, CORRUPT, DUP, RESET and THROTTLE, which the trace path applies
- * through the registers, the tracee's memory and a call of its own. ERRNO on close stays
- * out: the library closes and then reports the error, which is two answers to one call. */
+/* CHAOS_NET_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, TIMEOUT, DROP, REDIRECT,
+ * and the traced effects TRICKLE, CORRUPT, DUP, RESET and THROTTLE, which the trace path
+ * applies through the registers, the tracee's memory and a call of its own. ERRNO on close
+ * stays out: the library closes and then reports the error, which is two answers to one
+ * call. REDIRECT needs no register: the address it rewrites is in the tracee's memory, and
+ * a notification answered with CONTINUE makes the kernel read it from there. */
 static int chaos_init_net_supported(const struct chaos_net_rule *rule)
 {
     return (rule->effect == CHAOS_NET_EFFECT_ERRNO && rule->operation != CHAOS_NET_OP_CLOSE) ||
            rule->effect == CHAOS_NET_EFFECT_LATENCY || rule->effect == CHAOS_NET_EFFECT_TIMEOUT ||
-           rule->effect == CHAOS_NET_EFFECT_DROP || chaos_init_net_traced_effect(rule);
+           rule->effect == CHAOS_NET_EFFECT_DROP || rule->effect == CHAOS_NET_EFFECT_REDIRECT ||
+           chaos_init_net_traced_effect(rule);
 }
 
 /**
@@ -832,6 +835,46 @@ chaos_init_net_sockaddr(int fd, uint64_t address, uint64_t length, chaos_net_end
     return chaos_net_endpoint_from_sockaddr_fd(
         fd, (const struct sockaddr *)&copy, (socklen_t)size, endpoint
     );
+}
+
+/**
+ * @brief Builds the address a REDIRECT rule sends @p call to instead, from the sockaddr
+ *        the tracee passed.
+ *
+ * @details The family of that sockaddr decides what the target may be
+ * (chaos_net_redirect_sockaddr()), and that is all this needs from it, so only the family
+ * is read back out of the tracee. The result fits the length the caller passed whenever it
+ * was built: the family is kept, so the length is.
+ *
+ * @return 1 with @p out and @p size written, else 0 (the rule then does not fire).
+ */
+static int chaos_init_net_redirect(
+    const chaos_init_call_t *call,
+    const chaos_net_redirect_t *target,
+    unsigned char *out,
+    unsigned *size
+)
+{
+    struct sockaddr original;
+    struct sockaddr_storage built;
+    socklen_t built_length = 0;
+
+    *size = 0U;
+    (void)memset(&original, 0, sizeof(original));
+    if (chaos_init_read_memory(
+            call->tid, call->args[1], &original.sa_family, sizeof(original.sa_family)
+        ) != 0)
+    {
+        return 0;
+    }
+    if (!chaos_net_redirect_sockaddr(target, &original, &built, &built_length) ||
+        (uint64_t)built_length > call->args[2])
+    {
+        return 0;
+    }
+    (void)memcpy(out, &built, (size_t)built_length);
+    *size = (unsigned)built_length;
+    return 1;
 }
 
 /** @brief Payload bytes of a msghdr in tracee memory; CHAOS_POLICY_NO_SIZE if unknown. */
@@ -1640,6 +1683,8 @@ chaos_init_net_decide_at(const chaos_init_call_t *call, long result, chaos_init_
     chaos_init_net_dup_t *kept = NULL;
     uint64_t size = CHAOS_POLICY_NO_SIZE;
     int64_t timeout_ms = -1;
+    unsigned char redirect[sizeof(struct sockaddr_storage)];
+    unsigned redirect_size = 0U;
     size_t index;
 
     for (index = 0U; index < sizeof(g_chaos_init_net_calls) / sizeof(g_chaos_init_net_calls[0]);
@@ -1782,6 +1827,14 @@ chaos_init_net_decide_at(const chaos_init_call_t *call, long result, chaos_init_
             return 1;
         }
     }
+    /* REDIRECT needs an address this socket can be given: an IPv6 target cannot be
+     * written over the sockaddr of an AF_INET one. Built before the draw, as in the
+     * library, so a call it cannot reach counts no hit. */
+    if (rule.effect == CHAOS_NET_EFFECT_REDIRECT &&
+        !chaos_init_net_redirect(call, &rule.redirect, redirect, &redirect_size))
+    {
+        return 1;
+    }
     /* THROTTLE shortens the length where it sits in a register, or waits for a whole
      * datagram; either way it needs that register. recvmsg and the batches keep the
      * length in memory and are left alone, as in the library. A send whose byte count is
@@ -1817,6 +1870,14 @@ chaos_init_net_decide_at(const chaos_init_call_t *call, long result, chaos_init_
     {
         verdict->action = CHAOS_INIT_RETURN;
         verdict->value = (long)size;
+    }
+    else if (rule.effect == CHAOS_NET_EFFECT_REDIRECT)
+    {
+        /* The call runs, with the address the supervisor writes into the tracee once the
+         * notification is confirmed: a reply of CONTINUE makes the kernel read the
+         * arguments from the tracee again, which is exactly what this needs. */
+        (void)memcpy(verdict->redirect, redirect, redirect_size);
+        verdict->redirect_size = redirect_size;
     }
     else if (rule.effect == CHAOS_NET_EFFECT_THROTTLE)
     {
@@ -1942,6 +2003,15 @@ void chaos_init_net_commit(const chaos_init_call_t *call, const chaos_init_verdi
     {
         g_chaos_init_net_tid = call->tid;
         chaos_init_net_clear_ready(call);
+    }
+    if (verdict->redirect_size > 0U)
+    {
+        /* A failed write leaves the original address in place, so the connect goes where
+         * the caller meant: the hit is already counted, which is the one case where a hit
+         * can be a byte ahead of its effect. */
+        (void)chaos_init_write_memory(
+            call->tid, call->args[1], verdict->redirect, verdict->redirect_size
+        );
     }
 }
 

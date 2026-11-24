@@ -47,6 +47,8 @@
  *                       and whether any write came back short, for THROTTLE.
  *   late <path>         - waits three seconds, then opens <path>: a process that makes no
  *                       intercepted call while a rule file is being put in place.
+ *   redirect <port>     - listens on <port>, dials <port> + 1 and prints the port the
+ *                       connection landed on, for connect REDIRECT.
  *   setuid <path>       - drops to uid 65534, then opens <path> and maps 4 MiB:
  *                       "open=<r> mmap=<r>", for what a rule can still match after a
  *                       user switch.
@@ -448,6 +450,44 @@ int main(int argc, char **argv)
         }
         (void
         )printf("wrote=%ld,%ld zeros=%d tenth=%c\n", (long)first, (long)second, zeros, got[10]);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "redirect") == 0)
+    {
+        /* Nothing listens on the port that is dialled, so a connection at all is the
+         * redirect; the port getpeername reports is where it landed. */
+        const uint16_t port = (uint16_t)atoi(argv[2]);
+        struct sockaddr_in address;
+        struct sockaddr_in dial;
+        struct sockaddr_in peer;
+        socklen_t peer_length = sizeof(peer);
+        const int listener = socket(AF_INET, SOCK_STREAM, 0);
+        const int client = socket(AF_INET, SOCK_STREAM, 0);
+
+        memset(&address, 0, sizeof(address));
+        address.sin_family = AF_INET;
+        address.sin_port = htons(port);
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (listener < 0 || client < 0 ||
+            bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+            listen(listener, 1) != 0)
+        {
+            (void)printf("setup=%s\n", try_open_errno_name(errno));
+            return 0;
+        }
+        dial = address;
+        dial.sin_port = htons((uint16_t)(port + 1U));
+        if (connect(client, (const struct sockaddr *)&dial, (socklen_t)sizeof(dial)) != 0 ||
+            getpeername(client, (struct sockaddr *)&peer, &peer_length) != 0)
+        {
+            (void)printf("peer=%s\n", try_open_errno_name(errno));
+            (void)close(client);
+            (void)close(listener);
+            return 0;
+        }
+        (void)printf("peer=%u\n", (unsigned)ntohs(peer.sin_port));
+        (void)close(client);
+        (void)close(listener);
         return 0;
     }
     if (argc == 3 && strcmp(argv[1], "late") == 0)

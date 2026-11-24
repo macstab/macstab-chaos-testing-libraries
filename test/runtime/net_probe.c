@@ -6,7 +6,7 @@
  * Proves that rules in the rule file `/tmp/.chaos-net.conf`
  * (`<selector>:<operation>:<ERRNO-name | effect>:<value>`) are matched against real loopback
  * sockets and fault every wrapped socket call with the documented result. Each check uses its
- * own 127.0.0.1 port (41001-41038) so a rule can only match the socket under test. Exit code of
+ * own 127.0.0.1 port (41001-41041) so a rule can only match the socket under test. Exit code of
  * each check, in main()'s order:
  *
  * - 10-11   bind:EMFILE; bind returns -1/EMFILE.
@@ -20,6 +20,9 @@
  * - 70-75   recv:CORRUPT:1.0; 4 bytes arrive but differ from what was sent.
  * - 250-254 send:THROTTLE:4096 holds 8 KiB of stream sends to about a second and makes them
  *           short, while the same rate on another port leaves them whole and immediate.
+ * - 260-263 connect:REDIRECT lands the connection on the address of the rule, which
+ *           getpeername then reports; without the rule the same dial fails, because
+ *           nothing listens on the port the probe asked for.
  * - 180-183 recv:TRICKLE:3; recv, read, readv and recvmsg each return 1-3 bytes and the pieces
  *           reassemble to the sent bytes exactly.
  * - 190-194 recv:DUP:1.0; a payload is delivered, then delivered again on the next read
@@ -1359,6 +1362,64 @@ static int send_timed(int fd, size_t total, long long *elapsed_ms, int *short_se
 }
 
 /**
+ * @brief connect:REDIRECT sends the connection to the address of the rule, which the
+ *        kernel then treats as the one it was made to (exit 260-264).
+ *
+ * @details Nothing listens on the port the probe dials, so without the rule the connect
+ * fails: what makes it succeed is the redirect, and `getpeername` naming the other port
+ * is what shows the kernel agrees.
+ */
+static int probe_connect_redirect(void)
+{
+    struct sockaddr_in peer;
+    socklen_t peer_length = sizeof(peer);
+    int listener;
+    int client;
+    int rc;
+
+    rc = write_config("tcp4://127.0.0.1:41040:connect:REDIRECT:127.0.0.1:41039");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    listener = create_tcp_listener(41039U);
+    if (listener < 0)
+    {
+        return 260;
+    }
+    client = connect_tcp(41040U);
+    if (client < 0)
+    {
+        close(listener);
+        return 261;
+    }
+    if (getpeername(client, (struct sockaddr *)&peer, &peer_length) != 0 ||
+        ntohs(peer.sin_port) != 41039U)
+    {
+        close(client);
+        close(listener);
+        return 262;
+    }
+    close(client);
+    /* The same dial with the rule on another port: nothing listens on 41040, so it fails
+     * -- which is what tells a redirect from a port that was open anyway. */
+    rc = write_config("tcp4://127.0.0.1:41041:connect:REDIRECT:127.0.0.1:41039");
+    if (rc != 0)
+    {
+        close(listener);
+        return rc;
+    }
+    client = connect_tcp(41040U);
+    close(listener);
+    if (client >= 0)
+    {
+        close(client);
+        return 263;
+    }
+    return 0;
+}
+
+/**
  * @brief send:THROTTLE:4096 on a stream socket: 8 KiB takes about a second and arrives in
  *        short sends, while the same rate on another port leaves them whole and immediate
  *        (exit 250-254).
@@ -1723,6 +1784,9 @@ int main(void)
     if (rc != 0)
         return rc;
     rc = probe_recv_corrupt();
+    if (rc != 0)
+        return rc;
+    rc = probe_connect_redirect();
     if (rc != 0)
         return rc;
     rc = probe_send_throttle();

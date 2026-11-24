@@ -1976,6 +1976,81 @@ static void test_trickle_rule(void)
         assert(chaos_net_config_parse_line(drop_above_one, &rule) == -1);
     }
 
+    /* REDIRECT is connect-only and takes an address with a port, optionally a
+     * probability. Its value is the one in this grammar that carries a colon of its own,
+     * so the line is split at the keyword rather than from the right; a selector that
+     * happens to contain the keyword still has to parse as a selector. */
+    {
+        char redirect[] = "tcp4://127.0.0.1:5432:connect:REDIRECT:10.0.0.1:5433";
+        char ipv6[] = "*:connect:REDIRECT:[2001:db8::1]:443";
+        char chance[] = "*:connect:REDIRECT:10.0.0.1:5433@0.25";
+        char on_send[] = "*:send:REDIRECT:10.0.0.1:5433";
+        char on_close[] = "*:close:REDIRECT:10.0.0.1:5433";
+        char no_port[] = "*:connect:REDIRECT:10.0.0.1";
+        char zero_port[] = "*:connect:REDIRECT:10.0.0.1:0";
+        char wildcard[] = "*:connect:REDIRECT:*:5433";
+        char prefix[] = "*:connect:REDIRECT:10.0.0.0/8:5433";
+        char bad_address[] = "*:connect:REDIRECT:10.0.0.999:5433";
+        char bare_ipv6[] = "*:connect:REDIRECT:2001:db8::1:443";
+        char bad_chance[] = "*:connect:REDIRECT:10.0.0.1:5433@2";
+        char empty[] = "*:connect:REDIRECT:";
+        char in_selector[] = "tcp4://x:REDIRECT:connect:REDIRECT:10.0.0.1:1";
+        struct in_addr expected;
+
+        assert(inet_pton(AF_INET, "10.0.0.1", &expected) == 1);
+        assert(chaos_net_config_parse_line(redirect, &rule) == 1);
+        assert(rule.effect == CHAOS_NET_EFFECT_REDIRECT);
+        assert(rule.redirect.family == AF_INET && rule.redirect.port == 5433U);
+        assert(memcmp(&rule.redirect.value.ipv4, &expected, sizeof(expected)) == 0);
+        assert(rule.probability == 1.0);
+        assert(chaos_net_config_parse_line(ipv6, &rule) == 1);
+        assert(rule.redirect.family == AF_INET6 && rule.redirect.port == 443U);
+        assert(chaos_net_config_parse_line(chance, &rule) == 1);
+        assert(rule.redirect.port == 5433U && rule.probability == 0.25);
+        assert(chaos_net_config_parse_line(on_send, &rule) == -1);
+        assert(chaos_net_config_parse_line(on_close, &rule) == -1);
+        /* A target needs one address and a port connect can use. */
+        assert(chaos_net_config_parse_line(no_port, &rule) == -1);
+        assert(chaos_net_config_parse_line(zero_port, &rule) == -1);
+        assert(chaos_net_config_parse_line(wildcard, &rule) == -1);
+        assert(chaos_net_config_parse_line(prefix, &rule) == -1);
+        assert(chaos_net_config_parse_line(bad_address, &rule) == -1);
+        /* An IPv6 target needs its brackets, as an IPv6 selector does. */
+        assert(chaos_net_config_parse_line(bare_ipv6, &rule) == -1);
+        assert(chaos_net_config_parse_line(bad_chance, &rule) == -1);
+        assert(chaos_net_config_parse_line(empty, &rule) == -1);
+        assert(chaos_net_config_parse_line(in_selector, &rule) == -1);
+        /* The keyword with nothing but a selector in front of it: no operation field. */
+        {
+            char no_operation[] = "x:REDIRECT:10.0.0.1:1";
+
+            assert(chaos_net_config_parse_line(no_operation, &rule) == -1);
+        }
+        /* A target longer than the buffer the scheme is put in front of it in, and the
+         * arguments no line can produce: the parser passes its own fields, so those
+         * guards are proved by calling the helper directly. */
+        {
+            char line[CHAOS_NET_MAX_TEXT + 64U];
+            char address[CHAOS_NET_MAX_TEXT + 16U];
+            chaos_net_redirect_t target;
+            double chance = 0.0;
+
+            (void)memset(address, '1', sizeof(address) - 1U);
+            address[sizeof(address) - 1U] = '\0';
+            (void)snprintf(line, sizeof(line), "*:connect:REDIRECT:%s", address);
+            assert(chaos_net_config_parse_line(line, &rule) == -1);
+            /* The same length with a probability behind it, which is read first. */
+            (void)snprintf(line, sizeof(line), "*:connect:REDIRECT:%s@0.5", address);
+            assert(chaos_net_config_parse_line(line, &rule) == -1);
+            assert(chaos_net_parse_redirect(NULL, &target, &chance) == -1);
+            assert(chaos_net_parse_redirect("10.0.0.1:1", NULL, &chance) == -1);
+            assert(chaos_net_parse_redirect("10.0.0.1:1", &target, NULL) == -1);
+            assert(chaos_net_parse_redirect("", &target, &chance) == -1);
+            assert(chaos_net_parse_redirect("10.0.0.1:1", &target, &chance) == 0);
+            assert(target.port == 1U && chance == 1.0);
+        }
+    }
+
     /* THROTTLE is send-only and takes a rate in bytes per second, no probability: a rate
      * that fires on every other call is not a rate. Whether the socket is a stream is
      * decided per call, as DROP's datagram test is. */

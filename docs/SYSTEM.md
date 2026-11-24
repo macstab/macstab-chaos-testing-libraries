@@ -100,6 +100,7 @@ The test question is: *what remains after the call has returned?*
 |---|---|
 | `OFFSET`, `REGRESS`, `FREEZE` | the returned time is rewritten; the kernel clock is untouched |
 | `TORN`, `DROP`, `THROTTLE` | the call is performed partially, or not at all while reporting that it was |
+| `REDIRECT` | the call is performed with another argument; the kernel state it leaves is the connection it made, which the call was going to make anyway |
 | `THROTTLE`'s wait | it delays one call and leaves nothing behind; the rate lives in the process, not in the kernel, so no other process is slowed down |
 | `statfs` `FREE`, `FULL` | the returned structure is rewritten; the filesystem is untouched |
 | `RESET`'s `setsockopt(SO_LINGER)` | it parameterises the close that follows it, and only on a socket this process alone holds -- otherwise the option would outlive the call on a descriptor someone else still owns, which is exactly the state this rule forbids |
@@ -298,7 +299,7 @@ layered fault models.
 | rule file | `/tmp/.chaos-<lib>.conf`, one per library; re-read when its change stamp changes (reload) |
 | rule | one line of a rule file: selector, operation, effect, value, optional probability and qualifiers |
 | selector | what a rule matches: path prefix (io), endpoint (net), DNS name or address (dns), operation[/target] (time, memory, process) |
-| effect | what a matching rule does: `ERRNO`, `LATENCY`, `TIMEOUT`, `CORRUPT`, `TORN`, `DROP`, `THROTTLE`, `FREE`, `FULL`, `TRICKLE`, `DUP`, `RESET`, `OFFSET`, `REGRESS`, `FREEZE`, `GAI`, `REWRITE`, `OVERRIDE`, `SERVICE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT`, `FAIL_AFTER` |
+| effect | what a matching rule does: `ERRNO`, `LATENCY`, `TIMEOUT`, `CORRUPT`, `TORN`, `DROP`, `THROTTLE`, `REDIRECT`, `FREE`, `FULL`, `TRICKLE`, `DUP`, `RESET`, `OFFSET`, `REGRESS`, `FREEZE`, `GAI`, `REWRITE`, `OVERRIDE`, `SERVICE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT`, `FAIL_AFTER` |
 | probability | chance in [0, 1] that a matching rule fires on a call, sampled from a per-thread PRNG |
 | qualifier | `@first=N`, `@from=T`, `@until=T`, `@size>N`, `@size<N` (`src/common/chaos_policy.h`) |
 | hit | one application of a rule's effect; counted per rule |
@@ -374,7 +375,8 @@ unrelated site; failing at load is diagnosable.
      nothing done);
    - after it: `CORRUPT`, `OFFSET`, `REGRESS`, `FREEZE`, `FREE`, `FULL`,
      `REWRITE`, `SERVICE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT`;
-   - reshaping the request or the result: `TORN`, `THROTTLE`, `TRICKLE`, `DUP`;
+   - reshaping the request or the result: `TORN`, `THROTTLE`, `TRICKLE`, `DUP`,
+     `REDIRECT` (the address the call is made to);
    - parameterising the call itself: `RESET`, whose `setsockopt` precedes the
      close it belongs to.
 8. **Return** what libc would return, except for the injected fault. errno is

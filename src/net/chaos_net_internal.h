@@ -529,4 +529,88 @@ static inline uint64_t chaos_net_rule_hash(const char *text)
     return hash;
 }
 
+/**
+ * @brief REDIRECT: the address `connect` is sent to instead of the one it was given.
+ *
+ * @details Not a chaos_net_endpoint_t, which carries a UNIX path and selector
+ * bookkeeping a target has no use for: a redirect needs a family, an address and a port.
+ */
+typedef struct chaos_net_redirect
+{
+    int family;    /**< AF_INET or AF_INET6; 0 when the rule is no REDIRECT. */
+    uint16_t port; /**< Host byte order; never 0, which `connect` could not use. */
+    /** @brief Address storage; the active member follows @c family. */
+    union
+    {
+        struct in_addr ipv4;  /**< Active when family is AF_INET. */
+        struct in6_addr ipv6; /**< Active when family is AF_INET6. */
+    } value;
+} chaos_net_redirect_t;
+
+/**
+ * @brief Builds the sockaddr a REDIRECT rule sends a `connect` to instead of @p address.
+ *
+ * @details The socket decides what can be written into it, so the family of the address
+ * the caller passed is what the target has to fit:
+ * - same family: the target as it stands;
+ * - an IPv4 target on an AF_INET6 socket: the IPv4-mapped form (`::ffff:a.b.c.d`), which
+ *   is how such a socket reaches an IPv4 host and how `getpeername` reports it afterwards
+ *   -- the case a runtime that opens AF_INET6 sockets and connects to a v4 address hits,
+ *   and the one a `tcp4://` rule matched to get here;
+ * - an IPv6 target on an AF_INET socket: nothing to build, so the rule does not fire and
+ *   counts no hit, as DROP does not fire on a stream.
+ *
+ * The length never changes, because the family never does: a caller that passed 16 bytes
+ * gets 16 back. Here rather than in one of the modules because both the `connect` wrapper
+ * and chaos-init build the address, and from the same arithmetic.
+ *
+ * @param target      Parsed REDIRECT target.
+ * @param address     The sockaddr the caller passed; its family decides.
+ * @param out         Output storage, zeroed first.
+ * @param out_length  Output: bytes of @p out that are valid.
+ * @return 1 with @p out and @p out_length written, else 0.
+ */
+static inline int chaos_net_redirect_sockaddr(
+    const chaos_net_redirect_t *target,
+    const struct sockaddr *address,
+    struct sockaddr_storage *out,
+    socklen_t *out_length
+)
+{
+    (void)memset(out, 0, sizeof(*out));
+    if (address->sa_family == AF_INET && target->family == AF_INET)
+    {
+        struct sockaddr_in *ipv4 = (struct sockaddr_in *)(void *)out;
+
+        ipv4->sin_family = AF_INET;
+        ipv4->sin_port = htons(target->port);
+        ipv4->sin_addr = target->value.ipv4;
+        *out_length = (socklen_t)sizeof(*ipv4);
+        return 1;
+    }
+    if (address->sa_family == AF_INET6)
+    {
+        struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)(void *)out;
+
+        ipv6->sin6_family = AF_INET6;
+        ipv6->sin6_port = htons(target->port);
+        if (target->family == AF_INET6)
+        {
+            ipv6->sin6_addr = target->value.ipv6;
+        }
+        else
+        {
+            unsigned char *bytes = (unsigned char *)&ipv6->sin6_addr;
+
+            (void)memset(bytes, 0, 10U);
+            bytes[10] = 0xffU;
+            bytes[11] = 0xffU;
+            (void)memcpy(bytes + 12, &target->value.ipv4, 4U);
+        }
+        *out_length = (socklen_t)sizeof(*ipv6);
+        return 1;
+    }
+    return 0;
+}
+
 #endif
