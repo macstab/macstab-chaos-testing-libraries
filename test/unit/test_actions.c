@@ -439,6 +439,47 @@ static void test_every_gates_evaluations(void)
 }
 
 /**
+ * @brief Proves `@at=+N` holds a rule back until N ms after it became active.
+ *
+ * @details The gate itself is tested on values in test_common.c; what is asserted here is
+ * that chaos_io_rule_should_trigger() consults it, and that it reads the moment out of the
+ * rule's slot -- which is what makes the delay survive a reload that keeps the rule. No
+ * sleeping: the slot is handed an activation time in the past or in the present, which is
+ * the same thing the clock would produce.
+ */
+static void test_at_delays_activation(void)
+{
+    chaos_io_rule_t rule;
+    chaos_hit_slot_t slot;
+
+    (void)memset(&rule, 0, sizeof(rule));
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.effect = CHAOS_IO_EFFECT_ERRNO;
+    rule.probability = 1.0;
+    rule.hit = &slot;
+    rule.policy.at_ms = 500U;
+
+    /* Active a second ago: the delay has passed. */
+    slot.armed_ms = chaos_hits_now_ms() - 1000U;
+    assert(chaos_io_rule_should_trigger(&rule) != 0);
+    /* Active now: it has not. */
+    slot.armed_ms = chaos_hits_now_ms();
+    assert(chaos_io_rule_should_trigger(&rule) == 0);
+    /* A slot that never got a clock has no moment to count from, and neither has a rule
+     * copy without a slot: both stay closed rather than firing at once. */
+    slot.armed_ms = 0U;
+    assert(chaos_io_rule_should_trigger(&rule) == 0);
+    slot.armed_ms = chaos_hits_now_ms() - 1000U;
+    rule.hit = NULL;
+    assert(chaos_io_rule_should_trigger(&rule) == 0);
+    /* Without the qualifier the slot's moment decides nothing. */
+    rule.hit = &slot;
+    rule.policy.at_ms = 0U;
+    slot.armed_ms = chaos_hits_now_ms();
+    assert(chaos_io_rule_should_trigger(&rule) != 0);
+}
+
+/**
  * @brief FREE and FULL compute the free-block count they report, in the structure's unit.
  *
  * @details The unit is what the two structures disagree about (`f_bsize` for
@@ -487,6 +528,7 @@ static void test_free_blocks(void)
 int main(void)
 {
     test_every_gates_evaluations();
+    test_at_delays_activation();
     test_should_trigger_honours_qualifiers();
     test_should_trigger_counts_hits();
     test_probability_helpers();

@@ -25,7 +25,7 @@ rules are in [`docs/SYSTEM.md`](SYSTEM.md); loader-level internals (link map, PL
 | Wrappers with a selector | `pthread_create()`, `fork()`, `posix_spawn()`, `posix_spawnp()`, `execve()`, `execveat()` (Linux), `waitpid()` |
 | Wrappers under another call's rules | `wait()`, `wait3()`, `wait4()`, `waitid()` (waitpid); `execv()`, `execvp()`, `execvpe()`, `execl()`, `execle()`, `execlp()` (execve); `fexecve()` (execveat, Linux); `system()`, `popen()` (posix_spawn) |
 | Effects | ERRNO, LATENCY, FAIL_AFTER |
-| Qualifiers | `@first`, `@every`, `@from`, `@until`, `@size` (accepted; `@size` never matches, §10.4) |
+| Qualifiers | `@first`, `@every`, `@at`, `@from`, `@until`, `@size` (accepted; `@size` never matches, §10.4) |
 | Rule file | `/tmp/.chaos-process.conf` |
 | Status file | `/tmp/.chaos-process.status` |
 | Hits file | `/tmp/.chaos-process.hits.<n>` |
@@ -434,6 +434,7 @@ count         = 1*DIGIT                            ; 0 .. 18446744073709551615
 probability   = "0" / "1" / "0." 1*DIGIT / "1." 1*"0"
 qualifier     = "@first=" 1*18DIGIT                ; > 0
               / "@every=" 1*18DIGIT                ; > 0
+              / "@at=+" 1*18DIGIT                  ; ms after this rule was loaded; > 0
               / "@from=" 1*18DIGIT / "@until=" 1*18DIGIT   ; Unix ms, until >= 1
                                                        ; and > from
               / "@size>" 1*18DIGIT / "@size<" 1*18DIGIT

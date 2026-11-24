@@ -51,6 +51,7 @@ int chaos_process_probability_hit_sample(double probability, uint32_t sample)
 int chaos_process_rule_should_trigger(chaos_process_rule_t *rule)
 {
     if (rule == NULL || !chaos_policy_window_open(&rule->policy) ||
+        !chaos_policy_at_ok(&rule->policy, rule->hit) ||
         !chaos_policy_size_ok(&rule->policy, rule->call_size))
     {
         return 0;
@@ -140,7 +141,7 @@ int chaos_process_rule_fail_after_error(
         return 0;
     }
 
-    if (!chaos_policy_window_open(&rule->policy) ||
+    if (!chaos_policy_window_open(&rule->policy) || !chaos_policy_at_ok(&rule->policy, rule->hit) ||
         !chaos_policy_size_ok(&rule->policy, rule->call_size) ||
         !chaos_policy_fire(&rule->policy, rule->hit, rule->hit_generation))
     {

@@ -83,6 +83,7 @@ void chaos_dns_rule_apply_latency(chaos_dns_rule_t *rule)
 int chaos_dns_rule_should_trigger(chaos_dns_rule_t *rule)
 {
     if (rule == NULL || !chaos_policy_window_open(&rule->policy) ||
+        !chaos_policy_at_ok(&rule->policy, rule->hit) ||
         !chaos_policy_size_ok(&rule->policy, rule->call_size))
     {
         return 0;

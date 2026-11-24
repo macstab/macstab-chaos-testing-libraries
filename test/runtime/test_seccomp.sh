@@ -407,6 +407,14 @@ expect "Go: the vDSO of the Go image was blinded" \
     "$(grep -c "^vdso=failed$" /tmp/.chaos-init.status)" "0"
 rm -f /tmp/.chaos-time.conf
 
+# `@at=+N` holds a rule back until N ms after it became active for that process, which is
+# the only qualifier whose clock starts at the load rather than at a wall-clock time. One
+# run, two opens around a wait: the first comes too early for the rule, the second does
+# not. The arming is per process, so both have to be in the same run.
+printf "%s\n" "/tmp/sec/data:open:EIO:1.0 @at=+300 # t" > /tmp/.chaos-io.conf
+expect "C: a rule with @at fires only after its delay" \
+    "$($init --libs io -- /tmp/probe atwait /tmp/sec/data/x)" "before=ok after=EIO"
+
 # dns: the lookup is a library function, so what SECCOMP mode sees is the query the
 # resolver sends -- and that carries the name. A LATENCY rule for one name holds exactly
 # that query; another name goes out at once. The answer-changing effects are rejected,

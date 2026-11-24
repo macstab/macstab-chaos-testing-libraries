@@ -63,6 +63,7 @@ typedef struct chaos_rule_policy
 {
     uint64_t first;               /**< `@first=N` hit limit per process; 0 for none. */
     uint64_t every;               /**< `@every=N`: only every Nth evaluation; 0 for none. */
+    uint64_t at_ms;               /**< `@at=+N`: ms after the rule became active; 0 for none. */
     int64_t from_ms;              /**< `@from=T`, Unix ms; 0 for no lower bound. */
     int64_t until_ms;             /**< `@until=T`, Unix ms (exclusive); 0 for no upper bound. */
     uint64_t size_above;          /**< `@size>N` in bytes; meaningful when has_size_above. */
@@ -181,6 +182,15 @@ static inline int chaos_policy_parse_word(const char *word, chaos_rule_policy_t 
         value > 0U)
     {
         policy->every = value;
+        return 0;
+    }
+    /* `@at=+N` is written with the sign, which is what says "from now on" rather than
+     * "at this Unix time": that is `@from`, and reading a bare number as either would be
+     * a rule meaning two things. */
+    if (strncmp(word, "@at=+", 5U) == 0 && chaos_policy_parse_number(word + 5, &value) == 0 &&
+        value > 0U)
+    {
+        policy->at_ms = value;
         return 0;
     }
     if (strncmp(word, "@from=", 6U) == 0 && chaos_policy_parse_number(word + 6, &value) == 0)
@@ -308,8 +318,9 @@ static inline int chaos_policy_has_size(const chaos_rule_policy_t *policy)
 /** @brief Non-zero when @p policy carries no qualifier, so the rule needs no policy checks. */
 static inline int chaos_policy_is_empty(const chaos_rule_policy_t *policy)
 {
-    return policy->first == 0U && policy->every == 0U && policy->from_ms == 0 &&
-           policy->until_ms == 0 && !policy->has_size_above && !policy->has_size_below;
+    return policy->first == 0U && policy->every == 0U && policy->at_ms == 0U &&
+           policy->from_ms == 0 && policy->until_ms == 0 && !policy->has_size_above &&
+           !policy->has_size_below;
 }
 
 /**
@@ -329,6 +340,36 @@ static inline int chaos_policy_window_open(const chaos_rule_policy_t *policy)
     now = chaos_clock_realtime_ms();
     return (policy->from_ms == 0 || now >= policy->from_ms) &&
            (policy->until_ms == 0 || now < policy->until_ms);
+}
+
+/**
+ * @brief Non-zero when the rule's `@at=+N` delay has passed, or it has none.
+ *
+ * @details The delay is measured from the moment the rule became active in this process,
+ * which the slot holds (chaos_hit_slot_t::armed_ms): a reload that leaves the rule alone
+ * does not restart it, and a reload that brings it back after a change starts it again.
+ *
+ * A rule with the qualifier and no slot does not fire -- there is no moment to count from
+ * -- and neither does one whose slot never got a readable clock.
+ *
+ * @param policy  The rule's qualifiers.
+ * @param slot    The rule's slot (chaos_time_rule_t::hit and its siblings); may be NULL.
+ */
+static inline int chaos_policy_at_ok(const chaos_rule_policy_t *policy, const void *slot)
+{
+    const chaos_hit_slot_t *hit = slot;
+    uint64_t now;
+
+    if (policy->at_ms == 0U)
+    {
+        return 1;
+    }
+    if (hit == NULL || hit->armed_ms == 0U)
+    {
+        return 0;
+    }
+    now = chaos_hits_now_ms();
+    return now >= hit->armed_ms && now - hit->armed_ms >= policy->at_ms;
 }
 
 /**

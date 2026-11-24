@@ -173,6 +173,16 @@ struct chaos_hit_slot
      * its reading with the top bit set).
      */
     volatile uint64_t state;
+    /**
+     * CLOCK_MONOTONIC ms at which this rule became active in this process, for `@at=+N`;
+     * 0 when no clock could be read, which keeps such a rule closed.
+     *
+     * @details Set when the slot is taken for a rule text (chaos_hits_assign()) and kept
+     * when a reload hands the same slot to the same text, so the delay a rule asks for is
+     * measured from the load that brought it, not from the last reload that left it
+     * alone. A fork child keeps the parent's value: the rule has been active since then.
+     */
+    volatile uint64_t armed_ms;
     /** Library hook called after each counted hit to schedule a hits-file write; may be NULL. */
     void (*report)(chaos_hit_slot_t *slot);
     /**
@@ -261,6 +271,28 @@ static inline int chaos_hit_slot_current(const chaos_hit_slot_t *slot, uint64_t 
 }
 
 /**
+ * @brief CLOCK_MONOTONIC in ms, read without libchaos-time; 0 when no clock is readable.
+ *
+ * @details Uses the vDSO (no system call per hit) and falls back to a raw
+ * `clock_gettime` system call where no vDSO clock exists.
+ */
+static inline uint64_t chaos_hits_now_ms(void)
+{
+    struct timespec now;
+    const uint64_t vdso_ns = chaos_clock_now_ns();
+
+    if (vdso_ns != 0U)
+    {
+        return vdso_ns / UINT64_C(1000000);
+    }
+    if (CHAOS_CLOCK_RAW_GETTIME(CLOCK_MONOTONIC, &now) != 0)
+    {
+        return 0U;
+    }
+    return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
+}
+
+/**
  * @brief Assigns a slot from @p pool to each of the @p next_count rules of the snapshot
  *        being built.
  *
@@ -328,6 +360,9 @@ static inline void chaos_hits_assign(
             next[index]->count = 0U;
             next[index]->claimed = chaos_hit_claims_none(next[index]->generation);
             next[index]->state = 0U;
+            /* A rule that is new to this process becomes active now, which is where
+             * `@at=+N` starts counting. A slot carried over keeps the moment it got. */
+            next[index]->armed_ms = chaos_hits_now_ms();
         }
         next[index]->used = 1U;
         next[index]->report = report;
@@ -439,28 +474,6 @@ static inline void chaos_hit_record(chaos_hit_slot_t *slot)
     {
         slot->report(slot);
     }
-}
-
-/**
- * @brief CLOCK_MONOTONIC in ms, read without libchaos-time; 0 when no clock is readable.
- *
- * @details Uses the vDSO (no system call per hit) and falls back to a raw
- * `clock_gettime` system call where no vDSO clock exists.
- */
-static inline uint64_t chaos_hits_now_ms(void)
-{
-    struct timespec now;
-    const uint64_t vdso_ns = chaos_clock_now_ns();
-
-    if (vdso_ns != 0U)
-    {
-        return vdso_ns / UINT64_C(1000000);
-    }
-    if (CHAOS_CLOCK_RAW_GETTIME(CLOCK_MONOTONIC, &now) != 0)
-    {
-        return 0U;
-    }
-    return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
 }
 
 /**

@@ -627,6 +627,13 @@ static void test_policy_grammar(void)
         "/a:open:EIO:1.0 @every=0",
         "/a:open:EIO:1.0 @every=",
         "/a:open:EIO:1.0 @every=x",
+        /* `@at` is written with the sign that says "from now on"; without it the number
+         * would read as a Unix time, which is `@from`. A delay of zero is no delay. */
+        "/a:open:EIO:1.0 @at=500",
+        "/a:open:EIO:1.0 @at=+0",
+        "/a:open:EIO:1.0 @at=+",
+        "/a:open:EIO:1.0 @at=+x",
+        "/a:open:EIO:1.0 @at=",
         "/a:open:EIO:1.0 @from=x",
         "/a:open:EIO:1.0 @until=",
         /* `@until=0` is how "no upper bound" is stored, so taking it as written would turn
@@ -678,17 +685,44 @@ static void test_policy_grammar(void)
     assert(extract("/a:open:EIO:1.0 @every=1", &policy, rule) == 0 && policy.every == 1U);
     assert(!chaos_policy_is_empty(&policy));
 
+    /* `@at=+N` is a delay from the moment the rule became active, in ms. */
+    assert(extract("/a:open:EIO:1.0 @at=+500", &policy, rule) == 0 && policy.at_ms == 500U);
+    assert(!chaos_policy_is_empty(&policy));
+    {
+        chaos_hit_slot_t slot;
+
+        (void)memset(&slot, 0, sizeof(slot));
+        /* The delay is measured from the slot's activation moment: a second ago it has
+         * passed, now it has not, and without a moment at all (no slot, or no readable
+         * clock) the rule stays closed rather than firing at once. */
+        slot.armed_ms = chaos_hits_now_ms() - 1000U;
+        assert(chaos_policy_at_ok(&policy, &slot) != 0);
+        slot.armed_ms = chaos_hits_now_ms();
+        assert(chaos_policy_at_ok(&policy, &slot) == 0);
+        slot.armed_ms = chaos_hits_now_ms() + 100000U;
+        assert(chaos_policy_at_ok(&policy, &slot) == 0);
+        slot.armed_ms = 0U;
+        assert(chaos_policy_at_ok(&policy, &slot) == 0);
+        assert(chaos_policy_at_ok(&policy, NULL) == 0);
+        /* Without the qualifier there is nothing to wait for. */
+        assert(extract("/a:open:EIO:1.0", &policy, rule) == 0 && policy.at_ms == 0U);
+        assert(chaos_policy_at_ok(&policy, NULL) != 0);
+    }
+
     /* A window open on one side only is valid. */
     assert(extract("/a:open:EIO:1.0 @until=10", &policy, rule) == 0 && policy.until_ms == 10);
     assert(extract("/a:open:EIO:1.0 @from=10", &policy, rule) == 0 && policy.from_ms == 10);
 
-    /* A malformed qualifier rejects the line and leaves it unmodified; for the two window
-     * errors (`@until` <= `@from`) only the rejection is asserted, since those are found
-     * after the words were cut. */
+    /* A malformed qualifier rejects the line and leaves it unmodified; the window errors
+     * (`@until` <= `@from`) are the exception, because they are found after the words were
+     * cut -- which is what naming them by content rather than by position says. */
     for (index = 0U; index < sizeof(rejected) / sizeof(rejected[0]); ++index)
     {
+        const int window_error =
+            strstr(rejected[index], "@from=") != NULL && strstr(rejected[index], "@until=") != NULL;
+
         assert(extract(rejected[index], &policy, rule) != 0);
-        assert(index >= 10U || strcmp(rule, rejected[index]) == 0);
+        assert(window_error || strcmp(rule, rejected[index]) == 0);
     }
 }
 
@@ -1178,12 +1212,19 @@ static void test_hits_reload(void)
     chaos_hit_slot_t *active[3];
     chaos_hit_slot_t *next[2];
     uint64_t generation;
+    uint64_t armed;
 
     memset(pool, 0, sizeof(pool));
     chaos_hits_pool_reset(pool, 3U);
     chaos_hits_assign(pool, 3U, NULL, NULL, 0U, slots, first, 2U, NULL);
     assert(slots[0] == &pool[0] && slots[1] == &pool[1]);
     pool[1].count = 7U;
+    /* As if this rule had been active for five seconds already, which the reload below
+     * must not forget: within one millisecond a re-armed slot would be indistinguishable
+     * from one that kept its moment. */
+    assert(pool[1].armed_ms != 0U);
+    armed = pool[1].armed_ms - 5000U;
+    pool[1].armed_ms = armed;
 
     /* A rule whose text survives the reload keeps its slot and count (B moves from index 1
      * to 0); an active entry without a slot is not matched by text (C is new); a new rule
@@ -1194,6 +1235,12 @@ static void test_hits_reload(void)
     chaos_hits_assign(pool, 3U, active, active_texts, 3U, next, next_texts, 2U, count_report);
     assert(next[0] == &pool[1] && pool[1].count == 7U && pool[1].report == count_report);
     assert(next[1] == &pool[2] && pool[2].count == 0U && pool[2].used);
+    /* The moment a rule became active, which `@at=+N` counts from: the slot carried over
+     * keeps the moment it got at the first assignment, so a reload that leaves a rule
+     * alone does not restart its delay; the slot that is new to this process gets one
+     * now. */
+    assert(armed != 0U && pool[1].armed_ms == armed);
+    assert(pool[2].armed_ms != 0U);
 
     /* The rule that left (A) frees its slot and bumps its generation, so stale copies of
      * it stop matching; a NULL slot is always current. */

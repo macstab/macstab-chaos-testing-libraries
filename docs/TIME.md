@@ -26,7 +26,7 @@ in [`docs/PLATFORM.md`](PLATFORM.md).
 | Wrappers | `clock_gettime()`, `gettimeofday()`, `time()`, `timespec_get()`, `nanosleep()`, `clock_nanosleep()`, `sleep()`, `usleep()` |
 | Selectors | `*`, `clock_gettime`, `clock_gettime/<clock>`, `nanosleep`, `usleep` |
 | Effects | ERRNO, LATENCY, OFFSET, REGRESS, FREEZE |
-| Qualifiers | `@first`, `@every`, `@from`, `@until`, `@size` (accepted; `@size` never matches, §8.4) |
+| Qualifiers | `@first`, `@every`, `@at`, `@from`, `@until`, `@size` (accepted; `@size` never matches, §8.4) |
 | Rule file | `/tmp/.chaos-time.conf` |
 | Status file | `/tmp/.chaos-time.status` |
 | Hits file | `/tmp/.chaos-time.hits.<n>` |
@@ -541,6 +541,7 @@ offset-ms    = [ "+" / "-" ] 1*DIGIT                 ; |v| <= 3155760000000; REG
 probability  = "0" / "1" / "0." 1*DIGIT / "1." 1*"0"
 qualifier    = "@first=" 1*18DIGIT                   ; > 0
              / "@every=" 1*18DIGIT                   ; > 0
+             / "@at=+" 1*18DIGIT                     ; ms after this rule was loaded; > 0
              / "@from=" 1*18DIGIT / "@until=" 1*18DIGIT   ; Unix ms, until >= 1
                                                      ; and > from
              / "@size>" 1*18DIGIT / "@size<" 1*18DIGIT

@@ -210,6 +210,8 @@ separate whitespace-delimited words after the rule and before any `#` comment:
 | Qualifier | Meaning |
 |---|---|
 | `@first=N` | Fire at most N times per process (N ≥ 1), then go inert. |
+| `@every=N` | Only every Nth evaluation of the rule (N ≥ 1), counted per process. |
+| `@at=+N` | Active only from N ms after the rule became active for that process -- the moment its file was loaded there, not a wall-clock time. A reload that leaves the rule unchanged does not restart the delay. |
 | `@from=T` | Active once the wall clock reaches T (Unix milliseconds). |
 | `@until=T` | Active while the wall clock is before T; the window is `[from, until)`. `@until` ≤ `@from` rejects the line. |
 | `@size>N`, `@size<N` | Only calls that move more / fewer than N bytes. A call without a byte count never matches a size-gated rule (list in [`docs/DSL.md` §7.1](docs/DSL.md#71-todays-surface)). |
@@ -218,6 +220,7 @@ separate whitespace-delimited words after the rule and before any `#` comment:
 tcp4://127.0.0.1:5432:connect:ECONNREFUSED:1.0 @first=3 # net
 /data:write:EIO:1.0 @from=1760000000000 @until=1760000005000 # disk
 tcp4://127.0.0.1:9092:send:LATENCY:200 @size>65536
+/data:fsync:EIO:1.0 @at=+30000 # half a minute after this file was loaded
 ```
 
 - Windows are absolute so that every process in a container agrees on them. The time

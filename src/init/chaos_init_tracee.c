@@ -115,6 +115,12 @@ static void chaos_init_tracee_sync(chaos_init_rules_t *rules, int tracee)
             }
         }
         slots[index].report = chaos_init_tracee_report;
+        if (slots[index].armed_ms == 0U)
+        {
+            /* A rule that is new to this process becomes active now, which is where
+             * `@at=+N` starts counting; one carried over keeps the moment it got. */
+            slots[index].armed_ms = chaos_hits_now_ms();
+        }
     }
     rules->generation[tracee] = generation;
     rules->count[tracee] = new_count;

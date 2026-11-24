@@ -101,6 +101,7 @@ probability   = ( "0" [ "." 1*DIGIT ] ) / ( "1" [ "." 1*"0" ] )   ; [0, 1], loca
 ;; Qualifiers: trailing words that start with "@" (chaos_policy.h)
 qualifier     = "@first=" number              ; number > 0
               / "@every=" number              ; number > 0
+              / "@at=+"   number              ; ms after the rule became active; number > 0
               / "@from="  number              ; Unix milliseconds
               / "@until=" number              ; Unix ms; >= 1, and > @from when both are set
               / "@size>"  number
@@ -541,6 +542,7 @@ any `# owner` comment:
 |---|---|
 | `@first=N` | Fire at most N times per process (N ≥ 1), then go inert: start-up faults that clear by themselves. |
 | `@every=N` | Only every Nth **evaluation** of the rule (N ≥ 1): the 10th, 20th, 30th call that got past the window and size gates. Counts evaluations, not hits, so `@every=10` with `p=0.5` means "of evaluations 10, 20, 30… half fire". `@every=1` is allowed and gates nothing. The count is **per process**, like the `@first` budget: a forked child starts at zero, so on a pre-forking server each worker counts its own evaluations rather than sharing one sequence. |
+| `@at=+N` | Active only from N ms after the rule became active **for that process** (N ≥ 1), which is the moment its rule file was loaded there. Written with the `+`, which is what distinguishes it from a wall-clock time: that is `@from`. A reload that leaves the rule unchanged does not restart the delay; a reload that changes its text starts a new one, because the changed rule is a new rule. A forked child inherits the moment, so the delay runs from the parent's load, not from the fork. Use it for a fault that starts after the application has come up, without having to know the wall-clock time it will be ready at. |
 | `@from=T` | Active only once the wall clock reaches T (Unix milliseconds). |
 | `@until=T` | Active only while the wall clock is before T (T >= 1; `@until=0` is rejected, since 0 is how "no upper bound" is stored and the line would mean the opposite of what it says). With `@from`, the window is `[from, until)`; `@until` must be later than `@from`. One rule file can hold a whole incident timeline. |
 | `@size>N` / `@size<N` | Only calls whose byte count is above / below N. Both may be combined. For the calls that move data this is the number of bytes moved; for `truncate` it is the file's new length and for `allocate` the length of the range, since neither moves bytes. A call without a byte count never matches a size-gated rule. |
@@ -549,6 +551,7 @@ any `# owner` comment:
 tcp4://127.0.0.1:5432:connect:ECONNREFUSED:1.0 @first=3 # net
 /data:write:EIO:1.0 @from=1760000000000 @until=1760000005000 # disk
 tcp4://127.0.0.1:9092:send:LATENCY:200 @size>65536
+/data:fsync:EIO:1.0 @at=+30000 # half a minute after this file was loaded
 ```
 
 Calls that carry a byte count:
@@ -700,7 +703,7 @@ note right
     mmap/anon:ERRNO:ENOMEM@0.01
     clock_gettime/monotonic:OFFSET:-500
     pthread_create:FAIL_AFTER:EAGAIN,128
-  qualifiers: @first=N @every=N @from=T @until=T @size>N @size<N
+  qualifiers: @first=N @every=N @at=+N @from=T @until=T @size>N @size<N
 end note
 
 :Extract qualifiers, parse selector, effect, value;

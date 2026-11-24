@@ -41,6 +41,8 @@
  *                       is the case a RESET must not act on.
  *   dnsquery <name>     - sends a DNS question for <name> to 127.0.0.1:53 and prints the
  *                       elapsed ms, for the dns LATENCY rules.
+ *   atwait <path>       - opens <path>, waits 600 ms, opens it again: "before=<r>
+ *                       after=<r>", for the `@at=+N` delay.
  *   setuid <path>       - drops to uid 65534, then opens <path> and maps 4 MiB:
  *                       "open=<r> mmap=<r>", for what a rule can still match after a
  *                       user switch.
@@ -442,6 +444,19 @@ int main(int argc, char **argv)
         }
         (void
         )printf("wrote=%ld,%ld zeros=%d tenth=%c\n", (long)first, (long)second, zeros, got[10]);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "atwait") == 0)
+    {
+        /* Two opens in one run, 600 ms apart. A rule with `@at=+N` starts counting when it
+         * becomes active for this process, so only the second open is past a delay below
+         * that -- and both have to be in the same run, because the next one arms the rule
+         * afresh. */
+        const struct timespec wait = {0, 600000000L};
+        const char *before = try_open(argv[2]);
+
+        (void)nanosleep(&wait, NULL);
+        (void)printf("before=%s after=%s\n", before, try_open(argv[2]));
         return 0;
     }
     if (argc == 3 && strcmp(argv[1], "dnsquery") == 0)
