@@ -58,6 +58,7 @@
 
 #include "chaos_init_core.h"
 #include "chaos_init_delay.h"
+#include "chaos_init_dns.h"
 #include "chaos_init_trace.h"
 #include "chaos_init_io.h"
 #include "chaos_init_memory.h"
@@ -311,11 +312,12 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *in
     } control;
     uint32_t notify = SECCOMP_RET_USER_NOTIF;
     long traced[CHAOS_INIT_MAX_FILTER];
-    long time_calls[8];
+    long rule_calls[16];
     long time_clocks[16];
-    chaos_init_time_filter_t clock_filter;
-    const chaos_init_time_filter_t *clocks = NULL;
+    chaos_init_rule_filter_t rule_filter;
+    const chaos_init_rule_filter_t *rules = NULL;
     size_t traced_count = 0U;
+    size_t dns_count = 0U;
     int answer[2] = {0, 0};
     int error = 0;
     int listener = -1;
@@ -337,22 +339,30 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *in
             traced + traced_count, sizeof(traced) / sizeof(traced[0]) - traced_count
         );
     }
+    if ((libs & CHAOS_INIT_LIB_DNS) != 0U)
+    {
+        chaos_init_dns_start();
+        dns_count = chaos_init_dns_calls(rule_calls, sizeof(rule_calls) / sizeof(rule_calls[0]));
+    }
+    rule_filter.calls = rule_calls;
+    rule_filter.call_count = dns_count;
+    rule_filter.clocks = time_clocks;
+    rule_filter.clock_count = 0U;
     if ((libs & CHAOS_INIT_LIB_TIME) != 0U)
     {
         chaos_init_time_start();
-        clock_filter.calls = time_calls;
-        clock_filter.call_count =
-            chaos_init_time_calls(time_calls, sizeof(time_calls) / sizeof(time_calls[0]));
-        clock_filter.clocks = time_clocks;
-        clock_filter.clock_count =
+        rule_filter.call_count += chaos_init_time_calls(
+            rule_calls + dns_count, sizeof(rule_calls) / sizeof(rule_calls[0]) - dns_count
+        );
+        rule_filter.clock_count =
             chaos_init_time_clocks(time_clocks, sizeof(time_clocks) / sizeof(time_clocks[0]));
-        clocks = clock_filter.call_count > 0U ? &clock_filter : NULL;
     }
+    rules = rule_filter.call_count > 0U ? &rule_filter : NULL;
     /* Time needs a tracer even with nothing traced: the vDSO of every image has to be
      * blinded at its exec stop, or its clock reads never reach the filter at all. */
-    tracing = traced_count > 0U || clocks != NULL;
+    tracing = traced_count > 0U || (libs & CHAOS_INIT_LIB_TIME) != 0U;
     program.len = (unsigned short)chaos_init_build_filter(
-        libs, handover, traced, traced_count, clocks, filter, CHAOS_INIT_MAX_FILTER
+        libs, handover, traced, traced_count, rules, filter, CHAOS_INIT_MAX_FILTER
     );
     program.filter = filter;
     if (uname(&name) != 0 || !chaos_init_kernel_supported(CHAOS_INIT_RELEASE(&name)))
@@ -606,7 +616,10 @@ chaos_init_decide(unsigned libs, const chaos_init_call_t *call, chaos_init_verdi
 {
     memset(verdict, 0, sizeof(*verdict));
     verdict->action = CHAOS_INIT_PASS;
-    if (!((libs & CHAOS_INIT_LIB_NET) != 0U && chaos_init_net_decide(call, verdict)) &&
+    /* dns first: the send that carries a query is net's call as well, and the name in it
+     * is the narrower match. A send that is no query falls through to net. */
+    if (!((libs & CHAOS_INIT_LIB_DNS) != 0U && chaos_init_dns_decide(call, verdict)) &&
+        !((libs & CHAOS_INIT_LIB_NET) != 0U && chaos_init_net_decide(call, verdict)) &&
         !((libs & CHAOS_INIT_LIB_IO) != 0U && chaos_init_io_decide(call, verdict)) &&
         !((libs & CHAOS_INIT_LIB_MEMORY) != 0U && chaos_init_memory_decide(call, verdict)) &&
         !((libs & CHAOS_INIT_LIB_TIME) != 0U && chaos_init_time_decide(call, verdict)) &&
@@ -1236,6 +1249,10 @@ int main(int argc, char **argv)
     if (listener >= 0 && (options.libs & CHAOS_INIT_LIB_MEMORY) != 0U)
     {
         chaos_init_memory_start();
+    }
+    if (listener >= 0 && (options.libs & CHAOS_INIT_LIB_DNS) != 0U)
+    {
+        chaos_init_dns_start();
     }
     if (listener >= 0 && (options.libs & CHAOS_INIT_LIB_TIME) != 0U)
     {

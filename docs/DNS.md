@@ -38,6 +38,7 @@ Repository-wide ownership rules live in [`docs/SYSTEM.md`](SYSTEM.md).
 | Limits | 256 rules; rule file under 256 KiB (262 144 bytes); 32 literals per OVERRIDE |
 | Failure mode | fail-open |
 | Coverage gate | 100.00 % line coverage on every `src/dns/*.c` file (`test/runtime/check_coverage.sh`) |
+| SECCOMP mode | `LATENCY` on a forward selector, matched by the name in the query the resolver sends; every other effect and every `rdns://` selector is rejected with `unsupported in seccomp mode` (see [`docs/SECCOMP.md`](SECCOMP.md#35-dns-queries-matched-by-the-name-in-them)) |
 
 ---
 

@@ -1495,6 +1495,18 @@ chaos_dns_rule_shadowed(const chaos_dns_rule_t *rules, size_t count, const chaos
 }
 
 /**
+ * @brief Build hook: whether a parsed rule can be applied at all in this mode.
+ *
+ * @details chaos-init (SECCOMP mode) compiles this file with its own definition: a rule
+ * it cannot apply from outside the process rejects the whole file with
+ * CHAOS_STATUS_REASON_UNSUPPORTED, so the status file says so instead of the rule
+ * silently doing nothing.
+ */
+#ifndef CHAOS_DNS_RULE_SUPPORTED
+#define CHAOS_DNS_RULE_SUPPORTED(rule) 1
+#endif
+
+/**
  * @brief Parses a whole rule file (contract in chaos_dns_config.h).
  *
  * @details All or nothing: the first rejected line ends the parse with -1, so a partly
@@ -1570,6 +1582,12 @@ int chaos_dns_config_parse_buffer(char *buffer, chaos_dns_rule_t *rules, size_t 
         if (count >= CHAOS_DNS_MAX_RULES)
         {
             chaos_status_reject(&g_chaos_dns_config_error, CHAOS_STATUS_REASON_TOO_MANY);
+            *rule_count = 0U;
+            return -1;
+        }
+        if (!CHAOS_DNS_RULE_SUPPORTED(&parsed))
+        {
+            chaos_status_reject(&g_chaos_dns_config_error, CHAOS_STATUS_REASON_UNSUPPORTED);
             *rule_count = 0U;
             return -1;
         }

@@ -104,7 +104,7 @@ static int test_process_of(pid_t tid, pid_t *tgid, uint64_t *start)
 #include <stdint.h>
 
 /* The time rules' share of the filter; NULL unless a case builds one. */
-static const chaos_init_time_filter_t *g_test_clock = NULL;
+static const chaos_init_rule_filter_t *g_test_clock = NULL;
 
 /**
  * @brief Interprets @p filter (as built by chaos_init_build_filter()) over @p data and
@@ -301,7 +301,7 @@ static void test_clock_group(void)
     static const long calls[] = {__NR_clock_gettime, __NR_nanosleep};
     static const long wall[] = {CLOCK_REALTIME};
     static const long traced[] = {__NR_write};
-    chaos_init_time_filter_t filter;
+    chaos_init_rule_filter_t filter;
 
     filter.calls = calls;
     filter.call_count = sizeof(calls) / sizeof(calls[0]);

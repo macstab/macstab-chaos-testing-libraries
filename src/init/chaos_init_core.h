@@ -83,22 +83,25 @@ typedef struct chaos_init_options
 int chaos_init_parse_args(int argc, char **argv, chaos_init_options_t *options);
 
 /**
- * @brief Which clock reads a time rule set needs notified.
+ * @brief The part of the filter that comes from the rule files rather than from a table.
  *
- * @details A clock read is served from the vDSO, so the filter only ever sees one once
- * the tracee's lookups have been made to fail (chaos_init_vdso.h) -- and then it sees
- * every one of them. `clock_gettime` carries the clock in its first argument, so the
- * filter can test it and notify only the clocks a rule names, which leaves a monotonic
- * read untouched while a rule works on the wall clock. An empty clock list means every
- * clock, which is what a rule without one asks for.
+ * @details Two libraries decide what to notify from what their rules say. **time**: a
+ * clock read is served from the vDSO, so the filter only ever sees one once the tracee's
+ * lookups have been made to fail (chaos_init_vdso.h) -- and then it sees every one of
+ * them. `clock_gettime` carries the clock in its first argument, so the filter tests it
+ * and notifies only the clocks a rule names, which leaves a monotonic read untouched while
+ * a rule works on the wall clock; an empty clock list means every clock, which is what a
+ * rule without one asks for. **dns**: the sends a resolver makes, which are worth a
+ * notification only while a rule can act on one (chaos_init_dns_calls()).
  */
-typedef struct chaos_init_time_filter
+typedef struct chaos_init_rule_filter
 {
-    const long *calls;  /**< System call numbers to notify (chaos_init_time_calls()). */
+    const long *calls;  /**< Numbers to notify: chaos_init_dns_calls() and
+                             chaos_init_time_calls() together. */
     size_t call_count;  /**< Entries in @c calls. */
     const long *clocks; /**< Clock ids for `clock_gettime` (chaos_init_time_clocks()). */
     size_t clock_count; /**< Entries in @c clocks; 0 means every clock. */
-} chaos_init_time_filter_t;
+} chaos_init_rule_filter_t;
 
 /**
  * @brief Writes the seccomp BPF program for @p libs into @p out.
@@ -133,7 +136,7 @@ typedef struct chaos_init_time_filter
  *                      before traced effects existed.
  * @param traced_count  Entries in @p traced.
  * @param clock         The time rules' calls and clocks, or NULL when no time rule is
- *                      loaded (chaos_init_time_filter_t).
+ *                      loaded (chaos_init_rule_filter_t).
  * @param out           Output program of @p capacity instructions.
  * @return Number of instructions written, or 0 if @p capacity is too small.
  */
@@ -142,7 +145,7 @@ size_t chaos_init_build_filter(
     int handover_fd,
     const long *traced,
     size_t traced_count,
-    const chaos_init_time_filter_t *clock,
+    const chaos_init_rule_filter_t *clock,
     struct sock_filter *out,
     size_t capacity
 );

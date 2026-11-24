@@ -39,6 +39,8 @@
  *                       client's next read sees, for close RESET.
  *   shared <port>       - the same with a forked child holding the server end too, which
  *                       is the case a RESET must not act on.
+ *   dnsquery <name>     - sends a DNS question for <name> to 127.0.0.1:53 and prints the
+ *                       elapsed ms, for the dns LATENCY rules.
  *   setuid <path>       - drops to uid 65534, then opens <path> and maps 4 MiB:
  *                       "open=<r> mmap=<r>", for what a rule can still match after a
  *                       user switch.
@@ -440,6 +442,60 @@ int main(int argc, char **argv)
         }
         (void
         )printf("wrote=%ld,%ld zeros=%d tenth=%c\n", (long)first, (long)second, zeros, got[10]);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "dnsquery") == 0)
+    {
+        /* The question a resolver would send, built here so the probe needs no name
+         * server: nothing listens on the port, and a UDP send succeeds all the same. The
+         * supervisor reads the name out of the payload and holds the send, which is the
+         * whole mechanism -- the elapsed time is what shows it. */
+        unsigned char query[512];
+        struct sockaddr_in server;
+        struct timespec start;
+        struct timespec end;
+        const char *label = argv[2];
+        size_t at = 12U;
+        const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+        memset(query, 0, sizeof(query));
+        query[0] = 0x12;
+        query[1] = 0x34;
+        query[5] = 1U; /* one question */
+        while (*label != '\0')
+        {
+            const char *dot = strchr(label, '.');
+            const size_t length = dot != NULL ? (size_t)(dot - label) : strlen(label);
+
+            query[at++] = (unsigned char)length;
+            memcpy(query + at, label, length);
+            at += length;
+            label = dot != NULL ? dot + 1 : label + length;
+        }
+        query[at++] = 0U; /* the root label */
+        query[at++] = 0U;
+        query[at++] = 1U; /* QTYPE A */
+        query[at++] = 0U;
+        query[at++] = 1U; /* QCLASS IN */
+
+        memset(&server, 0, sizeof(server));
+        server.sin_family = AF_INET;
+        server.sin_port = htons(53);
+        server.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        (void)clock_gettime(CLOCK_MONOTONIC, &start);
+        if (fd < 0 ||
+            sendto(fd, query, at, 0, (struct sockaddr *)&server, sizeof(server)) != (ssize_t)at)
+        {
+            (void)printf("send=%s\n", try_open_errno_name(errno));
+            return 0;
+        }
+        (void)clock_gettime(CLOCK_MONOTONIC, &end);
+        (void)printf(
+            "%lld\n",
+            (long long)((end.tv_sec - start.tv_sec) * 1000 + (end.tv_nsec - start.tv_nsec) / 1000000
+            )
+        );
+        (void)close(fd);
         return 0;
     }
     if (argc == 3 && strcmp(argv[1], "setuid") == 0)

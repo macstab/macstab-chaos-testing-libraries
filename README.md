@@ -695,7 +695,7 @@ chaos-init --libs io,net,memory,process -- /usr/local/bin/nats-server -js
 | memory | `ERRNO`, `LATENCY` |
 | process | `ERRNO`, `LATENCY`, `FAIL_AFTER`; `clone` is classified as `pthread_create` (`CLONE_THREAD`), `posix_spawn` (`CLONE_VFORK`) or `fork` |
 | time | `ERRNO`, `LATENCY` on a clock read and on `nanosleep`; `OFFSET`, `REGRESS`, `FREEZE` on a clock read. The vDSO lookups of each image are made to fail first, so the reads become system calls; a `usleep` rule is rejected |
-| dns | nothing: name resolution is a library function |
+| dns | `LATENCY`, matched by the name in the query the resolver sends (which is how it reaches a static binary); the answer-changing effects are rejected, because the answer is the resolver's |
 
 - Rules seccomp cannot carry out reject their whole file with
   `reason=unsupported in seccomp mode`: io `FREE`/`FULL`, errno on `close`, and any

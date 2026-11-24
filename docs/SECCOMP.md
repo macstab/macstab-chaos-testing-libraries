@@ -16,7 +16,7 @@ time) and decides inside the process, without a round trip to a supervisor per c
 |---|---|
 | Binary | `chaos-init`, static, one per architecture (x86_64, aarch64); serves glibc, musl and libc-less images |
 | Command line | `chaos-init --libs <io,net,dns,time,memory,process> -- <command> [args...]` |
-| Libraries applied | io, net, time, memory, process (dns is accepted and applies nothing, §6) |
+| Libraries applied | io, net, dns (`LATENCY` only), time, memory, process |
 | Effects applied | ERRNO, LATENCY; net TIMEOUT; process FAIL_AFTER |
 | Mode status file | `/tmp/.chaos-init.status` |
 | Rule, status and hits files | those of the libraries: `/tmp/.chaos-<lib>.conf`, `.status`, `.hits.<n>` |
@@ -241,7 +241,7 @@ output `dist/chaos-init-<arch>`; or `make native-init`, output `build/chaos-init
 | memory | ERRNO, LATENCY on mmap (anon/file), munmap, mprotect, madvise | the arguments: operation, `mmap` flags, length for `@size` |
 | process | ERRNO, LATENCY, FAIL_AFTER on pthread_create, fork, posix_spawn, execve, execveat, waitpid | the system call and clone's flags (§5) |
 | time | ERRNO, LATENCY on a clock read and on nanosleep; OFFSET, REGRESS, FREEZE on a clock read, which the supervisor answers with a value of its own (§3.4) | the operation and, for a clock read, the clock in `args[0]`; a `usleep` rule is rejected, because libc sleeps through nanosleep |
-| dns | nothing (§6) | |
+| dns | LATENCY on a forward selector (§3.5) | the name in the query the resolver sends; the answer-changing effects and `rdns://` selectors are rejected |
 
 Probability and all qualifiers apply (`@first`, `@from`, `@until`, `@size`). When a
 LATENCY and an ERRNO rule both fire for one call, the call is delayed, then failed.
@@ -410,6 +410,32 @@ for that process alone: no other process, and no other container, is affected.
 - `usleep` rules are rejected (§4): libc sleeps through `nanosleep`, so the supervisor
   cannot tell the two entry points apart and such a rule could never fire.
 
+### 3.5 DNS queries, matched by the name in them
+
+`getaddrinfo()` is a library function, so the lookup itself cannot be intercepted here.
+What can be seen is the **query the resolver sends**, and that carries the name: a send
+whose payload is a DNS question is matched by the name in it, which is what makes
+`dns://api.example.com:LATENCY:500` work in a static binary -- the case LD_PRELOAD cannot
+reach at all.
+
+- **A query is recognised by its shape, not by a port.** The payload is parsed as a DNS
+  message: one question, the answer bit clear, the opcode QUERY, and a `QNAME` of
+  length-prefixed labels ending inside the payload. A query over TCP carries its length in
+  front, which is skipped when it matches the rest. A port test would be weaker -- it needs
+  the socket's peer, misses a resolver on another port, and still has to parse the name.
+- The sends looked at are `sendto` (glibc and musl over UDP), `sendmmsg` (glibc asking for
+  A and AAAA at once; the first message of the batch), `sendmsg` and `write` (a query over
+  TCP). They are notified only while a `LATENCY` rule is loaded.
+- **`LATENCY` is the only effect that survives.** The query is held, so the resolver sees a
+  slow name server, which is what the rule says. Everything else libchaos-dns offers
+  changes the *answer* (`GAI`, `REWRITE`, `OVERRIDE`, `SERVICE`, `FILTER_FAMILY`,
+  `SHUFFLE`, `LIMIT`), and the answer is assembled inside the resolver: failing the send
+  would produce whatever resolution error that resolver makes of it, not the `EAI_*` the
+  rule names. Those rules are rejected (§4), as are `rdns://` selectors -- a PTR query
+  carries `in-addr.arpa` labels, and the rule names an address.
+- The same send is net's call as well. dns decides first, because the name is the narrower
+  match; a send that is not a query falls through to net untouched.
+
 ---
 
 ## 4. Rejected rules
@@ -428,9 +454,10 @@ loads, and only the call forms named there are left alone -- the operation is th
 | io and net ERRNO on close | The libraries close, then report the error, as Linux does for a failing close. A notified call either runs or fails, not both. |
 | process `posix_spawnp` selector | The `PATH` search is in the C library; the system calls are those of posix_spawn, whose rules apply to it, so the rule could never fire. A `*` rule is accepted. |
 | time `usleep` selector | libc serves `usleep` through `nanosleep`, so the filter cannot tell which entry point the program used: a `nanosleep` rule covers both and a `usleep` rule could never fire. |
+| dns GAI, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, and every `rdns://` selector | They change the answer, which the resolver assembles from what comes back: a reply to the query's send cannot produce the `EAI_*` or the address list a rule names, only some resolution error. A reverse selector cannot even be matched -- a PTR query carries `in-addr.arpa` labels (§3.5). |
 
 The check is a build hook in the parsers (`CHAOS_IO_RULE_SUPPORTED`,
-`CHAOS_NET_RULE_SUPPORTED`, `CHAOS_TIME_RULE_SUPPORTED`,
+`CHAOS_NET_RULE_SUPPORTED`, `CHAOS_DNS_RULE_SUPPORTED`, `CHAOS_TIME_RULE_SUPPORTED`,
 `CHAOS_PROCESS_RULE_SUPPORTED`; `1` in the libraries), so the
 status file reports the rejection together with the load, never a passing `state=ok`
 first.
@@ -471,9 +498,9 @@ first.
 
 ## 6. Not possible
 
-- **dns.** `getaddrinfo` is a library function. A static program resolves names with
-  plain UDP/TCP to port 53, which net rules can fail or delay by endpoint, but not by
-  the name looked up. `--libs dns` installs no rule for it.
+- **dns, beyond `LATENCY`.** The query is reachable (§3.5) and so is the name in it, but
+  the answer is the resolver's: no reply to a send produces a chosen `EAI_*` code or a
+  chosen address list. Those rules are rejected rather than approximated.
 
 ---
 

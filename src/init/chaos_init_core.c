@@ -232,7 +232,7 @@ size_t chaos_init_build_filter(
     int handover_fd,
     const long *traced,
     size_t traced_count,
-    const chaos_init_time_filter_t *clock,
+    const chaos_init_rule_filter_t *clock,
     struct sock_filter *out,
     size_t capacity
 )

@@ -407,6 +407,25 @@ expect "Go: the vDSO of the Go image was blinded" \
     "$(grep -c "^vdso=failed$" /tmp/.chaos-init.status)" "0"
 rm -f /tmp/.chaos-time.conf
 
+# dns: the lookup is a library function, so what SECCOMP mode sees is the query the
+# resolver sends -- and that carries the name. A LATENCY rule for one name holds exactly
+# that query; another name goes out at once. The answer-changing effects are rejected,
+# because the answer is assembled inside the resolver.
+printf "%s\n" "dns://slow.example.com:LATENCY:200 # t" > /tmp/.chaos-dns.conf
+at_least "C: a dns rule holds the query for its name" \
+    "$($init --libs dns -- /tmp/probe dnsquery slow.example.com)" 200
+expect "C: and lets another name through" \
+    "$($init --libs dns -- /tmp/probe dnsquery fast.example.com)" "0"
+expect "C: the dns rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-dns.status | tr "\n" " ")" "state=ok rules=1 "
+printf "%s\n" "dns://slow.example.com:EAI_NONAME:1.0 # t" > /tmp/.chaos-dns.conf
+expect "C: an answer-changing dns rule rejects the file" \
+    "$($init --libs dns -- /tmp/probe dnsquery slow.example.com)" "0"
+expect "C: and says why" \
+    "$(sed -n 3,4p /tmp/.chaos-dns.status | tr "\n" " ")" \
+    "line=1 reason=unsupported in seccomp mode "
+rm -f /tmp/.chaos-dns.conf
+
 # A process that drops privileges becomes non-dumpable, and the kernel then refuses every
 # look into it: its path cannot be read, so a path rule does not match it. That is a rule
 # that looks applied and does nothing, so the supervisor says so in its status file. The
