@@ -425,8 +425,14 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *in
     }
     /* Traced: stop once, so the parent can set its ptrace options before the application
      * makes its first filtered call. The go signal is blocked and stays pending, so the
-     * sigwait() below returns as soon as the parent continues this thread. */
-    if (tracing)
+     * sigwait() below returns as soon as the parent continues this thread.
+     *
+     * answer[1], not `tracing`: the stop has to be the one the parent was told about. A
+     * library that asks for a tracer (time does, with no rule loaded at all) sets
+     * `tracing` before it is known whether the filter can be installed, and on a kernel
+     * or in a container that refuses seccomp this child never called PTRACE_TRACEME --
+     * stopping then would park the application at a stop nobody continues. */
+    if (answer[1])
     {
         (void)raise(SIGSTOP);
     }
