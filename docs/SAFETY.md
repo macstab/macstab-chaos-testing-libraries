@@ -308,9 +308,19 @@ Conditions and outcome:
 | Probability, `@from`/`@until` window, `@size` gate or `@first` budget says no | call passes through |
 | Reentrancy guard set | call passes through at once |
 
+| The status or hits file cannot be written (read-only `/tmp`, full filesystem, EACCES) | the rule still applies; the report is dropped silently |
+
 Removing the rule file restores normal behaviour within about 1 ms: once rules are loaded,
 each library looks at the file at most once per millisecond, and a missing file publishes an
-empty rule set. Every rejection is visible in `/tmp/.chaos-<lib>.status`
+empty rule set.
+
+A hardened container is the ordinary case of that last row: with Kubernetes
+`readOnlyRootFilesystem` (Docker `--read-only`) the rule file can still be mounted in, and
+nothing can be written back. Measured in `test/runtime/test_status.sh`: the rule fires -- a
+write to the named path fails with `EIO` -- and no status file appears. Fail-open means the
+*program* survives an internal error, not that the rule is dropped: a report that cannot be
+written is a report lost, not a fault skipped. A test that wants the report needs a writable
+`/tmp` (an `emptyDir` mount is enough). Every rejection is visible in `/tmp/.chaos-<lib>.status`
 ([ARCHITECTURE.md, Status file](ARCHITECTURE.md#status-file)).
 
 ### 5.1 The One Exception: Unresolvable Symbols

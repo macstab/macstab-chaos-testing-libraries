@@ -11,7 +11,10 @@
 #   - one valid rule       -> state=ok, rules=1
 #   - no rule file         -> no status file (a stale one is removed)
 #
-# On glibc it further proves that a non-root user (setpriv uid 1000) can update a status file root
+# On glibc it further proves that a container with a read-only root filesystem (Kubernetes
+# `readOnlyRootFilesystem`) still applies a rule file mounted into it, writes no status file
+# because it cannot, and breaks nothing -- the report is a report, not a precondition; and
+# that a non-root user (setpriv uid 1000) can update a status file root
 # created in sticky /tmp, by rewriting it in place since it cannot rename over it, and that a rule
 # file read after the program switched to de_DE.UTF-8 still parses "1.0" as a probability
 # (locale_probe.c). The locale check prints "skip" and passes when the locale cannot be installed
@@ -219,3 +222,35 @@ for libc in glibc musl; do
         "$base" \
         sh -c "$CHECK_SCRIPT"
 done
+
+# readOnlyRootFilesystem, the way Kubernetes runs a hardened container: the rule file can
+# still be mounted in, but nothing can be written. The library must then fault the call it
+# was asked to fault and keep quiet about the report it cannot write -- a status file is a
+# report, not a precondition. Fail-open means the *program* survives, not that the rule is
+# dropped.
+printf '%s\n' '/data:write:EIO:1.0' > "$TMP_DIR/ro-rules.conf"
+chmod a+r "$TMP_DIR/ro-rules.conf"
+RO_SCRIPT='
+set -eu
+mkdir -p /data 2>/dev/null || true
+# cp writes through a descriptor of its own; a shell redirect would make the file fd 1,
+# and descriptors 0-2 are never faulted.
+got=$(LD_PRELOAD=/out/libchaos-io-glibc-'"$ARCH"'.so cp /etc/hostname /data/x 2>&1 || true)
+case "$got" in
+    *"Input/output error"*) echo "ok   read-only root: the write still fails with EIO" ;;
+    *) echo "FAIL read-only root: expected an I/O error, got: $got" >&2; exit 1 ;;
+esac
+if [ -e /tmp/.chaos-io.status ]; then
+    echo "FAIL read-only root: a status file was written to a read-only /tmp" >&2
+    exit 1
+fi
+echo "ok   read-only root: no status file, and nothing broke"
+'
+docker run --rm \
+    --platform "$DOCKER_PLATFORM" \
+    --read-only \
+    --tmpfs /data:rw,size=4m \
+    -v "$TMP_DIR/glibc:/out:ro" \
+    -v "$TMP_DIR/ro-rules.conf:/tmp/.chaos-io.conf:ro" \
+    gcc:bookworm \
+    sh -c "$RO_SCRIPT"
