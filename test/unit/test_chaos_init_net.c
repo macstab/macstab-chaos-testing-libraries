@@ -1718,5 +1718,21 @@ int main(void)
     (void)unlink("/tmp/initnet.sock");
     (void)snprintf(rules, sizeof(rules), "/tmp/.chaos-net.hits.%ld", (long)getpid());
     (void)unlink(rules);
+    /* A reload without a call: what the inotify watch of chaos_init.c asks for when a
+     * rule file is put in place, so that the status file reports the rules before anything
+     * has called into them. Two rules, because every file loaded above has one or none: a
+     * status that said anything else would mean the reload did nothing. */
+    write_rules("*:close:LATENCY:5\n*:connect:ECONNREFUSED:1.0\n");
+    chaos_init_net_reload();
+    {
+        FILE *reloaded = fopen("/tmp/.chaos-net.status", "r");
+        char text[256] = {0};
+
+        assert(reloaded != NULL);
+        text[fread(text, 1U, sizeof(text) - 1U, reloaded)] = '\0';
+        (void)fclose(reloaded);
+        assert(strncmp(text, "state=ok\nrules=2\n", strlen("state=ok\nrules=2\n")) == 0);
+    }
+
     return 0;
 }

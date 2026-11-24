@@ -883,5 +883,21 @@ int main(void)
     (void)snprintf(buffer, sizeof(buffer), "/tmp/.chaos-io.hits.%ld", (long)getpid());
     (void)unlink(buffer);
     (void)unlink("/tmp/.chaos-io.conf");
+    /* A reload without a call: what the inotify watch of chaos_init.c asks for when a
+     * rule file is put in place, so that the status file reports the rules before anything
+     * has called into them. Two rules, because every file loaded above has one or none: a
+     * status that said anything else would mean the reload did nothing. */
+    write_rules("/tmp/initio/data:open:EIO:1.0\n/tmp/initio/other:open:EIO:1.0\n");
+    chaos_init_io_reload();
+    {
+        FILE *reloaded = fopen("/tmp/.chaos-io.status", "r");
+        char text[256] = {0};
+
+        assert(reloaded != NULL);
+        text[fread(text, 1U, sizeof(text) - 1U, reloaded)] = '\0';
+        (void)fclose(reloaded);
+        assert(strncmp(text, "state=ok\nrules=2\n", strlen("state=ok\nrules=2\n")) == 0);
+    }
+
     return 0;
 }

@@ -12,6 +12,8 @@
 #   short nor restarted per signal and counts one hit (also with the pre-5.19 test build,
 #   CHAOS_INIT_TEST_NO_KILLABLE_WAIT); a rule naming a symlink covers the real file;
 #   the hits files carry the reload generation as the libraries write it;
+# - a rule file that is put in place while nothing calls is read at once, reported in the
+#   status file, and applied to the call that follows;
 #   @first=1 fires once per process, a forked child included, one hits file per process; an
 #   execve starts a new process for @first while the old image keeps its hits file; the
 #   status file reports the rules;
@@ -301,6 +303,27 @@ printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/data:statfs:FULL:1.0 # 
 expect "a rule SECCOMP mode cannot apply rejects the file" "$($init --libs io -- /tmp/probe open /tmp/sec/data/x)" "ok"
 expect "the status file names it" "$(sed -n 3,4p /tmp/.chaos-io.status | tr "\n" " ")" \
     "line=2 reason=unsupported in seccomp mode "
+
+# A rule file that is put in place while nothing calls is read when it is put in place, not
+# only when the next intercepted call arrives: the status file a test reads to see the rules
+# accepted is written by that read, and the call it is waiting for may be seconds away. The
+# watch is on the directory, because the file arrives by rename and a watch on the file
+# itself never sees that. The probe makes its one call three seconds in, so both checks
+# below happen before any call of its own.
+rm -f /tmp/.chaos-io.conf /tmp/.chaos-io.status
+$init --libs io -- /tmp/probe late /tmp/sec/data/x > /tmp/late.out 2>&1 &
+late_pid=$!
+sleep 1
+printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" > /tmp/.chaos-io.conf.new
+expect "no status file before the rule file is in place" \
+    "$(cat /tmp/.chaos-io.status 2>/dev/null | wc -l | tr -d " ")" "0"
+mv -f /tmp/.chaos-io.conf.new /tmp/.chaos-io.conf
+sleep 1
+expect "a replaced rule file is read before any intercepted call" \
+    "$(sed -n 1,2p /tmp/.chaos-io.status | tr "\n" " ")" "state=ok rules=1 "
+wait "$late_pid"
+expect "and the rule applies to the call that follows" "$(cat /tmp/late.out)" "EIO"
+rm -f /tmp/late.out
 
 # TORN through a ptrace stop: the count is shortened in the register before the kernel reads
 # it, so the returned count and the file size drop together and both stay under ten. A

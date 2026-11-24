@@ -192,6 +192,17 @@ chaos-init --libs io,net,memory,process -- /usr/local/bin/nats-server -js
 
 - Rules are written to `/tmp/.chaos-<lib>.conf` exactly as for the libraries and are
   reloaded the same way. The supervisor reads them itself; it is under no filter.
+- A replaced rule file is read **when it is replaced**, not only when the next intercepted
+  call arrives: the supervisor watches `/tmp` (inotify) for a rule file being renamed into
+  place, written or removed, and reads it then. That matters for what the read writes --
+  the library's status file -- because a test that puts rules in place and waits to see
+  them accepted would otherwise wait for a call it has not made yet. Under `LD_PRELOAD`
+  the constructor does the same at process start. The watch is on the directory because
+  the file arrives by rename (`mv -f`), which a watch on the file itself never sees; a
+  watch that cannot be created costs nothing, since the next intercepted call still reads
+  the file. Two limits are unchanged by it: a rule file is stat'ed at most once per
+  millisecond, so two changes inside one millisecond are read as one, and the **filter
+  cannot be changed** after it is installed (§3.3).
 - `/tmp/.chaos-init.status` reports whether the mode is active:
 
   ```text

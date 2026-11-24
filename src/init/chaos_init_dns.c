@@ -127,6 +127,12 @@ void chaos_init_dns_start(void)
     (void)chaos_init_tracee_register(&g_chaos_init_dns_rules);
 }
 
+/** @copydoc chaos_init_dns_reload */
+void chaos_init_dns_reload(void)
+{
+    (void)chaos_dns_config_prepare();
+}
+
 /**
  * @brief Reads the name out of a DNS question, or reports that there is none.
  *

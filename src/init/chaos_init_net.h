@@ -102,4 +102,16 @@ size_t chaos_init_net_traced_calls(long *out, size_t capacity);
  */
 int chaos_init_net_decide_result(const chaos_init_call_t *call, long result);
 
+/**
+ * @brief Re-reads `/tmp/.chaos-net.conf` now, outside a decision.
+ *
+ * @details What a decision does first, done without one: the rule file is stat'ed and, if
+ * it changed, loaded and published, which also rewrites this library's status file. Called
+ * when the rule file was replaced (the inotify watch in chaos_init.c), so that a rule file
+ * nobody has called into yet is still reported -- under `LD_PRELOAD` the constructor does
+ * that at process start, and a status file that only appears with the first intercepted
+ * call would be a difference between the two modes that nothing explains.
+ */
+void chaos_init_net_reload(void);
+
 #endif

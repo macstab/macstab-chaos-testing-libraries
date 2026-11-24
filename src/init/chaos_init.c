@@ -76,6 +76,7 @@
 #include <linux/seccomp.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/inotify.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1035,6 +1036,106 @@ static int chaos_init_reap(unsigned libs, pid_t child, int *child_status)
 }
 
 /**
+ * @brief Directory the rule files live in: every one of them is `/tmp/.chaos-<lib>.conf`,
+ *        a documented path, so one watch covers all six.
+ */
+#define CHAOS_INIT_RULE_DIR "/tmp"
+
+/**
+ * @brief Whether @p name is a rule file of one of the libraries.
+ *
+ * @details `.chaos-<lib>.conf`, matched by its ends. This is a cost measure, not a
+ * correctness one: a reload the rule files did not need stats them and returns, so
+ * answering every event would be right and wasteful. The watched directory is `/tmp`,
+ * where every program in the container puts its temporary files, and the libraries their
+ * own status and hits files -- waking the supervisor and stat'ing six files for each of
+ * those is what this avoids.
+ */
+static int chaos_init_rule_file(const char *name)
+{
+    const size_t length = strlen(name);
+
+    return length > sizeof(".chaos-.conf") - 1U && strncmp(name, ".chaos-", 7U) == 0 &&
+           strcmp(name + length - (sizeof(".conf") - 1U), ".conf") == 0;
+}
+
+/**
+ * @brief Re-reads the rule files of @p libs, as the first decision of a call would.
+ *
+ * @details Publishing a rule file also writes that library's status file, which is the
+ * point of doing it without a call: a rule file nobody has called into yet is reported
+ * all the same.
+ */
+static void chaos_init_reload(unsigned libs)
+{
+    if ((libs & CHAOS_INIT_LIB_IO) != 0U)
+    {
+        chaos_init_io_reload();
+    }
+    if ((libs & CHAOS_INIT_LIB_NET) != 0U)
+    {
+        chaos_init_net_reload();
+    }
+    if ((libs & CHAOS_INIT_LIB_DNS) != 0U)
+    {
+        chaos_init_dns_reload();
+    }
+    if ((libs & CHAOS_INIT_LIB_TIME) != 0U)
+    {
+        chaos_init_time_reload();
+    }
+    if ((libs & CHAOS_INIT_LIB_MEMORY) != 0U)
+    {
+        chaos_init_memory_reload();
+    }
+    if ((libs & CHAOS_INIT_LIB_PROCESS) != 0U)
+    {
+        chaos_init_process_reload();
+    }
+}
+
+/**
+ * @brief Reads the pending watch events and reloads the rule files when one of them names
+ *        a rule file.
+ *
+ * @details One reload for the whole batch, and of every library rather than the one named:
+ * a prepare whose file did not change stats it and returns, which is cheaper than keeping
+ * a name per library here. Events the kernel could not queue are dropped by it
+ * (IN_Q_OVERFLOW); the next change, or the next intercepted call, is seen anyway.
+ */
+static void chaos_init_watched(int watcher, unsigned libs)
+{
+    union
+    {
+        struct inotify_event event; /* the alignment read(2) requires of the buffer */
+        char bytes[4096];
+    } buffer;
+    ssize_t got;
+    int reload = 0;
+
+    while ((got = read(watcher, buffer.bytes, sizeof(buffer.bytes))) > 0)
+    {
+        size_t offset = 0U;
+
+        while (offset + sizeof(struct inotify_event) <= (size_t)got)
+        {
+            const struct inotify_event *event =
+                (const struct inotify_event *)(const void *)(buffer.bytes + offset);
+
+            if (event->len > 0U && chaos_init_rule_file(event->name))
+            {
+                reload = 1;
+            }
+            offset += sizeof(struct inotify_event) + event->len;
+        }
+    }
+    if (reload)
+    {
+        chaos_init_reload(libs);
+    }
+}
+
+/**
  * @brief After the application exited: forks a background copy that keeps answering the
  *        processes it left behind (daemons, double forks), when one is needed.
  *
@@ -1093,6 +1194,7 @@ int main(int argc, char **argv)
     int error;
     int signals;
     int timer;
+    int watcher = -1;
     int child_status = 0;
     int serving_the_rest = 0;
     int found;
@@ -1288,10 +1390,32 @@ int main(int argc, char **argv)
         (void)kill(child, SIGKILL);
         return CHAOS_INIT_EXIT_HANDOVER;
     }
+    /* A replaced rule file is read when it is replaced, not only when the next intercepted
+     * call arrives: that call may be seconds away, or may never come in a container that
+     * is waiting for the rules to be in place, and the status file a test reads to see
+     * them accepted is written by the reload. The watch is on the directory because the
+     * file is delivered by rename (`mv -f`), which a watch on the file itself never sees.
+     * Without rules to apply (no listener) there is nothing to reload, and a watch that
+     * cannot be created costs nothing: every rule file is still read by the next call. */
+    if (listener >= 0)
+    {
+        watcher = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (watcher >= 0 &&
+            inotify_add_watch(
+                watcher, CHAOS_INIT_RULE_DIR, IN_MOVED_TO | IN_CLOSE_WRITE | IN_DELETE
+            ) < 0)
+        {
+            (void)close(watcher);
+            watcher = -1;
+        }
+    }
     for (;;)
     {
-        struct pollfd watched[3];
+        struct pollfd watched[4];
         nfds_t count = 2;
+        /* Which slot the watch got, or 0 when there is none: the slots after the timer
+         * depend on what exists, and a count alone has been a trap here before. */
+        nfds_t watch_slot = 0;
 
         watched[0].fd = signals;
         watched[0].events = POLLIN;
@@ -1302,6 +1426,13 @@ int main(int argc, char **argv)
             watched[2].fd = listener;
             watched[2].events = POLLIN;
             count = 3;
+        }
+        if (watcher >= 0)
+        {
+            watch_slot = count;
+            watched[count].fd = watcher;
+            watched[count].events = POLLIN;
+            ++count;
         }
         if (poll(watched, count, -1) < 0)
         {
@@ -1348,11 +1479,11 @@ int main(int argc, char **argv)
         /* One notification per iteration keeps signals and due delays from starving
          * under a notification storm. POLLIN wins over POLLHUP; a hang-up is seen on a
          * later iteration once nothing is left to receive. */
-        if (count == 3 && (watched[2].revents & POLLIN) != 0)
+        if (listener >= 0 && (watched[2].revents & POLLIN) != 0)
         {
             chaos_init_answer(listener, options.libs, request, response, sizes.seccomp_notif_resp);
         }
-        else if (count == 3 && (watched[2].revents & (POLLHUP | POLLERR)) != 0)
+        else if (listener >= 0 && (watched[2].revents & (POLLHUP | POLLERR)) != 0)
         {
             /* No process uses the filter any more (Linux 5.8+). Parked calls died with
              * their threads. The main process keeps running until SIGCHLD reports the
@@ -1364,6 +1495,10 @@ int main(int argc, char **argv)
                 chaos_init_tracee_flush(1);
                 return 0;
             }
+        }
+        if (watch_slot != 0 && (watched[watch_slot].revents & POLLIN) != 0)
+        {
+            chaos_init_watched(watcher, options.libs);
         }
         if (listener >= 0)
         {

@@ -45,6 +45,8 @@
  *                       after=<r>", for the `@at=+N` delay.
  *   throttle <path>     - writes 512 KiB to <path> in two rounds and prints the elapsed ms
  *                       and whether any write came back short, for THROTTLE.
+ *   late <path>         - waits three seconds, then opens <path>: a process that makes no
+ *                       intercepted call while a rule file is being put in place.
  *   setuid <path>       - drops to uid 65534, then opens <path> and maps 4 MiB:
  *                       "open=<r> mmap=<r>", for what a rule can still match after a
  *                       user switch.
@@ -446,6 +448,16 @@ int main(int argc, char **argv)
         }
         (void
         )printf("wrote=%ld,%ld zeros=%d tenth=%c\n", (long)first, (long)second, zeros, got[10]);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "late") == 0)
+    {
+        /* Nothing intercepted for three seconds: whatever the supervisor does with a rule
+         * file that appears meanwhile, it does without being asked by a call. */
+        const struct timespec wait = {3, 0};
+
+        (void)nanosleep(&wait, NULL);
+        (void)printf("%s\n", try_open(argv[2]));
         return 0;
     }
     if (argc == 3 && strcmp(argv[1], "throttle") == 0)

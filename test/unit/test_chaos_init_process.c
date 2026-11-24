@@ -267,5 +267,21 @@ int main(void)
     (void)snprintf(hits, sizeof(hits), "/tmp/.chaos-process.hits.%ld", (long)child);
     (void)unlink(hits);
     (void)unlink("/tmp/.chaos-process.conf");
+    /* A reload without a call: what the inotify watch of chaos_init.c asks for when a
+     * rule file is put in place, so that the status file reports the rules before anything
+     * has called into them. Two rules, because every file loaded above has one or none: a
+     * status that said anything else would mean the reload did nothing. */
+    write_rules("*:ERRNO:ENOMEM\nfork:LATENCY:5\n");
+    chaos_init_process_reload();
+    {
+        FILE *reloaded = fopen("/tmp/.chaos-process.status", "r");
+        char text[256] = {0};
+
+        assert(reloaded != NULL);
+        text[fread(text, 1U, sizeof(text) - 1U, reloaded)] = '\0';
+        (void)fclose(reloaded);
+        assert(strncmp(text, "state=ok\nrules=2\n", strlen("state=ok\nrules=2\n")) == 0);
+    }
+
     return 0;
 }

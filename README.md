@@ -693,6 +693,9 @@ chaos-init --libs io,net,memory,process -- /usr/local/bin/nats-server -js
 - `src/init/chaos_init_<lib>.c` turns a system call into what the library's wrapper
   would pass to the rule core; parsing, reload, matching, qualifiers and the status and
   hits files are the libraries' own source files.
+- A rule file that is renamed into place, written or removed is read at once (an inotify
+  watch on `/tmp`), so the library's status file reports it without waiting for the next
+  intercepted call; the filter itself cannot change after it is installed.
 - `/tmp/.chaos-init.status` reports `state=active` with `libs=` and `pid=` (and
   `mptcp=off` when chaos-init disabled Go's Multipath TCP), or `state=unsupported` with
   a `reason=`. The application starts in both cases; unsupported means no chaos.

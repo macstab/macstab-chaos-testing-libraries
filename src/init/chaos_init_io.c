@@ -369,6 +369,12 @@ void chaos_init_io_start(void)
     (void)chaos_init_tracee_register(&g_chaos_init_io_rules);
 }
 
+/** @copydoc chaos_init_io_reload */
+void chaos_init_io_reload(void)
+{
+    (void)chaos_io_config_prepare();
+}
+
 /**
  * @brief Resolves descriptor @p fd of thread @p tid to its file path via
  *        `/proc/<tid>/fd/<fd>`. @p fd is sign-extended from 32 bits, so negative values

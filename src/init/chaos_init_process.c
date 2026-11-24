@@ -136,6 +136,12 @@ void chaos_init_process_start(pid_t application)
     (void)chaos_init_tracee_register(&g_chaos_init_process_rules);
 }
 
+/** @copydoc chaos_init_process_reload */
+void chaos_init_process_reload(void)
+{
+    (void)chaos_process_config_prepare();
+}
+
 /** @brief The operation a clone with @p flags stands for (CLONE_THREAD wins over VFORK). */
 static chaos_process_operation_t chaos_init_process_clone(uint64_t flags)
 {

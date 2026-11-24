@@ -125,6 +125,12 @@ void chaos_init_time_start(void)
     (void)chaos_init_tracee_register(&g_chaos_init_time_rules);
 }
 
+/** @copydoc chaos_init_time_reload */
+void chaos_init_time_reload(void)
+{
+    (void)chaos_time_config_prepare();
+}
+
 /** @brief How a time system call reports its value. */
 typedef enum chaos_init_time_shape
 {

@@ -342,5 +342,21 @@ int main(void)
 
     (void)unlink("/tmp/.chaos-dns.conf");
     (void)unlink(path);
+    /* A reload without a call: what the inotify watch of chaos_init.c asks for when a
+     * rule file is put in place, so that the status file reports the rules before anything
+     * has called into them. Two rules, because every file loaded above has one or none: a
+     * status that said anything else would mean the reload did nothing. */
+    write_rules("dns://a.example.com:LATENCY:5\ndns://b.example.com:LATENCY:5\n");
+    chaos_init_dns_reload();
+    {
+        FILE *reloaded = fopen("/tmp/.chaos-dns.status", "r");
+        char text[256] = {0};
+
+        assert(reloaded != NULL);
+        text[fread(text, 1U, sizeof(text) - 1U, reloaded)] = '\0';
+        (void)fclose(reloaded);
+        assert(strncmp(text, "state=ok\nrules=2\n", strlen("state=ok\nrules=2\n")) == 0);
+    }
+
     return 0;
 }

@@ -763,6 +763,12 @@ void chaos_init_net_start(void)
     (void)chaos_init_tracee_register(&g_chaos_init_net_rules);
 }
 
+/** @copydoc chaos_init_net_reload */
+void chaos_init_net_reload(void)
+{
+    (void)chaos_net_config_prepare();
+}
+
 /**
  * @brief Total bytes of an iovec array of g_chaos_init_net_tid, for `@size`; more than
  *        1024 entries (UIO_MAXIOV) or an unreadable array yields CHAOS_POLICY_NO_SIZE.

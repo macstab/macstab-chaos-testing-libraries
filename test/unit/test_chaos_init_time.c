@@ -312,5 +312,21 @@ int main(void)
 
     (void)unlink("/tmp/.chaos-time.conf");
     (void)unlink(path);
+    /* A reload without a call: what the inotify watch of chaos_init.c asks for when a
+     * rule file is put in place, so that the status file reports the rules before anything
+     * has called into them. Two rules, because every file loaded above has one or none: a
+     * status that said anything else would mean the reload did nothing. */
+    write_rules("clock_gettime/realtime:OFFSET:1000\nclock_gettime/monotonic:LATENCY:5\n");
+    chaos_init_time_reload();
+    {
+        FILE *reloaded = fopen("/tmp/.chaos-time.status", "r");
+        char text[256] = {0};
+
+        assert(reloaded != NULL);
+        text[fread(text, 1U, sizeof(text) - 1U, reloaded)] = '\0';
+        (void)fclose(reloaded);
+        assert(strncmp(text, "state=ok\nrules=2\n", strlen("state=ok\nrules=2\n")) == 0);
+    }
+
     return 0;
 }

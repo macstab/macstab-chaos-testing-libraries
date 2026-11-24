@@ -81,6 +81,12 @@ void chaos_init_memory_start(void)
     (void)chaos_init_tracee_register(&g_chaos_init_memory_rules);
 }
 
+/** @copydoc chaos_init_memory_reload */
+void chaos_init_memory_reload(void)
+{
+    (void)chaos_memory_config_prepare();
+}
+
 /**
  * @brief Whether a rule with @p effect matches the call and fires for the calling
  *        process: matched against the snapshot, then triggered on the process's own slot
