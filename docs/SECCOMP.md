@@ -16,7 +16,7 @@ time) and decides inside the process, without a round trip to a supervisor per c
 |---|---|
 | Binary | `chaos-init`, static, one per architecture (x86_64, aarch64); serves glibc, musl and libc-less images |
 | Command line | `chaos-init --libs <io,net,dns,time,memory,process> -- <command> [args...]` |
-| Libraries applied | io, net, memory, process (dns and time are accepted and apply nothing, §6) |
+| Libraries applied | io, net, time, memory, process (dns is accepted and applies nothing, §6) |
 | Effects applied | ERRNO, LATENCY; net TIMEOUT; process FAIL_AFTER |
 | Mode status file | `/tmp/.chaos-init.status` |
 | Rule, status and hits files | those of the libraries: `/tmp/.chaos-<lib>.conf`, `.status`, `.hits.<n>` |
@@ -234,7 +234,8 @@ output `dist/chaos-init-<arch>`; or `make native-init`, output `build/chaos-init
 | net | ERRNO, LATENCY on socket, bind, listen, connect, accept, shutdown, send, recv, close (LATENCY only), poll; TIMEOUT on the poll family; DROP on a datagram send (not `sendmmsg`); TRICKLE on a stream receive, CORRUPT and DUP on a receive, RESET on close, through a ptrace stop (§3.3) | the endpoint: sockaddr arguments from memory, a socket's own address and peer from `/proc/<pid>/net/*` or sock_diag (§3.2), its type from its `system.sockprotoname` attribute |
 | memory | ERRNO, LATENCY on mmap (anon/file), munmap, mprotect, madvise | the arguments: operation, `mmap` flags, length for `@size` |
 | process | ERRNO, LATENCY, FAIL_AFTER on pthread_create, fork, posix_spawn, execve, execveat, waitpid | the system call and clone's flags (§5) |
-| dns, time | nothing (§6) | |
+| time | ERRNO, LATENCY on a clock read and on nanosleep; OFFSET, REGRESS, FREEZE on a clock read, which the supervisor answers with a value of its own (§3.4) | the operation and, for a clock read, the clock in `args[0]`; a `usleep` rule is rejected, because libc sleeps through nanosleep |
+| dns | nothing (§6) | |
 
 Probability and all qualifiers apply (`@first`, `@from`, `@until`, `@size`). When a
 LATENCY and an ERRNO rule both fire for one call, the call is delayed, then failed.
@@ -366,6 +367,43 @@ instead, which stops the thread with its registers readable and writable.
 The design, the measurements behind it and the rejected alternatives are in
 [docs/development/SECCOMP-PTRACE.md](development/SECCOMP-PTRACE.md).
 
+### 3.4 Clock reads, which do not arrive by themselves
+
+`clock_gettime`, `gettimeofday` and `time` are served from the **vDSO**, a page the kernel
+maps into every process. The C library and the Go runtime look the symbols up there at
+startup and call them directly: no system call, nothing for a filter to see. That is why
+time rules applied nothing in this mode at all.
+
+The way in is the lookup, not the code. At every `execve` -- a stop of its own
+(`PTRACE_O_TRACEEXEC`), before the new image has run one instruction -- the supervisor
+renames the vDSO's time symbols in that process's copy of the mapping. A lookup by name
+then finds nothing, and glibc, musl and Go each fall back to the system call they carry
+for that case. The write goes through `/proc/<pid>/mem`, which writes a read-only mapping
+where `process_vm_writev` refuses, and because the mapping is private the page is copied
+for that process alone: no other process, and no other container, is affected.
+
+- **The read does not run.** A clock read a value-changing rule matches is answered by the
+  supervisor: it reads the same clock, applies the effect and writes the value into the
+  caller's buffer, then answers 0. The clock is read at the moment the answer goes out, so
+  a read held back by LATENCY reports the time after its delay, as the library's does.
+- **Only the clocks a rule names are notified.** `clock_gettime` carries the clock in its
+  first argument, so the filter tests it: a rule on the wall clock leaves a monotonic read
+  to the kernel. A rule that names no clock (`*` or `clock_gettime`) notifies every one.
+  `gettimeofday` and `time` read the wall clock and nothing else, so a rule on another
+  clock leaves them out of the filter too.
+- **The cost is a notification per read of an affected clock**, instead of a vDSO call.
+  Every other clock read of that process costs a system call rather than a vDSO call,
+  because the fallback is permanent for the image. Measurements:
+  [docs/development/SECCOMP-PTRACE.md](development/SECCOMP-PTRACE.md).
+- **An image that cannot be written keeps its vDSO**, which is the one case where a time
+  rule would look applied and do nothing: a process that is not dumpable, or that changed
+  user before its `exec`. The status file then says `vdso=failed`, written again after the
+  application started.
+- **A `fork` child inherits the renamed mapping**; a child that execs gets a fresh vDSO
+  and a stop of its own.
+- `usleep` rules are rejected (§4): libc sleeps through `nanosleep`, so the supervisor
+  cannot tell the two entry points apart and such a rule could never fire.
+
 ---
 
 ## 4. Rejected rules
@@ -383,9 +421,11 @@ loads, and only the call forms named there are left alone -- the operation is th
 | io CORRUPT on a vectored read, net CORRUPT or DUP on `recvmsg` or a batch | The bytes `readv` and `recvmsg` delivered are spread over segments, and finding the one that holds byte N, or filling them from a kept payload, would mean walking the iovec in the tracee. Left alone, counting no hit. |
 | io and net ERRNO on close | The libraries close, then report the error, as Linux does for a failing close. A notified call either runs or fails, not both. |
 | process `posix_spawnp` selector | The `PATH` search is in the C library; the system calls are those of posix_spawn, whose rules apply to it, so the rule could never fire. A `*` rule is accepted. |
+| time `usleep` selector | libc serves `usleep` through `nanosleep`, so the filter cannot tell which entry point the program used: a `nanosleep` rule covers both and a `usleep` rule could never fire. |
 
 The check is a build hook in the parsers (`CHAOS_IO_RULE_SUPPORTED`,
-`CHAOS_NET_RULE_SUPPORTED`, `CHAOS_PROCESS_RULE_SUPPORTED`; `1` in the libraries), so the
+`CHAOS_NET_RULE_SUPPORTED`, `CHAOS_TIME_RULE_SUPPORTED`,
+`CHAOS_PROCESS_RULE_SUPPORTED`; `1` in the libraries), so the
 status file reports the rejection together with the load, never a passing `state=ok`
 first.
 
@@ -425,13 +465,6 @@ first.
 
 ## 6. Not possible
 
-- **time.** Programs read clocks through the vDSO, without a system call, so seccomp
-  never sees them. Sleeps (`nanosleep`, `clock_nanosleep`) would be visible, but Go
-  sleeps through its own timers, and the clock effects (OFFSET, REGRESS, FREEZE) change
-  results the kernel never returns through a notification. `--libs time` installs no
-  rule for it. No rule of the library is supported, so there is no per-rule
-  `CHAOS_TIME_RULE_SUPPORTED` predicate to reject one: the whole library is reported as
-  applying nothing.
 - **dns.** `getaddrinfo` is a library function. A static program resolves names with
   plain UDP/TCP to port 53, which net rules can fail or delay by endpoint, but not by
   the name looked up. `--libs dns` installs no rule for it.

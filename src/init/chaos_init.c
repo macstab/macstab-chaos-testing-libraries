@@ -64,7 +64,9 @@
 #include "chaos_init_net.h"
 #include "chaos_init_proc.h"
 #include "chaos_init_process.h"
+#include "chaos_init_time.h"
 #include "chaos_init_tracee.h"
+#include "chaos_init_vdso.h"
 #include "chaos_status.h"
 
 #include <errno.h>
@@ -250,12 +252,27 @@ static int chaos_init_try_install(const struct sock_fprog *program)
 
 /**
  * @brief Non-zero once the application put itself under this process with PTRACE_TRACEME,
- *        i.e. the filter has a traced group.
+ *        i.e. the filter has a traced group or time rules are loaded.
  *
  * @details File scope because the handover sets it and the serve loop reads it. The
  * supervisor has one thread and one application, so one flag is the whole state.
  */
 static int g_chaos_init_tracing = 0;
+
+/**
+ * @brief Non-zero once an image could not have its vDSO blinded (chaos_init_vdso.h).
+ *
+ * @details Its clock reads then never reach the filter, so time rules do nothing for that
+ * process -- the one thing this mode must not be quiet about. Reported in the status
+ * file, where a test can see it.
+ */
+static int g_chaos_init_vdso_failed = 0;
+
+/**
+ * @brief Whether this run disabled Go's Multipath TCP, kept so a status file written
+ *        again later (a failed vDSO blinding) says the same as the first one.
+ */
+static int g_chaos_init_mptcp_off = 0;
 
 /**
  * @brief Child side of the handover: installs the filter if possible and sends the parent
@@ -291,10 +308,15 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *in
     } control;
     uint32_t notify = SECCOMP_RET_USER_NOTIF;
     long traced[CHAOS_INIT_MAX_FILTER];
+    long time_calls[8];
+    long time_clocks[16];
+    chaos_init_time_filter_t clock_filter;
+    const chaos_init_time_filter_t *clocks = NULL;
     size_t traced_count = 0U;
     int answer[2] = {0, 0};
     int error = 0;
     int listener = -1;
+    int tracing;
 
     /* Which calls need a ptrace stop is a property of the rules, and a filter is fixed
      * once installed, so the rule file is read here, before the install. The child's copy
@@ -312,8 +334,23 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *in
             traced + traced_count, sizeof(traced) / sizeof(traced[0]) - traced_count
         );
     }
-    program.len = (unsigned short
-    )chaos_init_build_filter(libs, handover, traced, traced_count, filter, CHAOS_INIT_MAX_FILTER);
+    if ((libs & CHAOS_INIT_LIB_TIME) != 0U)
+    {
+        chaos_init_time_start();
+        clock_filter.calls = time_calls;
+        clock_filter.call_count =
+            chaos_init_time_calls(time_calls, sizeof(time_calls) / sizeof(time_calls[0]));
+        clock_filter.clocks = time_clocks;
+        clock_filter.clock_count =
+            chaos_init_time_clocks(time_clocks, sizeof(time_clocks) / sizeof(time_clocks[0]));
+        clocks = clock_filter.call_count > 0U ? &clock_filter : NULL;
+    }
+    /* Time needs a tracer even with nothing traced: the vDSO of every image has to be
+     * blinded at its exec stop, or its clock reads never reach the filter at all. */
+    tracing = traced_count > 0U || clocks != NULL;
+    program.len = (unsigned short)chaos_init_build_filter(
+        libs, handover, traced, traced_count, clocks, filter, CHAOS_INIT_MAX_FILTER
+    );
     program.filter = filter;
     if (uname(&name) != 0 || !chaos_init_kernel_supported(CHAOS_INIT_RELEASE(&name)))
     {
@@ -337,7 +374,7 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *in
      * the tracer has to exist the moment the filter does. PTRACE_TRACEME needs no
      * capability -- the tracee asks for it itself -- and makes this child's parent, which
      * is the process that owns the listener and runs the serve loop, its tracer. */
-    else if (traced_count > 0U && ptrace(PTRACE_TRACEME, 0, NULL, NULL) != 0)
+    else if (tracing && ptrace(PTRACE_TRACEME, 0, NULL, NULL) != 0)
     {
         error = errno;
     }
@@ -350,7 +387,7 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *in
     memset(&message, 0, sizeof(message));
     memset(&control, 0, sizeof(control));
     answer[0] = error;
-    answer[1] = error == 0 && traced_count > 0U;
+    answer[1] = error == 0 && tracing;
     payload.iov_base = answer;
     payload.iov_len = sizeof(answer);
     message.msg_iov = &payload;
@@ -375,7 +412,7 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *in
     /* Traced: stop once, so the parent can set its ptrace options before the application
      * makes its first filtered call. The go signal is blocked and stays pending, so the
      * sigwait() below returns as soon as the parent continues this thread. */
-    if (traced_count > 0U)
+    if (tracing)
     {
         (void)raise(SIGSTOP);
     }
@@ -475,8 +512,9 @@ static int chaos_init_receive_listener(int socket, int *error, int *traced)
 static void chaos_init_write_status(unsigned libs, const char *reason, int mptcp_off)
 {
     char text[CHAOS_STATUS_BUFFER_SIZE];
-    const size_t length =
-        chaos_init_format_status(text, sizeof(text), libs, reason, (long)getpid(), mptcp_off);
+    const size_t length = chaos_init_format_status(
+        text, sizeof(text), libs, reason, (long)getpid(), mptcp_off, g_chaos_init_vdso_failed
+    );
 
     if (mkdir("/tmp", 01777) == 0)
     {
@@ -561,6 +599,7 @@ chaos_init_decide(unsigned libs, const chaos_init_call_t *call, chaos_init_verdi
     if (!((libs & CHAOS_INIT_LIB_NET) != 0U && chaos_init_net_decide(call, verdict)) &&
         !((libs & CHAOS_INIT_LIB_IO) != 0U && chaos_init_io_decide(call, verdict)) &&
         !((libs & CHAOS_INIT_LIB_MEMORY) != 0U && chaos_init_memory_decide(call, verdict)) &&
+        !((libs & CHAOS_INIT_LIB_TIME) != 0U && chaos_init_time_decide(call, verdict)) &&
         (libs & CHAOS_INIT_LIB_PROCESS) != 0U)
     {
         (void)chaos_init_process_decide(call, verdict);
@@ -703,6 +742,23 @@ static void chaos_init_trace_stop(unsigned libs, pid_t tid, int status)
         (void)ptrace(PTRACE_CONT, tid, 0, 0);
         return;
     }
+    /* A new image: its vDSO is fresh, and nothing in it has looked up a time symbol yet.
+     * This is the only moment the lookups can be made to fail, so a clock read reaches
+     * the filter at all. A process that cannot be written keeps its vDSO and reads the
+     * clock without anybody seeing it, which the status file says. */
+    if ((status >> 8) == (SIGTRAP | (PTRACE_EVENT_EXEC << 8)))
+    {
+        if ((libs & CHAOS_INIT_LIB_TIME) != 0U && chaos_init_vdso_blind(tid) < 0 &&
+            g_chaos_init_vdso_failed == 0)
+        {
+            /* Said once, in the file a test reads: this image reads the clock where
+             * nothing can see it, so its time rules do nothing. */
+            g_chaos_init_vdso_failed = 1;
+            chaos_init_write_status(libs, NULL, g_chaos_init_mptcp_off);
+        }
+        (void)ptrace(PTRACE_CONT, tid, 0, 0);
+        return;
+    }
     if ((status >> 8) != (SIGTRAP | (PTRACE_EVENT_SECCOMP << 8)))
     {
         const int signal = (status >> 8) == SIGTRAP ? 0 : WSTOPSIG(status);
@@ -833,6 +889,7 @@ chaos_init_answer(int listener, unsigned libs, void *request, void *response, si
         return;
     }
     chaos_init_net_commit(&call, &verdict);
+    chaos_init_time_commit(&call, &verdict);
     if (verdict.action == CHAOS_INIT_DELAY)
     {
         const chaos_init_verdict_t answer = chaos_init_delay_answer(&verdict);
@@ -869,10 +926,14 @@ static void chaos_init_on_time(int timer, int listener, void *response, size_t r
     uint64_t id;
     int due_traced = 0;
 
+    chaos_init_call_t due_call;
     chaos_init_verdict_t due_verdict;
 
-    while (chaos_init_delay_pop(now, &id, &due_verdict, &due_traced))
+    while (chaos_init_delay_pop(now, &id, &due_call, &due_verdict, &due_traced))
     {
+        /* A clock read reports the time of the moment it is answered, so the value is
+         * read and written here rather than when the call was parked. */
+        chaos_init_time_commit(&due_call, &due_verdict);
         if (due_traced)
         {
             chaos_init_trace_answer((pid_t)id, &due_verdict);
@@ -1117,7 +1178,7 @@ int main(int argc, char **argv)
                 child,
                 0,
                 (void *)(long)(PTRACE_O_TRACESECCOMP | PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK |
-                               PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE)
+                               PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC)
             ) != 0)
         {
             (void)kill(child, SIGKILL);
@@ -1158,14 +1219,19 @@ int main(int argc, char **argv)
     {
         chaos_init_memory_start();
     }
+    if (listener >= 0 && (options.libs & CHAOS_INIT_LIB_TIME) != 0U)
+    {
+        chaos_init_time_start();
+    }
     if (listener >= 0 && (options.libs & CHAOS_INIT_LIB_PROCESS) != 0U)
     {
         chaos_init_process_start(child);
     }
+    g_chaos_init_mptcp_off = mptcp_off && listener >= 0;
     chaos_init_write_status(
         options.libs,
         listener >= 0 ? NULL : chaos_init_unsupported_reason(error),
-        mptcp_off && listener >= 0
+        g_chaos_init_mptcp_off
     );
     /* Status first, then go: whoever sees the application run reads this run's status. */
     (void)kill(child, CHAOS_INIT_GO_SIGNAL);

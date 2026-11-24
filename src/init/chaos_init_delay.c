@@ -98,7 +98,13 @@ int chaos_init_delay_next(uint64_t *due_ms)
     return 1;
 }
 
-int chaos_init_delay_pop(uint64_t now_ms, uint64_t *id, chaos_init_verdict_t *answer, int *traced)
+int chaos_init_delay_pop(
+    uint64_t now_ms,
+    uint64_t *id,
+    chaos_init_call_t *call,
+    chaos_init_verdict_t *answer,
+    int *traced
+)
 {
     size_t index;
 
@@ -107,6 +113,7 @@ int chaos_init_delay_pop(uint64_t now_ms, uint64_t *id, chaos_init_verdict_t *an
         if (g_chaos_init_delayed[index].due_ms <= now_ms)
         {
             *id = g_chaos_init_delayed[index].id;
+            *call = g_chaos_init_delayed[index].call;
             *answer = g_chaos_init_delayed[index].answer;
             *traced = g_chaos_init_delayed[index].traced;
             g_chaos_init_delayed[index] = g_chaos_init_delayed[--g_chaos_init_delayed_count];

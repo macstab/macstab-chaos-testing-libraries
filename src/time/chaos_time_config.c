@@ -1185,6 +1185,18 @@ static int chaos_time_rule_shadowed(
 }
 
 /**
+ * @brief Build hook: whether a parsed rule can be applied at all in this mode.
+ *
+ * @details chaos-init (SECCOMP mode) compiles this file with its own definition: a rule
+ * it cannot apply from outside the process rejects the whole file with
+ * CHAOS_STATUS_REASON_UNSUPPORTED, so the status file says so instead of the rule
+ * silently doing nothing.
+ */
+#ifndef CHAOS_TIME_RULE_SUPPORTED
+#define CHAOS_TIME_RULE_SUPPORTED(rule) 1
+#endif
+
+/**
  * @copydoc chaos_time_config_parse_buffer
  *
  * Line numbers in the error record count from 1, blank and comment lines included.
@@ -1258,6 +1270,12 @@ int chaos_time_config_parse_buffer(char *buffer, chaos_time_rule_t *rules, size_
         if (count >= CHAOS_TIME_MAX_RULES)
         {
             chaos_status_reject(&g_chaos_time_config_error, CHAOS_STATUS_REASON_TOO_MANY);
+            *rule_count = 0U;
+            return -1;
+        }
+        if (!CHAOS_TIME_RULE_SUPPORTED(&parsed))
+        {
+            chaos_status_reject(&g_chaos_time_config_error, CHAOS_STATUS_REASON_UNSUPPORTED);
             *rule_count = 0U;
             return -1;
         }

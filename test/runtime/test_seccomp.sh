@@ -347,6 +347,42 @@ expect "C: the suppression is reported" \
     "counted"
 rm -f /tmp/.chaos-net.conf
 
+# Time: a clock read is served from the vDSO, so the supervisor makes the lookups of every
+# new image fail and then answers the reads itself. OFFSET shows in the wall second, FREEZE
+# makes two reads agree, REGRESS makes the second one earlier -- and a rule on one clock
+# leaves the others alone, because the filter tests the clock argument.
+reference=$($init --libs time -- /tmp/probe clock realtime)
+expect "C: without a rule the clock behaves" \
+    "$(echo "$reference" | sed -n "s/^sec=[0-9]* same=0 back=0$/behaves/p")" "behaves"
+printf "%s\n" "clock_gettime/realtime:OFFSET:3600000 # t" > /tmp/.chaos-time.conf
+shifted=$($init --libs time -- /tmp/probe clock realtime)
+expect "C: OFFSET moves the wall clock" \
+    "$(( $(echo "$shifted" | sed -n "s/^sec=\([0-9]*\) .*/\1/p") - \
+         $(echo "$reference" | sed -n "s/^sec=\([0-9]*\) .*/\1/p") >= 3599 ? 1 : 0 ))" "1"
+expect "C: the time rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-time.status | tr "\n" " ")" "state=ok rules=1 "
+expect "C: another clock is left alone" \
+    "$($init --libs time -- /tmp/probe clock monotonic | sed -n "s/^sec=[0-9]* same=0 back=0$/behaves/p")" \
+    "behaves"
+printf "%s\n" "clock_gettime/realtime:FREEZE:1.0 # t" > /tmp/.chaos-time.conf
+expect "C: FREEZE holds the clock" \
+    "$($init --libs time -- /tmp/probe clock realtime | sed -n "s/^sec=[0-9]* same=1 back=0$/frozen/p")" \
+    "frozen"
+printf "%s\n" "clock_gettime/monotonic:REGRESS:5000 # t" > /tmp/.chaos-time.conf
+expect "C: REGRESS steps the clock back" \
+    "$($init --libs time -- /tmp/probe clock monotonic | sed -n "s/^sec=[0-9]* same=0 back=1$/stepped/p")" \
+    "stepped"
+# The same against a static Go binary, which is the case LD_PRELOAD cannot reach at all:
+# time.Now() takes both clocks from the vDSO, so the offset has to show in the wall second
+# while time.Since stays right.
+printf "%s\n" "clock_gettime/realtime:OFFSET:3600000 # t" > /tmp/.chaos-time.conf
+go_clock=$($init --libs time -- $go clock)
+expect "Go: the wall clock is shifted and time.Since is not" \
+    "$(echo "$go_clock" | sed -n "s/^sec=[0-9]* same=true since=2[0-9]ms$/shifted/p")" "shifted"
+expect "Go: the vDSO of the Go image was blinded" \
+    "$(grep -c "^vdso=failed$" /tmp/.chaos-init.status)" "0"
+rm -f /tmp/.chaos-time.conf
+
 # A forked child of the tracee is traced too: without PTRACE_O_TRACEFORK its filtered calls
 # would fail with ENOSYS, because a RET_TRACE with no tracer does.
 printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/data:write:TORN:1.0 # t" > /tmp/.chaos-io.conf

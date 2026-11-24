@@ -72,15 +72,33 @@ typedef struct chaos_init_options
  * @brief Parses `--libs <name>[,<name>...] -- <command> [args...]`.
  *
  * @details The grammar is fixed positionally: argv[1] `--libs`, argv[2] the list, argv[3]
- * `--`, argv[4] the command. Names: io, net, dns, time, memory, process. dns and time are
- * accepted (one rule set for both modes) but add no system call to the filter: clocks are
- * read through the vDSO and name resolution is a library function, so seccomp never sees
- * either. An empty name (`io,,net`, trailing comma) is unknown.
+ * `--`, argv[4] the command. Names: io, net, dns, time, memory, process. dns is accepted
+ * (one rule set for both modes) but adds no system call to the filter: name resolution is
+ * a library function, so seccomp never sees it. An empty name (`io,,net`, trailing comma)
+ * is unknown.
  *
  * @param options  Output; written only partially on failure.
  * @return 0, or -1 on any deviation from the grammar or an unknown name.
  */
 int chaos_init_parse_args(int argc, char **argv, chaos_init_options_t *options);
+
+/**
+ * @brief Which clock reads a time rule set needs notified.
+ *
+ * @details A clock read is served from the vDSO, so the filter only ever sees one once
+ * the tracee's lookups have been made to fail (chaos_init_vdso.h) -- and then it sees
+ * every one of them. `clock_gettime` carries the clock in its first argument, so the
+ * filter can test it and notify only the clocks a rule names, which leaves a monotonic
+ * read untouched while a rule works on the wall clock. An empty clock list means every
+ * clock, which is what a rule without one asks for.
+ */
+typedef struct chaos_init_time_filter
+{
+    const long *calls;  /**< System call numbers to notify (chaos_init_time_calls()). */
+    size_t call_count;  /**< Entries in @c calls. */
+    const long *clocks; /**< Clock ids for `clock_gettime` (chaos_init_time_clocks()). */
+    size_t clock_count; /**< Entries in @c clocks; 0 means every clock. */
+} chaos_init_time_filter_t;
 
 /**
  * @brief Writes the seccomp BPF program for @p libs into @p out.
@@ -114,6 +132,8 @@ int chaos_init_parse_args(int argc, char **argv, chaos_init_options_t *options);
  *                      above 0, so NULL with 0 builds the program this supervisor built
  *                      before traced effects existed.
  * @param traced_count  Entries in @p traced.
+ * @param clock         The time rules' calls and clocks, or NULL when no time rule is
+ *                      loaded (chaos_init_time_filter_t).
  * @param out           Output program of @p capacity instructions.
  * @return Number of instructions written, or 0 if @p capacity is too small.
  */
@@ -122,6 +142,7 @@ size_t chaos_init_build_filter(
     int handover_fd,
     const long *traced,
     size_t traced_count,
+    const chaos_init_time_filter_t *clock,
     struct sock_filter *out,
     size_t capacity
 );
@@ -187,14 +208,25 @@ const char *chaos_init_unsupported_reason(int error);
  * @brief Formats the status file.
  *
  * @details Active (@p reason NULL): `state=active`, `libs=`, `pid=`, plus `mptcp=off` when
- * @p mptcp_off. Unsupported: `state=unsupported`, `reason=`, `libs=`, `pid=`. One
- * `key=value` per line, each newline-terminated; libs are listed in bit order.
+ * @p mptcp_off and `vdso=failed` when @p vdso_failed. Unsupported: `state=unsupported`,
+ * `reason=`, `libs=`, `pid=`. One `key=value` per line, each newline-terminated; libs are
+ * listed in bit order.
+ *
+ * `vdso=failed` says that an image kept its vDSO (chaos_init_vdso.h), so its clock reads
+ * never reach the filter and time rules do nothing for it. The file is written again when
+ * that happens, after the application has started.
  *
  * @return Bytes written (NUL excluded); 0 if @p size is too small (buffer content then
  *         unspecified).
  */
 size_t chaos_init_format_status(
-    char *buffer, size_t size, unsigned libs, const char *reason, long pid, int mptcp_off
+    char *buffer,
+    size_t size,
+    unsigned libs,
+    const char *reason,
+    long pid,
+    int mptcp_off,
+    int vdso_failed
 );
 
 /**

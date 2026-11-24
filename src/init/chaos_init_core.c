@@ -232,11 +232,13 @@ size_t chaos_init_build_filter(
     int handover_fd,
     const long *traced,
     size_t traced_count,
+    const chaos_init_time_filter_t *clock,
     struct sock_filter *out,
     size_t capacity
 )
 {
     long calls[CHAOS_INIT_MAX_FILTER];
+    const size_t clock_count = clock != NULL ? clock->clock_count : 0U;
     size_t count = 0U;
     size_t index;
     size_t length = 0U;
@@ -257,6 +259,21 @@ size_t chaos_init_build_filter(
     if ((libs & CHAOS_INIT_LIB_PROCESS) != 0U)
     {
         CHAOS_INIT_ADD_ALL(g_chaos_init_process_calls, calls, &count);
+    }
+    /* The time calls come from the rules, not from a table: a clock read reaches the
+     * filter at all only because the vDSO lookups were made to fail, and which reads are
+     * worth that round trip is what the rule file says. clock_gettime is left out when
+     * the clocks are known, because it gets a test of its own on the clock argument. */
+    for (index = 0U; clock != NULL && index < clock->call_count; ++index)
+    {
+        if (clock_count > 0U && clock->calls[index] == __NR_clock_gettime)
+        {
+            continue;
+        }
+        if (count < sizeof(calls) / sizeof(calls[0]))
+        {
+            calls[count++] = clock->calls[index];
+        }
     }
     /* sendmsg leaves the JEQ chain for its own block, which exempts the handover. */
     for (index = 0U; index < count; ++index)
@@ -282,9 +299,10 @@ size_t chaos_init_build_filter(
             ++index;
         }
     }
-    /* Fixed part: 4 (arch, nr) + 2 (x32) + 7 (handover) + 3 (tail) = 16 at most. The
+    /* Fixed part: 4 (arch, nr) + 2 (x32) + 7 (handover) + 3 (tail) = 16 at most; a clock
+     * block adds its test, the load of the clock argument and its own two returns. The
      * bound also keeps the longest forward jump within the 8-bit jt field. */
-    if (count + traced_count + 17U > capacity)
+    if (count + traced_count + 17U + (clock_count > 0U ? clock_count + 4U : 0U) > capacity)
     {
         return 0U;
     }
@@ -327,16 +345,29 @@ size_t chaos_init_build_filter(
         out[length++] = (struct sock_filter)BPF_JUMP(
             BPF_JMP | BPF_JEQ | BPF_K,
             (unsigned)traced[index],
-            (unsigned char)(traced_count - index + count + 1U),
+            (unsigned char)(traced_count - index + count + (clock_count > 0U ? 2U : 1U)),
             0
         );
     }
     for (index = 0U; index < count; ++index)
     {
         /* Test `index` jumps count - index instructions: over the remaining tests and the ALLOW,
-         * onto the final USER_NOTIF. */
+         * onto the final USER_NOTIF. One more when the clock test sits between them. */
         out[length++] = (struct sock_filter)BPF_JUMP(
-            BPF_JMP | BPF_JEQ | BPF_K, (unsigned)calls[index], (unsigned char)(count - index), 0
+            BPF_JMP | BPF_JEQ | BPF_K,
+            (unsigned)calls[index],
+            (unsigned char)(count - index + (clock_count > 0U ? 1U : 0U)),
+            0
+        );
+    }
+    if (clock_count > 0U)
+    {
+        /* Over ALLOW, USER_NOTIF and the TRACE if there is one, onto the block below. */
+        out[length++] = (struct sock_filter)BPF_JUMP(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            (unsigned)__NR_clock_gettime,
+            (unsigned char)(traced_count > 0U ? 3U : 2U),
+            0
         );
     }
     out[length++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
@@ -347,6 +378,26 @@ size_t chaos_init_build_filter(
     if (traced_count > 0U)
     {
         out[length++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE);
+    }
+    /* The clock block, after the tail so every jump into and inside it is forward: the
+     * clock argument replaces nr in the accumulator, which is why it cannot sit in the
+     * chain above. A clock no rule names runs untouched. */
+    if (clock_count > 0U)
+    {
+        out[length++] = (struct sock_filter
+        )BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]));
+        for (index = 0U; index < clock_count; ++index)
+        {
+            /* Over the remaining tests and the ALLOW, onto this block's USER_NOTIF. */
+            out[length++] = (struct sock_filter)BPF_JUMP(
+                BPF_JMP | BPF_JEQ | BPF_K,
+                (unsigned)clock->clocks[index],
+                (unsigned char)(clock_count - index),
+                0
+            );
+        }
+        out[length++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+        out[length++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF);
     }
     return length;
 }
@@ -463,7 +514,13 @@ int chaos_init_godebug_mptcp_off(const char *current, char *out, size_t size)
 }
 
 size_t chaos_init_format_status(
-    char *buffer, size_t size, unsigned libs, const char *reason, long pid, int mptcp_off
+    char *buffer,
+    size_t size,
+    unsigned libs,
+    const char *reason,
+    long pid,
+    int mptcp_off,
+    int vdso_failed
 )
 {
     /* All six names joined take 30 bytes; strcat() cannot overflow 64. */
@@ -487,10 +544,11 @@ size_t chaos_init_format_status(
         written = snprintf(
             buffer,
             size,
-            "state=active\nlibs=%s\npid=%ld\n%s",
+            "state=active\nlibs=%s\npid=%ld\n%s%s",
             names,
             pid,
-            mptcp_off ? "mptcp=off\n" : ""
+            mptcp_off ? "mptcp=off\n" : "",
+            vdso_failed ? "vdso=failed\n" : ""
         );
     }
     else

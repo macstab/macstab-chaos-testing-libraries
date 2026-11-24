@@ -32,8 +32,12 @@ in [`docs/PLATFORM.md`](PLATFORM.md).
 | Hits file | `/tmp/.chaos-time.hits.<n>` |
 | Verification | unit tests with a 100.00 % line-coverage gate on `src/time/*.c`; runtime suites `test/runtime/test_time_glibc.sh` and `test_time_alpine.sh` (glibc and musl, amd64 and arm64) |
 
-SECCOMP mode (`chaos-init`) applies no time rules: clock reads go through the vDSO
-without a system call ([SECCOMP.md §6](SECCOMP.md#6-not-possible)).
+SECCOMP mode (`chaos-init`) applies every effect of this library, including to static
+binaries and to Go programs. A clock read is served from the vDSO, so the supervisor
+first makes the vDSO lookups of each new image fail, after which the reads become system
+calls it can answer with a value of its own; `usleep` rules are rejected, because libc
+sleeps through `nanosleep` ([SECCOMP.md
+§3.4](SECCOMP.md#34-clock-reads-which-do-not-arrive-by-themselves)).
 
 ---
 
@@ -685,10 +689,15 @@ symbols. It does not see these:
 The Go runtime (gc toolchain) does not call libc for time. On linux/amd64 and
 linux/arm64 it locates the vDSO itself and calls `__vdso_clock_gettime` /
 `__kernel_clock_gettime` directly, with `SYS_clock_gettime` as its fallback; sleeps are
-runtime timers, not `nanosleep()`. Go time is invisible to `libchaos-time` with or
-without cgo, and invisible to SECCOMP mode as well
-([SECCOMP.md §6](SECCOMP.md#6-not-possible)). Time faults for Go need source-level
-injection (an injectable clock).
+runtime timers, not `nanosleep()`. Go time is therefore invisible to `libchaos-time`
+with or without cgo.
+
+SECCOMP mode reaches it, through that fallback: `chaos-init` renames the vDSO's time
+symbols in the process before it starts, Go finds none and uses `SYS_clock_gettime`, and
+the supervisor answers it ([SECCOMP.md
+§3.4](SECCOMP.md#34-clock-reads-which-do-not-arrive-by-themselves)). A wall-clock rule
+then shows in `time.Now()` while `time.Since` stays right, because Go takes the monotonic
+reading of the same call from a clock no wall-clock rule names.
 
 ### 10.2 Direct vDSO Call
 
@@ -710,8 +719,9 @@ or `sem_timedwait`, §15) are not affected.
 
 ### 10.5 Statically Linked Binaries
 
-No dynamic loader, no LD_PRELOAD. SECCOMP mode reaches static binaries for other
-libraries, not for time.
+No dynamic loader, no LD_PRELOAD. SECCOMP mode reaches static binaries, time included:
+the vDSO lookups are made to fail and the clock reads become system calls
+([SECCOMP.md §3.4](SECCOMP.md#34-clock-reads-which-do-not-arrive-by-themselves)).
 
 ### 10.6 Programs Started Without the Preload
 
@@ -950,8 +960,10 @@ Not covered:
 - `alarm()`, `setitimer()`, POSIX timers: signal-domain timers (§13, §14)
 - `timerfd_*`: fd-domain timers (§16)
 - futex-based timed waits: deadlines not converted (§15)
-- direct vDSO calls (Go runtime), direct system calls, libc-internal calls (§10)
-- statically linked binaries; SECCOMP mode does not apply time rules
+- direct vDSO calls (Go runtime), direct system calls, libc-internal calls (§10) and
+  statically linked binaries -- under LD_PRELOAD. SECCOMP mode covers all four
+  ([SECCOMP.md §3.4](SECCOMP.md#34-clock-reads-which-do-not-arrive-by-themselves)),
+  except a `usleep` rule, which it rejects
 
 Limits:
 

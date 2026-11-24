@@ -11,6 +11,8 @@
 //	seccomp_go recvms <port>  ms the server side takes to read one byte the client sent
 //	seccomp_go spawn          os/exec runs /bin/true: "ok", "EAGAIN" or the error text
 //	seccomp_go mmap <bytes>   syscall.Mmap of that many anonymous bytes: "ok" or "ENOMEM"
+//	seccomp_go clock          time.Now() twice around a 20 ms sleep: the wall second, whether
+//	                          both reads agree, and the monotonic difference in ms
 //
 // Exit status: 0 after printing; 2 on bad usage.
 package main
@@ -89,8 +91,10 @@ func recvms(port string) int64 {
 }
 
 func main() {
-	if len(os.Args) < 2 || (os.Args[1] != "spawn" && len(os.Args) != 3) {
-		fmt.Fprintln(os.Stderr, "usage: seccomp_go open|openms <path> | dial|recvms <port> | spawn | mmap <bytes>")
+	if len(os.Args) < 2 ||
+		(os.Args[1] != "spawn" && os.Args[1] != "clock" && len(os.Args) != 3) {
+		fmt.Fprintln(os.Stderr,
+			"usage: seccomp_go open|openms <path> | dial|recvms <port> | spawn | clock | mmap <bytes>")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -117,6 +121,16 @@ func main() {
 		default:
 			fmt.Println(err.Error())
 		}
+	case "clock":
+		// time.Now() reads the wall clock and the monotonic clock in one call, both from
+		// the vDSO -- so this only sees a time rule once chaos-init has made the vDSO
+		// lookups of this image fail. A wall-clock rule must show in the seconds while
+		// time.Since stays right, which is the property Go programs depend on.
+		first := time.Now()
+		time.Sleep(20 * time.Millisecond)
+		second := time.Now()
+		fmt.Printf("sec=%d same=%t since=%dms\n", first.Unix(), first.Unix() == second.Unix(),
+			second.Sub(first).Milliseconds())
 	case "mmap":
 		length, _ := strconv.Atoi(os.Args[2])
 		_, err := syscall.Mmap(-1, 0, length, syscall.PROT_READ, syscall.MAP_ANON|syscall.MAP_PRIVATE)

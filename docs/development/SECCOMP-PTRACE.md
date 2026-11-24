@@ -124,23 +124,54 @@ there, so the plan's "scope: CLOCK_REALTIME/_COARSE, gettimeofday, time" is one 
 smaller than it says on that architecture. amd64 exports `__vdso_time` and has to be
 measured in CI — under QEMU the vDSO is not the host's, so this machine cannot answer it.
 
-### 4.2 Consequence for the design
+### 4.2 What was built instead: no stub at all
 
-The patcher reads the symbol's size out of the tracee's own vDSO and patches only when
-`size >= stub + state`. Anything else reports `unsupported` with the reason rather than
-writing a stub that overruns the next function. The state lives at the tail of the same
-symbol, so the stub reaches it with a fixed relative offset and the supervisor finds it
-again through the same symbol lookup.
+A stub would have meant hand-written machine code per architecture, a state page, and a
+copy of the kernel's timekeeping arithmetic -- for a property nobody asked for (cheap
+reads) at the price of the one thing this release is about (reads that are *seen*).
+
+The cheaper way in is the **lookup**. The C library and the Go runtime find the vDSO's
+functions by name at startup and keep the address; every one of them carries a fallback to
+the system call for the case where the symbol is not there (glibc's `INLINE_VSYSCALL`,
+musl's `__vdsosym`, Go's `vdsoClockgettimeSym`). So the supervisor renames the time
+symbols in the tracee's copy of the mapping, at the `execve` stop, before the new image
+has run one instruction. From then on the clock is read through the kernel, where the
+filter and the deciders already work -- and the effects are the deciders', not a stub's.
+
+Measured on arm64, with the renaming done at the exec stop of a child:
+
+| Program | Clock reads seen by the filter |
+|---|---|
+| glibc, three `clock_gettime(CLOCK_REALTIME)` | 3 |
+| musl, the same | 3 |
+| static Go (CGO_ENABLED=0), one `time.Now()` pair | 12 |
+
+Before the renaming: **zero** for all three. The Go figure is the whole runtime's reads,
+not only the program's, which is why the filter tests the clock argument and notifies only
+the clocks a rule names -- `time.Now()` takes its monotonic reading from the same call,
+and a wall-clock rule leaves that clock to the kernel.
+
+What this costs: one notification per read of a named clock, and a plain system call
+instead of a vDSO call for every other read of that image. What it saves: no machine code,
+no state page, no architecture-specific arithmetic -- and `usleep` is the only time rule
+SECCOMP mode has to reject.
 
 Writing through `/proc/<pid>/mem` with `FOLL_FORCE` triggers copy-on-write on the private
-vDSO mapping, so the patch is process-local. That property is what makes this safe in a
-shared container and belongs in SECCOMP.md once built.
+vDSO mapping, so the change is process-local: no other process in the container, and no
+other container, sees it. An image that cannot be written (not dumpable, or it changed
+user before its exec) keeps its vDSO; that is reported as `vdso=failed` in the status file,
+because a time rule that looks applied and does nothing is the failure this release is
+about.
 
 ---
 
 ## 5. Open — to be measured in CI, not here
 
-1. **amd64 vDSO symbol sizes**, including `__vdso_time`. This host cannot answer it.
+1. **amd64 vDSO symbol names.** The renaming list covers both spellings
+   (`__kernel_*` and `__vdso_*`) plus the unversioned aliases and `__vdso_time`, which
+   arm64 does not export. That the amd64 list is complete has to be seen in CI: a symbol
+   left behind means clock reads that stay invisible, which the `vdso=failed` flag does
+   *not* catch (nothing failed; the lookup simply succeeded).
 2. **Notification round-trip and ptrace-stop cost.** Docker Desktop runs a Linux VM, so
    absolute numbers here are not a budget. The shape to measure in CI: one notified call,
    one traced call (two stops), and `TRICKLE:1` on a busy reader, which is the case the

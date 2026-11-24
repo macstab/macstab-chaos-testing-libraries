@@ -39,6 +39,9 @@
  *                       client's next read sees, for close RESET.
  *   shared <port>       - the same with a forked child holding the server end too, which
  *                       is the case a RESET must not act on.
+ *   clock <name>        - reads the clock twice (`realtime` or `monotonic`) two
+ *                       milliseconds apart and prints the wall second, whether both reads
+ *                       agree and whether the second one is earlier, for the time effects.
  * - fork                fork + waitpid: "ok" or the errno name.
  * - exec                execl("/bin/true"); prints the errno name only when it fails.
  *
@@ -434,6 +437,39 @@ int main(int argc, char **argv)
         }
         (void
         )printf("wrote=%ld,%ld zeros=%d tenth=%c\n", (long)first, (long)second, zeros, got[10]);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "clock") == 0)
+    {
+        /* Two reads of one clock. A time rule is answered by the supervisor, which reads
+         * the same clock and applies the effect: OFFSET shows in the wall second, FREEZE
+         * makes both reads agree and REGRESS makes the second one earlier. Without a rule
+         * the clock behaves, which is the reference the script compares against.
+         *
+         * The reads go through the C library, which calls the vDSO unless the supervisor
+         * made its lookups fail -- so this also proves that step. */
+        const int monotonic = strcmp(argv[2], "monotonic") == 0;
+        const struct timespec gap = {0, 2000000L};
+        struct timespec first;
+        struct timespec second;
+
+        /* Two milliseconds between the reads: a clock that runs has moved on by then, so
+         * "the two agree" means the supervisor held it rather than that the host's clock
+         * has a coarse tick. */
+        if (clock_gettime(monotonic ? CLOCK_MONOTONIC : CLOCK_REALTIME, &first) != 0 ||
+            nanosleep(&gap, NULL) != 0 ||
+            clock_gettime(monotonic ? CLOCK_MONOTONIC : CLOCK_REALTIME, &second) != 0)
+        {
+            (void)printf("clock=%s\n", try_open_errno_name(errno));
+            return 0;
+        }
+        (void)printf(
+            "sec=%lld same=%d back=%d\n",
+            (long long)first.tv_sec,
+            first.tv_sec == second.tv_sec && first.tv_nsec == second.tv_nsec,
+            second.tv_sec < first.tv_sec ||
+                (second.tv_sec == first.tv_sec && second.tv_nsec < first.tv_nsec)
+        );
         return 0;
     }
     if (argc == 3 && strcmp(argv[1], "shared") == 0)

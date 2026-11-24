@@ -70,9 +70,19 @@ int chaos_init_delay_resume(const chaos_init_call_t *call, uint64_t id);
 int chaos_init_delay_next(uint64_t *due_ms);
 
 /**
- * @brief Removes one entry due at or before @p now_ms into @p id, @p answer and @p traced;
- *        call repeatedly to drain. @return 1, or 0 when none is due.
+ * @brief Removes one entry due at or before @p now_ms into @p id, @p call, @p answer and
+ *        @p traced; call repeatedly to drain. @return 1, or 0 when none is due.
+ *
+ * @details The call comes back with the answer because an answer can still have work to
+ * do in the tracee: a clock read reports the time of the moment it is answered, which
+ * means reading the clock and writing the value here (chaos_init_time_commit()).
  */
-int chaos_init_delay_pop(uint64_t now_ms, uint64_t *id, chaos_init_verdict_t *answer, int *traced);
+int chaos_init_delay_pop(
+    uint64_t now_ms,
+    uint64_t *id,
+    chaos_init_call_t *call,
+    chaos_init_verdict_t *answer,
+    int *traced
+);
 
 #endif

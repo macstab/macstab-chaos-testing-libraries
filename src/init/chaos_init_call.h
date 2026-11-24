@@ -88,6 +88,10 @@ typedef struct chaos_init_verdict
      *  chaos_init_net_commit() only after SECCOMP_IOCTL_NOTIF_ID_VALID confirmed the
      *  thread still waits, so a reused pid is never written to. */
     int clear_ready;
+    /** A clock read the supervisor answers itself: chaos_init_time_commit() reads the
+     *  clock, applies the effect and writes the value, at the moment the answer goes
+     *  out -- so a delayed read reports the time after its delay. */
+    int writes_time;
 } chaos_init_verdict_t;
 
 #endif
