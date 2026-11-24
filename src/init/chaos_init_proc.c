@@ -25,6 +25,30 @@
  */
 #define CHAOS_INIT_PAGE 4096U
 
+static int g_chaos_init_unreadable = 0;
+
+/**
+ * @brief Notes that the kernel refused a look into a tracee, by the errno of the attempt.
+ *
+ * @details EACCES, EPERM and EIO mean "not allowed to look", which is what a process that
+ * changed user answers: it is no longer dumpable, and from then on neither
+ * process_vm_readv() nor the tracer's own ptrace reads reach it without `CAP_SYS_PTRACE`
+ * (the kernel's `ptrace_access_vm()` checks both). ESRCH and EFAULT are ordinary: the
+ * thread ended, or the address is not mapped.
+ */
+static void chaos_init_proc_refused(int error)
+{
+    if (error == EACCES || error == EPERM || error == EIO)
+    {
+        g_chaos_init_unreadable = 1;
+    }
+}
+
+int chaos_init_unreadable(void)
+{
+    return g_chaos_init_unreadable;
+}
+
 int chaos_init_read_memory(pid_t pid, uint64_t address, void *out, size_t size)
 {
     struct iovec local;
@@ -40,6 +64,7 @@ int chaos_init_read_memory(pid_t pid, uint64_t address, void *out, size_t size)
         {
             errno = EFAULT; /* short read sets no errno: the rest is not mapped */
         }
+        chaos_init_proc_refused(errno);
         return -1;
     }
     return 0;
@@ -105,6 +130,7 @@ long chaos_init_proc_link(pid_t pid, const char *name, char *out, size_t size)
     length = readlink(path, out, size - 1U);
     if (length < 0)
     {
+        chaos_init_proc_refused(errno);
         return -1;
     }
     out[length] = '\0';

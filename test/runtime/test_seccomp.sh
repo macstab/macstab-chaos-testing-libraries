@@ -107,6 +107,30 @@ if ! docker version >/dev/null 2>&1; then
     exit "${CHAOS_SKIP_EXIT:-0}"
 fi
 
+# The user-switch case with CAP_SYS_PTRACE; run in its own container, because the main run
+# proves chaos-init needs no capability at all.
+PTRACE_SCRIPT='
+set -eu
+failures=0
+expect() {
+    if [ "$2" = "$3" ]; then
+        echo "ok   $LIBC $1"
+    else
+        echo "FAIL $LIBC $1: got \"$2\", want \"$3\"" >&2
+        failures=$((failures + 1))
+    fi
+}
+gcc -D_GNU_SOURCE -std=c99 -Wall -Wextra -Werror -pedantic -O2 -static -o /tmp/probe /work/test/runtime/seccomp_probe.c
+init=/out/chaos-init-'"$ARCH"'
+mkdir -p /tmp/sec/drop && chmod 777 /tmp/sec/drop
+printf "%s\n" "/tmp/sec/drop:open:EIO:1.0 # t" > /tmp/.chaos-io.conf
+expect "C: with CAP_SYS_PTRACE the path rule matches after the switch" \
+    "$($init --libs io -- /tmp/probe setuid /tmp/sec/drop/x)" "open=EIO mmap=ok"
+expect "C: and nothing was unreadable" \
+    "$(grep -c "^unreadable=yes$" /tmp/.chaos-init.status || true)" "0"
+[ "$failures" -eq 0 ]
+'
+
 CHECK_SCRIPT='
 set -eu
 failures=0
@@ -383,6 +407,23 @@ expect "Go: the vDSO of the Go image was blinded" \
     "$(grep -c "^vdso=failed$" /tmp/.chaos-init.status)" "0"
 rm -f /tmp/.chaos-time.conf
 
+# A process that drops privileges becomes non-dumpable, and the kernel then refuses every
+# look into it: its path cannot be read, so a path rule does not match it. That is a rule
+# that looks applied and does nothing, so the supervisor says so in its status file. The
+# same case with CAP_SYS_PTRACE is further down, in a container that has it.
+mkdir -p /tmp/sec/drop && chmod 777 /tmp/sec/drop
+printf "%s\n" "*:open:EIO:1.0 # t" > /tmp/.chaos-io.conf
+printf "%s\n" "mmap/anon:ERRNO:ENOMEM @size>1048576 # t" > /tmp/.chaos-memory.conf
+# Not even a `*` path rule matches: every io selector is a path, and the path of this open
+# lives in the process the kernel will not let the supervisor read. A memory rule names no
+# path and still fires, which is the line between what survives a user switch and what
+# does not.
+expect "C: no path rule matches a process that dropped privileges" \
+    "$($init --libs io,memory -- /tmp/probe setuid /tmp/sec/drop/x)" "open=ok mmap=ENOMEM"
+expect "C: and the supervisor says why" \
+    "$(grep -c "^unreadable=yes$" /tmp/.chaos-init.status)" "1"
+rm -f /tmp/.chaos-memory.conf
+
 # A forked child of the tracee is traced too: without PTRACE_O_TRACEFORK its filtered calls
 # would fail with ENOSYS, because a RET_TRACE with no tracer does.
 printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/data:write:TORN:1.0 # t" > /tmp/.chaos-io.conf
@@ -426,3 +467,16 @@ for libc in glibc musl; do
         "$base" \
         sh -c "$CHECK_SCRIPT"
 done
+
+# The other half of the user-switch case, in a container that holds CAP_SYS_PTRACE: the
+# kernel then lets the supervisor read a non-dumpable process, so the path rule matches
+# after all and nothing is reported. This is the documented cure for it, so it is tested
+# rather than claimed. One libc is enough: the check is the kernel's, not the library's.
+docker run --rm \
+    --platform "$DOCKER_PLATFORM" \
+    --cap-add SYS_PTRACE \
+    -e LIBC="privileged" \
+    -v "$TMP_DIR/out:/out:ro" \
+    -v "$ROOT_DIR:/work:ro" \
+    gcc:bookworm \
+    sh -c "$PTRACE_SCRIPT"

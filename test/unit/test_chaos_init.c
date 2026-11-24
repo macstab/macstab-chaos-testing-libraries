@@ -488,25 +488,34 @@ static void test_status_text(void)
 
     assert(
         chaos_init_format_status(
-            text, sizeof(text), CHAOS_INIT_LIB_PROCESS | CHAOS_INIT_LIB_IO, NULL, 1L, 0, 0
+            text, sizeof(text), CHAOS_INIT_LIB_PROCESS | CHAOS_INIT_LIB_IO, NULL, 1L, 0, 0, 0
         ) > 0U
     );
     assert(strcmp(text, "state=active\nlibs=io,process\npid=1\n") == 0);
     assert(
         chaos_init_format_status(
-            text, sizeof(text), CHAOS_INIT_LIB_NET, "kernel older than 5.5", 7L, 1, 0
+            text, sizeof(text), CHAOS_INIT_LIB_NET, "kernel older than 5.5", 7L, 1, 0, 0
         ) > 0U
     );
     assert(strcmp(text, "state=unsupported\nreason=kernel older than 5.5\nlibs=net\npid=7\n") == 0);
-    assert(chaos_init_format_status(tiny, sizeof(tiny), CHAOS_INIT_LIB_NET, NULL, 1L, 0, 0) == 0U);
+    assert(
+        chaos_init_format_status(tiny, sizeof(tiny), CHAOS_INIT_LIB_NET, NULL, 1L, 0, 0, 0) == 0U
+    );
     /* A too-small buffer returns 0 (above). When MPTCP was turned off for the
      * application, the active status says so with `mptcp=off`. */
-    assert(chaos_init_format_status(text, sizeof(text), CHAOS_INIT_LIB_NET, NULL, 1L, 1, 0) > 0U);
+    assert(
+        chaos_init_format_status(text, sizeof(text), CHAOS_INIT_LIB_NET, NULL, 1L, 1, 0, 0) > 0U
+    );
     assert(strcmp(text, "state=active\nlibs=net\npid=1\nmptcp=off\n") == 0);
-    /* An image whose vDSO could not be blinded reads the clock where nothing sees it, so
-     * the status says so rather than leaving a time rule looking applied. */
-    assert(chaos_init_format_status(text, sizeof(text), CHAOS_INIT_LIB_TIME, NULL, 1L, 0, 1) > 0U);
+    /* An image whose vDSO could not be blinded reads the clock where nothing sees it, and
+     * a process the kernel will not let the supervisor read matches no path and no
+     * endpoint: the status says both rather than leaving a rule looking applied. */
+    assert(
+        chaos_init_format_status(text, sizeof(text), CHAOS_INIT_LIB_TIME, NULL, 1L, 0, 1, 0) > 0U
+    );
     assert(strcmp(text, "state=active\nlibs=time\npid=1\nvdso=failed\n") == 0);
+    assert(chaos_init_format_status(text, sizeof(text), CHAOS_INIT_LIB_IO, NULL, 1L, 0, 0, 1) > 0U);
+    assert(strcmp(text, "state=active\nlibs=io\npid=1\nunreadable=yes\n") == 0);
 
     /* GODEBUG gets `multipathtcp=0` appended to existing settings; a user's own
      * `multipathtcp=` setting (first, or after a comma) is left alone (returns 0), a
@@ -762,6 +771,23 @@ static void test_memory_and_proc(void)
         ) == -1
     );
     assert(chaos_init_proc_read(getpid(), "fd", link, sizeof(link)) == -1); /* a directory */
+
+    /* "Not allowed to look" is told apart from the ordinary failures, because only the
+     * first means a rule cannot be matched at all: a process that changed user answers
+     * EPERM to a memory read, EIO to the tracer's own peek and EACCES to a /proc link,
+     * while ESRCH (the thread ended) and EFAULT (the address is not mapped) are everyday
+     * answers that say nothing about access. The reads above produced those two, so
+     * nothing is reported yet. */
+    assert(chaos_init_unreadable() == 0);
+    chaos_init_proc_refused(ESRCH);
+    chaos_init_proc_refused(EFAULT);
+    chaos_init_proc_refused(ENOENT);
+    assert(chaos_init_unreadable() == 0);
+    chaos_init_proc_refused(EACCES);
+    assert(chaos_init_unreadable() != 0);
+    chaos_init_proc_refused(EPERM);
+    chaos_init_proc_refused(EIO);
+    assert(chaos_init_unreadable() != 0);
 
     /* Thread -> (tgid, start time from stat field 22). A gone pid, a status without
      * Tgid, a truncated stat, a non-numeric field 22 fail. The comm field may contain

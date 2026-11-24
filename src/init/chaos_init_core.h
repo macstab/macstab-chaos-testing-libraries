@@ -208,13 +208,15 @@ const char *chaos_init_unsupported_reason(int error);
  * @brief Formats the status file.
  *
  * @details Active (@p reason NULL): `state=active`, `libs=`, `pid=`, plus `mptcp=off` when
- * @p mptcp_off and `vdso=failed` when @p vdso_failed. Unsupported: `state=unsupported`,
- * `reason=`, `libs=`, `pid=`. One `key=value` per line, each newline-terminated; libs are
- * listed in bit order.
+ * @p mptcp_off, `vdso=failed` when @p vdso_failed and `unreadable=yes` when
+ * @p unreadable. Unsupported: `state=unsupported`, `reason=`, `libs=`, `pid=`. One
+ * `key=value` per line, each newline-terminated; libs are listed in bit order.
  *
  * `vdso=failed` says that an image kept its vDSO (chaos_init_vdso.h), so its clock reads
- * never reach the filter and time rules do nothing for it. The file is written again when
- * that happens, after the application has started.
+ * never reach the filter and time rules do nothing for it. `unreadable=yes` says the
+ * kernel refused a look into a process (chaos_init_unreadable()), so path and endpoint
+ * selectors did not match it. Both are written again when they happen, after the
+ * application has started.
  *
  * @return Bytes written (NUL excluded); 0 if @p size is too small (buffer content then
  *         unspecified).
@@ -226,7 +228,8 @@ size_t chaos_init_format_status(
     const char *reason,
     long pid,
     int mptcp_off,
-    int vdso_failed
+    int vdso_failed,
+    int unreadable
 );
 
 /**

@@ -39,6 +39,9 @@
  *                       client's next read sees, for close RESET.
  *   shared <port>       - the same with a forked child holding the server end too, which
  *                       is the case a RESET must not act on.
+ *   setuid <path>       - drops to uid 65534, then opens <path> and maps 4 MiB:
+ *                       "open=<r> mmap=<r>", for what a rule can still match after a
+ *                       user switch.
  *   clock <name>        - reads the clock twice (`realtime` or `monotonic`) two
  *                       milliseconds apart and prints the wall second, whether both reads
  *                       agree and whether the second one is earlier, for the time effects.
@@ -437,6 +440,32 @@ int main(int argc, char **argv)
         }
         (void
         )printf("wrote=%ld,%ld zeros=%d tenth=%c\n", (long)first, (long)second, zeros, got[10]);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "setuid") == 0)
+    {
+        /* A server that drops privileges (Postgres, MySQL, Redis) becomes non-dumpable,
+         * after which the kernel refuses every look into it without CAP_SYS_PTRACE: the
+         * path of this open cannot be read, so a path rule does not match it. With the
+         * capability it does. The supervisor says which of the two happened in its status
+         * file (`unreadable=yes`). */
+        void *mapping;
+
+        if (setgid(65534) != 0 || setuid(65534) != 0)
+        {
+            (void)printf("setuid=%s\n", try_open_errno_name(errno));
+            return 0;
+        }
+        /* The open names a path, which the supervisor has to read out of this process; the
+         * mapping names none, so a memory rule reaches it either way. */
+        (void)printf("open=%s ", try_open(argv[2]));
+        mapping =
+            mmap(NULL, (size_t)4 * 1024 * 1024, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        (void)printf("mmap=%s\n", mapping != MAP_FAILED ? "ok" : try_open_errno_name(errno));
+        if (mapping != MAP_FAILED)
+        {
+            (void)munmap(mapping, (size_t)4 * 1024 * 1024);
+        }
         return 0;
     }
     if (argc == 3 && strcmp(argv[1], "clock") == 0)

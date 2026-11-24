@@ -274,6 +274,9 @@ static int g_chaos_init_vdso_failed = 0;
  */
 static int g_chaos_init_mptcp_off = 0;
 
+/** @brief Whether the status file already says a process could not be read. */
+static int g_chaos_init_said_unreadable = 0;
+
 /**
  * @brief Child side of the handover: installs the filter if possible and sends the parent
  *        either the listener (SCM_RIGHTS) or the errno that prevented it.
@@ -513,7 +516,14 @@ static void chaos_init_write_status(unsigned libs, const char *reason, int mptcp
 {
     char text[CHAOS_STATUS_BUFFER_SIZE];
     const size_t length = chaos_init_format_status(
-        text, sizeof(text), libs, reason, (long)getpid(), mptcp_off, g_chaos_init_vdso_failed
+        text,
+        sizeof(text),
+        libs,
+        reason,
+        (long)getpid(),
+        mptcp_off,
+        g_chaos_init_vdso_failed,
+        chaos_init_unreadable()
     );
 
     if (mkdir("/tmp", 01777) == 0)
@@ -603,6 +613,14 @@ chaos_init_decide(unsigned libs, const chaos_init_call_t *call, chaos_init_verdi
         (libs & CHAOS_INIT_LIB_PROCESS) != 0U)
     {
         (void)chaos_init_process_decide(call, verdict);
+    }
+    /* A decision that could not look into the process matched no path and no endpoint,
+     * which is a rule looking applied and doing nothing. Said once, in the file a test
+     * reads, with the cure in the documentation: --cap-add SYS_PTRACE. */
+    if (chaos_init_unreadable() && g_chaos_init_said_unreadable == 0)
+    {
+        g_chaos_init_said_unreadable = 1;
+        chaos_init_write_status(libs, NULL, g_chaos_init_mptcp_off);
     }
 }
 

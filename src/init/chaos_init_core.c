@@ -520,7 +520,8 @@ size_t chaos_init_format_status(
     const char *reason,
     long pid,
     int mptcp_off,
-    int vdso_failed
+    int vdso_failed,
+    int unreadable
 )
 {
     /* All six names joined take 30 bytes; strcat() cannot overflow 64. */
@@ -544,11 +545,12 @@ size_t chaos_init_format_status(
         written = snprintf(
             buffer,
             size,
-            "state=active\nlibs=%s\npid=%ld\n%s%s",
+            "state=active\nlibs=%s\npid=%ld\n%s%s%s",
             names,
             pid,
             mptcp_off ? "mptcp=off\n" : "",
-            vdso_failed ? "vdso=failed\n" : ""
+            vdso_failed ? "vdso=failed\n" : "",
+            unreadable ? "unreadable=yes\n" : ""
         );
     }
     else
