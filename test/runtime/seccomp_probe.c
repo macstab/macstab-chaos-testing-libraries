@@ -29,6 +29,7 @@
  *                       first recv returned and how much was left, for TRICKLE.
  *   corrupt <path>      - writes eight known bytes to <path>, reads them back and prints
  *                       how many differ and whether exactly one bit changed, for CORRUPT.
+ *   netcorrupt <port>   - the same count over a loopback stream pair, for net CORRUPT.
  * - fork                fork + waitpid: "ok" or the errno name.
  * - exec                execl("/bin/true"); prints the errno name only when it fails.
  *
@@ -292,6 +293,55 @@ int main(int argc, char **argv)
         first = recv(server, buffer, sizeof(buffer) > 10U ? 10U : sizeof(buffer), 0);
         second = first > 0 && first < 10 ? recv(server, buffer, (size_t)(10 - first), 0) : 0;
         (void)printf("first=%ld rest=%ld\n", (long)first, (long)second);
+        (void)close(server);
+        (void)close(client);
+        (void)close(listener);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "netcorrupt") == 0)
+    {
+        /* Eight known bytes travel over a loopback stream pair and one recv takes them
+         * all; printed is how many came back different and whether exactly one bit
+         * changed. A net CORRUPT rule flips one bit of what the receive delivered, so only
+         * the stop after the call can apply it -- at the entry stop the count is unknown. */
+        struct sockaddr_in address;
+        const int listener = socket(AF_INET, SOCK_STREAM, 0);
+        const int client = socket(AF_INET, SOCK_STREAM, 0);
+        int server;
+        unsigned char got[8];
+        int differences = 0;
+        int single_bit = 1;
+        size_t index;
+
+        memset(&address, 0, sizeof(address));
+        address.sin_family = AF_INET;
+        address.sin_port = htons((uint16_t)atoi(argv[2]));
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+            listen(listener, 1) != 0 ||
+            connect(client, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+            (server = accept(listener, NULL, NULL)) < 0 ||
+            write(client, "AAAAAAAA", (size_t)8) != 8)
+        {
+            (void)printf("setup=failed\n");
+            return 0;
+        }
+        if (recv(server, got, sizeof(got), 0) != 8)
+        {
+            (void)printf("recv=%s\n", try_open_errno_name(errno));
+            return 0;
+        }
+        for (index = 0U; index < sizeof(got); ++index)
+        {
+            const unsigned char changed = (unsigned char)(got[index] ^ 'A');
+
+            if (changed != 0U)
+            {
+                ++differences;
+                single_bit = single_bit && (changed & (unsigned char)(changed - 1U)) == 0U;
+            }
+        }
+        (void)printf("changed=%d onebit=%d\n", differences, differences > 0 && single_bit);
         (void)close(server);
         (void)close(client);
         (void)close(listener);

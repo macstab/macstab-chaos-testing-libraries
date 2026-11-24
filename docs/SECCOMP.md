@@ -231,7 +231,7 @@ output `dist/chaos-init-<arch>`; or `make native-init`, output `build/chaos-init
 | Library | Applied | Matched on |
 |---|---|---|
 | io | ERRNO, LATENCY on open, read, write, pread, pwrite, close (LATENCY only), fsync, fdatasync, truncate, allocate, unlink, rename; DROP on pwrite; TORN on write and pwrite and CORRUPT on read and pread, through a ptrace stop (§3.3) | the path: absolute, or joined lexically to `/proc/<pid>/cwd` or to the directory descriptor's path; descriptors through `/proc/<pid>/fd`. As in the library, descriptors 0–2, paths under `/proc`, `/sys`, `/dev` and the `/tmp/.chaos-*` control files are never faulted |
-| net | ERRNO, LATENCY on socket, bind, listen, connect, accept, shutdown, send, recv, close (LATENCY only), poll; TIMEOUT on the poll family; DROP on a datagram send (not `sendmmsg`); TRICKLE on a stream receive, through a ptrace stop (§3.3) | the endpoint: sockaddr arguments from memory, a socket's own address and peer from `/proc/<pid>/net/*` or sock_diag (§3.2), its type from its `system.sockprotoname` attribute |
+| net | ERRNO, LATENCY on socket, bind, listen, connect, accept, shutdown, send, recv, close (LATENCY only), poll; TIMEOUT on the poll family; DROP on a datagram send (not `sendmmsg`); TRICKLE on a stream receive and CORRUPT on a receive, through a ptrace stop (§3.3) | the endpoint: sockaddr arguments from memory, a socket's own address and peer from `/proc/<pid>/net/*` or sock_diag (§3.2), its type from its `system.sockprotoname` attribute |
 | memory | ERRNO, LATENCY on mmap (anon/file), munmap, mprotect, madvise | the arguments: operation, `mmap` flags, length for `@size` |
 | process | ERRNO, LATENCY, FAIL_AFTER on pthread_create, fork, posix_spawn, execve, execveat, waitpid | the system call and clone's flags (§5) |
 | dns, time | nothing (§6) | |
@@ -305,13 +305,15 @@ instead, which stops the thread with its registers readable and writable.
   The alternative, leaving `read` notified, would make `TRICKLE` silently miss every
   program that receives with `read()`. A run whose rules need no register gets byte for byte the filter
   this supervisor always built, so it costs exactly what it used to.
-- An effect on what a call *returned* -- `CORRUPT` flips a bit of the bytes a read
-  delivered -- cannot be decided when the call has not run. Such a thread is continued
-  into its syscall-exit stop and decided again there, with the result known. Nothing is
-  parked in between: the kernel restores the argument registers on return, so the second
-  stop sees the same descriptor, buffer and count and selects the same rule. The draw
-  happens at the second stop, so a read that delivered nothing counts no hit, exactly as
-  in the library.
+- An effect on what a call *returned* -- `CORRUPT` flips a bit of the bytes a read or a
+  receive delivered -- cannot be decided when the call has not run. Such a thread is
+  continued into its syscall-exit stop and decided again there, with the result known. The
+  call is carried from the first stop to the second in a table of at most 256 threads,
+  because the return value overwrites the first argument register on aarch64: the
+  descriptor is gone by the second stop, while the buffer and the count are still there.
+  More threads inside such a call at once than the table holds means the call runs without
+  the effect. The draw happens at the second stop, so a read or receive that delivered
+  nothing counts no hit, exactly as in the library.
 - A call cannot be both notified and traced: across stacked seccomp filters `USER_NOTIF`
   outranks `TRACE`. A traced number therefore carries **all** of its effects through the
   stop -- an `ERRNO` rule on a traced call is injected by setting its return register, a
@@ -338,15 +340,17 @@ The design, the measurements behind it and the rejected alternatives are in
 
 A rule the parser accepts but seccomp cannot carry out rejects its whole file, like an
 invalid line, with its line number and `reason=unsupported in seccomp mode`. No rule of
-that file applies.
+that file applies. The rows that end in "counting no hit" are the exception: the rule
+loads, and only the call forms named there are left alone -- the operation is the same for
+`read` and `readv`, so the parser cannot tell them apart.
 
 | Rule | Why not |
 |---|---|
-| io FREE, FULL; net CORRUPT, DUP | They rewrite the structure the kernel returned, or need a payload kept from an earlier call. Neither a notification reply nor a register reaches that. |
+| io FREE, FULL; net DUP | They rewrite the structure the kernel returned, or need a payload kept from an earlier call. Neither a notification reply nor a register reaches that, and the stop after the call only sees one return value. |
 | io TORN on a vectored write, net TRICKLE on `recvmsg` or a batch | The byte count of `writev`, `pwritev`, `recvmsg` and `recvmmsg` is in memory, not in a register, so one argument cannot shorten it. The call runs whole and counts no hit, as in the library. |
-| io CORRUPT on a vectored read | The bytes `readv` delivered are spread over segments, and finding the one that holds byte N would mean walking the iovec in the tracee. Left alone, counting no hit. |
+| io CORRUPT on a vectored read, net CORRUPT on `recvmsg` or a batch | The bytes `readv` and `recvmsg` delivered are spread over segments, and finding the one that holds byte N would mean walking the iovec in the tracee. Left alone, counting no hit. |
 | io `write:DROP` | A reply with the byte count is exactly a drop, but a dropped `write` has to move the descriptor's file offset on with it, which the supervisor cannot do from outside. `pwrite:DROP` carries its own offset and is applied (§3.1). |
-| net RESET | It needs a `setsockopt(SO_LINGER)` to run in the application before its close, and a notification reply either runs the notified call or fails it -- there is no reply that means "run this other call first". Injecting one needs `SECCOMP_RET_TRACE` and ptrace, not a descriptor: `PTRACE_TRACEME` is called by the tracee itself and needs no capability, so this is a question of machinery that does not exist yet, not of privilege. |
+| net RESET | It needs a `setsockopt(SO_LINGER)` to run in the application before its close, and a notification reply either runs the notified call or fails it -- there is no reply that means "run this other call first". Injecting one needs a second system call to run inside the tracee, which the trace path (§3.3) does not do yet -- it changes registers and memory, it does not make the thread call something else. Not a question of privilege: `PTRACE_TRACEME` is called by the tracee itself and needs no capability. |
 | io and net ERRNO on close | The libraries close, then report the error, as Linux does for a failing close. A notified call either runs or fails, not both. |
 | process `posix_spawnp` selector | The `PATH` search is in the C library; the system calls are those of posix_spawn, whose rules apply to it, so the rule could never fire. A `*` rule is accepted. |
 

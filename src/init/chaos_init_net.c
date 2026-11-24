@@ -26,8 +26,9 @@
  * at most CHAOS_INIT_NET_MAX_WAIT (1024) per call.
  *
  * @par Supported effects
- * ERRNO (not on close), LATENCY, TIMEOUT on the poll family, and DROP on a datagram send.
- * CORRUPT, TRICKLE and DUP change received data; RESET needs the socket itself (SO_LINGER);
+ * ERRNO (not on close), LATENCY, TIMEOUT on the poll family, DROP on a datagram send, and
+ * TRICKLE and CORRUPT through a ptrace stop.
+ * DUP needs a payload kept from an earlier call; RESET needs the socket itself (SO_LINGER);
  * ERRNO on close would have to close and fail at once. A rule file with any of them is
  * rejected at parse time via CHAOS_NET_RULE_SUPPORTED (`unsupported in seccomp mode`).
  * DROP needs nothing from the data: the reply carries the byte count and the call does not
@@ -82,18 +83,20 @@ static int chaos_init_net_supported(const struct chaos_net_rule *rule);
 /**
  * @brief Whether @p rule's effect needs the tracee's registers rather than a reply.
  *
- * @details Only TRICKLE so far: it shortens the requested length before the kernel reads
- * it, which a notification cannot do. The predicate decides the filter's traced group
+ * @details TRICKLE shortens the requested length before the kernel reads it; CORRUPT
+ * changes a byte the receive wrote, which needs the stop after it. A notification can do
+ * neither. The predicate decides the filter's traced group
  * (chaos_init_net_traced_calls()), so adding an effect here without teaching the trace
  * path to apply it would load a rule that never fires.
  */
 static int chaos_init_net_traced_effect(const struct chaos_net_rule *rule)
 {
-    return rule->effect == CHAOS_NET_EFFECT_TRICKLE;
+    return rule->effect == CHAOS_NET_EFFECT_TRICKLE || rule->effect == CHAOS_NET_EFFECT_CORRUPT;
 }
 
-/* CHAOS_NET_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, TIMEOUT, DROP, and
- * TRICKLE, which the trace path shortens in the tracee's registers. */
+/* CHAOS_NET_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, TIMEOUT, DROP, and the
+ * traced effects TRICKLE and CORRUPT, which the trace path applies through the registers
+ * and the tracee's memory. DUP stays out: it needs a payload kept from an earlier call. */
 static int chaos_init_net_supported(const struct chaos_net_rule *rule)
 {
     return (rule->effect == CHAOS_NET_EFFECT_ERRNO && rule->operation != CHAOS_NET_OP_CLOSE) ||
@@ -1293,10 +1296,18 @@ static void chaos_init_net_clear_ready(const chaos_init_call_t *call)
     }
 }
 
+/** @brief Result value that means "the call has not run yet" (the entry stop). */
+#define CHAOS_INIT_NET_NO_RESULT LONG_MIN
+
 /* Decode by table; shared calls only on sockets; cheap rejections (no rule for the
  * operation) before any endpoint lookup; then match, measure, and trigger on the
- * per-process slot. */
-int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *verdict)
+ * per-process slot.
+ *
+ * chaos_init_net_decide() and chaos_init_net_decide_result() share this body: the two stops
+ * of a traced call have to select the same rule. @p result is CHAOS_INIT_NET_NO_RESULT at
+ * the entry stop and the call's return value at the exit stop. */
+static int
+chaos_init_net_decide_at(const chaos_init_call_t *call, long result, chaos_init_verdict_t *verdict)
 {
     const chaos_init_net_call_t *entry = NULL;
     const chaos_net_config_state_t *state;
@@ -1359,6 +1370,32 @@ int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *v
     {
         return 1;
     }
+    if (rule.effect == CHAOS_NET_EFFECT_CORRUPT)
+    {
+        /* How many bytes there are to corrupt is the receive's result, so the entry stop
+         * only asks to be called again; the draw then happens after the call, as the
+         * library's does. The forms that keep their buffer in memory are left alone and
+         * count no hit. */
+        if (result == CHAOS_INIT_NET_NO_RESULT)
+        {
+            verdict->action = entry->size < 0 ? CHAOS_INIT_PASS : CHAOS_INIT_AFTER;
+            return 1;
+        }
+        /* chaos_net_received_bytes(): nothing written means nothing to corrupt, and a
+         * MSG_TRUNC receive on a stream socket discards the data instead of writing it. */
+        if (result <= 0 || size == CHAOS_POLICY_NO_SIZE ||
+            ((entry->nr == __NR_recvfrom && (call->args[3] & (uint64_t)MSG_TRUNC) != 0U) &&
+             chaos_init_net_is_stream(call->args[0])))
+        {
+            return 1;
+        }
+    }
+    else if (result != CHAOS_INIT_NET_NO_RESULT)
+    {
+        /* Every other effect was applied at the entry stop; the exit stop must not draw
+         * again. Reachable when the rule file changed between the two stops. */
+        return 1;
+    }
     /* TRICKLE shortens the requested length where it sits in a register, and only where
      * the library shortens it: a stream socket (a shorter buffer truncates a datagram),
      * not MSG_WAITALL (the caller asked for the whole count), and only a request larger
@@ -1407,6 +1444,23 @@ int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *v
         verdict->action = CHAOS_INIT_SHORTEN;
         verdict->arg_index = (unsigned)entry->size;
         verdict->value = (long)rule.chunk_bytes;
+    }
+    else if (rule.effect == CHAOS_NET_EFFECT_CORRUPT)
+    {
+        /* One byte of what the receive delivered, capped at the buffer: with MSG_TRUNC a
+         * datagram receive reports the whole datagram, which can be longer than what it
+         * wrote. The byte is read out of the tracee, one bit flipped, written back. */
+        const uint64_t length = (uint64_t)result < size ? (uint64_t)result : size;
+        const uint64_t offset =
+            (uint64_t)chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_FIRST_EFFECT) % length;
+        const unsigned bit = chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_SECOND_EFFECT) & 7U;
+        unsigned char byte = 0U;
+
+        if (chaos_init_read_memory(call->tid, call->args[1] + offset, &byte, sizeof(byte)) == 0)
+        {
+            byte ^= (unsigned char)(1U << bit);
+            (void)chaos_init_write_memory(call->tid, call->args[1] + offset, &byte, sizeof(byte));
+        }
     }
     else
     {
@@ -1469,4 +1523,18 @@ int chaos_init_net_mptcp_diag_available(void)
         );
     (void)close(probe);
     return !unresolvable;
+}
+
+/** @copydoc chaos_init_net_decide */
+int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *verdict)
+{
+    return chaos_init_net_decide_at(call, CHAOS_INIT_NET_NO_RESULT, verdict);
+}
+
+/** @copydoc chaos_init_net_decide_result */
+int chaos_init_net_decide_result(const chaos_init_call_t *call, long result)
+{
+    chaos_init_verdict_t verdict;
+
+    return chaos_init_net_decide_at(call, result, &verdict);
 }

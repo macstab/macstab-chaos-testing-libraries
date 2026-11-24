@@ -58,7 +58,7 @@ document wins where the two would disagree.
 | Qualifiers | `@first=N`, `@every=N`, `@from=T`, `@until=T`, `@size>N`, `@size<N` |
 | Limits | 256 rules; rule file under 256 KiB (262 144 bytes) |
 | Failure mode | fail-open: no rule, bad rule file or unresolvable endpoint means passthrough |
-| SECCOMP mode | ERRNO (not on `close`), LATENCY and TIMEOUT only; see [`docs/SECCOMP.md`](SECCOMP.md) |
+| SECCOMP mode | ERRNO (not on `close`), LATENCY, TIMEOUT, DROP on a datagram send, TRICKLE and CORRUPT on a receive; see [`docs/SECCOMP.md`](SECCOMP.md) |
 
 ## 1. Overview
 
@@ -527,6 +527,13 @@ their length sits in a register, so those calls are answered with `SECCOMP_RET_T
 shortened at the stop ([SECCOMP.md
 §3.3](SECCOMP.md#33-effects-that-need-the-registers-not-a-reply)). `recvmsg` and the
 batches keep their length in memory and run whole, counting no hit, as they do here.
+
+`CORRUPT` applies there as well, but at the stop *after* the call: how many bytes a
+receive delivered is its return value, so the entry stop has nothing to draw from. The
+byte and the bit are drawn at the second stop and written into the tracee's buffer, which
+keeps the rule's own promise -- a receive that delivered nothing counts no hit. The same
+two limits hold as here: `MSG_TRUNC` on a stream socket wrote nothing, and `recvmsg` and
+the batches keep their buffer in an iovec and are left alone, counting no hit.
 
 DROP reports a send as done and sends nothing, which is a lost packet. It applies to
 datagram sockets only, decided per call from `SO_TYPE` rather than from the selector: a
@@ -1085,7 +1092,7 @@ any service-mesh sidecar connection in the process.
 - **Dynamic linker.** Interposition requires a dynamically linked target that
   honours `LD_PRELOAD` (not set-uid under `AT_SECURE`). Statically linked
   programs and runtimes with their own system-call layer bypass the library;
-  SECCOMP mode covers them for ERRNO, LATENCY and TIMEOUT.
+  SECCOMP mode covers them for ERRNO, LATENCY, TIMEOUT, DROP, TRICKLE and CORRUPT.
 - **Kernel.** Endpoint identity comes from `getsockname`, `getpeername` and
   `SO_TYPE`; `epoll` membership from `/proc/self/fdinfo`. TIMEOUT waits with
   `ppoll` and the kernel's 8-byte signal set.

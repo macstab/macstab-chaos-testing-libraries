@@ -195,6 +195,21 @@ static void write_rules(const char *rules)
     assert(rename("/tmp/.chaos-net.conf.new", "/tmp/.chaos-net.conf") == 0);
 }
 
+/** @brief Whether every byte of @p area still holds @p fill, i.e. nothing was corrupted. */
+static int untouched(const unsigned char *area, size_t size, unsigned char fill)
+{
+    size_t index;
+
+    for (index = 0U; index < size; ++index)
+    {
+        if (area[index] != fill)
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /**
  * @brief Address lookup through sock_diag, the path for MPTCP sockets that no /proc/net
  *        table lists.
@@ -1126,9 +1141,10 @@ int main(void)
     );
 
     /* Effects SECCOMP mode cannot apply reject the whole rule file, status naming the
-     * line: CORRUPT (rewrites received data), ERRNO on close (would need close and fail
-     * at once), RESET (needs the socket itself). LATENCY on close is allowed. */
-    write_rules("*:connect:ECONNREFUSED:1.0\n*:recv:CORRUPT:1.0\n");
+     * line: DUP (needs a payload kept from an earlier call), ERRNO on close (would need
+     * close and fail at once), RESET (needs the socket itself). LATENCY on close is
+     * allowed. */
+    write_rules("*:connect:ECONNREFUSED:1.0\n*:recv:DUP:1.0\n");
     assert(PASSES(
         decide(__NR_connect, (uint64_t)unbound, P(&server_address), sizeof(server_address), 0, 0, 0)
     ));
@@ -1140,6 +1156,104 @@ int main(void)
         (void)fclose(file);
         assert(strstr(status, "line=2\nreason=unsupported in seccomp mode\n") != NULL);
     }
+    /* CORRUPT is applied here too, but only at the exit stop: the entry stop cannot know
+     * how many bytes a receive will deliver, so it asks to be called again and draws
+     * nothing. Over twelve rounds exactly one byte inside the received length changes each
+     * time, nothing beyond it does, and both the byte and its bit vary -- they are drawn.
+     * A MSG_TRUNC receive on a stream socket wrote nothing and is left alone, and so is a
+     * receive that returned nothing. */
+    write_rules("*:recv:CORRUPT:1.0\n");
+    {
+        unsigned char area[128];
+        chaos_init_call_t after;
+        size_t round;
+        size_t first_offset = sizeof(area);
+        unsigned char first_mask = 0U;
+        int saw_another = 0;
+        int saw_another_bit = 0;
+
+        assert(
+            decide(__NR_recvfrom, (uint64_t)server, P(area), sizeof(area), 0, 0, 0).action ==
+            CHAOS_INIT_AFTER
+        );
+        assert(PASSES(decide(__NR_recvmsg, (uint64_t)server, P(&message), 0, 0, 0, 0)));
+
+        memset(&after, 0, sizeof(after));
+        after.tid = getpid();
+        after.nr = __NR_recvfrom;
+        after.args[0] = (uint64_t)server;
+        after.args[1] = P(area);
+        after.args[2] = sizeof(area);
+        /* Nothing delivered: nothing to corrupt and no draw. */
+        (void)memset(area, 'A', sizeof(area));
+        assert(chaos_init_net_decide_result(&after, 0) == 1);
+        assert(chaos_init_net_decide_result(&after, -1) == 1);
+        assert(untouched(area, sizeof(area), 'A'));
+        /* MSG_TRUNC on a stream socket discards the data instead of writing it. */
+        after.args[3] = (uint64_t)MSG_TRUNC;
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        assert(untouched(area, sizeof(area), 'A'));
+        after.args[3] = 0U;
+        for (round = 0U; round < 12U; ++round)
+        {
+            size_t index;
+            size_t offset = sizeof(area);
+            unsigned char mask = 0U;
+            int differences = 0;
+
+            (void)memset(area, 'A', sizeof(area));
+            assert(chaos_init_net_decide_result(&after, 8) == 1);
+            for (index = 0U; index < sizeof(area); ++index)
+            {
+                const unsigned char changed = (unsigned char)(area[index] ^ 'A');
+
+                if (changed != 0U)
+                {
+                    ++differences;
+                    offset = index;
+                    mask = changed;
+                    assert(index < 8U);
+                    assert((changed & (unsigned char)(changed - 1U)) == 0U);
+                }
+            }
+            assert(differences == 1);
+            if (round == 0U)
+            {
+                first_offset = offset;
+                first_mask = mask;
+            }
+            saw_another = saw_another || offset != first_offset;
+            saw_another_bit = saw_another_bit || mask != first_mask;
+        }
+        assert(saw_another);
+        assert(saw_another_bit);
+
+        /* An effect other than CORRUPT can only reach the exit stop if the rule file
+         * changed between the two stops. It must do nothing there: the call has already
+         * run, and drawing again would charge a hit for an effect nobody can apply. */
+        write_rules("*:recv:ECONNRESET:1.0\n");
+        (void)memset(area, 'A', sizeof(area));
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        assert(untouched(area, sizeof(area), 'A'));
+        /* One real hit through the entry stop, and the two exit-stop calls above added
+         * none: a count of three here would mean the guard let them draw. The hits file is
+         * rewritten by each hit, so it is current without a flush. */
+        assert(FAILS(decide(__NR_recvfrom, (uint64_t)server, P(area), 8U, 0, 0, 0), ECONNRESET));
+        {
+            char hits[256] = {0};
+            char path[64];
+            FILE *file;
+
+            (void)snprintf(path, sizeof(path), "/tmp/.chaos-net.hits.%ld", (long)getpid());
+            file = fopen(path, "r");
+            assert(file != NULL);
+            hits[fread(hits, 1U, sizeof(hits) - 1U, file)] = '\0';
+            (void)fclose(file);
+            assert(strcmp(hits, "1\t*:recv:ECONNRESET:1.0\n") == 0);
+        }
+    }
+
     /* TRICKLE is applied here now: the requested length sits in a register, so the filter
      * answers the call with TRACE and the stop shortens it to the chunk. The library's
      * limits hold -- a stream socket only, not MSG_WAITALL, and only a request larger than

@@ -618,15 +618,26 @@ static void chaos_init_trace_stop(unsigned libs, pid_t tid, int status)
     chaos_init_verdict_t verdict;
     unsigned index;
 
-    /* The exit stop of a call whose entry stop asked for it. Nothing was parked: the
-     * argument registers still hold the caller's values, so the same rule is selected,
-     * and the result is the one register that changed. */
+    /* The exit stop of a call whose entry stop asked for it. The call comes from the
+     * parking table rather than from the registers, because the result overwrites the
+     * first argument on aarch64; only the result itself is read here. */
     if (chaos_init_trace_is_syscall_stop(status))
     {
-        if (chaos_init_trace_unpark(tid, &call) && chaos_init_trace_read(tid, &regs) == 0 &&
-            (libs & CHAOS_INIT_LIB_IO) != 0U)
+        if (chaos_init_trace_unpark(tid, &call) && chaos_init_trace_read(tid, &regs) == 0)
         {
-            (void)chaos_init_io_decide_result(&call, chaos_init_trace_result(&regs));
+            const long result = chaos_init_trace_result(&regs);
+            int claimed = 0;
+
+            /* The owner is the decider that claimed the call at the entry stop, found the
+             * same way: net takes read and write on a socket, io everything else. */
+            if ((libs & CHAOS_INIT_LIB_NET) != 0U)
+            {
+                claimed = chaos_init_net_decide_result(&call, result);
+            }
+            if (!claimed && (libs & CHAOS_INIT_LIB_IO) != 0U)
+            {
+                (void)chaos_init_io_decide_result(&call, result);
+            }
         }
         (void)ptrace(PTRACE_CONT, tid, 0, 0);
         return;

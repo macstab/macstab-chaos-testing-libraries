@@ -90,4 +90,16 @@ void chaos_init_net_commit(const chaos_init_call_t *call, const chaos_init_verdi
  */
 size_t chaos_init_net_traced_calls(long *out, size_t capacity);
 
+/**
+ * @brief Decides @p call again at its syscall-exit stop, where @p result is what it
+ *        returned, and applies an effect that needed it (CORRUPT).
+ *
+ * @details Reached only for a call whose entry stop answered CHAOS_INIT_AFTER, with the
+ * call as the entry stop saw it: see chaos_init_io_decide_result(). The draw happens here,
+ * so a receive that delivered nothing counts no hit.
+ *
+ * @return 1 when it is a net system call, else 0.
+ */
+int chaos_init_net_decide_result(const chaos_init_call_t *call, long result);
+
 #endif

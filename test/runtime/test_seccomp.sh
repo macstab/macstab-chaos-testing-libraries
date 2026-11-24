@@ -298,6 +298,13 @@ expect "C: CORRUPT flips one bit of a read" \
     "$($init --libs io -- /tmp/probe corrupt /tmp/sec/data/c)" "changed=1 onebit=1"
 expect "C: the CORRUPT rule is applied, not rejected" \
     "$(sed -n 1,2p /tmp/.chaos-io.status | tr "\n" " ")" "state=ok rules=1 "
+# The same effect on a receive, the net path to the same stop.
+printf "%s\n" "*:recv:CORRUPT:1.0 # t" > /tmp/.chaos-net.conf
+expect "C: CORRUPT flips one bit of a receive" \
+    "$($init --libs net -- /tmp/probe netcorrupt 7802)" "changed=1 onebit=1"
+expect "C: the net CORRUPT rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-net.status | tr "\n" " ")" "state=ok rules=1 "
+rm -f /tmp/.chaos-net.conf
 
 # A forked child of the tracee is traced too: without PTRACE_O_TRACEFORK its filtered calls
 # would fail with ENOSYS, because a RET_TRACE with no tracer does.
