@@ -687,6 +687,21 @@ closes last. A rule that only ever matches the parent's close — a Postgres
 postmaster handing the connection to a backend, for instance — does nothing, and
 its hit count stays at zero rather than claiming an RST that never left.
 
+**Measured against PostgreSQL 16 (alpine, musl, `LD_PRELOAD` in the server), and it is
+the limiting case:** a `close:RESET` rule resets nothing there. The postmaster closes its
+copy of each accepted socket right after forking the backend, and that close is suppressed
+because the backend still holds it; the backend then ends the session by **exiting**, and a
+process that exits closes its descriptors in the kernel, where no interposed `close` exists
+to decide. The rule says so rather than lying about it: `suppressed.shared` counts up and
+the hit count stays 0. Everything else in that backend works -- a `send:LATENCY:200` rule
+on the same endpoint produced two hits per backend in the same setup -- so this is about
+the one call that is never made, not about the library reaching the process.
+
+To model "the server dropped the connection" against such a server, fault the **client**
+side instead: `recv:ECONNRESET` on the client gives it exactly what an RST gives it, from a
+call the client does make. `close:RESET` is for a process that closes the socket itself,
+which is the common case in application code and in single-process servers.
+
 A hit count of zero alone would not say whether the rule never matched or matched
 and was suppressed, so every suppression is counted and published. The hits file
 carries two header lines in front of the rule lines:
