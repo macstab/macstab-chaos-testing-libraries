@@ -341,7 +341,9 @@ names, so each is interposed.
 
 ### Supported Errnos
 
-`EIO`, `ENOSPC`, `EDQUOT`, `EROFS`, `EACCES`, `EMFILE`, `ENFILE`, `ENOENT`.
+`EIO`, `ENOSPC`, `EDQUOT`, `EROFS`, `EACCES`, `EMFILE`, `ENFILE`, `ENOENT`, or a
+positive decimal number up to 2 147 483 647, which is passed through as written (an
+errno this build has no name for).
 
 ### Matching Rules
 
@@ -440,7 +442,8 @@ call passes through.
 
 **Errnos.** `ECONNREFUSED`, `ETIMEDOUT`, `ECONNRESET`, `EHOSTUNREACH`, `ENETUNREACH`,
 `EADDRINUSE`, `EADDRNOTAVAIL`, `EAFNOSUPPORT`, `EPROTONOSUPPORT`, `EPIPE`, `ENOTCONN`,
-`EOPNOTSUPP`, `EINVAL`, `EINTR`, `ENOMEM`, `ENOBUFS`, `EMFILE`, `ENFILE`, `EAGAIN`.
+`EOPNOTSUPP`, `EINVAL`, `EINTR`, `ENOMEM`, `ENOBUFS`, `EMFILE`, `ENFILE`, `EAGAIN`, or
+a positive decimal number up to 2 147 483 647.
 
 **Boundaries.**
 

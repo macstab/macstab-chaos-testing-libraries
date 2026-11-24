@@ -924,8 +924,9 @@ behaviour:
 - No network exposure, no logging, no authentication surface; the library inherits
   the process's privileges.
 - Input validation is the parser: a fixed four-field grammar, bounded file size and
-  rule count, an operation whitelist, an effect/operation matrix and an 8-name errno
-  whitelist (no numeric errno values).
+  rule count, an operation whitelist, an effect/operation matrix and an errno field
+  that is one of 8 names or a positive number below 2^31 -- the number is range-checked
+  and never interpreted, so a rule can name an error this build has no name for.
 
 ## 11. Performance Model
 
@@ -1105,8 +1106,10 @@ never on the disk.
 
 ### Supported errno names
 
-`EIO`, `ENOSPC`, `EDQUOT`, `EROFS`, `EACCES`, `EMFILE`, `ENFILE`, `ENOENT`. No other
-name and no numeric value is accepted.
+`EIO`, `ENOSPC`, `EDQUOT`, `EROFS`, `EACCES`, `EMFILE`, `ENFILE`, `ENOENT`, or a
+positive decimal number from 1 to 2 147 483 647 -- the value this build has no name for
+is passed through as it is written, which is how a rule reaches an errno a newer kernel
+defines. No other name is accepted.
 
 ### `@size` byte counts
 
@@ -1322,8 +1325,8 @@ bypassing the page cache, and requires buffer, length and offset alignment
 (typically 512 or 4 096 bytes, filesystem dependent).
 
 - **open:** an `open`/`openat` with `O_DIRECT` is matched like any other. The
-  injectable errors are the 8 names in §13; `EINVAL`, the usual `O_DIRECT`
-  rejection, is not among them.
+  injectable errors are the 8 names in §13 and any positive number, so `EINVAL`, the
+  usual `O_DIRECT` rejection, is written as its number (22 on Linux).
 - **read/write:** descriptors opened with `O_DIRECT` are matched like any other;
   `EIO` on a direct write models a device error reaching user space.
 - **TORN:** the shortened count is not aligned in general, and the kernel then fails

@@ -186,6 +186,7 @@ io-effect     = io-errno ":" probability
               / "CORRUPT" ":" probability                   ; read, pread only
 io-errno      = "EIO" / "ENOSPC" / "EDQUOT" / "EROFS" / "EACCES"
               / "EMFILE" / "ENFILE" / "ENOENT"
+              / 1*DIGIT                                     ; 1 .. 2147483647
 ms            = 1*DIGIT                                     ; 0 .. 4294967295
 bytes         = 1*DIGIT                                     ; 0 .. 18446744073709551615
 rate          = 1*DIGIT                                     ; bytes per second,
@@ -219,6 +220,7 @@ net-errno     = "ECONNREFUSED" / "ETIMEDOUT" / "ECONNRESET" / "EHOSTUNREACH"
               / "ENETUNREACH" / "EADDRINUSE" / "EADDRNOTAVAIL" / "EAFNOSUPPORT"
               / "EPROTONOSUPPORT" / "EPIPE" / "ENOTCONN" / "EOPNOTSUPP" / "EINVAL"
               / "EINTR" / "ENOMEM" / "ENOBUFS" / "EMFILE" / "ENFILE" / "EAGAIN"
+              / 1*DIGIT                                     ; 1 .. 2147483647
 ;; socket rules accept only "*", a wildcard host with port 0 ("tcp4://*:0"),
 ;; or "unix://*": a new socket has no address yet.
 

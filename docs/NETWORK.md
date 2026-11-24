@@ -602,10 +602,15 @@ The errno names accepted in the effect field, with no per-operation filtering:
 | `EINVAL` | `EINTR` | `ENOMEM` | `ENOBUFS` |
 | `EMFILE` | `ENFILE` | `EAGAIN` | |
 
-The set is a whitelist: `EFAULT`, `EBADF` and similar values that would make a
-correct program look buggy are not accepted. Pick a value the real function can
-return for the operation (`EADDRINUSE` on `bind`, `ECONNREFUSED` on `connect`,
-`EAGAIN` on a non-blocking `recv`); the library does not check.
+A positive decimal number from 1 to 2 147 483 647 is accepted too and passed through
+as written, which is how a rule reaches an error this build has no name for; the number
+is range-checked and never interpreted.
+
+The names are a whitelist: `EFAULT`, `EBADF` and similar values that would make a
+correct program look buggy have no name here -- though the number of one still works,
+which is the price of being able to name an unknown error. Pick a value the real
+function can return for the operation (`EADDRINUSE` on `bind`, `ECONNREFUSED` on
+`connect`, `EAGAIN` on a non-blocking `recv`); the library does not check.
 
 ### Effect semantics
 
