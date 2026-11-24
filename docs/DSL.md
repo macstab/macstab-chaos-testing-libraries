@@ -136,6 +136,28 @@ Rules common to all libraries:
   none: a rate or a chunk size that applied to every other call would not be a rate or
   a chunk size. A probability written on one of them rejects the line.
 
+### Delivering a rule file
+
+A rule file is read while the application runs, so how it is written is part of the
+contract:
+
+- **Write a temporary file in the same directory and rename it over the rule file.**
+  `rename(2)` is atomic: a reader sees the complete old file or the complete new one,
+  never half of either. The shell form the orchestration layer uses is
+  `{ cat old; new } > tmp && mv -f tmp file`, and under `chaos-init` the rename is
+  also what makes the supervisor read the file at once
+  ([SECCOMP.md §2](SECCOMP.md#2-usage)).
+- **Writing in place is not safe.** A reader that catches a partial line rejects the
+  whole file (all-or-nothing parsing) and says so in the status file, so nothing is
+  applied silently -- but a test would see an error that is an artefact of the
+  delivery rather than of its rules. The libraries narrow the window (a file whose
+  mtime is within 20 ms is read again) and cannot close it.
+- **Which version a count belongs to** is in the hits file: its first line is
+  `generation=<n>`, the number of rule-file versions that process has published. A
+  rule whose text a reload leaves unchanged keeps its counts and its `@first` claims,
+  so the generation is how a reader tells "0 hits since the reload" from "0 hits
+  ever".
+
 The grammar is checked by the property-based parser test suite. Run it to confirm
 all six parsers accept valid inputs and reject malformed ones:
 

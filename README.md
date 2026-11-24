@@ -160,6 +160,11 @@ rm -f /tmp/.chaos-io.conf /tmp/.chaos-io.hits.*
 - The library constructor loads the rule file, so rules written before the program
   starts apply from its first call. A rewrite while it runs takes effect within about
   1 ms ([Runtime Behavior](#runtime-behavior)).
+- Write a rule file by renaming a temporary file from the same directory over it
+  (`{ cat old; new; } > tmp && mv -f tmp file`): `rename(2)` is atomic, so a reader
+  sees the complete old file or the complete new one. Writing in place can be caught
+  mid-line, which rejects the whole file and reports an error that belongs to the
+  delivery rather than to the rules ([`docs/DSL.md` §2.1](docs/DSL.md#21-common-rule-envelope)).
 - Rule files are trusted input: any user who can write `/tmp` can create them
   ([`docs/SAFETY.md` §9](docs/SAFETY.md#9-config-file-security)).
 

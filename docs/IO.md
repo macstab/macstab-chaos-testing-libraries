@@ -38,6 +38,7 @@ dependency is stated.
 - [15. Stack Walkdown](#15-stack-walkdown)
 - [16a. glibc Alternate Entry Points: LFS Names and _FORTIFY_SOURCE](#16a-glibc-alternate-entry-points-lfs-names-and-_fortify_source)
 - [16b. Non-Coverage: splice, tee, vmsplice](#16b-non-coverage-splice-tee-vmsplice)
+- [16e. Non-Coverage: asynchronous submission (`io_submit`, io_uring)](#16e-non-coverage-asynchronous-submission-io_submit-io_uring)
 - [16c. O_DIRECT and Kernel Bypass Implications](#16c-o_direct-and-kernel-bypass-implications)
 - [16. References](#16-references)
 
@@ -159,8 +160,8 @@ the forms most programs use: the JDK deletes with `unlink()` and moves with
 
 - Static binaries in LD_PRELOAD mode (use SECCOMP mode).
 - Inode-identity matching: matching is by path string.
-- Writes through `mmap()` mappings, io_uring, POSIX AIO, `splice`/`tee`/`vmsplice`
-  (§16b).
+- Writes through `mmap()` mappings, `splice`/`tee`/`vmsplice` (§16b), io_uring and
+  POSIX AIO (§16e).
 - Network, DNS, time, process or memory faults (the other `libchaos-<lib>` libraries).
 - A public API: the only interface is the rule file and the files it produces.
 
@@ -1291,6 +1292,28 @@ They are not interposed:
 
 The zero-copy paths file-copy tools actually take, `sendfile()` and
 `copy_file_range()`, are interposed as `write` on the output descriptor.
+
+## 16e. Non-Coverage: asynchronous submission (`io_submit`, io_uring)
+
+`io_submit(2)` (libaio) and `io_uring_enter(2)` hand the kernel a batch of
+operations in one call. Neither is interposed, and the reason differs:
+
+- **`io_submit`** lives in libaio, not in libc, so there is no libc symbol to
+  interpose; a program that uses it links libaio itself. Under `chaos-init` it is a
+  system call and could be notified, but a fault there acts on the **submission**: an
+  `ERRNO` fails the whole batch, and "every tenth read" is not expressible, because
+  the filter sees one call carrying many operations and the completions come back
+  through `io_getevents` without a call per operation.
+- **io_uring** makes no per-operation call at all -- submissions and completions
+  travel through shared rings -- so its reads, writes and opens are invisible to both
+  modes. Recent Docker default seccomp profiles block it outright.
+
+What this means for a test: a database or server told to use one of these engines is
+not faulted on its data path. Both PostgreSQL (`io_method`) and MySQL
+(`innodb_use_native_aio`) can be configured to issue one system call per operation,
+which is the configuration an io rule needs. The capability is stated here rather
+than worked around: a rule that silently applied to nothing would be the failure this
+project exists to remove.
 
 ## 16c. O_DIRECT and Kernel Bypass Implications
 
