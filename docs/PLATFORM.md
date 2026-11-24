@@ -15,7 +15,11 @@
 
 > The layer below the per-library docs: what the kernel, the dynamic loader and the C library do when an `LD_PRELOAD` object defines `read`, why the wrappers work, and where they are bypassed.
 >
-> Scope: ELF on Linux, x86_64 (amd64) and aarch64 (arm64), glibc and musl. Release objects are built with gcc:10 on glibc 2.31 and on Alpine 3.20 (musl); glibc 2.31 is the oldest glibc the runtime suites load them into, and `test/runtime/check_glibc_baseline.sh` rejects any imported glibc symbol version above `GLIBC_2.17`. SECCOMP mode (`chaos-init`) needs Linux 5.5 or later. No other operating system or loader is covered.
+> Scope: ELF on Linux, x86_64 (amd64) and aarch64 (arm64), glibc and musl. The arm64
+> objects are linked with `max-page-size=65536`, so they load on an aarch64 kernel
+> configured for 4, 16 or 64 KiB pages; the amd64 ones stay at 4096, which is every
+> x86_64 kernel. The alignment is a property of the file (`readelf -lW`, `p_align`
+> 0x10000) and is checked that way, because a load test needs a kernel with those pages. Release objects are built with gcc:10 on glibc 2.31 and on Alpine 3.20 (musl); glibc 2.31 is the oldest glibc the runtime suites load them into, and `test/runtime/check_glibc_baseline.sh` rejects any imported glibc symbol version above `GLIBC_2.17`. SECCOMP mode (`chaos-init`) needs Linux 5.5 or later. No other operating system or loader is covered.
 
 ---
 
