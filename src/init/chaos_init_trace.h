@@ -55,6 +55,7 @@
 
 #include "chaos_init_call.h"
 
+#include <limits.h>
 #include <stdint.h>
 #include <sys/types.h>
 
@@ -196,6 +197,63 @@ int chaos_init_trace_instead(
  * @return 0 on success; -1 with errno.
  */
 int chaos_init_trace_set_result(pid_t tid, chaos_init_trace_regs_t *regs, long value);
+
+/**
+ * @brief Where in the tracee a substituted call's argument can be put.
+ *
+ * @details Below the stack pointer, which the stopped thread's own frame does not use: the
+ * kernel runs a system call on its own stack, and nothing in the tracee runs between the
+ * stop and the substituted call. The area is dead again as soon as that call returns.
+ *
+ * @param regs  Registers read at the stop.
+ * @return The address, or 0 when the registers were never read.
+ */
+uint64_t chaos_init_trace_scratch(const chaos_init_trace_regs_t *regs);
+
+/**
+ * @brief Puts @p number and @p args back and steps @p tid onto the instruction that
+ *        issued them, so the call it was stopped at runs after all.
+ *
+ * @details Used at the exit stop of a substituted call that had to run *before* the
+ * original one rather than in its place. The program counter goes back by one system call
+ * instruction, so the thread issues the call again -- which the filter answers again, and
+ * the caller has to let that second stop through (chaos_init_trace_pass()).
+ *
+ * The number goes into the register the instruction reads, not the one the kernel copies
+ * it to: this call has not been dispatched yet.
+ *
+ * The caller does not call chaos_init_trace_write() afterwards; this does it.
+ *
+ * @return 0 on success; -1 with errno.
+ */
+int chaos_init_trace_resume(
+    pid_t tid, chaos_init_trace_regs_t *regs, long number, const uint64_t *args
+);
+
+/**
+ * @brief Remembers that @p tid's next stop is a call the supervisor already decided.
+ *
+ * @details A call put back by chaos_init_trace_resume() stops again, because seccomp
+ * filters it like any other. Deciding it twice would count a second hit and loop, so the
+ * mark says to let it run.
+ *
+ * @return 0, or -1 when the table is full.
+ */
+int chaos_init_trace_pass(pid_t tid);
+
+/**
+ * @brief Whether @p tid's stop is such a call, forgetting the mark if it is.
+ *
+ * @return 1 when the stop is to be let through, else 0.
+ */
+int chaos_init_trace_passing(pid_t tid);
+
+/**
+ * @brief Promised value that means "put the original call back", not "return this".
+ *
+ * @details No system call returns it, so it cannot collide with a real promise.
+ */
+#define CHAOS_INIT_TRACE_AGAIN LONG_MIN
 
 /**
  * @brief Remembers the value @p tid's next exit stop has to report to the tracee.

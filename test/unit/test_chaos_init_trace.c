@@ -27,7 +27,10 @@
  * - a call can be replaced by another one entirely: a write becomes the `lseek` that moves
  *   the file offset on, nothing is written, and the tracee is told the count the write
  *   would have returned (this is write DROP's whole mechanism);
- * - a promised result comes back once per thread, as a parked call does.
+ * - a promised result comes back once per thread, as a parked call does;
+ * - a call can also be run *before* the original one, with an argument in the tracee's
+ *   stack scratch, after which the original is put back and runs for real: the stop it
+ *   makes on the way is the one the pass mark lets through (close RESET's mechanism).
  */
 
 #ifndef _GNU_SOURCE
@@ -43,6 +46,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -526,6 +530,163 @@ static void test_running_another_call_instead(void)
     (void)unlink(path);
 }
 
+/**
+ * @brief Proves a call can be run before the original one, which then still runs.
+ *
+ * @details The child writes one byte to a pipe. The supervisor turns that write into the
+ * `setsockopt(SO_LINGER)` a close RESET needs -- argument in the tracee's stack scratch --
+ * and puts the write back at the exit stop. The filter stops the write again, which the
+ * pass mark lets through, and the child sees a write that worked and a socket that carries
+ * the option. Nothing short of all three would give both.
+ */
+static void test_running_another_call_first(void)
+{
+    chaos_init_trace_regs_t regs;
+    struct linger request = {1, 0};
+    int pipe_fds[2];
+    pid_t child;
+    int status = 0;
+
+    assert(pipe(pipe_fds) == 0);
+    child = fork();
+    assert(child >= 0);
+    if (child == 0)
+    {
+        /* Descriptor 7 is the socket the injected setsockopt is aimed at. */
+        const int sock = socket(AF_INET, SOCK_STREAM, 0);
+        struct linger got;
+        socklen_t length = (socklen_t)sizeof(got);
+
+        (void)close(pipe_fds[0]);
+        (void)memset(&got, 0, sizeof(got));
+        if (sock < 0 || dup2(sock, 7) != 7 || ptrace(PTRACE_TRACEME, 0, NULL, NULL) != 0)
+        {
+            _exit(3);
+        }
+        install_trace_filter(__NR_write);
+        (void)raise(SIGSTOP);
+        if (syscall(SYS_write, pipe_fds[1], "x", (size_t)1) != 1)
+        {
+            _exit(4);
+        }
+        if (getsockopt(7, SOL_SOCKET, SO_LINGER, &got, &length) != 0 || got.l_onoff != 1 ||
+            got.l_linger != 0)
+        {
+            _exit(5);
+        }
+        _exit(0);
+    }
+    (void)close(pipe_fds[1]);
+    await_trace_stop(child, &regs);
+    assert(
+        ptrace(
+            PTRACE_SETOPTIONS,
+            child,
+            0,
+            (void *)(long)(PTRACE_O_TRACESECCOMP | PTRACE_O_TRACESYSGOOD)
+        ) == 0
+    );
+    {
+        uint64_t args[CHAOS_INIT_TRACE_ARGS] = {0U, 0U, 0U, 0U, 0U, 0U};
+        const uint64_t scratch = chaos_init_trace_scratch(&regs);
+        chaos_init_call_t original;
+        struct iovec local;
+        struct iovec remote;
+        unsigned index;
+
+        memset(&original, 0, sizeof(original));
+        original.tid = child;
+        original.nr = (int)chaos_init_trace_number(&regs);
+        for (index = 0U; index < CHAOS_INIT_TRACE_ARGS; ++index)
+        {
+            original.args[index] = chaos_init_trace_arg(&regs, index);
+        }
+        assert(original.nr == __NR_write && scratch != 0U);
+        /* Clear of the 128 bytes the x86-64 ABI reserves below the pointer for a leaf
+         * function, and aligned as both ABIs require of the stack: the area has to be
+         * somewhere nothing of the tracee keeps anything. */
+        {
+            const chaos_init_trace_block_t *block =
+                (const chaos_init_trace_block_t *)(void *)regs.raw;
+#if defined(__aarch64__)
+            const uint64_t pointer = (uint64_t)block->sp;
+#else
+            const uint64_t pointer = (uint64_t)block->rsp;
+#endif
+
+            assert(scratch + 128U < pointer && (scratch & 15U) == 0U);
+        }
+
+        local.iov_base = &request;
+        local.iov_len = sizeof(request);
+        remote.iov_base = (void *)(uintptr_t)scratch;
+        remote.iov_len = sizeof(request);
+        assert(process_vm_writev(child, &local, 1, &remote, 1, 0) == (ssize_t)sizeof(request));
+
+        args[0] = 7U;
+        args[1] = (uint64_t)SOL_SOCKET;
+        args[2] = (uint64_t)SO_LINGER;
+        args[3] = scratch;
+        args[4] = (uint64_t)sizeof(request);
+        assert(chaos_init_trace_pass(child) == 0);
+        assert(chaos_init_trace_instead(child, &regs, __NR_setsockopt, args) == 0);
+        assert(ptrace(PTRACE_SYSCALL, child, 0, 0) == 0);
+
+        assert(waitpid(child, &status, 0) == child && WIFSTOPPED(status));
+        assert(chaos_init_trace_is_syscall_stop(status));
+        assert(chaos_init_trace_read(child, &regs) == 0);
+        assert(chaos_init_trace_result(&regs) == 0);
+        assert(chaos_init_trace_resume(child, &regs, original.nr, original.args) == 0);
+        assert(ptrace(PTRACE_CONT, child, 0, 0) == 0);
+
+        /* The write is issued again, so the filter stops it again: without the mark the
+         * supervisor would decide it a second time and put it back for ever. */
+        assert(waitpid(child, &status, 0) == child && WIFSTOPPED(status));
+        assert((status >> 8) == (SIGTRAP | (PTRACE_EVENT_SECCOMP << 8)));
+        assert(chaos_init_trace_passing(child) == 1);
+        assert(chaos_init_trace_passing(child) == 0);
+        assert(ptrace(PTRACE_CONT, child, 0, 0) == 0);
+    }
+    {
+        char byte = 0;
+
+        assert(read(pipe_fds[0], &byte, 1U) == 1 && byte == 'x');
+        while (waitpid(child, &status, 0) == child && !WIFEXITED(status))
+        {
+            if (WIFSTOPPED(status))
+            {
+                (void)ptrace(PTRACE_CONT, child, 0, 0);
+            }
+        }
+        assert(WEXITSTATUS(status) == 0);
+    }
+    (void)close(pipe_fds[0]);
+}
+
+/** @brief Proves the pass marks are kept per thread and taken once. */
+static void test_passing_a_call(void)
+{
+    size_t index;
+
+    assert(chaos_init_trace_passing(5555) == 0);
+    assert(chaos_init_trace_pass(5555) == 0);
+    /* A second mark for the same thread is the same mark: a thread is in one call. */
+    assert(chaos_init_trace_pass(5555) == 0);
+    assert(chaos_init_trace_passing(5555) == 1);
+    assert(chaos_init_trace_passing(5555) == 0);
+    for (index = 0U; index < CHAOS_INIT_TRACE_PENDING; ++index)
+    {
+        assert(chaos_init_trace_pass((pid_t)(3000 + index)) == 0);
+    }
+    assert(chaos_init_trace_pass(2999) == -1);
+    for (index = 0U; index < CHAOS_INIT_TRACE_PENDING; ++index)
+    {
+        assert(chaos_init_trace_passing((pid_t)(3000 + index)) == 1);
+    }
+    assert(chaos_init_trace_pass(2999) == 0);
+    assert(chaos_init_trace_passing(2999) == 1);
+}
+
 /** @brief Proves a promised result is kept per thread and handed out once. */
 static void test_promising_a_result(void)
 {
@@ -581,6 +742,10 @@ static void test_unread_registers_are_refused(void)
         assert(
             chaos_init_trace_instead(getpid(), &regs, __NR_lseek, none) == -1 && errno == EINVAL
         );
+        errno = 0;
+        assert(chaos_init_trace_resume(getpid(), &regs, __NR_write, none) == -1 && errno == EINVAL);
+        /* No registers, no stack pointer, so no scratch to offer. */
+        assert(chaos_init_trace_scratch(&regs) == 0U);
     }
     errno = 0;
     assert(chaos_init_trace_write(getpid(), &regs) == -1 && errno == EINVAL);
@@ -598,7 +763,9 @@ int main(void)
     test_exit_stop_reaches_the_result();
     test_parking_a_call();
     test_running_another_call_instead();
+    test_running_another_call_first();
     test_promising_a_result();
+    test_passing_a_call();
     test_skip_on_a_dead_tracee();
     test_unread_registers_are_refused();
     return 0;

@@ -6,7 +6,8 @@
  * @details
  * Built -static, so no dynamic loader exists and LD_PRELOAD mode cannot reach it; every fault
  * it observes comes from chaos-init answering seccomp user notifications (SECCOMP mode). It
- * prints errno names (EIO, EACCES, ECONNREFUSED, ENOMEM; strerror() text otherwise).
+ * prints errno names (EIO, EACCES, ECONNREFUSED, ECONNRESET, ENOMEM; strerror() text
+ * otherwise).
  *
  * Usage: seccomp_probe <mode> [arg]
  * - open <path>         open(O_RDONLY|O_CREAT): "ok" or the errno name.
@@ -34,6 +35,10 @@
  *                       prints the three payloads, for net DUP.
  *   drop <path>         - writes ten bytes to <path>, then four, and prints what the two
  *                       writes returned and where the four landed, for write DROP.
+ *   reset <port>        - closes the server end of a loopback pair and prints what the
+ *                       client's next read sees, for close RESET.
+ *   shared <port>       - the same with a forked child holding the server end too, which
+ *                       is the case a RESET must not act on.
  * - fork                fork + waitpid: "ok" or the errno name.
  * - exec                execl("/bin/true"); prints the errno name only when it fails.
  *
@@ -73,6 +78,8 @@ static const char *try_open_errno_name(int error)
         return "EACCES";
     case ECONNREFUSED:
         return "ECONNREFUSED";
+    case ECONNRESET:
+        return "ECONNRESET";
     case ENOMEM:
         return "ENOMEM";
     default:
@@ -427,6 +434,101 @@ int main(int argc, char **argv)
         }
         (void
         )printf("wrote=%ld,%ld zeros=%d tenth=%c\n", (long)first, (long)second, zeros, got[10]);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "shared") == 0)
+    {
+        /* A forked child holds the accepted end as well, so SO_LINGER set here would
+         * reset the connection at the child's close instead -- out of any rule's reach.
+         * The supervisor finds the second holder in /proc and leaves the close alone, so
+         * the client reads end of file. The child exits only after that read. */
+        struct sockaddr_in address;
+        const int listener = socket(AF_INET, SOCK_STREAM, 0);
+        const int client = socket(AF_INET, SOCK_STREAM, 0);
+        int keeper[2];
+        int server;
+        pid_t child;
+        char byte;
+        ssize_t got;
+
+        memset(&address, 0, sizeof(address));
+        address.sin_family = AF_INET;
+        address.sin_port = htons((uint16_t)atoi(argv[2]));
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (pipe(keeper) != 0 ||
+            bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+            listen(listener, 1) != 0 ||
+            connect(client, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+            (server = accept(listener, NULL, NULL)) < 0)
+        {
+            (void)printf("setup=failed\n");
+            return 0;
+        }
+        child = fork();
+        if (child < 0)
+        {
+            (void)printf("fork=failed\n");
+            return 0;
+        }
+        if (child == 0)
+        {
+            /* Holds the socket until the parent is done, then closes it on exit. */
+            (void)close(keeper[1]);
+            (void)read(keeper[0], &byte, (size_t)1);
+            _exit(0);
+        }
+        (void)close(keeper[0]);
+        if (close(server) != 0)
+        {
+            (void)printf("close=%s\n", try_open_errno_name(errno));
+            return 0;
+        }
+        /* The connection is not finished while the child still holds its end, so the
+         * child is let go first; what the client then reads is the answer. A RESET the
+         * supervisor had set up here would arrive at that close, not at this one. */
+        (void)close(keeper[1]);
+        (void)waitpid(child, NULL, 0);
+        got = recv(client, &byte, (size_t)1, 0);
+        (void)printf("peer=%s\n", got == 0 ? "eof" : try_open_errno_name(errno));
+        (void)close(client);
+        (void)close(listener);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "reset") == 0)
+    {
+        /* The accepted end is closed while the client still holds its end. A plain close
+         * sends a FIN and the client reads end of file; a RESET rule puts
+         * SO_LINGER{1,0} on the socket first, so the kernel aborts the connection and the
+         * client reads ECONNRESET. Only the one descriptor holds the socket, so the
+         * ownership check lets the rule through. */
+        struct sockaddr_in address;
+        const int listener = socket(AF_INET, SOCK_STREAM, 0);
+        const int client = socket(AF_INET, SOCK_STREAM, 0);
+        int server;
+        char byte;
+        ssize_t got;
+
+        memset(&address, 0, sizeof(address));
+        address.sin_family = AF_INET;
+        address.sin_port = htons((uint16_t)atoi(argv[2]));
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+            listen(listener, 1) != 0 ||
+            connect(client, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+            (server = accept(listener, NULL, NULL)) < 0)
+        {
+            (void)printf("setup=failed\n");
+            return 0;
+        }
+        if (close(server) != 0)
+        {
+            (void)printf("close=%s\n", try_open_errno_name(errno));
+            return 0;
+        }
+        got = recv(client, &byte, (size_t)1, 0);
+        (void)printf("peer=%s\n", got == 0 ? "eof" : try_open_errno_name(errno));
+        (void)close(client);
+        (void)close(listener);
         return 0;
     }
     if (argc == 3 && strcmp(argv[1], "waits") == 0)

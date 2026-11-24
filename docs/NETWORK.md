@@ -58,7 +58,7 @@ document wins where the two would disagree.
 | Qualifiers | `@first=N`, `@every=N`, `@from=T`, `@until=T`, `@size>N`, `@size<N` |
 | Limits | 256 rules; rule file under 256 KiB (262 144 bytes) |
 | Failure mode | fail-open: no rule, bad rule file or unresolvable endpoint means passthrough |
-| SECCOMP mode | ERRNO (not on `close`), LATENCY, TIMEOUT, DROP on a datagram send, TRICKLE, CORRUPT and DUP on a receive; see [`docs/SECCOMP.md`](SECCOMP.md) |
+| SECCOMP mode | ERRNO (not on `close`), LATENCY, TIMEOUT, DROP on a datagram send, TRICKLE, CORRUPT and DUP on a receive, RESET on close; see [`docs/SECCOMP.md`](SECCOMP.md) |
 
 ## 1. Overview
 
@@ -689,6 +689,17 @@ Both lines carry no tab. A reader that splits each line on the first tab and
 skips what has none therefore ignores them without changes — which is why they
 are header lines rather than another column.
 
+Under `chaos-init` all of this holds, with the `setsockopt` running inside the
+traced process: the close is answered with `SECCOMP_RET_TRACE`, the option is set
+through a call the supervisor substitutes at that stop, and the close is then put
+back and runs for real ([SECCOMP.md
+§3.3](SECCOMP.md#33-effects-that-need-the-registers-not-a-reply)). The ownership
+scan reads the same `/proc` links from the other side, under the group leader of
+the calling thread, and the two suppression counts reach the same header lines of
+the hits file. A process whose `/proc` the supervisor cannot read counts as
+unknown there as it does here -- though a supervisor running as the container's
+PID 1 can read more than a library inside one process can.
+
 **TRICKLE:N.** A receive asks the kernel for at most N bytes. `recv`, `recvfrom`
 and `read` pass N as the length; `recvmsg` and `readv` pass a copy of the iovec
 array cut to N bytes (arrays of more than 64 entries are left alone), and
@@ -1100,7 +1111,8 @@ any service-mesh sidecar connection in the process.
 - **Dynamic linker.** Interposition requires a dynamically linked target that
   honours `LD_PRELOAD` (not set-uid under `AT_SECURE`). Statically linked
   programs and runtimes with their own system-call layer bypass the library;
-  SECCOMP mode covers them for ERRNO, LATENCY, TIMEOUT, DROP, TRICKLE, CORRUPT and DUP.
+  SECCOMP mode covers them for ERRNO, LATENCY, TIMEOUT, DROP, TRICKLE, CORRUPT, DUP
+  and RESET.
 - **Kernel.** Endpoint identity comes from `getsockname`, `getpeername` and
   `SO_TYPE`; `epoll` membership from `/proc/self/fdinfo`. TIMEOUT waits with
   `ppoll` and the kernel's 8-byte signal set.

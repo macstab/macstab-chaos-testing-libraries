@@ -131,6 +131,8 @@ static void chaos_init_tracee_write(chaos_init_rules_t *rules, int tracee)
     const size_t count = rules->snapshot(&texts, &generation);
 
     static chaos_hit_slot_t *slots[CHAOS_INIT_MAX_RULES];
+    char header[CHAOS_HITS_HEADER_MAX];
+    const char *lines = rules->header != NULL ? rules->header(header, sizeof(header)) : NULL;
     size_t index;
 
     chaos_init_tracee_sync(rules, tracee);
@@ -159,7 +161,7 @@ static void chaos_init_tracee_write(chaos_init_rules_t *rules, int tracee)
         slots,
         (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) texts,
         count < rules->max_rules ? count : rules->max_rules,
-        NULL,
+        lines,
         rules->buffer,
         rules->max_rules * CHAOS_HITS_LINE_MAX + 1U
     );

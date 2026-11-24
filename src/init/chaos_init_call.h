@@ -30,7 +30,8 @@ typedef enum chaos_init_action
     CHAOS_INIT_RETURN,   /**< Reply `value` without running (poll-family TIMEOUT: 0). */
     CHAOS_INIT_SHORTEN,  /**< Run it with argument `arg_index` replaced by `value` (TORN). */
     CHAOS_INIT_AFTER,    /**< Run it, then decide again with its result (CORRUPT). */
-    CHAOS_INIT_INSTEAD   /**< Run `instead_nr`(`instead_args`), then report `value` (DROP). */
+    CHAOS_INIT_INSTEAD,  /**< Run `instead_nr`(`instead_args`), then report `value` (DROP). */
+    CHAOS_INIT_BEFORE    /**< Run `instead_nr`(`instead_args`) first, then the call (RESET). */
 } chaos_init_action_t;
 
 /**
@@ -45,12 +46,18 @@ typedef enum chaos_init_action
  * the first argument on aarch64. No draw happens at the entry stop for such an effect, so
  * a call that returns nothing to change counts no hit, exactly as in the library.
  *
- * @par Running another call instead
+ * @par Running another call instead, or first
  * CHAOS_INIT_INSTEAD replaces the call with the one in `instead_nr` and `instead_args`,
  * which is how an effect that needs a second system call to keep the descriptor
  * consistent is applied from outside: a dropped `write` has to move the file offset on by
  * as much as it claims to have written. The tracee is told `value`, not what the
  * substituted call returned.
+ *
+ * CHAOS_INIT_BEFORE runs that call and then the original one: `close:RESET` needs a
+ * `setsockopt(SO_LINGER)` to take effect on the socket the close then aborts. Its
+ * argument is in memory, so `instead_data` is put into the tracee's stack scratch and its
+ * address goes into argument `instead_arg`. The original call is put back and stops once
+ * more, which the supervisor lets through rather than deciding twice.
  *
  * @par Which verdicts reach which path
  * A notification reply can PASS, FAIL, DELAY or RETURN. SHORTEN, AFTER and INSTEAD need
@@ -66,8 +73,11 @@ typedef struct chaos_init_verdict
     unsigned delay_ms;
     long value;      /**< RETURN, or DELAY with `returns`: the return value. SHORTEN: the count. */
     int returns;     /**< DELAY: when due, return `value` instead of running. */
-    long instead_nr; /**< INSTEAD: the system call to run in its place. */
-    uint64_t instead_args[6]; /**< INSTEAD: that call's arguments. */
+    long instead_nr; /**< INSTEAD, BEFORE: the system call to run in its place or first. */
+    uint64_t instead_args[6];      /**< INSTEAD, BEFORE: that call's arguments. */
+    unsigned char instead_data[8]; /**< BEFORE: bytes for the tracee's scratch. */
+    unsigned instead_size;         /**< BEFORE: how many of them; 0 when it needs none. */
+    unsigned instead_arg;          /**< BEFORE: the argument the scratch address goes into. */
     /**
      * SHORTEN: which argument `value` replaces. Only a call that reports its byte count in
      * a register can be shortened, so the index is the one the decode table names; the

@@ -744,10 +744,23 @@ static size_t test_snapshot(const chaos_init_text_t **texts, uint64_t *generatio
     return g_test_text_count;
 }
 
+/* A library that has something to say in the header lines of its hits file, as net has
+ * (its RESET suppressions): the hook is optional, and what it returns leads the file. */
+static int g_test_header = 0;
+static const char *test_header(char *out, size_t size)
+{
+    if (!g_test_header || (size_t)snprintf(out, size, "suppressed.shared=3\n") >= size)
+    {
+        return NULL;
+    }
+    return out;
+}
+
 static chaos_init_rules_t g_test_lib = {
     "/tmp/.chaos-inittest.hits",
     4U,
     test_snapshot,
+    test_header,
     g_test_rules_slots,
     g_test_rules_hashes,
     g_test_rules_generation,
@@ -762,13 +775,13 @@ static chaos_init_rules_t g_test_lib = {
  * @brief Reads and deletes the hits file `/tmp/.chaos-inittest.hits.<tgid>`; returns 0
  *        when it does not exist. Deleting makes the next call prove a fresh write.
  */
-static int read_hits(pid_t tgid, char *out, size_t size)
+static int read_hits(long tgid, char *out, size_t size)
 {
     char path[64];
     FILE *file;
     size_t length;
 
-    (void)snprintf(path, sizeof(path), "/tmp/.chaos-inittest.hits.%ld", (long)tgid);
+    (void)snprintf(path, sizeof(path), "/tmp/.chaos-inittest.hits.%ld", tgid);
     file = fopen(path, "r");
     if (file == NULL)
     {
@@ -872,6 +885,11 @@ static void test_tracee_table(void)
     foreign.report = chaos_init_tracee_report;
     chaos_hit_record(&foreign);
 
+    /* The same write, with a header hook: its lines lead the file, which is how a
+     * library reports what no hit count can say -- net counts its suppressed RESETs
+     * there. The hook is optional (the other libraries pass none) and one that cannot
+     * format its lines writes none, so the counts arrive either way. */
+    g_test_header = 1;
     /* Pid reuse: process 10 gets a new start time. The old entry is dropped (its
      * pending hits written first) and the new process starts from 0 under a new serial. */
     chaos_hit_record(slot);
@@ -898,7 +916,9 @@ static void test_tracee_table(void)
         (void)snprintf(path, sizeof(path), "/tmp/.chaos-inittest.hits.%ld", number);
         assert(unlink(path) == 0);
     }
-    assert(read_hits(10, hits, sizeof(hits)) && strncmp(hits, "67\t", 3U) == 0);
+    assert(read_hits(10, hits, sizeof(hits)));
+    assert(strncmp(hits, "suppressed.shared=3\n67\t", 23U) == 0);
+    g_test_header = 0;
 
     /* A full table (CHAOS_INIT_MAX_TRACEES = 128: process 10, 20..139, 140..146) first
      * reclaims ended processes: process 30 ends and 150 takes its entry... */

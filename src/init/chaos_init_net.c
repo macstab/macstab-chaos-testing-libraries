@@ -53,6 +53,11 @@
 
 #include "chaos_init_net.h"
 
+/** @brief Test seam: the /proc identity lookup, as in chaos_init_tracee.c. */
+#ifndef CHAOS_INIT_PROCESS_OF
+#define CHAOS_INIT_PROCESS_OF(tid, tgid, start) chaos_init_process_of((tid), (tgid), (start))
+#endif
+
 /* Parser hook, defined before the core is included: rules this mode cannot apply reject
  * their file at load time. */
 struct chaos_net_rule;
@@ -62,6 +67,7 @@ static int chaos_init_net_supported(const struct chaos_net_rule *rule);
 #include "../net/chaos_net_actions.c"
 #include "../net/chaos_net_config.c"
 #include "../net/chaos_net_endpoint.c"
+#include "../net/chaos_net_owner.c"
 #include "chaos_init_proc.h"
 #include "chaos_init_core.h"
 #include "chaos_init_tracee.h"
@@ -85,19 +91,21 @@ static int chaos_init_net_supported(const struct chaos_net_rule *rule);
  *
  * @details TRICKLE shortens the requested length before the kernel reads it; CORRUPT
  * changes a byte the receive wrote and DUP keeps the bytes it wrote, both of which need
- * the stop after it. A notification can do neither. The predicate decides the filter's traced group
+ * the stop after it; RESET needs a `setsockopt` to run in the tracee before its close. A
+ * notification can do none of them. The predicate decides the filter's traced group
  * (chaos_init_net_traced_calls()), so adding an effect here without teaching the trace
  * path to apply it would load a rule that never fires.
  */
 static int chaos_init_net_traced_effect(const struct chaos_net_rule *rule)
 {
     return rule->effect == CHAOS_NET_EFFECT_TRICKLE || rule->effect == CHAOS_NET_EFFECT_CORRUPT ||
-           rule->effect == CHAOS_NET_EFFECT_DUP;
+           rule->effect == CHAOS_NET_EFFECT_DUP || rule->effect == CHAOS_NET_EFFECT_RESET;
 }
 
 /* CHAOS_NET_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, TIMEOUT, DROP, and the
- * traced effects TRICKLE, CORRUPT and DUP, which the trace path applies through the
- * registers and the tracee's memory. ERRNO on close and RESET stay out. */
+ * traced effects TRICKLE, CORRUPT, DUP and RESET, which the trace path applies through the
+ * registers, the tracee's memory and a call of its own. ERRNO on close stays out: the
+ * library closes and then reports the error, which is two answers to one call. */
 static int chaos_init_net_supported(const struct chaos_net_rule *rule)
 {
     return (rule->effect == CHAOS_NET_EFFECT_ERRNO && rule->operation != CHAOS_NET_OP_CLOSE) ||
@@ -632,6 +640,24 @@ static const chaos_init_net_call_t g_chaos_init_net_calls[] = {
 #endif
 };
 
+/**
+ * @brief Whether @p rule needs a trace stop for @p entry in particular.
+ *
+ * @details TRICKLE, CORRUPT and DUP need the length or the buffer in a register, which
+ * recvmsg and the batches keep in memory: they stay notified, as the library leaves them
+ * alone too. RESET needs no register of the close, only a stop to run a `setsockopt`
+ * before it.
+ */
+static int
+chaos_init_net_traced_call(const struct chaos_net_rule *rule, const chaos_init_net_call_t *entry)
+{
+    if (rule->operation != entry->operation)
+    {
+        return 0;
+    }
+    return rule->effect == CHAOS_NET_EFFECT_RESET || entry->size >= 0;
+}
+
 /** @copydoc chaos_init_net_traced_calls */
 size_t chaos_init_net_traced_calls(long *out, size_t capacity)
 {
@@ -657,11 +683,9 @@ size_t chaos_init_net_traced_calls(long *out, size_t capacity)
         {
             size_t seen;
 
-            /* Only a call whose length sits in a register: recvmsg and the batches keep it
-             * in memory, so one argument cannot shorten them and they stay notified, as
-             * the library leaves them alone too. */
-            if (g_chaos_init_net_calls[entry].operation != state->rules[rule_index].operation ||
-                g_chaos_init_net_calls[entry].size < 0)
+            if (!chaos_init_net_traced_call(
+                    &state->rules[rule_index], &g_chaos_init_net_calls[entry]
+                ))
             {
                 continue;
             }
@@ -714,6 +738,9 @@ static chaos_init_rules_t g_chaos_init_net_rules = {
     CHAOS_NET_HITS_PREFIX,
     CHAOS_NET_MAX_RULES,
     chaos_init_net_snapshot,
+    /* The same header the library writes: the reload generation, and the RESET
+     * suppressions, which are the one thing a rule reports without a hit. */
+    chaos_net_hits_header,
     g_chaos_init_net_slots,
     g_chaos_init_net_hashes,
     g_chaos_init_net_generation,
@@ -1297,6 +1324,52 @@ static void chaos_init_net_clear_ready(const chaos_init_call_t *call)
     }
 }
 
+/**
+ * @brief Who holds the socket behind descriptor @p fd of thread @p tid.
+ *
+ * @details The same scan the library makes (chaos_net_socket_ownership()), from the other
+ * side: the inode comes from the `/proc/<tid>/fd/<fd>` link rather than from an `fstat`,
+ * and the descriptor table searched first is the tracee's process, not the supervisor's.
+ * A process is what owns descriptors, so the thread's group leader is the one to look
+ * under -- `/proc` lists no threads, so a search that excluded the tid would find the
+ * group's own link again and read it as somebody else's.
+ *
+ * @return SOLE when this descriptor is the only one anywhere, SHARED when another holds
+ *         the same socket, UNKNOWN when the scan could establish neither.
+ */
+static chaos_net_ownership_t chaos_init_net_ownership(pid_t tid, uint64_t fd)
+{
+    char target[CHAOS_NET_OWNER_TARGET_MAX];
+    char directory[32];
+    char owner[16];
+    const unsigned long inode = chaos_init_net_inode((int)fd);
+    uint64_t image = 0U;
+    pid_t tgid = 0;
+    size_t own = 0U;
+    int other;
+
+    if (inode == 0U || CHAOS_INIT_PROCESS_OF(tid, &tgid, &image) != 0)
+    {
+        return CHAOS_NET_OWNER_UNKNOWN;
+    }
+    (void)snprintf(target, sizeof(target), "socket:[%lu]", inode);
+    (void)snprintf(directory, sizeof(directory), "/proc/%ld/fd", (long)tgid);
+    (void)snprintf(owner, sizeof(owner), "%ld", (long)tgid);
+    /* The link was there a moment ago, so a scan that does not find it did not see what
+     * must be there: nothing may be concluded from it. */
+    if (chaos_net_owner_count(directory, target, &own) != 0 || own == 0U)
+    {
+        return CHAOS_NET_OWNER_UNKNOWN;
+    }
+    if (own > 1U)
+    {
+        return CHAOS_NET_OWNER_SHARED;
+    }
+    other = chaos_net_owner_other_holder(target, owner);
+    return other > 0 ? CHAOS_NET_OWNER_SHARED
+                     : (other == 0 ? CHAOS_NET_OWNER_SOLE : CHAOS_NET_OWNER_UNKNOWN);
+}
+
 /*---------------------------------------------------------------------------*
  * DUP: keep what a receive delivered and deliver it again
  *---------------------------------------------------------------------------*/
@@ -1566,6 +1639,20 @@ chaos_init_net_decide_at(const chaos_init_call_t *call, long result, chaos_init_
             return 1;
         }
     }
+    else if (rule.effect == CHAOS_NET_EFFECT_RESET)
+    {
+        /* Ownership is settled before the draw, as in the library: SO_LINGER on a socket
+         * another descriptor still holds would reset nothing now and reset it later, out
+         * of any rule's reach. A suppression is counted for the hits file's header rather
+         * than passed over in silence, and spends neither a hit nor a `@first` claim. */
+        const chaos_net_ownership_t ownership = chaos_init_net_ownership(call->tid, call->args[0]);
+
+        if (ownership != CHAOS_NET_OWNER_SOLE)
+        {
+            chaos_net_reset_suppressed(ownership);
+            return 1;
+        }
+    }
     else if (rule.effect == CHAOS_NET_EFFECT_DUP)
     {
         /* chaos_net_dups(): a request of zero or unknown length, the forms that keep their
@@ -1651,6 +1738,24 @@ chaos_init_net_decide_at(const chaos_init_call_t *call, long result, chaos_init_
         verdict->action = CHAOS_INIT_SHORTEN;
         verdict->arg_index = (unsigned)entry->size;
         verdict->value = (long)rule.chunk_bytes;
+    }
+    else if (rule.effect == CHAOS_NET_EFFECT_RESET)
+    {
+        /* The close has to abort the connection, which means a
+         * `setsockopt(SO_LINGER{1,0})` on the same socket first: the option lives on the
+         * file description, so only a call inside the tracee can set it. Its argument goes
+         * into the tracee's stack scratch, and the close itself runs afterwards. */
+        const struct linger abort_linger = {1, 0};
+
+        verdict->action = CHAOS_INIT_BEFORE;
+        verdict->instead_nr = __NR_setsockopt;
+        verdict->instead_args[0] = call->args[0];
+        verdict->instead_args[1] = (uint64_t)SOL_SOCKET;
+        verdict->instead_args[2] = (uint64_t)SO_LINGER;
+        verdict->instead_args[4] = (uint64_t)sizeof(abort_linger);
+        (void)memcpy(verdict->instead_data, &abort_linger, sizeof(abort_linger));
+        verdict->instead_size = (unsigned)sizeof(abort_linger);
+        verdict->instead_arg = 3U;
     }
     else if (rule.effect == CHAOS_NET_EFFECT_DUP)
     {

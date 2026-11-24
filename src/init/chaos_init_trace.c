@@ -202,6 +202,46 @@ int chaos_init_trace_claim(pid_t tid, long *value)
     return 0;
 }
 
+static pid_t g_chaos_init_trace_passes[CHAOS_INIT_TRACE_PENDING];
+static size_t g_chaos_init_trace_pass_count = 0U;
+
+/** @copydoc chaos_init_trace_pass */
+int chaos_init_trace_pass(pid_t tid)
+{
+    size_t index;
+
+    for (index = 0U; index < g_chaos_init_trace_pass_count; ++index)
+    {
+        if (g_chaos_init_trace_passes[index] == tid)
+        {
+            return 0;
+        }
+    }
+    if (g_chaos_init_trace_pass_count == CHAOS_INIT_TRACE_PENDING)
+    {
+        return -1;
+    }
+    g_chaos_init_trace_passes[g_chaos_init_trace_pass_count++] = tid;
+    return 0;
+}
+
+/** @copydoc chaos_init_trace_passing */
+int chaos_init_trace_passing(pid_t tid)
+{
+    size_t index;
+
+    for (index = 0U; index < g_chaos_init_trace_pass_count; ++index)
+    {
+        if (g_chaos_init_trace_passes[index] == tid)
+        {
+            g_chaos_init_trace_passes[index] =
+                g_chaos_init_trace_passes[--g_chaos_init_trace_pass_count];
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /** @copydoc chaos_init_trace_result */
 long chaos_init_trace_result(const chaos_init_trace_regs_t *regs)
 {
@@ -346,6 +386,56 @@ int chaos_init_trace_instead(
     block->orig_rax = (unsigned long long)number;
     return chaos_init_trace_write(tid, regs);
 #endif
+}
+
+/** @copydoc chaos_init_trace_scratch */
+uint64_t chaos_init_trace_scratch(const chaos_init_trace_regs_t *regs)
+{
+    const chaos_init_trace_block_t *block =
+        chaos_init_trace_block((chaos_init_trace_regs_t *)(uintptr_t)regs);
+
+    if (block == NULL)
+    {
+        return 0U;
+    }
+    /* Far enough below the pointer to clear the red zone the x86-64 ABI gives leaf
+     * functions, and aligned, which both ABIs require of the stack. */
+#if defined(__aarch64__)
+    return ((uint64_t)block->sp - 256U) & ~(uint64_t)15U;
+#else
+    return ((uint64_t)block->rsp - 256U) & ~(uint64_t)15U;
+#endif
+}
+
+/** @copydoc chaos_init_trace_resume */
+int chaos_init_trace_resume(
+    pid_t tid, chaos_init_trace_regs_t *regs, long number, const uint64_t *args
+)
+{
+    chaos_init_trace_block_t *block = chaos_init_trace_block(regs);
+    unsigned index;
+
+    if (block == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    for (index = 0U; index < CHAOS_INIT_TRACE_ARGS; ++index)
+    {
+        chaos_init_trace_set_arg(regs, index, args[index]);
+    }
+#if defined(__aarch64__)
+    /* `svc #0` is four bytes, and it reads the number from x8 -- which the kernel restored
+     * on the way out, so the write only states what the instruction will read anyway. */
+    block->regs[8] = (uint64_t)number;
+    block->pc -= 4U;
+#else
+    /* `syscall` is two bytes and reads the number from rax, which holds the result of the
+     * call that just finished: here the write is what makes the right call run again. */
+    block->rax = (unsigned long long)number;
+    block->rip -= 2U;
+#endif
+    return chaos_init_trace_write(tid, regs);
 }
 
 /** @copydoc chaos_init_trace_skip */

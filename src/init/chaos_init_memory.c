@@ -60,6 +60,7 @@ static chaos_init_rules_t g_chaos_init_memory_rules = {
     CHAOS_MEMORY_HITS_PREFIX,
     CHAOS_MEMORY_MAX_RULES,
     chaos_init_memory_snapshot,
+    NULL,
     g_chaos_init_memory_slots,
     g_chaos_init_memory_hashes,
     g_chaos_init_memory_generation,

@@ -49,19 +49,48 @@
  * - RESET and ERRNO on close reject the whole rule file in SECCOMP mode.
  */
 
+#include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/types.h>
 
 static int g_fail_process = 0;
+static pid_t g_fake_tgid = 0;
 static const char *g_fake_protocol = NULL;
 int chaos_init_process_of(pid_t tid, pid_t *tgid, uint64_t *start);
 static int test_process_of(pid_t tid, pid_t *tgid, uint64_t *start)
 {
-    return g_fail_process ? -1 : chaos_init_process_of(tid, tgid, start);
+    if (g_fail_process)
+    {
+        return -1;
+    }
+    if (g_fake_tgid != 0)
+    {
+        /* A process that does not exist: its descriptor table cannot be read, so the
+         * ownership of a socket cannot be established. */
+        *tgid = g_fake_tgid;
+        *start = 0U;
+        return 0;
+    }
+    return chaos_init_process_of(tid, tgid, start);
 }
 #define CHAOS_INIT_PROCESS_OF(tid, tgid, start) test_process_of((tid), (tgid), (start))
+
+/* Seam of the ownership scan (chaos_net_owner.c): a directory it cannot read may hide a
+ * holder of the socket, which no test can provoke from outside. With `g_deaf_proc` set,
+ * every directory but the one named in `g_own_fd_dir` refuses to open. */
+static int g_deaf_proc = 0;
+static char g_own_fd_dir[32] = "";
+static int test_owner_open(const char *path)
+{
+    if (g_deaf_proc && strcmp(path, g_own_fd_dir) != 0)
+    {
+        return -1;
+    }
+    return open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+}
+#define CHAOS_NET_OWNER_OPEN(path) test_owner_open(path)
 
 #include <sys/xattr.h>
 static unsigned g_protocol_lookups = 0U;
@@ -1251,7 +1280,10 @@ int main(void)
             assert(file != NULL);
             hits[fread(hits, 1U, sizeof(hits) - 1U, file)] = '\0';
             (void)fclose(file);
-            assert(strcmp(hits, "1\t*:recv:ECONNRESET:1.0\n") == 0);
+            /* The file leads with the tab-free header lines the library writes there
+             * (generation, RESET suppressions), so the count line is looked up rather
+             * than compared against the whole file. */
+            assert(strstr(hits, "\n1\t*:recv:ECONNRESET:1.0\n") != NULL);
         }
     }
 
@@ -1365,7 +1397,7 @@ int main(void)
             assert(file != NULL);
             hits[fread(hits, 1U, sizeof(hits) - 1U, file)] = '\0';
             (void)fclose(file);
-            assert(strcmp(hits, "1\t*:recv:DUP:1.0\n") == 0);
+            assert(strstr(hits, "\n1\t*:recv:DUP:1.0\n") != NULL);
         }
         /* A buffer the supervisor cannot read keeps nothing, and one it cannot write
          * leaves the verdict at AFTER: the receive runs for real. */
@@ -1523,8 +1555,66 @@ int main(void)
         assert(chaos_init_net_traced_calls(traced, sizeof(traced) / sizeof(traced[0])) == 0U);
     }
     assert(PASSES(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0)));
+    /* RESET aborts the connection, which is a setsockopt(SO_LINGER{1,0}) on the socket
+     * before the close -- a call of its own, run inside the tracee, with its argument in
+     * the tracee's stack scratch. The close itself still runs, so the verdict is BEFORE
+     * and not INSTEAD. Only the close is traced for it: the option needs no register of
+     * the call. */
     write_rules("*:close:RESET:1.0\n");
-    assert(PASSES(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0)));
+    {
+        long traced[8];
+        struct linger expected;
+        chaos_init_verdict_t aborting = decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0);
+
+        assert(chaos_init_net_traced_calls(traced, sizeof(traced) / sizeof(traced[0])) == 1U);
+        assert(traced[0] == __NR_close);
+        assert(aborting.action == CHAOS_INIT_BEFORE);
+        assert(aborting.instead_nr == __NR_setsockopt);
+        assert(aborting.instead_args[0] == (uint64_t)server);
+        assert(aborting.instead_args[1] == (uint64_t)SOL_SOCKET);
+        assert(aborting.instead_args[2] == (uint64_t)SO_LINGER);
+        assert(aborting.instead_args[4] == sizeof(struct linger));
+        assert(aborting.instead_size == (unsigned)sizeof(struct linger));
+        assert(aborting.instead_arg == 3U);
+        (void)memcpy(&expected, aborting.instead_data, sizeof(expected));
+        assert(expected.l_onoff == 1 && expected.l_linger == 0);
+
+        /* A socket a second descriptor still holds is not reset: the option would reset it
+         * later, when no rule is looking. The suppression is counted instead of passed
+         * over, and spends no hit. A table that cannot be read leaves the ownership
+         * unknown, which is counted apart -- that is an environment problem, not a
+         * pre-forking server. */
+        {
+            const int shared_fd = dup(server);
+
+            assert(shared_fd > 2);
+            assert(PASSES(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0)));
+            (void)close(shared_fd);
+        }
+        g_fake_tgid = 0x7ffffff;
+        assert(PASSES(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0)));
+        g_fake_tgid = 0;
+        /* A /proc directory the supervisor cannot read may hide a second holder, so the
+         * ownership is unknown rather than sole. */
+        (void)snprintf(g_own_fd_dir, sizeof(g_own_fd_dir), "/proc/%ld/fd", (long)getpid());
+        g_deaf_proc = 1;
+        assert(PASSES(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0)));
+        g_deaf_proc = 0;
+        g_fail_process = 1;
+        assert(PASSES(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0)));
+        g_fail_process = 0;
+        /* The two counts are apart and go into the header lines of the hits file, which
+         * chaos-init writes on the hits cadence (chaos_init_rules_t::header) -- a rule
+         * that only ever gets suppressed reports nothing otherwise. */
+        {
+            char header[CHAOS_HITS_HEADER_MAX];
+            const char *lines = chaos_net_hits_header(header, sizeof(header));
+
+            assert(lines != NULL);
+            assert(strstr(lines, "suppressed.shared=1\n") != NULL);
+            assert(strstr(lines, "suppressed.unknown=3\n") != NULL);
+        }
+    }
     write_rules("*:close:LATENCY:5\n");
     assert(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0).action == CHAOS_INIT_DELAY);
 

@@ -301,6 +301,7 @@ static chaos_init_rules_t g_chaos_init_io_rules = {
     CHAOS_IO_HITS_PREFIX,
     CHAOS_IO_MAX_RULES,
     chaos_init_io_snapshot,
+    NULL,
     g_chaos_init_io_slots,
     g_chaos_init_io_hashes,
     g_chaos_init_io_generation,

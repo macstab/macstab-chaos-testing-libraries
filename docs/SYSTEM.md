@@ -782,9 +782,10 @@ proceed), or continue unchanged, by the rules of the libraries named in
 (`TORN`, `CORRUPT`, `TRICKLE`, `DUP`, `DROP`) are applied through a ptrace stop
 instead of a notification, which reaches the tracee's registers, its memory and a
 system call of the supervisor's choosing; the vectored forms are left out of it and
-count no hit. What remains rejected with reason `unsupported in seccomp mode` is what
-rewrites a structure the kernel returned (io `FREE`/`FULL`) or needs a second call to
-run before the original (net `RESET`, errno on `close`).
+count no hit. A second call of the supervisor runs in the tracee where an
+effect needs one (`write:DROP`'s `lseek`, `close:RESET`'s `setsockopt`). What remains
+rejected with reason `unsupported in seccomp mode` is what rewrites a structure the
+kernel returned (io `FREE`/`FULL`) or answers one call twice (errno on `close`).
 Details: [SECCOMP.md](SECCOMP.md).
 
 ### Shared Internal Scaffold

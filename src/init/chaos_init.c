@@ -62,6 +62,7 @@
 #include "chaos_init_io.h"
 #include "chaos_init_memory.h"
 #include "chaos_init_net.h"
+#include "chaos_init_proc.h"
 #include "chaos_init_process.h"
 #include "chaos_init_tracee.h"
 #include "chaos_status.h"
@@ -599,6 +600,41 @@ static void chaos_init_trace_answer(pid_t tid, const chaos_init_verdict_t *verdi
 }
 
 /**
+ * @brief Sets @p tid up to run the call @p verdict asks for, data and all.
+ *
+ * @details The argument the call needs in memory goes into the tracee's stack scratch,
+ * which is dead space for the duration: nothing of the tracee runs between this stop and
+ * the substituted call.
+ *
+ * @return 0 when the thread is ready to be continued into that call; -1 otherwise.
+ */
+static int chaos_init_trace_substitute(
+    pid_t tid, chaos_init_trace_regs_t *regs, const chaos_init_verdict_t *verdict
+)
+{
+    uint64_t args[CHAOS_INIT_TRACE_ARGS];
+    unsigned index;
+
+    for (index = 0U; index < CHAOS_INIT_TRACE_ARGS; ++index)
+    {
+        args[index] = verdict->instead_args[index];
+    }
+    if (verdict->instead_size > 0U)
+    {
+        const uint64_t scratch = chaos_init_trace_scratch(regs);
+
+        if (scratch == 0U ||
+            chaos_init_write_memory(tid, scratch, verdict->instead_data, verdict->instead_size) !=
+                0)
+        {
+            return -1;
+        }
+        args[verdict->instead_arg] = scratch;
+    }
+    return chaos_init_trace_instead(tid, regs, verdict->instead_nr, args);
+}
+
+/**
  * @brief Handles one ptrace stop of @p tid reported by @p status.
  *
  * @details Four kinds arrive here. A syscall-exit stop belongs to a call whose entry stop
@@ -627,12 +663,23 @@ static void chaos_init_trace_stop(unsigned libs, pid_t tid, int status)
 
         /* The exit stop of a call the supervisor put there itself: what that call returned
          * is none of the tracee's business, which is told the value the call it asked for
-         * would have reported. */
+         * would have reported -- or, for a call that only had to run first, gets its own
+         * call back and runs it. */
         if (chaos_init_trace_claim(tid, &promised))
         {
             if (chaos_init_trace_read(tid, &regs) == 0)
             {
-                (void)chaos_init_trace_set_result(tid, &regs, promised);
+                if (promised == CHAOS_INIT_TRACE_AGAIN)
+                {
+                    if (chaos_init_trace_unpark(tid, &call))
+                    {
+                        (void)chaos_init_trace_resume(tid, &regs, call.nr, call.args);
+                    }
+                }
+                else
+                {
+                    (void)chaos_init_trace_set_result(tid, &regs, promised);
+                }
             }
             (void)ptrace(PTRACE_CONT, tid, 0, 0);
             return;
@@ -665,7 +712,9 @@ static void chaos_init_trace_stop(unsigned libs, pid_t tid, int status)
         (void)ptrace(PTRACE_CONT, tid, 0, (void *)(long)signal);
         return;
     }
-    if (chaos_init_trace_read(tid, &regs) != 0)
+    /* A call the supervisor put back after running another one first: already decided, so
+     * deciding it again would count a second hit and put it back for ever. */
+    if (chaos_init_trace_passing(tid) || chaos_init_trace_read(tid, &regs) != 0)
     {
         (void)ptrace(PTRACE_CONT, tid, 0, 0);
         return;
@@ -687,17 +736,31 @@ static void chaos_init_trace_stop(unsigned libs, pid_t tid, int status)
         (void)ptrace(PTRACE_SYSCALL, tid, 0, 0);
         return;
     }
-    /* Another call in its place, and the value the tracee is told once that call has run.
-     * The promise is made first: with no room for it the call runs unchanged rather than
-     * returning whatever the substituted one did. */
-    if (verdict.action == CHAOS_INIT_INSTEAD && chaos_init_trace_promise(tid, verdict.value) == 0)
+    /* Another call in its place, or before it. Everything the second stop needs is
+     * reserved first -- the promise, and for BEFORE the parked call and the mark that lets
+     * the call through when it comes back -- so that a table too full to hold one of them
+     * leaves the call unchanged instead of losing it. */
+    if (verdict.action == CHAOS_INIT_INSTEAD || verdict.action == CHAOS_INIT_BEFORE)
     {
-        if (chaos_init_trace_instead(tid, &regs, verdict.instead_nr, verdict.instead_args) == 0)
+        const int before = verdict.action == CHAOS_INIT_BEFORE;
+        const long promise = before ? CHAOS_INIT_TRACE_AGAIN : verdict.value;
+
+        if (chaos_init_trace_promise(tid, promise) == 0 &&
+            (!before || (chaos_init_trace_park(&call) == 0 && chaos_init_trace_pass(tid) == 0)) &&
+            chaos_init_trace_substitute(tid, &regs, &verdict) == 0)
         {
             (void)ptrace(PTRACE_SYSCALL, tid, 0, 0);
             return;
         }
-        (void)chaos_init_trace_claim(tid, &verdict.value);
+        {
+            long dropped = 0;
+            chaos_init_call_t gone;
+
+            (void)chaos_init_trace_claim(tid, &dropped);
+            (void)chaos_init_trace_passing(tid);
+            (void)chaos_init_trace_unpark(tid, &gone);
+        }
+        verdict.action = CHAOS_INIT_PASS;
     }
     if (verdict.action == CHAOS_INIT_DELAY)
     {

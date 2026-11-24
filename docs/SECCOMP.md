@@ -231,7 +231,7 @@ output `dist/chaos-init-<arch>`; or `make native-init`, output `build/chaos-init
 | Library | Applied | Matched on |
 |---|---|---|
 | io | ERRNO, LATENCY on open, read, write, pread, pwrite, close (LATENCY only), fsync, fdatasync, truncate, allocate, unlink, rename; DROP on pwrite; TORN on write and pwrite, CORRUPT on read and pread and DROP on write and writev, through a ptrace stop (§3.3) | the path: absolute, or joined lexically to `/proc/<pid>/cwd` or to the directory descriptor's path; descriptors through `/proc/<pid>/fd`. As in the library, descriptors 0–2, paths under `/proc`, `/sys`, `/dev` and the `/tmp/.chaos-*` control files are never faulted |
-| net | ERRNO, LATENCY on socket, bind, listen, connect, accept, shutdown, send, recv, close (LATENCY only), poll; TIMEOUT on the poll family; DROP on a datagram send (not `sendmmsg`); TRICKLE on a stream receive, CORRUPT and DUP on a receive, through a ptrace stop (§3.3) | the endpoint: sockaddr arguments from memory, a socket's own address and peer from `/proc/<pid>/net/*` or sock_diag (§3.2), its type from its `system.sockprotoname` attribute |
+| net | ERRNO, LATENCY on socket, bind, listen, connect, accept, shutdown, send, recv, close (LATENCY only), poll; TIMEOUT on the poll family; DROP on a datagram send (not `sendmmsg`); TRICKLE on a stream receive, CORRUPT and DUP on a receive, RESET on close, through a ptrace stop (§3.3) | the endpoint: sockaddr arguments from memory, a socket's own address and peer from `/proc/<pid>/net/*` or sock_diag (§3.2), its type from its `system.sockprotoname` attribute |
 | memory | ERRNO, LATENCY on mmap (anon/file), munmap, mprotect, madvise | the arguments: operation, `mmap` flags, length for `@size` |
 | process | ERRNO, LATENCY, FAIL_AFTER on pthread_create, fork, posix_spawn, execve, execveat, waitpid | the system call and clone's flags (§5) |
 | dns, time | nothing (§6) | |
@@ -331,6 +331,21 @@ instead, which stops the thread with its registers readable and writable.
   filtered again, because seccomp ran before the stop. The promised value is kept per
   thread, in a table of the same size as the parking one; no room for it means the call
   runs unchanged.
+- `close:RESET` needs its second call to run **before** the original one rather than in
+  its place: `SO_LINGER` has to be on the socket that the close then aborts. The
+  `setsockopt` is substituted the same way, its `struct linger` written into the tracee's
+  stack scratch -- 256 bytes below the stack pointer, clear of the x86-64 red zone and
+  of anything the stopped thread keeps. At the exit stop the original call is put back:
+  its number and arguments are restored and the program counter steps back onto the
+  system call instruction, so the thread issues the close again. That second issue is
+  filtered again, and a per-thread mark lets it through rather than deciding it twice.
+  Everything the second stop needs is reserved before the substitution, so a table too
+  full leaves the call alone instead of losing it.
+- The ownership check `close:RESET` needs (`NETWORK.md` §RESET) reads the tracee's
+  descriptor table rather than the supervisor's: the socket inode comes from the
+  `/proc/<pid>/fd` link, and the table searched first is the thread's group leader's,
+  because `/proc` lists no threads. A suppressed RESET is counted and published in the
+  header lines of that library's hits file, which chaos-init writes as the library does.
 - A call cannot be both notified and traced: across stacked seccomp filters `USER_NOTIF`
   outranks `TRACE`. A traced number therefore carries **all** of its effects through the
   stop -- an `ERRNO` rule on a traced call is injected by setting its return register, a
@@ -366,7 +381,6 @@ loads, and only the call forms named there are left alone -- the operation is th
 | io FREE, FULL | They rewrite the structure the kernel returned, which neither a notification reply nor a register reaches. |
 | io TORN on a vectored write, net TRICKLE on `recvmsg` or a batch | The byte count of `writev`, `pwritev`, `recvmsg` and `recvmmsg` is in memory, not in a register, so one argument cannot shorten it. The call runs whole and counts no hit, as in the library. |
 | io CORRUPT on a vectored read, net CORRUPT or DUP on `recvmsg` or a batch | The bytes `readv` and `recvmsg` delivered are spread over segments, and finding the one that holds byte N, or filling them from a kept payload, would mean walking the iovec in the tracee. Left alone, counting no hit. |
-| net RESET | It needs a `setsockopt(SO_LINGER)` to run in the application before its close, and a notification reply either runs the notified call or fails it -- there is no reply that means "run this other call first". Injecting one needs a second system call to run inside the tracee, which the trace path (§3.3) does not do yet -- it changes registers and memory, it does not make the thread call something else. Not a question of privilege: `PTRACE_TRACEME` is called by the tracee itself and needs no capability. |
 | io and net ERRNO on close | The libraries close, then report the error, as Linux does for a failing close. A notified call either runs or fails, not both. |
 | process `posix_spawnp` selector | The `PATH` search is in the C library; the system calls are those of posix_spawn, whose rules apply to it, so the rule could never fire. A `*` rule is accepted. |
 

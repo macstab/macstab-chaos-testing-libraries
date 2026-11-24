@@ -114,6 +114,7 @@ static chaos_init_rules_t g_chaos_init_process_rules = {
     CHAOS_PROCESS_HITS_PREFIX,
     CHAOS_PROCESS_MAX_RULES,
     chaos_init_process_snapshot,
+    NULL,
     g_chaos_init_process_slots,
     g_chaos_init_process_hashes,
     g_chaos_init_process_generation,

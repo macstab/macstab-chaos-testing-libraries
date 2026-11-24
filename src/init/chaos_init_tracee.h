@@ -64,6 +64,12 @@ typedef struct chaos_init_rules
      * @return Number of rules.
      */
     size_t (*snapshot)(const chaos_init_text_t **texts, uint64_t *generation);
+    /**
+     * Builds the tab-free header lines of this library's hits file, or NULL for none.
+     * Optional: a library with nothing to report there leaves it out.
+     * @return @p out, or NULL when nothing is to be written.
+     */
+    const char *(*header)(char *out, size_t size);
     chaos_hit_slot_t *slots; /**< CHAOS_INIT_MAX_TRACEES * max_rules */
     uint64_t *hashes;        /**< Text hash per slot, to carry counts over reloads. */
     uint64_t *generation;    /**< Per process: the snapshot its slots belong to. */

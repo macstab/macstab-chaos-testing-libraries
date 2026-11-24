@@ -325,6 +325,28 @@ expect "C: a dropped write moves the offset on" \
 expect "C: the write DROP rule is applied, not rejected" \
     "$(sed -n 1,2p /tmp/.chaos-io.status | tr "\n" " ")" "state=ok rules=1 "
 
+# close:RESET is the other half of that machinery: the setsockopt has to run before the
+# close, not instead of it, so the supervisor substitutes it, puts the close back and lets
+# the second stop through. The peer is what proves it -- a FIN reads as end of file, an RST
+# as ECONNRESET.
+expect "C: without a rule the peer reads end of file" "$($init --libs net -- /tmp/probe reset 7804)" \
+    "peer=eof"
+printf "%s\n" "*:close:RESET:1.0 # t" > /tmp/.chaos-net.conf
+expect "C: close RESET aborts the connection" "$($init --libs net -- /tmp/probe reset 7805)" \
+    "peer=ECONNRESET"
+expect "C: the RESET rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-net.status | tr "\n" " ")" "state=ok rules=1 "
+# A socket a forked child still holds is left alone -- SO_LINGER would reset it at the
+# close of that child, where no rule is looking. The suppression is reported in the header
+# lines of the hits file, so a rule that never gets to fire is not silent about it.
+rm -f /tmp/.chaos-net.hits.*
+expect "C: a shared socket is not reset" "$($init --libs net -- /tmp/probe shared 7806)" \
+    "peer=eof"
+expect "C: the suppression is reported" \
+    "$(cat /tmp/.chaos-net.hits.* | sed -n "s/^suppressed.shared=\([1-9][0-9]*\)$/counted/p" | head -1)" \
+    "counted"
+rm -f /tmp/.chaos-net.conf
+
 # A forked child of the tracee is traced too: without PTRACE_O_TRACEFORK its filtered calls
 # would fail with ENOSYS, because a RET_TRACE with no tracer does.
 printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/data:write:TORN:1.0 # t" > /tmp/.chaos-io.conf
