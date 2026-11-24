@@ -520,6 +520,13 @@ first.
   paths, `@size`, `@first` or `@from` keep a rule to the calls meant.
 - `pthread_create` failures surface as the error the C library reports for a failed
   `clone`, normally the injected errno returned by `pthread_create()`.
+- **A short write may be invisible to the program.** TORN and THROTTLE shorten the system
+  call; a runtime that loops over the remainder re-issues it, so the data arrives in
+  several calls and the caller sees no short write. Measured with a static Go binary:
+  `syscall.Write` returns the shortened count, `os.File.Write` returns the full length.
+  The rule still fires, and the hits file counts the calls it fired on rather than the
+  tears the program saw. A rate survives the loop -- the remainder is issued at the same
+  rate ([`docs/IO.md`](IO.md), "What a short write is visible to").
 - **Each process draws its own samples.** A rule's sample depends on the process it is
   evaluated in, because the supervisor gives every process it decides for a lineage of its
   own -- taken from the order the processes appeared in, which is the only ordering it can

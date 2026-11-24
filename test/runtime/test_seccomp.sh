@@ -31,6 +31,9 @@
 #   search, #!-less script via /bin/sh), a non-executable command exits 126, a later exec is
 #   refused, a fork rule fails fork (C), a posix_spawn rule fails Go os/exec;
 # - a rule SECCOMP mode cannot apply (CORRUPT) rejects the whole file, named in the status;
+# - the data effects reach a static Go binary too: TORN shortens the raw write it makes
+#   itself (its os.File write loops and still writes everything), THROTTLE holds those
+#   writes to the rate all the same, and TRICKLE cuts a net.Conn.Read to the chunk;
 # - TORN is applied through a ptrace stop: the returned count and the file size both drop
 #   below ten and agree, and a fork of the traced application still runs; TRICKLE cuts a
 #   stream receive to its chunk and leaves the rest in the socket; REDIRECT lands a connect
@@ -365,6 +368,32 @@ expect "C: TRICKLE shortens every receive" "$($init --libs net -- /tmp/probe tri
 expect "C: the TRICKLE rule is applied, not rejected" \
     "$(sed -n 1,2p /tmp/.chaos-net.status | tr "\n" " ")" "state=ok rules=1 "
 rm -f /tmp/.chaos-net.conf
+
+# The data effects against a static Go binary, which is what SECCOMP mode exists for: Go
+# makes its system calls without libc, so no preload can reach them, and its runtime is
+# the one that has to cope with a short write or a chunked read. What it does with them is
+# measured here rather than assumed: a raw syscall.Write shows the tear, while
+# os.File.Write returns ten all the same, because internal/poll re-issues what the
+# shortened call left. A TORN rule is therefore visible to a Go program only where the
+# program makes the call itself -- and the hits file counts one hit per system call, not
+# per short write the program saw.
+printf "%s\n" "/tmp/sec/data:write:TORN:1.0 # t" > /tmp/.chaos-io.conf
+go_torn=$($init --libs io -- $go torn /tmp/sec/data/gotorn)
+expect "Go: TORN shortens the raw write it makes itself" \
+    "$(echo "$go_torn" | sed -n "s/^raw=\\([1-9]\\) wrapped=10$/short/p")" "short"
+expect "Go: without a rule both write all ten bytes" \
+    "$(printf "%s\n" "/tmp/sec/other:write:TORN:1.0 # t" > /tmp/.chaos-io.conf;
+       $init --libs io -- $go torn /tmp/sec/data/gotorn)" "raw=10 wrapped=10"
+# The same loop is why a rate still bites: it issues the remainder at the rate, so what a
+# Go program sees is time instead of a short write.
+printf "%s\n" "/tmp/sec/data:write:THROTTLE:262144 # t" > /tmp/.chaos-io.conf
+at_least "Go: THROTTLE holds its writes to the rate" \
+    "$($init --libs io -- $go throttle /tmp/sec/data/gorate)" 700
+printf "%s\n" "*:recv:TRICKLE:4 # t" > /tmp/.chaos-net.conf
+expect "Go: TRICKLE cuts a net.Conn.Read to the chunk" \
+    "$($init --libs net -- $go trickle 7907)" "first=4"
+expect "Go: without a rule the whole message arrives at once" \
+    "$(rm -f /tmp/.chaos-net.conf; $init --libs net -- $go trickle 7908)" "first=10"
 
 # A probabilistic rule on a pre-forking server: every backend evaluates the rule for the
 # first time, so if they all drew the same sample the count would be 0 or 24 and never

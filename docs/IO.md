@@ -1099,12 +1099,35 @@ never on the disk.
 |---|---|---|---|
 | ERRNO | yes | before the call; the real call is skipped | `close`: after the real close. `posix_fallocate`: returned, `errno` untouched. stdio: error value plus `ferror()`. |
 | LATENCY | no | before the call | Always fires when matched and the qualifiers pass; raw `clock_nanosleep`, restarted on `EINTR`. |
-| TORN | yes | before the call | Count in `[1, n-1]`; `writev`/`pwritev` only up to 64 entries; no effect on stdio. |
+| TORN | yes | before the call | Count in `[1, n-1]`; `writev`/`pwritev` only up to 64 entries; no effect on stdio. A caller that loops over the remainder sees no short write at all (see below). |
 | FREE | yes | after a successful call | The free-space counts (`f_bfree`, `f_bavail`) report the rule's byte count, rounded down to whole blocks; the total is untouched. |
 | FULL | yes | after a successful call | The same two counts report zero. |
 | DROP | yes | instead of the call | The full count is reported written and nothing is written. On `write`/`writev` the file offset is moved on by that many bytes, so the caller's next write does not land on top of what it believes it already wrote; an `O_APPEND` descriptor needs no correction, and one with no offset at all (a pipe, a FIFO) keeps the rule from firing. `pwrite`/`pwritev` need no correction. No effect on stdio, on `sendfile` or on `copy_file_range`. |
 | THROTTLE | no (a rate, not a chance) | before the call | The call runs with what the (rule, descriptor) token bucket allows: a full bucket is one second's worth, so the rate only bites once a caller keeps going. An allowance covering the whole call changes nothing and counts no hit. An empty bucket means `EAGAIN` on a non-blocking descriptor and otherwise a wait for a tenth of a second's worth, which is then written. `writev`/`pwritev` are trimmed up to 64 entries; `sendfile` and `copy_file_range` are shortened as TORN shortens them, since the kernel moves both offsets by what it transferred; no effect on stdio. |
 | CORRUPT | yes, drawn after the call | after a call that returned `> 0` bytes | One bit of one returned byte. |
+
+### What a short write is visible to
+
+A torn (or throttled) write shortens the system call. Whether the **program** sees a short
+write depends on what it wrapped the call in:
+
+- a program that calls `write(2)` itself and reports what it returned sees the tear;
+- a wrapper that loops until the buffer is written re-issues the remainder, so the data
+  all arrives -- in several calls -- and the caller sees nothing. Measured with a static
+  Go binary: `syscall.Write` returns the shortened count, while `os.File.Write` returns
+  the full length, because `internal/poll.FD.Write` loops. Any wrapper written that way
+  behaves the same.
+
+Two consequences worth knowing before writing a rule:
+
+- the hits file counts **system calls the rule fired on**, not short writes the program
+  saw, so a looping caller produces several hits and no visible tear;
+- a rate (`THROTTLE`) is unaffected by the loop: it issues the remainder at the same rate,
+  so the program sees the time rather than the short count. Measured against the same Go
+  binary: 512 KiB at 256 KiB/s took 1003 ms through `os.File.Write`.
+
+To test a short write against a looping runtime, fault the operation the program cannot
+retry away instead -- `ERRNO`, `DROP`, or a rate.
 
 ### Supported errno names
 
