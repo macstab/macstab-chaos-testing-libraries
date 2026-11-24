@@ -49,6 +49,10 @@
  *                       intercepted call while a rule file is being put in place.
  *   redirect <port>     - listens on <port>, dials <port> + 1 and prints the port the
  *                       connection landed on, for connect REDIRECT.
+ *   prefork <port>      - a pre-forking server: 24 connections, each served by a forked
+ *                       child that closes last, and prints how many of them the client
+ *                       saw reset. With a rule at `p=0.5` that number tells whether the
+ *                       children drew their own samples or all the same one.
  *   setuid <path>       - drops to uid 65534, then opens <path> and maps 4 MiB:
  *                       "open=<r> mmap=<r>", for what a rule can still match after a
  *                       user switch.
@@ -450,6 +454,68 @@ int main(int argc, char **argv)
         }
         (void
         )printf("wrote=%ld,%ld zeros=%d tenth=%c\n", (long)first, (long)second, zeros, got[10]);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "prefork") == 0)
+    {
+        /* The shape a probabilistic rule used to collapse in: every backend of a
+         * pre-forking server evaluating the rule for the first time. If they all draw the
+         * same sample, the count is 0 or 24 and never anything else. */
+        const uint16_t port = (uint16_t)atoi(argv[2]);
+        const int rounds = 24;
+        const int reuse = 1;
+        struct sockaddr_in address;
+        const int listener = socket(AF_INET, SOCK_STREAM, 0);
+        int clients[24];
+        int resets = 0;
+        int round;
+
+        memset(&address, 0, sizeof(address));
+        address.sin_family = AF_INET;
+        address.sin_port = htons(port);
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        /* The connections of an earlier run of this mode leave the port in TIME_WAIT. */
+        (void)setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        if (listener < 0 || bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+            listen(listener, 16) != 0)
+        {
+            (void)printf("setup=%s\n", try_open_errno_name(errno));
+            return 0;
+        }
+        for (round = 0; round < rounds; ++round)
+        {
+            const struct timespec wait = {0, 5000000L};
+            char buffer[8];
+            const int client = socket(AF_INET, SOCK_STREAM, 0);
+            int served;
+            pid_t child;
+            ssize_t got;
+
+            clients[round] = client;
+            if (client < 0 || connect(client, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+                (served = accept(listener, NULL, NULL)) < 0)
+            {
+                (void)printf("round=%s\n", try_open_errno_name(errno));
+                return 0;
+            }
+            child = fork();
+            if (child == 0)
+            {
+                (void)nanosleep(&wait, NULL);
+                (void)close(served);
+                _exit(0);
+            }
+            (void)close(served);
+            got = read(client, buffer, sizeof(buffer));
+            resets += got < 0 && errno == ECONNRESET;
+            (void)waitpid(child, NULL, 0);
+        }
+        (void)printf("resets=%d of %d\n", resets, rounds);
+        for (round = 0; round < rounds; ++round)
+        {
+            (void)close(clients[round]);
+        }
+        (void)close(listener);
         return 0;
     }
     if (argc == 3 && strcmp(argv[1], "redirect") == 0)

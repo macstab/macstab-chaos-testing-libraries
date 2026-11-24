@@ -941,8 +941,24 @@ static void test_fork_takes_over_orphaned_reload(void)
     (void)chaos_time_config_prepare();
     assert(g_chaos_time_cached_mtime == CHAOS_TIME_MTIME_RELOADING);
     g_chaos_time_lineage = 0U;
+    g_chaos_time_forks = 0U;
+    chaos_time_config_before_fork();
     chaos_time_config_after_fork();
     assert(g_chaos_time_lineage != 0U);
+    /* And from its siblings': the ordinal the prepare handler counted in the parent is
+     * what tells two children apart, without which a pre-forking server would draw one
+     * sample for all of its backends. Deterministic, so the same fork order repeats. */
+    {
+        const uint64_t first_child = g_chaos_time_lineage;
+
+        g_chaos_time_lineage = 0U;
+        g_chaos_time_forks = 1U;
+        chaos_time_config_before_fork();
+        chaos_time_config_after_fork();
+        assert(g_chaos_time_lineage != first_child && g_chaos_time_lineage != 0U);
+    }
+    g_chaos_time_lineage = 0U;
+    g_chaos_time_forks = 0U;
     assert(g_chaos_time_cached_mtime == CHAOS_TIME_MTIME_UNKNOWN);
     assert(g_chaos_time_hits_pid == (uint64_t)getpid());
     assert(chaos_time_config_prepare());

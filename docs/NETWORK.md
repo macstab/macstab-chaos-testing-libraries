@@ -888,6 +888,7 @@ runs inside whichever wrapper call notices the change.
 | Rule snapshots (two) | process | single-writer reload claim, sequence counter per snapshot |
 | Reentrancy guard | thread (`__thread int`) | none needed |
 | Process lineage | process (`uint64_t`) | written only by the atfork child handler |
+| Fork counter | process (`uint64_t`) | atomic increment in the atfork prepare handler |
 | Endpoints | stack, per call | none needed |
 | DUP slot table | process | per-slot try-lock, lock-free close path |
 | Hit counters | process | atomic increments; one writer of the hits file at a time |
@@ -931,8 +932,16 @@ fires nor counts.
 
 - `pthread_atfork` child handlers release a reload claim and the hits-writer flag
   held by threads that do not exist in the child, reset hit counts and `@first`
-  claims, give the child its own hits file, mix the process lineage forward (so
-  pre-fork workers do not all decide alike), and release DUP slot locks.
+  claims, give the child its own hits file, mix the process lineage forward, and
+  release DUP slot locks.
+- What is mixed forward is the child's **ordinal among its siblings**, counted by
+  the prepare handler in the parent before each fork. Mixing a constant would give
+  every child of one parent the same lineage, and the backends of a pre-forking
+  server -- each evaluating a rule for the first time -- would then draw the same
+  sample: `tcp4://*:5432:close:RESET:0.5` would reset every connection or none of
+  them. With the ordinal they draw independently, and the same fork order repeats
+  the same run under `CHAOS_SEED`
+  ([`docs/DSL.md` §6.4](DSL.md#64-reproducibility)).
 - A `vfork()` child and `posix_spawn()` run no atfork handler. They share the
   parent's memory, see its claims as busy, and never write a hits file.
 - After `exec` the new image loads the library afresh if `LD_PRELOAD` is still

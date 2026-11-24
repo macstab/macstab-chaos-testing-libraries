@@ -10,6 +10,10 @@
  * - a socket held by one descriptor is SOLE;
  * - a dup of it in this process is SHARED, and SOLE again once the dup is closed;
  * - a socket a forked child holds is SHARED, and SOLE again once the child is gone;
+ * - a socket a child received over a unix socket (`SCM_RIGHTS`) is SHARED as well, with
+ *   the socket created after the fork so that nothing could have been inherited: the scan
+ *   reads which processes hold the socket, not how they came by it, which is the whole
+ *   reason it needs no stamps, no `dup` interposition and no cmsg walking;
  * - a descriptor that is no socket is UNKNOWN, because the scan cannot find its own link
  *   among the sockets and must not conclude from that;
  * - a closed descriptor is UNKNOWN, since fstat fails.
@@ -141,6 +145,124 @@ static void test_ownership_across_a_fork(void)
     assert(close(sock) == 0);
 }
 
+/** @brief Sends descriptor @p fd over the unix socket @p pipe_fd; 0 on success. */
+static int send_descriptor(int pipe_fd, int fd)
+{
+    union
+    {
+        struct cmsghdr header; /* for the alignment sendmsg requires of the buffer */
+        char bytes[CMSG_SPACE(sizeof(int))];
+    } control;
+    struct msghdr message;
+    struct cmsghdr *header;
+    struct iovec payload;
+    char byte = 'f';
+
+    (void)memset(&control, 0, sizeof(control));
+    (void)memset(&message, 0, sizeof(message));
+    payload.iov_base = &byte;
+    payload.iov_len = 1U;
+    message.msg_iov = &payload;
+    message.msg_iovlen = 1U;
+    message.msg_control = control.bytes;
+    message.msg_controllen = sizeof(control.bytes);
+    header = CMSG_FIRSTHDR(&message);
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(sizeof(int));
+    (void)memcpy(CMSG_DATA(header), &fd, sizeof(fd));
+    return sendmsg(pipe_fd, &message, 0) == 1 ? 0 : -1;
+}
+
+/** @brief Receives one descriptor from the unix socket @p pipe_fd, or -1. */
+static int receive_descriptor(int pipe_fd)
+{
+    union
+    {
+        struct cmsghdr header;
+        char bytes[CMSG_SPACE(sizeof(int))];
+    } control;
+    struct msghdr message;
+    const struct cmsghdr *header;
+    struct iovec payload;
+    char byte = 0;
+    int received = -1;
+
+    (void)memset(&control, 0, sizeof(control));
+    (void)memset(&message, 0, sizeof(message));
+    payload.iov_base = &byte;
+    payload.iov_len = 1U;
+    message.msg_iov = &payload;
+    message.msg_iovlen = 1U;
+    message.msg_control = control.bytes;
+    message.msg_controllen = sizeof(control.bytes);
+    if (recvmsg(pipe_fd, &message, 0) != 1)
+    {
+        return -1;
+    }
+    header = CMSG_FIRSTHDR(&message);
+    if (header == NULL || header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS ||
+        header->cmsg_len != CMSG_LEN(sizeof(int)))
+    {
+        return -1;
+    }
+    (void)memcpy(&received, CMSG_DATA(header), sizeof(received));
+    return received;
+}
+
+/**
+ * @brief Proves a holder that was given the descriptor over a unix socket is found too.
+ *
+ * @details The socket is created **after** the fork, so the child cannot have inherited
+ * it: between the two assertions below nothing happens but the passing of the descriptor.
+ * That is the claim the ownership scan rests on -- it reads the state, so every way a
+ * descriptor can reach another process is covered, including the ones nothing interposes.
+ */
+static void test_ownership_after_scm_rights(void)
+{
+    int pair[2];
+    int ready[2];
+    pid_t child;
+    int sock;
+    char token = 0;
+
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    assert(pipe(ready) == 0);
+    child = fork();
+    assert(child >= 0);
+    if (child == 0)
+    {
+        /* Holds nothing of the parent's but the two ends it needs. */
+        (void)close(pair[0]);
+        (void)close(ready[0]);
+        if (receive_descriptor(pair[1]) < 0 || write(ready[1], "x", 1U) != 1)
+        {
+            _exit(1);
+        }
+        for (;;)
+        {
+            (void)pause();
+        }
+    }
+    assert(close(pair[1]) == 0);
+    assert(close(ready[1]) == 0);
+
+    sock = open_socket();
+    assert(sock >= 0);
+    assert(chaos_net_socket_ownership(sock) == CHAOS_NET_OWNER_SOLE);
+    assert(send_descriptor(pair[0], sock) == 0);
+    assert(read(ready[0], &token, 1U) == 1);
+    assert(chaos_net_socket_ownership(sock) == CHAOS_NET_OWNER_SHARED);
+
+    assert(kill(child, SIGKILL) == 0);
+    assert(waitpid(child, NULL, 0) == child);
+    assert(chaos_net_socket_ownership(sock) == CHAOS_NET_OWNER_SOLE);
+
+    assert(close(ready[0]) == 0);
+    assert(close(pair[0]) == 0);
+    assert(close(sock) == 0);
+}
+
 /** @brief Proves anything the scan cannot account for answers UNKNOWN, never SOLE. */
 static void test_ownership_of_a_non_socket(void)
 {
@@ -205,6 +327,7 @@ int main(void)
     test_ownership_of_a_socket();
     test_unreadable_answers_unknown();
     test_ownership_across_a_fork();
+    test_ownership_after_scm_rights();
     test_ownership_of_a_non_socket();
     return 0;
 }

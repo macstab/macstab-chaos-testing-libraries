@@ -12,6 +12,8 @@
 #   short nor restarted per signal and counts one hit (also with the pre-5.19 test build,
 #   CHAOS_INIT_TEST_NO_KILLABLE_WAIT); a rule naming a symlink covers the real file;
 #   the hits files carry the reload generation as the libraries write it;
+# - a probability on a pre-forking server resets some of its backends rather than all or
+#   none, and the same CHAOS_SEED gives the same number twice;
 # - a rule file that is put in place while nothing calls is read at once, reported in the
 #   status file, and applied to the call that follows;
 #   @first=1 fires once per process, a forked child included, one hits file per process; an
@@ -362,6 +364,20 @@ expect "C: TRICKLE shortens every receive" "$($init --libs net -- /tmp/probe tri
     "first=4 rest=4"
 expect "C: the TRICKLE rule is applied, not rejected" \
     "$(sed -n 1,2p /tmp/.chaos-net.status | tr "\n" " ")" "state=ok rules=1 "
+rm -f /tmp/.chaos-net.conf
+
+# A probabilistic rule on a pre-forking server: every backend evaluates the rule for the
+# first time, so if they all drew the same sample the count would be 0 or 24 and never
+# anything between. The supervisor gives each process it decides for a lineage of its own,
+# taken from the order the processes appeared in, which is what makes the count a count.
+# CHAOS_SEED fixes it, so this is a number and not a coin toss.
+printf "%s\n" "tcp4://127.0.0.1:7905:close:RESET:0.5 # t" > /tmp/.chaos-net.conf
+preforked=$(CHAOS_SEED=42 $init --libs net -- /tmp/probe prefork 7905)
+expect "C: a probability on a pre-forking server resets some backends, not all or none" \
+    "$(echo "$preforked" | sed -n "s/^resets=\\([0-9]*\\) of 24$/\\1/p" |
+       awk "{ print (\$1 > 0 && \$1 < 24) ? \"some\" : \"all-or-none\" }")" "some"
+expect "C: and the same seed gives the same number again" \
+    "$(CHAOS_SEED=42 $init --libs net -- /tmp/probe prefork 7905)" "$preforked"
 rm -f /tmp/.chaos-net.conf
 
 # REDIRECT: the address `connect` was given is in the memory of the tracee, and a reply of

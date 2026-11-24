@@ -836,8 +836,10 @@ portability across the toolchains in the build matrix.
 - `pthread_atfork` child handler (`chaos_io_config_after_fork()`): releases a reload
   claim held by a thread that does not exist in the child, clears the hits writer
   state, resets hit counts and `@first` claims, gives the child its own hits file
-  number, and mixes the process lineage forward, so the child's rules decide on their
-  own (pre-fork workers would otherwise all fault alike).
+  number, and mixes the process lineage forward with the child's ordinal among its
+  siblings (counted by the prepare handler in the parent), so the child's rules decide
+  on their own and differently from its siblings -- pre-fork workers would otherwise
+  all fault alike, which at `p<1` means all of them or none.
 - `vfork` children and `posix_spawn` run no atfork handler. They share the parent's
   memory, see its reload claim as busy, may count into its slots, and never write a
   hits file (the writer checks `getpid()`).

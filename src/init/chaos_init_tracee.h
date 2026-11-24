@@ -70,6 +70,17 @@ typedef struct chaos_init_rules
      * @return @p out, or NULL when nothing is to be written.
      */
     const char *(*header)(char *out, size_t size);
+    /**
+     * @brief Sets this library's draw lineage for the process whose allocation serial is
+     *        given, or NULL to leave it alone.
+     *
+     * @details Called before every decision, because the sample of a rule must differ
+     * between two processes the same rule is evaluated in: a pre-forking server whose
+     * backends all drew alike would turn a probability into all-or-nothing. The serial is
+     * the supervisor's own count of the processes it has seen, so the answer follows the
+     * order they appeared in and nothing the kernel assigns.
+     */
+    void (*lineage)(uint64_t serial);
     chaos_hit_slot_t *slots; /**< CHAOS_INIT_MAX_TRACEES * max_rules */
     uint64_t *hashes;        /**< Text hash per slot, to carry counts over reloads. */
     uint64_t *generation;    /**< Per process: the snapshot its slots belong to. */

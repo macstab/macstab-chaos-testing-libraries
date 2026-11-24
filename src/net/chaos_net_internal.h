@@ -377,6 +377,17 @@ extern __thread int g_chaos_net_tls_guard;
 extern uint64_t g_chaos_net_lineage;
 
 /**
+ * @brief How often this process has forked, counted before the fork (the atfork prepare
+ *        handler), so that the child sees its own ordinal among its siblings.
+ *
+ * @details Without it every child of one parent would mix the same value into its
+ * lineage and the siblings of a pre-forking server would all make the *same* decision:
+ * at `p=0.5` either all of them or none, which is not a probability any more. The child
+ * resets it, so each process counts the children it forks itself.
+ */
+extern uint64_t g_chaos_net_forks;
+
+/**
  * @brief Process-wide seed, the base of every per-thread seed.
  *
  * @details Read from /dev/urandom by chaos_net_init() with raw system calls; if that

@@ -923,8 +923,24 @@ static void test_fork_takes_over_orphaned_reload(void)
     /* The child's lineage must differ from its parent's, or every backend of a
      * pre-forking server would make the same decisions. */
     g_chaos_io_lineage = 0U;
+    g_chaos_io_forks = 0U;
+    chaos_io_config_before_fork();
     chaos_io_config_after_fork();
     assert(g_chaos_io_lineage != 0U);
+    /* And from its siblings': the ordinal the prepare handler counted in the parent is
+     * what tells two children apart, without which a pre-forking server would draw one
+     * sample for all of its backends. Deterministic, so the same fork order repeats. */
+    {
+        const uint64_t first_child = g_chaos_io_lineage;
+
+        g_chaos_io_lineage = 0U;
+        g_chaos_io_forks = 1U;
+        chaos_io_config_before_fork();
+        chaos_io_config_after_fork();
+        assert(g_chaos_io_lineage != first_child && g_chaos_io_lineage != 0U);
+    }
+    g_chaos_io_lineage = 0U;
+    g_chaos_io_forks = 0U;
     assert(g_chaos_io_cached_mtime == CHAOS_IO_MTIME_UNKNOWN);
     assert(g_chaos_io_hits_pid == (uint64_t)getpid());
     assert(chaos_io_config_prepare());

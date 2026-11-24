@@ -68,6 +68,9 @@ __thread int g_chaos_time_tls_guard = 0;
 /** xorshift64* state; 0 means unseeded, so every new thread seeds itself on first draw. */
 uint64_t g_chaos_time_lineage = 0U;
 
+/** @copydoc g_chaos_time_forks */
+uint64_t g_chaos_time_forks = 0U;
+
 /**
  * Process seed; overwritten with /dev/urandom bytes by chaos_time_init().
  *

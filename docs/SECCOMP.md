@@ -520,6 +520,16 @@ first.
   paths, `@size`, `@first` or `@from` keep a rule to the calls meant.
 - `pthread_create` failures surface as the error the C library reports for a failed
   `clone`, normally the injected errno returned by `pthread_create()`.
+- **Each process draws its own samples.** A rule's sample depends on the process it is
+  evaluated in, because the supervisor gives every process it decides for a lineage of its
+  own -- taken from the order the processes appeared in, which is the only ordering it can
+  see. Without it the backends of a pre-forking server, each evaluating a rule for the
+  first time, would all draw the same sample and `close:RESET:0.5` would reset every
+  connection or none. The first process, the application itself, keeps lineage 0, so a
+  single-process run decides exactly as it does under `LD_PRELOAD`; descendants decide
+  differently between the modes, because the library mixes a child's ordinal among its
+  siblings and the supervisor cannot see the fork topology. Both are reproducible under
+  `CHAOS_SEED` ([`docs/DSL.md` §6.4](DSL.md#64-reproducible-faults-chaos_seed)).
 - **net REDIRECT overwrites the caller's sockaddr**, where the library passes a copy and
   leaves it alone: the kernel reads that argument from the tracee's memory, and only a
   register could point it elsewhere. A program that keeps the sockaddr and dials it again

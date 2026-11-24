@@ -547,9 +547,11 @@ draw  = mix(base + d) >> 32;                    /* d: 0 probability, 1.. the eff
 - **`d` numbers the draws of one evaluation.** SHUFFLE takes `N-1` of them for a
   list of `N` addresses, so the whole permutation is reproducible.
 - **The lineage** is 0 in the process that loaded the library and mixed forward in
-  each forked child, so pre-fork workers do not all decide alike. It sits beside
-  the key rather than inside it: rewriting the keys in the atfork child would
-  write every snapshot page.
+  each forked child with that child's ordinal among its siblings, which the parent
+  counts before each fork. The ordinal is the point: with a constant, every child of
+  one parent would draw the same sample and pre-fork workers would all decide alike.
+  It sits beside the key rather than inside it: rewriting the keys in the atfork
+  child would write every snapshot page.
 
 `chaos_dns_prng_mix()` is the SplitMix64 finaliser:
 

@@ -222,6 +222,17 @@ extern __thread int g_chaos_time_tls_guard;
 extern uint64_t g_chaos_time_lineage;
 
 /**
+ * @brief How often this process has forked, counted before the fork (the atfork prepare
+ *        handler), so that the child sees its own ordinal among its siblings.
+ *
+ * @details Without it every child of one parent would mix the same value into its
+ * lineage and the siblings of a pre-forking server would all make the *same* decision:
+ * at `p=0.5` either all of them or none, which is not a probability any more. The child
+ * resets it, so each process counts the children it forks itself.
+ */
+extern uint64_t g_chaos_time_forks;
+
+/**
  * Process-wide seed: 8 bytes of /dev/urandom read by chaos_time_init().
  *
  * Mixed with the thread id and a stack address when a thread seeds itself. Before the

@@ -1675,6 +1675,26 @@ int main(void)
             assert(chaos_init_net_redirect(&unreadable, &rule_target, built, &built_size) == 0);
         }
     }
+    /* Each process the supervisor decides for draws with a lineage of its own, or the
+     * backends of a pre-forking server would all make the same decision at `p<1`. Serial 1
+     * is the application itself and keeps lineage 0, so a single process decides exactly as
+     * it would under LD_PRELOAD. */
+    {
+        chaos_init_net_lineage(1U);
+        assert(g_chaos_net_lineage == 0U);
+        chaos_init_net_lineage(2U);
+        {
+            const uint64_t second = g_chaos_net_lineage;
+
+            assert(second != 0U);
+            chaos_init_net_lineage(3U);
+            assert(g_chaos_net_lineage != second && g_chaos_net_lineage != 0U);
+            chaos_init_net_lineage(2U);
+            assert(g_chaos_net_lineage == second);
+        }
+        chaos_init_net_lineage(1U);
+    }
+
     /* A target of the other family fits no sockaddr this socket can pass: the rule does
      * not fire, and the draw is not spent on it. */
     (void)snprintf(

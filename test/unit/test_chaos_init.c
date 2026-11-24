@@ -897,11 +897,19 @@ static const char *test_header(char *out, size_t size)
     return out;
 }
 
+/** @brief The serial the lineage hook was last given, which every decision must set. */
+static uint64_t g_test_lineage_serial = 0U;
+static void test_lineage(uint64_t serial)
+{
+    g_test_lineage_serial = serial;
+}
+
 static chaos_init_rules_t g_test_lib = {
     "/tmp/.chaos-inittest.hits",
     4U,
     test_snapshot,
     test_header,
+    test_lineage,
     g_test_rules_slots,
     g_test_rules_hashes,
     g_test_rules_generation,
@@ -973,6 +981,15 @@ static void test_tracee_table(void)
     /* find() looks up by tgid without allocating; tgid 0 never matches a free entry. */
     assert(chaos_init_tracee_find(10) == first && chaos_init_tracee_tgid(first) == 10);
     assert(chaos_init_tracee_find(12) == -1 && chaos_init_tracee_find(0) == -1);
+
+    /* Looking a slot up is also what sets the library's draw lineage for the process
+     * being decided for: two processes must not draw the same sample, or the backends of
+     * a pre-forking server would all decide alike at `p<1`. The serial is the
+     * supervisor's own count of the processes it has seen. */
+    g_test_lineage_serial = 0U;
+    (void)chaos_init_tracee_slot(&g_test_lib, first, 0U);
+    assert(g_test_lineage_serial == chaos_init_tracee_serial(first));
+    assert(g_test_lineage_serial != 0U);
 
     /* A hit is counted in the process's slot and the hits file is written at once;
      * slots exist only for the snapshot's 2 rules. */

@@ -195,6 +195,21 @@ static char g_chaos_process_config_texts[CHAOS_PROCESS_MAX_RULES][CHAOS_STATUS_T
 /** @brief Hits-writer lock: set (by CAS) while a thread writes the hits file. */
 static volatile int g_chaos_process_hits_writing = 0;
 
+/**
+ * @brief pthread_atfork() prepare handler: counts this fork in the parent.
+ *
+ * @details The child reads the counter as its own ordinal among its siblings, which is
+ * what makes two children of one parent decide differently (g_chaos_process_forks). Counted
+ * here rather than in the child, because a child cannot tell how many siblings came
+ * before it. Atomic, so two threads forking at once get different ordinals rather than
+ * the same one; which of them gets which follows the order the kernel ran them in, as
+ * everything else about concurrent calls does.
+ */
+static void chaos_process_config_before_fork(void)
+{
+    (void)__sync_fetch_and_add(&g_chaos_process_forks, UINT64_C(1));
+}
+
 /** @brief Set once the atfork handler is registered; pthread_atfork() cannot unregister. */
 static int g_chaos_process_atfork_registered = 0;
 
@@ -999,7 +1014,8 @@ void chaos_process_config_init(void)
     if (!g_chaos_process_atfork_registered)
     {
         g_chaos_process_atfork_registered = 1;
-        (void)pthread_atfork(NULL, NULL, chaos_process_config_after_fork);
+        (void
+        )pthread_atfork(chaos_process_config_before_fork, NULL, chaos_process_config_after_fork);
     }
     /* Find the vDSO clock now, not first inside a wrapper a signal handler may re-enter. */
     (void)chaos_clock_now_ns();
@@ -1445,7 +1461,9 @@ static void chaos_process_config_after_fork(void)
     /* The child decides differently from the parent and from its siblings without the
      * rules' keys being rewritten: one global instead of every snapshot page. Mixed, not
      * incremented, so sibling lineages are unrelated rather than adjacent. */
-    g_chaos_process_lineage = chaos_process_prng_mix(g_chaos_process_lineage + UINT64_C(1));
+    g_chaos_process_lineage =
+        chaos_process_prng_mix(g_chaos_process_lineage + g_chaos_process_forks);
+    g_chaos_process_forks = 0U;
     /* FAIL_AFTER counts per process, like @first, and as chaos-init counts it. */
     chaos_process_reset_fail_after_counters();
     if (g_chaos_process_hit_pool_used)

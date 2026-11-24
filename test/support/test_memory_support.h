@@ -60,6 +60,7 @@
     chaos_memory_posix_madvise_fn g_chaos_memory_real_posix_madvise = NULL;                        \
     __thread int g_chaos_memory_tls_guard = 0;                                                     \
     uint64_t g_chaos_memory_lineage = 0U;                                                          \
+    uint64_t g_chaos_memory_forks = 0U;                                                            \
     uint64_t g_chaos_memory_process_seed = 1U
 
 /**
@@ -78,6 +79,7 @@ static inline void chaos_memory_test_reset_runtime(void)
     g_chaos_memory_real_posix_madvise = NULL;
     g_chaos_memory_tls_guard = 0;
     g_chaos_memory_lineage = 0U;
+    g_chaos_memory_forks = 0U;
     g_chaos_memory_process_seed = 1U;
 }
 

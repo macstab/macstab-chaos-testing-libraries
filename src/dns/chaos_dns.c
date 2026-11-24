@@ -60,6 +60,9 @@ chaos_dns_gethostbyaddr_r_fn g_chaos_dns_real_gethostbyaddr_r = NULL;
 
 __thread int g_chaos_dns_tls_guard = 0;
 uint64_t g_chaos_dns_lineage = 0U;
+
+/** @copydoc g_chaos_dns_forks */
+uint64_t g_chaos_dns_forks = 0U;
 uint64_t g_chaos_dns_process_seed = UINT64_C(0x2545f4914f6cdd1d);
 /** @endcond */
 

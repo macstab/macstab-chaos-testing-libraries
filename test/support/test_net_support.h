@@ -126,6 +126,7 @@
     CHAOS_NET_DEFINE_TEST_ACCEPT4_GLOBAL()                                                         \
     __thread int g_chaos_net_tls_guard = 0;                                                        \
     uint64_t g_chaos_net_lineage = 0U;                                                             \
+    uint64_t g_chaos_net_forks = 0U;                                                               \
     uint64_t g_chaos_net_process_seed = 1U
 
 /**
@@ -209,6 +210,7 @@ static inline void chaos_net_test_reset_runtime(void)
     CHAOS_NET_RESET_TEST_ACCEPT4_GLOBAL()
     g_chaos_net_tls_guard = 0;
     g_chaos_net_lineage = 0U;
+    g_chaos_net_forks = 0U;
     g_chaos_net_process_seed = 1U;
 }
 

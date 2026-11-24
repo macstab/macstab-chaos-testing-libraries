@@ -1160,11 +1160,43 @@ static void test_fork_takes_over_orphaned_reload(void)
     g_chaos_net_cached_mtime = CHAOS_NET_MTIME_RELOADING;
     (void)chaos_net_config_prepare();
     assert(g_chaos_net_cached_mtime == CHAOS_NET_MTIME_RELOADING);
-    /* The child's lineage must differ from its parent's, or every backend of a
-     * pre-forking server would make the same decisions. */
+    /* The child's lineage must differ from its parent's -- and, which is the harder half,
+     * from its siblings': every backend of a pre-forking server drawing the same sample
+     * turns a probability into all or none. The ordinal that distinguishes them is counted
+     * by the prepare handler in the parent, so the two handlers are exercised in the order
+     * a fork runs them, with the parent's state restored in between. */
     g_chaos_net_lineage = 0U;
+    g_chaos_net_forks = 0U;
+    chaos_net_config_before_fork();
+    assert(g_chaos_net_forks == 1U);
     chaos_net_config_after_fork();
     assert(g_chaos_net_lineage != 0U);
+    /* The child counts its own children from zero. */
+    assert(g_chaos_net_forks == 0U);
+    {
+        const uint64_t first_child = g_chaos_net_lineage;
+
+        /* Back to what the parent holds after that fork, then fork a second child. */
+        g_chaos_net_lineage = 0U;
+        g_chaos_net_forks = 1U;
+        chaos_net_config_before_fork();
+        chaos_net_config_after_fork();
+        assert(g_chaos_net_lineage != first_child);
+        assert(g_chaos_net_lineage != 0U);
+        {
+            const uint64_t second_child = g_chaos_net_lineage;
+
+            /* And it follows from the ordinal alone: the same fork order, the same
+             * lineage, which is what makes a run with CHAOS_SEED reproducible. */
+            g_chaos_net_lineage = 0U;
+            g_chaos_net_forks = 1U;
+            chaos_net_config_before_fork();
+            chaos_net_config_after_fork();
+            assert(g_chaos_net_lineage == second_child);
+        }
+    }
+    g_chaos_net_lineage = 0U;
+    g_chaos_net_forks = 0U;
     assert(g_chaos_net_cached_mtime == CHAOS_NET_MTIME_UNKNOWN);
     assert(g_chaos_net_hits_pid == (uint64_t)getpid());
     assert(chaos_net_config_prepare());

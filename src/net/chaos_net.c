@@ -95,6 +95,9 @@ __thread int g_chaos_net_tls_guard = 0;
 /** @copydoc g_chaos_net_lineage */
 uint64_t g_chaos_net_lineage = 0U;
 
+/** @copydoc g_chaos_net_forks */
+uint64_t g_chaos_net_forks = 0U;
+
 /**
  * @brief Process-wide PRNG seed; replaced once by chaos_net_init().
  *

@@ -569,13 +569,22 @@ The counter-based libraries have no stream. A sample is a pure function of
 - the **evaluation number** of that rule, counted in its hit slot,
 - the **draw** within that evaluation (probability, then each effect's samples),
 - the process **lineage**, 0 in the process that loaded the library and mixed
-  forward in each forked child.
+  forward in each forked child **with that child's ordinal among its siblings**,
+  which the parent counts before each fork. The ordinal is what a pre-forking
+  server needs: its backends all evaluate a rule for the first time, so without it
+  they would draw the same sample and `p=0.5` would reset all of their connections
+  or none. Under `chaos-init` the supervisor cannot see the fork topology, so it
+  gives each process it decides for a lineage from the order the processes appeared
+  in -- the first one, the application itself, keeps lineage 0, so a single-process
+  run decides identically in both modes. A `vfork` child and `posix_spawn` run no
+  atfork handler and keep the parent's lineage, as they share its memory.
 
 So the nth evaluation of a rule makes the same decision in every run with the same
 seed, whatever else the process is doing, and no thread can shift another's
-decisions. What the caller must hold constant is the **order of its own calls**;
-two calls racing for the same rule may swap their numbers, which is the caller's
-concern and not something a chaos library can decide for it.
+decisions. What the caller must hold constant is the **order of its own calls** and
+the **order of its forks**; two calls racing for the same rule may swap their
+numbers, as may two threads forking at once, which is the caller's concern and not
+something a chaos library can decide for it.
 
 `CHAOS_SEED` is read in the ELF constructor, before `main`, and by `chaos-init` at
 start, so both modes reproduce the same run. A value that is not decimal digits in

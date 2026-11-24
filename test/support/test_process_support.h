@@ -85,6 +85,7 @@
     chaos_process_waitid_fn g_chaos_process_real_waitid = NULL;                                    \
     __thread int g_chaos_process_tls_guard = 0;                                                    \
     uint64_t g_chaos_process_lineage = 0U;                                                         \
+    uint64_t g_chaos_process_forks = 0U;                                                           \
     uint64_t g_chaos_process_process_seed = 1U;                                                    \
     volatile uint64_t g_chaos_process_fail_after_counters[CHAOS_PROCESS_OP_COUNT] = {0U}
 
@@ -115,6 +116,7 @@ static inline void chaos_process_test_reset_runtime(void)
     g_chaos_process_real_waitid = NULL;
     g_chaos_process_tls_guard = 0;
     g_chaos_process_lineage = 0U;
+    g_chaos_process_forks = 0U;
     g_chaos_process_process_seed = 1U;
     (void)memset(
         (void *)g_chaos_process_fail_after_counters,

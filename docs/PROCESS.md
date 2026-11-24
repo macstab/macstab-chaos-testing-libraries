@@ -587,8 +587,10 @@ counter-based, identical across the libraries
   number from its hit slot and `d` the draw within that evaluation (0 is the probability).
 - A rule fires when `sample < p * 2^32`; `p ≤ 0` never fires and `p ≥ 1` always fires,
   both without drawing.
-- In a forked child the atfork handler mixes the process lineage forward, so pre-fork
-  workers do not all decide alike.
+- In a forked child the atfork handler mixes the process lineage forward with the child's
+  ordinal among its siblings, which the parent counts before each fork: without the
+  ordinal every child of one parent would draw the same sample, so pre-fork workers would
+  all decide alike -- at `p<1` all of them or none.
 - No per-thread state and no stream: the nth evaluation of a rule decides the same way in
   every run with the same seed, and no thread can shift another's decisions.
 

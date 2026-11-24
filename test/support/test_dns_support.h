@@ -63,6 +63,7 @@
     chaos_dns_gethostbyaddr_r_fn g_chaos_dns_real_gethostbyaddr_r = NULL;                          \
     __thread int g_chaos_dns_tls_guard = 0;                                                        \
     uint64_t g_chaos_dns_lineage = 0U;                                                             \
+    uint64_t g_chaos_dns_forks = 0U;                                                               \
     uint64_t g_chaos_dns_process_seed = 1U
 
 /**
@@ -82,6 +83,7 @@ static inline void chaos_dns_test_reset_runtime(void)
     g_chaos_dns_real_gethostbyaddr_r = NULL;
     g_chaos_dns_tls_guard = 0;
     g_chaos_dns_lineage = 0U;
+    g_chaos_dns_forks = 0U;
     g_chaos_dns_process_seed = 1U;
 }
 

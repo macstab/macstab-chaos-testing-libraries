@@ -58,6 +58,9 @@ chaos_process_popen_fn g_chaos_process_real_popen = NULL;
 chaos_process_waitid_fn g_chaos_process_real_waitid = NULL;
 __thread int g_chaos_process_tls_guard = 0;
 uint64_t g_chaos_process_lineage = 0U;
+
+/** @copydoc g_chaos_process_forks */
+uint64_t g_chaos_process_forks = 0U;
 uint64_t g_chaos_process_process_seed = UINT64_C(0x2545f4914f6cdd1d);
 volatile uint64_t g_chaos_process_fail_after_counters[CHAOS_PROCESS_OP_COUNT] = {0U};
 

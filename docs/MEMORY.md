@@ -536,9 +536,12 @@ silence.
 Every probability check uses draw 0 and fires when `sample < p × 2^32`; `p <= 0`
 never fires, `p >= 1` always fires.
 
-**fork.** The atfork child handler mixes `g_chaos_memory_lineage` forward, so the
-child's rules decide on their own; pre-fork workers would otherwise all fault
-alike. The lineage sits beside the key instead of inside it, because rewriting the
+**fork.** The atfork child handler mixes `g_chaos_memory_lineage` forward with the
+child's ordinal among its siblings, which the parent counts in its prepare handler
+before each fork. Both halves matter: without the mixing a child would decide like
+its parent, and without the ordinal every child of one parent would decide like its
+siblings -- pre-fork workers would all fault alike, which at `p<1` is all of them or
+none. The lineage sits beside the key instead of inside it, because rewriting the
 keys would write every snapshot page in each child.
 
 **Reproducibility.** The nth evaluation of a rule makes the same decision in every

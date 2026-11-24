@@ -335,6 +335,12 @@ uint64_t chaos_init_tracee_serial(int tracee)
 chaos_hit_slot_t *chaos_init_tracee_slot(chaos_init_rules_t *rules, int tracee, size_t rule_index)
 {
     chaos_init_tracee_sync(rules, tracee);
+    /* Before the rule is drawn: the lineage belongs to the process being decided for, and
+     * every decision reaches this function to find its slot. */
+    if (rules->lineage != NULL)
+    {
+        rules->lineage(g_chaos_init_tracees[tracee].serial);
+    }
     if (rule_index >= rules->count[tracee] || rule_index >= rules->max_rules)
     {
         return NULL;

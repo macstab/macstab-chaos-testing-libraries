@@ -61,6 +61,9 @@ static int chaos_init_process_supported(const struct chaos_process_rule *rule);
  * the duration of one decision (chaos_init_process_fail_after()). */
 __thread int g_chaos_process_tls_guard = 0;
 uint64_t g_chaos_process_lineage = 0U;
+
+/** @copydoc g_chaos_process_forks (the supervisor never forks a tracee itself). */
+uint64_t g_chaos_process_forks = 0U;
 uint64_t g_chaos_process_process_seed = UINT64_C(0xbb67ae8584caa73b);
 volatile uint64_t g_chaos_process_fail_after_counters[CHAOS_PROCESS_OP_COUNT] = {0U};
 
@@ -110,6 +113,20 @@ static size_t chaos_init_process_snapshot(const chaos_init_text_t **texts, uint6
     return state->rule_count;
 }
 
+/**
+ * @brief Sets the process draw lineage for the process with allocation serial @p serial.
+ *
+ * @details Serial 1 is the application itself and gets lineage 0, so a single-process run
+ * decides exactly as it would under `LD_PRELOAD`. Every later process is a descendant and
+ * gets a lineage of its own, which is what keeps the backends of a pre-forking server from
+ * all drawing the same sample -- the library reaches the same end from the other side, by
+ * mixing each child's ordinal among its siblings in the atfork handler.
+ */
+static void chaos_init_process_lineage(uint64_t serial)
+{
+    g_chaos_process_lineage = serial > 1U ? chaos_process_prng_mix(serial - 1U) : 0U;
+}
+
 static chaos_init_rules_t g_chaos_init_process_rules = {
     CHAOS_PROCESS_HITS_PREFIX,
     CHAOS_PROCESS_MAX_RULES,
@@ -117,6 +134,8 @@ static chaos_init_rules_t g_chaos_init_process_rules = {
     /* The same header the library writes, so a reader correlates the counts with the
      * same reload generation whichever mode produced them. */
     chaos_process_hits_header,
+    /* Each process the supervisor decides for draws with a lineage of its own. */
+    chaos_init_process_lineage,
     g_chaos_init_process_slots,
     g_chaos_init_process_hashes,
     g_chaos_init_process_generation,

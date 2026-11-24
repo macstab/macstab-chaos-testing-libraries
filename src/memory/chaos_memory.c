@@ -69,6 +69,9 @@ __thread int g_chaos_memory_tls_guard = 0;
 /** @brief Per-thread xorshift64* state; 0 until the thread's first draw seeds it. */
 uint64_t g_chaos_memory_lineage = 0U;
 
+/** @copydoc g_chaos_memory_forks */
+uint64_t g_chaos_memory_forks = 0U;
+
 /**
  * @brief Process seed; replaced by the constructor with /dev/urandom bytes.
  *

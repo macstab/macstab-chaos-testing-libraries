@@ -62,6 +62,7 @@
     chaos_time_timespec_get_fn g_chaos_time_real_timespec_get = NULL;                              \
     __thread int g_chaos_time_tls_guard = 0;                                                       \
     uint64_t g_chaos_time_lineage = 0U;                                                            \
+    uint64_t g_chaos_time_forks = 0U;                                                              \
     uint64_t g_chaos_time_process_seed = 1U
 
 /**
@@ -82,6 +83,7 @@ static inline void chaos_time_test_reset_runtime(void)
     g_chaos_time_real_timespec_get = NULL;
     g_chaos_time_tls_guard = 0;
     g_chaos_time_lineage = 0U;
+    g_chaos_time_forks = 0U;
     g_chaos_time_process_seed = 1U;
 }
 

@@ -106,6 +106,9 @@ __thread int g_chaos_io_tls_guard = 0;
 /** @copydoc g_chaos_io_lineage */
 uint64_t g_chaos_io_lineage = 0U;
 
+/** @copydoc g_chaos_io_forks */
+uint64_t g_chaos_io_forks = 0U;
+
 /**
  * @brief Process-wide entropy base; replaced in the constructor by `CHAOS_SEED`, or by 64
  *        bits from `/dev/urandom` (or a pid-derived value). The initialiser is a non-zero
