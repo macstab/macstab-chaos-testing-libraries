@@ -977,9 +977,12 @@ an `int` and a `uint64_t` of TLS.
 
 - **Hits file** `/tmp/.chaos-io.hits.<n>`, one per process (`<n>` is the pid, or a
   derived number when that name is taken, e.g. after `execve`): one line per rule,
-  `<count><TAB><rule as written>`. Rewritten on each of the first 64 hits, then at
-  most every 100 ms, and at normal exit; a hit not due for a write makes no system
-  call. Sum the files of all processes.
+  `<count><TAB><rule as written>`, led by the tab-free line `generation=<n>` -- the
+  number of rule-file snapshots this process has published, so a count of 0 after a
+  reload can be told apart from a count the reload reset. Under `chaos-init` the
+  supervisor writes the same file with the same header. Rewritten on each of the first
+  64 hits, then at most every 100 ms, and at normal exit; a hit not due for a write
+  makes no system call. Sum the files of all processes.
 
 The application-visible outcomes are the injected errno values, the added latency,
 short write counts and corrupted read bytes.

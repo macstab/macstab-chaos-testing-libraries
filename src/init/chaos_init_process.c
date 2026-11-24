@@ -114,7 +114,9 @@ static chaos_init_rules_t g_chaos_init_process_rules = {
     CHAOS_PROCESS_HITS_PREFIX,
     CHAOS_PROCESS_MAX_RULES,
     chaos_init_process_snapshot,
-    NULL,
+    /* The same header the library writes, so a reader correlates the counts with the
+     * same reload generation whichever mode produced them. */
+    chaos_process_hits_header,
     g_chaos_init_process_slots,
     g_chaos_init_process_hashes,
     g_chaos_init_process_generation,

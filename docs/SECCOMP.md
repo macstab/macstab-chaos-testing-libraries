@@ -131,7 +131,11 @@ SECCOMP_IOCTL_NOTIF_RECV                (EINTR / ENOENT: nothing to answer)
 
 - Forwarded to the application: SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2,
   SIGWINCH, SIGALRM, SIGPIPE. SIGCHLD reaps every exited process (`waitpid(-1, WNOHANG)`).
-- When the application exits, all pending hits files are written. As PID 1, or when no
+- When the application exits, all pending hits files are written. They are the libraries'
+  own files, header lines and all: every library's hits file names the reload generation
+  its counts belong to, and net adds its RESET suppressions, whichever mode produced them
+  -- a reader correlates a count with a rule file version without knowing how the rules
+  were applied. As PID 1, or when no
   listener exists, chaos-init exits with the application's code (`128 + signal` when it
   was killed). Otherwise it returns that code at once and a forked background copy, with
   stdio on `/dev/null`, keeps answering until the kernel reports that no process uses

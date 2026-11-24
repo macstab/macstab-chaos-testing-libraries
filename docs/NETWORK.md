@@ -688,9 +688,10 @@ suppressed.unknown=0
 12	tcp4://127.0.0.1:5432:close:RESET:1 # pg
 ```
 
-The `generation` line is written by every library (`chaos_hits.h`): it counts the
-rule-file snapshots this process has published, so a count of 0 after a reload can
-be told apart from a count the reload reset.
+The `generation` line is written by every library (`chaos_hits.h`) and, under
+`chaos-init`, by the supervisor on their behalf: it counts the rule-file snapshots
+this process has published, so a count of 0 after a reload can be told apart from a
+count the reload reset, whichever mode produced the counts.
 
 `shared` means the socket was held elsewhere — a pre-forking server behaving as
 designed. `unknown` means the ownership could not be established at all (a

@@ -60,7 +60,9 @@ static chaos_init_rules_t g_chaos_init_memory_rules = {
     CHAOS_MEMORY_HITS_PREFIX,
     CHAOS_MEMORY_MAX_RULES,
     chaos_init_memory_snapshot,
-    NULL,
+    /* The same header the library writes, so a reader correlates the counts with the
+     * same reload generation whichever mode produced them. */
+    chaos_memory_hits_header,
     g_chaos_init_memory_slots,
     g_chaos_init_memory_hashes,
     g_chaos_init_memory_generation,

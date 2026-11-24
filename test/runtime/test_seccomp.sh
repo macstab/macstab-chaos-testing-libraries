@@ -11,6 +11,7 @@
 #   delays the open (C, Go), also under SIGALRM every 20 ms, where the delay is neither cut
 #   short nor restarted per signal and counts one hit (also with the pre-5.19 test build,
 #   CHAOS_INIT_TEST_NO_KILLABLE_WAIT); a rule naming a symlink covers the real file;
+#   the hits files carry the reload generation as the libraries write it;
 #   @first=1 fires once per process, a forked child included, one hits file per process; an
 #   execve starts a new process for @first while the old image keeps its hits file; the
 #   status file reports the rules;
@@ -238,6 +239,10 @@ expect "@first=1 again after an execve, as for a new process" \
 files=$(ls /tmp/.chaos-io.hits.* | wc -l)
 once=$(cat /tmp/.chaos-io.hits.* | awk -F "\t" "\$2 ~ /once/ { s += \$1 } END { print s + 0 }")
 expect "the image an execve replaced keeps its hits file" "$files $once" "2 2"
+# The hits files the supervisor writes carry the same tab-free header the library writes,
+# so a reader correlates the counts with a reload generation whichever mode produced them.
+expect "the hits file names the reload generation" \
+    "$(head -1 /tmp/.chaos-io.hits.* | sed -n "s/^generation=[0-9]*$/named/p" | head -1)" "named"
 expect "io status reports the rules" "$(head -2 /tmp/.chaos-io.status | tr "\n" " ")" "state=ok rules=3 "
 
 printf "%s\n" "tcp4://127.0.0.1:7777:connect:ECONNREFUSED:1.0 # t" \

@@ -445,11 +445,12 @@ int main(void)
     assert(file != NULL);
     hits[fread(hits, 1U, sizeof(hits) - 1U, file)] = '\0';
     (void)fclose(file);
-    assert(
-        strncmp(
-            hits, "3\t/tmp/initio/data:open:EIO:1.0\n", strlen("3\t/tmp/initio/data:open:EIO:1.0\n")
-        ) == 0
-    );
+    /* The file leads with the tab-free header lines the library writes there -- the
+     * reload generation -- so the count lines are looked up rather than compared against
+     * the start of the file. A reader correlates the counts with that generation, and it
+     * must be there whichever mode produced them. */
+    assert(strncmp(hits, "generation=", strlen("generation=")) == 0);
+    assert(strstr(hits, "\n3\t/tmp/initio/data:open:EIO:1.0\n") != NULL);
     assert(strstr(hits, "1\t/tmp/initio/once:open:EACCES:1.0 @first=1\n") != NULL);
     assert(strstr(hits, "0\t/tmp/initio/never:open:EIO:0.0\n") != NULL);
 
@@ -462,11 +463,7 @@ int main(void)
     hits[fread(hits, 1U, sizeof(hits) - 1U, file)] = '\0';
     (void)fclose(file);
     assert(strstr(hits, "1\t/tmp/initio/once:open:EACCES:1.0 @first=1\n") != NULL);
-    assert(
-        strncmp(
-            hits, "0\t/tmp/initio/data:open:EIO:1.0\n", strlen("0\t/tmp/initio/data:open:EIO:1.0\n")
-        ) == 0
-    );
+    assert(strstr(hits, "\n0\t/tmp/initio/data:open:EIO:1.0\n") != NULL);
     (void)unlink(buffer);
 
     /* TORN is applied here now: the byte count sits in a register, so the filter answers
@@ -619,7 +616,7 @@ int main(void)
         assert(file != NULL);
         hits[fread(hits, 1U, sizeof(hits) - 1U, file)] = '\0';
         (void)fclose(file);
-        assert(strncmp(hits, "12\t/tmp/initio/torn:read:CORRUPT:1.0\n", 37U) == 0);
+        assert(strstr(hits, "\n12\t/tmp/initio/torn:read:CORRUPT:1.0\n") != NULL);
 
         /* An effect that is not CORRUPT can only reach the exit stop if the rule file
          * changed between the two stops. It must do nothing there: the call has already
@@ -636,7 +633,7 @@ int main(void)
         assert(file != NULL);
         hits[fread(hits, 1U, sizeof(hits) - 1U, file)] = '\0';
         (void)fclose(file);
-        assert(strncmp(hits, "1\t/tmp/initio/torn:read:EIO:1.0\n", 33U) == 0);
+        assert(strstr(hits, "\n1\t/tmp/initio/torn:read:EIO:1.0\n") != NULL);
         /* A call of another kind is not io's at the exit stop either. */
         after.nr = __NR_getpid;
         assert(chaos_init_io_decide_result(&after, 8) == 0);
@@ -753,7 +750,7 @@ int main(void)
             assert(file != NULL);
             hits[fread(hits, 1U, sizeof(hits) - 1U, file)] = '\0';
             (void)fclose(file);
-            assert(strcmp(hits, "3\t/tmp/initio/torn:write:DROP:1.0\n") == 0);
+            assert(strstr(hits, "\n3\t/tmp/initio/torn:write:DROP:1.0\n") != NULL);
         }
     }
     /* O_APPEND writes at the end whatever the offset says, so a dropped one corrects

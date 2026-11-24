@@ -106,7 +106,9 @@ static chaos_init_rules_t g_chaos_init_dns_rules = {
     CHAOS_DNS_HITS_PREFIX,
     CHAOS_DNS_MAX_RULES,
     chaos_init_dns_snapshot,
-    NULL,
+    /* The same header the library writes, so a reader correlates the counts with the
+     * same reload generation whichever mode produced them. */
+    chaos_dns_hits_header,
     g_chaos_init_dns_slots,
     g_chaos_init_dns_hashes,
     g_chaos_init_dns_generation,

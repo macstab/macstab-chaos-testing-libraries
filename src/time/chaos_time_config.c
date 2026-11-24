@@ -1373,6 +1373,24 @@ static void chaos_time_config_reject_file(chaos_time_config_state_t *state, cons
 }
 
 /**
+ * @brief The tab-free header lines of this library's hits file: the reload generation.
+ *
+ * @details A named function rather than the expression it replaced, because chaos-init
+ * hands it to chaos_hits_write_for() when it writes this file for a traced process: the
+ * generation a reader correlates counts with must not depend on which mode produced them.
+ *
+ * @param out  Buffer of at least CHAOS_HITS_HEADER_MAX bytes.
+ * @param size Its size.
+ * @return @p out, or NULL when it could not be formatted (then no header is written).
+ */
+static const char *chaos_time_hits_header(char *out, size_t size)
+{
+    const size_t used = chaos_hits_header_generation(out, size, g_chaos_time_config_generation);
+
+    return used != 0U ? out : NULL;
+}
+
+/**
  * @brief Records a hit on @p slot and writes the hits file when due; NULL flushes.
  *
  * @details Writes on each of the first CHAOS_HITS_EAGER (64) hits, then at most every
@@ -1434,11 +1452,7 @@ static void chaos_time_config_report_hits(chaos_hit_slot_t *slot)
                 state->hits,
                 (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) state->text,
                 state->rule_count,
-                chaos_hits_header_generation(
-                    header, sizeof(header), g_chaos_time_config_generation
-                ) != 0U
-                    ? header
-                    : NULL,
+                chaos_time_hits_header(header, sizeof(header)),
                 g_chaos_time_hits_buffer,
                 sizeof(g_chaos_time_hits_buffer)
             );
