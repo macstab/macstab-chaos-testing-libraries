@@ -1308,7 +1308,12 @@ int chaos_net_config_parse_line(char *line, chaos_net_rule_t *rule)
     else if (strcmp(effect_text, "REDIRECT") == 0)
     {
         rule->effect = CHAOS_NET_EFFECT_REDIRECT;
-        if (chaos_net_parse_redirect(value_text, &rule->redirect, &rule->probability) != 0)
+        /* A UNIX selector matches a UNIX socket, and an address with a port cannot be
+         * written over a sockaddr_un: such a rule could never fire, which is a rejection
+         * here rather than a silence at run time. A `*` selector is kept -- it matches the
+         * IP sockets the target fits as well. */
+        if (rule->selector.kind == CHAOS_NET_ENDPOINT_UNIX ||
+            chaos_net_parse_redirect(value_text, &rule->redirect, &rule->probability) != 0)
         {
             return -1;
         }

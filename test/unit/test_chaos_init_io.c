@@ -794,6 +794,16 @@ int main(void)
         held = decide(__NR_write, (uint64_t)torn, P(buffer), 10U, 0, 0);
         assert(held.action == CHAOS_INIT_DELAY);
         assert(held.delay_ms > 100U && held.delay_ms <= 200U);
+        /* A call the rate lets through whole spends neither a hit nor a `@first` claim --
+         * the allowance changed nothing, so there was no effect to charge for. The budget
+         * is the sharpest way to say it: with `@first=1` the untouched call must leave the
+         * claim for the call that is actually shortened. */
+        write_rules("/tmp/initio/torn:write:THROTTLE:13 @first=1\n");
+        assert(PASSES(decide(__NR_write, (uint64_t)torn, P(buffer), 13U, 0, 0)));
+        held = decide(__NR_write, (uint64_t)torn, P(buffer), 13U, 0, 0);
+        assert(held.action == CHAOS_INIT_DELAY && held.shortens);
+        write_rules("/tmp/initio/torn:write:THROTTLE:10\n");
+
         /* A non-blocking descriptor is told EAGAIN instead of being parked, as in the
          * library: its event loop is written for that answer. Its own bucket, because a
          * slot is keyed by the descriptor. */

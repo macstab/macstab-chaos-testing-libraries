@@ -1704,6 +1704,9 @@ chaos_init_net_decide_at(const chaos_init_call_t *call, long result, chaos_init_
     int64_t timeout_ms = -1;
     unsigned char redirect[sizeof(struct sockaddr_storage)];
     unsigned redirect_size = 0U;
+    chaos_bucket_t *throttle_bucket = NULL;
+    uint64_t throttle_allowed = 0U;
+    int throttle_stream = 0;
     size_t index;
 
     for (index = 0U; index < sizeof(g_chaos_init_net_calls) / sizeof(g_chaos_init_net_calls[0]);
@@ -1864,6 +1867,28 @@ chaos_init_net_decide_at(const chaos_init_call_t *call, long result, chaos_init_
     {
         return 1;
     }
+    /* THROTTLE takes its bytes before the rule is asked, as the library does: an
+     * allowance that covers the whole send changes nothing, so it must spend neither a hit
+     * nor a `@first` claim. The bytes are charged either way. */
+    if (rule.effect == CHAOS_NET_EFFECT_THROTTLE)
+    {
+        pid_t throttle_tgid = 0;
+        uint64_t throttle_image = 0U;
+
+        throttle_bucket =
+            CHAOS_INIT_PROCESS_OF(call->tid, &throttle_tgid, &throttle_image) == 0
+                ? chaos_init_net_throttle_bucket(throttle_tgid, call->args[0], rule.rate_bps)
+                : NULL;
+        throttle_stream = chaos_init_net_is_stream(call->args[0]);
+        throttle_allowed =
+            throttle_bucket != NULL
+                ? chaos_bucket_take(throttle_bucket, rule.rate_bps, size, chaos_hits_now_ms())
+                : size;
+        if (throttle_allowed >= size)
+        {
+            return 1;
+        }
+    }
     /* Swap the snapshot's shared slot for the calling process's (see chaos_init_io.c). */
     state = chaos_net_config_active_state();
     rule.call_size = size;
@@ -1900,33 +1925,18 @@ chaos_init_net_decide_at(const chaos_init_call_t *call, long result, chaos_init_
     }
     else if (rule.effect == CHAOS_NET_EFFECT_THROTTLE)
     {
-        /* The same bucket arithmetic as the library's, and the same two answers: a stream
-         * is shortened to what the rate allows, a datagram is never cut -- half a datagram
-         * is not a datagram -- and waits for its whole message instead. What the supervisor
-         * does differently is the waiting: it holds the call in its delay queue rather than
-         * sleeping in the thread, so the tracee's other threads keep being served, and
-         * reserves the bytes when it parks the call, so the rate is the same on both
-         * paths. A non-blocking socket is told EAGAIN, as in the library. */
-        pid_t tgid = 0;
-        uint64_t image = 0U;
-        chaos_bucket_t *bucket =
-            CHAOS_INIT_PROCESS_OF(call->tid, &tgid, &image) == 0
-                ? chaos_init_net_throttle_bucket(tgid, call->args[0], rule.rate_bps)
-                : NULL;
-        const int stream = chaos_init_net_is_stream(call->args[0]);
-        const uint64_t allowed =
-            bucket != NULL ? chaos_bucket_take(bucket, rule.rate_bps, size, chaos_hits_now_ms())
-                           : size;
-
-        if (allowed >= size)
-        {
-            verdict->action = CHAOS_INIT_PASS;
-        }
-        else if (allowed > 0U && stream)
+        /* The bytes were taken before the draw (above). What is left is the same pair of
+         * answers the library gives: a stream is shortened to what the rate allowed, a
+         * datagram is never cut -- half a datagram is not a datagram -- and waits for its
+         * whole message instead. The waiting happens in the delay queue rather than in the
+         * thread, so the other threads of the tracee keep being served, and the bytes are
+         * reserved when the call is parked, so the rate matches the library's. A
+         * non-blocking socket is told EAGAIN, as in the library. */
+        if (throttle_allowed > 0U && throttle_stream)
         {
             verdict->action = CHAOS_INIT_SHORTEN;
             verdict->arg_index = (unsigned)entry->size;
-            verdict->value = (long)allowed;
+            verdict->value = (long)throttle_allowed;
         }
         else if (chaos_init_net_nonblocking(call->tid, call->args[0]))
         {
@@ -1936,11 +1946,12 @@ chaos_init_net_decide_at(const chaos_init_call_t *call, long result, chaos_init_
         else
         {
             const uint64_t chunk = chaos_bucket_chunk(rule.rate_bps);
-            const uint64_t held = !stream ? size : (chunk < size ? chunk : size);
+            const uint64_t held = !throttle_stream ? size : (chunk < size ? chunk : size);
 
             verdict->action = CHAOS_INIT_DELAY;
-            verdict->delay_ms = (unsigned
-            )chaos_bucket_reserve(bucket, rule.rate_bps, held - allowed, chaos_hits_now_ms());
+            verdict->delay_ms = (unsigned)chaos_bucket_reserve(
+                throttle_bucket, rule.rate_bps, held - throttle_allowed, chaos_hits_now_ms()
+            );
             verdict->shortens = held < size;
             verdict->arg_index = (unsigned)entry->size;
             verdict->value = (long)held;

@@ -638,6 +638,8 @@ chaos_init_io_decide_at(const chaos_init_call_t *call, long result, chaos_init_v
 {
     const chaos_init_io_call_t *entry = NULL;
     const chaos_io_config_state_t *state;
+    chaos_bucket_t *throttle_bucket = NULL;
+    uint64_t throttle_allowed = 0U;
     char path[CHAOS_IO_MAX_PATH];
     chaos_io_rule_t rule;
     size_t index;
@@ -775,6 +777,30 @@ chaos_init_io_decide_at(const chaos_init_call_t *call, long result, chaos_init_v
          * add, and must not draw again. */
         return 1;
     }
+    /* THROTTLE takes its bytes before the rule is asked, as the library does: an
+     * allowance that covers the whole call changes nothing, so it must spend neither a hit
+     * nor a `@first` claim. The bytes are charged either way -- they are gone whether the
+     * rule then fires or not -- which is why this effect decides before the draw. */
+    if (rule.effect == CHAOS_IO_EFFECT_THROTTLE)
+    {
+        pid_t throttle_tgid = 0;
+        uint64_t throttle_image = 0U;
+
+        throttle_bucket =
+            CHAOS_INIT_PROCESS_OF(call->tid, &throttle_tgid, &throttle_image) == 0
+                ? chaos_init_io_throttle_bucket(throttle_tgid, call->args[0], rule.rate_bps)
+                : NULL;
+        throttle_allowed =
+            throttle_bucket != NULL
+                ? chaos_bucket_take(
+                      throttle_bucket, rule.rate_bps, rule.call_size, chaos_hits_now_ms()
+                  )
+                : rule.call_size;
+        if (throttle_allowed >= rule.call_size)
+        {
+            return 1;
+        }
+    }
     state = chaos_io_config_active_state();
     rule.hit = chaos_init_tracee_hit(
         &g_chaos_init_io_rules, call->tid, state->hits, state->rule_count, rule.hit
@@ -818,32 +844,16 @@ chaos_init_io_decide_at(const chaos_init_call_t *call, long result, chaos_init_v
     }
     else if (rule.effect == CHAOS_IO_EFFECT_THROTTLE)
     {
-        /* The same bucket arithmetic as the library's, with one difference in what it can
-         * do when nothing is left: the supervisor reserves a tenth of a second's worth and
-         * holds the call in its delay queue rather than sleeping in the thread, so the
-         * tracee's other threads keep being served. The reservation is why both paths
-         * enforce the same rate: the bytes are charged when the call is parked, not when it
-         * is let go. A non-blocking descriptor is told EAGAIN, as in the library. */
-        pid_t tgid = 0;
-        uint64_t image = 0U;
-        chaos_bucket_t *bucket =
-            CHAOS_INIT_PROCESS_OF(call->tid, &tgid, &image) == 0
-                ? chaos_init_io_throttle_bucket(tgid, call->args[0], rule.rate_bps)
-                : NULL;
-        const uint64_t allowed =
-            bucket != NULL
-                ? chaos_bucket_take(bucket, rule.rate_bps, rule.call_size, chaos_hits_now_ms())
-                : rule.call_size;
-
-        if (allowed >= rule.call_size)
-        {
-            verdict->action = CHAOS_INIT_PASS;
-        }
-        else if (allowed > 0U)
+        /* The bytes were taken before the draw (above); what is left is how to answer a
+         * call the rate cannot serve whole. The supervisor shortens it where the count
+         * sits in a register, and otherwise parks it rather than sleeping in the thread,
+         * so the tracee's other threads keep being served. A non-blocking descriptor is
+         * told EAGAIN, as in the library. */
+        if (throttle_allowed > 0U)
         {
             verdict->action = CHAOS_INIT_SHORTEN;
             verdict->arg_index = (unsigned)entry->size;
-            verdict->value = (long)allowed;
+            verdict->value = (long)throttle_allowed;
         }
         else if (chaos_init_io_nonblocking(call->tid, call->args[0]))
         {
@@ -854,10 +864,14 @@ chaos_init_io_decide_at(const chaos_init_call_t *call, long result, chaos_init_v
         {
             const uint64_t chunk = chaos_bucket_chunk(rule.rate_bps);
             const uint64_t held = chunk < rule.call_size ? chunk : rule.call_size;
+            /* Reserved, not just waited for: the bytes are charged when the call is
+             * parked, so a second caller waits for the ones after them and the rate comes
+             * out the same as the library's. */
+            const uint64_t wait =
+                chaos_bucket_reserve(throttle_bucket, rule.rate_bps, held, chaos_hits_now_ms());
 
             verdict->action = CHAOS_INIT_DELAY;
-            verdict->delay_ms =
-                (unsigned)chaos_bucket_reserve(bucket, rule.rate_bps, held, chaos_hits_now_ms());
+            verdict->delay_ms = (unsigned)wait;
             verdict->shortens = 1;
             verdict->arg_index = (unsigned)entry->size;
             verdict->value = (long)held;

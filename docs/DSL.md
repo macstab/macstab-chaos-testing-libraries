@@ -511,7 +511,9 @@ consequences follow from that, all of them intended:
 - a rule naming the original destination is therefore the only place to write the
   redirect: a second rule on the target decides what the connection then meets.
 
-An optional `@probability` after the port makes it occasional, as LATENCY's does.
+An optional `@probability` after the port makes it occasional, as LATENCY's does. The
+target is always an address and a port, so a `unix://` selector with a `REDIRECT` is an
+illegal selector/effect pair and rejects the file: such a rule could never fire.
 Semantics: [NETWORK.md](NETWORK.md).
 
 ---

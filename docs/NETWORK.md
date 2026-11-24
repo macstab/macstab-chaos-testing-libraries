@@ -532,6 +532,12 @@ An effect/operation pair outside this table rejects the rule file.
 keyword `:REDIRECT:` is split there rather than from the right. An IPv6 target needs its
 brackets, as an IPv6 selector does: `[2001:db8::1]:443`.
 
+A `unix://` selector with a `REDIRECT` target **rejects the rule file**. The target is an
+address and a port, so the rule could only fire on a UNIX `connect` by writing an IP
+address over a `sockaddr_un` -- it would never fire, and a rule that is loaded, reported
+and silent is the one outcome this library rejects on sight. Redirecting a UNIX socket
+elsewhere is not expressible: name the socket the program should reach instead.
+
 Under `chaos-init`, `TRICKLE` applies to `recv`, `recvfrom` and `read` on a stream socket:
 their length sits in a register, so those calls are answered with `SECCOMP_RET_TRACE` and
 shortened at the stop ([SECCOMP.md

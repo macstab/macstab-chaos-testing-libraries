@@ -2052,6 +2052,17 @@ static void test_trickle_rule(void)
         assert(chaos_net_config_parse_line(bad_chance, &rule) == -1);
         assert(chaos_net_config_parse_line(empty, &rule) == -1);
         assert(chaos_net_config_parse_line(in_selector, &rule) == -1);
+        /* A UNIX selector can never be given an address with a port: rejected at load
+         * time rather than accepted and silent. The wildcard stays valid -- it matches the
+         * IP sockets the target fits. */
+        {
+            char unix_selector[] = "unix:///run/app.sock:connect:REDIRECT:10.0.0.1:5433";
+            char wildcard[] = "*:connect:REDIRECT:10.0.0.1:5433";
+
+            assert(chaos_net_config_parse_line(unix_selector, &rule) == -1);
+            assert(chaos_net_config_parse_line(wildcard, &rule) == 1);
+            assert(rule.effect == CHAOS_NET_EFFECT_REDIRECT && rule.redirect.port == 5433U);
+        }
         /* The keyword with nothing but a selector in front of it: no operation field. */
         {
             char no_operation[] = "x:REDIRECT:10.0.0.1:1";

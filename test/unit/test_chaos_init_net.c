@@ -1749,6 +1749,27 @@ int main(void)
         /* sendmsg keeps its length in the message, so no register can shorten it: left
          * alone and charged nothing, as in the library. */
         assert(PASSES(decide(__NR_sendmsg, (uint64_t)server, P(&message), 0, 0, 0, 0)));
+
+        /* A send the rate lets through whole spends neither a hit nor a `@first` claim,
+         * as in the library: with `@first=1` the untouched send must leave the claim for
+         * the one that is actually held back. */
+        (void)snprintf(
+            rules,
+            sizeof(rules),
+            "tcp4://127.0.0.1:%u:send:THROTTLE:13 @first=1\n",
+            ntohs(server_address.sin_port)
+        );
+        write_rules(rules);
+        assert(PASSES(decide(__NR_write, (uint64_t)server, P(buffer), 13U, 0, 0, 0)));
+        held = decide(__NR_write, (uint64_t)server, P(buffer), 13U, 0, 0, 0);
+        assert(held.action == CHAOS_INIT_DELAY && held.shortens);
+        (void)snprintf(
+            rules,
+            sizeof(rules),
+            "tcp4://127.0.0.1:%u:send:THROTTLE:10\n",
+            ntohs(server_address.sin_port)
+        );
+        write_rules(rules);
     }
     /* A datagram is never cut -- half a datagram is not a datagram -- so it waits for its
      * whole message and then sends it whole. Five bytes per second: the first message

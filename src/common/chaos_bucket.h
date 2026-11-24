@@ -59,8 +59,13 @@ typedef struct chaos_bucket
  * @brief Whether the truncated millisecond @p a is later than @p b.
  *
  * @details A signed difference, so the wrap of the 32-bit millisecond is not a special
- * case: it answers correctly as long as the two are less than 24 days apart, which two
- * stamps of one bucket are by construction.
+ * case: it answers correctly as long as the two are less than 24 days apart. A bucket's
+ * stamp is either a moment that has passed or a reservation, and a reservation reaches at
+ * most one message ahead of the clock (a tenth of a second's worth for a stream, a whole
+ * message for a datagram), so reaching 24 days would take millions of them queued on one
+ * descriptor. Past that the arithmetic reads the stamp as long past and hands out a full
+ * bucket -- it errs towards letting the traffic through, which is the direction every
+ * other failure in these libraries takes.
  */
 static inline int chaos_bucket_later(uint64_t a, uint64_t b)
 {

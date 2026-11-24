@@ -1110,6 +1110,10 @@ static void chaos_init_reload(unsigned libs)
  * a prepare whose file did not change stats it and returns, which is cheaper than keeping
  * a name per library here. Events the kernel could not queue are dropped by it
  * (IN_Q_OVERFLOW); the next change, or the next intercepted call, is seen anyway.
+ *
+ * One read per call, not a drain: a directory as busy as `/tmp` can deliver events as
+ * fast as they are read, and a loop here would hold the serve loop away from the
+ * notifications it exists for. What is left queued makes the next poll() return at once.
  */
 static void chaos_init_watched(int watcher, unsigned libs)
 {
@@ -1118,24 +1122,20 @@ static void chaos_init_watched(int watcher, unsigned libs)
         struct inotify_event event; /* the alignment read(2) requires of the buffer */
         char bytes[4096];
     } buffer;
-    ssize_t got;
+    const ssize_t got = read(watcher, buffer.bytes, sizeof(buffer.bytes));
+    size_t offset = 0U;
     int reload = 0;
 
-    while ((got = read(watcher, buffer.bytes, sizeof(buffer.bytes))) > 0)
+    while (got > 0 && offset + sizeof(struct inotify_event) <= (size_t)got)
     {
-        size_t offset = 0U;
+        const struct inotify_event *event =
+            (const struct inotify_event *)(const void *)(buffer.bytes + offset);
 
-        while (offset + sizeof(struct inotify_event) <= (size_t)got)
+        if (event->len > 0U && chaos_init_rule_file(event->name))
         {
-            const struct inotify_event *event =
-                (const struct inotify_event *)(const void *)(buffer.bytes + offset);
-
-            if (event->len > 0U && chaos_init_rule_file(event->name))
-            {
-                reload = 1;
-            }
-            offset += sizeof(struct inotify_event) + event->len;
+            reload = 1;
         }
+        offset += sizeof(struct inotify_event) + event->len;
     }
     if (reload)
     {
