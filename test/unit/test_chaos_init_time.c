@@ -123,6 +123,9 @@ int main(void)
 {
     struct timespec value;
     struct timeval day;
+#ifdef __NR_time
+    time_t seconds;
+#endif
     chaos_init_call_t other;
     chaos_init_verdict_t verdict;
     long calls[8];
@@ -200,6 +203,23 @@ int main(void)
     day.tv_usec = 0;
     assert(serve(__NR_gettimeofday, P(&day), 0).action == CHAOS_INIT_RETURN);
     assert(day.tv_sec == 1001 && day.tv_usec == 0);
+
+#ifdef __NR_time
+    /* time() carries its result in the return value, which is what separates it from the
+     * other two reads: the buffer is optional, so a shifted clock has to show in what the
+     * call returns or the effect is lost. Only x86-64 has the call at all. */
+    write_rules("clock_gettime:OFFSET:1000\n");
+    seconds = 0;
+    verdict = serve(__NR_time, P(&seconds), 0);
+    assert(verdict.action == CHAOS_INIT_RETURN && verdict.returns == 1);
+    assert(verdict.value == 1001 && seconds == 1001);
+    /* And with no buffer at all, where the return value is the whole answer. */
+    verdict = serve(__NR_time, 0, 0);
+    assert(verdict.action == CHAOS_INIT_RETURN && verdict.value == 1001);
+    /* Without a rule it is the kernel's call to answer. */
+    write_rules("clock_gettime/monotonic:OFFSET:1000\n");
+    assert(serve(__NR_time, P(&seconds), 0).action == CHAOS_INIT_PASS);
+#endif
 
     /* FREEZE holds the clock at the reading of the call that started it: the second read
      * gets the same value although the clock has moved on. */

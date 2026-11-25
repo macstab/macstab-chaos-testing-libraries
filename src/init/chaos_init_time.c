@@ -155,11 +155,10 @@ typedef enum chaos_init_time_shape
 {
     CHAOS_INIT_TIME_NONE = 0, /**< A sleep: no value to write. */
     CHAOS_INIT_TIME_TIMESPEC, /**< clock_gettime: struct timespec. */
-    CHAOS_INIT_TIME_TIMEVAL   /**< gettimeofday: struct timeval. */
-#ifdef __NR_time
-    ,
-    CHAOS_INIT_TIME_SECONDS /**< time: time_t; x86_64 only, aarch64 has no vDSO time. */
-#endif
+    CHAOS_INIT_TIME_TIMEVAL,  /**< gettimeofday: struct timeval. */
+    CHAOS_INIT_TIME_SECONDS   /**< time: time_t, and the call's return value. Only x86-64
+                               *   has the call; the shape is named everywhere so the code
+                               *   that answers it needs no condition of its own. */
 } chaos_init_time_shape_t;
 
 /**
@@ -275,6 +274,35 @@ chaos_init_time_value_rule(const chaos_init_call_t *call, clockid_t clock, chaos
     return CHAOS_TIME_EFFECT_INVALID;
 }
 
+/**
+ * @brief Applies the value effect that matches @p call to @p reading.
+ *
+ * @details Shared by the decision and the commit, which both have to produce the same
+ * value: the commit writes it into the tracee, and the decision carries it in the reply
+ * where the call returns it rather than writes it (`time`). A rule file that changed in
+ * between leaves the reading as it is, which is what the call would have produced.
+ */
+static void
+chaos_init_time_shift(const chaos_init_call_t *call, clockid_t clock, struct timespec *reading)
+{
+    chaos_time_rule_t rule;
+
+    switch (chaos_init_time_value_rule(call, clock, &rule))
+    {
+    case CHAOS_TIME_EFFECT_OFFSET:
+        chaos_time_rule_apply_offset(&rule, reading);
+        break;
+    case CHAOS_TIME_EFFECT_REGRESS:
+        chaos_time_rule_apply_regress(&rule, reading);
+        break;
+    case CHAOS_TIME_EFFECT_FREEZE:
+        chaos_time_rule_apply_freeze(&rule, reading);
+        break;
+    default:
+        break;
+    }
+}
+
 int chaos_init_time_decide(const chaos_init_call_t *call, chaos_init_verdict_t *verdict)
 {
     chaos_time_operation_t operation;
@@ -307,19 +335,31 @@ int chaos_init_time_decide(const chaos_init_call_t *call, chaos_init_verdict_t *
         return 1;
     }
     /* A value the supervisor has to produce: only for a read it can serve, which means a
-     * clock it can read itself and a buffer to write. Anything else runs as it is, so a
-     * rule on a clock this kernel does not know is left to the kernel's own EINVAL. */
-    if (shape == CHAOS_INIT_TIME_NONE || target == 0U ||
+     * clock it can read itself and somewhere for the value to go. Anything else runs as it
+     * is, so a rule on a clock this kernel does not know is left to the kernel's own
+     * EINVAL. `time` is the one read whose value is the return rather than the buffer, so
+     * it is served without one -- and a `time(NULL)` served by the kernel instead would
+     * report the true clock although the vDSO was blinded to prevent exactly that. */
+    if (shape == CHAOS_INIT_TIME_NONE || (target == 0U && shape != CHAOS_INIT_TIME_SECONDS) ||
         chaos_init_time_value_rule(call, clock, &rule) == CHAOS_TIME_EFFECT_INVALID ||
         CHAOS_INIT_TIME_CLOCK(clock, &reading) != 0)
     {
         return 1;
     }
     /* The call does not run; the answer carries the value, written at commit. A delayed
-     * read keeps its delay and answers with the value when it is due. */
+     * read keeps its delay and answers with the value when it is due. clock_gettime and
+     * gettimeofday return 0 on success and leave the value in the buffer; time returns the
+     * seconds, so the shift has to be made here as well as at the commit. */
     verdict->action = verdict->action == CHAOS_INIT_DELAY ? CHAOS_INIT_DELAY : CHAOS_INIT_RETURN;
     verdict->returns = 1;
     verdict->value = 0;
+#ifdef __NR_time
+    if (shape == CHAOS_INIT_TIME_SECONDS)
+    {
+        chaos_init_time_shift(call, clock, &reading);
+        verdict->value = (long)reading.tv_sec;
+    }
+#endif
     verdict->writes_time = 1;
     return 1;
 }
@@ -328,33 +368,17 @@ void chaos_init_time_commit(const chaos_init_call_t *call, const chaos_init_verd
 {
     chaos_time_operation_t operation;
     chaos_init_time_shape_t shape;
-    chaos_time_rule_t rule;
     struct timespec reading;
     clockid_t clock;
     uint64_t target;
 
     if (verdict->writes_time == 0 ||
-        !chaos_init_time_decode(call, &operation, &clock, &shape, &target) ||
+        !chaos_init_time_decode(call, &operation, &clock, &shape, &target) || target == 0U ||
         CHAOS_INIT_TIME_CLOCK(clock, &reading) != 0)
     {
         return;
     }
-    switch (chaos_init_time_value_rule(call, clock, &rule))
-    {
-    case CHAOS_TIME_EFFECT_OFFSET:
-        chaos_time_rule_apply_offset(&rule, &reading);
-        break;
-    case CHAOS_TIME_EFFECT_REGRESS:
-        chaos_time_rule_apply_regress(&rule, &reading);
-        break;
-    case CHAOS_TIME_EFFECT_FREEZE:
-        chaos_time_rule_apply_freeze(&rule, &reading);
-        break;
-    default:
-        /* The rule file changed between the decision and the reply: the real value is
-         * then what the tracee gets, which is what the call would have produced. */
-        break;
-    }
+    chaos_init_time_shift(call, clock, &reading);
     if (shape == CHAOS_INIT_TIME_TIMEVAL)
     {
         struct timeval value;

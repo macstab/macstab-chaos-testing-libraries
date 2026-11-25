@@ -419,6 +419,10 @@ for that process alone: no other process, and no other container, is affected.
   supervisor: it reads the same clock, applies the effect and writes the value into the
   caller's buffer, then answers 0. The clock is read at the moment the answer goes out, so
   a read held back by LATENCY reports the time after its delay, as the library's does.
+  `time` is the exception that proves the rule, and only x86-64 has the call: its value
+  **is** the return, the buffer is optional, so the supervisor answers with the shifted
+  seconds and serves a `time(NULL)` as well. Leaving that one to the kernel would report
+  the true clock from the very image whose vDSO was blinded to prevent it.
 - **Only the clocks a rule names are notified.** `clock_gettime` carries the clock in its
   first argument, so the filter tests it: a rule on the wall clock leaves a monotonic read
   to the kernel. A rule that names no clock (`*` or `clock_gettime`) notifies every one.
