@@ -49,6 +49,7 @@
  * - RESET and ERRNO on close reject the whole rule file in SECCOMP mode.
  */
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -79,13 +80,28 @@ static int test_process_of(pid_t tid, pid_t *tgid, uint64_t *start)
 
 /* Seam of the ownership scan (chaos_net_owner.c): a directory it cannot read may hide a
  * holder of the socket, which no test can provoke from outside. With `g_deaf_proc` set,
- * every directory but the one named in `g_own_fd_dir` refuses to open. */
+ * every directory but the one named in `g_own_fd_dir` refuses to open, with EACCES: the
+ * errno matters, because ENOENT is the one failure the scan skips instead of counting.
+ *
+ * `g_lone_proc` is the other direction, and it is what makes these checks independent of
+ * the host they run on: every process but this one reports ENOENT, so the scan concludes
+ * SOLE whatever else is running. Without it, an ordinary user beside a root process whose
+ * descriptors cannot be read -- a CI runner -- gets UNKNOWN and every RESET here is
+ * suppressed. That answer is correct, and test_net_owner.c is where it is tested; here it
+ * would only hide what these assertions are about. */
 static int g_deaf_proc = 0;
+static int g_lone_proc = 0;
 static char g_own_fd_dir[32] = "";
 static int test_owner_open(const char *path)
 {
     if (g_deaf_proc && strcmp(path, g_own_fd_dir) != 0)
     {
+        errno = EACCES;
+        return -1;
+    }
+    if (g_lone_proc && strcmp(path, "/proc") != 0 && strcmp(path, g_own_fd_dir) != 0)
+    {
+        errno = ENOENT;
         return -1;
     }
     return open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -1561,6 +1577,8 @@ int main(void)
      * and not INSTEAD. Only the close is traced for it: the option needs no register of
      * the call. */
     write_rules("*:close:RESET:1.0\n");
+    (void)snprintf(g_own_fd_dir, sizeof(g_own_fd_dir), "/proc/%ld/fd", (long)getpid());
+    g_lone_proc = 1;
     {
         long traced[8];
         struct linger expected;
@@ -1596,7 +1614,6 @@ int main(void)
         g_fake_tgid = 0;
         /* A /proc directory the supervisor cannot read may hide a second holder, so the
          * ownership is unknown rather than sole. */
-        (void)snprintf(g_own_fd_dir, sizeof(g_own_fd_dir), "/proc/%ld/fd", (long)getpid());
         g_deaf_proc = 1;
         assert(PASSES(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0)));
         g_deaf_proc = 0;
@@ -1615,6 +1632,7 @@ int main(void)
             assert(strstr(lines, "suppressed.unknown=3\n") != NULL);
         }
     }
+    g_lone_proc = 0;
     /* REDIRECT: the address `connect` was given is in the tracee, and a notification
      * answered with CONTINUE makes the kernel read it from there again -- so the verdict
      * carries the new address and the call is let through. Here the tracee is this
