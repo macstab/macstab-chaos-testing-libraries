@@ -17,10 +17,17 @@
  * - a descriptor that is no socket is UNKNOWN, because the scan cannot find its own link
  *   among the sockets and must not conclude from that;
  * - a closed descriptor is UNKNOWN, since fstat fails.
+ *
+ * Where a process cannot be read, the scan answers UNKNOWN rather than SOLE by design, so
+ * the expected answer for a socket this process alone holds depends on the host: as root
+ * in a container every process is readable and it is SOLE, and as an ordinary user beside
+ * a root process it is UNKNOWN. expected_sole() decides which, measured independently of
+ * the code under test.
  */
 
 #include "../support/test_net_support.h"
 
+#include <dirent.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -89,6 +96,64 @@ static int open_socket(void)
     return socket(AF_INET, SOCK_DGRAM, 0);
 }
 
+/** @brief Whether @p name is all digits, as a process directory is. */
+static int all_digits(const char *name)
+{
+    size_t index = 0U;
+
+    while (name[index] >= '0' && name[index] <= '9')
+    {
+        ++index;
+    }
+    return index > 0U && name[index] == '\0';
+}
+
+/**
+ * @brief What the scan must answer for a socket this process alone holds.
+ *
+ * @details SOLE only where every other process can be read; a process whose descriptors
+ * are closed to this one could be hiding a holder, so UNKNOWN is the correct answer there
+ * -- the normal case for an ordinary user on a host that also runs root processes, which
+ * is what a CI runner is. Decided with opendir() and open(), not with the raw calls the
+ * scan uses, so this expectation does not inherit a fault from the code it judges; and
+ * since SHARED is wrong either way, a scan that over-reports still fails on both hosts.
+ */
+static chaos_net_ownership_t expected_sole(void)
+{
+    DIR *proc = opendir("/proc");
+    chaos_net_ownership_t expected = CHAOS_NET_OWNER_SOLE;
+    const struct dirent *entry;
+
+    if (proc == NULL)
+    {
+        return CHAOS_NET_OWNER_UNKNOWN;
+    }
+    while (expected == CHAOS_NET_OWNER_SOLE && (entry = readdir(proc)) != NULL)
+    {
+        char path[sizeof("/proc//fd") + sizeof(entry->d_name)];
+        int fd;
+
+        if (!all_digits(entry->d_name))
+        {
+            continue;
+        }
+        (void)snprintf(path, sizeof(path), "/proc/%s/fd", entry->d_name);
+        fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (fd < 0)
+        {
+            /* A process that ended between the listing and the open holds nothing. */
+            if (errno != ENOENT)
+            {
+                expected = CHAOS_NET_OWNER_UNKNOWN;
+            }
+            continue;
+        }
+        (void)close(fd);
+    }
+    (void)closedir(proc);
+    return expected;
+}
+
 /** @brief Proves the scan tells a sole owner from a shared one. */
 static void test_ownership_of_a_socket(void)
 {
@@ -96,7 +161,7 @@ static void test_ownership_of_a_socket(void)
     int copy;
 
     assert(sock >= 0);
-    assert(chaos_net_socket_ownership(sock) == CHAOS_NET_OWNER_SOLE);
+    assert(chaos_net_socket_ownership(sock) == expected_sole());
 
     /* A dup in this process is a second link to the same inode. */
     copy = dup(sock);
@@ -104,7 +169,7 @@ static void test_ownership_of_a_socket(void)
     assert(chaos_net_socket_ownership(sock) == CHAOS_NET_OWNER_SHARED);
     assert(chaos_net_socket_ownership(copy) == CHAOS_NET_OWNER_SHARED);
     assert(close(copy) == 0);
-    assert(chaos_net_socket_ownership(sock) == CHAOS_NET_OWNER_SOLE);
+    assert(chaos_net_socket_ownership(sock) == expected_sole());
 
     assert(close(sock) == 0);
 }
@@ -139,7 +204,7 @@ static void test_ownership_across_a_fork(void)
 
     assert(kill(child, SIGKILL) == 0);
     assert(waitpid(child, NULL, 0) == child);
-    assert(chaos_net_socket_ownership(sock) == CHAOS_NET_OWNER_SOLE);
+    assert(chaos_net_socket_ownership(sock) == expected_sole());
 
     assert(close(ready[0]) == 0);
     assert(close(sock) == 0);
@@ -249,14 +314,14 @@ static void test_ownership_after_scm_rights(void)
 
     sock = open_socket();
     assert(sock >= 0);
-    assert(chaos_net_socket_ownership(sock) == CHAOS_NET_OWNER_SOLE);
+    assert(chaos_net_socket_ownership(sock) == expected_sole());
     assert(send_descriptor(pair[0], sock) == 0);
     assert(read(ready[0], &token, 1U) == 1);
     assert(chaos_net_socket_ownership(sock) == CHAOS_NET_OWNER_SHARED);
 
     assert(kill(child, SIGKILL) == 0);
     assert(waitpid(child, NULL, 0) == child);
-    assert(chaos_net_socket_ownership(sock) == CHAOS_NET_OWNER_SOLE);
+    assert(chaos_net_socket_ownership(sock) == expected_sole());
 
     assert(close(ready[0]) == 0);
     assert(close(pair[0]) == 0);
@@ -294,7 +359,7 @@ static void test_unreadable_answers_unknown(void)
     const int sock = open_socket();
 
     assert(sock >= 0);
-    assert(chaos_net_socket_ownership(sock) == CHAOS_NET_OWNER_SOLE);
+    assert(chaos_net_socket_ownership(sock) == expected_sole());
 
     g_fail_open_for = 1; /* /proc/self/fd */
     assert(chaos_net_socket_ownership(sock) == CHAOS_NET_OWNER_UNKNOWN);
@@ -318,7 +383,7 @@ static void test_unreadable_answers_unknown(void)
     assert(chaos_net_socket_ownership(sock) == CHAOS_NET_OWNER_UNKNOWN);
     g_fail_getdents_after = -1;
 
-    assert(chaos_net_socket_ownership(sock) == CHAOS_NET_OWNER_SOLE);
+    assert(chaos_net_socket_ownership(sock) == expected_sole());
     assert(close(sock) == 0);
 }
 
