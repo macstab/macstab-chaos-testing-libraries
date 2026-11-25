@@ -33,6 +33,14 @@
 #include "../../src/init/chaos_init_proc.c"
 #include "../../src/init/chaos_init_tracee.c"
 
+/* The seed source lives in chaos_init_core.c, which this probe does not include; the
+ * declaration comes from chaos_init_core.h, so the definition may follow the include. The
+ * probe never draws -- it only compares address lookups -- so any fixed value will do. */
+uint64_t chaos_init_seed(void)
+{
+    return UINT64_C(0x5eed5eed5eed5eed);
+}
+
 #include <arpa/inet.h>
 #include <stdio.h>
 #include <sys/stat.h>
