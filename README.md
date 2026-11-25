@@ -918,6 +918,7 @@ No C++ runtime, no allocator in the hot path, `-ldl` as the only link library.
 | Document | Content |
 |---|---|
 | [`docs/DSL.md`](docs/DSL.md) | Rule grammar (ABNF), qualifiers, specificity order, cross-layer mapping |
+| [`docs/UPGRADING.md`](docs/UPGRADING.md) | What changes for an existing rule file, per release |
 | [`docs/PLATFORM.md`](docs/PLATFORM.md) | ELF link map, PLT/GOT, `RTLD_NEXT`, IFUNC, symbol versioning, vDSO, `AT_SECURE`, static binaries |
 | [`docs/SYSTEM.md`](docs/SYSTEM.md) | Loader/libc/kernel interaction, one-symbol-one-owner invariant, composition |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Component map, call flow, reload protocol, status and hits files, fd cache |
