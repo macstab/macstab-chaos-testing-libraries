@@ -7,7 +7,8 @@
  * @details Unit under test: `chaos_io_config_parse_line()` in
  * `src/config/chaos_io_config.c`, compiled in by `#include`. Grammar of a rule line:
  * `<path_prefix>:<operation>:<effect>:<param>`, where `<effect>` is an accepted errno name
- * (ERRNO effect) or LATENCY, TORN, CORRUPT, and `<param>` is a probability in [0, 1]
+ * (ERRNO effect) or LATENCY, TORN, CORRUPT, DROP, THROTTLE, FULL, FREE, and `<param>` is a
+ * probability in [0, 1], a byte rate (THROTTLE) or a byte count (FREE)
  * (milliseconds for LATENCY). The parser is pure string processing on a mutable buffer,
  * so no rule file and no wrapper is involved.
  *
@@ -278,6 +279,54 @@ static void test_invalid_inputs(void)
 
     snprintf(line, sizeof(line), "*:write:CORRUPT:0.1");
     assert(chaos_io_config_parse_line(line, &rule) == -1);
+
+    /* The four effects this release added, each refused where it cannot act. DROP needs a
+     * write-class operation and FULL and FREE the statfs one; THROTTLE needs a rate rather
+     * than a probability, and a rate of zero is no rate. */
+    snprintf(line, sizeof(line), "*:read:DROP:1.0");
+    assert(chaos_io_config_parse_line(line, &rule) == -1);
+
+    snprintf(line, sizeof(line), "*:write:FULL:1.0");
+    assert(chaos_io_config_parse_line(line, &rule) == -1);
+
+    snprintf(line, sizeof(line), "*:read:FREE:4096");
+    assert(chaos_io_config_parse_line(line, &rule) == -1);
+
+    snprintf(line, sizeof(line), "*:write:THROTTLE:0");
+    assert(chaos_io_config_parse_line(line, &rule) == -1);
+
+    snprintf(line, sizeof(line), "*:write:THROTTLE:notanumber");
+    assert(chaos_io_config_parse_line(line, &rule) == -1);
+
+    snprintf(line, sizeof(line), "*:statfs:FREE:notanumber");
+    assert(chaos_io_config_parse_line(line, &rule) == -1);
+
+    /* And a `@size` gate on statfs, which reports no byte count: a gate no call can pass. */
+    snprintf(line, sizeof(line), "*:statfs:FULL:1.0 @size>10");
+    assert(chaos_io_config_parse_line(line, &rule) == -1);
+}
+
+/** @brief The four effects this release added, accepted where they can act. */
+static void test_new_effects_round_trip(void)
+{
+    chaos_io_rule_t rule;
+    char line[256];
+
+    snprintf(line, sizeof(line), "/data:write:DROP:0.25");
+    assert(chaos_io_config_parse_line(line, &rule) == 1);
+    assert(rule.effect == CHAOS_IO_EFFECT_DROP && rule.operation == CHAOS_IO_OP_WRITE);
+
+    snprintf(line, sizeof(line), "/data:write:THROTTLE:262144");
+    assert(chaos_io_config_parse_line(line, &rule) == 1);
+    assert(rule.effect == CHAOS_IO_EFFECT_THROTTLE && rule.rate_bps == 262144U);
+
+    snprintf(line, sizeof(line), "/data:statfs:FULL:1.0");
+    assert(chaos_io_config_parse_line(line, &rule) == 1);
+    assert(rule.effect == CHAOS_IO_EFFECT_FULL && rule.operation == CHAOS_IO_OP_STATFS);
+
+    snprintf(line, sizeof(line), "/data:statfs:FREE:1048576");
+    assert(chaos_io_config_parse_line(line, &rule) == 1);
+    assert(rule.effect == CHAOS_IO_EFFECT_FREE && rule.free_bytes == 1048576U);
 }
 
 /* ---- main --------------------------------------------------------------- */
@@ -297,6 +346,7 @@ int main(void)
     test_blank_comment_identity();
     test_robustness();
     test_invalid_inputs();
+    test_new_effects_round_trip();
 
     puts("PROPTEST: OK");
     return 0;

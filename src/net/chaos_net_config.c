@@ -1367,7 +1367,11 @@ chaos_net_rule_shadowed(const chaos_net_rule_t *rules, size_t count, const chaos
 
     for (index = 0U; index < count; ++index)
     {
-        if (rules[index].operation == later->operation && rules[index].effect == later->effect &&
+        /* Not the effect: the selection does not look at it (see chaos_io_config.c), and
+         * two rules with the same operation and the same selector tie on every
+         * specificity stage down to the line, so the later one is dead whatever it
+         * carries. */
+        if (rules[index].operation == later->operation &&
             memcmp(&rules[index].selector, &later->selector, sizeof(later->selector)) == 0)
         {
             return 1;

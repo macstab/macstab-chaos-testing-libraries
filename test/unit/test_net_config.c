@@ -2555,9 +2555,26 @@ static void test_shadowed_rules_warn(void)
     );
     assert(chaos_net_config_last_error()->reason == NULL);
 
+    /* A different effect on the same selector and operation is *not* a second selection:
+     * net matches on the operation and the endpoint and never on the effect, so the later
+     * rule is as dead as a literal duplicate. Proved through the selection rather than
+     * argued -- the file is written, prepared and asked, and it answers with the first
+     * rule's effect. */
     assert(chaos_net_config_parse_buffer(distinct, rules, &count) == 0);
     assert(count == 2U);
-    assert(chaos_net_config_last_error()->warning_count == 0U);
+    assert(chaos_net_config_last_error()->warning_count == 1U);
+    assert(chaos_net_config_last_error()->warnings[0].line == 2U);
+    {
+        chaos_net_endpoint_t any = {0};
+        chaos_net_rule_t picked;
+
+        write_config_text("*:recv:LATENCY:10\n*:recv:ECONNRESET:1.0\n", 31);
+        assert(chaos_net_endpoint_parse_selector("tcp4://127.0.0.1:9011", &any));
+        g_chaos_net_cached_mtime = CHAOS_NET_MTIME_UNKNOWN;
+        assert(chaos_net_config_prepare());
+        assert(chaos_net_config_match_endpoint_loaded(CHAOS_NET_OP_RECV, &any, &picked));
+        assert(picked.effect == CHAOS_NET_EFFECT_LATENCY);
+    }
 
     /* The operation counts as much as the selector: recv and send never shadow. */
     assert(chaos_net_config_parse_buffer(other_operation, rules, &count) == 0);

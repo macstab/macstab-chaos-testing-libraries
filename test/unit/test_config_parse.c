@@ -1843,9 +1843,22 @@ static void test_shadowed_rules_warn(void)
     assert(chaos_io_config_last_error()->warnings[0].line == 2U);
     assert(chaos_io_config_last_error()->warnings[1].line == 3U);
 
-    /* Differing in any of the three parts means both rules can fire. */
+    /* A different effect is *not* one of those: io selects on the operation and the prefix
+     * and never looks at the effect, so the later rule can never be picked either. Proved
+     * here rather than argued -- the selection is asked, and it answers with the first
+     * rule's effect whichever way round the two are written. */
     assert(chaos_io_config_parse_buffer(other_effect, rules, &count) == 0);
-    assert(chaos_io_config_last_error()->warning_count == 0U);
+    assert(count == 2U);
+    {
+        chaos_io_rule_t picked;
+
+        assert(chaos_io_config_select_rule(rules, count, CHAOS_IO_OP_READ, "/data/x", &picked));
+        assert(picked.effect == CHAOS_IO_EFFECT_ERRNO);
+    }
+    assert(chaos_io_config_last_error()->warning_count == 1U);
+    assert(chaos_io_config_last_error()->warnings[0].line == 2U);
+    /* The other two differences are real: another operation or another prefix is another
+     * selection, and both rules can fire. */
     assert(chaos_io_config_parse_buffer(other_operation, rules, &count) == 0);
     assert(chaos_io_config_last_error()->warning_count == 0U);
     assert(chaos_io_config_parse_buffer(other_prefix, rules, &count) == 0);

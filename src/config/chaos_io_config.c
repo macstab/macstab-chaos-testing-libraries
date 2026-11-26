@@ -528,24 +528,6 @@ static int chaos_io_parse_probability(const char *text, double *probability)
 }
 
 /**
- * @brief Parses a LATENCY parameter: decimal milliseconds, 0 to 4294967295 (about 49.7
- *        days), optionally followed by `@probability`.
- *
- * @details strtoul() base 10 with the whole token consumed (trailing blanks allowed).
- * strtoul() also accepts leading blanks and a sign; "-N" wraps to a value above the limit
- * on LP64 and is rejected, except "-0", which reads as 0.
- *
- * Without `@probability` the rule is certain (1.0), which is what `LATENCY:ms` has always
- * meant. A blank before the `@` makes it a qualifier word instead and the line is rejected,
- * as everywhere else in the grammar: the milliseconds then have a trailing blank, which the
- * whole-token rule refuses.
- *
- * @param[in]  text         Field; NULL returns -1.
- * @param[out] latency_ms   Receives the value; NULL returns -1.
- * @param[out] probability  Receives the probability, 1.0 without one; NULL returns -1.
- * @return 0 on success; -1 on a syntax or range error.
- */
-/**
  * @brief Parses the milliseconds of a LATENCY parameter, whole token.
  *
  * @param[in]  text        Field; NULL returns -1.
@@ -659,6 +641,24 @@ static int chaos_io_parse_rate(const char *text, uint64_t *rate)
     return 0;
 }
 
+/**
+ * @brief Parses a LATENCY parameter: decimal milliseconds, 0 to 4294967295 (about 49.7
+ *        days), optionally followed by `@probability`.
+ *
+ * @details strtoul() base 10 with the whole token consumed (trailing blanks allowed).
+ * strtoul() also accepts leading blanks and a sign; "-N" wraps to a value above the limit
+ * on LP64 and is rejected, except "-0", which reads as 0.
+ *
+ * Without `@probability` the rule is certain (1.0), which is what `LATENCY:ms` has always
+ * meant. A blank before the `@` makes it a qualifier word instead and the line is rejected,
+ * as everywhere else in the grammar: the milliseconds then have a trailing blank, which the
+ * whole-token rule refuses.
+ *
+ * @param[in]  text         Field; NULL returns -1.
+ * @param[out] latency_ms   Receives the value; NULL returns -1.
+ * @param[out] probability  Receives the probability, 1.0 without one; NULL returns -1.
+ * @return 0 on success; -1 on a syntax or range error.
+ */
 static int chaos_io_parse_latency(const char *text, unsigned int *latency_ms, double *probability)
 {
     char milliseconds[16];
@@ -957,7 +957,15 @@ chaos_io_rule_shadowed(const chaos_io_rule_t *rules, size_t count, const chaos_i
 
     for (index = 0U; index < count; ++index)
     {
-        if (rules[index].operation == later->operation && rules[index].effect == later->effect &&
+        /* The effect is not part of this, because it is not part of the selection:
+         * chaos_io_config_select_rule() picks on the operation and the prefix and keeps
+         * the earliest of equal-length prefixes, so a later rule with the same two can
+         * never be picked whatever effect it carries. Comparing effects here let
+         * `/data:read:EIO` followed by `/data:read:LATENCY:200` load with `state=ok` and
+         * no warning while the second never fired -- the silent never-fires this channel
+         * exists to surface. The libraries whose selection takes the effect (dns, time,
+         * memory, process) do compare it, and are right to. */
+        if (rules[index].operation == later->operation &&
             strcmp(rules[index].path_prefix, later->path_prefix) == 0)
         {
             return 1;
