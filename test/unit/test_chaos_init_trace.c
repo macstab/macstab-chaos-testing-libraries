@@ -125,7 +125,10 @@ static void test_reads_the_stopped_call(void)
             assert(ptrace(PTRACE_CONT, child, 0, 0) == 0);
         }
     }
-    assert(WEXITSTATUS(status) == 0);
+    /* WIFEXITED first: a tracee killed by a signal leaves the loop above through
+     * waitpid() running out of children, and WEXITSTATUS of a signal status is 0 -- so
+     * without this every SIGSEGV, SIGSYS, SIGFPE or SIGABRT in the tracee read as a pass. */
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     (void)close(pipe_fds[0]);
 }
 
@@ -164,7 +167,10 @@ static void test_shortening_an_argument_shortens_the_call(void)
             assert(ptrace(PTRACE_CONT, child, 0, 0) == 0);
         }
     }
-    assert(WEXITSTATUS(status) == 0);
+    /* WIFEXITED first: a tracee killed by a signal leaves the loop above through
+     * waitpid() running out of children, and WEXITSTATUS of a signal status is 0 -- so
+     * without this every SIGSEGV, SIGSYS, SIGFPE or SIGABRT in the tracee read as a pass. */
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     (void)close(pipe_fds[0]);
 }
 
@@ -219,7 +225,10 @@ static void test_skipping_a_call(void)
             assert(ptrace(PTRACE_CONT, child, 0, 0) == 0);
         }
     }
-    assert(WEXITSTATUS(status) == 0);
+    /* WIFEXITED first: a tracee killed by a signal leaves the loop above through
+     * waitpid() running out of children, and WEXITSTATUS of a signal status is 0 -- so
+     * without this every SIGSEGV, SIGSYS, SIGFPE or SIGABRT in the tracee read as a pass. */
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     /* Nothing was written: both calls were skipped. The child has exited, so its end of
      * the pipe is closed and a read reports end of file rather than blocking. */
     {
@@ -347,7 +356,10 @@ static void test_exit_stop_reaches_the_result(void)
             assert(ptrace(PTRACE_CONT, child, 0, 0) == 0);
         }
     }
-    assert(WEXITSTATUS(status) == 0);
+    /* WIFEXITED first: a tracee killed by a signal leaves the loop above through
+     * waitpid() running out of children, and WEXITSTATUS of a signal status is 0 -- so
+     * without this every SIGSEGV, SIGSYS, SIGFPE or SIGABRT in the tracee read as a pass. */
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     (void)close(pipe_fds[0]);
 }
 
@@ -525,7 +537,10 @@ static void test_running_another_call_instead(void)
         assert(ptrace(PTRACE_CONT, child, 0, 0) == 0);
     }
     assert(waitpid(child, &status, 0) == child && WIFEXITED(status));
-    assert(WEXITSTATUS(status) == 0);
+    /* WIFEXITED first: a tracee killed by a signal leaves the loop above through
+     * waitpid() running out of children, and WEXITSTATUS of a signal status is 0 -- so
+     * without this every SIGSEGV, SIGSYS, SIGFPE or SIGABRT in the tracee read as a pass. */
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     (void)close(fd);
     (void)unlink(path);
 }
@@ -658,7 +673,10 @@ static void test_running_another_call_first(void)
                 (void)ptrace(PTRACE_CONT, child, 0, 0);
             }
         }
-        assert(WEXITSTATUS(status) == 0);
+        /* WIFEXITED first: a tracee killed by a signal leaves the loop above through
+         * waitpid() running out of children, and WEXITSTATUS of a signal status is 0 -- so
+         * without this every SIGSEGV, SIGSYS, SIGFPE or SIGABRT in the tracee read as a pass. */
+        assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
     (void)close(pipe_fds[0]);
 }

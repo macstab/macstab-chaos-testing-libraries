@@ -233,7 +233,17 @@ int main(void)
         broken[12] = 0xc0U; /* a compression pointer, which a question may not hold */
         (void)decide(__NR_sendto, broken, length, &owned);
         assert(owned == 0);
-        broken[12] = 200U; /* a label that runs past the payload */
+        /* A label whose content runs past the payload. 200 would not test this: its high
+         * bits make it a compression pointer, which the clause above rejects first.
+         *
+         * The bound this reaches is redundancy rather than a guard, and the test says so
+         * because the next reader will wonder: the capacity check caps a name at 255
+         * characters and therefore `at` at about 268, so in a 512-byte payload the copy
+         * can never reach the end of the buffer. Measured: removing the bound entirely
+         * leaves the suite green under ASan, because a name that walks past `size` is
+         * refused by the root-label check behind the loop. It stays as the cheap half of
+         * the pair, so a later change to either limit cannot turn into a read. */
+        broken[12] = 60U;
         (void)decide(__NR_sendto, broken, length, &owned);
         assert(owned == 0);
         /* The root label and the type and class behind it have to be there. */
@@ -263,7 +273,15 @@ int main(void)
         assert(owned == 0);
         write_rules("dns://slow.example.com:LATENCY:40\n");
 
-        /* A name longer than a name may be: 64 labels of four bytes. */
+        /* The capacity guard, pinned from both sides. A rule that matches any name ending
+         * in `.abc` is loaded first, so these assertions see whether the name was built at
+         * all -- `owned == 0` alone passes for a name that parsed and matched nothing,
+         * which is why the old case here proved nothing.
+         *
+         * 64 labels of three bytes is a name of exactly 255 characters: the longest one
+         * the protocol allows, and it must parse. One more character must not, because the
+         * terminator would then be written one byte past the 256-byte name. */
+        write_rules("dns://*.abc:LATENCY:90\n");
         (void)memset(broken, 0, sizeof(broken));
         broken[5] = 1U;
         for (index = 0U; index < 64U; ++index)
@@ -271,8 +289,21 @@ int main(void)
             broken[12U + index * 4U] = 3U;
             (void)memcpy(broken + 13U + index * 4U, "abc", 3U);
         }
-        (void)decide(__NR_sendto, broken, 12U + 64U * 4U + 6U, &owned);
+        assert(decide(__NR_sendto, broken, 12U + 64U * 4U + 6U, &owned).delay_ms == 90U);
+        assert(owned);
+        /* 63 labels of three plus one of four: 256 characters, one too many. */
+        (void)memset(broken, 0, sizeof(broken));
+        broken[5] = 1U;
+        for (index = 0U; index < 63U; ++index)
+        {
+            broken[12U + index * 4U] = 3U;
+            (void)memcpy(broken + 13U + index * 4U, "abc", 3U);
+        }
+        broken[12U + 63U * 4U] = 4U;
+        (void)memcpy(broken + 13U + 63U * 4U, "wabc", 4U);
+        (void)decide(__NR_sendto, broken, 12U + 63U * 4U + 5U + 6U, &owned);
         assert(owned == 0);
+        write_rules("dns://slow.example.com:LATENCY:40\n");
     }
 
     /* Calls and payloads the decider leaves alone: another system call, no buffer, no

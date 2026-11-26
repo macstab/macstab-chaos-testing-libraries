@@ -2086,6 +2086,12 @@ static void test_direct_helper_paths(void)
     int pipefd[2];
 
     reset_wrapper_stubs();
+    /* Zeroed before the first field is set, not 120 lines further down: the draw the
+     * trigger makes reads `rule->hit`, and a rule outside a snapshot has no slot -- which
+     * is only true once the rule is zeroed. With stack garbage there the counter is bumped
+     * through a wild pointer, which UBSan turns into a segfault and ASan happens to
+     * survive, so it would flake rather than fail. */
+    (void)memset(&rule, 0, sizeof(rule));
     assert(chaos_net_apply_pre_call_rule(NULL) == 0);
     assert(chaos_net_apply_simple_pre_call_rule(NULL) == 0);
     assert(chaos_net_wait_pre_call(NULL, 0, &synthetic_timeout) == 0);
