@@ -1961,6 +1961,11 @@ chaos_init_net_decide_at(const chaos_init_call_t *call, long result, chaos_init_
         }
         else if (chaos_init_net_nonblocking(call->tid, call->args[0]))
         {
+            /* Nothing is sent, so the bytes the take handed out go back: see
+             * chaos_net_socket.c. */
+            chaos_bucket_return(
+                throttle_bucket, rule.rate_bps, throttle_allowed, chaos_hits_now_ms()
+            );
             verdict->action = CHAOS_INIT_FAIL;
             verdict->error = EAGAIN;
         }

@@ -633,6 +633,20 @@ static void test_delays(void)
      * call and in no guaranteed order (8 and 9 are both due by 250); a full queue of
      * CHAOS_INIT_MAX_DELAYED refuses the next add. */
     assert(chaos_init_delay_next(&due) == 0);
+    /* A traced entry is never rebound to a notification id. It keeps the thread id in the
+     * same field an id goes into, so an entry rebound that way would stay marked traced
+     * with a notification id in it, and the answer when it came due would ptrace()
+     * whatever process holds that number. A call is either notified or traced -- the
+     * filter decides -- so the two never belong to the same caller. */
+    {
+        chaos_init_call_t stopped = call;
+
+        stopped.tid = 4321;
+        assert(chaos_init_delay_add((uint64_t)stopped.tid, &stopped, 900U, &eio, 1) == 0);
+        assert(chaos_init_delay_resume(&stopped, 99U) == 0);
+        assert(chaos_init_delay_pop_at(900U, &id, &answer, &traced) == 1);
+        assert(traced == 1 && id == (uint64_t)stopped.tid);
+    }
     assert(chaos_init_delay_pop_at(1000U, &id, &answer, &traced) == 0);
     assert(chaos_init_delay_add(7U, &call, 300U, &run, 0) == 0);
     assert(chaos_init_delay_add(8U, &call, 100U, &eio, 0) == 0);

@@ -208,6 +208,41 @@ static inline uint64_t chaos_bucket_chunk(uint64_t rate)
 }
 
 /**
+ * @brief Gives @p bytes back to @p bucket, up to one second's worth.
+ *
+ * @details For a caller that took its allowance and then could not use it: a non-blocking
+ * send that has to answer EAGAIN moved nothing, so the bytes it was charged have to come
+ * back or its next attempt finds the bucket empty again. Without this a datagram larger
+ * than one second's worth of the rate can never be sent at all -- the take never covers
+ * it, every refill is consumed by an attempt that fails, and an event loop told the socket
+ * is writable retries for ever at a rate of zero.
+ *
+ * The stamp is left where it was: only the token count grows, clamped to the rate like
+ * every other refill, so giving back more than was taken cannot lift the bucket above its
+ * ceiling.
+ */
+static inline void
+chaos_bucket_return(chaos_bucket_t *bucket, uint64_t rate, uint64_t bytes, uint64_t now_ms)
+{
+    if (rate == 0U || bytes == 0U || now_ms == 0U)
+    {
+        return;
+    }
+    for (;;)
+    {
+        const uint64_t seen = bucket->state;
+        uint64_t mark = 0U;
+        const uint64_t tokens = chaos_bucket_refill(seen, rate, now_ms, &mark);
+        const uint64_t given = tokens + bytes < rate ? tokens + bytes : rate;
+
+        if (CHAOS_BUCKET_CAS(&bucket->state, seen, chaos_bucket_state(given, mark)))
+        {
+            return;
+        }
+    }
+}
+
+/**
  * @brief Charges @p want bytes to @p bucket, even ones that have not arrived yet.
  *
  * @details What a caller does that must not come back empty-handed: the bytes it is short

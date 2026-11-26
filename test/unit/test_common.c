@@ -1519,6 +1519,35 @@ static void test_bucket(void)
         }
         assert(moved == 50U);
     }
+
+    /* Giving back what could not be used. A caller that takes its allowance and then has
+     * to answer EAGAIN moved nothing, so the bytes come back or its next attempt meets a
+     * bucket it drained itself -- and a datagram larger than one second's worth, which the
+     * take can never cover because the bucket is capped there, would never be sent at all.
+     * The ceiling still holds, and the stamp is untouched. */
+    {
+        const uint64_t at = 40000U;
+
+        bucket.state = 0U;
+        assert(chaos_bucket_take(&bucket, 1000U, 1000U, at) == 1000U);
+        assert(chaos_bucket_take(&bucket, 1000U, 10U, at) == 0U);
+        chaos_bucket_return(&bucket, 1000U, 400U, at);
+        assert(chaos_bucket_take(&bucket, 1000U, 1000U, at) == 400U);
+        /* More back than the bucket holds is capped, not wrapped. */
+        chaos_bucket_return(&bucket, 1000U, 99999U, at);
+        assert(chaos_bucket_take(&bucket, 1000U, 5000U, at) == 1000U);
+        /* No rate, nothing given, no clock: nothing happens, as everywhere else here. */
+        chaos_bucket_return(&bucket, 0U, 10U, at);
+        chaos_bucket_return(&bucket, 1000U, 0U, at);
+        chaos_bucket_return(&bucket, 1000U, 10U, 0U);
+        assert(chaos_bucket_take(&bucket, 1000U, 10U, at) == 0U);
+        /* And a lost race: the state moved under the caller, so it reads it again and
+         * gives the bytes back on top of what it finds. */
+        g_bucket_cas_fails = 1U;
+        chaos_bucket_return(&bucket, 1000U, 250U, at);
+        assert(g_bucket_cas_fails == 0U);
+        assert(chaos_bucket_take(&bucket, 1000U, 1000U, at) == 250U);
+    }
 }
 
 int main(void)

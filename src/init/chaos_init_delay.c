@@ -69,9 +69,16 @@ int chaos_init_delay_resume(const chaos_init_call_t *call, uint64_t id)
         const chaos_init_call_t *parked = &g_chaos_init_delayed[index].call;
 
         /* Same thread, number and raw arguments: the restarted call. Pointed-to memory is
-         * not compared; the raw registers identify the call. */
-        if (parked->tid == call->tid && parked->nr == call->nr &&
-            memcmp(parked->args, call->args, sizeof(parked->args)) == 0)
+         * not compared; the raw registers identify the call.
+         *
+         * Only an entry that was parked from the notification path, though. A traced entry
+         * keeps the thread id in the same field a notification id goes into, so rebinding
+         * one to an id would leave it marked traced with a notification id in it -- and
+         * when it came due the answer would ptrace() whatever process happens to hold that
+         * number. The two kinds never belong to the same caller: a call is either notified
+         * or traced, decided by the filter. */
+        if (g_chaos_init_delayed[index].traced == 0 && parked->tid == call->tid &&
+            parked->nr == call->nr && memcmp(parked->args, call->args, sizeof(parked->args)) == 0)
         {
             g_chaos_init_delayed[index].id = id;
             return 1;

@@ -1050,6 +1050,11 @@ static size_t chaos_net_throttle_size(chaos_net_rule_t *rule, int fd, size_t siz
             {
                 return size;
             }
+            /* Nothing is sent, so nothing may stay charged: the bytes the take handed out
+             * go back. Otherwise every attempt drains the refill it was waiting for, and a
+             * datagram larger than one second's worth of the rate -- which the take can
+             * never cover, since the bucket is capped there -- is never sent at all. */
+            chaos_bucket_return(bucket, rule->rate_bps, allowed, chaos_hits_now_ms());
             *refuse = 1;
             return 0U;
         }
