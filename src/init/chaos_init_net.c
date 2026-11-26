@@ -1775,8 +1775,15 @@ chaos_init_net_decide_at(const chaos_init_call_t *call, long result, chaos_init_
             return 1;
         }
         /* chaos_net_received_bytes(): nothing written means nothing to corrupt, and a
-         * MSG_TRUNC receive on a stream socket discards the data instead of writing it. */
-        if (result <= 0 || size == CHAOS_POLICY_NO_SIZE ||
+         * MSG_TRUNC receive on a stream socket discards the data instead of writing it.
+         *
+         * `size == 0` is the third of those and not a theoretical one: a MSG_TRUNC receive
+         * on a datagram socket reports the whole datagram although the buffer took none of
+         * it, so the byte to flip would be drawn out of a length of zero. On x86-64 that
+         * divide kills the supervisor with SIGFPE -- and the supervisor is PID 1. On
+         * aarch64 it does not trap at all (UDIV yields 0), so it would write a byte into a
+         * buffer the call never wrote to. The library guards the same thing twice. */
+        if (result <= 0 || size == CHAOS_POLICY_NO_SIZE || size == 0U ||
             ((entry->nr == __NR_recvfrom && (call->args[3] & (uint64_t)MSG_TRUNC) != 0U) &&
              chaos_init_net_is_stream(call->args[0])))
         {

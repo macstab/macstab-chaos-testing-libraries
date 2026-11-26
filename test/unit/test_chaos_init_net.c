@@ -1239,6 +1239,35 @@ int main(void)
         after.args[3] = (uint64_t)MSG_TRUNC;
         assert(chaos_init_net_decide_result(&after, 8) == 1);
         assert(untouched(area, sizeof(area), 'A'));
+        /* A receive that reports more than the buffer could hold -- what MSG_TRUNC does on
+         * a datagram socket -- with no buffer at all. The byte to corrupt would be drawn
+         * out of a length of zero: SIGFPE on x86-64, where the supervisor is PID 1, and a
+         * write into a buffer the call never touched on aarch64, which does not trap. */
+        {
+            chaos_init_call_t empty = after;
+            char hits[256] = {0};
+            char path[64];
+            FILE *file;
+
+            empty.args[2] = 0U;
+            empty.args[3] = 0U;
+            (void)memset(area, 'A', sizeof(area));
+            assert(chaos_init_net_decide_result(&empty, 8) == 1);
+            assert(untouched(area, sizeof(area), 'A'));
+            /* The buffer alone does not settle it: on aarch64 a modulo by zero yields the
+             * dividend rather than trapping, so the byte would be written at a drawn
+             * offset far outside this buffer -- somewhere else in the tracee. What both
+             * architectures show is the draw itself: the guard sits before it, so no hit
+             * may have been counted, and a hit rewrites the file. */
+            (void)snprintf(path, sizeof(path), "/tmp/.chaos-net.hits.%ld", (long)getpid());
+            file = fopen(path, "r");
+            if (file != NULL)
+            {
+                hits[fread(hits, 1U, sizeof(hits) - 1U, file)] = '\0';
+                (void)fclose(file);
+            }
+            assert(strstr(hits, "*:recv:CORRUPT:1.0") == NULL);
+        }
         after.args[3] = 0U;
         for (round = 0U; round < 12U; ++round)
         {
@@ -1752,7 +1781,8 @@ int main(void)
         assert(held.arg_index == 2U && held.value == 3L);
         /* Nothing left: the call is parked rather than slept in, so the tracee's other
          * threads keep being served, and the answer when it is due shortens it to the one
-         * byte the wait bought. */
+         * byte the wait bought.
+ */
         held = decide(__NR_write, (uint64_t)server, P(buffer), 10U, 0, 0, 0);
         assert(held.action == CHAOS_INIT_DELAY);
         assert(held.delay_ms == 100U && held.shortens && held.value == 1L);
