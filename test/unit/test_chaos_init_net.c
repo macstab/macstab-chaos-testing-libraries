@@ -1782,10 +1782,15 @@ int main(void)
         /* Nothing left: the call is parked rather than slept in, so the tracee's other
          * threads keep being served, and the answer when it is due shortens it to the one
          * byte the wait bought.
- */
+         *
+         * A range, not 100 exactly: the bucket keeps the part of a millisecond it could
+         * not turn into a token, so the wait is what is left of the byte's 100 ms after
+         * the few milliseconds these calls themselves took. Pinning 100 would pin the
+         * loss of that remainder, which is the defect the bucket test now covers. */
         held = decide(__NR_write, (uint64_t)server, P(buffer), 10U, 0, 0, 0);
         assert(held.action == CHAOS_INIT_DELAY);
-        assert(held.delay_ms == 100U && held.shortens && held.value == 1L);
+        assert(held.delay_ms > 50U && held.delay_ms <= 100U);
+        assert(held.shortens && held.value == 1L);
         assert(held.arg_index == 2U);
         /* The byte is charged when the call is parked, so the next caller waits for the
          * one after it rather than for the same one: a second wait on top of what is left

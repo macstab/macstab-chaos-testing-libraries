@@ -106,9 +106,32 @@ chaos_bucket_refill(uint64_t seen, uint64_t rate, uint64_t now, uint64_t *mark)
     }
     else if (chaos_bucket_later(now, stamp))
     {
-        /* The idle time is not bounded here: the clamp to one second's worth below bounds
-         * the result anyway, and the product of two 32-bit values fits the word. */
-        tokens += (uint32_t)(now - stamp) * rate / UINT64_C(1000);
+        const uint64_t elapsed = (uint32_t)(now - stamp);
+
+        if (elapsed >= UINT64_C(1000))
+        {
+            /* A second or more fills it whatever the rate, which also keeps the products
+             * below from needing more than the word: elapsed stays under 1000 there. */
+            tokens = rate;
+        }
+        else
+        {
+            /* Only whole milliseconds are consumed, and only the tokens those whole
+             * milliseconds pay for are handed out. The remainder stays in the stamp.
+             *
+             * Advancing the stamp to `now` and crediting elapsed * rate / 1000 -- the
+             * obvious form -- throws the remainder away on every refill, and below a
+             * thousand bytes a second the remainder is the whole credit: a millisecond at
+             * 500 B/s is worth 0 bytes, so a caller asking once per millisecond is
+             * refilled nothing for ever while the clock is consumed. Charging the time
+             * the credit covers without recomputing the credit from it is the other trap:
+             * the leftover fraction is then credited twice and the rate runs over. */
+            const uint64_t covered = elapsed * rate / UINT64_C(1000);
+            const uint64_t consumed = covered * UINT64_C(1000) / rate;
+
+            tokens += consumed * rate / UINT64_C(1000);
+            *mark = stamp + consumed;
+        }
     }
     else
     {
@@ -223,9 +246,15 @@ chaos_bucket_reserve(chaos_bucket_t *bucket, uint64_t rate, uint64_t want, uint6
 
         if (CHAOS_BUCKET_CAS(&bucket->state, seen, chaos_bucket_state(left, mark + wait)))
         {
+            const uint64_t due = mark + wait;
+
             /* The wait of a caller that found the bucket already reserved runs from that
-             * reservation, not from now: what is left of it, plus the new one. */
-            return (uint32_t)(mark - now_ms) + wait;
+             * reservation, not from now: what is left of it, plus the new one. `mark` can
+             * also sit *before* now -- it carries the part of a millisecond the refill did
+             * not convert into a token -- so the difference is taken only when it is
+             * ahead, instead of relying on an unsigned subtraction to wrap into the right
+             * answer. A reservation already due is no wait at all. */
+            return chaos_bucket_later(due, now_ms) ? (uint64_t)(uint32_t)(due - now_ms) : 0U;
         }
     }
 }

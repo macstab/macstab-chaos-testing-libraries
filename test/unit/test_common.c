@@ -1338,20 +1338,26 @@ static void test_hits_file_number(void)
     assert(chaos_hits_file_number(long_prefix) == (long)getpid());
 }
 
-/* A once-control whose initialiser spins until a helper thread releases it. */
+/* A once-control whose initialiser spins until a helper thread releases it.
+ *
+ * The three flags are handed between threads with the same acquire/release builtins
+ * chaos_once.h uses, not with `volatile`: volatile keeps the compiler from caching the
+ * value but orders nothing, so a handshake built on it is a data race that happens to
+ * work on the two architectures this is built for. It also hides the ordering from
+ * ThreadSanitizer, which then reports the test rather than the code under test. */
 static volatile chaos_once_t g_once = CHAOS_ONCE_INIT;
-static volatile int g_initialising = 0;
-static volatile int g_release = 0;
-static volatile int g_initialised = 0;
+static int g_initialising = 0;
+static int g_release = 0;
+static int g_initialised = 0;
 
 static void slow_initialise(void)
 {
-    g_initialising = 1;
-    while (!g_release)
+    __atomic_store_n(&g_initialising, 1, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&g_release, __ATOMIC_ACQUIRE) == 0)
     {
         (void)sched_yield();
     }
-    g_initialised = 1;
+    __atomic_store_n(&g_initialised, 1, __ATOMIC_RELEASE);
 }
 
 static void *run_once(void *argument)
@@ -1367,7 +1373,7 @@ static void *release_later(void *argument)
 
     (void)argument;
     (void)nanosleep(&pause, NULL);
-    g_release = 1;
+    __atomic_store_n(&g_release, 1, __ATOMIC_RELEASE);
     return NULL;
 }
 
@@ -1384,14 +1390,16 @@ static void test_once_waits(void)
     pthread_t releaser;
 
     assert(pthread_create(&initialiser, NULL, run_once, NULL) == 0);
-    while (!g_initialising)
+    while (__atomic_load_n(&g_initialising, __ATOMIC_ACQUIRE) == 0)
     {
         (void)sched_yield();
     }
 
     assert(pthread_create(&releaser, NULL, release_later, NULL) == 0);
     assert(chaos_once(&g_once, slow_initialise) == 1);
-    assert(g_initialised);
+    /* Plain read: chaos_once() returning 1 is what makes the initialiser's write visible,
+     * and that is the property under test. */
+    assert(__atomic_load_n(&g_initialised, __ATOMIC_RELAXED) == 1);
     assert(pthread_join(initialiser, NULL) == 0);
     assert(pthread_join(releaser, NULL) == 0);
 }
@@ -1485,6 +1493,26 @@ static void test_bucket(void)
     bucket.state = 0U;
     assert(chaos_bucket_reserve(&bucket, 1000U, 2000U, UINT64_C(0x1000003e8)) == 1000U);
     assert((bucket.state >> 32) == 0U);
+
+    /* A rate whose millisecond is worth less than a byte. Asked once per millisecond, the
+     * elapsed time must not be thrown away: at 500 bytes a second a byte is due every
+     * other millisecond, so a hundred milliseconds of polling must hand out fifty. The
+     * whole second's worth the bucket starts with is drained first, so what follows is
+     * refill alone. Rates below a thousand are the common ones -- a slow log shipper, a
+     * trickling metrics push -- and a bucket that loses the remainder hands out nothing
+     * for them, for ever. */
+    {
+        uint64_t moved = 0U;
+        uint64_t at;
+
+        bucket.state = 0U;
+        assert(chaos_bucket_take(&bucket, 500U, 500U, 30000U) == 500U);
+        for (at = 30001U; at <= 30100U; ++at)
+        {
+            moved += chaos_bucket_take(&bucket, 500U, 1U, at);
+        }
+        assert(moved == 50U);
+    }
 }
 
 int main(void)
