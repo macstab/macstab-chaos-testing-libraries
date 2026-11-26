@@ -909,7 +909,7 @@ The shared objects carry only the wrappers and their rule engine:
 | `-fomit-frame-pointer`, `-fno-ident` | no frame-pointer setup, no compiler ident string |
 | `-fno-stack-protector` | no canary: `__stack_chk_fail` would write to stderr through the interposed `write` ([`docs/ENGINEERING.md`](docs/ENGINEERING.md)) |
 | `-Wl,--strip-all`, `-Wl,--build-id=none` | no symbol table beyond the dynamic one, no build-id note |
-| `-Wl,-z,max-page-size=4096 -Wl,-z,common-page-size=4096` | 4 KiB segment alignment; the aarch64 GNU ld default of 64 KiB pads every segment |
+| `-Wl,-z,max-page-size=4096` (amd64) / `=65536` (arm64), `-Wl,-z,common-page-size=4096` | Segment alignment at least the kernel's page size: a 4 KiB-aligned object does not load on an arm64 kernel configured with 64 KiB pages |
 
 No C++ runtime, no allocator in the hot path, `-ldl` as the only link library.
 

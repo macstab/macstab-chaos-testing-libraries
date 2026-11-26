@@ -704,11 +704,14 @@ parser, and `-Wall -Wextra -Werror`.
 
 No build-id note; release objects are identified by version and file name.
 
-### `-Wl,-z,max-page-size=4096` and `-Wl,-z,common-page-size=4096`
+### `max-page-size` per architecture, `common-page-size=4096`
 
-4 KiB segment alignment instead of the 64 KiB aarch64 default, which pads the
-file. Consequence: the segments assume 4 KiB pages. On arm64 kernels
-configured with 16 KiB or 64 KiB pages the loader cannot map these objects.
+Segment alignment (`p_align`) must be at least the kernel's page size, or the loader
+cannot map the object at all. amd64 keeps 4 KiB; **arm64 is linked with
+`max-page-size=65536`**, because an arm64 kernel may be configured with 16 KiB or 64 KiB
+pages (CentOS/RHEL arm64, some Ampere images) and a 4 KiB-aligned object does not load
+there. It costs about 20 KiB per arm64 object. `common-page-size=4096` stays on both, so
+the file is not padded to the larger size.
 
 ### Summary Table
 
@@ -723,7 +726,7 @@ configured with 16 KiB or 64 KiB pages the loader cannot map these objects.
 | `-fomit-frame-pointer`, `-fno-ident` | no frame pointer, no `.comment` | smaller, one more register |
 | `-fno-stack-protector` | no canary | no `__stack_chk_fail` import |
 | `-Wl,--build-id=none` | no build-id note | smaller |
-| `-Wl,-z,max-page-size=4096`, `common-page-size=4096` | 4 KiB alignment | smaller arm64 objects; requires 4 KiB pages |
+| `max-page-size` 4096 (amd64) / 65536 (arm64), `common-page-size=4096` | alignment at least the kernel's page size | loads on 4, 16 and 64 KiB-page kernels; +20 KiB per arm64 object |
 | `-ldl` | link libdl | `dlsym` before glibc 2.34 |
 
 ## Verified Doc Examples

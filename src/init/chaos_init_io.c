@@ -711,7 +711,18 @@ chaos_init_io_decide_at(const chaos_init_call_t *call, long result, chaos_init_v
     /* `@size` input, measured only after a match: the iovec case costs tracee reads. */
     if (entry->size >= 0)
     {
-        rule.call_size = call->args[entry->size];
+        const uint64_t raw = call->args[entry->size];
+
+        /* truncate and allocate carry a signed off_t, and a negative length is not a byte
+         * count: the kernel rejects it with EINVAL, and the wrapper maps it to "no size"
+         * for that reason. Taken out of the register as unsigned it is a count above any
+         * `@size>N` gate, so the supervisor would fail a call the kernel refuses by itself
+         * -- a fault on a call no rule selected, and a disagreement with LD_PRELOAD. */
+        rule.call_size = ((entry->operation == CHAOS_IO_OP_TRUNCATE ||
+                           entry->operation == CHAOS_IO_OP_ALLOCATE) &&
+                          (int64_t)raw < 0)
+                             ? CHAOS_POLICY_NO_SIZE
+                             : raw;
     }
     else if (entry->size == -2)
     {

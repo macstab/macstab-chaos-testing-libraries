@@ -26,7 +26,7 @@ in [`docs/PLATFORM.md`](PLATFORM.md).
 | Wrappers | `clock_gettime()`, `gettimeofday()`, `time()`, `timespec_get()`, `nanosleep()`, `clock_nanosleep()`, `sleep()`, `usleep()` |
 | Selectors | `*`, `clock_gettime`, `clock_gettime/<clock>`, `nanosleep`, `usleep` |
 | Effects | ERRNO, LATENCY, OFFSET, REGRESS, FREEZE |
-| Qualifiers | `@first`, `@every`, `@at`, `@from`, `@until`, `@size` (accepted; `@size` never matches, §8.4) |
+| Qualifiers | `@first`, `@every`, `@at`, `@from`, `@until`; `@size` is **rejected** (§8.4) |
 | Rule file | `/tmp/.chaos-time.conf` |
 | Status file | `/tmp/.chaos-time.status` |
 | Hits file | `/tmp/.chaos-time.hits.<n>` |
@@ -376,7 +376,7 @@ Rules of the effect:
 - **Window:** outside `@from`/`@until` nothing is shifted, also after the jump.
 - **fork():** the child inherits the state (a jumped parent has a jumped child); a
   decision in progress (`3`) is reset to `1`.
-- With `@size` the rule never jumps (clock reads carry no byte count, §8.4).
+- `@size` is rejected on a clock rule, so it cannot be combined with this (§8.4).
 
 A static negative OFFSET never shows the step, because the first read is already
 shifted. REGRESS exists for code that must survive the step itself: timeouts, rate
@@ -423,7 +423,7 @@ Rules of the effect:
   not break the guarantee of §5.2 the way OFFSET and REGRESS do. It breaks progress
   instead: code that waits for an interval to pass waits forever, which is the fault under
   test for watchdogs, lease renewal and backoff loops.
-- With `@size` the rule never fires (clock reads carry no byte count, §8.4).
+- `@size` is rejected on a clock rule, so it cannot be combined with this (§8.4).
 
 FREEZE is applied last, after OFFSET and REGRESS, so the value it keeps is the one those
 rules produced: an `OFFSET:+86400000` and a `FREEZE:1` on the same clock stop it one day
@@ -598,8 +598,9 @@ returns `EIO`.
 `@first`, `@from`, `@until` and `@size` behave as in every library (`chaos_policy.h`):
 `@first=N` caps the firings per process, `@from`/`@until` gate on the real wall clock in
 Unix milliseconds (read from the vDSO, so a realtime OFFSET does not move the window).
-Clock reads and sleeps carry no byte count, so **a rule with `@size` parses but never
-fires**.
+Clock reads and sleeps carry no byte count, so **a rule with `@size` is rejected** and
+takes the whole file with it -- a gate no call can ever pass is a rule that cannot fire,
+and this release refuses those rather than loading them.
 
 ### 8.5 Failure Behaviour of the Rule File
 
@@ -755,8 +756,8 @@ Only a shift that every read carries is converted:
 
 | Rule    | Converted when                                                                            |
 |---------|-------------------------------------------------------------------------------------------|
-| OFFSET  | probability 1, no `@first`, no `@size`, `@from`/`@until` window open                      |
-| REGRESS | state jumped (`2`) and window open                                                        |
+| OFFSET  | probability 1, no `@first`, no `@every`, no `@at`, `@from`/`@until` window open            |
+| REGRESS | state jumped (`2`), no `@every`, no `@at`, and window open                                |
 | FREEZE  | never: a stopped clock is no shift the conversion could undo (§5.6)                       |
 
 A deadline computed from a read the probability gate left unshifted cannot be told apart

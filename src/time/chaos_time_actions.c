@@ -334,8 +334,15 @@ int chaos_time_rule_unshift_deadline(
 {
     int changed = 0;
 
+    /* Every qualifier that can make the shift apply to some reads and not others has to
+     * be absent, because this subtraction is unconditional: a deadline the program worked
+     * out from a shifted clock is only shifted if the clock really was. `@every` and
+     * `@at` are the two this list was missing -- with `@at=+60000` no read was shifted for
+     * the first minute while every absolute clock_nanosleep had the offset taken off its
+     * deadline anyway, so it woke at once and a loop sleeping absolutely spun. */
     if (offset_rule != NULL && offset_rule->effect == CHAOS_TIME_EFFECT_OFFSET &&
         offset_rule->probability >= 1.0 && offset_rule->policy.first == 0U &&
+        offset_rule->policy.every == 0U && offset_rule->policy.at_ms == 0U &&
         !offset_rule->policy.has_size_above && !offset_rule->policy.has_size_below &&
         chaos_policy_window_open(&offset_rule->policy))
     {
@@ -345,7 +352,8 @@ int chaos_time_rule_unshift_deadline(
     if (regress_rule != NULL && regress_rule->effect == CHAOS_TIME_EFFECT_REGRESS &&
         regress_rule->hit != NULL &&
         chaos_hit_slot_current(regress_rule->hit, regress_rule->hit_generation) &&
-        regress_rule->hit->state == 2U && chaos_policy_window_open(&regress_rule->policy))
+        regress_rule->hit->state == 2U && regress_rule->policy.every == 0U &&
+        regress_rule->policy.at_ms == 0U && chaos_policy_window_open(&regress_rule->policy))
     {
         chaos_time_add_offset_ms(deadline, regress_rule->offset_ms);
         changed = 1;

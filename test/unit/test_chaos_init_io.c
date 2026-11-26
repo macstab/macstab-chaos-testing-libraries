@@ -356,6 +356,16 @@ int main(void)
      * never fired here. */
     assert(FAILS(decide(__NR_fallocate, (uint64_t)big, 0, 0, 200U, 0), EDQUOT));
     assert(PASSES(decide(__NR_fallocate, (uint64_t)big, 0, 0, 50U, 0)));
+    /* A negative length is not a byte count. Both of these carry a signed off_t, the
+     * kernel rejects them with EINVAL, and the wrapper maps them to "no size" for exactly
+     * that reason -- read out of the register as unsigned, -4096 is a count above any
+     * `@size>N` gate, so the supervisor failed a call the kernel would have refused while
+     * LD_PRELOAD let it through. -1 happened to agree, being the value that means "no
+     * size"; -2 and below did not. */
+    assert(PASSES(decide(__NR_truncate, P("/tmp/initio/big/f"), (uint64_t)(int64_t)-4096, 0, 0, 0))
+    );
+    assert(PASSES(decide(__NR_ftruncate, (uint64_t)big, (uint64_t)(int64_t)-2, 0, 0, 0)));
+    assert(PASSES(decide(__NR_fallocate, (uint64_t)big, 0, 0, (uint64_t)(int64_t)-4096, 0)));
     assert(
         FAILS(decide(__NR_unlinkat, (uint64_t)AT_FDCWD, P("/tmp/initio/data/f"), 0, 0, 0), EACCES)
     );

@@ -516,6 +516,15 @@ static void test_unshift_deadline(void)
     offset.policy.until_ms = 1;
     assert(chaos_time_rule_unshift_deadline(&offset, NULL, &deadline) == 0);
     offset.policy.until_ms = 0;
+    /* The two qualifiers this release added belong in the same list: both make the shift
+     * apply to some reads and not others, and an unshifted deadline taken off a deadline
+     * the program never shifted makes an absolute sleep return at once. */
+    offset.policy.every = 2U;
+    assert(chaos_time_rule_unshift_deadline(&offset, NULL, &deadline) == 0);
+    offset.policy.every = 0U;
+    offset.policy.at_ms = 60000U;
+    assert(chaos_time_rule_unshift_deadline(&offset, NULL, &deadline) == 0);
+    offset.policy.at_ms = 0U;
     assert(deadline.tv_sec == 98);
 
     slot.state = 1U;
@@ -527,6 +536,12 @@ static void test_unshift_deadline(void)
     regress.policy.until_ms = 1;
     assert(chaos_time_rule_unshift_deadline(NULL, &regress, &deadline) == 0);
     regress.policy.until_ms = 0;
+    regress.policy.every = 3U;
+    assert(chaos_time_rule_unshift_deadline(NULL, &regress, &deadline) == 0);
+    regress.policy.every = 0U;
+    regress.policy.at_ms = 500U;
+    assert(chaos_time_rule_unshift_deadline(NULL, &regress, &deadline) == 0);
+    regress.policy.at_ms = 0U;
     assert(chaos_time_rule_unshift_deadline(NULL, &regress, &deadline) == 1);
     assert(deadline.tv_sec == 103);
     assert(chaos_time_rule_unshift_deadline(&offset, &regress, &deadline) == 1);
