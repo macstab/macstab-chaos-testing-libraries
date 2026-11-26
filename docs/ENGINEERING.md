@@ -78,17 +78,18 @@ Shared mechanisms live in header-only `src/common/` (see
 5. [`src/wrappers/chaos_io_rw.c`](../src/wrappers/chaos_io_rw.c) — `read`/`write` families, vectored I/O, `sendfile`, `copy_file_range`
 6. [`src/wrappers/chaos_io_fsops.c`](../src/wrappers/chaos_io_fsops.c) — truncate, allocate, unlink, rename families
 7. [`src/wrappers/chaos_io_sync.c`](../src/wrappers/chaos_io_sync.c) — `close`, `dup2`/`dup3`, `close_range`, `closefrom`, `fsync`, `fdatasync`
-8. [`src/wrappers/chaos_io_stdio.c`](../src/wrappers/chaos_io_stdio.c) — stdio streams
-9. [`src/config/chaos_io_config.c`](../src/config/chaos_io_config.c) — reload, parser, longest-prefix selection
-10. [`src/effects/chaos_io_actions.c`](../src/effects/chaos_io_actions.c) — probability, latency, corruption, torn-write sizing
-11. [`src/config/chaos_io_fdcache.c`](../src/config/chaos_io_fdcache.c) — process-wide 32-slot fd→path cache
+8. [`src/wrappers/chaos_io_statfs.c`](../src/wrappers/chaos_io_statfs.c) — `statfs`, `fstatfs`, `statvfs`, `fstatvfs`; `FREE` and `FULL`
+9. [`src/wrappers/chaos_io_stdio.c`](../src/wrappers/chaos_io_stdio.c) — stdio streams
+10. [`src/config/chaos_io_config.c`](../src/config/chaos_io_config.c) — reload, parser, longest-prefix selection
+11. [`src/effects/chaos_io_actions.c`](../src/effects/chaos_io_actions.c) — probability, latency, corruption, torn-write sizing, free-space counts
+12. [`src/config/chaos_io_fdcache.c`](../src/config/chaos_io_fdcache.c) — process-wide 32-slot fd→path cache
 
 ### `libchaos-net`
 
 1. [`src/net/chaos_net.c`](../src/net/chaos_net.c) — constructor, real functions, seed
 2. [`src/net/chaos_net_config.c`](../src/net/chaos_net_config.c) — reload, parser, endpoint-rank selection
 3. [`src/net/chaos_net_endpoint.c`](../src/net/chaos_net_endpoint.c) — selector parsing; endpoints from `sockaddr`, `getsockname`/`getpeername`, `SO_TYPE`
-4. [`src/net/chaos_net_socket.c`](../src/net/chaos_net_socket.c) — `connect`, `accept`, `send*`/`recv*`, and `read`/`write`/`readv`/`writev`/`close` on sockets; `TRICKLE`, `DUP`, `RESET`
+4. [`src/net/chaos_net_socket.c`](../src/net/chaos_net_socket.c) — `connect`, `accept`, `send*`/`recv*`, and `read`/`write`/`readv`/`writev`/`close` on sockets; `TRICKLE`, `DUP`, `RESET`, `DROP`, `THROTTLE`, `REDIRECT`
 5. [`src/net/chaos_net_extra.c`](../src/net/chaos_net_extra.c) — `socket`, `socketpair`, `shutdown`, `sendmmsg`, `recvmmsg`
 6. [`src/net/chaos_net_wait.c`](../src/net/chaos_net_wait.c) — `poll`, `ppoll`, `select`, `pselect`, `epoll_wait`, `epoll_pwait`; epoll membership from `/proc/self/fdinfo`
 7. [`src/net/chaos_net_actions.c`](../src/net/chaos_net_actions.c) — probability, latency, corruption
@@ -105,7 +106,7 @@ Shared mechanisms live in header-only `src/common/` (see
 
 1. [`src/time/chaos_time.c`](../src/time/chaos_time.c) — constructor, real functions, seed, first load
 2. [`src/time/chaos_time_config.c`](../src/time/chaos_time_config.c) — reload, parser, clock selectors
-3. [`src/time/chaos_time_actions.c`](../src/time/chaos_time_actions.c) — probability, latency, `OFFSET` arithmetic (clamped at `{0, 0}`), `REGRESS` state
+3. [`src/time/chaos_time_actions.c`](../src/time/chaos_time_actions.c) — probability, latency, `OFFSET` arithmetic (clamped at `{0, 0}`), `REGRESS` state, `FREEZE` reading
 4. [`src/time/chaos_time_hooks.c`](../src/time/chaos_time_hooks.c) — `clock_gettime`, `gettimeofday`, `time`, `timespec_get`, `nanosleep`, `clock_nanosleep`, `sleep`, `usleep`
 
 ### `libchaos-memory`
@@ -190,6 +191,15 @@ Owns `close`, `fsync`, `fdatasync` and the descriptor-recycling calls
 and `fdatasync` take `ERRNO` and `LATENCY` only. Keep these wrappers free of
 effect-specific policy.
 
+### [`src/wrappers/chaos_io_statfs.c`](../src/wrappers/chaos_io_statfs.c)
+
+Owns `statfs`, `fstatfs`, `statvfs`, `fstatvfs` and the glibc `64` aliases. The
+real call always runs and two fields of its answer are rewritten: `f_bfree` and
+`f_bavail`, in the structure's own unit (`f_bsize` for `struct statfs`,
+`f_frsize` for `struct statvfs`). The total is left alone, and a failing real
+call is reported unchanged. The inode counts are not touched: a filesystem out
+of inodes is a different fault, and one rule should not say two things.
+
 ### [`src/wrappers/chaos_io_stdio.c`](../src/wrappers/chaos_io_stdio.c)
 
 Owns stdio. glibc and musl read and write a `FILE` with internal system calls,
@@ -201,7 +211,8 @@ all. Read class: `fread`, `fgets`, `fgetc`, `getc`, `getline`, `getdelim`,
 negative count), sets errno and raises the stream's error indicator (bit
 `0x20` of the first word of `FILE` on glibc and musl, set under the stream
 lock). `TORN` does not apply: a short `fwrite` signals an error in stdio, not
-partial success. Not wrapped: `scanf` family, `*_unlocked`, and
+partial success, and `DROP` and `THROTTLE` are ignored for the same reason --
+stdio buffers, so what they would hold back is not the bytes of one system call. Not wrapped: `scanf` family, `*_unlocked`, and
 `printf`/`puts`/`putchar`/`getchar`, which only use descriptors 0–2.
 
 ### [`src/config/chaos_io_config.c`](../src/config/chaos_io_config.c)
@@ -263,7 +274,13 @@ Owns `connect`, `accept`/`accept4`, `send`/`sendto`/`sendmsg`,
 to libc directly. Receive reshaping lives here: `TRICKLE` only on stream
 sockets (shortening a datagram receive truncates the datagram), and only for
 iovec arrays of at most 64 entries; `DUP` skips peeks, `MSG_TRUNC`,
-out-of-band and error-queue reads, `MSG_WAITALL` and empty buffers.
+out-of-band and error-queue reads, `MSG_WAITALL` and empty buffers. `DROP`
+replaces a send on a datagram socket with its own byte count, for the same
+reason mirrored: a gap in a stream is not packet loss. Send reshaping lives here
+too: `THROTTLE` takes each send's bytes from a token bucket
+([`src/common/chaos_bucket.h`](../src/common/chaos_bucket.h)) kept per descriptor
+and rate, shortens a stream send to what is left and makes a datagram wait for its
+whole message rather than cutting it.
 
 ### [`src/net/chaos_net_extra.c`](../src/net/chaos_net_extra.c)
 
@@ -316,20 +333,25 @@ symbols (see [Recursion And Internal Calls](#recursion-and-internal-calls)).
 ### [`src/time/chaos_time_config.c`](../src/time/chaos_time_config.c)
 
 Owns time rule-file ingestion: selectors `*` (rank 1), operation (rank 2),
-`clock_gettime/<clock>` (rank 3). `OFFSET` is valid only on `clock_gettime`
-selectors; `REGRESS` only on `clock_gettime/<clock>` with a positive offset.
+`clock_gettime/<clock>` (rank 3). `OFFSET` and `FREEZE` are valid only on
+`clock_gettime` selectors; `REGRESS` only on `clock_gettime/<clock>` with a
+positive offset. `FREEZE` takes the probability as its value field, having no
+amount of its own.
 
 ### [`src/time/chaos_time_actions.c`](../src/time/chaos_time_actions.c)
 
 Owns `OFFSET` arithmetic on `int64_t` intermediates (no signed overflow),
 normalising `tv_nsec` into `[0, 999 999 999]` and clamping a negative result
-to `{0, 0}`. Neither `OFFSET` nor `REGRESS` keeps `CLOCK_MONOTONIC`
-monotonic; that is their purpose.
+to `{0, 0}`, and the `FREEZE` reading in the hit slot, marked with the top bit
+so it cannot be read as a `REGRESS` state. Neither `OFFSET` nor `REGRESS` keeps
+`CLOCK_MONOTONIC` monotonic; that is their purpose. `FREEZE` does keep it and
+stops progress instead.
 
 ### [`src/time/chaos_time_hooks.c`](../src/time/chaos_time_hooks.c)
 
 Owns the eight time wrappers. Order per wrapper: guard → `LATENCY` →
-`ERRNO` → real call → `OFFSET`/`REGRESS` (clock reads only, on success).
+`ERRNO` → real call → `OFFSET`/`REGRESS`/`FREEZE` (clock reads only, on
+success; `FREEZE` last, so it keeps the value the other two produced).
 `gettimeofday`, `time` and `timespec_get` use the `clock_gettime/realtime`
 rules; `clock_nanosleep` and `sleep` use the `nanosleep` rules.
 
@@ -425,11 +447,19 @@ is not offered: the caller cannot tell it from a genuine short read.
 
 ### `write()`, `writev()`, `pwrite()`, `pwritev()`, and Linux `sendfile()` / `copy_file_range()`
 
-May delay before, fail before, or shorten the request (`TORN`). The caller's
-buffer is never modified. For `writev`/`pwritev` the torn byte budget is
-mapped back into a truncated copy of the iovec array (vectors longer than
-`CHAOS_IO_TORN_MAX_IOV` are not torn). `sendfile` and `copy_file_range` match
-on the destination descriptor and support `ERRNO`, `LATENCY`, `TORN`.
+May delay before, fail before, shorten the request (`TORN`, or `THROTTLE` to what
+its token bucket allows) or replace it entirely (`DROP`: the full count is reported
+and nothing is written). The
+caller's buffer is never modified. For `writev`/`pwritev` the torn byte budget
+is mapped back into a truncated copy of the iovec array (vectors longer than
+`CHAOS_IO_TORN_MAX_IOV` are not torn). A dropped `write`/`writev` moves the file
+offset on by the reported count, which is what keeps the next write off the
+bytes the caller believes it already wrote; `O_APPEND` needs no correction and a
+descriptor without an offset does not fire. `sendfile` and `copy_file_range`
+match on the destination descriptor and support `ERRNO`, `LATENCY`, `TORN` and
+`THROTTLE` -- a shortened transfer moves both offsets by what it transferred, so it
+is short rather than lost -- but not `DROP`, which would have to fake the offsets of
+two descriptors at once.
 
 Data moved through `splice`, `mmap` or other paths outside the wrapped set is
 not faulted.
@@ -674,11 +704,14 @@ parser, and `-Wall -Wextra -Werror`.
 
 No build-id note; release objects are identified by version and file name.
 
-### `-Wl,-z,max-page-size=4096` and `-Wl,-z,common-page-size=4096`
+### `max-page-size` per architecture, `common-page-size=4096`
 
-4 KiB segment alignment instead of the 64 KiB aarch64 default, which pads the
-file. Consequence: the segments assume 4 KiB pages. On arm64 kernels
-configured with 16 KiB or 64 KiB pages the loader cannot map these objects.
+Segment alignment (`p_align`) must be at least the kernel's page size, or the loader
+cannot map the object at all. amd64 keeps 4 KiB; **arm64 is linked with
+`max-page-size=65536`**, because an arm64 kernel may be configured with 16 KiB or 64 KiB
+pages (CentOS/RHEL arm64, some Ampere images) and a 4 KiB-aligned object does not load
+there. It costs about 20 KiB per arm64 object. `common-page-size=4096` stays on both, so
+the file is not padded to the larger size.
 
 ### Summary Table
 
@@ -693,7 +726,7 @@ configured with 16 KiB or 64 KiB pages the loader cannot map these objects.
 | `-fomit-frame-pointer`, `-fno-ident` | no frame pointer, no `.comment` | smaller, one more register |
 | `-fno-stack-protector` | no canary | no `__stack_chk_fail` import |
 | `-Wl,--build-id=none` | no build-id note | smaller |
-| `-Wl,-z,max-page-size=4096`, `common-page-size=4096` | 4 KiB alignment | smaller arm64 objects; requires 4 KiB pages |
+| `max-page-size` 4096 (amd64) / 65536 (arm64), `common-page-size=4096` | alignment at least the kernel's page size | loads on 4, 16 and 64 KiB-page kernels; +20 KiB per arm64 object |
 | `-ldl` | link libdl | `dlsym` before glibc 2.34 |
 
 ## Verified Doc Examples

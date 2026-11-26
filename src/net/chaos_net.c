@@ -92,8 +92,11 @@ chaos_net_epoll_pwait_fn g_chaos_net_real_epoll_pwait = NULL;
 /** @brief See chaos_net_internal.h. 0 = not inside a library section. */
 __thread int g_chaos_net_tls_guard = 0;
 
-/** @brief See chaos_net_internal.h. 0 = not seeded yet. */
-__thread uint64_t g_chaos_net_tls_prng_state = 0U;
+/** @copydoc g_chaos_net_lineage */
+uint64_t g_chaos_net_lineage = 0U;
+
+/** @copydoc g_chaos_net_forks */
+uint64_t g_chaos_net_forks = 0U;
 
 /**
  * @brief Process-wide PRNG seed; replaced once by chaos_net_init().
@@ -216,6 +219,41 @@ static uint64_t chaos_net_read_seed_material(void)
 }
 
 /**
+ * @brief The process seed: `CHAOS_SEED` from the environment, else 64 random bits.
+ *
+ * @details `CHAOS_SEED=<decimal u64>` makes every decision of this container reproducible:
+ * a rule's draws follow from the seed, the rule's text and the number of the evaluation,
+ * nothing else. Without it the seed is random.
+ *
+ * `getenv()` is safe here and nowhere else in the library: this runs in the ELF
+ * constructor, before `main`, single-threaded, before the application can call `setenv`.
+ * Anything unusable is ignored rather than rejected -- the seed decides which faults fire,
+ * not whether the rules are valid, and a rule file that loads is worth more to a test than
+ * a refusal over an environment variable. Digits only: strtoull() takes a sign, and "-1"
+ * would wrap silently into UINT64_MAX, a seed nobody asked for.
+ *
+ * @return The seed.
+ */
+static uint64_t chaos_net_seed(void)
+{
+    const char *text = getenv("CHAOS_SEED");
+    char *end = NULL;
+    unsigned long long value;
+
+    if (text == NULL || text[0] < '0' || text[0] > '9')
+    {
+        return chaos_net_read_seed_material();
+    }
+    errno = 0;
+    value = strtoull(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0')
+    {
+        return chaos_net_read_seed_material();
+    }
+    return (uint64_t)value;
+}
+
+/**
  * @brief Resolves every real function. Runs once, through chaos_net_ensure_symbols().
  *
  * @details Must not call a wrapper: on this thread a re-entry into chaos_once() returns
@@ -283,8 +321,7 @@ CHAOS_NET_CONSTRUCTOR
 static void chaos_net_init(void)
 {
     chaos_net_ensure_symbols();
-    g_chaos_net_process_seed = chaos_net_read_seed_material();
-    chaos_net_prng_seed_thread(g_chaos_net_process_seed);
+    g_chaos_net_process_seed = chaos_net_seed();
     chaos_net_config_init();
     /* Load the rules now so a bad rule file is reported at start-up. */
     (void)chaos_net_config_prepare();

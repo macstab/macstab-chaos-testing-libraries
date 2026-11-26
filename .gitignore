@@ -9,3 +9,6 @@ dist/
 .claude/
 # Bytecode cache of benchmark/driver.
 __pycache__/
+
+# Temporary working notes for the 2.1.0 release: planning material, not a deliverable.
+LIBCHAOS-*.md

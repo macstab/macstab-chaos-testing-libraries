@@ -57,10 +57,6 @@ static void test_probability_helpers(void)
     assert(chaos_process_probability_hit_sample(1.0, 0xffffffffU));
     assert(chaos_process_probability_hit_sample(0.5, 0U));
     assert(!chaos_process_probability_hit_sample(0.5, 0xffffffffU));
-
-    chaos_process_prng_seed_thread(UINT64_C(0x1234));
-    assert(!chaos_process_probability_hit(0.0));
-    assert(chaos_process_probability_hit(1.0));
 }
 
 /**
@@ -166,6 +162,33 @@ static void test_fail_after_helper(void)
     assert(chaos_process_rule_fail_after_error(&rule, CHAOS_PROCESS_OP_FORK, &errnum));
     assert(errnum == EAGAIN);
 
+    /* `@every=N` applies to FAIL_AFTER too, counting the calls past the threshold: with
+     * count=0 and `@every=2` the 2nd, 4th and 6th call fail and the others do not. Without
+     * the gate here the qualifier would parse on a FAIL_AFTER rule and do nothing. */
+    {
+        chaos_hit_slot_t slot;
+        unsigned call;
+
+        reset_action_state();
+        (void)memset(&slot, 0, sizeof(slot));
+        rule.hit = &slot;
+        rule.fail_after_count = 0U;
+        rule.policy.every = 2U;
+        for (call = 1U; call <= 6U; ++call)
+        {
+            const int failed =
+                chaos_process_rule_fail_after_error(&rule, CHAOS_PROCESS_OP_FORK, &errnum) != 0;
+
+            assert(failed == (call % 2U == 0U));
+        }
+        assert(slot.evaluations == 6U);
+        assert(slot.count == 3U);
+        rule.policy.every = 0U;
+        rule.hit = NULL;
+    }
+
+    reset_action_state();
+    rule.fail_after_count = 0U;
     rule.probability = 0.0;
     assert(!chaos_process_rule_fail_after_error(&rule, CHAOS_PROCESS_OP_FORK, &errnum));
     assert(!chaos_process_rule_fail_after_error(NULL, CHAOS_PROCESS_OP_FORK, &errnum));
@@ -294,8 +317,108 @@ static void test_fail_after_honours_qualifiers(void)
     assert(errnum == EAGAIN);
 }
 
+/**
+ * @brief Proves a sample follows from the rule and the number of the evaluation, and from
+ *        nothing else.
+ *
+ * @details This is what makes a fault reproducible: the same rule at the same evaluation
+ * number gives the same sample; the next evaluation, a rule of different text and a forked
+ * child's lineage each give an unrelated one; and the draws within one evaluation differ
+ * from each other.
+ */
+static void test_draws_are_reproducible(void)
+{
+    chaos_process_rule_t rule;
+    chaos_hit_slot_t slot;
+    uint32_t first;
+
+    (void)memset(&rule, 0, sizeof(rule));
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.hit = &slot;
+    rule.key = chaos_process_prng_mix(g_chaos_process_process_seed ^ chaos_process_rule_hash("a"));
+
+    chaos_process_rule_draw_begin(&rule);
+    assert(slot.evaluations == 1U);
+    first = chaos_process_rule_draw(&rule, CHAOS_PROCESS_DRAW_PROBABILITY);
+    assert(chaos_process_rule_draw(&rule, CHAOS_PROCESS_DRAW_PROBABILITY) == first);
+    assert(chaos_process_rule_draw(&rule, CHAOS_PROCESS_DRAW_FIRST_EFFECT) != first);
+
+    chaos_process_rule_draw_begin(&rule);
+    assert(slot.evaluations == 2U);
+    assert(chaos_process_rule_draw(&rule, CHAOS_PROCESS_DRAW_PROBABILITY) != first);
+
+    /* A rule whose text differs is a different rule, even in the same slot. */
+    rule.key = chaos_process_prng_mix(g_chaos_process_process_seed ^ chaos_process_rule_hash("b"));
+    slot.evaluations = 0U;
+    chaos_process_rule_draw_begin(&rule);
+    assert(chaos_process_rule_draw(&rule, CHAOS_PROCESS_DRAW_PROBABILITY) != first);
+
+    /* Same rule, same evaluation, different lineage: a forked child decides on its own. */
+    rule.key = chaos_process_prng_mix(g_chaos_process_process_seed ^ chaos_process_rule_hash("a"));
+    slot.evaluations = 0U;
+    g_chaos_process_lineage = chaos_process_prng_mix(1U);
+    chaos_process_rule_draw_begin(&rule);
+    assert(chaos_process_rule_draw(&rule, CHAOS_PROCESS_DRAW_PROBABILITY) != first);
+    g_chaos_process_lineage = 0U;
+
+    /* A rule outside a snapshot has no slot: evaluation 0 every time, which is what makes
+     * the unit tests reproducible without seeding anything. */
+    rule.hit = NULL;
+    chaos_process_rule_draw_begin(&rule);
+    first = chaos_process_rule_draw(&rule, CHAOS_PROCESS_DRAW_PROBABILITY);
+    chaos_process_rule_draw_begin(&rule);
+    assert(chaos_process_rule_draw(&rule, CHAOS_PROCESS_DRAW_PROBABILITY) == first);
+
+    assert(chaos_process_rule_hash("a") == chaos_process_rule_hash("a"));
+    assert(chaos_process_rule_hash("a") != chaos_process_rule_hash("b"));
+    assert(chaos_process_rule_hash(NULL) != chaos_process_rule_hash("a"));
+}
+
+/**
+ * @brief Proves `@every=N` lets only every Nth evaluation through, in the real gate.
+ *
+ * @details The gate itself is tested on values in test_common.c; what is asserted here is
+ * that chaos_process_rule_should_trigger() actually consults it, and where. `@every` counts
+ * evaluations, so a rule at probability 1.0 and `@every=3` fires on the 3rd, 6th and 9th
+ * call and on no other -- and the two calls in between still count as evaluations, which is
+ * what makes the third one the third.
+ */
+static void test_every_gates_evaluations(void)
+{
+    chaos_process_rule_t rule;
+    chaos_hit_slot_t slot;
+    unsigned call;
+    unsigned fired = 0U;
+
+    (void)memset(&rule, 0, sizeof(rule));
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.effect = CHAOS_PROCESS_EFFECT_ERRNO;
+    rule.probability = 1.0;
+    rule.hit = &slot;
+    rule.policy.every = 3U;
+
+    for (call = 1U; call <= 9U; ++call)
+    {
+        const int triggered = chaos_process_rule_should_trigger(&rule) != 0;
+
+        assert(triggered == (call % 3U == 0U));
+        fired += (unsigned)triggered;
+    }
+    assert(fired == 3U);
+    assert(slot.evaluations == 9U);
+    assert(slot.count == 3U);
+
+    /* Without the qualifier every evaluation fires. */
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.policy.every = 0U;
+    assert(chaos_process_rule_should_trigger(&rule) != 0);
+    assert(slot.count == 1U);
+}
+
 int main(void)
 {
+    test_every_gates_evaluations();
+    test_draws_are_reproducible();
     test_should_trigger_honours_qualifiers();
     test_fail_after_honours_qualifiers();
     test_should_trigger_counts_hits();

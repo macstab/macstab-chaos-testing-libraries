@@ -21,6 +21,7 @@ typedef struct chaos_init_delayed
     chaos_init_call_t call;
     uint64_t due_ms;
     chaos_init_verdict_t answer;
+    int traced; /**< `id` is a tracee's tid, not a notification id. */
 } chaos_init_delayed_t;
 
 static chaos_init_delayed_t g_chaos_init_delayed[CHAOS_INIT_MAX_DELAYED];
@@ -32,13 +33,18 @@ chaos_init_verdict_t chaos_init_delay_answer(const chaos_init_verdict_t *verdict
 
     answer.action = verdict->error != 0 ? CHAOS_INIT_FAIL
                     : verdict->returns  ? CHAOS_INIT_RETURN
+                    : verdict->shortens ? CHAOS_INIT_SHORTEN
                                         : CHAOS_INIT_PASS;
     answer.delay_ms = 0U;
     return answer;
 }
 
 int chaos_init_delay_add(
-    uint64_t id, const chaos_init_call_t *call, uint64_t due_ms, const chaos_init_verdict_t *answer
+    uint64_t id,
+    const chaos_init_call_t *call,
+    uint64_t due_ms,
+    const chaos_init_verdict_t *answer,
+    int traced
 )
 {
     if (g_chaos_init_delayed_count == CHAOS_INIT_MAX_DELAYED)
@@ -49,6 +55,7 @@ int chaos_init_delay_add(
     g_chaos_init_delayed[g_chaos_init_delayed_count].call = *call;
     g_chaos_init_delayed[g_chaos_init_delayed_count].due_ms = due_ms;
     g_chaos_init_delayed[g_chaos_init_delayed_count].answer = *answer;
+    g_chaos_init_delayed[g_chaos_init_delayed_count].traced = traced;
     ++g_chaos_init_delayed_count;
     return 0;
 }
@@ -62,9 +69,16 @@ int chaos_init_delay_resume(const chaos_init_call_t *call, uint64_t id)
         const chaos_init_call_t *parked = &g_chaos_init_delayed[index].call;
 
         /* Same thread, number and raw arguments: the restarted call. Pointed-to memory is
-         * not compared; the raw registers identify the call. */
-        if (parked->tid == call->tid && parked->nr == call->nr &&
-            memcmp(parked->args, call->args, sizeof(parked->args)) == 0)
+         * not compared; the raw registers identify the call.
+         *
+         * Only an entry that was parked from the notification path, though. A traced entry
+         * keeps the thread id in the same field a notification id goes into, so rebinding
+         * one to an id would leave it marked traced with a notification id in it -- and
+         * when it came due the answer would ptrace() whatever process happens to hold that
+         * number. The two kinds never belong to the same caller: a call is either notified
+         * or traced, decided by the filter. */
+        if (g_chaos_init_delayed[index].traced == 0 && parked->tid == call->tid &&
+            parked->nr == call->nr && memcmp(parked->args, call->args, sizeof(parked->args)) == 0)
         {
             g_chaos_init_delayed[index].id = id;
             return 1;
@@ -92,7 +106,13 @@ int chaos_init_delay_next(uint64_t *due_ms)
     return 1;
 }
 
-int chaos_init_delay_pop(uint64_t now_ms, uint64_t *id, chaos_init_verdict_t *answer)
+int chaos_init_delay_pop(
+    uint64_t now_ms,
+    uint64_t *id,
+    chaos_init_call_t *call,
+    chaos_init_verdict_t *answer,
+    int *traced
+)
 {
     size_t index;
 
@@ -101,7 +121,9 @@ int chaos_init_delay_pop(uint64_t now_ms, uint64_t *id, chaos_init_verdict_t *an
         if (g_chaos_init_delayed[index].due_ms <= now_ms)
         {
             *id = g_chaos_init_delayed[index].id;
+            *call = g_chaos_init_delayed[index].call;
             *answer = g_chaos_init_delayed[index].answer;
+            *traced = g_chaos_init_delayed[index].traced;
             g_chaos_init_delayed[index] = g_chaos_init_delayed[--g_chaos_init_delayed_count];
             return 1;
         }

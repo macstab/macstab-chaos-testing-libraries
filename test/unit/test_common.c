@@ -5,7 +5,8 @@
  *        slot pools, concurrent initialisers, and the qualifier grammar all libraries use.
  *
  * @details Units under test: `chaos_policy.h`, `chaos_clock.h`, `chaos_status.h`,
- * `chaos_hits.h`, `chaos_once.h`, `chaos_sleep.h`, included header-only.
+ * `chaos_hits.h`, `chaos_bucket.h`, `chaos_once.h`, `chaos_sleep.h`, included
+ * header-only.
  *
  * Isolation: every system call the headers make goes through an overridable macro, which
  * this file defines before the includes:
@@ -33,6 +34,9 @@
  * - hits files are created exclusively (link, or rename where hard links fail), never
  *   overwrite another process's file of the same pid, and are skipped when the name or
  *   contents do not fit; slots follow rule texts across reloads and forks;
+ * - a token bucket starts full, refills at its rate, holds at most one second's worth,
+ *   and hands out bytes it does not have only against a wait that no second caller is
+ *   given again;
  * - a second thread entering an initialiser that is running waits for it;
  * - an interrupted sleep resumes with the remaining time; errno is preserved.
  */
@@ -86,6 +90,21 @@ static struct timespec g_sleep_request;
 static long test_sleep(struct timespec *request, struct timespec *remaining);
 #define CHAOS_SLEEP_SYSCALL(request, remaining) test_sleep((request), (remaining))
 
+/* Bucket seam: `g_bucket_cas_fails` makes that many compare-and-swap attempts fail, which
+ * is what a thread losing the race to another one sees. */
+static unsigned g_bucket_cas_fails = 0U;
+static int test_bucket_cas(volatile uint64_t *state, uint64_t seen, uint64_t next)
+{
+    if (g_bucket_cas_fails > 0U)
+    {
+        --g_bucket_cas_fails;
+        return 0;
+    }
+    return __sync_bool_compare_and_swap(state, seen, next);
+}
+#define CHAOS_BUCKET_CAS(state, seen, next) test_bucket_cas((state), (seen), (next))
+
+#include "../../src/common/chaos_bucket.h"
 #include "../../src/common/chaos_hits.h"
 #include "../../src/common/chaos_once.h"
 #include "../../src/common/chaos_policy.h"
@@ -394,7 +413,9 @@ static void test_hits(void)
         long number = 1L;
         int owned = 0;
 
-        chaos_hits_write_for(prefix, 1L, &number, &owned, next, texts, 2U, room, sizeof(room));
+        chaos_hits_write_for(
+            prefix, 1L, &number, &owned, next, texts, 2U, NULL, room, sizeof(room)
+        );
         chaos_hits_write_for(
             "/tmp/chaos-common-test/hits",
             1L,
@@ -403,6 +424,7 @@ static void test_hits(void)
             next,
             texts,
             2U,
+            NULL,
             buffer,
             sizeof(buffer)
         );
@@ -413,14 +435,32 @@ static void test_hits(void)
          * it. A stale EEXIST in errno must not be mistaken for a taken name. */
         errno = EEXIST;
         chaos_hits_write_for(
-            "/tmp/chaos-common-test/hits", 1L, &number, &owned, next, texts, 2U, room, sizeof(room)
+            "/tmp/chaos-common-test/hits",
+            1L,
+            &number,
+            &owned,
+            next,
+            texts,
+            2U,
+            NULL,
+            room,
+            sizeof(room)
         );
         assert(number == 1L && owned && errno == EEXIST);
         assert(read_file("/tmp/chaos-common-test/hits.1", contents, sizeof(contents)) > 0L);
         assert(strcmp(contents, "3\t/a:open:EIO:1.0\n0\t/b:open:EIO:1.0\n") == 0);
         pool[0].count = 4U;
         chaos_hits_write_for(
-            "/tmp/chaos-common-test/hits", 1L, &number, &owned, next, texts, 2U, room, sizeof(room)
+            "/tmp/chaos-common-test/hits",
+            1L,
+            &number,
+            &owned,
+            next,
+            texts,
+            2U,
+            NULL,
+            room,
+            sizeof(room)
         );
         assert(read_file("/tmp/chaos-common-test/hits.1", contents, sizeof(contents)) > 0L);
         assert(strncmp(contents, "4\t", 2U) == 0);
@@ -442,6 +482,7 @@ static void test_hits(void)
                 next,
                 texts,
                 2U,
+                NULL,
                 room,
                 sizeof(room)
             );
@@ -468,6 +509,7 @@ static void test_hits(void)
                 next,
                 texts,
                 2U,
+                NULL,
                 room,
                 sizeof(room)
             );
@@ -482,13 +524,108 @@ static void test_hits(void)
         owned = 0;
         g_link_fails = EPERM;
         chaos_hits_write_for(
-            "/tmp/chaos-common-test/hits", 1L, &number, &owned, next, texts, 2U, room, sizeof(room)
+            "/tmp/chaos-common-test/hits",
+            1L,
+            &number,
+            &owned,
+            next,
+            texts,
+            2U,
+            NULL,
+            room,
+            sizeof(room)
         );
         g_link_fails = 0;
         assert(owned && number == 1L);
         assert(read_file("/tmp/chaos-common-test/hits.1", contents, sizeof(contents)) > 0L);
         assert(!staging_left());
         (void)unlink("/tmp/chaos-common-test/hits.1");
+
+        /* Header lines (counts that belong to no rule) go in front of the rule lines, and
+         * carry no tab: that is what lets a reader which splits on the first tab skip what
+         * it does not know. Proven here on the bytes, not on the intent. */
+        number = 1L;
+        owned = 0;
+        pool[0].count = 7U;
+        chaos_hits_write_for(
+            "/tmp/chaos-common-test/hits",
+            1L,
+            &number,
+            &owned,
+            next,
+            texts,
+            2U,
+            "suppressed.shared=2\nsuppressed.unknown=0\n",
+            room,
+            sizeof(room)
+        );
+        {
+            char whole[128];
+
+            assert(read_file("/tmp/chaos-common-test/hits.1", whole, sizeof(whole)) > 0L);
+            assert(
+                strcmp(
+                    whole,
+                    "suppressed.shared=2\nsuppressed.unknown=0\n"
+                    "7\t/a:open:EIO:1.0\n0\t/b:open:EIO:1.0\n"
+                ) == 0
+            );
+            /* The header is in front of every tab, which is what makes it skippable. */
+            assert(strchr(whole, '\t') > strstr(whole, "suppressed.unknown=0"));
+        }
+        (void)unlink("/tmp/chaos-common-test/hits.1");
+
+        /* Negative: no header writes the rule lines alone, byte for byte as before. */
+        chaos_hits_write_for(
+            "/tmp/chaos-common-test/hits",
+            1L,
+            &number,
+            &owned,
+            next,
+            texts,
+            2U,
+            NULL,
+            room,
+            sizeof(room)
+        );
+        assert(read_file("/tmp/chaos-common-test/hits.1", contents, sizeof(contents)) > 0L);
+        assert(strcmp(contents, "7\t/a:open:EIO:1.0\n0\t/b:open:EIO:1.0\n") == 0);
+        (void)unlink("/tmp/chaos-common-test/hits.1");
+
+        /* The shared generation line: the header a library writes always starts with it,
+         * so a reader can tell which rule file the counts below belong to. */
+        {
+            char header[CHAOS_HITS_HEADER_MAX];
+
+            assert(chaos_hits_header_generation(header, sizeof(header), 7U) == 13U);
+            assert(strcmp(header, "generation=7\n") == 0);
+            assert(chaos_hits_header_generation(header, sizeof(header), 0U) == 13U);
+            assert(strcmp(header, "generation=0\n") == 0);
+            /* No tab, which is what makes it skippable by a reader that splits on one. */
+            assert(strchr(header, '\t') == NULL);
+            /* Too small: nothing is claimed, so the caller writes no header at all. */
+            assert(chaos_hits_header_generation(header, 4U, 7U) == 0U);
+        }
+
+        /* Negative: a header that does not fit the scratch writes nothing at all -- a
+         * truncated header would be a line a reader cannot classify. */
+        {
+            char tiny[8];
+
+            chaos_hits_write_for(
+                "/tmp/chaos-common-test/hits",
+                1L,
+                &number,
+                &owned,
+                next,
+                texts,
+                2U,
+                "suppressed.shared=2\n",
+                tiny,
+                sizeof(tiny)
+            );
+            assert(access("/tmp/chaos-common-test/hits.1", F_OK) != 0);
+        }
     }
 }
 
@@ -505,13 +642,33 @@ static void test_policy_grammar(void)
     static const char *const rejected[] = {
         "/a:open:EIO:1.0 @first=0",
         "/a:open:EIO:1.0 @first=x",
+        /* `@every=0` would divide by zero, and `@every=` has no count at all. */
+        "/a:open:EIO:1.0 @every=0",
+        "/a:open:EIO:1.0 @every=",
+        "/a:open:EIO:1.0 @every=x",
+        /* `@at` is written with the sign that says "from now on"; without it the number
+         * would read as a Unix time, which is `@from`. A delay of zero is no delay. */
+        "/a:open:EIO:1.0 @at=500",
+        "/a:open:EIO:1.0 @at=+0",
+        "/a:open:EIO:1.0 @at=+",
+        "/a:open:EIO:1.0 @at=+x",
+        "/a:open:EIO:1.0 @at=",
         "/a:open:EIO:1.0 @from=x",
         "/a:open:EIO:1.0 @until=",
+        /* `@until=0` is how "no upper bound" is stored, so taking it as written would turn
+         * a window that can never be open into one that is always open. */
+        "/a:open:EIO:1.0 @until=0",
+        "/a:open:EIO:1.0 @from=0 @until=0",
         "/a:open:EIO:1.0 @size<1/",
         "/a:open:EIO:1.0 @size>1:",
         "/a:open:EIO:1.0 @size=1",
         "/a:open:EIO:1.0 @from=20 @until=20",
         "/a:open:EIO:1.0 @from=20 @until=10",
+        /* A '#' with no blank before it would cut the value short instead of starting
+         * a comment: dns://x:REWRITE:a#b would quietly redirect to `a`. */
+        "/a:open:EIO:1.0#note",
+        "/a:open:EIO:1.0 @first=3#note",
+        "/a:open:EIO:1.0\t@first=3#note",
     };
     chaos_rule_policy_t policy;
     char rule[128];
@@ -534,16 +691,57 @@ static void test_policy_grammar(void)
     assert(strcmp(rule, "/a:open:EIO:1.0 x@first=3") == 0 && chaos_policy_is_empty(&policy));
     assert(extract(" \t", &policy, rule) == 0 && chaos_policy_is_empty(&policy));
 
+    /* A comment still starts wherever a blank, tab or CR precedes the '#', and a line
+     * that opens with one is still a comment. */
+    assert(extract("#note", &policy, rule) == 0 && chaos_policy_is_empty(&policy));
+    assert(extract("/a:open:EIO:1.0 #note", &policy, rule) == 0);
+    assert(extract("/a:open:EIO:1.0\t#note", &policy, rule) == 0);
+    assert(extract("/a:open:EIO:1.0\r#note", &policy, rule) == 0);
+
+    /* `@every=N` counts evaluations, not hits: N >= 1, and 1 is allowed though it gates
+     * nothing. */
+    assert(extract("/a:open:EIO:1.0 @every=3", &policy, rule) == 0 && policy.every == 3U);
+    assert(extract("/a:open:EIO:1.0 @every=1", &policy, rule) == 0 && policy.every == 1U);
+    assert(!chaos_policy_is_empty(&policy));
+
+    /* `@at=+N` is a delay from the moment the rule became active, in ms. */
+    assert(extract("/a:open:EIO:1.0 @at=+500", &policy, rule) == 0 && policy.at_ms == 500U);
+    assert(!chaos_policy_is_empty(&policy));
+    {
+        chaos_hit_slot_t slot;
+
+        (void)memset(&slot, 0, sizeof(slot));
+        /* The delay is measured from the slot's activation moment: a second ago it has
+         * passed, now it has not, and without a moment at all (no slot, or no readable
+         * clock) the rule stays closed rather than firing at once. */
+        slot.armed_ms = chaos_hits_now_ms() - 1000U;
+        assert(chaos_policy_at_ok(&policy, &slot) != 0);
+        slot.armed_ms = chaos_hits_now_ms();
+        assert(chaos_policy_at_ok(&policy, &slot) == 0);
+        slot.armed_ms = chaos_hits_now_ms() + 100000U;
+        assert(chaos_policy_at_ok(&policy, &slot) == 0);
+        slot.armed_ms = 0U;
+        assert(chaos_policy_at_ok(&policy, &slot) == 0);
+        assert(chaos_policy_at_ok(&policy, NULL) == 0);
+        /* Without the qualifier there is nothing to wait for. */
+        assert(extract("/a:open:EIO:1.0", &policy, rule) == 0 && policy.at_ms == 0U);
+        assert(chaos_policy_at_ok(&policy, NULL) != 0);
+    }
+
     /* A window open on one side only is valid. */
     assert(extract("/a:open:EIO:1.0 @until=10", &policy, rule) == 0 && policy.until_ms == 10);
     assert(extract("/a:open:EIO:1.0 @from=10", &policy, rule) == 0 && policy.from_ms == 10);
 
-    /* A malformed qualifier rejects the line and leaves it unmodified; for the two window
-     * errors (`@until` <= `@from`, entries 7 and 8) only the rejection is asserted. */
+    /* A malformed qualifier rejects the line and leaves it unmodified; the window errors
+     * (`@until` <= `@from`) are the exception, because they are found after the words were
+     * cut -- which is what naming them by content rather than by position says. */
     for (index = 0U; index < sizeof(rejected) / sizeof(rejected[0]); ++index)
     {
+        const int window_error =
+            strstr(rejected[index], "@from=") != NULL && strstr(rejected[index], "@until=") != NULL;
+
         assert(extract(rejected[index], &policy, rule) != 0);
-        assert(index >= 7U || strcmp(rule, rejected[index]) == 0);
+        assert(window_error || strcmp(rule, rejected[index]) == 0);
     }
 }
 
@@ -593,6 +791,24 @@ static void test_policy_checks(void)
     memset(&policy, 0, sizeof(policy));
     policy.has_size_below = 1U;
     assert(!chaos_policy_is_empty(&policy));
+    memset(&policy, 0, sizeof(policy));
+    policy.every = 2U;
+    assert(!chaos_policy_is_empty(&policy));
+
+    /* `@every=N`: the Nth evaluation of the rule passes, the others do not. The counter
+     * the gate reads is the one chaos_hits.h keeps per rule, so the first evaluation is
+     * number 1. Without the qualifier every evaluation passes. */
+    memset(&policy, 0, sizeof(policy));
+    assert(chaos_policy_every_ok(&policy, 1U) && chaos_policy_every_ok(&policy, 7U));
+    policy.every = 3U;
+    assert(!chaos_policy_every_ok(&policy, 1U));
+    assert(!chaos_policy_every_ok(&policy, 2U));
+    assert(chaos_policy_every_ok(&policy, 3U));
+    assert(!chaos_policy_every_ok(&policy, 4U));
+    assert(chaos_policy_every_ok(&policy, 6U));
+    /* `@every=1` gates nothing, which is why it is allowed rather than rejected. */
+    policy.every = 1U;
+    assert(chaos_policy_every_ok(&policy, 1U) && chaos_policy_every_ok(&policy, 2U));
 
     /* The window is [from, until) in Unix ms on the wall clock. */
     memset(&policy, 0, sizeof(policy));
@@ -813,6 +1029,8 @@ static void test_status_report(void)
     char line[260];
     char report[CHAOS_STATUS_BUFFER_SIZE];
 
+    chaos_status_clear(&error);
+
     /* Control characters (TAB, DEL) become blanks; the kept text ends at a newline. */
     chaos_status_keep_line(&error, 3U, "a\tb\177c\nd");
     assert(strcmp(error.text, "a b c") == 0 && error.line == 3U && error.reason == NULL);
@@ -836,6 +1054,84 @@ static void test_status_report(void)
     );
     chaos_status_clear(&error);
     assert(error.line == 0U && error.reason == NULL && error.text[0] == '\0');
+    assert(error.warning_count == 0U);
+
+    /* No warning raised: the report carries no `warnings` key at all, so a reader that
+     * does not know the key sees exactly what it saw before. */
+    assert(chaos_status_format(report, sizeof(report), CHAOS_STATUS_OK, 2U, &error, 9L) > 0U);
+    assert(strcmp(report, "state=ok\nrules=2\npid=9\n") == 0);
+
+    /* Warnings are listed in order, numbered from 1, between the state and the pid. The
+     * rule file stays in force, so the state is still ok and no error key appears. */
+    chaos_status_warn(&error, 4U, CHAOS_STATUS_WARN_SHADOWED);
+    chaos_status_warn(&error, 7U, CHAOS_STATUS_WARN_SHADOWED);
+    assert(error.warning_count == 2U);
+    assert(chaos_status_format(report, sizeof(report), CHAOS_STATUS_OK, 2U, &error, 9L) > 0U);
+    assert(
+        strcmp(
+            report,
+            "state=ok\nrules=2\nwarnings=2\n"
+            "warn.1=line:4 reason:shadowed by an earlier rule\n"
+            "warn.2=line:7 reason:shadowed by an earlier rule\n"
+            "pid=9\n"
+        ) == 0
+    );
+
+    /* A rejected file reports both: the rejection and the warnings raised before it. */
+    chaos_status_keep_line(&error, 9U, "bad");
+    chaos_status_reject(&error, CHAOS_STATUS_REASON_INVALID);
+    assert(error.warning_count == 2U); /* keep_line leaves warnings alone */
+    assert(chaos_status_format(report, sizeof(report), CHAOS_STATUS_ERROR, 2U, &error, 9L) > 0U);
+    assert(
+        strcmp(
+            report,
+            "state=error\nrules=0\nline=9\nreason=invalid rule\ntext=bad\nwarnings=2\n"
+            "warn.1=line:4 reason:shadowed by an earlier rule\n"
+            "warn.2=line:7 reason:shadowed by an earlier rule\n"
+            "pid=9\n"
+        ) == 0
+    );
+
+    /* Past the cap only the first CHAOS_STATUS_WARN_MAX are listed, while the count keeps
+     * rising: a flood is visible without flooding the report. */
+    {
+        size_t index;
+        size_t listed = 0U;
+        const char *scan = report;
+
+        chaos_status_clear(&error);
+        for (index = 0U; index < CHAOS_STATUS_WARN_MAX + 3U; ++index)
+        {
+            chaos_status_warn(&error, index + 1U, CHAOS_STATUS_WARN_SHADOWED);
+        }
+        assert(error.warning_count == CHAOS_STATUS_WARN_MAX + 3U);
+        assert(chaos_status_format(report, sizeof(report), CHAOS_STATUS_OK, 1U, &error, 9L) > 0U);
+        assert(strstr(report, "warnings=11\n") != NULL);
+        while ((scan = strstr(scan, "warn.")) != NULL)
+        {
+            ++listed;
+            ++scan;
+        }
+        assert(listed == CHAOS_STATUS_WARN_MAX);
+        assert(strstr(report, "warn.8=line:8 ") != NULL);
+        assert(strstr(report, "warn.9=") == NULL);
+    }
+
+    /* A buffer too small truncates between keys and stays a valid string. */
+    {
+        char tiny[12];
+
+        chaos_status_clear(&error);
+        chaos_status_warn(&error, 1U, CHAOS_STATUS_WARN_SHADOWED);
+        assert(
+            chaos_status_format(tiny, sizeof(tiny), CHAOS_STATUS_OK, 1U, &error, 9L) < sizeof(tiny)
+        );
+        assert(strlen(tiny) < sizeof(tiny));
+        assert(chaos_status_format(tiny, 1U, CHAOS_STATUS_OK, 1U, &error, 9L) == 0U);
+        assert(tiny[0] == '\0');
+        assert(chaos_status_format(tiny, 0U, CHAOS_STATUS_OK, 1U, &error, 9L) == 0U);
+    }
+    chaos_status_clear(&error);
 
     /* A buffer too small: the report is truncated and the return is the length kept. */
     assert(chaos_status_format(report, 8U, CHAOS_STATUS_OK, 1U, NULL, 1L) == 7U);
@@ -935,12 +1231,24 @@ static void test_hits_reload(void)
     chaos_hit_slot_t *active[3];
     chaos_hit_slot_t *next[2];
     uint64_t generation;
+    uint64_t armed;
 
     memset(pool, 0, sizeof(pool));
     chaos_hits_pool_reset(pool, 3U);
     chaos_hits_assign(pool, 3U, NULL, NULL, 0U, slots, first, 2U, NULL);
     assert(slots[0] == &pool[0] && slots[1] == &pool[1]);
     pool[1].count = 7U;
+    /* The evaluation ordinal of whoever held a slot before must not be inherited: it is
+     * what the draw key is mixed with, so a rule starting at somebody else's ordinal
+     * makes different decisions for the same seed, and `@every=N` fires on the wrong
+     * calls. Slot 2 below is handed to a rule that is new to this process. */
+    pool[2].evaluations = 11U;
+    /* As if this rule had been active for five seconds already, which the reload below
+     * must not forget: within one millisecond a re-armed slot would be indistinguishable
+     * from one that kept its moment. */
+    assert(pool[1].armed_ms != 0U);
+    armed = pool[1].armed_ms - 5000U;
+    pool[1].armed_ms = armed;
 
     /* A rule whose text survives the reload keeps its slot and count (B moves from index 1
      * to 0); an active entry without a slot is not matched by text (C is new); a new rule
@@ -951,6 +1259,13 @@ static void test_hits_reload(void)
     chaos_hits_assign(pool, 3U, active, active_texts, 3U, next, next_texts, 2U, count_report);
     assert(next[0] == &pool[1] && pool[1].count == 7U && pool[1].report == count_report);
     assert(next[1] == &pool[2] && pool[2].count == 0U && pool[2].used);
+    assert(pool[2].evaluations == 0U);
+    /* The moment a rule became active, which `@at=+N` counts from: the slot carried over
+     * keeps the moment it got at the first assignment, so a reload that leaves a rule
+     * alone does not restart its delay; the slot that is new to this process gets one
+     * now. */
+    assert(armed != 0U && pool[1].armed_ms == armed);
+    assert(pool[2].armed_ms != 0U);
 
     /* The rule that left (A) frees its slot and bumps its generation, so stale copies of
      * it stop matching; a NULL slot is always current. */
@@ -1029,20 +1344,26 @@ static void test_hits_file_number(void)
     assert(chaos_hits_file_number(long_prefix) == (long)getpid());
 }
 
-/* A once-control whose initialiser spins until a helper thread releases it. */
+/* A once-control whose initialiser spins until a helper thread releases it.
+ *
+ * The three flags are handed between threads with the same acquire/release builtins
+ * chaos_once.h uses, not with `volatile`: volatile keeps the compiler from caching the
+ * value but orders nothing, so a handshake built on it is a data race that happens to
+ * work on the two architectures this is built for. It also hides the ordering from
+ * ThreadSanitizer, which then reports the test rather than the code under test. */
 static volatile chaos_once_t g_once = CHAOS_ONCE_INIT;
-static volatile int g_initialising = 0;
-static volatile int g_release = 0;
-static volatile int g_initialised = 0;
+static int g_initialising = 0;
+static int g_release = 0;
+static int g_initialised = 0;
 
 static void slow_initialise(void)
 {
-    g_initialising = 1;
-    while (!g_release)
+    __atomic_store_n(&g_initialising, 1, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&g_release, __ATOMIC_ACQUIRE) == 0)
     {
         (void)sched_yield();
     }
-    g_initialised = 1;
+    __atomic_store_n(&g_initialised, 1, __ATOMIC_RELEASE);
 }
 
 static void *run_once(void *argument)
@@ -1058,7 +1379,7 @@ static void *release_later(void *argument)
 
     (void)argument;
     (void)nanosleep(&pause, NULL);
-    g_release = 1;
+    __atomic_store_n(&g_release, 1, __ATOMIC_RELEASE);
     return NULL;
 }
 
@@ -1075,16 +1396,158 @@ static void test_once_waits(void)
     pthread_t releaser;
 
     assert(pthread_create(&initialiser, NULL, run_once, NULL) == 0);
-    while (!g_initialising)
+    while (__atomic_load_n(&g_initialising, __ATOMIC_ACQUIRE) == 0)
     {
         (void)sched_yield();
     }
 
     assert(pthread_create(&releaser, NULL, release_later, NULL) == 0);
     assert(chaos_once(&g_once, slow_initialise) == 1);
-    assert(g_initialised);
+    /* Plain read: chaos_once() returning 1 is what makes the initialiser's write visible,
+     * and that is the property under test. */
+    assert(__atomic_load_n(&g_initialised, __ATOMIC_RELAXED) == 1);
     assert(pthread_join(initialiser, NULL) == 0);
     assert(pthread_join(releaser, NULL) == 0);
+}
+
+/**
+ * @brief The token bucket: what it hands out, what it refills, and what it reserves.
+ *
+ * @details The bucket is a pure function of its state word and the millisecond it is
+ * asked at, so every property is checked by asking at chosen times rather than by
+ * sleeping. The rate is 1000 bytes per second throughout, which makes a millisecond worth
+ * exactly one byte and the arithmetic readable.
+ */
+static void test_bucket(void)
+{
+    chaos_bucket_t bucket;
+
+    /* No rate, nothing wanted, or no clock: the call is not held back at all. A bucket
+     * that throttled when the clock is unreadable would block a process for ever. */
+    bucket.state = 0U;
+    assert(chaos_bucket_take(&bucket, 0U, 500U, 1000U) == 500U);
+    assert(chaos_bucket_take(&bucket, 1000U, 0U, 1000U) == 0U);
+    assert(chaos_bucket_take(&bucket, 1000U, 500U, 0U) == 500U);
+    assert(chaos_bucket_reserve(&bucket, 0U, 500U, 1000U) == 0U);
+    assert(chaos_bucket_reserve(&bucket, 1000U, 0U, 1000U) == 0U);
+    assert(chaos_bucket_reserve(&bucket, 1000U, 500U, 0U) == 0U);
+    assert(bucket.state == 0U);
+
+    /* A bucket nobody has used is full: the first second's worth passes at once, and only
+     * a caller that keeps going is slowed down. */
+    assert(chaos_bucket_take(&bucket, 1000U, 1000U, 10000U) == 1000U);
+    assert(chaos_bucket_take(&bucket, 1000U, 1000U, 10000U) == 0U);
+    /* Refill is the elapsed milliseconds, one byte each, and what is asked for bounds it. */
+    assert(chaos_bucket_take(&bucket, 1000U, 1000U, 10400U) == 400U);
+    assert(chaos_bucket_take(&bucket, 1000U, 100U, 10900U) == 100U);
+    /* Never more than one second's worth, however long the bucket stood idle. */
+    assert(chaos_bucket_take(&bucket, 1000U, 5000U, 20000U) == 1000U);
+
+    /* A tenth of a second's worth is what a caller that has to wait asks for, and it
+     * never rounds down to nothing: below ten bytes per second the chunk is one byte. */
+    assert(chaos_bucket_chunk(1000U) == 100U);
+    assert(chaos_bucket_chunk(10U) == 1U);
+    assert(chaos_bucket_chunk(9U) == 1U);
+    assert(chaos_bucket_chunk(1U) == 1U);
+
+    /* The wait for what is not there yet, rounded up so it is never short of a token. */
+    assert(chaos_bucket_wait_ms(1000U, 100U) == 100U);
+    assert(chaos_bucket_wait_ms(1000U, 1U) == 1U);
+    assert(chaos_bucket_wait_ms(1000000U, 1U) == 1U);
+    assert(chaos_bucket_wait_ms(0U, 100U) == 0U);
+    assert(chaos_bucket_wait_ms(1000U, 0U) == 0U);
+
+    /* A reservation hands out bytes that have not arrived and returns the wait for them.
+     * The empty bucket of the line above is at 20000 with nothing left. */
+    assert(chaos_bucket_reserve(&bucket, 1000U, 100U, 20000U) == 100U);
+    /* The bytes are charged, so a call at the moment the wait is over gets nothing more
+     * than what arrived meanwhile: without the charge the rate would double. */
+    assert(chaos_bucket_take(&bucket, 1000U, 100U, 20100U) == 0U);
+    /* And a second reservation made while the first one waits is told to wait for both,
+     * which is what holds the rate when several threads share a descriptor. */
+    assert(chaos_bucket_reserve(&bucket, 1000U, 100U, 20000U) == 200U);
+    assert(chaos_bucket_reserve(&bucket, 1000U, 100U, 20000U) == 300U);
+    /* A reservation covered by what is in the bucket waits not at all and empties it. */
+    bucket.state = 0U;
+    assert(chaos_bucket_reserve(&bucket, 1000U, 400U, 30000U) == 0U);
+    assert(chaos_bucket_take(&bucket, 1000U, 1000U, 30000U) == 600U);
+
+    /* A lost race: the attempt fails, the loop looks again and hands out the same bytes,
+     * because nothing but the bucket's own word is involved. */
+    bucket.state = 0U;
+    g_bucket_cas_fails = 1U;
+    assert(chaos_bucket_take(&bucket, 1000U, 400U, 40000U) == 400U);
+    assert(g_bucket_cas_fails == 0U);
+    g_bucket_cas_fails = 1U;
+    assert(chaos_bucket_reserve(&bucket, 1000U, 1000U, 40000U) == 400U);
+    assert(g_bucket_cas_fails == 0U);
+
+    /* The millisecond is truncated to 32 bits and every comparison is a signed
+     * difference, so the wrap after 49 days is not a special case: a stamp just below it
+     * and a reading just above it are 2 ms apart, not 4294967294. */
+    assert(chaos_bucket_later(UINT64_C(0x100000001), UINT64_C(0xffffffff)));
+    assert(!chaos_bucket_later(UINT64_C(0xffffffff), UINT64_C(0x100000001)));
+    bucket.state = 0U;
+    assert(chaos_bucket_take(&bucket, 1000U, 1000U, UINT64_C(0xffffffff)) == 1000U);
+    assert(chaos_bucket_take(&bucket, 1000U, 1000U, UINT64_C(0x100000001)) == 2U);
+    /* And what is stored is the truncated millisecond: a whole reading would spill into
+     * the token half of the word and hand out tokens nobody refilled. A monotonic clock
+     * passes 2^32 ms after 49 days of uptime, so this is the ordinary case, not an edge. */
+    bucket.state = 0U;
+    assert(chaos_bucket_take(&bucket, 1000U, 1000U, UINT64_C(0x1000003e8)) == 1000U);
+    assert((bucket.state >> 32) == 0U);
+    bucket.state = 0U;
+    assert(chaos_bucket_reserve(&bucket, 1000U, 2000U, UINT64_C(0x1000003e8)) == 1000U);
+    assert((bucket.state >> 32) == 0U);
+
+    /* A rate whose millisecond is worth less than a byte. Asked once per millisecond, the
+     * elapsed time must not be thrown away: at 500 bytes a second a byte is due every
+     * other millisecond, so a hundred milliseconds of polling must hand out fifty. The
+     * whole second's worth the bucket starts with is drained first, so what follows is
+     * refill alone. Rates below a thousand are the common ones -- a slow log shipper, a
+     * trickling metrics push -- and a bucket that loses the remainder hands out nothing
+     * for them, for ever. */
+    {
+        uint64_t moved = 0U;
+        uint64_t at;
+
+        bucket.state = 0U;
+        assert(chaos_bucket_take(&bucket, 500U, 500U, 30000U) == 500U);
+        for (at = 30001U; at <= 30100U; ++at)
+        {
+            moved += chaos_bucket_take(&bucket, 500U, 1U, at);
+        }
+        assert(moved == 50U);
+    }
+
+    /* Giving back what could not be used. A caller that takes its allowance and then has
+     * to answer EAGAIN moved nothing, so the bytes come back or its next attempt meets a
+     * bucket it drained itself -- and a datagram larger than one second's worth, which the
+     * take can never cover because the bucket is capped there, would never be sent at all.
+     * The ceiling still holds, and the stamp is untouched. */
+    {
+        const uint64_t at = 40000U;
+
+        bucket.state = 0U;
+        assert(chaos_bucket_take(&bucket, 1000U, 1000U, at) == 1000U);
+        assert(chaos_bucket_take(&bucket, 1000U, 10U, at) == 0U);
+        chaos_bucket_return(&bucket, 1000U, 400U, at);
+        assert(chaos_bucket_take(&bucket, 1000U, 1000U, at) == 400U);
+        /* More back than the bucket holds is capped, not wrapped. */
+        chaos_bucket_return(&bucket, 1000U, 99999U, at);
+        assert(chaos_bucket_take(&bucket, 1000U, 5000U, at) == 1000U);
+        /* No rate, nothing given, no clock: nothing happens, as everywhere else here. */
+        chaos_bucket_return(&bucket, 0U, 10U, at);
+        chaos_bucket_return(&bucket, 1000U, 0U, at);
+        chaos_bucket_return(&bucket, 1000U, 10U, 0U);
+        assert(chaos_bucket_take(&bucket, 1000U, 10U, at) == 0U);
+        /* And a lost race: the state moved under the caller, so it reads it again and
+         * gives the bytes back on top of what it finds. */
+        g_bucket_cas_fails = 1U;
+        chaos_bucket_return(&bucket, 1000U, 250U, at);
+        assert(g_bucket_cas_fails == 0U);
+        assert(chaos_bucket_take(&bucket, 1000U, 1000U, at) == 250U);
+    }
 }
 
 int main(void)
@@ -1107,6 +1570,7 @@ int main(void)
     test_hits_reload();
     test_hits_file_number();
     test_once_waits();
+    test_bucket();
     (void)rmdir("/tmp/chaos-common-test");
     return 0;
 }

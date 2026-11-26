@@ -44,6 +44,25 @@
  * (`test_net_runtime.c`).
  */
 
+#include <time.h>
+
+/** @brief Milliseconds the last chaos_sleep_ms() asked for; -1 when it was not called. */
+static long g_slept_ms = -1;
+
+/**
+ * @brief Test seam for chaos_sleep.h: records the request instead of sleeping.
+ *
+ * @details Only THROTTLE reaches it -- the LATENCY stub below never sleeps -- so the
+ * recorded value is the wait a rate asked for.
+ */
+static int chaos_net_test_sleep(const struct timespec *request, struct timespec *remaining)
+{
+    (void)remaining;
+    g_slept_ms = (long)request->tv_sec * 1000L + request->tv_nsec / 1000000L;
+    return 0;
+}
+#define CHAOS_SLEEP_SYSCALL(request, remaining) chaos_net_test_sleep((request), (remaining))
+
 #include "../support/test_net_support.h"
 
 #include <fcntl.h>
@@ -422,7 +441,7 @@ int chaos_net_endpoint_from_end_fd(
 }
 
 /** @brief LATENCY stub: counts calls and records the rule's `call_size`; never sleeps. */
-void chaos_net_rule_apply_latency(const chaos_net_rule_t *rule)
+void chaos_net_rule_apply_latency(chaos_net_rule_t *rule)
 {
     assert(rule != NULL);
     ++g_latency_calls;
@@ -431,7 +450,7 @@ void chaos_net_rule_apply_latency(const chaos_net_rule_t *rule)
 
 /** @brief ERRNO stub: fires an ERRNO rule while `g_errno_trigger` is set, mirroring the real
  *   effect check. */
-int chaos_net_rule_apply_errno(const chaos_net_rule_t *rule)
+int chaos_net_rule_apply_errno(chaos_net_rule_t *rule)
 {
     if (rule == NULL || rule->effect != CHAOS_NET_EFFECT_ERRNO || g_errno_trigger == 0)
     {
@@ -442,10 +461,16 @@ int chaos_net_rule_apply_errno(const chaos_net_rule_t *rule)
     return 1;
 }
 
+/** @brief Times the should-trigger stub was asked; proves a suppressed RESET spends none. */
+static int g_should_trigger_calls = 0;
+
 /** @brief Should-trigger stub: returns `g_should_trigger` for every rule. */
-int chaos_net_rule_should_trigger(const chaos_net_rule_t *rule)
+int chaos_net_rule_should_trigger(chaos_net_rule_t *rule)
 {
-    (void)rule;
+    ++g_should_trigger_calls;
+    /* The real one starts this call's draws here, so a wrapper that asks an effect for a
+     * sample without a trigger is visible in the stubbed build too. */
+    chaos_net_rule_draw_begin(rule);
     return g_should_trigger;
 }
 
@@ -466,8 +491,9 @@ void chaos_net_corrupt_buffer_sample(
 }
 
 /** @brief CORRUPT stub without samples: always flips bit 0 of byte 0, a predictable target. */
-void chaos_net_corrupt_buffer(void *buffer, size_t size)
+void chaos_net_corrupt_buffer(const chaos_net_rule_t *rule, void *buffer, size_t size)
 {
+    assert(rule != NULL);
     chaos_net_corrupt_buffer_sample(buffer, size, 0U, 0U);
 }
 
@@ -494,14 +520,24 @@ static int chaos_net_test_listen(int sockfd, int backlog)
     return g_listen_result;
 }
 
+/** @brief The address the last fake connect() was given, which is what REDIRECT rewrites. */
+static struct sockaddr_storage g_connect_address;
+/** @brief Its length, which a redirect must leave as the caller passed it. */
+static socklen_t g_connect_address_length = 0;
+
 /** @brief Fake real connect(). */
 static int
 chaos_net_test_connect(int sockfd, const struct sockaddr *address, socklen_t address_length)
 {
     (void)sockfd;
-    (void)address;
-    (void)address_length;
     ++g_connect_calls;
+    (void)memset(&g_connect_address, 0, sizeof(g_connect_address));
+    if (address != NULL && address_length > 0 &&
+        (size_t)address_length <= sizeof(g_connect_address))
+    {
+        (void)memcpy(&g_connect_address, address, (size_t)address_length);
+    }
+    g_connect_address_length = address_length;
     return g_connect_result;
 }
 
@@ -563,14 +599,17 @@ chaos_net_test_accept4(int sockfd, struct sockaddr *address, socklen_t *address_
 }
 #endif
 
+/** @brief Bytes the last fake send() was given, which is what THROTTLE shortens. */
+static size_t g_send_size = 0U;
+
 /** @brief Fake real send(); reports 4 bytes by default. */
 static ssize_t chaos_net_test_send(int sockfd, const void *buffer, size_t size, int flags)
 {
     (void)sockfd;
     (void)buffer;
-    (void)size;
     (void)flags;
     ++g_send_calls;
+    g_send_size = size;
     return g_send_result;
 }
 
@@ -929,10 +968,43 @@ static void chaos_net_test_dup_before_tag(int fd);
 static uint64_t g_dup_socket_epoch = 1U;
 #define CHAOS_NET_DUP_SOCKET(fd)                                                                   \
     (g_dup_socket_epoch == 0U ? 0U : (uint64_t)(fd) + (g_dup_socket_epoch << 32))
+/* Ownership the fake scan reports; the real one reads /proc and has its own test. */
+static int g_stub_ownership = (int)CHAOS_NET_OWNER_SOLE;
+/** @brief Descriptors the fake ownership scan was asked about. */
+static int g_ownership_calls = 0;
+static int chaos_net_test_ownership(int fd);
+#define CHAOS_NET_OWNERSHIP(fd) ((chaos_net_ownership_t)chaos_net_test_ownership(fd))
+/* Suppressions counted for the hits file; the counter itself lives in chaos_net_config.c,
+ * which this test stubs rather than links. */
+static int g_suppressed_shared = 0;
+static int g_suppressed_unknown = 0;
+static void chaos_net_test_reset_suppressed(chaos_net_ownership_t ownership);
+#define CHAOS_NET_RESET_SUPPRESSED(ownership) chaos_net_test_reset_suppressed(ownership)
 #define CHAOS_NET_DUP_BEFORE_TAG(fd) chaos_net_test_dup_before_tag(fd)
 #define CHAOS_NET_DUP_MAP(size) chaos_net_test_dup_map(size)
 #define CHAOS_NET_DUP_UNMAP(address, size) chaos_net_test_dup_unmap((address), (size))
 #include "../../src/net/chaos_net_socket.c"
+
+/** @brief Fake ownership scan: counts the question and reports `g_stub_ownership`. */
+static int chaos_net_test_ownership(int fd)
+{
+    (void)fd;
+    ++g_ownership_calls;
+    return g_stub_ownership;
+}
+
+/** @brief Counts a suppressed RESET the way chaos_net_config.c does, split by cause. */
+static void chaos_net_test_reset_suppressed(chaos_net_ownership_t ownership)
+{
+    if (ownership == CHAOS_NET_OWNER_SHARED)
+    {
+        ++g_suppressed_shared;
+    }
+    else
+    {
+        ++g_suppressed_unknown;
+    }
+}
 
 /** @brief Hook between the DUP close check and the tag: forgets @p fd once when armed. */
 static void chaos_net_test_dup_before_tag(int fd)
@@ -1089,11 +1161,13 @@ static void reset_wrapper_stubs(void)
     g_bind_calls = 0;
     g_listen_calls = 0;
     g_connect_calls = 0;
+    g_connect_address_length = 0;
     g_accept_calls = 0;
     g_socket_calls = 0;
     g_socketpair_calls = 0;
     g_shutdown_calls = 0;
     g_send_calls = 0;
+    g_send_size = 0U;
     g_sendto_calls = 0;
     g_sendmsg_calls = 0;
     g_recv_calls = 0;
@@ -1185,6 +1259,116 @@ static void test_bind_and_connect_paths(void)
     reset_wrapper_stubs();
     assert(connect(3, (const struct sockaddr *)&address, (socklen_t)sizeof(address)) == 0);
     assert(g_connect_calls == 1);
+}
+
+/**
+ * @brief Proves REDIRECT connects to the address of the rule instead of the one the
+ *   caller named, and only where that address fits the socket.
+ *
+ * @details The kernel then treats the new address as the one the connection was made to,
+ * so `getpeername` reports it and every later rule matches it -- which is why the rule
+ * has to be written for the address the program asks for, not for the one it reaches.
+ * Covered:
+ * - an IPv4 target over an IPv4 address: the real connect sees the target, with the
+ *   length the caller passed;
+ * - an IPv4 target over an IPv6 address: the IPv4-mapped form, which is how an AF_INET6
+ *   socket reaches an IPv4 host;
+ * - an IPv6 target over an IPv6 address: the target as it stands;
+ * - an IPv6 target over an IPv4 address: nothing fits, so the rule does not fire and no
+ *   draw is spent on it -- the call goes where the caller sent it;
+ * - a draw that misses: the same.
+ */
+static void test_connect_redirect(void)
+{
+    static const unsigned char mapped_prefix[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    struct sockaddr_in address;
+    struct sockaddr_in6 address6;
+    struct in_addr target4;
+    struct in6_addr target6;
+
+    assert(inet_pton(AF_INET, "10.0.0.7", &target4) == 1);
+    assert(inet_pton(AF_INET6, "2001:db8::7", &target6) == 1);
+    chaos_net_test_set_ipv4(&address, "127.0.0.1", 5432U);
+    memset(&address6, 0, sizeof(address6));
+    address6.sin6_family = AF_INET6;
+    address6.sin6_port = htons(5432U);
+
+    /* An IPv4 target over an IPv4 address. */
+    reset_wrapper_stubs();
+    g_should_trigger_calls = 0;
+    g_stub_endpoint_from_sockaddr = 1;
+    g_stub_match_endpoint = 1;
+    memset(&g_stub_rule, 0, sizeof(g_stub_rule));
+    g_stub_rule.effect = CHAOS_NET_EFFECT_REDIRECT;
+    g_stub_rule.redirect.family = AF_INET;
+    g_stub_rule.redirect.port = 5433U;
+    g_stub_rule.redirect.value.ipv4 = target4;
+    g_should_trigger = 1;
+    assert(connect(3, (const struct sockaddr *)&address, (socklen_t)sizeof(address)) == 0);
+    assert(g_connect_calls == 1);
+    assert(g_connect_address_length == (socklen_t)sizeof(struct sockaddr_in));
+    {
+        const struct sockaddr_in *sent =
+            (const struct sockaddr_in *)(const void *)&g_connect_address;
+
+        assert(sent->sin_family == AF_INET);
+        assert(ntohs(sent->sin_port) == 5433U);
+        assert(memcmp(&sent->sin_addr, &target4, sizeof(target4)) == 0);
+    }
+    assert(g_should_trigger_calls == 1);
+
+    /* The same target over an IPv6 address: the IPv4-mapped form. */
+    g_connect_calls = 0;
+    assert(connect(3, (const struct sockaddr *)&address6, (socklen_t)sizeof(address6)) == 0);
+    assert(g_connect_address_length == (socklen_t)sizeof(struct sockaddr_in6));
+    {
+        const struct sockaddr_in6 *sent =
+            (const struct sockaddr_in6 *)(const void *)&g_connect_address;
+        const unsigned char *bytes = (const unsigned char *)&sent->sin6_addr;
+
+        assert(sent->sin6_family == AF_INET6);
+        assert(ntohs(sent->sin6_port) == 5433U);
+        assert(memcmp(bytes, mapped_prefix, sizeof(mapped_prefix)) == 0);
+        assert(memcmp(bytes + 12, &target4, sizeof(target4)) == 0);
+    }
+
+    /* An IPv6 target over an IPv6 address. */
+    g_stub_rule.redirect.family = AF_INET6;
+    g_stub_rule.redirect.value.ipv6 = target6;
+    g_connect_calls = 0;
+    assert(connect(3, (const struct sockaddr *)&address6, (socklen_t)sizeof(address6)) == 0);
+    {
+        const struct sockaddr_in6 *sent =
+            (const struct sockaddr_in6 *)(const void *)&g_connect_address;
+
+        assert(memcmp(&sent->sin6_addr, &target6, sizeof(target6)) == 0);
+    }
+
+    /* An IPv6 target over an IPv4 address fits nowhere: the call goes where the caller
+     * sent it, and the rule is not even asked. */
+    g_connect_calls = 0;
+    g_should_trigger_calls = 0;
+    assert(connect(3, (const struct sockaddr *)&address, (socklen_t)sizeof(address)) == 0);
+    {
+        const struct sockaddr_in *sent =
+            (const struct sockaddr_in *)(const void *)&g_connect_address;
+
+        assert(ntohs(sent->sin_port) == 5432U);
+    }
+    assert(g_should_trigger_calls == 0);
+
+    /* A draw that misses: the caller's address again. */
+    g_stub_rule.redirect.family = AF_INET;
+    g_should_trigger = 0;
+    g_connect_calls = 0;
+    assert(connect(3, (const struct sockaddr *)&address, (socklen_t)sizeof(address)) == 0);
+    {
+        const struct sockaddr_in *sent =
+            (const struct sockaddr_in *)(const void *)&g_connect_address;
+
+        assert(ntohs(sent->sin_port) == 5432U);
+    }
+    reset_wrapper_stubs();
 }
 
 /**
@@ -1902,6 +2086,12 @@ static void test_direct_helper_paths(void)
     int pipefd[2];
 
     reset_wrapper_stubs();
+    /* Zeroed before the first field is set, not 120 lines further down: the draw the
+     * trigger makes reads `rule->hit`, and a rule outside a snapshot has no slot -- which
+     * is only true once the rule is zeroed. With stack garbage there the counter is bumped
+     * through a wild pointer, which UBSan turns into a segfault and ASan happens to
+     * survive, so it would flake rather than fail. */
+    (void)memset(&rule, 0, sizeof(rule));
     assert(chaos_net_apply_pre_call_rule(NULL) == 0);
     assert(chaos_net_apply_simple_pre_call_rule(NULL) == 0);
     assert(chaos_net_wait_pre_call(NULL, 0, &synthetic_timeout) == 0);
@@ -2026,16 +2216,25 @@ static void test_direct_helper_paths(void)
     second[1] = 'b';
     second[2] = 'c';
     second[3] = 'd';
-    chaos_net_corrupt_iovecs(NULL, 0, 0U);
+    /* The effects draw from this rule; a zeroed one has no slot, so it is evaluation 0. */
+    (void)memset(&rule, 0, sizeof(rule));
+    chaos_net_corrupt_iovecs(&rule, NULL, 0, 0U);
     recv_iov[0].iov_base = first;
     recv_iov[0].iov_len = 1U;
     recv_iov[1].iov_base = second;
     recv_iov[1].iov_len = sizeof(second);
-    for (g_chaos_net_tls_prng_state = 1U; chaos_net_prng_next_u32() % 3U == 0U;
-         ++g_chaos_net_tls_prng_state)
+    /* A key whose byte draw does not land in the first 1-byte segment, so the walk has to
+     * step into the second one; the bound keeps the search finite. */
+    for (rule.key = 1U; rule.key < 256U; ++rule.key)
     {
+        chaos_net_rule_draw_begin(&rule);
+        if (chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_FIRST_EFFECT) % 3U != 0U)
+        {
+            break;
+        }
     }
-    chaos_net_corrupt_iovecs(recv_iov, 2, 3U);
+    assert(rule.key < 256U);
+    chaos_net_corrupt_iovecs(&rule, recv_iov, 2, 3U);
     assert(g_corrupt_calls >= 1);
 
     reset_wrapper_stubs();
@@ -2080,7 +2279,7 @@ static void test_direct_linux_helper_paths(void)
     struct iovec recv_iov[2];
     char first[1] = {0};
     char second[4] = {'a', 'b', 'c', 'd'};
-    struct mmsghdr recv_messages[1];
+    struct mmsghdr recv_messages[2];
     struct epoll_event events[1];
     struct epoll_event event;
     chaos_net_rule_t rule;
@@ -2101,9 +2300,59 @@ static void test_direct_linux_helper_paths(void)
     recv_messages[0].msg_hdr.msg_iov = recv_iov;
     recv_messages[0].msg_hdr.msg_iovlen = 2;
     recv_messages[0].msg_len = 4U;
-    chaos_net_corrupt_mmsghdrs(NULL, 0U);
-    chaos_net_corrupt_mmsghdrs(recv_messages, 1U);
+    /* The effects draw from this rule; a zeroed one has no slot, so it is evaluation 0. */
+    (void)memset(&rule, 0, sizeof(rule));
+    chaos_net_corrupt_mmsghdrs(&rule, NULL, 0U);
+    chaos_net_corrupt_mmsghdrs(&rule, recv_messages, 1U);
     assert(g_corrupt_calls == 1);
+
+    /* Which message of a batch is corrupted comes from its own draw, not from the one the
+     * byte index uses: a rule whose two draws pick different messages must corrupt the one
+     * the message draw names. The search makes the assertion discriminating. */
+    {
+        unsigned char batch_first[4] = {0U, 0U, 0U, 0U};
+        unsigned char batch_second[4] = {0U, 0U, 0U, 0U};
+        struct iovec batch_iov[2];
+
+        batch_iov[0].iov_base = batch_first;
+        batch_iov[0].iov_len = sizeof(batch_first);
+        batch_iov[1].iov_base = batch_second;
+        batch_iov[1].iov_len = sizeof(batch_second);
+        (void)memset(recv_messages, 0, sizeof(recv_messages));
+        recv_messages[0].msg_hdr.msg_iov = &batch_iov[0];
+        recv_messages[0].msg_hdr.msg_iovlen = 1;
+        recv_messages[0].msg_len = (unsigned int)sizeof(batch_first);
+        recv_messages[1].msg_hdr.msg_iov = &batch_iov[1];
+        recv_messages[1].msg_hdr.msg_iovlen = 1;
+        recv_messages[1].msg_len = (unsigned int)sizeof(batch_second);
+
+        for (rule.key = 1U; rule.key < 256U; ++rule.key)
+        {
+            chaos_net_rule_draw_begin(&rule);
+            if (chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_MESSAGE) % 2U !=
+                chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_FIRST_EFFECT) % 2U)
+            {
+                break;
+            }
+        }
+        assert(rule.key < 256U);
+        chaos_net_rule_draw_begin(&rule);
+        {
+            const unsigned int expected = chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_MESSAGE) % 2U;
+            const unsigned char *corrupted = expected == 0U ? batch_first : batch_second;
+            const unsigned char *untouched = expected == 0U ? batch_second : batch_first;
+
+            g_corrupt_calls = 0;
+            chaos_net_corrupt_mmsghdrs(&rule, recv_messages, 2U);
+            assert(g_corrupt_calls == 1);
+            assert(
+                corrupted[0] != 0U || corrupted[1] != 0U || corrupted[2] != 0U || corrupted[3] != 0U
+            );
+            assert(
+                untouched[0] == 0U && untouched[1] == 0U && untouched[2] == 0U && untouched[3] == 0U
+            );
+        }
+    }
 
     reset_wrapper_stubs();
     assert(!chaos_net_wait_match_epoll(-1, NULL));
@@ -2574,6 +2823,9 @@ static void reset_descriptor_stubs(void)
     g_chaos_net_real_setsockopt = chaos_net_test_next_setsockopt;
     g_descriptor_calls = 0;
     g_setsockopt_calls = 0;
+    g_stub_ownership = (int)CHAOS_NET_OWNER_SOLE;
+    g_ownership_calls = 0;
+    g_should_trigger_calls = 0;
     (void)memset(&g_setsockopt_linger, 0, sizeof(g_setsockopt_linger));
 }
 
@@ -2686,6 +2938,52 @@ static void test_descriptor_calls_on_sockets(void)
     g_should_trigger = 0;
     assert(close(5) == 0);
     assert(g_setsockopt_calls == 1);
+
+    /* A socket another descriptor still holds is left alone: SO_LINGER would reset nothing
+     * now and reset it at some later close, for no rule. Ownership is settled before the
+     * rule fires, so no hit and no `@first` claim is spent either. */
+    g_should_trigger = 1;
+    g_stub_ownership = (int)CHAOS_NET_OWNER_SHARED;
+    g_should_trigger_calls = 0;
+    g_ownership_calls = 0;
+    g_suppressed_shared = 0;
+    g_suppressed_unknown = 0;
+    assert(close(5) == 0);
+    assert(g_setsockopt_calls == 1);
+    assert(g_ownership_calls == 1);
+    assert(g_should_trigger_calls == 0);
+    /* Not silent: the suppression is counted for the hits file, under its cause. */
+    assert(g_suppressed_shared == 1 && g_suppressed_unknown == 0);
+
+    /* An ownership that could not be established counts as shared: a wrong "sole" is what
+     * leaves the option behind. It is reported apart, because it means a broken environment
+     * rather than a socket a pre-forking server shares on purpose. */
+    g_stub_ownership = (int)CHAOS_NET_OWNER_UNKNOWN;
+    assert(close(5) == 0);
+    assert(g_setsockopt_calls == 1);
+    assert(g_should_trigger_calls == 0);
+    assert(g_suppressed_shared == 1 && g_suppressed_unknown == 1);
+
+    /* Sole ownership resets as before, and counts no suppression. */
+    g_stub_ownership = (int)CHAOS_NET_OWNER_SOLE;
+    assert(close(5) == 0);
+    assert(g_setsockopt_calls == 2);
+    assert(g_should_trigger_calls == 1);
+    assert(g_suppressed_shared == 1 && g_suppressed_unknown == 1);
+
+    /* Negative: a close without a RESET rule neither scans ownership nor counts anything,
+     * however the socket is held -- the counter must not turn into a close counter. */
+    g_stub_ownership = (int)CHAOS_NET_OWNER_SHARED;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_ERRNO;
+    g_errno_trigger = 0;
+    g_ownership_calls = 0;
+    assert(close(5) == 0);
+    assert(g_ownership_calls == 0);
+    assert(g_suppressed_shared == 1 && g_suppressed_unknown == 1);
+    g_stub_rule.effect = CHAOS_NET_EFFECT_RESET;
+    g_stub_ownership = (int)CHAOS_NET_OWNER_SOLE;
+
+    g_should_trigger = 0;
     g_stub_rule.effect = CHAOS_NET_EFFECT_LATENCY;
     assert(close(5) == 0);
     assert(g_latency_calls == 1);
@@ -2749,8 +3047,15 @@ static void test_fortified_read_and_poll(void)
 
 /**
  * @brief Proves the `@size` byte count of a vector or message is the sum of all its iovecs,
- *   and unknown (`CHAOS_POLICY_NO_SIZE`) for NULL, a negative count, or more than
- *   `CHAOS_NET_IOV_MAX` entries, which the kernel rejects before reading them.
+ *   and unknown (`CHAOS_POLICY_NO_SIZE`) for NULL, a negative count, more than
+ *   `CHAOS_NET_IOV_MAX` entries (which the kernel rejects before reading them), or a total
+ *   above `SSIZE_MAX`.
+ *
+ * @details The last case is the one that cannot be allowed to wrap: two segments of
+ * `SSIZE_MAX` sum to 2^64 - 2, which is not the sentinel and would pass every gate as a
+ * plausible huge number; one more byte and it wraps to 0, so `@size<10` would match a call
+ * asking for more than the address space. Such a call returns `ssize_t` and the kernel
+ * rejects it with EINVAL, so it has no byte count at all.
  */
 static void test_size_of_vectors_and_messages(void)
 {
@@ -2771,6 +3076,18 @@ static void test_size_of_vectors_and_messages(void)
     assert(chaos_net_message_size(NULL) == CHAOS_POLICY_NO_SIZE);
     assert(chaos_net_iovec_size(iov, CHAOS_NET_IOV_MAX + 1) == CHAOS_POLICY_NO_SIZE);
     message.msg_iovlen = (size_t)CHAOS_NET_IOV_MAX + 1U;
+    assert(chaos_net_message_size(&message) == CHAOS_POLICY_NO_SIZE);
+
+    /* Exactly SSIZE_MAX is still a count; one byte more, in one segment or across two, is
+     * not. The second segment is what a wrapping sum would hide. */
+    iov[0].iov_len = (size_t)SSIZE_MAX;
+    iov[1].iov_len = 0U;
+    assert(chaos_net_iovec_size(iov, 2) == (uint64_t)SSIZE_MAX);
+    iov[1].iov_len = 1U;
+    assert(chaos_net_iovec_size(iov, 2) == CHAOS_POLICY_NO_SIZE);
+    iov[1].iov_len = (size_t)SSIZE_MAX;
+    assert(chaos_net_iovec_size(iov, 2) == CHAOS_POLICY_NO_SIZE);
+    message.msg_iovlen = 2U;
     assert(chaos_net_message_size(&message) == CHAOS_POLICY_NO_SIZE);
 }
 
@@ -2807,6 +3124,239 @@ static void test_wrappers_record_call_size(void)
     rc = recvmsg(4, &message, 0);
     assert(g_last_call_size == 11U);
     (void)rc;
+}
+
+/** @brief Arms a THROTTLE rule of @p rate bytes per second on send, for @p type sockets. */
+static void arm_throttle_rule(int type, uint64_t rate)
+{
+    reset_wrapper_stubs();
+    g_should_trigger_calls = 0;
+    g_slept_ms = -1;
+    g_test_socket_type = type;
+    g_stub_endpoint_from_peer = 1;
+    g_stub_match_endpoint = 1;
+    memset(&g_stub_rule, 0, sizeof(g_stub_rule));
+    g_stub_rule.effect = CHAOS_NET_EFFECT_THROTTLE;
+    g_stub_rule.rate_bps = rate;
+    g_should_trigger = 1;
+}
+
+/**
+ * @brief Proves THROTTLE holds the send side to a byte rate, and never cuts a datagram.
+ *
+ * @details The rates are tiny so that a token takes long enough to arrive for the test not
+ * to depend on the machine: at 10 bytes per second the bucket is a reliable 100 ms away
+ * from its next byte. Each case uses a rate of its own, which gives it a fresh bucket --
+ * a slot is keyed by descriptor and rate. Covered:
+ * - a full bucket passes the whole send and does not even ask the rule, so an allowance
+ *   that changes nothing spends neither a hit nor a `@first` claim;
+ * - an empty bucket shortens a stream send to a tenth of a second's worth and waits for
+ *   exactly that;
+ * - a datagram is never shortened: it waits for its whole message, because half a
+ *   datagram is not a datagram;
+ * - a non-blocking socket is told EAGAIN instead of being made to wait;
+ * - a rule that does not fire costs neither bytes nor the wait.
+ */
+static void test_throttle_sends(void)
+{
+    char buffer[32];
+    int nonblocking;
+
+    memset(buffer, 'x', sizeof(buffer));
+
+    /* A full bucket is one second's worth: the first 10 bytes go whole. */
+    arm_throttle_rule(SOCK_STREAM, 10U);
+    assert(send(4, buffer, 10U, 0) == g_send_result);
+    assert(g_send_size == 10U);
+    assert(g_should_trigger_calls == 0);
+    assert(g_slept_ms == -1);
+
+    /* Empty now: a stream send is cut to a tenth of a second's worth -- the floor of that
+     * is one byte at this rate -- and waits the 100 ms that byte takes to arrive. */
+    assert(send(4, buffer, 10U, 0) == g_send_result);
+    assert(g_send_size == 1U);
+    assert(g_slept_ms == 100);
+    assert(g_should_trigger_calls == 1);
+    /* The byte was charged when the wait started, so the send after it waits again rather
+     * than finding that byte in the bucket -- otherwise two sends would move two bytes in
+     * the time one takes to arrive and the rate would come out double. */
+    g_slept_ms = -1;
+    assert(send(4, buffer, 10U, 0) == g_send_result);
+    assert(g_slept_ms > 100);
+
+    /* A datagram keeps its length. Three of the five bytes in the bucket first, so that
+     * the next message meets a part of what it needs. */
+    arm_throttle_rule(SOCK_DGRAM, 5U);
+    assert(sendto(4, buffer, 3U, 0, NULL, 0U) == g_sendto_result);
+    assert(g_slept_ms == -1);
+    /* Ten bytes with two left: the message is sent whole and waits for the eight that are
+     * missing, 1600 ms at this rate -- not for all ten, which would charge the two the
+     * bucket already handed out a second time and make the rate come out too low. */
+    assert(send(4, buffer, 10U, 0) == g_send_result);
+    assert(g_send_size == 10U);
+    assert(g_slept_ms == 1600);
+
+    /* A non-blocking socket: EAGAIN, nothing sent, no wait. A real descriptor is needed
+     * because the flags are read from the kernel, not from the rule. */
+    nonblocking = (int)syscall(SYS_socket, AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    assert(nonblocking >= 0);
+    arm_throttle_rule(SOCK_DGRAM, 20U);
+    assert(send(nonblocking, buffer, 16U, 0) == g_send_result);
+    errno = 0;
+    assert(send(nonblocking, buffer, 16U, 0) == -1);
+    assert(errno == EAGAIN);
+    assert(g_send_calls == 1);
+    assert(g_slept_ms == -1);
+    /* sendto refuses the same way, and so does write on a socket: one rule, one answer,
+     * whichever call the application reaches for. */
+    arm_throttle_rule(SOCK_DGRAM, 23U);
+    assert(sendto(nonblocking, buffer, 16U, 0, NULL, 0U) == g_sendto_result);
+    errno = 0;
+    assert(sendto(nonblocking, buffer, 16U, 0, NULL, 0U) == -1);
+    assert(errno == EAGAIN);
+    assert(g_sendto_calls == 1);
+    {
+        reset_descriptor_stubs();
+        g_slept_ms = -1;
+        g_test_socket_type = SOCK_DGRAM;
+        g_stub_prepare = 1;
+        g_stub_endpoint_from_peer = 1;
+        g_stub_match_endpoint = 1;
+        memset(&g_stub_rule, 0, sizeof(g_stub_rule));
+        g_stub_rule.effect = CHAOS_NET_EFFECT_THROTTLE;
+        g_stub_rule.rate_bps = 24U;
+        g_should_trigger = 1;
+        assert(write(nonblocking, buffer, 16U) == 16);
+        errno = 0;
+        assert(write(nonblocking, buffer, 16U) == -1);
+        assert(errno == EAGAIN);
+        assert(g_descriptor_calls == 1);
+    }
+
+    /* A rule that does not fire costs neither bytes nor the wait. Three places ask it:
+     * with a part of the call's bytes in the bucket, with none and a blocking socket, and
+     * with none and a non-blocking one -- which must not be told EAGAIN either, because
+     * that is an answer only a rule that fires may give. */
+    arm_throttle_rule(SOCK_STREAM, 30U);
+    assert(send(4, buffer, 16U, 0) == g_send_result);
+    g_should_trigger = 0;
+    assert(send(4, buffer, 16U, 0) == g_send_result);
+    assert(g_send_size == 16U);
+    assert(g_slept_ms == -1);
+    arm_throttle_rule(SOCK_STREAM, 31U);
+    assert(send(4, buffer, 31U, 0) == g_send_result);
+    g_should_trigger = 0;
+    assert(send(4, buffer, 31U, 0) == g_send_result);
+    assert(g_send_size == 31U);
+    assert(g_slept_ms == -1);
+    arm_throttle_rule(SOCK_DGRAM, 22U);
+    assert(send(nonblocking, buffer, 16U, 0) == g_send_result);
+    g_should_trigger = 0;
+    assert(send(nonblocking, buffer, 16U, 0) == g_send_result);
+    assert(g_send_size == 16U);
+    assert(g_slept_ms == -1);
+    (void)syscall(SYS_close, nonblocking);
+    reset_wrapper_stubs();
+    g_test_socket_type = SOCK_STREAM;
+}
+
+/**
+ * @brief Proves DROP reports a datagram send that did not happen, and only for datagrams.
+ *
+ * @details A lost packet is what a program using UDP has to survive, and no other effect
+ * produces one: ERRNO is a send the program knows failed. Covered:
+ * - send, sendto, sendmsg, write and writev on a datagram socket report their full byte
+ *   count and make no real call;
+ * - a stream socket is left alone and the draw is not even taken: a silent gap in a TCP
+ *   stream is a state no network produces, since the kernel retransmits until the bytes
+ *   arrive or the connection breaks;
+ * - a draw that misses sends for real;
+ * - a send whose byte count is not a value the call could return (an iovec total above
+ *   SSIZE_MAX, which also covers the unreadable-vector sentinel) is sent: reporting it as
+ *   sent would hand the caller a negative count, i.e. an error with no errno.
+ */
+static void test_drop_datagram_sends(void)
+{
+    char buffer[4] = {'d', 'a', 't', 'a'};
+    struct iovec iov;
+    struct iovec huge;
+    struct msghdr message;
+
+    iov.iov_base = buffer;
+    iov.iov_len = sizeof(buffer);
+    huge.iov_base = buffer;
+    huge.iov_len = (size_t)SSIZE_MAX + 1U;
+    memset(&message, 0, sizeof(message));
+    message.msg_iov = &iov;
+    message.msg_iovlen = 1U;
+
+    /* Every send form on a datagram socket: full count reported, no real call.
+     * reset_wrapper_stubs() leaves the draw counter alone, so it is cleared here. */
+    reset_wrapper_stubs();
+    g_should_trigger_calls = 0;
+    g_test_socket_type = SOCK_DGRAM;
+    g_stub_endpoint_from_peer = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_DROP;
+    g_should_trigger = 1;
+    assert(send(4, buffer, 4U, 0) == 4);
+    assert(g_send_calls == 0);
+    assert(sendto(4, buffer, 4U, 0, NULL, 0U) == 4);
+    assert(g_sendto_calls == 0);
+    assert(sendmsg(4, &message, 0) == 4);
+    assert(g_sendmsg_calls == 0);
+    assert(g_should_trigger_calls == 3);
+
+    /* A stream socket is not dropped, and no draw is spent on it. */
+    reset_wrapper_stubs();
+    g_should_trigger_calls = 0;
+    g_test_socket_type = SOCK_STREAM;
+    g_stub_endpoint_from_peer = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_DROP;
+    g_should_trigger = 1;
+    assert(send(4, buffer, 4U, 0) == 4);
+    assert(g_send_calls == 1);
+    assert(g_should_trigger_calls == 0);
+
+    /* A draw that misses sends for real. */
+    reset_wrapper_stubs();
+    g_test_socket_type = SOCK_DGRAM;
+    g_stub_endpoint_from_peer = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_DROP;
+    g_should_trigger = 0;
+    assert(send(4, buffer, 4U, 0) == 4);
+    assert(g_send_calls == 1);
+
+    /* A message with no readable byte count is sent. */
+    reset_wrapper_stubs();
+    g_test_socket_type = SOCK_DGRAM;
+    g_stub_endpoint_from_peer = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_DROP;
+    g_should_trigger = 1;
+    message.msg_iov = &huge;
+    assert(sendmsg(4, &message, 0) == g_sendmsg_result);
+    assert(g_sendmsg_calls == 1);
+    message.msg_iov = &iov;
+
+    /* write() and writev() on a datagram socket are sends too. */
+    reset_descriptor_stubs();
+    g_test_socket_type = SOCK_DGRAM;
+    g_stub_prepare = 1;
+    g_stub_endpoint_from_peer = 1;
+    g_stub_match_endpoint = 1;
+    g_stub_rule.effect = CHAOS_NET_EFFECT_DROP;
+    g_should_trigger = 1;
+    assert(write(5, buffer, 4U) == 4);
+    assert(writev(5, &iov, 1) == (ssize_t)sizeof(buffer));
+    assert(g_descriptor_calls == 0);
+    g_test_socket_type = SOCK_STREAM;
+    assert(write(5, buffer, 4U) == 4);
+    assert(g_descriptor_calls == 1);
+    reset_wrapper_stubs();
+    g_test_socket_type = SOCK_STREAM;
 }
 
 /**
@@ -3770,27 +4320,29 @@ static void test_receive_helpers_and_vector_shapes(void)
     iov[0].iov_len = 0U;
     iov[1].iov_base = second;
     iov[1].iov_len = 4U;
-    chaos_net_corrupt_iovecs(iov, 0, 4U);
-    chaos_net_corrupt_iovecs(iov, 2, 0U);
+    (void)memset(&rule, 0, sizeof(rule));
+    chaos_net_rule_draw_begin(&rule);
+    chaos_net_corrupt_iovecs(&rule, iov, 0, 4U);
+    chaos_net_corrupt_iovecs(&rule, iov, 2, 0U);
     assert(g_corrupt_calls == 0);
-    chaos_net_corrupt_iovecs(iov, 2, 4U);
+    chaos_net_corrupt_iovecs(&rule, iov, 2, 4U);
     assert(g_corrupt_calls == 1 && g_last_corrupt_size == 4U);
     assert(memcmp(second, "data", 4U) != 0 && strcmp(first, "aaa") == 0);
 
 #ifdef __linux__
     (void)memcpy(second, "data", 4U);
     (void)memset(mmsg, 0, sizeof(mmsg));
-    chaos_net_corrupt_mmsghdrs(mmsg, 0U);
-    chaos_net_corrupt_mmsghdrs(mmsg, 1U); /* msg_len 0: skipped */
+    chaos_net_corrupt_mmsghdrs(&rule, mmsg, 0U);
+    chaos_net_corrupt_mmsghdrs(&rule, mmsg, 1U); /* msg_len 0: skipped */
     mmsg[0].msg_len = 4U;
-    chaos_net_corrupt_mmsghdrs(mmsg, 1U); /* no vector: skipped */
+    chaos_net_corrupt_mmsghdrs(&rule, mmsg, 1U); /* no vector: skipped */
     mmsg[0].msg_hdr.msg_iov = iov;
-    chaos_net_corrupt_mmsghdrs(mmsg, 1U); /* msg_iovlen 0: skipped */
+    chaos_net_corrupt_mmsghdrs(&rule, mmsg, 1U); /* msg_iovlen 0: skipped */
     mmsg[0].msg_hdr.msg_iovlen = 1U;
-    chaos_net_corrupt_mmsghdrs(mmsg, 1U); /* only an empty entry: skipped */
+    chaos_net_corrupt_mmsghdrs(&rule, mmsg, 1U); /* only an empty entry: skipped */
     assert(g_corrupt_calls == 1);
     mmsg[0].msg_hdr.msg_iovlen = 2U;
-    chaos_net_corrupt_mmsghdrs(mmsg, 1U);
+    chaos_net_corrupt_mmsghdrs(&rule, mmsg, 1U);
     assert(g_corrupt_calls == 2 && g_last_corrupt_size == 4U);
     assert(memcmp(second, "data", 4U) != 0);
 #endif
@@ -4135,10 +4687,13 @@ int main(void)
     test_dup_skips_and_close_races();
     test_trickle_and_dup_edges();
     test_dup_replays_the_last_payload();
+    test_drop_datagram_sends();
+    test_throttle_sends();
     test_trickle_shortens_receives();
     test_wrappers_record_call_size();
     test_size_of_vectors_and_messages();
     test_bind_and_connect_paths();
+    test_connect_redirect();
     test_accept_and_send_paths();
     test_recv_paths();
     test_descriptor_calls_on_sockets();

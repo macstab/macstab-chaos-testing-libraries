@@ -28,17 +28,31 @@
 
 /**
  * @brief The answer a DELAY verdict turns into when due: FAIL with `error` if set, else
- *        RETURN `value` if `returns`, else PASS. `delay_ms` is cleared.
+ *        RETURN `value` if `returns`, else SHORTEN if `shortens`, else PASS. `delay_ms` is
+ *        cleared.
+ *
+ * @details SHORTEN reaches the tracee through its registers, so a delay that ends in one
+ * only arises for a traced call -- which is every call a THROTTLE rule can act on.
  */
 chaos_init_verdict_t chaos_init_delay_answer(const chaos_init_verdict_t *verdict);
 
 /**
- * @brief Parks notification @p id of @p call until @p due_ms, when it is answered with
- *        @p answer (PASS, FAIL or RETURN). Both structures are copied.
+ * @brief Parks call @p id until @p due_ms, when it is answered with @p answer (PASS, FAIL
+ *        or RETURN). Both structures are copied.
+ *
+ * @param traced  Non-zero when @p id is the tid of a tracee stopped at a seccomp stop
+ *                rather than a notification id: the answer is then applied to its
+ *                registers and the thread continued, not sent to the listener. A thread is
+ *                in one system call at a time, so its tid identifies the parked call as a
+ *                notification id does.
  * @return 0, or -1 when the queue is full.
  */
 int chaos_init_delay_add(
-    uint64_t id, const chaos_init_call_t *call, uint64_t due_ms, const chaos_init_verdict_t *answer
+    uint64_t id,
+    const chaos_init_call_t *call,
+    uint64_t due_ms,
+    const chaos_init_verdict_t *answer,
+    int traced
 );
 
 /**
@@ -60,9 +74,19 @@ int chaos_init_delay_resume(const chaos_init_call_t *call, uint64_t id);
 int chaos_init_delay_next(uint64_t *due_ms);
 
 /**
- * @brief Removes one entry due at or before @p now_ms into @p id and @p answer; call
- *        repeatedly to drain. @return 1, or 0 when none is due.
+ * @brief Removes one entry due at or before @p now_ms into @p id, @p call, @p answer and
+ *        @p traced; call repeatedly to drain. @return 1, or 0 when none is due.
+ *
+ * @details The call comes back with the answer because an answer can still have work to
+ * do in the tracee: a clock read reports the time of the moment it is answered, which
+ * means reading the clock and writing the value here (chaos_init_time_commit()).
  */
-int chaos_init_delay_pop(uint64_t now_ms, uint64_t *id, chaos_init_verdict_t *answer);
+int chaos_init_delay_pop(
+    uint64_t now_ms,
+    uint64_t *id,
+    chaos_init_call_t *call,
+    chaos_init_verdict_t *answer,
+    int *traced
+);
 
 #endif

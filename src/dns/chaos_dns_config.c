@@ -136,6 +136,17 @@ static int g_chaos_dns_hit_pool_used = 0;
 static volatile unsigned int g_chaos_dns_active_config_index = 0U;
 
 /**
+ * @brief Rule-file snapshots this process has published, reported as the hits file's
+ *        `generation=` line.
+ *
+ * @details Lets a reader tell which rules a count belongs to: after a reload that changed
+ * the file the number differs, so counts that restarted are not mistaken for counts that
+ * stalled. Written only by the reload owner, between the same barriers as the active
+ * index.
+ */
+static volatile uint64_t g_chaos_dns_config_generation = 0U;
+
+/**
  * @brief Change stamp of the loaded rule file, and the reload claim.
  *
  * @details Holds a chaos_dns_config_hash_mtime() stamp or a reserved value:
@@ -183,6 +194,21 @@ static char g_chaos_dns_config_texts[CHAOS_DNS_MAX_RULES][CHAOS_STATUS_TEXT_MAX 
 /** @brief Hits-writer flag: set (by CAS) while one thread writes the hits file. */
 static volatile int g_chaos_dns_hits_writing = 0;
 
+/**
+ * @brief pthread_atfork() prepare handler: counts this fork in the parent.
+ *
+ * @details The child reads the counter as its own ordinal among its siblings, which is
+ * what makes two children of one parent decide differently (g_chaos_dns_forks). Counted
+ * here rather than in the child, because a child cannot tell how many siblings came
+ * before it. Atomic, so two threads forking at once get different ordinals rather than
+ * the same one; which of them gets which follows the order the kernel ran them in, as
+ * everything else about concurrent calls does.
+ */
+static void chaos_dns_config_before_fork(void)
+{
+    (void)__sync_fetch_and_add(&g_chaos_dns_forks, UINT64_C(1));
+}
+
 /** @brief Whether the pthread_atfork handler is registered (once per image). */
 static int g_chaos_dns_atfork_registered = 0;
 
@@ -206,7 +232,8 @@ static long g_chaos_dns_hits_file = 0L;
 static int g_chaos_dns_hits_owned = 0;
 
 /** @brief Scratch for formatting the hits file; used only by the hits writer. */
-static char g_chaos_dns_hits_buffer[CHAOS_DNS_MAX_RULES * CHAOS_HITS_LINE_MAX + 1U];
+static char
+    g_chaos_dns_hits_buffer[CHAOS_DNS_MAX_RULES * CHAOS_HITS_LINE_MAX + CHAOS_HITS_HEADER_MAX + 1U];
 
 /* -------------------------------------------------------------------------
  * Internal helpers: state management
@@ -278,6 +305,7 @@ static void chaos_dns_config_publish(unsigned int next_index, uint64_t observed_
     chaos_snapshot_write_end(&g_chaos_dns_config_states[next_index].sequence);
     __sync_synchronize();
     g_chaos_dns_active_config_index = next_index;
+    ++g_chaos_dns_config_generation;
     __sync_synchronize();
     g_chaos_dns_cached_mtime = observed_mtime;
 }
@@ -1291,7 +1319,7 @@ void chaos_dns_config_init(void)
     if (!g_chaos_dns_atfork_registered)
     {
         g_chaos_dns_atfork_registered = 1;
-        (void)pthread_atfork(NULL, NULL, chaos_dns_config_after_fork);
+        (void)pthread_atfork(chaos_dns_config_before_fork, NULL, chaos_dns_config_after_fork);
     }
     /* Resolve the vDSO clock now, not first inside a wrapper a signal handler re-entered. */
     (void)chaos_clock_now_ns();
@@ -1452,6 +1480,48 @@ int chaos_dns_config_parse_line(char *line, chaos_dns_rule_t *rule)
 }
 
 /**
+ * @brief Whether rule @p later can never win against one already accepted.
+ *
+ * @details Selection is rank, then the longer selector text, then the earlier line. Two
+ * rules with the same selector and effect tie on everything but the line, so the earlier
+ * one always wins and the later can never fire. It is a valid rule, so it is kept and the
+ * status file warns about it instead of the file being rejected. The selector holds no
+ * pointers and every rule is zeroed before it is filled, so comparing its bytes is exact.
+ *
+ * @param rules Rules accepted so far.
+ * @param count How many.
+ * @param later The rule about to be accepted.
+ * @return Non-zero when an earlier rule shadows @p later.
+ */
+static int
+chaos_dns_rule_shadowed(const chaos_dns_rule_t *rules, size_t count, const chaos_dns_rule_t *later)
+{
+    size_t index;
+
+    for (index = 0U; index < count; ++index)
+    {
+        if (rules[index].effect == later->effect &&
+            memcmp(&rules[index].selector, &later->selector, sizeof(later->selector)) == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
+ * @brief Build hook: whether a parsed rule can be applied at all in this mode.
+ *
+ * @details chaos-init (SECCOMP mode) compiles this file with its own definition: a rule
+ * it cannot apply from outside the process rejects the whole file with
+ * CHAOS_STATUS_REASON_UNSUPPORTED, so the status file says so instead of the rule
+ * silently doing nothing.
+ */
+#ifndef CHAOS_DNS_RULE_SUPPORTED
+#define CHAOS_DNS_RULE_SUPPORTED(rule) 1
+#endif
+
+/**
  * @brief Parses a whole rule file (contract in chaos_dns_config.h).
  *
  * @details All or nothing: the first rejected line ends the parse with -1, so a partly
@@ -1514,6 +1584,14 @@ int chaos_dns_config_parse_buffer(char *buffer, chaos_dns_rule_t *rules, size_t 
             }
             continue;
         }
+        if (chaos_policy_has_size(&policy))
+        {
+            /* No dns call reports a byte count, so a size gate can never pass and the
+             * rule would load and never fire. */
+            chaos_status_reject(&g_chaos_dns_config_error, CHAOS_STATUS_REASON_INVALID);
+            *rule_count = 0U;
+            return -1;
+        }
         parsed.policy = policy;
         parsed.call_size = CHAOS_POLICY_NO_SIZE;
         if (count >= CHAOS_DNS_MAX_RULES)
@@ -1522,15 +1600,27 @@ int chaos_dns_config_parse_buffer(char *buffer, chaos_dns_rule_t *rules, size_t 
             *rule_count = 0U;
             return -1;
         }
+        if (!CHAOS_DNS_RULE_SUPPORTED(&parsed))
+        {
+            chaos_status_reject(&g_chaos_dns_config_error, CHAOS_STATUS_REASON_UNSUPPORTED);
+            *rule_count = 0U;
+            return -1;
+        }
         (void)memcpy(
             g_chaos_dns_config_texts[count],
             g_chaos_dns_config_error.text,
             sizeof(g_chaos_dns_config_texts[count])
         );
+        if (chaos_dns_rule_shadowed(rules, count, &parsed))
+        {
+            chaos_status_warn(
+                &g_chaos_dns_config_error, g_chaos_dns_config_error.line, CHAOS_STATUS_WARN_SHADOWED
+            );
+        }
         rules[count++] = parsed;
     }
 
-    chaos_status_clear(&g_chaos_dns_config_error);
+    chaos_status_clear_rejection(&g_chaos_dns_config_error);
     *rule_count = count;
     return 0;
 }
@@ -1647,6 +1737,24 @@ static void chaos_dns_config_reject_file(chaos_dns_config_state_t *state, const 
 }
 
 /**
+ * @brief The tab-free header lines of this library's hits file: the reload generation.
+ *
+ * @details A named function rather than the expression it replaced, because chaos-init
+ * hands it to chaos_hits_write_for() when it writes this file for a traced process: the
+ * generation a reader correlates counts with must not depend on which mode produced them.
+ *
+ * @param out  Buffer of at least CHAOS_HITS_HEADER_MAX bytes.
+ * @param size Its size.
+ * @return @p out, or NULL when it could not be formatted (then no header is written).
+ */
+static const char *chaos_dns_hits_header(char *out, size_t size)
+{
+    const size_t used = chaos_hits_header_generation(out, size, g_chaos_dns_config_generation);
+
+    return used != 0U ? out : NULL;
+}
+
+/**
  * @brief Writes this process's hit counts after a hit on @p slot (NULL: forced, at exit
  *        or after an idle interval).
  *
@@ -1659,6 +1767,7 @@ static void chaos_dns_config_reject_file(chaos_dns_config_state_t *state, const 
  */
 static void chaos_dns_config_report_hits(chaos_hit_slot_t *slot)
 {
+    char header[CHAOS_HITS_HEADER_MAX];
     chaos_dns_config_state_t *state;
     const uint64_t now = chaos_hits_now_ms();
 
@@ -1706,6 +1815,7 @@ static void chaos_dns_config_report_hits(chaos_hit_slot_t *slot)
                 state->hits,
                 (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) state->text,
                 state->rule_count,
+                chaos_dns_hits_header(header, sizeof(header)),
                 g_chaos_dns_hits_buffer,
                 sizeof(g_chaos_dns_hits_buffer)
             );
@@ -1746,7 +1856,11 @@ static void chaos_dns_config_after_fork(void)
     CHAOS_STORE_IF_CHANGED(g_chaos_dns_hits_owned, 0);
     /* The child must not draw the parent's numbers (pre-fork workers would all decide
      * alike): its PRNG reseeds from its own thread id on the next draw. */
-    CHAOS_STORE_IF_CHANGED(g_chaos_dns_tls_prng_state, 0U);
+    /* The child decides differently from the parent and from its siblings without the
+     * rules' keys being rewritten: one global instead of every snapshot page. Mixed, not
+     * incremented, so sibling lineages are unrelated rather than adjacent. */
+    g_chaos_dns_lineage = chaos_dns_prng_mix(g_chaos_dns_lineage + g_chaos_dns_forks);
+    g_chaos_dns_forks = 0U;
     if (g_chaos_dns_hit_pool_used)
     {
         chaos_hits_pool_after_fork(
@@ -1804,6 +1918,11 @@ static void chaos_dns_config_attach_hits(chaos_dns_config_state_t *next_state)
         next_state->rules[index].hit = next_state->hits[index];
         next_state->rules[index].hit_generation =
             next_state->hits[index] != NULL ? next_state->hits[index]->generation : 0U;
+        /* From the text, so a rule keeps its decisions across a reload that keeps it and
+         * the rule that reuses its slot does not inherit them. */
+        next_state->rules[index].key = chaos_dns_prng_mix(
+            g_chaos_dns_process_seed ^ chaos_dns_rule_hash(next_state->text[index])
+        );
     }
 }
 
@@ -1828,7 +1947,11 @@ static void chaos_dns_config_report(uint64_t observed_mtime, const chaos_dns_con
     }
     else
     {
-        chaos_status_write(CHAOS_DNS_STATUS_PATH, CHAOS_STATUS_OK, state->rule_count, NULL);
+        /* The record is passed on success too: it carries the warnings, and its
+         * rejection fields were cleared when the parse succeeded. */
+        chaos_status_write(
+            CHAOS_DNS_STATUS_PATH, CHAOS_STATUS_OK, state->rule_count, &g_chaos_dns_config_error
+        );
     }
 }
 

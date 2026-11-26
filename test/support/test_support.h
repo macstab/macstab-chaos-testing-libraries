@@ -82,10 +82,12 @@
  *   reaching an arbitrary address.
  * - The Linux-only copy pointers via CHAOS_IO_DEFINE_TEST_LINUX_COPY_GLOBALS().
  * - `__thread int g_chaos_io_tls_guard` (reentrancy guard) = 0.
- * - `__thread uint64_t g_chaos_io_tls_prng_state` = 0, which makes the per-thread PRNG seed
- *   itself on first use.
- * - `uint64_t g_chaos_io_process_seed` = 1, non-zero so probability draws work without the
- *   constructor.
+ * - `uint64_t g_chaos_io_lineage` = 0, the lineage of the process that loaded the library;
+ * - `uint64_t g_chaos_io_forks` = 0, the number of forks this process has made;
+ *   a forked child mixes it forward so it decides differently.
+ * - `uint64_t g_chaos_io_process_seed` = 1, non-zero so draws work without the constructor.
+ *   A rule outside a snapshot has key 0 and no slot, so its draws are a fixed function of
+ *   this seed -- tests get the same samples every run without seeding anything.
  */
 #define CHAOS_IO_DEFINE_TEST_GLOBALS()                                                             \
     chaos_io_read_fn g_chaos_io_real_read = NULL;                                                  \
@@ -126,7 +128,8 @@
     chaos_io_renameat_fn g_chaos_io_real_renameat = NULL;                                          \
     CHAOS_IO_DEFINE_TEST_LINUX_COPY_GLOBALS()                                                      \
     __thread int g_chaos_io_tls_guard = 0;                                                         \
-    __thread uint64_t g_chaos_io_tls_prng_state = 0U;                                              \
+    uint64_t g_chaos_io_lineage = 0U;                                                              \
+    uint64_t g_chaos_io_forks = 0U;                                                                \
     uint64_t g_chaos_io_process_seed = 1U
 
 /**
@@ -355,7 +358,8 @@ static inline void chaos_test_reset_runtime(void)
     g_chaos_io_real_renameat = NULL;
     CHAOS_IO_TEST_RESET_REAL_LINUX_COPY()
     g_chaos_io_tls_guard = 0;
-    g_chaos_io_tls_prng_state = 0U;
+    g_chaos_io_lineage = 0U;
+    g_chaos_io_forks = 0U;
     g_chaos_io_process_seed = 1U;
 }
 

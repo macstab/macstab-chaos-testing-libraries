@@ -51,11 +51,6 @@ int chaos_net_probability_hit_sample(double probability, uint32_t sample)
     return (double)sample < threshold;
 }
 
-int chaos_net_probability_hit(double probability)
-{
-    return chaos_net_probability_hit_sample(probability, chaos_net_prng_next_u32());
-}
-
 /**
  * @brief Flips one bit chosen by caller-supplied samples (contract in the header).
  *
@@ -83,10 +78,10 @@ void chaos_net_corrupt_buffer_sample(
 /**
  * @brief Flips one bit, with the byte and the bit from two PRNG draws.
  */
-void chaos_net_corrupt_buffer(void *buffer, size_t size)
+void chaos_net_corrupt_buffer(const chaos_net_rule_t *rule, void *buffer, size_t size)
 {
-    uint32_t index_sample = chaos_net_prng_next_u32();
-    uint32_t bit_sample = chaos_net_prng_next_u32();
+    uint32_t index_sample = chaos_net_rule_draw(rule, CHAOS_NET_DRAW_FIRST_EFFECT);
+    uint32_t bit_sample = chaos_net_rule_draw(rule, CHAOS_NET_DRAW_SECOND_EFFECT);
 
     chaos_net_corrupt_buffer_sample(buffer, size, index_sample, bit_sample);
 }
@@ -94,7 +89,7 @@ void chaos_net_corrupt_buffer(void *buffer, size_t size)
 /**
  * @brief Sleeps for a firing LATENCY rule (contract in the header).
  */
-void chaos_net_rule_apply_latency(const chaos_net_rule_t *rule)
+void chaos_net_rule_apply_latency(chaos_net_rule_t *rule)
 {
     /* The qualifiers (@first, @from, @until, @size) and the hit count apply to a delay
      * as to any other effect. */
@@ -113,18 +108,24 @@ void chaos_net_rule_apply_latency(const chaos_net_rule_t *rule)
  * call the window or the size gate rejects neither consumes a random number nor claims
  * an `@first` slot.
  */
-int chaos_net_rule_should_trigger(const chaos_net_rule_t *rule)
+int chaos_net_rule_should_trigger(chaos_net_rule_t *rule)
 {
     if (rule == NULL || !chaos_policy_window_open(&rule->policy) ||
+        !chaos_policy_at_ok(&rule->policy, rule->hit) ||
         !chaos_policy_size_ok(&rule->policy, rule->call_size))
     {
         return 0;
     }
-    if (rule->effect == CHAOS_NET_EFFECT_LATENCY)
+    /* Past the gates that cost nothing: this call is an evaluation of the rule and gets
+     * its number. `@every=N` picks evaluations, so it gates here, before the draw; every
+     * sample of this call follows from the same number. */
+    if (!chaos_policy_every_ok(&rule->policy, chaos_net_rule_draw_begin(rule)))
     {
-        return chaos_policy_fire(&rule->policy, rule->hit, rule->hit_generation);
+        return 0;
     }
-    if (!chaos_net_probability_hit(rule->probability))
+    if (!chaos_net_probability_hit_sample(
+            rule->probability, chaos_net_rule_draw(rule, CHAOS_NET_DRAW_PROBABILITY)
+        ))
     {
         return 0;
     }
@@ -137,7 +138,7 @@ int chaos_net_rule_should_trigger(const chaos_net_rule_t *rule)
  * @details Safe to call unconditionally: a NULL or non-ERRNO rule returns 0 with errno
  * untouched, so the errno a wrapper reports after forwarding stays the real function's.
  */
-int chaos_net_rule_apply_errno(const chaos_net_rule_t *rule)
+int chaos_net_rule_apply_errno(chaos_net_rule_t *rule)
 {
     if (rule == NULL || rule->effect != CHAOS_NET_EFFECT_ERRNO)
     {

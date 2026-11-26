@@ -41,16 +41,6 @@
 int chaos_time_probability_hit_sample(double probability, uint32_t sample);
 
 /**
- * Draws from the calling thread's PRNG and tests @p probability.
- *
- * Always advances the stream, also for probability 0 or 1.
- *
- * @param probability  Probability in [0.0, 1.0].
- * @return             Non-zero when it fires.
- */
-int chaos_time_probability_hit(double probability);
-
-/**
  * The full firing decision for one call: window, size gate, probability, `@first`.
  *
  * In order: the `@from`/`@until` window is open, the call's size passes any `@size`
@@ -60,7 +50,7 @@ int chaos_time_probability_hit(double probability);
  * @param rule  Rule copy; NULL returns 0.
  * @return      Non-zero when the effect is to be applied now.
  */
-int chaos_time_rule_should_trigger(const chaos_time_rule_t *rule);
+int chaos_time_rule_should_trigger(chaos_time_rule_t *rule);
 
 /**
  * LATENCY: sleeps rule->latency_ms before the real call, if the rule fires.
@@ -73,7 +63,7 @@ int chaos_time_rule_should_trigger(const chaos_time_rule_t *rule);
  *
  * @param rule  Rule copy; NULL or a non-LATENCY rule does nothing.
  */
-void chaos_time_rule_apply_latency(const chaos_time_rule_t *rule);
+void chaos_time_rule_apply_latency(chaos_time_rule_t *rule);
 
 /**
  * ERRNO: sets errno = rule->errnum if the rule fires.
@@ -82,7 +72,7 @@ void chaos_time_rule_apply_latency(const chaos_time_rule_t *rule);
  * @return      Non-zero when errno was set and the wrapper must fail the call without
  *              calling the real function.
  */
-int chaos_time_rule_apply_errno(const chaos_time_rule_t *rule);
+int chaos_time_rule_apply_errno(chaos_time_rule_t *rule);
 
 /**
  * OFFSET: adds rule->offset_ms to @p value if the rule fires.
@@ -96,7 +86,7 @@ int chaos_time_rule_apply_errno(const chaos_time_rule_t *rule);
  * @param rule   Rule copy; NULL or a non-OFFSET rule does nothing.
  * @param value  Time to shift in place; NULL does nothing.
  */
-void chaos_time_rule_apply_offset(const chaos_time_rule_t *rule, struct timespec *value);
+void chaos_time_rule_apply_offset(chaos_time_rule_t *rule, struct timespec *value);
 
 /**
  * REGRESS: steps the clock back by rule->offset_ms once, then keeps it shifted.
@@ -112,7 +102,19 @@ void chaos_time_rule_apply_offset(const chaos_time_rule_t *rule, struct timespec
  * @param rule   Rule copy; NULL or a non-REGRESS rule does nothing.
  * @param value  Time to shift in place; NULL does nothing.
  */
-void chaos_time_rule_apply_regress(const chaos_time_rule_t *rule, struct timespec *value);
+void chaos_time_rule_apply_regress(chaos_time_rule_t *rule, struct timespec *value);
+
+/**
+ * @brief FREEZE effect: stops @p value at the reading of the call that fires the rule.
+ *
+ * @details The first call that passes the qualifiers and the probability keeps its reading
+ * in the rule's hit slot; every later call is given that value back. Outside a
+ * `@from`/`@until` window the clock runs, frozen or not, as it does for REGRESS.
+ *
+ * @param[in,out] rule   Matched FREEZE rule; anything else is a no-op.
+ * @param[in,out] value  Reading of a successful clock call; replaced once frozen.
+ */
+void chaos_time_rule_apply_freeze(chaos_time_rule_t *rule, struct timespec *value);
 
 /**
  * Maps a TIMER_ABSTIME deadline from the program's shifted clock back to the real one.

@@ -116,7 +116,7 @@ static int chaos_io_stdio_rule(
  *        errno, raises the error indicator and returns 1, so the caller fails without
  *        calling libc. TORN and CORRUPT return 0 here.
  */
-static int chaos_io_stdio_fails(FILE *stream, const chaos_io_rule_t *rule)
+static int chaos_io_stdio_fails(FILE *stream, chaos_io_rule_t *rule)
 {
     if (rule->effect == CHAOS_IO_EFFECT_LATENCY)
     {
@@ -133,11 +133,11 @@ static int chaos_io_stdio_fails(FILE *stream, const chaos_io_rule_t *rule)
 
 /** @brief CORRUPT after a stdio read: flips one bit among the @p bytes returned, when the
  *         rule fires; nothing for 0 bytes. */
-static void chaos_io_stdio_corrupt(const chaos_io_rule_t *rule, void *buffer, size_t bytes)
+static void chaos_io_stdio_corrupt(chaos_io_rule_t *rule, void *buffer, size_t bytes)
 {
     if (bytes > 0U && rule->effect == CHAOS_IO_EFFECT_CORRUPT && chaos_io_rule_should_trigger(rule))
     {
-        chaos_io_corrupt_buffer(buffer, bytes);
+        chaos_io_corrupt_buffer(rule, buffer, bytes);
     }
 }
 

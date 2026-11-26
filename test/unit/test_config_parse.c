@@ -191,6 +191,18 @@ static void test_helper_primitives(void)
     assert(chaos_io_parse_errno_name("ENFILE") == ENFILE);
     assert(chaos_io_parse_errno_name("ENOENT") == ENOENT);
     assert(chaos_io_parse_errno_name("EINVAL") == -1);
+    /* A number the C library has no name for, as time, process and memory accept: only
+     * the range is checked. Zero, a negative, a float, trailing text and a value past
+     * int are not errnos. */
+    assert(chaos_io_parse_errno_name("5") == 5);
+    assert(chaos_io_parse_errno_name("2147483647") == 2147483647);
+    assert(chaos_io_parse_errno_name("5 ") == 5);
+    assert(chaos_io_parse_errno_name("0") == -1);
+    assert(chaos_io_parse_errno_name("-5") == -1);
+    assert(chaos_io_parse_errno_name("5.5") == -1);
+    assert(chaos_io_parse_errno_name("5x") == -1);
+    assert(chaos_io_parse_errno_name("2147483648") == -1);
+    assert(chaos_io_parse_errno_name("") == -1);
 
     {
         double probability = -1.0;
@@ -209,17 +221,38 @@ static void test_helper_primitives(void)
 
     {
         unsigned int latency_ms = 0U;
+        double latency_probability = 0.0;
         char invalid_latency[] = "10ms";
         char overflow_latency[] = "4294967296";
         char valid_latency[] = "25  ";
         char zero_latency[] = "0";
+        char with_probability[] = "25@0.25";
+        char empty_milliseconds[] = "@0.25";
+        char blank_before_at[] = "25 @0.25";
+        char bad_probability[] = "25@2";
+        char two_at_signs[] = "25@0.5@0.5";
+        char long_milliseconds[] = "00000000000000025@1";
 
-        assert(chaos_io_parse_latency(NULL, &latency_ms) == -1);
-        assert(chaos_io_parse_latency(invalid_latency, &latency_ms) == -1);
-        assert(chaos_io_parse_latency(overflow_latency, &latency_ms) == -1);
-        assert(chaos_io_parse_latency(valid_latency, &latency_ms) == 0);
+        assert(chaos_io_parse_latency(NULL, &latency_ms, &latency_probability) == -1);
+        assert(chaos_io_parse_latency(invalid_latency, &latency_ms, &latency_probability) == -1);
+        assert(chaos_io_parse_latency(overflow_latency, &latency_ms, &latency_probability) == -1);
+        assert(chaos_io_parse_latency(valid_latency, &latency_ms, &latency_probability) == 0);
         assert(latency_ms == 25U);
-        assert(chaos_io_parse_latency(zero_latency, NULL) == -1);
+        /* No @probability means certain, which is what `LATENCY:ms` always meant. */
+        assert(latency_probability == 1.0);
+        assert(chaos_io_parse_latency(zero_latency, NULL, &latency_probability) == -1);
+        assert(chaos_io_parse_latency(zero_latency, &latency_ms, NULL) == -1);
+
+        assert(chaos_io_parse_latency(with_probability, &latency_ms, &latency_probability) == 0);
+        assert(latency_ms == 25U && latency_probability == 0.25);
+
+        /* Rejected: no milliseconds, a blank before the `@` (that is a qualifier word),
+         * a probability out of range, a second `@`, and milliseconds too long to be one. */
+        assert(chaos_io_parse_latency(empty_milliseconds, &latency_ms, &latency_probability) == -1);
+        assert(chaos_io_parse_latency(blank_before_at, &latency_ms, &latency_probability) == -1);
+        assert(chaos_io_parse_latency(bad_probability, &latency_ms, &latency_probability) == -1);
+        assert(chaos_io_parse_latency(two_at_signs, &latency_ms, &latency_probability) == -1);
+        assert(chaos_io_parse_latency(long_milliseconds, &latency_ms, &latency_probability) == -1);
     }
 
     assert(chaos_io_effect_allowed(CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_ERRNO));
@@ -233,6 +266,46 @@ static void test_helper_primitives(void)
     assert(chaos_io_effect_allowed(CHAOS_IO_OP_PREAD, CHAOS_IO_EFFECT_CORRUPT));
     assert(!chaos_io_effect_allowed(CHAOS_IO_OP_OPEN, CHAOS_IO_EFFECT_CORRUPT));
     assert(!chaos_io_effect_allowed(CHAOS_IO_OP_UNLINK, CHAOS_IO_EFFECT_CORRUPT));
+    assert(chaos_io_effect_allowed(CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_DROP));
+    assert(chaos_io_effect_allowed(CHAOS_IO_OP_PWRITE, CHAOS_IO_EFFECT_DROP));
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_DROP));
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_FSYNC, CHAOS_IO_EFFECT_DROP));
+    assert(chaos_io_effect_allowed(CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_THROTTLE));
+    assert(chaos_io_effect_allowed(CHAOS_IO_OP_PWRITE, CHAOS_IO_EFFECT_THROTTLE));
+    /* The read side is left out on purpose: a read may always return less than it was
+     * asked for, so holding one back is no fault a device produces. */
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_THROTTLE));
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_PREAD, CHAOS_IO_EFFECT_THROTTLE));
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_THROTTLE));
+    {
+        /* Arguments no line can produce, as with the free-space helper above. */
+        uint64_t rate = 0U;
+
+        assert(chaos_io_parse_rate(NULL, &rate) == -1);
+        assert(chaos_io_parse_rate("", &rate) == -1);
+        assert(chaos_io_parse_rate(" 4096", &rate) == -1);
+        assert(chaos_io_parse_rate("4096", &rate) == 0 && rate == 4096U);
+    }
+    {
+        /* Arguments no line can produce: the parser passes its own fields, so the guard is
+         * proved by calling the helper directly, as the latency helpers above are. */
+        uint64_t bytes = 0U;
+        double chance = 0.0;
+
+        assert(chaos_io_parse_free_bytes(NULL, &bytes, &chance) == -1);
+        assert(chaos_io_parse_free_bytes("4096", NULL, &chance) == -1);
+        assert(chaos_io_parse_free_bytes("4096", &bytes, NULL) == -1);
+        assert(chaos_io_parse_free_bytes("4096", &bytes, &chance) == 0);
+        assert(bytes == 4096U && chance == 1.0);
+    }
+    assert(chaos_io_effect_allowed(CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_FREE));
+    assert(chaos_io_effect_allowed(CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_FULL));
+    assert(chaos_io_effect_allowed(CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_ERRNO));
+    assert(chaos_io_effect_allowed(CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_LATENCY));
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_FREE));
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_FULL));
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_TORN));
+    assert(!chaos_io_effect_allowed(CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_DROP));
     assert(!chaos_io_effect_allowed(CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_INVALID));
 
     assert(chaos_io_config_normalize_mtime_hash(CHAOS_IO_MTIME_MISSING) != CHAOS_IO_MTIME_MISSING);
@@ -268,25 +341,98 @@ static void test_parse_line_valid_cases(void)
         int errnum;
         double probability;
         unsigned int latency_ms;
+        uint64_t free_bytes;
+        uint64_t rate_bps;
     } cases[] = {
-        {"/data:read:EIO:0.1", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_ERRNO, EIO, 0.1, 0U},
-        {"/data:write:ENOSPC:0.2", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_ERRNO, ENOSPC, 0.2, 0U},
-        {"/data:open:EMFILE:0.3", CHAOS_IO_OP_OPEN, CHAOS_IO_EFFECT_ERRNO, EMFILE, 0.3, 0U},
-        {"/data:close:EDQUOT:0.4", CHAOS_IO_OP_CLOSE, CHAOS_IO_EFFECT_ERRNO, EDQUOT, 0.4, 0U},
-        {"/data:fsync:EROFS:0.5", CHAOS_IO_OP_FSYNC, CHAOS_IO_EFFECT_ERRNO, EROFS, 0.5, 0U},
-        {"/data:fdatasync:EACCES:0.6", CHAOS_IO_OP_FDATASYNC, CHAOS_IO_EFFECT_ERRNO, EACCES, 0.6, 0U
+        {"/data:read:EIO:0.1", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_ERRNO, EIO, 0.1, 0U, 0U, 0U},
+        {"/data:write:ENOSPC:0.2", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_ERRNO, ENOSPC, 0.2, 0U, 0U, 0U
         },
-        {"/data:pread:ENOENT:0.7", CHAOS_IO_OP_PREAD, CHAOS_IO_EFFECT_ERRNO, ENOENT, 0.7, 0U},
-        {"/data:pwrite:ENFILE:0.8", CHAOS_IO_OP_PWRITE, CHAOS_IO_EFFECT_ERRNO, ENFILE, 0.8, 0U},
-        {"/data:truncate:EIO:0.2", CHAOS_IO_OP_TRUNCATE, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U},
-        {"/data:allocate:EIO:0.2", CHAOS_IO_OP_ALLOCATE, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U},
-        {"/data:unlink:EIO:0.2", CHAOS_IO_OP_UNLINK, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U},
-        {"/data:rename_from:EIO:0.2", CHAOS_IO_OP_RENAME_FROM, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U},
-        {"/data:rename_to:EIO:0.2", CHAOS_IO_OP_RENAME_TO, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U},
-        {"/data:write:LATENCY:25", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_LATENCY, 0, 0.0, 25U},
-        {"/data:truncate:LATENCY:25", CHAOS_IO_OP_TRUNCATE, CHAOS_IO_EFFECT_LATENCY, 0, 0.0, 25U},
-        {"/data:write:TORN:0.9", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_TORN, 0, 0.9, 0U},
-        {"/data:read:CORRUPT:1.0", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_CORRUPT, 0, 1.0, 0U}
+        {"/data:open:EMFILE:0.3", CHAOS_IO_OP_OPEN, CHAOS_IO_EFFECT_ERRNO, EMFILE, 0.3, 0U, 0U, 0U},
+        {"/data:close:EDQUOT:0.4", CHAOS_IO_OP_CLOSE, CHAOS_IO_EFFECT_ERRNO, EDQUOT, 0.4, 0U, 0U, 0U
+        },
+        {"/data:fsync:EROFS:0.5", CHAOS_IO_OP_FSYNC, CHAOS_IO_EFFECT_ERRNO, EROFS, 0.5, 0U, 0U, 0U},
+        {"/data:fdatasync:EACCES:0.6",
+         CHAOS_IO_OP_FDATASYNC,
+         CHAOS_IO_EFFECT_ERRNO,
+         EACCES,
+         0.6,
+         0U,
+         0U,
+         0U},
+        {"/data:pread:ENOENT:0.7", CHAOS_IO_OP_PREAD, CHAOS_IO_EFFECT_ERRNO, ENOENT, 0.7, 0U, 0U, 0U
+        },
+        {"/data:pwrite:ENFILE:0.8",
+         CHAOS_IO_OP_PWRITE,
+         CHAOS_IO_EFFECT_ERRNO,
+         ENFILE,
+         0.8,
+         0U,
+         0U,
+         0U},
+        {"/data:truncate:EIO:0.2", CHAOS_IO_OP_TRUNCATE, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U, 0U, 0U
+        },
+        {"/data:allocate:EIO:0.2", CHAOS_IO_OP_ALLOCATE, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U, 0U, 0U
+        },
+        {"/data:unlink:EIO:0.2", CHAOS_IO_OP_UNLINK, CHAOS_IO_EFFECT_ERRNO, EIO, 0.2, 0U, 0U, 0U},
+        {"/data:rename_from:EIO:0.2",
+         CHAOS_IO_OP_RENAME_FROM,
+         CHAOS_IO_EFFECT_ERRNO,
+         EIO,
+         0.2,
+         0U,
+         0U,
+         0U},
+        {"/data:rename_to:EIO:0.2",
+         CHAOS_IO_OP_RENAME_TO,
+         CHAOS_IO_EFFECT_ERRNO,
+         EIO,
+         0.2,
+         0U,
+         0U,
+         0U},
+        {"/data:write:LATENCY:25", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_LATENCY, 0, 1.0, 25U, 0U, 0U},
+        {"/data:truncate:LATENCY:25",
+         CHAOS_IO_OP_TRUNCATE,
+         CHAOS_IO_EFFECT_LATENCY,
+         0,
+         1.0,
+         25U,
+         0U,
+         0U},
+        {"/data:read:LATENCY:25@0.5", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_LATENCY, 0, 0.5, 25U, 0U, 0U
+        },
+        {"/data:write:TORN:0.9", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_TORN, 0, 0.9, 0U, 0U, 0U},
+        {"/data:read:CORRUPT:1.0", CHAOS_IO_OP_READ, CHAOS_IO_EFFECT_CORRUPT, 0, 1.0, 0U, 0U, 0U},
+        {"/data:write:DROP:0.4", CHAOS_IO_OP_WRITE, CHAOS_IO_EFFECT_DROP, 0, 0.4, 0U, 0U, 0U},
+        {"/data:pwrite:DROP:1.0", CHAOS_IO_OP_PWRITE, CHAOS_IO_EFFECT_DROP, 0, 1.0, 0U, 0U, 0U},
+        {"/data:statfs:FULL:1.0", CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_FULL, 0, 1.0, 0U, 0U, 0U},
+        {"/data:statfs:FREE:0", CHAOS_IO_OP_STATFS, CHAOS_IO_EFFECT_FREE, 0, 1.0, 0U, 0U, 0U},
+        {"/data:statfs:FREE:1048576@0.5",
+         CHAOS_IO_OP_STATFS,
+         CHAOS_IO_EFFECT_FREE,
+         0,
+         0.5,
+         0U,
+         1048576U,
+         0U},
+        /* THROTTLE carries a rate and no probability, so its probability is the 1.0 every
+         * matched call is held to; a rate the parser forgot would throttle to nothing. */
+        {"/data:write:THROTTLE:65536",
+         CHAOS_IO_OP_WRITE,
+         CHAOS_IO_EFFECT_THROTTLE,
+         0,
+         1.0,
+         0U,
+         0U,
+         65536U},
+        {"/data:pwrite:THROTTLE:4294967295",
+         CHAOS_IO_OP_PWRITE,
+         CHAOS_IO_EFFECT_THROTTLE,
+         0,
+         1.0,
+         0U,
+         0U,
+         4294967295U}
     };
     size_t index;
 
@@ -299,19 +445,23 @@ static void test_parse_line_valid_cases(void)
         assert(chaos_io_config_parse_line(line, &rule) == 1);
         assert(rule.operation == cases[index].operation);
         assert(rule.effect == cases[index].effect);
+        /* Every effect carries a probability, LATENCY included: a rule whose probability
+         * the parser forgets to store never fires, and nothing else would notice. */
+        assert(rule.probability == cases[index].probability);
         if (rule.effect == CHAOS_IO_EFFECT_ERRNO)
         {
             assert(rule.errnum == cases[index].errnum);
-            assert(rule.probability == cases[index].probability);
         }
         if (rule.effect == CHAOS_IO_EFFECT_LATENCY)
         {
             assert(rule.latency_ms == cases[index].latency_ms);
         }
-        if (rule.effect == CHAOS_IO_EFFECT_TORN || rule.effect == CHAOS_IO_EFFECT_CORRUPT)
-        {
-            assert(rule.probability == cases[index].probability);
-        }
+        /* Asserted for every row, not only the FREE ones: a parser that stores the byte
+         * count on the wrong effect is as wrong as one that forgets it. */
+        assert(rule.free_bytes == cases[index].free_bytes);
+        /* And for every row again: a rate stored on the wrong effect is as wrong as one
+         * that was never stored. */
+        assert(rule.rate_bps == cases[index].rate_bps);
     }
 
     {
@@ -347,9 +497,33 @@ static void test_parse_line_invalid_cases(void)
     char invalid_latency[] = "/data:write:LATENCY:not-a-number";
     char invalid_corrupt_probability[] = "/data:read:CORRUPT:2.0";
     char invalid_torn_probability[] = "/data:pwrite:TORN:-0.1";
+    char invalid_drop_operation[] = "/data:read:DROP:0.2";
+    char invalid_drop_fsync[] = "/data:fsync:DROP:1.0";
+    char invalid_drop_probability[] = "/data:write:DROP:1.5";
+    char invalid_free_operation[] = "/data:write:FREE:4096";
+    char invalid_full_operation[] = "/data:read:FULL:1";
+    char invalid_free_value[] = "/data:statfs:FREE:plenty";
+    char invalid_free_negative[] = "/data:statfs:FREE:-1";
+    char invalid_free_huge[] = "/data:statfs:FREE:99999999999999999999999";
+    char invalid_free_probability[] = "/data:statfs:FREE:4096@2";
+    char invalid_free_empty[] = "/data:statfs:FREE:";
+    char invalid_free_no_digits[] = "/data:statfs:FREE:@0.5";
+    char invalid_free_long[] = "/data:statfs:FREE:1111111111111111111111111@0.5";
+    char invalid_full_value[] = "/data:statfs:FULL:nope";
+    char invalid_throttle_operation[] = "/data:read:THROTTLE:4096";
+    char invalid_throttle_statfs[] = "/data:statfs:THROTTLE:4096";
+    char invalid_throttle_zero[] = "/data:write:THROTTLE:0";
+    char invalid_throttle_text[] = "/data:write:THROTTLE:fast";
+    char invalid_throttle_negative[] = "/data:write:THROTTLE:-4096";
+    char invalid_throttle_empty[] = "/data:write:THROTTLE:";
+    char invalid_throttle_huge[] = "/data:write:THROTTLE:4294967296";
+    char invalid_throttle_probability[] = "/data:write:THROTTLE:4096@0.5";
     char empty_operation[] = "/data::EIO:0.1";
     char empty_effect[] = "/data:read::0.1";
     char empty_value[] = "/data:read:EIO:";
+    char relative_prefix[] = "data:read:EIO:1.0";
+    char dotted_prefix[] = "./data:read:EIO:1.0";
+    char parent_prefix[] = "../data:read:EIO:1.0";
     chaos_io_rule_t rule;
 
     assert(chaos_io_config_parse_line(NULL, &rule) == -1);
@@ -363,11 +537,40 @@ static void test_parse_line_invalid_cases(void)
     assert(chaos_io_config_parse_line(invalid_operation, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_errno_probability, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_effect, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_drop_operation, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_drop_fsync, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_drop_probability, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_free_operation, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_full_operation, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_free_value, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_free_negative, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_free_huge, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_free_probability, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_free_empty, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_free_no_digits, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_free_long, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_full_value, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_throttle_operation, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_throttle_statfs, &rule) == -1);
+    /* A rate of 0 would be "no bytes ever", which is a hang and not a rate. */
+    assert(chaos_io_config_parse_line(invalid_throttle_zero, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_throttle_text, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_throttle_negative, &rule) == -1);
+    assert(chaos_io_config_parse_line(invalid_throttle_empty, &rule) == -1);
+    /* One above what the bucket's token half holds: rejected, not truncated. */
+    assert(chaos_io_config_parse_line(invalid_throttle_huge, &rule) == -1);
+    /* A probability on a rate would have to mean "every other call is limited". */
+    assert(chaos_io_config_parse_line(invalid_throttle_probability, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_combination, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_truncate_combination, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_latency, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_corrupt_probability, &rule) == -1);
     assert(chaos_io_config_parse_line(invalid_torn_probability, &rule) == -1);
+    /* A prefix that is neither the wildcard nor absolute can never cover a path:
+     * such a rule used to load and never fire. */
+    assert(chaos_io_config_parse_line(relative_prefix, &rule) == -1);
+    assert(chaos_io_config_parse_line(dotted_prefix, &rule) == -1);
+    assert(chaos_io_config_parse_line(parent_prefix, &rule) == -1);
 
     (void)memset(long_path_line, 'a', sizeof(long_path_line));
     long_path_line[0] = '/';
@@ -595,6 +798,58 @@ static void test_reload_prepare_and_match(void)
 }
 
 /**
+ * @brief Proves a rule's draw key follows its text, not its place in the file.
+ *
+ * @details The key is what makes a fault reproducible, so it has to belong to the rule and
+ * not to the slot the rule happens to occupy: chaos_hits_assign() hands a slot out again
+ * when a rule leaves the file, and a key from the slot index would make the next rule in
+ * that slot inherit the old one's decisions. Asserted by reloading the same two rules in
+ * the other order -- each text keeps its key -- and by adding a rule in front, which must
+ * leave the other two keys alone.
+ */
+static void test_draw_key_follows_the_rule_text(void)
+{
+    uint64_t first_key;
+    uint64_t second_key;
+    const chaos_io_config_state_t *state;
+
+    chaos_test_use_real_io();
+    chaos_io_config_init();
+    chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/a:write:EIO:1.0\n/b:read:EIO:1.0\n");
+    assert(chaos_io_config_prepare() == 1);
+    state = chaos_io_config_active_state();
+    assert(state->rule_count == 2U);
+    assert(strcmp(state->text[0], "/a:write:EIO:1.0") == 0);
+    first_key = state->rules[0].key;
+    second_key = state->rules[1].key;
+    assert(first_key != second_key);
+
+    /* Same rules, other order: the keys travel with the texts. */
+    chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/b:read:EIO:1.0\n/a:write:EIO:1.0\n");
+    g_chaos_io_cached_mtime = CHAOS_IO_MTIME_UNKNOWN;
+    assert(chaos_io_config_prepare() == 1);
+    state = chaos_io_config_active_state();
+    assert(state->rule_count == 2U);
+    assert(strcmp(state->text[0], "/b:read:EIO:1.0") == 0);
+    assert(state->rules[0].key == second_key);
+    assert(state->rules[1].key == first_key);
+
+    /* A rule added in front shifts every index; the keys do not move. */
+    chaos_test_write_text_file(
+        CHAOS_IO_CONFIG_PATH, "/c:open:EIO:1.0\n/b:read:EIO:1.0\n/a:write:EIO:1.0\n"
+    );
+    g_chaos_io_cached_mtime = CHAOS_IO_MTIME_UNKNOWN;
+    assert(chaos_io_config_prepare() == 1);
+    state = chaos_io_config_active_state();
+    assert(state->rule_count == 3U);
+    assert(state->rules[1].key == second_key);
+    assert(state->rules[2].key == first_key);
+    assert(state->rules[0].key != first_key && state->rules[0].key != second_key);
+
+    (void)unlink(CHAOS_IO_CONFIG_PATH);
+}
+
+/**
  * @brief A transient read failure keeps the active rules and retries: with open failing
  *        the old single rule stays active and the stamp is not advanced (nor left at
  *        RELOADING); the next call with working I/O loads both new rules.
@@ -650,8 +905,8 @@ static void test_change_stamp_beyond_mtime(void)
  *
  * @details The test name predates this design: a vfork child shares memory with a parent
  * whose reload may still be running, so prepare() must not steal the claim whoever made
- * it. chaos_io_config_after_fork() resets the child's PRNG state, rebinds the hits pid and
- * turns RELOADING into UNKNOWN so the next prepare() reloads; on a settled stamp it
+ * it. chaos_io_config_after_fork() mixes the child's lineage forward, rebinds the hits pid
+ * and turns RELOADING into UNKNOWN so the next prepare() reloads; on a settled stamp it
  * changes nothing.
  */
 static void test_fork_takes_over_orphaned_reload(void)
@@ -665,9 +920,27 @@ static void test_fork_takes_over_orphaned_reload(void)
     g_chaos_io_cached_mtime = CHAOS_IO_MTIME_RELOADING;
     (void)chaos_io_config_prepare();
     assert(g_chaos_io_cached_mtime == CHAOS_IO_MTIME_RELOADING);
-    g_chaos_io_tls_prng_state = UINT64_C(42);
+    /* The child's lineage must differ from its parent's, or every backend of a
+     * pre-forking server would make the same decisions. */
+    g_chaos_io_lineage = 0U;
+    g_chaos_io_forks = 0U;
+    chaos_io_config_before_fork();
     chaos_io_config_after_fork();
-    assert(g_chaos_io_tls_prng_state == 0U);
+    assert(g_chaos_io_lineage != 0U);
+    /* And from its siblings': the ordinal the prepare handler counted in the parent is
+     * what tells two children apart, without which a pre-forking server would draw one
+     * sample for all of its backends. Deterministic, so the same fork order repeats. */
+    {
+        const uint64_t first_child = g_chaos_io_lineage;
+
+        g_chaos_io_lineage = 0U;
+        g_chaos_io_forks = 1U;
+        chaos_io_config_before_fork();
+        chaos_io_config_after_fork();
+        assert(g_chaos_io_lineage != first_child && g_chaos_io_lineage != 0U);
+    }
+    g_chaos_io_lineage = 0U;
+    g_chaos_io_forks = 0U;
     assert(g_chaos_io_cached_mtime == CHAOS_IO_MTIME_UNKNOWN);
     assert(g_chaos_io_hits_pid == (uint64_t)getpid());
     assert(chaos_io_config_prepare());
@@ -908,6 +1181,9 @@ static void test_prepare_reports_status(void)
     assert(!read_status_file(status, sizeof(status)));
 }
 
+/** @brief Header lines of the last read_hits_file(), without the rule lines. */
+static char g_hits_header[128];
+
 /** @brief Reads this process's hits file into @p buffer; returns 0 when it does not exist. */
 static int read_hits_file(char *buffer, size_t size)
 {
@@ -924,6 +1200,22 @@ static int read_hits_file(char *buffer, size_t size)
     length = fread(buffer, 1U, size - 1U, file);
     buffer[length] = '\0';
     assert(fclose(file) == 0);
+
+    /* The header lines (`generation=`, no tab) are split off into g_hits_header, so the
+     * assertions on the rule lines stay about rule lines. That the header really is in
+     * front, and carries no tab, is asserted here for every reader below. */
+    {
+        const char *rules = strchr(buffer, '\n');
+
+        assert(strncmp(buffer, "generation=", 11U) == 0);
+        assert(rules != NULL);
+        ++rules;
+        assert((size_t)(rules - buffer) < sizeof(g_hits_header));
+        (void)memcpy(g_hits_header, buffer, (size_t)(rules - buffer));
+        g_hits_header[rules - buffer] = '\0';
+        assert(strchr(g_hits_header, '\t') == NULL);
+        (void)memmove(buffer, rules, strlen(rules) + 1U);
+    }
     return 1;
 }
 
@@ -1208,6 +1500,10 @@ static void test_rule_qualifiers(void)
     static chaos_io_rule_t rules[CHAOS_IO_MAX_RULES];
     char qualified[] =
         "/data:write:EIO:1.0 @first=3 @from=1000 @until=2000 @size>10 @size<99 # owner\n";
+    char sized_open[] = "/data:open:EIO:1.0 @size>10\n";
+    char sized_fsync[] = "/data:fsync:EIO:1.0 @size<10\n";
+    char sized_truncate[] = "/data:truncate:EIO:1.0 @size>10\n";
+    char sized_statfs[] = "/data:statfs:EIO:1.0 @size>10\n";
     char unknown[] = "/data:write:EIO:1.0 @bogus=1\n";
     char lonely[] = "# header\n  @first=3\n";
     char backwards[] = "/data:write:EIO:1.0 @from=2000 @until=1000\n";
@@ -1228,6 +1524,16 @@ static void test_rule_qualifiers(void)
     assert(chaos_io_config_parse_buffer(lonely, rules, &count) == -1);
     assert(chaos_io_config_last_error()->line == 2U);
     assert(chaos_io_config_parse_buffer(backwards, rules, &count) == -1);
+    /* open and fsync report no byte count, so a size gate on them could never pass:
+     * the rule would load and never fire. read, write, pread, pwrite and fallocate do
+     * report one, so the gate stays available there. */
+    assert(chaos_io_config_parse_buffer(sized_open, rules, &count) == -1);
+    assert(chaos_io_config_parse_buffer(sized_fsync, rules, &count) == -1);
+    /* statfs answers a question about the filesystem and moves no bytes, so it has no
+     * count either: a size-gated statfs rule would load and never fire. */
+    assert(chaos_io_config_parse_buffer(sized_statfs, rules, &count) == -1);
+    /* truncate passes its length, so the gate is meaningful there. */
+    assert(chaos_io_config_parse_buffer(sized_truncate, rules, &count) == 0);
     assert(chaos_io_config_parse_buffer(empty_first, rules, &count) == -1);
 }
 
@@ -1498,8 +1804,128 @@ static void test_long_link_target_is_not_followed(void)
     (void)unlink(CHAOS_IO_CONFIG_PATH);
 }
 
+/**
+ * @brief Proves a rule an earlier one always wins against is kept and warned about.
+ *
+ * @details Selection is rank, then the longer selector text, then the earlier line. Two
+ * rules with the same prefix, operation and effect tie on everything but the line, so the
+ * later one can never fire. It is valid, so the file loads and the status record carries a
+ * warning naming its line instead of a rejection.
+ *
+ * Covered: the duplicate warns and names the later line; three copies warn twice; and a
+ * rule that differs in its effect, its operation or its prefix does not warn, so the
+ * warning marks dead rules rather than every repeated selector.
+ */
+static void test_shadowed_rules_warn(void)
+{
+    static chaos_io_rule_t rules[CHAOS_IO_MAX_RULES];
+    char duplicate[] = "/data:read:EIO:1.0\n/data:read:EIO:0.5\n";
+    char triple[] = "/data:read:EIO:1.0\n/data:read:EIO:0.5\n/data:read:EIO:0.25\n";
+    char other_effect[] = "/data:read:EIO:1.0\n/data:read:LATENCY:5\n";
+    char other_operation[] = "/data:read:EIO:1.0\n/data:write:EIO:1.0\n";
+    char other_prefix[] = "/data:read:EIO:1.0\n/other:read:EIO:1.0\n";
+    size_t count = 0U;
+
+    /* The duplicate is kept -- both rules load -- and its line is named. */
+    assert(chaos_io_config_parse_buffer(duplicate, rules, &count) == 0);
+    assert(count == 2U);
+    assert(chaos_io_config_last_error()->warning_count == 1U);
+    assert(chaos_io_config_last_error()->warnings[0].line == 2U);
+    assert(
+        strcmp(chaos_io_config_last_error()->warnings[0].reason, CHAOS_STATUS_WARN_SHADOWED) == 0
+    );
+    /* A successful parse reports no rejection, only the warning. */
+    assert(chaos_io_config_last_error()->reason == NULL);
+
+    assert(chaos_io_config_parse_buffer(triple, rules, &count) == 0);
+    assert(count == 3U);
+    assert(chaos_io_config_last_error()->warning_count == 2U);
+    assert(chaos_io_config_last_error()->warnings[0].line == 2U);
+    assert(chaos_io_config_last_error()->warnings[1].line == 3U);
+
+    /* A different effect is *not* one of those: io selects on the operation and the prefix
+     * and never looks at the effect, so the later rule can never be picked either. Proved
+     * here rather than argued -- the selection is asked, and it answers with the first
+     * rule's effect whichever way round the two are written. */
+    assert(chaos_io_config_parse_buffer(other_effect, rules, &count) == 0);
+    assert(count == 2U);
+    {
+        chaos_io_rule_t picked;
+
+        assert(chaos_io_config_select_rule(rules, count, CHAOS_IO_OP_READ, "/data/x", &picked));
+        assert(picked.effect == CHAOS_IO_EFFECT_ERRNO);
+    }
+    assert(chaos_io_config_last_error()->warning_count == 1U);
+    assert(chaos_io_config_last_error()->warnings[0].line == 2U);
+    /* The other two differences are real: another operation or another prefix is another
+     * selection, and both rules can fire. */
+    assert(chaos_io_config_parse_buffer(other_operation, rules, &count) == 0);
+    assert(chaos_io_config_last_error()->warning_count == 0U);
+    assert(chaos_io_config_parse_buffer(other_prefix, rules, &count) == 0);
+    assert(chaos_io_config_last_error()->warning_count == 0U);
+}
+
+/**
+ * @brief Proves the hits file names the rule-file generation its counts belong to.
+ *
+ * @details A count of 0 after a reload can mean two things: the rule never fired, or the
+ * reload reset it. The generation tells them apart -- it rises with every published
+ * snapshot, so a reader that sees a new number knows the counts below restarted with it.
+ */
+static void test_hits_name_their_generation(void)
+{
+    char hits[1024];
+    char path[64];
+    const chaos_io_config_state_t *state;
+    uint64_t first_generation;
+
+    chaos_test_use_real_io();
+    chaos_io_config_init();
+    chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/a:write:EIO:1.0\n");
+    assert(chaos_io_config_prepare() == 1);
+    first_generation = g_chaos_io_config_generation;
+    assert(first_generation > 0U);
+    state = chaos_io_config_active_state();
+    assert(state->rule_count == 1U);
+    chaos_hit_record(state->rules[0].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    {
+        char expected[40];
+
+        (void)snprintf(
+            expected, sizeof(expected), "generation=%llu\n", (unsigned long long)first_generation
+        );
+        assert(strncmp(g_hits_header, expected, strlen(expected)) == 0);
+    }
+
+    /* A reload publishes a new snapshot, so the number rises. */
+    chaos_test_write_text_file(CHAOS_IO_CONFIG_PATH, "/b:write:EIO:1.0\n");
+    g_chaos_io_cached_mtime = CHAOS_IO_MTIME_UNKNOWN;
+    assert(chaos_io_config_prepare() == 1);
+    assert(g_chaos_io_config_generation == first_generation + 1U);
+    state = chaos_io_config_active_state();
+    chaos_hit_record(state->rules[0].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    {
+        char expected[40];
+
+        (void)snprintf(
+            expected,
+            sizeof(expected),
+            "generation=%llu\n",
+            (unsigned long long)(first_generation + 1U)
+        );
+        assert(strncmp(g_hits_header, expected, strlen(expected)) == 0);
+    }
+
+    (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_IO_HITS_PREFIX, g_chaos_io_hits_file);
+    (void)unlink(path);
+    (void)unlink(CHAOS_IO_CONFIG_PATH);
+}
+
 int main(void)
 {
+    test_hits_name_their_generation();
     /* Check the rule file on every call; the throttle has its own test. */
     g_chaos_io_check_interval_ns = 0U;
     chaos_test_backup_file(CHAOS_IO_CONFIG_PATH, &g_config_backup);
@@ -1512,6 +1938,7 @@ int main(void)
     test_parse_buffer_error_paths();
     test_read_file_paths();
     test_reload_prepare_and_match();
+    test_draw_key_follows_the_rule_text();
     test_read_failure_keeps_rules_and_retries();
     test_change_stamp_beyond_mtime();
     test_fork_takes_over_orphaned_reload();
@@ -1533,5 +1960,6 @@ int main(void)
     test_matching_edges();
     test_hit_after_interval_is_written();
     test_long_link_target_is_not_followed();
+    test_shadowed_rules_warn();
     return 0;
 }

@@ -37,8 +37,8 @@ CHAOS_NET_DEFINE_TEST_GLOBALS();
  *   is replaced by 1.
  *
  * @details Out-of-range probabilities are clamped, never sampled: -1.0 never hits and 1.0
- * hits even for sample UINT32_MAX. Re-seeding with the same value and calling
- * `chaos_net_probability_hit()` matches drawing the sample by hand.
+ * hits even for sample UINT32_MAX. Where the sample comes from is tested in
+ * test_draws_are_reproducible().
  */
 static void test_probability_helpers(void)
 {
@@ -47,29 +47,81 @@ static void test_probability_helpers(void)
     assert(chaos_net_probability_hit_sample(1.0, 0xffffffffU) == 1);
     assert(chaos_net_probability_hit_sample(0.5, 0U) == 1);
     assert(chaos_net_probability_hit_sample(0.5, 0xffffffffU) == 0);
+}
 
-    chaos_net_prng_seed_thread(123456U);
-    {
-        uint32_t expected_sample = chaos_net_prng_next_u32();
-        int expected_hit = chaos_net_probability_hit_sample(0.25, expected_sample);
+/**
+ * @brief Proves a sample follows from the rule and the number of the evaluation, and from
+ *        nothing else.
+ *
+ * @details This is what makes a fault reproducible: the same rule at the same evaluation
+ * number gives the same samples; the next evaluation and a rule of different text give
+ * unrelated ones; the draws within one evaluation differ from each other; and a forked
+ * child's lineage changes all of them, so the backends of a pre-forking server do not
+ * decide alike.
+ */
+static void test_draws_are_reproducible(void)
+{
+    chaos_net_rule_t rule;
+    chaos_hit_slot_t slot;
+    uint32_t first;
+    uint32_t message;
+    uint32_t next_evaluation;
 
-        chaos_net_prng_seed_thread(123456U);
-        assert(chaos_net_probability_hit(0.25) == expected_hit);
-    }
+    (void)memset(&rule, 0, sizeof(rule));
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.hit = &slot;
+    rule.key = chaos_net_prng_mix(
+        g_chaos_net_process_seed ^ chaos_net_rule_hash("tcp4://127.0.0.1:1:recv:CORRUPT:1")
+    );
 
-    chaos_net_prng_seed_thread(1U);
-    {
-        const uint32_t from_one = chaos_net_prng_next_u32();
+    chaos_net_rule_draw_begin(&rule);
+    assert(slot.evaluations == 1U);
+    first = chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_PROBABILITY);
+    assert(chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_PROBABILITY) == first);
+    assert(chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_FIRST_EFFECT) != first);
+    assert(chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_SECOND_EFFECT) != first);
+    message = chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_MESSAGE);
+    assert(message != first);
+    assert(message != chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_FIRST_EFFECT));
 
-        chaos_net_prng_seed_thread(0U);
-        assert(g_chaos_net_tls_prng_state != 0U);
-        assert(chaos_net_prng_next_u32() == from_one);
-    }
+    chaos_net_rule_draw_begin(&rule);
+    assert(slot.evaluations == 2U);
+    next_evaluation = chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_PROBABILITY);
+    assert(next_evaluation != first);
+
+    rule.key = chaos_net_prng_mix(
+        g_chaos_net_process_seed ^ chaos_net_rule_hash("tcp4://127.0.0.1:2:recv:CORRUPT:1")
+    );
+    slot.evaluations = 0U;
+    chaos_net_rule_draw_begin(&rule);
+    assert(chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_PROBABILITY) != first);
+
+    rule.key = chaos_net_prng_mix(
+        g_chaos_net_process_seed ^ chaos_net_rule_hash("tcp4://127.0.0.1:1:recv:CORRUPT:1")
+    );
+    slot.evaluations = 0U;
+    g_chaos_net_lineage = chaos_net_prng_mix(1U);
+    chaos_net_rule_draw_begin(&rule);
+    assert(chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_PROBABILITY) != first);
+    g_chaos_net_lineage = 0U;
+
+    /* A rule outside a snapshot has no slot: evaluation 0 every time, which is what makes
+     * the unit tests reproducible without seeding anything. */
+    rule.hit = NULL;
+    chaos_net_rule_draw_begin(&rule);
+    next_evaluation = chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_PROBABILITY);
+    chaos_net_rule_draw_begin(&rule);
+    assert(chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_PROBABILITY) == next_evaluation);
+
+    assert(chaos_net_rule_hash("a") == chaos_net_rule_hash("a"));
+    assert(chaos_net_rule_hash("a") != chaos_net_rule_hash("b"));
+    assert(chaos_net_rule_hash(NULL) != chaos_net_rule_hash("a"));
 }
 
 /**
  * @brief Proves CORRUPT flips one bit at the position the two samples select, and that the
- *   PRNG-driven form draws the index sample first and the bit sample second.
+ *   rule-driven form takes the index from the first effect draw and the bit from the
+ *   second.
  *
  * @details Index sample 1, bit sample 5 on three zero bytes yields `{0, 0x20, 0}`. A NULL or
  * zero-length buffer is left alone (a recv() of 0 bytes has nothing to corrupt).
@@ -87,18 +139,36 @@ static void test_corrupt_helpers(void)
     chaos_net_corrupt_buffer_sample(buffer, sizeof(buffer), 1U, 5U);
     assert(memcmp(buffer, expected, sizeof(buffer)) == 0);
 
-    chaos_net_prng_seed_thread(99U);
     {
-        uint32_t expected_index_sample = chaos_net_prng_next_u32();
-        uint32_t expected_bit_sample = chaos_net_prng_next_u32();
+        unsigned char swapped[] = {0x00U, 0x00U, 0x00U, 0x00U};
+        chaos_net_rule_t rule;
+        uint32_t byte_draw;
+        uint32_t bit_draw;
+
+        /* A key whose two effect draws select a different byte or bit when swapped, so the
+         * assertion below can tell the two orders apart at all; the bound keeps it finite. */
+        (void)memset(&rule, 0, sizeof(rule));
+        for (rule.key = 1U; rule.key < 256U; ++rule.key)
+        {
+            chaos_net_rule_draw_begin(&rule);
+            byte_draw = chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_FIRST_EFFECT);
+            bit_draw = chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_SECOND_EFFECT);
+            if (byte_draw % sizeof(seeded_expected) != bit_draw % sizeof(seeded_expected) ||
+                (byte_draw & 7U) != (bit_draw & 7U))
+            {
+                break;
+            }
+        }
+        assert(rule.key < 256U);
 
         chaos_net_corrupt_buffer_sample(
-            seeded_expected, sizeof(seeded_expected), expected_index_sample, expected_bit_sample
+            seeded_expected, sizeof(seeded_expected), byte_draw, bit_draw
         );
-    }
+        chaos_net_corrupt_buffer_sample(swapped, sizeof(swapped), bit_draw, byte_draw);
+        assert(memcmp(swapped, seeded_expected, sizeof(swapped)) != 0);
 
-    chaos_net_prng_seed_thread(99U);
-    chaos_net_corrupt_buffer(seeded_buffer, sizeof(seeded_buffer));
+        chaos_net_corrupt_buffer(&rule, seeded_buffer, sizeof(seeded_buffer));
+    }
     assert(memcmp(seeded_buffer, seeded_expected, sizeof(seeded_buffer)) == 0);
 }
 
@@ -117,6 +187,7 @@ static void test_latency_honours_qualifiers(void)
     (void)memset(&slot, 0, sizeof(slot));
     rule.effect = CHAOS_NET_EFFECT_LATENCY;
     rule.latency_ms = 5U;
+    rule.probability = 1.0; /* what the parser gives `LATENCY:ms` without `@p` */
     rule.hit = &slot;
     rule.policy.first = 1U;
 
@@ -144,13 +215,13 @@ static void test_latency_honours_qualifiers(void)
 }
 
 /**
- * @brief Proves LATENCY sleeps once for the whole delay, and that LATENCY rules fire without a
- *   probability while ERRNO rules draw against theirs.
+ * @brief Proves LATENCY sleeps once for the whole delay, and that every effect draws against
+ *   its probability.
  *
  * @details A NULL rule and a rule of no effect do not sleep. 2500 ms is a single sleep request
- * of 2 s + 500000000 ns, not a sequence of shorter sleeps. A LATENCY rule with probability 0
- * still fires: its value field is the delay, not a probability. ERRNO at 0.0 never fires and
- * at 1.0 always does.
+ * of 2 s + 500000000 ns, not a sequence of shorter sleeps. LATENCY is gated like the rest:
+ * `LATENCY:ms` parses as probability 1.0, `LATENCY:ms@p` as p, and a zero probability sleeps
+ * not at all. ERRNO at 0.0 never fires and at 1.0 always does.
  */
 static void test_latency_and_trigger_helpers(void)
 {
@@ -165,6 +236,12 @@ static void test_latency_and_trigger_helpers(void)
 
     rule.effect = CHAOS_NET_EFFECT_LATENCY;
     rule.latency_ms = 2500U;
+    /* Negative: no probability, no delay -- the gate has no LATENCY exception any more. */
+    chaos_net_rule_apply_latency(&rule);
+    assert(g_test_sleep_calls == 0U);
+    assert(chaos_net_rule_should_trigger(&rule) == 0);
+
+    rule.probability = 1.0; /* what the parser gives `LATENCY:ms` without `@p` */
     chaos_net_rule_apply_latency(&rule);
     assert(g_test_sleep_calls == 1U);
     assert(g_test_sleep_requests[0].tv_sec == 2);
@@ -291,11 +368,54 @@ static void test_should_trigger_honours_qualifiers(void)
     assert(chaos_net_rule_should_trigger(&rule) == 0);
 }
 
+/**
+ * @brief Proves `@every=N` lets only every Nth evaluation through, in the real gate.
+ *
+ * @details The gate itself is tested on values in test_common.c; what is asserted here is
+ * that chaos_net_rule_should_trigger() actually consults it, and where. `@every` counts
+ * evaluations, so a rule at probability 1.0 and `@every=3` fires on the 3rd, 6th and 9th
+ * call and on no other -- and the two calls in between still count as evaluations, which is
+ * what makes the third one the third.
+ */
+static void test_every_gates_evaluations(void)
+{
+    chaos_net_rule_t rule;
+    chaos_hit_slot_t slot;
+    unsigned call;
+    unsigned fired = 0U;
+
+    (void)memset(&rule, 0, sizeof(rule));
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.effect = CHAOS_NET_EFFECT_ERRNO;
+    rule.probability = 1.0;
+    rule.hit = &slot;
+    rule.policy.every = 3U;
+
+    for (call = 1U; call <= 9U; ++call)
+    {
+        const int triggered = chaos_net_rule_should_trigger(&rule) != 0;
+
+        assert(triggered == (call % 3U == 0U));
+        fired += (unsigned)triggered;
+    }
+    assert(fired == 3U);
+    assert(slot.evaluations == 9U);
+    assert(slot.count == 3U);
+
+    /* Without the qualifier every evaluation fires. */
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.policy.every = 0U;
+    assert(chaos_net_rule_should_trigger(&rule) != 0);
+    assert(slot.count == 1U);
+}
+
 int main(void)
 {
+    test_every_gates_evaluations();
     test_should_trigger_honours_qualifiers();
     test_should_trigger_counts_hits();
     test_probability_helpers();
+    test_draws_are_reproducible();
     test_corrupt_helpers();
     test_latency_and_trigger_helpers();
     test_latency_honours_qualifiers();

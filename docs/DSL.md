@@ -71,8 +71,8 @@ How the libc layer instantiates the triple:
 | Part | libc layer |
 |---|---|
 | S | a path prefix (io), an endpoint (net), a host name or address (dns), a function or function/argument class (time, process, memory), always with `*` as catch-all |
-| E | ERRNO (spelled as the errno name in io and net), GAI (`EAI_*`, dns), LATENCY, TIMEOUT, CORRUPT, TORN, TRICKLE, DUP, RESET, OFFSET, REGRESS, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER |
-| P | probability ∧ `@from`/`@until` window ∧ `@size` gate ∧ `@first` budget; for FAIL_AFTER additionally a per-operation call counter |
+| E | ERRNO (an errno name, or a positive number in every library), GAI (`EAI_*`, dns), LATENCY, TIMEOUT, CORRUPT, TORN, DROP, THROTTLE, REDIRECT, FREE, FULL, TRICKLE, DUP, RESET, OFFSET, REGRESS, FREEZE, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER |
+| P | probability ∧ `@from`/`@until` window ∧ `@size` gate ∧ `@every` evaluation gate ∧ `@first` budget; for FAIL_AFTER additionally a per-operation call counter |
 | selection | io, net: **one rule per call**, the most specific for the call's operation. dns, time, process, memory: **one rule per effect**, the most specific for each effect, so several effects compose on one call (§8) |
 
 ---
@@ -87,7 +87,7 @@ the limits and the failure behaviour; they differ in field layout and vocabulary
 ```abnf
 file          = *( line LF ) [ line ]
 line          = [ rule *( 1*WSP qualifier ) ] *WSP [ comment ]
-comment       = "#" *( VCHAR / WSP )         ; "#" starts a comment anywhere
+comment       = "#" *( VCHAR / WSP )         ; at line start or after a blank
 
 ;; Two field layouts (whitespace around each field is trimmed):
 four-field    = selector ":" operation ":" effect-or-errno ":" value     ; io, net
@@ -100,8 +100,10 @@ probability   = ( "0" [ "." 1*DIGIT ] ) / ( "1" [ "." 1*"0" ] )   ; [0, 1], loca
 
 ;; Qualifiers: trailing words that start with "@" (chaos_policy.h)
 qualifier     = "@first=" number              ; number > 0
+              / "@every=" number              ; number > 0
+              / "@at=+"   number              ; ms after the rule became active; number > 0
               / "@from="  number              ; Unix milliseconds
-              / "@until=" number              ; Unix milliseconds; > @from when both are set
+              / "@until=" number              ; Unix ms; >= 1, and > @from when both are set
               / "@size>"  number
               / "@size<"  number
 number        = 1*18DIGIT
@@ -109,8 +111,15 @@ number        = 1*18DIGIT
 
 Rules common to all libraries:
 
-- One rule per line. A `#` anywhere starts a comment, so no selector or value can
-  contain `#`.
+- One rule per line. A `#` starts a comment when a blank, tab or CR precedes it, or when
+  it opens the line; no selector or value can contain `#`. A `#` glued to the text before
+  it (`dns://x:REWRITE:a#b`) is **rejected**, because cutting there would silently shorten
+  the value and redirect to `a` instead of reporting the mistake.
+- A rule that is valid but cannot do what its author meant is kept and reported through
+  the status file's `warnings=` and `warn.<n>=` keys rather than rejected. That is where
+  "this rule can never fire" is said: a rule shadowed by an earlier one with the same
+  selector, operation and effect, and an effect suppressed at run time. The keys are
+  absent when nothing was raised, and `state` stays `ok`.
 - Parsing is all-or-nothing: one invalid line (unknown selector, effect, errno,
   illegal effect/selector pair, malformed qualifier, qualifier without a rule)
   leaves the library with **no rules**. The status file
@@ -121,9 +130,33 @@ Rules common to all libraries:
 - The probability parser accepts only the forms above, independent of
   `LC_NUMERIC` (a JVM calls `setlocale(LC_ALL, "")`; under a German locale `strtod`
   stops at the `.` of `0.5`). `nan`, `inf`, exponents and hexadecimal are rejected.
-- In three-field libraries an omitted probability is 1.0. In io and net the
-  probability is the `value` field itself and is mandatory for every effect except
-  LATENCY and TRICKLE, which have none.
+- An omitted probability is 1.0 in every library. In io and net the probability is
+  the `value` field itself and is mandatory for every effect except LATENCY, where it
+  is the optional `@probability` suffix of `ms`, and TRICKLE and THROTTLE, which have
+  none: a rate or a chunk size that applied to every other call would not be a rate or
+  a chunk size. A probability written on one of them rejects the line.
+
+### Delivering a rule file
+
+A rule file is read while the application runs, so how it is written is part of the
+contract:
+
+- **Write a temporary file in the same directory and rename it over the rule file.**
+  `rename(2)` is atomic: a reader sees the complete old file or the complete new one,
+  never half of either. The shell form the orchestration layer uses is
+  `{ cat old; new } > tmp && mv -f tmp file`, and under `chaos-init` the rename is
+  also what makes the supervisor read the file at once
+  ([SECCOMP.md §2](SECCOMP.md#2-usage)).
+- **Writing in place is not safe.** A reader that catches a partial line rejects the
+  whole file (all-or-nothing parsing) and says so in the status file, so nothing is
+  applied silently -- but a test would see an error that is an artefact of the
+  delivery rather than of its rules. The libraries narrow the window (a file whose
+  mtime is within 20 ms is read again) and cannot close it.
+- **Which version a count belongs to** is in the hits file: its first line is
+  `generation=<n>`, the number of rule-file versions that process has published. A
+  rule whose text a reload leaves unchanged keeps its counts and its `@first` claims,
+  so the generation is how a reader tells "0 hits since the reload" from "0 hits
+  ever".
 
 The grammar is checked by the property-based parser test suite. Run it to confirm
 all six parsers accept valid inputs and reject malformed ones:
@@ -142,40 +175,58 @@ io-selector   = "*" / 1*1023( %x21-22 / %x24-39 / %x3B-7E )  ; no ":" or "#"; ab
                                                             ; paths are prefixes
 io-op         = "read" / "write" / "open" / "close" / "fsync" / "fdatasync"
               / "pread" / "pwrite" / "truncate" / "allocate"
-              / "unlink" / "rename_from" / "rename_to"
+              / "unlink" / "rename_from" / "rename_to" / "statfs"
 io-effect     = io-errno ":" probability
-              / "LATENCY" ":" ms
+              / "LATENCY" ":" ms [ "@" probability ]
               / "TORN" ":" probability                      ; write, pwrite only
+              / "DROP" ":" probability                      ; write, pwrite only
+              / "THROTTLE" ":" rate                         ; write, pwrite only
+              / "FREE" ":" bytes [ "@" probability ]        ; statfs only
+              / "FULL" ":" probability                      ; statfs only
               / "CORRUPT" ":" probability                   ; read, pread only
 io-errno      = "EIO" / "ENOSPC" / "EDQUOT" / "EROFS" / "EACCES"
               / "EMFILE" / "ENFILE" / "ENOENT"
+              / 1*DIGIT                                     ; 1 .. 2147483647
 ms            = 1*DIGIT                                     ; 0 .. 4294967295
+bytes         = 1*DIGIT                                     ; 0 .. 18446744073709551615
+rate          = 1*DIGIT                                     ; bytes per second,
+                                                            ; 1 .. 4294967295; no
+                                                            ; probability
 
 ;; --------------------------------------------------------------- libchaos-net
 ;; /tmp/.chaos-net.conf     fields are split from the RIGHT, so the endpoint
 ;; may contain ":"
 net-rule      = endpoint ":" net-op ":" net-effect
 endpoint      = "*"
-              / ( "tcp4" / "udp4" ) "://" ( ipv4 / "*" ) ":" port
-              / ( "tcp6" / "udp6" ) "://" ( "[" ipv6 "]" / "*" ) ":" port
+              / ( "tcp4" / "udp4" ) "://" ( ipv4 [ "/" v4-prefix ] / "*" ) ":" port
+              / ( "tcp6" / "udp6" ) "://" ( "[" ipv6 "]" [ "/" v6-prefix ] / "*" ) ":" port
               / "unix://" unix-path                         ; exact path, "@name" for
                                                             ; abstract sockets, or "*"
+v4-prefix     = 1*2DIGIT                                    ; 0 .. 32; host bits must be 0
+v6-prefix     = 1*3DIGIT                                    ; 0 .. 128; host bits must be 0
 port          = 1*5DIGIT                                    ; 0 .. 65535, exact: no wildcard
 net-op        = "socket" / "bind" / "listen" / "connect" / "accept"
               / "shutdown" / "poll" / "send" / "recv" / "close"
 net-effect    = net-errno ":" probability                   ; every operation
-              / "LATENCY" ":" ms                            ; every operation
+              / "LATENCY" ":" ms [ "@" probability ]        ; every operation
               / "CORRUPT" ":" probability                   ; recv only
               / "TRICKLE" ":" bytes                         ; recv only; bytes >= 1
               / "DUP" ":" probability                       ; recv only
               / "TIMEOUT" ":" probability                   ; poll only
               / "RESET" ":" probability                     ; close only
+              / "DROP" ":" probability                      ; send only, datagram sockets
+              / "THROTTLE" ":" rate                         ; send only
+              / "REDIRECT" ":" target [ "@" probability ]   ; connect only
+target        = ipv4 ":" port / "[" ipv6 "]" ":" port       ; one address, port >= 1
 net-errno     = "ECONNREFUSED" / "ETIMEDOUT" / "ECONNRESET" / "EHOSTUNREACH"
               / "ENETUNREACH" / "EADDRINUSE" / "EADDRNOTAVAIL" / "EAFNOSUPPORT"
               / "EPROTONOSUPPORT" / "EPIPE" / "ENOTCONN" / "EOPNOTSUPP" / "EINVAL"
               / "EINTR" / "ENOMEM" / "ENOBUFS" / "EMFILE" / "ENFILE" / "EAGAIN"
+              / 1*DIGIT                                     ; 1 .. 2147483647
 ;; socket rules accept only "*", a wildcard host with port 0 ("tcp4://*:0"),
 ;; or "unix://*": a new socket has no address yet.
+;; REDIRECT is the one effect whose value carries a ":" of its own, so a line that
+;; holds the keyword ":REDIRECT:" is split there rather than from the right.
 
 ;; --------------------------------------------------------------- libchaos-dns
 ;; /tmp/.chaos-dns.conf
@@ -208,6 +259,7 @@ time-effect   = "ERRNO" ":" time-errno [ "@" probability ]
               / "LATENCY" ":" ms [ "@" probability ]
               / "OFFSET" ":" offset [ "@" probability ]     ; clock_gettime[/clock] only
               / "REGRESS" ":" offset [ "@" probability ]    ; clock_gettime/clock only, > 0
+              / "FREEZE" ":" probability                    ; clock_gettime[/clock] only
 time-errno    = "EINVAL" / "EFAULT" / "EINTR" / "EPERM" / "ENOSYS" / "EAGAIN"
               / 1*DIGIT                                     ; 1 .. 2147483647
 offset        = [ "-" / "+" ] 1*DIGIT                       ; ms, |offset| <= 3155760000000
@@ -300,10 +352,10 @@ Same caveat as §2.3: a sketch of the surface, not its source of truth.
 |---|---|---|---|
 | **Selector** | Path prefix, endpoint, host name/address, or function selector parsed from a text rule | `ChaosSelector` typed builder — `network()`, `jdbc()`, `dns()`, etc. | `@Chaos(target=…)` annotation parameter; YAML `selector:` block |
 | **Selector match site** | Inside the wrapper, against the call's arguments (descriptors resolved to paths or endpoints) | Inside the ByteBuddy-injected advice at the JDK call site | At the orchestration boundary (Toxiproxy / Testcontainers `withCommand` hook) |
-| **Effect** | ERRNO, GAI, LATENCY, TIMEOUT, CORRUPT, TORN, TRICKLE, DUP, RESET, OFFSET, REGRESS, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER | `ChaosEffect.delay/throw/fail/stress/deadlock/spike/drop` | Toxiproxy toxics / `tc netem` rules / cgroup throttling |
-| **Effect application phase** | Pre-call (ERRNO, GAI, LATENCY, FAIL_AFTER; TORN shortens the count), instead of the call (OVERRIDE), post-call (CORRUPT, OFFSET, REGRESS, result-set transforms) | Same conceptual phases at the bytecode advice level | At the network/cgroup boundary, always pre-effect from the application's perspective |
-| **Activation policy** | Probability, `@first`, `@from`/`@until`, `@size`; FAIL_AFTER's call counter | `ActivationPolicy.always/count/timeWindow/session` | Annotation parameters + scenario lifecycle hooks |
-| **Activation evaluation** | Per call: window, size gate, one draw from a per-thread PRNG, `@first` claim | Per-call dispatcher check + session-scoped state | Lifecycle-driven (apply on `@BeforeEach`, remove on `@AfterEach`) |
+| **Effect** | ERRNO, GAI, LATENCY, TIMEOUT, CORRUPT, TORN, DROP, THROTTLE, REDIRECT, FREE, FULL, TRICKLE, DUP, RESET, OFFSET, REGRESS, FREEZE, REWRITE, OVERRIDE, SERVICE, FILTER_FAMILY, SHUFFLE, LIMIT, FAIL_AFTER | `ChaosEffect.delay/throw/fail/stress/deadlock/spike/drop` | Toxiproxy toxics / `tc netem` rules / cgroup throttling |
+| **Effect application phase** | Pre-call (ERRNO, GAI, LATENCY, FAIL_AFTER; TORN and THROTTLE shorten the count, REDIRECT replaces the address), instead of the call (OVERRIDE, DROP), post-call (CORRUPT, OFFSET, REGRESS, FREEZE, result-set transforms) | Same conceptual phases at the bytecode advice level | At the network/cgroup boundary, always pre-effect from the application's perspective |
+| **Activation policy** | Probability, `@first`, `@every`, `@from`/`@until`, `@size`; FAIL_AFTER's call counter | `ActivationPolicy.always/count/timeWindow/session` | Annotation parameters + scenario lifecycle hooks |
+| **Activation evaluation** | Per call: window, size gate, `@every`, the rule's probability sample, `@first` claim | Per-call dispatcher check + session-scoped state | Lifecycle-driven (apply on `@BeforeEach`, remove on `@AfterEach`) |
 | **Configuration source** | Text file `/tmp/.chaos-<lib>.conf` | Java code (builder) + JSON startup config | YAML / annotations + dynamic Testcontainers calls |
 | **Reload semantics** | `stat()` of the rule file at most every 1 ms, two-snapshot publication under a CAS-owned reload | Live registration / deregistration via dispatcher API | Lifecycle hooks; the boundary mutates between phases |
 | **Failure mode on bad config** | Fail-open: no rules, status file names the line | Fail-fast at builder validation (`IllegalArgumentException`) | Fail-fast at YAML parse |
@@ -389,14 +441,19 @@ first, then the failure. In io and net one rule decides the call, so a LATENCY r
 and an ERRNO rule for the same operation and equally specific selector never both
 apply (§8).
 
-### 5.3. Class C — argument and result mutation (TORN, CORRUPT, OFFSET, REGRESS)
+### 5.3. Class C — argument and result mutation (TORN, CORRUPT, OFFSET, REGRESS, FREEZE)
 
 | libc | Phase | JVM | Orchestration |
 |---|---|---|---|
 | `clock_gettime/realtime:OFFSET:500` | after the call: the returned time is shifted | `clockSkew(Duration.ofMillis(500))` | N/A (clocks cannot be mutated at the orchestration boundary) |
 | `clock_gettime/monotonic:REGRESS:1000` | after the call: the clock steps back once | N/A | N/A |
+| `clock_gettime/realtime:FREEZE:1` | after the call: every read returns the reading of the first call that fired | N/A | N/A |
 | `/data:read:CORRUPT:0.1` (io), `…:recv:CORRUPT:0.1` (net) | after a successful read: one bit of the returned bytes flips | `byteCorruption(probability=0.1)` | Toxiproxy `bandwidth` + custom byte mangler (rare) |
 | `/data:write:TORN:0.1` | before the call: the byte count is shortened to `[1, n-1]` | `partialWrite(probability=0.1)` | N/A |
+| `/data:write:DROP:0.1` (io) | instead of the call: the full count is reported and nothing is written | N/A | N/A |
+| `udp4://10.0.0.5:53:send:DROP:0.1` (net) | instead of the call: the datagram is reported sent and never leaves | N/A | `tc qdisc ... netem loss 10%` (per interface, not per rule) |
+| `/data:write:THROTTLE:65536` (io), `tcp4://10.0.0.5:5432:send:THROTTLE:65536` (net) | before the call: the byte count is shortened to what the rate allows, and a call that would get nothing waits for a tenth of a second's worth | N/A | `tc qdisc ... netem rate` / Toxiproxy `bandwidth` (per interface or proxy, not per rule) |
+| `/data:statfs:FULL:1` (io) | after the call: the answer reports no free space | N/A | a smaller volume, which changes the total too |
 
 ### 5.4. Class D — result-set transform (DNS)
 
@@ -430,6 +487,35 @@ publication and in a forked child.
 it (DUP); `poll` rules can time out (TIMEOUT); `close` rules can reset the
 connection (RESET). Semantics: [NETWORK.md](NETWORK.md).
 
+### 5.7. Rate limiting (THROTTLE)
+
+`THROTTLE:<bytes per second>` holds the write side of a descriptor (io `write`,
+`pwrite`) or the send side of a socket (net `send`) to a byte rate: each call moves
+only what a token bucket of one second's worth allows, and a call that would get
+nothing waits for a tenth of a second's worth -- or, on a non-blocking descriptor,
+is told `EAGAIN`. The bucket is per descriptor and per rule, so two rules do not
+share a rate and two descriptors are limited separately. There is no probability
+(§2.1). Semantics: [IO.md](IO.md), [NETWORK.md](NETWORK.md).
+
+### 5.8. Sending a connection elsewhere (REDIRECT)
+
+`REDIRECT:<address>:<port>` on net `connect` connects to that address instead of the one
+the program asked for, which is the misconfiguration no errno models: the port of the
+staging database, a service that answers but is the wrong one, a sidecar that has moved.
+The kernel then treats the new address as the one the connection was made to, and three
+consequences follow from that, all of them intended:
+
+- `getpeername` reports the address the rule named, not the one the program passed;
+- every later rule matches the **redirected** address, so a rule on the original one
+  never fires again for that connection;
+- a rule naming the original destination is therefore the only place to write the
+  redirect: a second rule on the target decides what the connection then meets.
+
+An optional `@probability` after the port makes it occasional, as LATENCY's does. The
+target is always an address and a port, so a `unix://` selector with a `REDIRECT` is an
+illegal selector/effect pair and rejects the file: such a rule could never fire.
+Semantics: [NETWORK.md](NETWORK.md).
+
 ---
 
 ## 6. Probability semantics and PRNG model
@@ -443,8 +529,9 @@ connection (RESET). Semantics: [NETWORK.md](NETWORK.md).
 - The probability is checked after the `@from`/`@until` window and the `@size`
   gate and before the `@first` claim; a rule filtered out earlier consumes no draw
   (FAIL_AFTER draws once its threshold is reached, before the other gates).
-- LATENCY and TRICKLE in io and net have no probability. Omitted probability in
-  three-field libraries means 1.0.
+- TRICKLE and THROTTLE have no probability; LATENCY takes it as an optional
+  `@probability` after the milliseconds. An omitted probability is 1.0 in every
+  library.
 
 Identity across layers: same definition, same closed interval.
 
@@ -452,14 +539,16 @@ Identity across layers: same definition, same closed interval.
 
 | Layer | State | Seeding | Quality |
 |---|---|---|---|
-| libc | `__thread uint64_t g_chaos_<lib>_tls_prng_state`, xorshift64* | Process seed: 8 bytes of `/dev/urandom` read with raw system calls in the constructor (fallback `0x6a09e667f3bcc909 ^ getpid()`). Per thread, on its first draw: SplitMix64(process seed ⊕ kernel thread id ⊕ stack address) with the low bit forced to 1 | xorshift64* (period 2^64 − 1); sufficient for fault injection |
+| libc, counter-based (all six) | None. A sample is `mix(mix((key ⊕ lineage) + n) + d)`: `key` = SplitMix64(process seed ⊕ hash(rule text)), `n` = the rule's evaluation number from its hit slot, `d` = the draw within that evaluation | Process seed: `CHAOS_SEED` (decimal, 64-bit) if set, else 8 bytes of `/dev/urandom` read with raw system calls in the constructor (fallback `0x6a09e667f3bcc909 ^ getpid()`) | SplitMix64 finaliser; every input bit affects every output bit |
 | JVM | `SplittableRandom` per scenario / per session (per-thread split) | `Thread`-local split from a session seed | L'Ecuyer-class (`SplittableRandom` is well studied) |
 | Orchestration | Server-side (Toxiproxy uses Go's `math/rand`) | Toxiproxy seeds from time at process start | Sufficient for chaos |
 
-### 6.3. Why per-thread, lazily seeded
+### 6.3. What the counter-based model replaced
 
-**Per thread.** No shared state and no contention in highly parallel processes;
-each thread evolves its own sequence.
+**Per thread, until 2.1.0.** Each thread evolved its own xorshift64* sequence: no
+shared state and no contention, but no way to reproduce a run either, and a `gettid`
+call per thread. The counter-based derivation keeps the first property (a sample
+touches no shared state but the rule's evaluation counter) and adds the second.
 
 **Lazily seeded.** A thread that never evaluates a probability never pays for
 seeding. The process seed itself is read once in the constructor.
@@ -467,6 +556,47 @@ seeding. The process seed itself is read once in the constructor.
 **fork.** The child's atfork handler zeroes the forking thread's state, so the child
 reseeds from its own thread id; pre-fork worker pools would otherwise make identical
 decisions in every worker.
+
+### 6.4. Reproducible faults: `CHAOS_SEED`
+
+A per-thread stream cannot be reproduced. Its seed mixes the kernel thread id, which
+counts every process and thread the container started before, and a stack address,
+which ASLR moves on every start. Fixing the process seed therefore does nothing for
+a multi-threaded target: the same seed gives different faults in the next run.
+
+The counter-based libraries have no stream. A sample is a pure function of
+
+- the **process seed** — `CHAOS_SEED=<decimal 64-bit>`, else random,
+- the **rule**, by a hash of its text rather than its slot or its line,
+- the **evaluation number** of that rule, counted in its hit slot,
+- the **draw** within that evaluation (probability, then each effect's samples),
+- the process **lineage**, 0 in the process that loaded the library and mixed
+  forward in each forked child **with that child's ordinal among its siblings**,
+  which the parent counts before each fork. The ordinal is what a pre-forking
+  server needs: its backends all evaluate a rule for the first time, so without it
+  they would draw the same sample and `p=0.5` would reset all of their connections
+  or none. Under `chaos-init` the supervisor cannot see the fork topology, so it
+  gives each process it decides for a lineage from the order the processes appeared
+  in -- the first one, the application itself, keeps lineage 0, so a single-process
+  run decides identically in both modes. A `vfork` child and `posix_spawn` run no
+  atfork handler and keep the parent's lineage, as they share its memory.
+
+So the nth evaluation of a rule makes the same decision in every run with the same
+seed, whatever else the process is doing, and no thread can shift another's
+decisions. What the caller must hold constant is the **order of its own calls** and
+the **order of its forks**; two calls racing for the same rule may swap their
+numbers, as may two threads forking at once, which is the caller's concern and not
+something a chaos library can decide for it.
+
+`CHAOS_SEED` is read in the ELF constructor, before `main`, and by `chaos-init` at
+start, so both modes reproduce the same run. A value that is not decimal digits in
+range is ignored and the random source takes over: the seed decides which faults
+fire, not whether the rule file is valid, and a test is better served by rules that
+load. `-1` is **not** accepted as `2^64 − 1`.
+
+All six libraries work this way. The per-thread xorshift64* stream, its lazy seeding
+from the thread id and a stack address, and the `gettid` call that went with it are
+gone.
 
 **Why `SplittableRandom` on the JVM.** Steele, Lea, Flood, "Fast splittable
 pseudorandom number generators", OOPSLA 2014. The libc side shares the desiderata
@@ -486,14 +616,17 @@ any `# owner` comment:
 | Qualifier | Meaning |
 |---|---|
 | `@first=N` | Fire at most N times per process (N ≥ 1), then go inert: start-up faults that clear by themselves. |
+| `@every=N` | Only every Nth **evaluation** of the rule (N ≥ 1): the 10th, 20th, 30th call that got past the window and size gates. Counts evaluations, not hits, so `@every=10` with `p=0.5` means "of evaluations 10, 20, 30… half fire". `@every=1` is allowed and gates nothing. The count is **per process**, like the `@first` budget: a forked child starts at zero, so on a pre-forking server each worker counts its own evaluations rather than sharing one sequence. |
+| `@at=+N` | Active only from N ms after the rule became active **for that process** (N ≥ 1), which is the moment its rule file was loaded there. Written with the `+`, which is what distinguishes it from a wall-clock time: that is `@from`. A reload that leaves the rule unchanged does not restart the delay; a reload that changes its text starts a new one, because the changed rule is a new rule. A forked child inherits the moment, so the delay runs from the parent's load, not from the fork. Use it for a fault that starts after the application has come up, without having to know the wall-clock time it will be ready at. |
 | `@from=T` | Active only once the wall clock reaches T (Unix milliseconds). |
-| `@until=T` | Active only while the wall clock is before T. With `@from`, the window is `[from, until)`; `@until` must be later than `@from`. One rule file can hold a whole incident timeline. |
-| `@size>N` / `@size<N` | Only calls moving more / fewer than N bytes. Both may be combined. A call without a byte count never matches a size-gated rule. |
+| `@until=T` | Active only while the wall clock is before T (T >= 1; `@until=0` is rejected, since 0 is how "no upper bound" is stored and the line would mean the opposite of what it says). With `@from`, the window is `[from, until)`; `@until` must be later than `@from`. One rule file can hold a whole incident timeline. |
+| `@size>N` / `@size<N` | Only calls whose byte count is above / below N. Both may be combined. For the calls that move data this is the number of bytes moved; for `truncate` it is the file's new length and for `allocate` the length of the range, since neither moves bytes. A call without a byte count never matches a size-gated rule. |
 
 ```text
 tcp4://127.0.0.1:5432:connect:ECONNREFUSED:1.0 @first=3 # net
 /data:write:EIO:1.0 @from=1760000000000 @until=1760000005000 # disk
 tcp4://127.0.0.1:9092:send:LATENCY:200 @size>65536
+/data:fsync:EIO:1.0 @at=+30000 # half a minute after this file was loaded
 ```
 
 Calls that carry a byte count:
@@ -511,14 +644,19 @@ Semantics:
   with `@`; the line is cut before the first of them. A blank before a three-field
   `@probability` therefore turns it into a qualifier word and rejects the line.
 - **Validation.** An unknown or malformed qualifier, a number of more than 18 digits,
-  `@first=0`, `@until` not after `@from`, or qualifiers on a line without a rule
-  reject the file like any invalid line.
+  `@first=0`, `@every=0`, `@until=0`, `@until` not after `@from`, or qualifiers on a line
+  without a rule reject the file like any invalid line. `@until=0` is rejected rather than
+  read as written: 0 is the stored value for "no upper bound", so a window that can never
+  be open would become one that is always open.
 - **Wall clock.** The window is checked against `CLOCK_REALTIME` read from the vDSO
   (or the raw system call), never through the interposed `clock_gettime`, so a
-  libchaos-time OFFSET rule does not move another rule's window. Absolute times make
+  libchaos-time OFFSET or FREEZE rule does not move another rule's window. Absolute times make
   every process of a container agree on the window; the JVM layer turns relative
   durations into absolute times.
-- **Order of checks.** Window, size gate, probability, then the `@first` claim. Only
+- **Order of checks.** Window, size gate, `@every`, probability, then the `@first`
+  claim. `@every` sits before the probability because it picks evaluations: a call it
+  rejects is still counted as an evaluation, which is what makes the next Nth one the
+  Nth. Only
   a rule that passes all four fires and records a hit. FAIL_AFTER differs: its call
   counter advances on every matched call first, then the threshold and probability
   are checked, then window, size gate and `@first`.
@@ -570,6 +708,13 @@ select one rule
   LATENCY  → sleep, real call
   ERRNO    → fail (no real call; io close: real close, then fail)
   TORN     → real call with shortened count            (io write, pwrite)
+  DROP     → no real call, full count reported         (io write, pwrite;
+                                                        net send on datagrams)
+  THROTTLE → real call with the count the rate allows  (io write, pwrite;
+                                                        net send; a datagram is
+                                                        never cut, it waits)
+  REDIRECT → real call with another destination        (net connect)
+  FREE/FULL→ real call, then the free counts rewritten (io statfs)
   CORRUPT  → real call, then flip one returned bit     (io read, pread; net recv)
   other net effects: see NETWORK.md
 ```
@@ -581,7 +726,7 @@ independently; the order is fixed in the wrappers:
 |---|---|
 | memory (`mmap`, `munmap`, `mprotect`, `madvise`, `posix_madvise`) | LATENCY → ERRNO → real call |
 | process (every operation) | LATENCY → ERRNO → FAIL_AFTER → real call |
-| time, clock reads (`clock_gettime`, `gettimeofday`, `time`, `timespec_get`) | LATENCY → ERRNO → real call → OFFSET → REGRESS |
+| time, clock reads (`clock_gettime`, `gettimeofday`, `time`, `timespec_get`) | LATENCY → ERRNO → real call → OFFSET → REGRESS → FREEZE |
 | time, sleeps (`nanosleep`, `sleep`, `clock_nanosleep`, `usleep`) | LATENCY → ERRNO → real call (`clock_nanosleep` with `TIMER_ABSTIME` maps the deadline back through OFFSET/REGRESS) |
 | dns `getaddrinfo` | LATENCY → GAI → REWRITE → SERVICE → OVERRIDE *or* real call → FILTER_FAMILY → SHUFFLE → LIMIT |
 | dns `getnameinfo` | LATENCY → GAI → real call → REWRITE → SERVICE (on the returned host and service) |
@@ -637,7 +782,7 @@ note right
     mmap/anon:ERRNO:ENOMEM@0.01
     clock_gettime/monotonic:OFFSET:-500
     pthread_create:FAIL_AFTER:EAGAIN,128
-  qualifiers: @first=N @from=T @until=T @size>N @size<N
+  qualifiers: @first=N @every=N @at=+N @from=T @until=T @size>N @size<N
 end note
 
 :Extract qualifiers, parse selector, effect, value;
@@ -677,7 +822,7 @@ note right
   others: highest rank, longer text, first in file
   mmap/anon > mmap > *
   dns:~//api.example.com > dns:~//*.example.com > dns:~//* > *
-  tcp4:~//10.0.0.15:5432 > tcp4:~//*:5432 > *
+  tcp4:~//10.0.0.15:5432 > tcp4:~//10.0.0.0/8:5432 > tcp4:~//*:5432 > *
   clock_gettime/monotonic > clock_gettime > *
 end note
 
@@ -700,7 +845,7 @@ if (Rule selected?) then (yes)
   :Real function
   (TORN: shortened count, OVERRIDE: synthetic list);
   :Post-call effects
-  (CORRUPT, OFFSET, REGRESS,
+  (CORRUPT, OFFSET, REGRESS, FREEZE,
    FILTER_FAMILY, SHUFFLE, LIMIT);
   :Return result;
 else (no)
@@ -714,7 +859,7 @@ legend
   1. "*" is a selector in every library and the least specific one
   2. Specificity is a strict partial order on selectors (§10.3)
   3. io, net: one rule per call; dns, time, process, memory: one rule per effect
-  4. OFFSET, REGRESS, CORRUPT only post-call; ERRNO, GAI, FAIL_AFTER only pre-call
+  4. OFFSET, REGRESS, FREEZE, CORRUPT only post-call; ERRNO, GAI, FAIL_AFTER only pre-call
   5. FAIL_AFTER counts per operation and process, not per thread
   6. Probability 0 never fires but is still selected (it shadows weaker rules)
   7. No rule selected: wrapped(args) == real(args)
@@ -808,8 +953,8 @@ fires(ERRNO ∨ GAI ∨ FAIL_AFTER, e)  ⇒  ¬real_call(e) ∧ ¬post_call_effe
 A pre-call failure suppresses the real call and every later effect (sole exception:
 io `close`, which runs the real close before reporting). LATENCY is orthogonal: in
 dns, time, process and memory it may delay a call that then fails. In io and net
-LATENCY, ERRNO, TORN and CORRUPT are mutually exclusive per call because only one
-rule is selected.
+LATENCY, ERRNO, TORN, DROP, THROTTLE and CORRUPT are mutually exclusive per call
+because only one rule is selected.
 
 ---
 
@@ -920,6 +1065,8 @@ if (!match(fd, operation, &rule))  return real(args);
 if (rule.effect == LATENCY)        apply_latency(&rule);
 else if (apply_errno(&rule))       return -1;
 else if (rule.effect == TORN && should_trigger(&rule))  count = torn(count);
+else if (rule.effect == DROP && drop_write(&rule, fd, count))  return count;
+else if (rule.effect == THROTTLE)  count = throttle(&rule, fd, count, &refuse);
 rc = real(args);
 if (rc > 0 && rule.effect == CORRUPT && should_trigger(&rule))  corrupt(buf, rc);
 return rc;
@@ -974,6 +1121,13 @@ the implementation prefers it.
   additionally the host. `tcp4://10.0.0.2:5432` matches only the former. So
   `* ≺ tcp4://*:5432 ≺ tcp4://10.0.0.15:5432`, matching ranks 1 < 2 < 3. Exact
   `unix://` paths (4) are more specific than `unix://*` (2). □
+- A `/N` prefix (`tcp4://10.0.0.0/8:5432`, `tcp6://[2001:db8::]/32:443`) is an address
+  selector like any other, so it has rank 3, and the prefix length orders two of them:
+  `tcp4://10.0.0.0/8:5432 ≺ tcp4://10.1.0.0/16:5432 ≺ tcp4://10.1.2.3:5432`, because a
+  literal address is the `/32` (or `/128`) case of the same comparison. A prefix must be
+  written canonically -- every bit after it zero -- so `10.0.0.1/8` is rejected rather than
+  read as `10.0.0.0/8`: the selector text is a rule's identity, and two spellings of one
+  network would be two rules that match the same traffic. `*` takes no prefix. □
 
 **dns — name rank and suffix length:**
 
@@ -1020,7 +1174,7 @@ holds; the vocabulary is partial.
 
 | Orchestration concept | Why no libc/JVM equivalent |
 |---|---|
-| Toxiproxy `bandwidth` toxic | Rate shaping over time is a network-layer concept; the closest libc effect, TRICKLE, limits chunk size per `recv`, not throughput. |
+| Toxiproxy `bandwidth` toxic | Covered for the send side by THROTTLE (§5.7), which holds a descriptor to a byte rate. The receive side is not: a rate there would have to hold data the kernel has already buffered, so TRICKLE limits the chunk size of each `recv` instead of the throughput. |
 | `tc qdisc netem` packet drop | Packet-level effect; the libc layer acts per call. |
 | Cgroup memory throttle | Container-level pressure; the libc layer fails individual calls. |
 | Pre-built multi-step scenarios (*replication lag during pod drainage*) | Multi-process recipes; each libc rule file is per container. |

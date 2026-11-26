@@ -11,7 +11,8 @@
  *
  * - io: open64, openat64, __open_2, __open64_2, __openat_2, __openat64_2 (open:EIO);
  *   __read_chk (read); pread64, preadv64, __pread_chk, __pread64_chk (pread); pwrite64,
- *   pwritev64 (pwrite); ftruncate64 (truncate); fallocate64 (allocate); sendfile64 (write).
+ *   pwritev64 (pwrite); ftruncate64 (truncate); fallocate64 (allocate); sendfile64 (write);
+ *   statfs64, fstatfs64, statvfs64, fstatvfs64 (statfs:EIO).
  * - memory: mmap64 (mmap/anon:ERRNO:ENOMEM).
  * - net: __recv_chk, __recvfrom_chk and __read_chk on a socket (recv:ECONNRESET), and
  *   __poll_chk/__ppoll_chk returning 0 under poll:TIMEOUT with data pending.
@@ -40,6 +41,8 @@
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
+#include <sys/statvfs.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -185,6 +188,20 @@ static void probe_io(void)
 
     write_rules(conf, DATA_DIR ":write:EIO:1.0\n");
     expect_fault("sendfile64", sendfile64(fd, other, NULL, 3U), EIO);
+
+    /* The four large-file filesystem queries. They are alias declarations, so gcov reports
+     * no lines for them and the coverage gate passes over them entirely: if the alias
+     * named the wrong function, or were dropped, nothing else here would notice. */
+    write_rules(conf, DATA_DIR ":statfs:EIO:1.0\n");
+    {
+        struct statfs64 fs64;
+        struct statvfs64 vfs64;
+
+        expect_fault("statfs64", statfs64(DATA_FILE, &fs64), EIO);
+        expect_fault("fstatfs64", fstatfs64(fd, &fs64), EIO);
+        expect_fault("statvfs64", statvfs64(DATA_FILE, &vfs64), EIO);
+        expect_fault("fstatvfs64", fstatvfs64(fd, &vfs64), EIO);
+    }
 
     (void)unlink(conf);
     (void)close(fd);

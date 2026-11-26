@@ -24,6 +24,7 @@
 
 #include <linux/filter.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /** @name Library bits for --libs (bit order is also the order of `libs=` in the status file) */
 /**@{*/
@@ -71,15 +72,36 @@ typedef struct chaos_init_options
  * @brief Parses `--libs <name>[,<name>...] -- <command> [args...]`.
  *
  * @details The grammar is fixed positionally: argv[1] `--libs`, argv[2] the list, argv[3]
- * `--`, argv[4] the command. Names: io, net, dns, time, memory, process. dns and time are
- * accepted (one rule set for both modes) but add no system call to the filter: clocks are
- * read through the vDSO and name resolution is a library function, so seccomp never sees
- * either. An empty name (`io,,net`, trailing comma) is unknown.
+ * `--`, argv[4] the command. Names: io, net, dns, time, memory, process. dns is accepted
+ * (one rule set for both modes) but adds no system call to the filter: name resolution is
+ * a library function, so seccomp never sees it. An empty name (`io,,net`, trailing comma)
+ * is unknown.
  *
  * @param options  Output; written only partially on failure.
  * @return 0, or -1 on any deviation from the grammar or an unknown name.
  */
 int chaos_init_parse_args(int argc, char **argv, chaos_init_options_t *options);
+
+/**
+ * @brief The part of the filter that comes from the rule files rather than from a table.
+ *
+ * @details Two libraries decide what to notify from what their rules say. **time**: a
+ * clock read is served from the vDSO, so the filter only ever sees one once the tracee's
+ * lookups have been made to fail (chaos_init_vdso.h) -- and then it sees every one of
+ * them. `clock_gettime` carries the clock in its first argument, so the filter tests it
+ * and notifies only the clocks a rule names, which leaves a monotonic read untouched while
+ * a rule works on the wall clock; an empty clock list means every clock, which is what a
+ * rule without one asks for. **dns**: the sends a resolver makes, which are worth a
+ * notification only while a rule can act on one (chaos_init_dns_calls()).
+ */
+typedef struct chaos_init_rule_filter
+{
+    const long *calls;  /**< Numbers to notify: chaos_init_dns_calls() and
+                             chaos_init_time_calls() together. */
+    size_t call_count;  /**< Entries in @c calls. */
+    const long *clocks; /**< Clock ids for `clock_gettime` (chaos_init_time_clocks()). */
+    size_t clock_count; /**< Entries in @c clocks; 0 means every clock. */
+} chaos_init_rule_filter_t;
 
 /**
  * @brief Writes the seccomp BPF program for @p libs into @p out.
@@ -90,19 +112,43 @@ int chaos_init_parse_args(int argc, char **argv, chaos_init_options_t *options);
  * 2. x86_64 only: nr >= 0x40000000 (x32 ABI): ALLOW.
  * 3. When sendmsg is among the calls: the handover exemption (see CHAOS_INIT_HANDOVER_FLAGS),
  *    otherwise USER_NOTIF for every sendmsg.
- * 4. One JEQ per remaining system call number, each jumping to the trailing USER_NOTIF.
- * 5. ALLOW, then USER_NOTIF.
+ * 4. One JEQ per traced number, each jumping to the trailing TRACE.
+ * 5. One JEQ per remaining system call number, each jumping to the trailing USER_NOTIF.
+ * 6. ALLOW, USER_NOTIF, and TRACE when anything is traced.
  *
  * Numbers shared by several libraries (read, readv, write, writev, close) appear once.
- * The tests form a linear JEQ chain of at most CHAOS_INIT_MAX_FILTER - 16 entries; that
+ * The tests form a linear JEQ chain of at most CHAOS_INIT_MAX_FILTER - 17 entries; that
  * bound also keeps every forward jump within classic BPF's 8-bit jt/jf offsets.
  *
- * @param handover_fd  The child's descriptor of the handover socketpair.
- * @param out          Output program of @p capacity instructions.
+ * @par Why two groups
+ * A notification reply can fail a call, delay it or return a value, but cannot reach the
+ * tracee's registers, which the data effects need (TORN shortens a length, CORRUPT acts
+ * after the call). Those need `SECCOMP_RET_TRACE` and a ptrace stop. The two cannot be
+ * combined per call: across stacked filters USER_NOTIF outranks TRACE, so a notified
+ * number can never also be traced, and every number belongs to exactly one group. A
+ * traced number therefore carries *all* of its effects through ptrace, errno and latency
+ * included. Details and the measurements behind the choice:
+ * [docs/development/SECCOMP-PTRACE.md](../../docs/development/SECCOMP-PTRACE.md).
+ *
+ * @param handover_fd   The child's descriptor of the handover socketpair.
+ * @param traced        Numbers to answer with TRACE, read only when @p traced_count is
+ *                      above 0, so NULL with 0 builds the program this supervisor built
+ *                      before traced effects existed.
+ * @param traced_count  Entries in @p traced.
+ * @param clock         The time rules' calls and clocks, or NULL when no time rule is
+ *                      loaded (chaos_init_rule_filter_t).
+ * @param out           Output program of @p capacity instructions.
  * @return Number of instructions written, or 0 if @p capacity is too small.
  */
-size_t
-chaos_init_build_filter(unsigned libs, int handover_fd, struct sock_filter *out, size_t capacity);
+size_t chaos_init_build_filter(
+    unsigned libs,
+    int handover_fd,
+    const long *traced,
+    size_t traced_count,
+    const chaos_init_rule_filter_t *clock,
+    struct sock_filter *out,
+    size_t capacity
+);
 
 /**
  * @brief Converts a waitpid() status to the exit code chaos-init returns: the child's own
@@ -165,14 +211,28 @@ const char *chaos_init_unsupported_reason(int error);
  * @brief Formats the status file.
  *
  * @details Active (@p reason NULL): `state=active`, `libs=`, `pid=`, plus `mptcp=off` when
- * @p mptcp_off. Unsupported: `state=unsupported`, `reason=`, `libs=`, `pid=`. One
+ * @p mptcp_off, `vdso=failed` when @p vdso_failed and `unreadable=yes` when
+ * @p unreadable. Unsupported: `state=unsupported`, `reason=`, `libs=`, `pid=`. One
  * `key=value` per line, each newline-terminated; libs are listed in bit order.
+ *
+ * `vdso=failed` says that an image kept its vDSO (chaos_init_vdso.h), so its clock reads
+ * never reach the filter and time rules do nothing for it. `unreadable=yes` says the
+ * kernel refused a look into a process (chaos_init_unreadable()), so path and endpoint
+ * selectors did not match it. Both are written again when they happen, after the
+ * application has started.
  *
  * @return Bytes written (NUL excluded); 0 if @p size is too small (buffer content then
  *         unspecified).
  */
 size_t chaos_init_format_status(
-    char *buffer, size_t size, unsigned libs, const char *reason, long pid, int mptcp_off
+    char *buffer,
+    size_t size,
+    unsigned libs,
+    const char *reason,
+    long pid,
+    int mptcp_off,
+    int vdso_failed,
+    int unreadable
 );
 
 /**
@@ -189,5 +249,44 @@ size_t chaos_init_format_status(
  *         present, or the result does not fit in @p size).
  */
 int chaos_init_godebug_mptcp_off(const char *current, char *out, size_t size);
+
+/**
+ * @brief The process seed a library starts with: `CHAOS_SEED` from the environment, else
+ *        64 random bits.
+ *
+ * @details Same contract as under `LD_PRELOAD` (see the libraries' internal headers), so a
+ * test reproduces the same faults in either mode: `CHAOS_SEED=<decimal u64>` fixes every
+ * decision, nothing else does. A malformed or out-of-range value is ignored rather than
+ * refused -- the seed decides which faults fire, not whether the rules are valid.
+ *
+ * Only the libraries whose draws follow from the rule and the evaluation number honour it
+ * so far; the rest still mix a thread id into their per-thread generator, where a seed
+ * promises nothing.
+ *
+ * @return The seed.
+ */
+uint64_t chaos_init_seed(void);
+
+/**
+ * @brief Records the system calls the installed filter answers with TRACE.
+ *
+ * @details A seccomp filter cannot be changed once installed, so this set is fixed for the
+ * life of the container while the rule file is not: a reload can add an effect that needs
+ * a trace stop the filter does not provide. Without knowing the set, the deciders produce
+ * a verdict only a trace stop can carry, the notification path answers CONTINUE, and a
+ * hit is reported for a fault that never happened. Called once, after the handover.
+ *
+ * @param calls  Numbers to remember; NULL or @p count 0 records an empty set.
+ * @param count  How many, truncated to what the store holds.
+ */
+void chaos_init_traced_set(const long *calls, size_t count);
+
+/**
+ * @brief Whether the installed filter answers @p nr with TRACE.
+ *
+ * @return 1 when it does, else 0 -- including when no set was recorded, which is the case
+ *         for a supervisor that installed no TRACE instruction at all.
+ */
+int chaos_init_traced(long nr);
 
 #endif

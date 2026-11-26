@@ -44,7 +44,8 @@
  * - chaos_time_ensure_symbols() as a no-op, so real functions stay what the test assigns.
  * - The eight `g_chaos_time_real_*` real-function pointers, all NULL.
  * - `__thread int g_chaos_time_tls_guard` (reentrancy guard) = 0.
- * - `__thread uint64_t g_chaos_time_tls_prng_state` (per-thread PRNG state) = 0; 0 makes the
+ * - `uint64_t g_chaos_time_lineage` = 0, the lineage of the process that
+ *   loaded the library; a forked child mixes it forward so it decides on its own.
  *   PRNG reseed from the process seed on first use.
  * - `uint64_t g_chaos_time_process_seed` = 1 instead of the /dev/urandom seed of
  *   chaos_time_init(); per-thread streams still mix in the TID and a stack address.
@@ -60,7 +61,8 @@
     chaos_time_sleep_fn g_chaos_time_real_sleep = NULL;                                            \
     chaos_time_timespec_get_fn g_chaos_time_real_timespec_get = NULL;                              \
     __thread int g_chaos_time_tls_guard = 0;                                                       \
-    __thread uint64_t g_chaos_time_tls_prng_state = 0U;                                            \
+    uint64_t g_chaos_time_lineage = 0U;                                                            \
+    uint64_t g_chaos_time_forks = 0U;                                                              \
     uint64_t g_chaos_time_process_seed = 1U
 
 /**
@@ -80,7 +82,8 @@ static inline void chaos_time_test_reset_runtime(void)
     g_chaos_time_real_sleep = NULL;
     g_chaos_time_real_timespec_get = NULL;
     g_chaos_time_tls_guard = 0;
-    g_chaos_time_tls_prng_state = 0U;
+    g_chaos_time_lineage = 0U;
+    g_chaos_time_forks = 0U;
     g_chaos_time_process_seed = 1U;
 }
 

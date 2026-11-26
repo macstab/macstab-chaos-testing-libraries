@@ -15,7 +15,8 @@
  *      endpoint does not resolve (not a socket, unsupported family or type) is forwarded
  *      untouched.
  *   3. Match the active snapshot; apply pre-call effects (LATENCY, ERRNO), make the real
- *      call, apply post-call effects (CORRUPT; DUP and TRICKLE reshape the receive).
+ *      call, apply post-call effects (CORRUPT; DUP and TRICKLE reshape the receive). DROP
+ *      replaces the call: the byte count is reported and the datagram is not sent.
  * While no rule is active, step 2 is skipped for the connected-socket and descriptor
  * paths, so an idle library costs one throttled check per call.
  *
@@ -52,11 +53,15 @@
  * @par Stability: private / internal
  */
 
+#include "chaos_bucket.h"
 #include "chaos_net_actions.h"
 #include "chaos_net_config.h"
 #include "chaos_net_endpoint.h"
 #include "chaos_net_internal.h"
 
+#include "chaos_sleep.h"
+
+#include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
 #include <string.h>
@@ -71,12 +76,15 @@
  * `bit_sample & 7`; the segment holding that byte is found by walking the list. The
  * vector counterpart of chaos_net_corrupt_buffer(), for recvmsg and readv.
  *
+ * @param rule    Firing rule; the byte index is its first effect draw, the bit its second.
  * @param iov     Scatter list the kernel filled; NULL is a no-op.
  * @param iovcnt  Entries in @p iov; <= 0 is a no-op.
  * @param size    Bytes received, already capped at the vector's capacity; 0 is a no-op.
- * @par Thread-safety: advances the calling thread's PRNG by two steps.
+ * @par Thread-safety: no shared state; the samples follow from the rule and the call.
  */
-static void chaos_net_corrupt_iovecs(const struct iovec *iov, int iovcnt, size_t size)
+static void chaos_net_corrupt_iovecs(
+    const chaos_net_rule_t *rule, const struct iovec *iov, int iovcnt, size_t size
+)
 {
     uint32_t index_sample;
     uint32_t bit_sample;
@@ -89,8 +97,8 @@ static void chaos_net_corrupt_iovecs(const struct iovec *iov, int iovcnt, size_t
         return;
     }
 
-    index_sample = chaos_net_prng_next_u32();
-    bit_sample = chaos_net_prng_next_u32();
+    index_sample = chaos_net_rule_draw(rule, CHAOS_NET_DRAW_FIRST_EFFECT);
+    bit_sample = chaos_net_rule_draw(rule, CHAOS_NET_DRAW_SECOND_EFFECT);
     index = (size_t)(index_sample % size);
     for (entry = 0; entry < iovcnt && remaining > 0U; ++entry)
     {
@@ -366,7 +374,7 @@ static ssize_t chaos_net_call_real_recvmsg(int sockfd, struct msghdr *message, i
  * @param rule  Matched rule copy; NULL yields 0.
  * @return 0 to make the real call (after any delay); -1 to return -1 at once, errno set.
  */
-static int chaos_net_apply_pre_call_rule(const chaos_net_rule_t *rule)
+static int chaos_net_apply_pre_call_rule(chaos_net_rule_t *rule)
 {
     if (rule == NULL)
     {
@@ -449,7 +457,9 @@ CHAOS_NET_EXPORT int listen(int sockfd, int backlog)
  *
  * @details Endpoint from the destination sockaddr plus SO_TYPE, e.g.
  * `tcp4://10.0.0.1:6379 : connect : ECONNREFUSED : 1.0`. An ERRNO firing never reaches
- * the kernel: no SYN is sent and the socket stays unconnected.
+ * the kernel: no SYN is sent and the socket stays unconnected. A REDIRECT firing sends
+ * the connect to another address instead, which the kernel then treats as the one the
+ * caller asked for: `getpeername` reports it, and every later rule matches it.
  */
 CHAOS_NET_EXPORT int
 connect(int sockfd, CHAOS_NET_CONST_SOCKADDR_PARAM address, socklen_t address_length)
@@ -470,6 +480,20 @@ connect(int sockfd, CHAOS_NET_CONST_SOCKADDR_PARAM address, socklen_t address_le
     if (chaos_net_apply_pre_call_rule(&rule) != 0)
     {
         return -1;
+    }
+    if (rule.effect == CHAOS_NET_EFFECT_REDIRECT)
+    {
+        struct sockaddr_storage target;
+        socklen_t target_length = 0;
+
+        /* Built before the draw, so a target this socket cannot reach spends no hit. */
+        if (chaos_net_redirect_sockaddr(&rule.redirect, address_ptr, &target, &target_length) &&
+            chaos_net_rule_should_trigger(&rule))
+        {
+            return chaos_net_call_real_connect(
+                sockfd, (const struct sockaddr *)(const void *)&target, target_length
+            );
+        }
     }
     return chaos_net_call_real_connect(sockfd, address_ptr, address_length);
 }
@@ -612,6 +636,17 @@ static uint64_t chaos_net_dup_socket(int fd)
     return identity;
 }
 #define CHAOS_NET_DUP_SOCKET(fd) chaos_net_dup_socket(fd)
+#endif
+
+/* Test seam: the ownership scan reads /proc, which a unit test replaces with an answer. */
+#ifndef CHAOS_NET_OWNERSHIP
+#define CHAOS_NET_OWNERSHIP(fd) chaos_net_socket_ownership(fd)
+#endif
+
+/* Test seam: the suppression counter lives in chaos_net_config.c, which the wrapper tests
+ * stub rather than link. */
+#ifndef CHAOS_NET_RESET_SUPPRESSED
+#define CHAOS_NET_RESET_SUPPRESSED(ownership) chaos_net_reset_suppressed(ownership)
 #endif
 
 static int chaos_net_is_stream(int fd);
@@ -829,7 +864,7 @@ static void chaos_net_dup_store(
  *         did not fire): the caller then receives normally.
  */
 static ssize_t chaos_net_dup_replay(
-    const chaos_net_rule_t *rule,
+    chaos_net_rule_t *rule,
     int fd,
     const struct iovec *iov,
     int iovcnt,
@@ -906,6 +941,137 @@ static void chaos_net_dup_forget(int fd)
     (void)__sync_bool_compare_and_swap(&table[fd % CHAOS_NET_DUP_SLOTS].fd, fd, -1);
 }
 
+/*---------------------------------------------------------------------------*
+ * THROTTLE: hold the send side to a byte rate
+ *---------------------------------------------------------------------------*/
+
+/** @brief Sockets whose send rate is tracked at once (slots indexed by fd % 64). */
+#define CHAOS_NET_THROTTLE_SLOTS 64U
+
+/**
+ * @brief One socket's token bucket.
+ *
+ * @details Slot `fd % CHAOS_NET_THROTTLE_SLOTS`, tagged with the descriptor and the rate
+ * it was armed with: a colliding descriptor takes the slot over and the two then share one
+ * rate, and a changed rate starts a fresh bucket. Plain statics, as libchaos-io's are: a
+ * bucket is three words, and a fork child inheriting them is right, because it inherited
+ * the sockets too.
+ */
+typedef struct chaos_net_throttle
+{
+    volatile int fd;
+    volatile uint64_t rate;
+    chaos_bucket_t bucket;
+    /** Whether this slot has ever had an owner: a takeover starts empty, a first use full. */
+    int taken;
+} chaos_net_throttle_t;
+
+static chaos_net_throttle_t g_chaos_net_throttles[CHAOS_NET_THROTTLE_SLOTS];
+
+/**
+ * @brief Whether @p fd is non-blocking; 0 when the flags cannot be read.
+ *
+ * @details A raw `fcntl` so no wrapper sees it, with errno preserved as the other
+ * descriptor queries here do.
+ */
+static int chaos_net_nonblocking(int fd)
+{
+    const int saved_errno = errno;
+    const long flags = syscall(SYS_fcntl, fd, F_GETFL, 0);
+
+    errno = saved_errno;
+    return flags >= 0 && (flags & O_NONBLOCK) != 0;
+}
+
+/** @brief The bucket of (@p fd, @p rate), reset when the slot held something else. */
+static chaos_bucket_t *chaos_net_throttle_bucket(int fd, uint64_t rate)
+{
+    chaos_net_throttle_t *entry = &g_chaos_net_throttles[(unsigned)fd % CHAOS_NET_THROTTLE_SLOTS];
+
+    if (entry->fd != fd || entry->rate != rate)
+    {
+        /* Empty for a new owner, full only the first time: see chaos_io_rw.c. */
+        const int stolen = entry->taken && entry->fd != fd;
+
+        entry->bucket.state = stolen ? chaos_bucket_state(0U, chaos_hits_now_ms()) : 0U;
+        entry->taken = 1;
+        entry->rate = rate;
+        entry->fd = fd;
+    }
+    return &entry->bucket;
+}
+
+/**
+ * @brief How many of @p size bytes the rule's rate lets through now.
+ *
+ * @details Only a stream carries a partial send: a datagram is one message, so shortening
+ * it would deliver something the application never sent -- such a send waits for its whole
+ * message instead. A socket in non-blocking mode is told `EAGAIN` rather than slept on,
+ * which is what its event loop is written for.
+ *
+ * The bucket is charged first and the rule asked second, as the TRICKLE path does: an
+ * allowance that covers the whole call changes nothing and spends no hit. A send that has
+ * to wait reserves what it will send, so that two threads on one socket are charged
+ * separately and wait one after the other instead of both for the same bytes.
+ *
+ * @param refuse  Output: non-zero when the caller must report EAGAIN instead of sending.
+ * @return Bytes to pass to the real call; @p size when the rule does not hold it back.
+ */
+static size_t chaos_net_throttle_size(chaos_net_rule_t *rule, int fd, size_t size, int *refuse)
+{
+    chaos_bucket_t *bucket;
+    const int stream = chaos_net_is_stream(fd);
+    uint64_t allowed;
+
+    *refuse = 0;
+    if (rule->effect != CHAOS_NET_EFFECT_THROTTLE || size == 0U ||
+        size == (size_t)CHAOS_POLICY_NO_SIZE)
+    {
+        return size;
+    }
+    bucket = chaos_net_throttle_bucket(fd, rule->rate_bps);
+    allowed = chaos_bucket_take(bucket, rule->rate_bps, size, chaos_hits_now_ms());
+    if (allowed == (uint64_t)size)
+    {
+        return size;
+    }
+    if (allowed == 0U || !stream)
+    {
+        /* A stream sends a tenth of a second's worth; a datagram sends its whole
+         * message, because half a datagram is not a datagram. Only what the first take
+         * did not already hand out is reserved, so the message is charged once. */
+        const uint64_t chunk = chaos_bucket_chunk(rule->rate_bps);
+        const uint64_t target =
+            !stream ? (uint64_t)size : (chunk < (uint64_t)size ? chunk : (uint64_t)size);
+
+        if (chaos_net_nonblocking(fd))
+        {
+            if (!chaos_net_rule_should_trigger(rule))
+            {
+                return size;
+            }
+            /* Nothing is sent, so nothing may stay charged: the bytes the take handed out
+             * go back. Otherwise every attempt drains the refill it was waiting for, and a
+             * datagram larger than one second's worth of the rate -- which the take can
+             * never cover, since the bucket is capped there -- is never sent at all. */
+            chaos_bucket_return(bucket, rule->rate_bps, allowed, chaos_hits_now_ms());
+            *refuse = 1;
+            return 0U;
+        }
+        /* Asked before the wait, unlike the partial allowance below: a rule that does not
+         * fire must not cost the caller the wait it was about to take. */
+        if (!chaos_net_rule_should_trigger(rule))
+        {
+            return size;
+        }
+        chaos_sleep_ms(
+            chaos_bucket_reserve(bucket, rule->rate_bps, target - allowed, chaos_hits_now_ms())
+        );
+        return stream ? (size_t)target : size;
+    }
+    return chaos_net_rule_should_trigger(rule) ? (size_t)allowed : size;
+}
+
 /** @brief Receive flags that bypass DUP (the call is made for real, nothing is kept). */
 #ifdef MSG_ERRQUEUE
 #define CHAOS_NET_DUP_SKIP_FLAGS (MSG_PEEK | MSG_TRUNC | MSG_OOB | MSG_WAITALL | MSG_ERRQUEUE)
@@ -921,7 +1087,7 @@ static void chaos_net_dup_forget(int fd)
  * the whole buffer, which a shorter kept payload would not give). An empty or unknown-size
  * request is bypassed too: a replay into it would return 0, which reads as EOF.
  */
-static int chaos_net_dups(const chaos_net_rule_t *rule, int flags, uint64_t requested)
+static int chaos_net_dups(chaos_net_rule_t *rule, int flags, uint64_t requested)
 {
     return rule->effect == CHAOS_NET_EFFECT_DUP && (flags & CHAOS_NET_DUP_SKIP_FLAGS) == 0 &&
            requested != 0U && requested != CHAOS_POLICY_NO_SIZE;
@@ -969,6 +1135,32 @@ static int chaos_net_is_stream(int fd)
 }
 
 /**
+ * @brief Whether a DROP rule fires for a send of `rule->call_size` bytes on @p fd.
+ *
+ * @details DROP reports a send as done and sends nothing, which is a lost packet. Only a
+ * datagram socket qualifies: datagrams are a lossy medium and a program that uses them
+ * must survive one going missing, while a hole in a TCP stream is not packet loss -- the
+ * kernel retransmits until the bytes arrive or the connection breaks, so a stream with a
+ * silent gap is a state no network produces.
+ *
+ * A send whose byte count is not a value the call could return is left alone: an unreadable
+ * vector reports CHAOS_POLICY_NO_SIZE and an iovec total may exceed SSIZE_MAX, and reporting
+ * either as sent would hand the caller a negative count, i.e. an error with no errno. One
+ * bound covers both, since the sentinel is UINT64_MAX. The kernel rejects such a call with
+ * EINVAL anyway. The rule is asked last, so a call DROP leaves alone counts no hit, as with
+ * TRICKLE.
+ *
+ * @param rule  Matched rule.
+ * @param fd    Socket being written.
+ * @return Non-zero when the real send must be skipped and `rule->call_size` reported.
+ */
+static int chaos_net_drops(chaos_net_rule_t *rule, int fd)
+{
+    return rule->effect == CHAOS_NET_EFFECT_DROP && rule->call_size <= (uint64_t)SSIZE_MAX &&
+           CHAOS_NET_SOCKET_TYPE(fd) == SOCK_DGRAM && chaos_net_rule_should_trigger(rule);
+}
+
+/**
  * @brief Bytes of a @p size-byte buffer that a receive returning @p rc actually filled.
  *
  * @details With MSG_TRUNC, a datagram receive returns the full datagram length, which can
@@ -992,7 +1184,7 @@ static size_t chaos_net_received_bytes(int fd, ssize_t rc, size_t size, int flag
  * MSG_WAITALL asks for the whole count, which the kernel shortens only on a signal, an
  * error or end of stream; such a receive is left alone too.
  */
-static int chaos_net_trickles(const chaos_net_rule_t *rule, int fd, uint64_t requested, int flags)
+static int chaos_net_trickles(chaos_net_rule_t *rule, int fd, uint64_t requested, int flags)
 {
     return rule->effect == CHAOS_NET_EFFECT_TRICKLE && (flags & MSG_WAITALL) == 0 &&
            requested > rule->chunk_bytes && requested != CHAOS_POLICY_NO_SIZE &&
@@ -1074,7 +1266,8 @@ int chaos_net_match_connected(
  * @brief send(2) wrapper: SEND rules on either end of the connection.
  *
  * @details send() has no destination argument; chaos_net_match_connected() searches both
- * ends of the connection, the peer winning ties. `@size` sees @p size.
+ * ends of the connection, the peer winning ties. `@size` sees @p size. A firing DROP on a
+ * datagram socket reports @p size as sent without sending it (chaos_net_drops()).
  */
 CHAOS_NET_EXPORT ssize_t send(int sockfd, const void *buffer, size_t size, int flags)
 {
@@ -1091,6 +1284,20 @@ CHAOS_NET_EXPORT ssize_t send(int sockfd, const void *buffer, size_t size, int f
     if (chaos_net_apply_pre_call_rule(&rule) != 0)
     {
         return -1;
+    }
+    if (chaos_net_drops(&rule, sockfd))
+    {
+        return (ssize_t)size;
+    }
+    {
+        int refuse = 0;
+
+        size = chaos_net_throttle_size(&rule, sockfd, size, &refuse);
+        if (refuse)
+        {
+            errno = EAGAIN;
+            return -1;
+        }
     }
     return chaos_net_call_real_send(sockfd, buffer, size, flags);
 }
@@ -1136,6 +1343,20 @@ CHAOS_NET_EXPORT ssize_t sendto(
     {
         return -1;
     }
+    if (chaos_net_drops(&rule, sockfd))
+    {
+        return (ssize_t)size;
+    }
+    {
+        int refuse = 0;
+
+        size = chaos_net_throttle_size(&rule, sockfd, size, &refuse);
+        if (refuse)
+        {
+            errno = EAGAIN;
+            return -1;
+        }
+    }
     return chaos_net_call_real_sendto(sockfd, buffer, size, flags, address_ptr, address_length);
 }
 
@@ -1171,6 +1392,10 @@ CHAOS_NET_EXPORT ssize_t sendmsg(int sockfd, const struct msghdr *message, int f
     if (chaos_net_apply_pre_call_rule(&rule) != 0)
     {
         return -1;
+    }
+    if (chaos_net_drops(&rule, sockfd))
+    {
+        return (ssize_t)rule.call_size;
     }
     return chaos_net_call_real_sendmsg(sockfd, message, flags);
 }
@@ -1233,7 +1458,7 @@ CHAOS_NET_EXPORT ssize_t recv(int sockfd, void *buffer, size_t size, int flags)
 
         if (filled > 0U && chaos_net_rule_should_trigger(&rule))
         {
-            chaos_net_corrupt_buffer(buffer, filled);
+            chaos_net_corrupt_buffer(&rule, buffer, filled);
         }
     }
     return rc;
@@ -1321,7 +1546,7 @@ CHAOS_NET_EXPORT ssize_t recvfrom(
 
         if (filled > 0U && chaos_net_rule_should_trigger(&rule))
         {
-            chaos_net_corrupt_buffer(buffer, filled);
+            chaos_net_corrupt_buffer(&rule, buffer, filled);
         }
     }
     return rc;
@@ -1430,7 +1655,7 @@ CHAOS_NET_EXPORT ssize_t recvmsg(int sockfd, struct msghdr *message, int flags)
 
         if (filled > 0U && chaos_net_rule_should_trigger(&rule))
         {
-            chaos_net_corrupt_iovecs(message->msg_iov, (int)message->msg_iovlen, filled);
+            chaos_net_corrupt_iovecs(&rule, message->msg_iov, (int)message->msg_iovlen, filled);
         }
     }
     return rc;
@@ -1731,7 +1956,7 @@ CHAOS_NET_EXPORT ssize_t read(int fd, void *buffer, size_t size)
     rc = chaos_net_call_real_read(fd, buffer, size);
     if (rc > 0 && rule.effect == CHAOS_NET_EFFECT_CORRUPT && chaos_net_rule_should_trigger(&rule))
     {
-        chaos_net_corrupt_buffer(buffer, (size_t)rc);
+        chaos_net_corrupt_buffer(&rule, buffer, (size_t)rc);
     }
     return rc;
 }
@@ -1786,13 +2011,13 @@ CHAOS_NET_EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
     rc = chaos_net_call_real_readv(fd, iov, iovcnt);
     if (rc > 0 && rule.effect == CHAOS_NET_EFFECT_CORRUPT && chaos_net_rule_should_trigger(&rule))
     {
-        chaos_net_corrupt_iovecs(iov, iovcnt, (size_t)rc);
+        chaos_net_corrupt_iovecs(&rule, iov, iovcnt, (size_t)rc);
     }
     return rc;
 }
 
 /**
- * @brief write(2) wrapper: `send` rules (LATENCY, ERRNO) on sockets; everything else
+ * @brief write(2) wrapper: `send` rules (LATENCY, ERRNO, DROP) on sockets; everything else
  *        forwarded.
  */
 CHAOS_NET_EXPORT ssize_t write(int fd, const void *buffer, size_t size)
@@ -1800,16 +2025,32 @@ CHAOS_NET_EXPORT ssize_t write(int fd, const void *buffer, size_t size)
     chaos_net_rule_t rule;
 
     chaos_net_ensure_symbols();
-    if (chaos_net_match_descriptor_rule(fd, CHAOS_NET_OP_SEND, (uint64_t)size, &rule) &&
-        chaos_net_apply_pre_call_rule(&rule) != 0)
+    if (chaos_net_match_descriptor_rule(fd, CHAOS_NET_OP_SEND, (uint64_t)size, &rule))
     {
-        return -1;
+        if (chaos_net_apply_pre_call_rule(&rule) != 0)
+        {
+            return -1;
+        }
+        if (chaos_net_drops(&rule, fd))
+        {
+            return (ssize_t)size;
+        }
+        {
+            int refuse = 0;
+
+            size = chaos_net_throttle_size(&rule, fd, size, &refuse);
+            if (refuse)
+            {
+                errno = EAGAIN;
+                return -1;
+            }
+        }
     }
     return chaos_net_call_real_write(fd, buffer, size);
 }
 
 /**
- * @brief writev(2) wrapper: `send` rules (LATENCY, ERRNO) on sockets; everything else
+ * @brief writev(2) wrapper: `send` rules (LATENCY, ERRNO, DROP) on sockets; everything else
  *        forwarded.
  */
 CHAOS_NET_EXPORT ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
@@ -1819,10 +2060,16 @@ CHAOS_NET_EXPORT ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
     chaos_net_ensure_symbols();
     if (chaos_net_match_descriptor_rule(
             fd, CHAOS_NET_OP_SEND, chaos_net_iovec_size(iov, iovcnt), &rule
-        ) &&
-        chaos_net_apply_pre_call_rule(&rule) != 0)
+        ))
     {
-        return -1;
+        if (chaos_net_apply_pre_call_rule(&rule) != 0)
+        {
+            return -1;
+        }
+        if (chaos_net_drops(&rule, fd))
+        {
+            return (ssize_t)rule.call_size;
+        }
     }
     return chaos_net_call_real_writev(fd, iov, iovcnt);
 }
@@ -1847,6 +2094,7 @@ CHAOS_NET_EXPORT int close(int fd)
     chaos_net_rule_t rule;
     struct linger abort_linger;
     int matched;
+    chaos_net_ownership_t ownership;
     int saved_errno;
     int rc;
 
@@ -1855,6 +2103,24 @@ CHAOS_NET_EXPORT int close(int fd)
     if (matched && rule.effect == CHAOS_NET_EFFECT_LATENCY)
     {
         chaos_net_rule_apply_latency(&rule);
+    }
+    /* Ownership is settled before the rule fires, so a suppressed RESET spends neither a hit
+     * nor a `@first` claim: SO_LINGER on a socket another descriptor still holds would not
+     * reset anything now and would reset it later, out of any rule's reach. A suppression is
+     * not silent -- it is counted for the hits file's header lines.
+     *
+     * The order was tried the other way round, to save the walk of `/proc` on a close the
+     * probability was going to decline, and it is wrong: `suppressed.shared` is a
+     * diagnostic for a misconfiguration -- it is what tells a test why its RESET rule does
+     * nothing against a pre-forking server -- and sampling it by the probability makes that
+     * message quieter by exactly the factor that made the scan look expensive. At `p=0.01`
+     * it would report 1 suppression instead of 100. The scan runs once per connection
+     * teardown, never on a throughput path, and costs about 10 us where a container has a
+     * handful of processes. */
+    else if (matched && rule.effect == CHAOS_NET_EFFECT_RESET &&
+             (ownership = CHAOS_NET_OWNERSHIP(fd)) != CHAOS_NET_OWNER_SOLE)
+    {
+        CHAOS_NET_RESET_SUPPRESSED(ownership);
     }
     else if (matched && rule.effect == CHAOS_NET_EFFECT_RESET &&
              chaos_net_rule_should_trigger(&rule))

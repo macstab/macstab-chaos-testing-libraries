@@ -54,14 +54,6 @@ int chaos_time_probability_hit_sample(double probability, uint32_t sample)
 }
 
 /**
- * @copydoc chaos_time_probability_hit
- */
-int chaos_time_probability_hit(double probability)
-{
-    return chaos_time_probability_hit_sample(probability, chaos_time_prng_next_u32());
-}
-
-/**
  * Sleeps @p usec through the real usleep, else the real nanosleep, under the guard.
  *
  * usleep is not restarted when a signal interrupts it, so the chunk may be shorter;
@@ -142,15 +134,25 @@ static void chaos_time_add_offset_ms(struct timespec *value, int64_t offset_ms)
 /**
  * @copydoc chaos_time_rule_should_trigger
  */
-int chaos_time_rule_should_trigger(const chaos_time_rule_t *rule)
+int chaos_time_rule_should_trigger(chaos_time_rule_t *rule)
 {
     if (rule == NULL || !chaos_policy_window_open(&rule->policy) ||
+        !chaos_policy_at_ok(&rule->policy, rule->hit) ||
         !chaos_policy_size_ok(&rule->policy, rule->call_size))
     {
         return 0;
     }
 
-    if (!chaos_time_probability_hit(rule->probability))
+    /* Past the gates that cost nothing: this call is an evaluation of the rule and gets
+     * its number. `@every=N` picks evaluations, so it gates here, before the draw; every
+     * sample of this call follows from the same number. */
+    if (!chaos_policy_every_ok(&rule->policy, chaos_time_rule_draw_begin(rule)))
+    {
+        return 0;
+    }
+    if (!chaos_time_probability_hit_sample(
+            rule->probability, chaos_time_rule_draw(rule, CHAOS_TIME_DRAW_PROBABILITY)
+        ))
     {
         return 0;
     }
@@ -162,7 +164,7 @@ int chaos_time_rule_should_trigger(const chaos_time_rule_t *rule)
  *
  * One firing decision per call, before the first chunk.
  */
-void chaos_time_rule_apply_latency(const chaos_time_rule_t *rule)
+void chaos_time_rule_apply_latency(chaos_time_rule_t *rule)
 {
     uint64_t remaining_us;
 
@@ -185,7 +187,7 @@ void chaos_time_rule_apply_latency(const chaos_time_rule_t *rule)
 /**
  * @copydoc chaos_time_rule_apply_errno
  */
-int chaos_time_rule_apply_errno(const chaos_time_rule_t *rule)
+int chaos_time_rule_apply_errno(chaos_time_rule_t *rule)
 {
     if (rule == NULL || rule->effect != CHAOS_TIME_EFFECT_ERRNO ||
         !chaos_time_rule_should_trigger(rule))
@@ -200,7 +202,7 @@ int chaos_time_rule_apply_errno(const chaos_time_rule_t *rule)
 /**
  * @copydoc chaos_time_rule_apply_offset
  */
-void chaos_time_rule_apply_offset(const chaos_time_rule_t *rule, struct timespec *value)
+void chaos_time_rule_apply_offset(chaos_time_rule_t *rule, struct timespec *value)
 {
     if (rule == NULL || value == NULL || rule->effect != CHAOS_TIME_EFFECT_OFFSET ||
         !chaos_time_rule_should_trigger(rule))
@@ -219,7 +221,7 @@ void chaos_time_rule_apply_offset(const chaos_time_rule_t *rule, struct timespec
  * does not; in 2 every read is shifted. A read that meets state 3 on another thread is
  * not shifted. The atfork child handler turns an inherited 3 back into 1.
  */
-void chaos_time_rule_apply_regress(const chaos_time_rule_t *rule, struct timespec *value)
+void chaos_time_rule_apply_regress(chaos_time_rule_t *rule, struct timespec *value)
 {
     chaos_hit_slot_t *slot;
 
@@ -228,8 +230,9 @@ void chaos_time_rule_apply_regress(const chaos_time_rule_t *rule, struct timespe
     {
         return;
     }
-    /* Outside its @from/@until window the rule shifts nothing, before or after the jump. */
-    if (!chaos_policy_window_open(&rule->policy))
+    /* Outside its @from/@until window, or before its `@at` delay has passed, the rule
+     * shifts nothing -- before or after the jump. */
+    if (!chaos_policy_window_open(&rule->policy) || !chaos_policy_at_ok(&rule->policy, rule->hit))
     {
         return;
     }
@@ -257,6 +260,66 @@ void chaos_time_rule_apply_regress(const chaos_time_rule_t *rule, struct timespe
     chaos_time_add_offset_ms(value, -rule->offset_ms);
 }
 
+/** @brief Nanoseconds per second, for packing a reading into the slot's state word. */
+#define CHAOS_TIME_NS_PER_SEC UINT64_C(1000000000)
+
+/**
+ * @brief Marks the slot's state word as a frozen reading rather than a REGRESS state.
+ *
+ * @details The top bit, which no clock reaches: 2^63 ns is 292 years of uptime, and the
+ * kernel rejects a realtime value that large. It is not decoration. REGRESS keeps a small
+ * state machine (0, 1, 2, 3) in the same word, and chaos_hits_pool_after_fork() rewrites a
+ * 3 to a 1 for it; a plain `nanoseconds + 1` would alias that at a reading of 2 ns, which
+ * CLOCK_PROCESS_CPUTIME_ID produces at the start of a process. The mark keeps a frozen
+ * reading out of every value the other effect's machine uses.
+ */
+#define CHAOS_TIME_FREEZE_MARK (UINT64_C(1) << 63)
+
+/**
+ * @copydoc chaos_time_rule_apply_freeze
+ *
+ * slot->state holds the frozen reading in nanoseconds with CHAOS_TIME_FREEZE_MARK set, so a
+ * cleared mark means "not frozen" for any reading, including 0. One CAS decides which
+ * concurrent reader's value is kept; the losers read the winner's, so every thread sees the
+ * same frozen time.
+ */
+void chaos_time_rule_apply_freeze(chaos_time_rule_t *rule, struct timespec *value)
+{
+    chaos_hit_slot_t *slot;
+    uint64_t frozen;
+
+    if (rule == NULL || value == NULL || rule->effect != CHAOS_TIME_EFFECT_FREEZE ||
+        rule->hit == NULL || !chaos_hit_slot_current(rule->hit, rule->hit_generation))
+    {
+        return;
+    }
+    /* Outside its @from/@until window, or before its `@at` delay has passed, the rule
+     * stops nothing -- before or after the freeze. */
+    if (!chaos_policy_window_open(&rule->policy) || !chaos_policy_at_ok(&rule->policy, rule->hit))
+    {
+        return;
+    }
+    slot = rule->hit;
+    frozen = slot->state;
+    if ((frozen & CHAOS_TIME_FREEZE_MARK) == 0U)
+    {
+        if (!chaos_time_rule_should_trigger(rule))
+        {
+            return;
+        }
+        (void)__sync_bool_compare_and_swap(
+            &slot->state,
+            frozen,
+            ((uint64_t)value->tv_sec * CHAOS_TIME_NS_PER_SEC + (uint64_t)value->tv_nsec) |
+                CHAOS_TIME_FREEZE_MARK
+        );
+        frozen = slot->state;
+    }
+    frozen &= ~CHAOS_TIME_FREEZE_MARK;
+    value->tv_sec = (time_t)(frozen / CHAOS_TIME_NS_PER_SEC);
+    value->tv_nsec = (long)(frozen % CHAOS_TIME_NS_PER_SEC);
+}
+
 /**
  * @copydoc chaos_time_rule_unshift_deadline
  *
@@ -271,8 +334,15 @@ int chaos_time_rule_unshift_deadline(
 {
     int changed = 0;
 
+    /* Every qualifier that can make the shift apply to some reads and not others has to
+     * be absent, because this subtraction is unconditional: a deadline the program worked
+     * out from a shifted clock is only shifted if the clock really was. `@every` and
+     * `@at` are the two this list was missing -- with `@at=+60000` no read was shifted for
+     * the first minute while every absolute clock_nanosleep had the offset taken off its
+     * deadline anyway, so it woke at once and a loop sleeping absolutely spun. */
     if (offset_rule != NULL && offset_rule->effect == CHAOS_TIME_EFFECT_OFFSET &&
         offset_rule->probability >= 1.0 && offset_rule->policy.first == 0U &&
+        offset_rule->policy.every == 0U && offset_rule->policy.at_ms == 0U &&
         !offset_rule->policy.has_size_above && !offset_rule->policy.has_size_below &&
         chaos_policy_window_open(&offset_rule->policy))
     {
@@ -282,7 +352,8 @@ int chaos_time_rule_unshift_deadline(
     if (regress_rule != NULL && regress_rule->effect == CHAOS_TIME_EFFECT_REGRESS &&
         regress_rule->hit != NULL &&
         chaos_hit_slot_current(regress_rule->hit, regress_rule->hit_generation) &&
-        regress_rule->hit->state == 2U && chaos_policy_window_open(&regress_rule->policy))
+        regress_rule->hit->state == 2U && regress_rule->policy.every == 0U &&
+        regress_rule->policy.at_ms == 0U && chaos_policy_window_open(&regress_rule->policy))
     {
         chaos_time_add_offset_ms(deadline, regress_rule->offset_ms);
         changed = 1;

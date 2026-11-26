@@ -438,6 +438,7 @@ static int chaos_time_read_clock(clockid_t clock_id, struct timespec *value)
     chaos_time_rule_t errno_rule;
     chaos_time_rule_t offset_rule;
     chaos_time_rule_t regress_rule;
+    chaos_time_rule_t freeze_rule;
     int rc;
 
     if (chaos_time_config_match(
@@ -471,6 +472,14 @@ static int chaos_time_read_clock(clockid_t clock_id, struct timespec *value)
         ))
     {
         chaos_time_rule_apply_regress(&regress_rule, value);
+    }
+    /* Last: a frozen clock stands still, so an OFFSET or REGRESS on the same clock is
+     * folded into the reading that gets kept rather than applied to it again. */
+    if (chaos_time_config_match(
+            CHAOS_TIME_EFFECT_FREEZE, CHAOS_TIME_OP_CLOCK_GETTIME, clock_id, &freeze_rule
+        ))
+    {
+        chaos_time_rule_apply_freeze(&freeze_rule, value);
     }
 
     return 0;

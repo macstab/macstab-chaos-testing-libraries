@@ -19,6 +19,32 @@
  * suffix `<n>` is normally the pid (chaos_hits_file_number_for() explains when it is
  * not). A reader sums all `/tmp/.chaos-<lib>.hits.*` files to get totals over processes.
  *
+ * @par Header lines
+ * `key=value` lines come before the rule lines (the @p header argument of
+ * chaos_hits_write_for()), for anything that belongs to no single rule. Every library
+ * writes `generation=<n>`, the number of rule-file snapshots it has published, so a reader
+ * can tell which rules the counts belong to; libchaos-net adds the RESET suppressions of
+ * NETWORK.md:
+ *
+ * @code
+ * generation=4
+ * suppressed.shared=3
+ * suppressed.unknown=0
+ * 12<TAB>tcp4://127.0.0.1:5432:close:RESET:1 # pg
+ * @endcode
+ *
+ * A header line carries **no tab**, which is what makes it additive: a reader that splits on
+ * the first tab and skips what has none ignores lines it does not know. A second *column* in
+ * a rule line would not be additive -- such a reader takes the first number and the rest of
+ * the line as the rule text, so counts land under a rule that does not exist, silently. New
+ * reports therefore go into header lines, never into a column.
+ *
+ * @par Evaluations against hits
+ * A slot counts both: `count` is the hits (an applied effect) and `evaluations` is the
+ * calls that reached the probability draw. A rule with a probability below 1 fires on a
+ * fraction of its evaluations, and without the second number a test cannot tell "the
+ * selector never matched" from "it matched and the draw said no".
+ *
  * @par Slot pool and reload
  * The counters live in a pool of slots each library keeps beside its two rule snapshots.
  * chaos_hits_assign() gives a rule that survives a reload (same text) the very same
@@ -88,6 +114,34 @@
 #define CHAOS_HITS_LINE_MAX (20U + 1U + CHAOS_STATUS_TEXT_MAX + 1U)
 
 /**
+ * @brief Room for a library's whole header block: the generation line plus the two
+ *        suppression lines libchaos-net adds, each at most `<key>=<20 digits>` and a
+ *        newline.
+ */
+#define CHAOS_HITS_HEADER_MAX 128U
+
+/**
+ * @brief Writes the `generation=<n>` header line, which every library's header starts with.
+ *
+ * @details The generation counts the rule-file snapshots this process has published, so a
+ * reader can tell which rules the counts below belong to: a test that rewrites the rule
+ * file and reads the hits sees the number change and knows the counts restarted. Carries
+ * no tab, like every header line, so a reader that splits on the first tab skips it.
+ *
+ * @param out        Buffer, normally CHAOS_HITS_HEADER_MAX bytes.
+ * @param size       Its size.
+ * @param generation Snapshots published so far.
+ * @return Bytes written, not counting the NUL; 0 when @p out is too small, in which case
+ *         the caller writes no header rather than a truncated one.
+ */
+static inline size_t chaos_hits_header_generation(char *out, size_t size, uint64_t generation)
+{
+    const int rc = snprintf(out, size, "generation=%llu\n", (unsigned long long)generation);
+
+    return rc > 0 && (size_t)rc < size ? (size_t)rc : 0U;
+}
+
+/**
  * @brief Per-rule state that must outlive a reload: hit count, `@first` claims, effect
  *        state, and the generation that tells a live rule copy from a stale one.
  */
@@ -98,6 +152,14 @@ struct chaos_hit_slot
     /** Hits of this rule in this process; incremented atomically, reset in a forked child. */
     volatile uint64_t count;
     /**
+     * Evaluations of this rule in this process: incremented once per call that reached the
+     * probability draw, so `count` over `evaluations` is the fault rate the test actually
+     * got. It is also the counter the reproducible-fault derivation needs -- the nth
+     * evaluation of a rule always makes the same decision (CHAOS_SEED, see the library's
+     * internal header). Reset in a forked child, like `count`.
+     */
+    volatile uint64_t evaluations;
+    /**
      * Hits claimed under `@first=N` (chaos_policy_fire()): claim count in the low 32 bits,
      * low 32 bits of the owning generation in the high 32 bits. One word, so one CAS
      * checks the allowance and the ownership together.
@@ -105,9 +167,22 @@ struct chaos_hit_slot
     volatile uint64_t claimed;
     /**
      * Effect state that must survive reloads. libchaos-time REGRESS: 0 idle, 1 armed,
-     * 3 one thread is deciding the jump, 2 jumped.
+     * 3 one thread is deciding the jump, 2 jumped. Those four values are reserved,
+     * because chaos_hits_pool_after_fork() knows the machine and rewrites a 3; another
+     * effect storing something here must stay clear of them (libchaos-time FREEZE keeps
+     * its reading with the top bit set).
      */
     volatile uint64_t state;
+    /**
+     * CLOCK_MONOTONIC ms at which this rule became active in this process, for `@at=+N`;
+     * 0 when no clock could be read, which keeps such a rule closed.
+     *
+     * @details Set when the slot is taken for a rule text (chaos_hits_assign()) and kept
+     * when a reload hands the same slot to the same text, so the delay a rule asks for is
+     * measured from the load that brought it, not from the last reload that left it
+     * alone. A fork child keeps the parent's value: the rule has been active since then.
+     */
+    volatile uint64_t armed_ms;
     /** Library hook called after each counted hit to schedule a hits-file write; may be NULL. */
     void (*report)(chaos_hit_slot_t *slot);
     /**
@@ -196,6 +271,28 @@ static inline int chaos_hit_slot_current(const chaos_hit_slot_t *slot, uint64_t 
 }
 
 /**
+ * @brief CLOCK_MONOTONIC in ms, read without libchaos-time; 0 when no clock is readable.
+ *
+ * @details Uses the vDSO (no system call per hit) and falls back to a raw
+ * `clock_gettime` system call where no vDSO clock exists.
+ */
+static inline uint64_t chaos_hits_now_ms(void)
+{
+    struct timespec now;
+    const uint64_t vdso_ns = chaos_clock_now_ns();
+
+    if (vdso_ns != 0U)
+    {
+        return vdso_ns / UINT64_C(1000000);
+    }
+    if (CHAOS_CLOCK_RAW_GETTIME(CLOCK_MONOTONIC, &now) != 0)
+    {
+        return 0U;
+    }
+    return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
+}
+
+/**
  * @brief Assigns a slot from @p pool to each of the @p next_count rules of the snapshot
  *        being built.
  *
@@ -263,6 +360,15 @@ static inline void chaos_hits_assign(
             next[index]->count = 0U;
             next[index]->claimed = chaos_hit_claims_none(next[index]->generation);
             next[index]->state = 0U;
+            /* The evaluation ordinal too: it is mixed into the draw key, so a rule that
+             * inherited the previous occupant's count would make its first decision with
+             * somebody else's sample number -- and then the nth evaluation of a rule no
+             * longer decides the same thing for a given CHAOS_SEED, which is the whole
+             * point of the counter. The fork and reset paths already clear it. */
+            next[index]->evaluations = 0U;
+            /* A rule that is new to this process becomes active now, which is where
+             * `@at=+N` starts counting. A slot carried over keeps the moment it got. */
+            next[index]->armed_ms = chaos_hits_now_ms();
         }
         next[index]->used = 1U;
         next[index]->report = report;
@@ -315,6 +421,7 @@ static inline void chaos_hits_pool_reset(chaos_hit_slot_t *pool, size_t pool_siz
     {
         pool[index].used = 0U;
         pool[index].count = 0U;
+        pool[index].evaluations = 0U;
         pool[index].state = 0U;
         (void)__sync_fetch_and_add(&pool[index].generation, 1U);
         pool[index].claimed = chaos_hit_claims_none(pool[index].generation);
@@ -342,7 +449,13 @@ static inline void chaos_hits_pool_after_fork(
     for (index = 0U; index < pool_size; ++index)
     {
         CHAOS_STORE_IF_CHANGED(pool[index].count, 0U);
+        CHAOS_STORE_IF_CHANGED(pool[index].evaluations, 0U);
         CHAOS_STORE_IF_CHANGED(pool[index].claimed, chaos_hit_claims_none(pool[index].generation));
+        /* libchaos-time's REGRESS machine: a decision caught in progress (3) goes back to
+         * armed (1). The values 0, 1, 2 and 3 are therefore reserved in this word, and any
+         * other effect that stores something here must stay clear of them -- FREEZE keeps
+         * its reading with the top bit set for exactly that reason. A plain small integer
+         * would be rewritten here behind its owner's back. */
         if (pool[index].state == 3U)
         {
             pool[index].state = 1U;
@@ -367,28 +480,6 @@ static inline void chaos_hit_record(chaos_hit_slot_t *slot)
     {
         slot->report(slot);
     }
-}
-
-/**
- * @brief CLOCK_MONOTONIC in ms, read without libchaos-time; 0 when no clock is readable.
- *
- * @details Uses the vDSO (no system call per hit) and falls back to a raw
- * `clock_gettime` system call where no vDSO clock exists.
- */
-static inline uint64_t chaos_hits_now_ms(void)
-{
-    struct timespec now;
-    const uint64_t vdso_ns = chaos_clock_now_ns();
-
-    if (vdso_ns != 0U)
-    {
-        return vdso_ns / UINT64_C(1000000);
-    }
-    if (CHAOS_CLOCK_RAW_GETTIME(CLOCK_MONOTONIC, &now) != 0)
-    {
-        return 0U;
-    }
-    return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
 }
 
 /**
@@ -459,7 +550,10 @@ static inline long chaos_hits_file_number(const char *prefix)
  * @param slots        Counters, @p count entries; a NULL entry is written as 0.
  * @param texts        Rule texts, @p count entries of CHAOS_STATUS_TEXT_MAX + 1 bytes.
  * @param count        Number of rules.
- * @param buffer       Scratch of at least @p count * CHAOS_HITS_LINE_MAX + 1 bytes.
+ * @param header       `key=value` lines (each ending in a newline, no tab) written before the
+ *                     rule lines; NULL or empty for none.
+ * @param buffer       Scratch of at least @p count * CHAOS_HITS_LINE_MAX + 1 bytes, plus the
+ *                     length of @p header.
  * @param buffer_size  Size of @p buffer in bytes.
  */
 static inline void chaos_hits_write_for(
@@ -470,6 +564,7 @@ static inline void chaos_hits_write_for(
     chaos_hit_slot_t *const *slots,
     const char (*texts)[CHAOS_STATUS_TEXT_MAX + 1U],
     size_t count,
+    const char *header,
     char *buffer,
     size_t buffer_size
 )
@@ -479,6 +574,15 @@ static inline void chaos_hits_write_for(
     size_t index;
     unsigned attempt;
 
+    if (header != NULL)
+    {
+        length = strlen(header);
+        if (length >= buffer_size)
+        {
+            return;
+        }
+        memcpy(buffer, header, length);
+    }
     for (index = 0U; index < count; ++index)
     {
         const unsigned long long hits = slots[index] != NULL ? slots[index]->count : 0U;

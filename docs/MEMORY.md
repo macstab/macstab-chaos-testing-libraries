@@ -58,7 +58,7 @@ filters the system calls themselves and sees every mapping, the loader's and
 12. [KASLR Interaction](#12-kaslr-interaction)
 13. [PT_GNU_STACK and the Executable-Stack Guard](#13-pt_gnu_stack-and-the-executable-stack-guard)
 14. [Reentrancy Guard and TLS State](#14-reentrancy-guard-and-tls-state)
-15. [PRNG Model](#15-prng-model)
+15. [Draw Model](#15-draw-model--counter-based-no-stream)
 16. [Config Reload Protocol — Two-Snapshot CAS](#16-config-reload-protocol--two-snapshot-cas)
 17. [glibc vs musl Divergence](#17-glibc-vs-musl-divergence)
 18. [Execution Boundary Summary](#18-execution-boundary-summary)
@@ -153,7 +153,8 @@ errno-value = "ENOMEM" / "EINVAL" / "EACCES" / "EPERM" / "EBADF" / "ENODEV"
             / 1*DIGIT                          ; decimal, 1 .. 2147483647
 latency-ms  = 1*DIGIT                          ; decimal, 0 .. 4294967295
 probability = ( "0" [ "." 1*DIGIT ] ) / ( "1" [ "." 1*"0" ] )
-qualifier   = "@first=" 1*18DIGIT / "@from=" 1*18DIGIT / "@until=" 1*18DIGIT
+qualifier   = "@first=" 1*18DIGIT / "@every=" 1*18DIGIT / "@at=+" 1*18DIGIT
+            / "@from=" 1*18DIGIT / "@until=" 1*18DIGIT   ; until >= 1, > from
             / "@size>" 1*18DIGIT / "@size<" 1*18DIGIT
                                                ; @first > 0; @until > @from when both set
 comment     = "#" *( VCHAR / WSP )
@@ -482,9 +483,10 @@ static inline void chaos_memory_leave_internal(int previous)
 
 The library is loaded at process start by `LD_PRELOAD`, so its TLS is part of the
 static TLS block the C library allocates with every thread; reading or writing the
-guard never maps memory. TLS is deliberately tiny (the guard, an `int`, and the PRNG state, a
-`uint64_t`): static TLS is reserved in every thread and counts against its minimum stack
-size, and large objects there made runtimes with small explicit thread stacks (the
+guard never maps memory. TLS is deliberately tiny -- the guard, an `int`, and nothing
+else since the per-thread generator went away: static TLS is reserved in every thread and
+counts against its minimum stack size, and large objects there made runtimes with small
+explicit thread stacks (the
 Erlang VM) fail `pthread_create` with `EINVAL`. The 256 KiB rule-file buffer is
 therefore a process-wide static, used only by the thread that owns a reload.
 
@@ -499,45 +501,52 @@ set) calls `abort()`.
 
 ---
 
-## 15. PRNG Model
+## 15. Draw Model — counter-based, no stream
 
-Shared by all libraries. Each thread owns an xorshift64* generator; probability
-draws need no synchronisation and threads never share a sequence.
-
-**Process seed.** The constructor reads 8 bytes from `/dev/urandom` with raw
-`SYS_openat`/`SYS_read`/`SYS_close` (no interposed call during construction),
-`errno` preserved. Fallback when that fails: `0x6a09e667f3bcc909 ^ getpid()`. The
-main thread is seeded directly from the process seed.
-
-**Lazy per-thread seed** on a thread's first draw:
+Shared by all six libraries. There is no generator to advance and no per-thread
+state: a sample is a pure function of the process seed, the rule, the number of
+the evaluation and the draw within it.
 
 ```c
-seed  = g_chaos_memory_process_seed;
-seed ^= chaos_memory_current_tid();      /* SYS_gettid on Linux */
-seed ^= (uint64_t)(uintptr_t)&seed;      /* stack address */
-g_chaos_memory_tls_prng_state = chaos_memory_prng_mix(seed) | 1U;  /* never 0 */
+key   = mix(g_chaos_memory_process_seed ^ chaos_memory_rule_hash(rule text));
+base  = mix((key ^ g_chaos_memory_lineage) + n);  /* n: nth evaluation of this rule */
+draw  = mix(base + d) >> 32;                      /* d: 0 probability, 1.. effects   */
 ```
+
+**Process seed.** `CHAOS_SEED=<decimal 64-bit>` if set; else the constructor reads
+8 bytes from `/dev/urandom` with raw `SYS_openat`/`SYS_read`/`SYS_close` (no
+interposed call during construction), `errno` preserved, fallback
+`0x6a09e667f3bcc909 ^ getpid()`. A `CHAOS_SEED` that is not decimal digits in range
+is ignored rather than refused, and `-1` is not taken as 2^64−1.
+
+**The key comes from the rule's text**, not its slot or line: `chaos_hits_assign()`
+hands a slot out again when a rule leaves the file, and a key tied to the slot would
+let the next rule inherit the old one's decisions.
+
+**`n` is the rule's evaluation number**, counted in its hit slot (`chaos_hits.h`),
+so it survives a reload that keeps the rule. **`d` numbers the draws within one
+evaluation**, so the probability and an effect's samples cannot be the same number.
 
 `chaos_memory_prng_mix()` is the SplitMix64 finaliser (Steele, Lea, Flood, OOPSLA
-2014): consecutive thread ids yield uncorrelated states. Forcing the low bit keeps
-the state out of 0, the one state xorshift cannot leave.
+2014); every input bit affects every output bit, so neighbouring counters give
+unrelated samples. Two mixing stages rather than one: `key + n * K + d` would
+collide once `d` reached `K`, a constant the next effect added would break in
+silence.
 
-**Step and output:**
+Every probability check uses draw 0 and fires when `sample < p × 2^32`; `p <= 0`
+never fires, `p >= 1` always fires.
 
-```c
-state ^= state >> 12;
-state ^= state << 25;
-state ^= state >> 27;
-return (uint32_t)((state * UINT64_C(0x2545f4914f6cdd1d)) >> 32);
-```
+**fork.** The atfork child handler mixes `g_chaos_memory_lineage` forward with the
+child's ordinal among its siblings, which the parent counts in its prepare handler
+before each fork. Both halves matter: without the mixing a child would decide like
+its parent, and without the ordinal every child of one parent would decide like its
+siblings -- pre-fork workers would all fault alike, which at `p<1` is all of them or
+none. The lineage sits beside the key instead of inside it, because rewriting the
+keys would write every snapshot page in each child.
 
-xorshift64 (Marsaglia, 2003) with the multiplicative output scrambler of xorshift64*
-(Vigna, 2016); period 2^64 − 1. Every probability check consumes one draw and fires
-when `sample < p × 2^32`; `p <= 0` never fires, `p >= 1` always fires.
-
-**fork.** The atfork child handler zeroes the forking thread's state, so the child
-reseeds from its own thread id on its next draw; pre-fork workers would otherwise
-make identical decisions.
+**Reproducibility.** The nth evaluation of a rule makes the same decision in every
+run with the same `CHAOS_SEED`. What the caller holds constant is the order of its
+own calls; two calls racing for one rule may swap their numbers.
 
 ---
 

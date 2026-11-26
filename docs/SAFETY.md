@@ -170,7 +170,7 @@ else AT_SECURE == 0
   Ldso -> Chaos : libchaos constructor
   note right of Chaos
     resolve real functions (RTLD_NEXT)
-    seed PRNG, reset config state
+    take the process seed, reset config state
     load rule file, write status file
   end note
   Ldso -> Caller : _start / main with interposition active
@@ -253,7 +253,6 @@ system calls of their own; an injected ERRNO makes none.
 | `openat`, `read`, `close` | `/dev/urandom` seed | once per library, raw system calls |
 | `openat`, `write`, `fchmod`, `linkat`, `renameat` (`renameat2` on arm64), `unlinkat`, `faccessat` | status and hits files | raw system calls; failures ignored |
 | `clock_nanosleep` | LATENCY | raw system call, restarted on `EINTR` |
-| `gettid` | lazy per-thread PRNG seed | raw system call, first draw per thread |
 | `readlink` or `readlinkat` (via libc `readlink`) | fd → path (`libchaos-io`) | fd-cache miss |
 | `mmap`, `munmap` | fd-cache table (`libchaos-io`) | raw system calls, once per process |
 
@@ -309,9 +308,19 @@ Conditions and outcome:
 | Probability, `@from`/`@until` window, `@size` gate or `@first` budget says no | call passes through |
 | Reentrancy guard set | call passes through at once |
 
+| The status or hits file cannot be written (read-only `/tmp`, full filesystem, EACCES) | the rule still applies; the report is dropped silently |
+
 Removing the rule file restores normal behaviour within about 1 ms: once rules are loaded,
 each library looks at the file at most once per millisecond, and a missing file publishes an
-empty rule set. Every rejection is visible in `/tmp/.chaos-<lib>.status`
+empty rule set.
+
+A hardened container is the ordinary case of that last row: with Kubernetes
+`readOnlyRootFilesystem` (Docker `--read-only`) the rule file can still be mounted in, and
+nothing can be written back. Measured in `test/runtime/test_status.sh`: the rule fires -- a
+write to the named path fails with `EIO` -- and no status file appears. Fail-open means the
+*program* survives an internal error, not that the rule is dropped: a report that cannot be
+written is a report lost, not a fault skipped. A test that wants the report needs a writable
+`/tmp` (an `emptyDir` mount is enough). Every rejection is visible in `/tmp/.chaos-<lib>.status`
 ([ARCHITECTURE.md, Status file](ARCHITECTURE.md#status-file)).
 
 ### 5.1 The One Exception: Unresolvable Symbols
@@ -628,7 +637,7 @@ order, after the executable and before its `DT_NEEDED` libraries.
 ELF initialisers run dependencies first. Another object's constructor can therefore call an
 interposed function before a libchaos constructor has run, which is why every wrapper
 resolves the real functions itself (`chaos_<lib>_ensure_symbols()`) instead of relying on
-the constructor. Each libchaos constructor resolves its real functions, seeds its PRNG,
+the constructor. Each libchaos constructor resolves its real functions, takes the process seed,
 registers its atfork handler and loads its rule file; none depends on another libchaos
 library, so their relative order does not affect correctness.
 

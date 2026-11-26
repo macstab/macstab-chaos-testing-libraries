@@ -21,6 +21,12 @@
  *   fd cache, so a pipe that reuses the number is not mistaken for the directory.
  * - check_wildcard_spares_non_files: `*:write:TORN` tears a regular file but writes an
  *   eventfd, a pipe and a socket whole; tearing an 8-byte eventfd write would be EINVAL.
+ * - check_dropped_writes: two dropped writes report their full counts and write nothing, and
+ *   the bytes of a later real write land after both of them, not at offset 0 -- the point of
+ *   the offset correction. An O_APPEND stream and a pipe are covered too.
+ * - check_free_space: FULL reports a filesystem with nothing free and FREE a fixed number
+ *   of bytes, through all four of statfs, fstatfs, statvfs and fstatvfs; the total stays as
+ *   the kernel reported it, and clearing the rule gives the real numbers back.
  * - check_vectored_writes: under a matching TORN rule, writev with an unmapped iovec array
  *   gets the kernel's EFAULT and with IOV_MAX + 1 entries the kernel's EINVAL instead of a
  *   crash in the wrapper; a 100-entry vector too long to tear is written whole; a 2-entry
@@ -45,6 +51,8 @@
 #include <sys/syscall.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/statfs.h>
+#include <sys/statvfs.h>
 #include <limits.h>
 #include <stdint.h>
 #include <sys/eventfd.h>
@@ -298,6 +306,105 @@ static void check_vectored_writes(void)
     expect("vector file removed", unlink(PROBE_DIR "/vector.bin") == 0);
 }
 
+/**
+ * @brief Two dropped writes report success, write nothing, and leave the offset where a real
+ *        pair of writes would have left it.
+ *
+ * @details The file ends up as a hole of ten zero bytes followed by the bytes of the third
+ * write: that is what proves the correction. Without it both drops would leave the offset at
+ * 0 and the real write would start there, which is a file no lost write can produce. A pipe
+ * has no offset, so the rule does not fire on it and the byte arrives.
+ */
+static void check_dropped_writes(void)
+{
+    char contents[32];
+    int pipe_fds[2];
+    ssize_t got;
+    int fd;
+
+    write_rules(PROBE_DIR "/dropped.bin:write:DROP:1.0\n");
+    fd = open(PROBE_DIR "/dropped.bin", O_CREAT | O_RDWR | O_TRUNC, 0600);
+    expect("drop reports the first write", fd >= 0 && write(fd, "12345", 5U) == 5);
+    expect("drop reports the second write", write(fd, "67890", 5U) == 5);
+    expect("drop moved the offset", lseek(fd, 0, SEEK_CUR) == 10);
+    write_rules("# idle\n");
+    expect("real write after two drops", write(fd, "AB", 2U) == 2);
+    expect("file has both drops as a hole", lseek(fd, 0, SEEK_SET) == 0);
+    got = read(fd, contents, sizeof(contents));
+    expect(
+        "dropped bytes are absent",
+        got == 12 && memcmp(contents, "\0\0\0\0\0\0\0\0\0\0AB", 12U) == 0
+    );
+    expect("dropped file removed", close(fd) == 0 && unlink(PROBE_DIR "/dropped.bin") == 0);
+
+    /* A pipe has no offset to keep straight, so the rule does not fire there. */
+    write_rules("*:write:DROP:1.0\n");
+    expect("pipe created", pipe(pipe_fds) == 0);
+    expect("pipe write not dropped", write(pipe_fds[1], "x", 1U) == 1);
+    expect(
+        "pipe byte arrived",
+        read(pipe_fds[0], contents, 1U) == 1 && contents[0] == 'x' && close(pipe_fds[0]) == 0 &&
+            close(pipe_fds[1]) == 0
+    );
+}
+
+/**
+ * @brief FULL and FREE rewrite the free counts of all four free-space calls.
+ *
+ * @details The real answer is taken first, so the test compares against the kernel's own
+ * numbers rather than against constants: the total must survive untouched (a filling
+ * filesystem, not a shrinking one), and the free counts must become what the rule says.
+ * `FREE:1048576` is a megabyte, which is a whole number of blocks on any filesystem a
+ * container runs on, so the division is exact here and the test does not depend on it.
+ */
+static void check_free_space(void)
+{
+    struct statfs real_answer;
+    struct statfs answer;
+    struct statvfs vanswer;
+
+    write_rules("# idle\n");
+    expect("statfs real", statfs(PROBE_DIR, &real_answer) == 0 && real_answer.f_blocks > 0);
+
+    write_rules(PROBE_DIR ":statfs:FULL:1\n");
+    expect(
+        "statfs FULL",
+        statfs(PROBE_DIR, &answer) == 0 && answer.f_bfree == 0 && answer.f_bavail == 0 &&
+            answer.f_blocks == real_answer.f_blocks
+    );
+    expect(
+        "statvfs FULL",
+        statvfs(PROBE_DIR, &vanswer) == 0 && vanswer.f_bfree == 0 && vanswer.f_bavail == 0
+    );
+    {
+        const int fd = open(PROBE_DIR "/space.bin", O_CREAT | O_RDWR, 0600);
+
+        expect("fstatfs FULL", fd >= 0 && fstatfs(fd, &answer) == 0 && answer.f_bfree == 0);
+        expect("fstatvfs FULL", fstatvfs(fd, &vanswer) == 0 && vanswer.f_bavail == 0);
+
+        write_rules(PROBE_DIR ":statfs:FREE:1048576\n");
+        expect(
+            "statfs FREE",
+            statfs(PROBE_DIR, &answer) == 0 &&
+                answer.f_bfree == (__typeof__(answer.f_bfree))(1048576U / answer.f_bsize) &&
+                answer.f_bavail == answer.f_bfree
+        );
+        expect(
+            "statvfs FREE",
+            statvfs(PROBE_DIR, &vanswer) == 0 &&
+                vanswer.f_bfree == (fsblkcnt_t)(1048576U / vanswer.f_frsize)
+        );
+        expect("fstatfs FREE", fstatfs(fd, &answer) == 0 && answer.f_bfree > 0);
+
+        write_rules("# idle\n");
+        expect(
+            "statfs real again",
+            statfs(PROBE_DIR, &answer) == 0 && answer.f_bfree == real_answer.f_bfree
+        );
+        expect("space file removed", close(fd) == 0 && unlink(PROBE_DIR "/space.bin") == 0);
+    }
+}
+
 int main(void)
 {
     struct stat info;
@@ -374,6 +481,8 @@ int main(void)
     );
 #endif
 
+    check_dropped_writes();
+    check_free_space();
     check_vectored_writes();
     check_path_spellings();
     check_unseen_close();

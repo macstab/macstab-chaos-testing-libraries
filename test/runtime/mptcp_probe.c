@@ -33,6 +33,27 @@
 #include "../../src/init/chaos_init_proc.c"
 #include "../../src/init/chaos_init_tracee.c"
 
+/* The seed source lives in chaos_init_core.c, which this probe does not include; the
+ * declaration comes from chaos_init_core.h, so the definition may follow the include. The
+ * probe never draws -- it only compares address lookups -- so any fixed value will do. */
+uint64_t chaos_init_seed(void)
+{
+    return UINT64_C(0x5eed5eed5eed5eed);
+}
+
+/* The installed TRACE set lives in chaos_init_core.c, which this file does not include.
+ * Nothing here decides a traced effect, so a fixed answer will do. */
+void chaos_init_traced_set(const long *calls, size_t count)
+{
+    (void)calls;
+    (void)count;
+}
+int chaos_init_traced(long nr)
+{
+    (void)nr;
+    return 1;
+}
+
 #include <arpa/inet.h>
 #include <stdio.h>
 #include <sys/stat.h>

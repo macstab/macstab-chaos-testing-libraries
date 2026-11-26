@@ -12,8 +12,11 @@
  * gained no privilege. Docker's default seccomp profile allows the calls. Yama
  * `ptrace_scope=1` additionally restricts ATTACH to ancestors, which `chaos-init` is as
  * PID 1 but its background copy (chaos_init.c) is not; `ptrace_scope>=2` forbids it
- * outright. A tracee that changes uid becomes unreadable. In each case the reads fail,
- * path and endpoint selectors do not match, and selectors on the operation alone still do.
+ * outright. A tracee that changes uid becomes non-dumpable, after which the kernel refuses
+ * every read of it -- including the tracer's own ptrace reads -- without `CAP_SYS_PTRACE`.
+ * In each case the reads fail and the selectors that need them do not match: that is every
+ * io and net selector, while memory, process and time match on arguments alone.
+ * chaos_init_unreadable() reports it.
  *
  * @par TOCTOU
  * Everything read here can change before the kernel acts on the call: another thread can
@@ -29,6 +32,25 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
+
+/**
+ * @brief Whether the kernel has refused a look into a tracee in this run.
+ *
+ * @details A process that changes user (a database server dropping privileges) becomes
+ * non-dumpable, and from then on the kernel refuses every read of its memory and of its
+ * `/proc` links -- `process_vm_readv()` with EPERM, the tracer's own ptrace reads with
+ * EIO, the links with EACCES -- unless the supervisor holds `CAP_SYS_PTRACE`. Path and
+ * endpoint selectors then do not match that process, while selectors on the operation
+ * alone still do.
+ *
+ * That is a rule looking applied and doing nothing, which is what this reports: the
+ * supervisor writes `unreadable=yes` into its status file the first time it happens, so a
+ * test can see the difference between "the rule did not fire" and "the rule could not be
+ * matched at all". The cure is not in this code: `--cap-add SYS_PTRACE` on the container.
+ *
+ * @return Non-zero once such a refusal has happened.
+ */
+int chaos_init_unreadable(void);
 
 /**
  * @brief Copies @p size bytes at @p address in process @p pid into @p out.

@@ -516,6 +516,15 @@ static void test_unshift_deadline(void)
     offset.policy.until_ms = 1;
     assert(chaos_time_rule_unshift_deadline(&offset, NULL, &deadline) == 0);
     offset.policy.until_ms = 0;
+    /* The two qualifiers this release added belong in the same list: both make the shift
+     * apply to some reads and not others, and an unshifted deadline taken off a deadline
+     * the program never shifted makes an absolute sleep return at once. */
+    offset.policy.every = 2U;
+    assert(chaos_time_rule_unshift_deadline(&offset, NULL, &deadline) == 0);
+    offset.policy.every = 0U;
+    offset.policy.at_ms = 60000U;
+    assert(chaos_time_rule_unshift_deadline(&offset, NULL, &deadline) == 0);
+    offset.policy.at_ms = 0U;
     assert(deadline.tv_sec == 98);
 
     slot.state = 1U;
@@ -527,6 +536,12 @@ static void test_unshift_deadline(void)
     regress.policy.until_ms = 1;
     assert(chaos_time_rule_unshift_deadline(NULL, &regress, &deadline) == 0);
     regress.policy.until_ms = 0;
+    regress.policy.every = 3U;
+    assert(chaos_time_rule_unshift_deadline(NULL, &regress, &deadline) == 0);
+    regress.policy.every = 0U;
+    regress.policy.at_ms = 500U;
+    assert(chaos_time_rule_unshift_deadline(NULL, &regress, &deadline) == 0);
+    regress.policy.at_ms = 0U;
     assert(chaos_time_rule_unshift_deadline(NULL, &regress, &deadline) == 1);
     assert(deadline.tv_sec == 103);
     assert(chaos_time_rule_unshift_deadline(&offset, &regress, &deadline) == 1);
@@ -541,8 +556,235 @@ static void test_unshift_deadline(void)
     assert(chaos_time_rule_unshift_deadline(&offset, &regress, &deadline) == 0);
 }
 
+/**
+ * @brief Proves a sample follows from the rule and the number of the evaluation, and from
+ *        nothing else.
+ *
+ * @details This is what makes a fault reproducible: the same rule at the same evaluation
+ * number gives the same sample; the next evaluation, a rule of different text and a forked
+ * child's lineage each give an unrelated one; and the draws within one evaluation differ
+ * from each other.
+ */
+static void test_draws_are_reproducible(void)
+{
+    chaos_time_rule_t rule;
+    chaos_hit_slot_t slot;
+    uint32_t first;
+
+    (void)memset(&rule, 0, sizeof(rule));
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.hit = &slot;
+    rule.key = chaos_time_prng_mix(g_chaos_time_process_seed ^ chaos_time_rule_hash("a"));
+
+    chaos_time_rule_draw_begin(&rule);
+    assert(slot.evaluations == 1U);
+    first = chaos_time_rule_draw(&rule, CHAOS_TIME_DRAW_PROBABILITY);
+    assert(chaos_time_rule_draw(&rule, CHAOS_TIME_DRAW_PROBABILITY) == first);
+    assert(chaos_time_rule_draw(&rule, CHAOS_TIME_DRAW_FIRST_EFFECT) != first);
+
+    chaos_time_rule_draw_begin(&rule);
+    assert(slot.evaluations == 2U);
+    assert(chaos_time_rule_draw(&rule, CHAOS_TIME_DRAW_PROBABILITY) != first);
+
+    /* A rule whose text differs is a different rule, even in the same slot. */
+    rule.key = chaos_time_prng_mix(g_chaos_time_process_seed ^ chaos_time_rule_hash("b"));
+    slot.evaluations = 0U;
+    chaos_time_rule_draw_begin(&rule);
+    assert(chaos_time_rule_draw(&rule, CHAOS_TIME_DRAW_PROBABILITY) != first);
+
+    /* Same rule, same evaluation, different lineage: a forked child decides on its own. */
+    rule.key = chaos_time_prng_mix(g_chaos_time_process_seed ^ chaos_time_rule_hash("a"));
+    slot.evaluations = 0U;
+    g_chaos_time_lineage = chaos_time_prng_mix(1U);
+    chaos_time_rule_draw_begin(&rule);
+    assert(chaos_time_rule_draw(&rule, CHAOS_TIME_DRAW_PROBABILITY) != first);
+    g_chaos_time_lineage = 0U;
+
+    /* A rule outside a snapshot has no slot: evaluation 0 every time, which is what makes
+     * the unit tests reproducible without seeding anything. */
+    rule.hit = NULL;
+    chaos_time_rule_draw_begin(&rule);
+    first = chaos_time_rule_draw(&rule, CHAOS_TIME_DRAW_PROBABILITY);
+    chaos_time_rule_draw_begin(&rule);
+    assert(chaos_time_rule_draw(&rule, CHAOS_TIME_DRAW_PROBABILITY) == first);
+
+    assert(chaos_time_rule_hash("a") == chaos_time_rule_hash("a"));
+    assert(chaos_time_rule_hash("a") != chaos_time_rule_hash("b"));
+    assert(chaos_time_rule_hash(NULL) != chaos_time_rule_hash("a"));
+}
+
+/**
+ * @brief Proves `@every=N` lets only every Nth evaluation through, in the real gate.
+ *
+ * @details The gate itself is tested on values in test_common.c; what is asserted here is
+ * that chaos_time_rule_should_trigger() actually consults it, and where. `@every` counts
+ * evaluations, so a rule at probability 1.0 and `@every=3` fires on the 3rd, 6th and 9th
+ * call and on no other -- and the two calls in between still count as evaluations, which is
+ * what makes the third one the third.
+ */
+static void test_every_gates_evaluations(void)
+{
+    chaos_time_rule_t rule;
+    chaos_hit_slot_t slot;
+    unsigned call;
+    unsigned fired = 0U;
+
+    (void)memset(&rule, 0, sizeof(rule));
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.effect = CHAOS_TIME_EFFECT_ERRNO;
+    rule.probability = 1.0;
+    rule.hit = &slot;
+    rule.policy.every = 3U;
+
+    for (call = 1U; call <= 9U; ++call)
+    {
+        const int triggered = chaos_time_rule_should_trigger(&rule) != 0;
+
+        assert(triggered == (call % 3U == 0U));
+        fired += (unsigned)triggered;
+    }
+    assert(fired == 3U);
+    assert(slot.evaluations == 9U);
+    assert(slot.count == 3U);
+
+    /* Without the qualifier every evaluation fires. */
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.policy.every = 0U;
+    assert(chaos_time_rule_should_trigger(&rule) != 0);
+    assert(slot.count == 1U);
+}
+
+/**
+ * @brief Proves FREEZE stops the clock at the value of the call that fired it.
+ *
+ * @details FREEZE is the effect §7 of the plan reads out of the state page, so it has to
+ * exist as a rule effect first. Asserted here:
+ * - before the rule fires the clock runs: the reading passes through unchanged;
+ * - the first firing call's reading is kept, and every later read returns it, whatever the
+ *   real clock says -- the probability decides when the freeze starts, not each read;
+ * - the kept value lives in the hit slot, so a second rule copy of the same rule (another
+ *   thread, or a copy taken before a reload) sees the same frozen time;
+ * - outside the `@from`/`@until` window the clock runs, before and after the freeze, which
+ *   is how REGRESS behaves too;
+ * - a reading of 0 freezes as well: the slot keeps the reading with the top bit set, so a
+ *   cleared bit, not a zero word, is what "not frozen" means;
+ * - the top bit keeps a frozen reading clear of REGRESS's state machine in the same word:
+ *   a reading of 2 ns would otherwise store a 3, which the fork handler rewrites to a 1.
+ */
+static void test_freeze_stops_the_clock(void)
+{
+    chaos_time_rule_t rule;
+    chaos_hit_slot_t slot;
+    struct timespec value;
+
+    (void)memset(&rule, 0, sizeof(rule));
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.effect = CHAOS_TIME_EFFECT_FREEZE;
+    rule.hit = &slot;
+    rule.probability = 0.0;
+
+    /* Probability 0: nothing is frozen and the reading is untouched. */
+    value.tv_sec = 100;
+    value.tv_nsec = 5;
+    chaos_time_rule_apply_freeze(&rule, &value);
+    assert(value.tv_sec == 100 && value.tv_nsec == 5);
+    assert(slot.state == 0U);
+
+    /* The first firing call's reading is kept. */
+    rule.probability = 1.0;
+    value.tv_sec = 200;
+    value.tv_nsec = 7;
+    chaos_time_rule_apply_freeze(&rule, &value);
+    assert(value.tv_sec == 200 && value.tv_nsec == 7);
+    assert(slot.state == ((UINT64_C(200) * UINT64_C(1000000000) + 7U) | (UINT64_C(1) << 63)));
+
+    /* Later reads return it, whatever the clock says. */
+    value.tv_sec = 999;
+    value.tv_nsec = 123;
+    chaos_time_rule_apply_freeze(&rule, &value);
+    assert(value.tv_sec == 200 && value.tv_nsec == 7);
+
+    /* Another copy of the same rule sees the same frozen time: it lives in the slot. */
+    {
+        chaos_time_rule_t other = rule;
+
+        other.probability = 0.0;
+        value.tv_sec = 555;
+        value.tv_nsec = 1;
+        chaos_time_rule_apply_freeze(&other, &value);
+        assert(value.tv_sec == 200 && value.tv_nsec == 7);
+    }
+
+    /* Outside the window the clock runs, frozen or not. */
+    rule.policy.from_ms = INT64_C(4000000000000);
+    value.tv_sec = 777;
+    value.tv_nsec = 9;
+    chaos_time_rule_apply_freeze(&rule, &value);
+    assert(value.tv_sec == 777 && value.tv_nsec == 9);
+    (void)memset(&rule.policy, 0, sizeof(rule.policy));
+
+    /* A reading of 0 freezes too, which the mark bit in the slot is there for. */
+    (void)memset(&slot, 0, sizeof(slot));
+    value.tv_sec = 0;
+    value.tv_nsec = 0;
+    chaos_time_rule_apply_freeze(&rule, &value);
+    assert(slot.state == (UINT64_C(1) << 63));
+    value.tv_sec = 42;
+    value.tv_nsec = 42;
+    chaos_time_rule_apply_freeze(&rule, &value);
+    assert(value.tv_sec == 0 && value.tv_nsec == 0);
+
+    /* A reading of 2 ns is the one REGRESS's state machine would claim: stored as a bare
+     * `ns + 1` it is a 3, which chaos_hits_pool_after_fork() rewrites to a 1 and so hands
+     * the child a clock frozen at 0. With the mark it stays 2 ns across the fork reset. */
+    (void)memset(&slot, 0, sizeof(slot));
+    value.tv_sec = 0;
+    value.tv_nsec = 2;
+    chaos_time_rule_apply_freeze(&rule, &value);
+    assert(slot.state != 3U);
+    if (slot.state == 3U)
+    {
+        slot.state = 1U;
+    }
+    value.tv_sec = 42;
+    value.tv_nsec = 42;
+    chaos_time_rule_apply_freeze(&rule, &value);
+    assert(value.tv_sec == 0 && value.tv_nsec == 2);
+
+    /* A FREEZE rule reaches the absolute-deadline conversion unchanged: a stopped clock is
+     * no shift that could be undone, and TIME.md says so. The conversion checks the effect,
+     * so this holds by construction -- asserted anyway, because a later hook that passed a
+     * FREEZE rule in would otherwise shorten every absolute sleep silently. */
+    {
+        struct timespec deadline;
+
+        deadline.tv_sec = 500;
+        deadline.tv_nsec = 7;
+        rule.effect = CHAOS_TIME_EFFECT_FREEZE;
+        assert(chaos_time_rule_unshift_deadline(&rule, &rule, &deadline) == 0);
+        assert(deadline.tv_sec == 500 && deadline.tv_nsec == 7);
+    }
+
+    /* Not a FREEZE rule, no rule, no value, no slot: all no-ops. */
+    (void)memset(&slot, 0, sizeof(slot));
+    value.tv_sec = 5;
+    value.tv_nsec = 5;
+    rule.effect = CHAOS_TIME_EFFECT_OFFSET;
+    chaos_time_rule_apply_freeze(&rule, &value);
+    rule.effect = CHAOS_TIME_EFFECT_FREEZE;
+    chaos_time_rule_apply_freeze(NULL, &value);
+    chaos_time_rule_apply_freeze(&rule, NULL);
+    rule.hit = NULL;
+    chaos_time_rule_apply_freeze(&rule, &value);
+    assert(value.tv_sec == 5 && value.tv_nsec == 5);
+    assert(slot.state == 0U);
+}
+
 int main(void)
 {
+    test_freeze_stops_the_clock();
+    test_every_gates_evaluations();
+    test_draws_are_reproducible();
     test_regress_goes_back_once();
     test_unshift_deadline();
     test_should_trigger_honours_qualifiers();

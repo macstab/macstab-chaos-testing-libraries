@@ -54,6 +54,18 @@ static long chaos_test_raw_syscall(long number, ...)
 }
 #define CHAOS_IO_SYSCALL chaos_test_raw_syscall
 
+/** @brief Milliseconds the last chaos_sleep_ms() asked for; -1 when it was not called. */
+static long g_slept_ms = -1;
+
+/** @brief Test seam for chaos_sleep.h: records the request instead of sleeping. */
+static int chaos_test_sleep(const struct timespec *request, struct timespec *remaining)
+{
+    (void)remaining;
+    g_slept_ms = (long)request->tv_sec * 1000L + request->tv_nsec / 1000000L;
+    return 0;
+}
+#define CHAOS_SLEEP_SYSCALL(request, remaining) chaos_test_sleep((request), (remaining))
+
 #include "../support/test_chaos_io_harness.h"
 
 #include <dirent.h>
@@ -205,9 +217,44 @@ static void test_call_real_open_and_match_fd_rule(void)
 }
 
 /**
- * @brief The constructor resolves every real function, seeds the process and this
- *        thread's PRNG from the seed material, initialises the config once, loads the
- *        rule file once (so a bad file is reported at start-up) and resets the fd cache.
+ * @brief Proves `CHAOS_SEED` fixes the process seed, and that anything unusable falls back
+ *        to the random source rather than refusing to load.
+ *
+ * @details The seed decides which faults fire, so a test that wants to reproduce a run
+ * sets it and a test that does not leaves it unset. A value that cannot be read is the
+ * interesting case: refusing the rule file over an environment variable would cost the
+ * test its rules, so the random source takes over and the rules still load.
+ */
+static void test_seed_from_environment(void)
+{
+    static const char *const unusable[] = {"", "12x", "x", "-1", "99999999999999999999999"};
+    size_t index;
+
+    chaos_test_reset_state();
+    g_sys_open_result = 5;
+    g_sys_read_result = (long)sizeof(uint64_t);
+    g_sys_seed_value = UINT64_C(0xfeedbeef12345678);
+
+    assert(setenv("CHAOS_SEED", "42", 1) == 0);
+    assert(chaos_io_seed() == UINT64_C(42));
+    /* The whole 64-bit range, not just what fits a long. */
+    assert(setenv("CHAOS_SEED", "18446744073709551615", 1) == 0);
+    assert(chaos_io_seed() == UINT64_MAX);
+
+    for (index = 0U; index < sizeof(unusable) / sizeof(unusable[0]); ++index)
+    {
+        assert(setenv("CHAOS_SEED", unusable[index], 1) == 0);
+        assert(chaos_io_seed() == UINT64_C(0xfeedbeef12345678));
+    }
+
+    assert(unsetenv("CHAOS_SEED") == 0);
+    assert(chaos_io_seed() == UINT64_C(0xfeedbeef12345678));
+}
+
+/**
+ * @brief The constructor resolves every real function, takes the process seed, initialises
+ *        the config once, loads the rule file once (so a bad file is reported at start-up)
+ *        and resets the fd cache.
  */
 static void test_init_runtime(void)
 {
@@ -242,7 +289,8 @@ static void test_init_runtime(void)
     assert(g_chaos_io_real_fallocate == chaos_test_real_fallocate_impl);
 #endif
     assert(g_chaos_io_process_seed == UINT64_C(0xfeedbeef12345678));
-    assert(g_chaos_io_tls_prng_state != 0U);
+    /* The lineage starts at 0: this is the process that loaded the library. */
+    assert(g_chaos_io_lineage == 0U);
     assert(g_config_init_calls == 1);
     /* The constructor loads the rules at once so a bad rule file is reported. */
     assert(g_config_prepare_calls == 1);
@@ -359,6 +407,20 @@ static void test_fsops_helpers_and_wrappers(void)
     assert(ftruncate(9, 3) == 0);
     assert(g_last_match_loaded_operation == CHAOS_IO_OP_TRUNCATE);
     assert(g_latency_calls == 1);
+
+    /* truncate and allocate report a length rather than bytes moved, so `@size` can gate
+     * them. A negative length is no byte count -- the kernel rejects such a call with
+     * EINVAL -- so those report none and a size-gated rule cannot match. */
+    assert(ftruncate(9, 4096) == 0);
+    assert(g_last_call_size == 4096U);
+    /* -4096, not -1: CHAOS_POLICY_NO_SIZE is UINT64_MAX, which is exactly what casting -1
+     * yields, so -1 would pass this with or without the guard. */
+    assert(ftruncate(9, -4096) == 0);
+    assert(g_last_call_size == CHAOS_POLICY_NO_SIZE);
+    assert(fallocate(9, 0, 0, 8192) == 0);
+    assert(g_last_call_size == 8192U);
+    assert(fallocate(9, 0, 0, -4096) == 0);
+    assert(g_last_call_size == CHAOS_POLICY_NO_SIZE);
 
     chaos_test_reset_state();
     chaos_test_bind_real_functions();
@@ -771,6 +833,26 @@ static void test_read_and_write_wrappers(void)
     assert(g_last_torn_requested == 6U);
     assert(g_real_write_count == 2U);
 
+    /* The `@size` gate decides before the probability draw: a write below the bound is not
+     * torn even though the draw would hit, one above it is. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/write.bin");
+    g_config_match_loaded_result = 1;
+    g_config_rule.effect = CHAOS_IO_EFFECT_TORN;
+    g_config_rule.policy.has_size_above = 1U;
+    g_config_rule.policy.size_above = 10U;
+    g_rule_should_trigger_result = 1;
+    g_torn_count_result = 2U;
+    g_real_write_return = 6;
+    assert(write(9, "abcdef", 6U) == 6);
+    assert(g_real_write_count == 6U);
+    g_real_write_return = 2;
+    assert(write(9, "abcdefghijklmnop", 16U) == 2);
+    assert(g_last_torn_requested == 16U);
+
     chaos_test_reset_state();
     chaos_test_bind_real_functions();
     g_config_prepare_result = 1;
@@ -809,9 +891,15 @@ static void test_vectored_helpers(void)
     struct iovec target[2];
     char first[4] = {'a', 'b', 'c', 'd'};
     char second[4] = {'e', 'f', 'g', 'h'};
+    /* The torn length and the corruption indices come from this rule's draws; what is
+     * under test here is the vector arithmetic around them. */
+    chaos_io_rule_t torn_rule;
     size_t total = 0U;
     int target_count = 0;
     uint64_t seed = 1U;
+
+    (void)memset(&torn_rule, 0, sizeof(torn_rule));
+    chaos_io_rule_draw_begin(&torn_rule);
 
     source[0].iov_base = first;
     source[0].iov_len = 2U;
@@ -841,50 +929,50 @@ static void test_vectored_helpers(void)
 
     chaos_test_reset_state();
     g_torn_count_result = 0U;
-    assert(chaos_io_build_torn_iovecs(source, 2, target, &target_count) == 0);
+    assert(chaos_io_build_torn_iovecs(&torn_rule, source, 2, target, &target_count) == 0);
     source[0].iov_len = 0U;
     source[1].iov_len = 0U;
-    assert(chaos_io_build_torn_iovecs(source, 2, target, &target_count) == 0);
+    assert(chaos_io_build_torn_iovecs(&torn_rule, source, 2, target, &target_count) == 0);
     source[0].iov_len = 2U;
     source[1].iov_len = 3U;
     g_torn_count_result = 5U;
-    assert(chaos_io_build_torn_iovecs(source, 2, target, &target_count) == 0);
+    assert(chaos_io_build_torn_iovecs(&torn_rule, source, 2, target, &target_count) == 0);
     g_torn_count_result = 3U;
-    assert(chaos_io_build_torn_iovecs(source, 2, target, &target_count) == 1);
+    assert(chaos_io_build_torn_iovecs(&torn_rule, source, 2, target, &target_count) == 1);
     assert(target_count == 2);
     assert(target[0].iov_len == 2U);
     assert(target[1].iov_len == 1U);
 
     chaos_test_reset_state();
-    chaos_io_corrupt_iovecs(NULL, 2, 1U);
-    chaos_io_corrupt_iovecs(source, 0, 1U);
-    chaos_io_corrupt_iovecs(source, 2, 0U);
+    chaos_io_corrupt_iovecs(&torn_rule, NULL, 2, 1U);
+    chaos_io_corrupt_iovecs(&torn_rule, source, 0, 1U);
+    chaos_io_corrupt_iovecs(&torn_rule, source, 2, 0U);
     assert(g_corrupt_sample_calls == 0);
 
     chaos_test_reset_state();
     source[0].iov_len = 4U;
     source[1].iov_len = 4U;
-    chaos_io_corrupt_iovecs(source, 2, 3U);
+    chaos_io_corrupt_iovecs(&torn_rule, source, 2, 3U);
     assert(g_corrupt_sample_calls == 1);
     assert(g_last_corrupt_sample_size == 3U);
 
-    /* Search for a seed whose first draw is odd, so the flip lands in the second of two
-     * 1-byte segments; the bound of 256 seeds keeps the search finite. */
+    /* Search for a rule key whose byte draw is odd, so the flip lands in the second of two
+     * 1-byte segments; the bound of 256 keys keeps the search finite. */
     chaos_test_reset_state();
     source[0].iov_len = 1U;
     source[1].iov_len = 1U;
     while (seed < 256U)
     {
-        chaos_io_prng_seed_thread(seed);
-        if ((chaos_io_prng_next_u32() % 2U) == 1U)
+        torn_rule.key = seed;
+        chaos_io_rule_draw_begin(&torn_rule);
+        if ((chaos_io_rule_draw(&torn_rule, CHAOS_IO_DRAW_FIRST_EFFECT) % 2U) == 1U)
         {
             break;
         }
         ++seed;
     }
     assert(seed < 256U);
-    chaos_io_prng_seed_thread(seed);
-    chaos_io_corrupt_iovecs(source, 2, 2U);
+    chaos_io_corrupt_iovecs(&torn_rule, source, 2, 2U);
     assert(g_corrupt_sample_calls == 1);
     assert(g_last_corrupt_sample_size == 1U);
 }
@@ -2533,7 +2621,6 @@ static void test_stdio_streams_keep_the_cache_right(void)
 static void test_path_filters_join_and_seed(void)
 {
     char path[16];
-    uint64_t state_of_zero;
 
     assert(!chaos_io_is_control_path(NULL));
     assert(chaos_io_is_control_path("/tmp/.chaos-dns.status"));
@@ -2559,12 +2646,6 @@ static void test_path_filters_join_and_seed(void)
     assert(chaos_io_join_paths(path, 8U, "/tmp", "f1") == 1);
     assert(strcmp(path, "/tmp/f1") == 0);
     assert(chaos_io_join_paths(path, 7U, "/tmp", "f1") == 0);
-
-    chaos_io_prng_seed_thread(0U);
-    state_of_zero = g_chaos_io_tls_prng_state;
-    assert(state_of_zero != 0U);
-    chaos_io_prng_seed_thread(1U);
-    assert(g_chaos_io_tls_prng_state == state_of_zero);
 }
 
 /* rmdir() and unlinkat() here are the wrappers over the harness stubs, and syscall() is
@@ -2929,6 +3010,10 @@ static void test_vectored_edge_segments(void)
     struct iovec target[3];
     char bytes[4] = {'a', 'b', 'c', 'd'};
     int target_count = 0;
+    chaos_io_rule_t torn_rule;
+
+    (void)memset(&torn_rule, 0, sizeof(torn_rule));
+    chaos_io_rule_draw_begin(&torn_rule);
 
     /* An empty segment inside the budget is kept, empty. */
     source[0].iov_base = bytes;
@@ -2941,7 +3026,7 @@ static void test_vectored_edge_segments(void)
 
     /* Corruption lands in the segment that holds the bytes, past the empty one. */
     chaos_test_reset_state();
-    chaos_io_corrupt_iovecs(source, 2, 4U);
+    chaos_io_corrupt_iovecs(&torn_rule, source, 2, 4U);
     assert(g_corrupt_sample_calls == 1);
     assert(g_last_corrupt_sample_size == 4U);
 
@@ -2949,7 +3034,7 @@ static void test_vectored_edge_segments(void)
     source[0].iov_len = (size_t)SSIZE_MAX;
     source[1].iov_len = (size_t)SSIZE_MAX;
     g_torn_count_result = 1U;
-    assert(chaos_io_build_torn_iovecs(source, 2, target, &target_count) == 0);
+    assert(chaos_io_build_torn_iovecs(&torn_rule, source, 2, target, &target_count) == 0);
     assert(chaos_io_iovec_size(source, 2) == CHAOS_POLICY_NO_SIZE);
 }
 
@@ -3043,6 +3128,698 @@ static long chaos_test_file_size(const char *path)
     struct stat info;
 
     return stat(path, &info) == 0 ? (long)info.st_size : -1L;
+}
+/**
+ * @brief The four free-space wrappers ask the kernel, then rewrite the two free counts.
+ *
+ * @details What has to hold, and what the assertions are built to catch:
+ * - the real call always runs, so the answer is the kernel's with two fields replaced; a
+ *   failing real call is reported unchanged and nothing is rewritten, which keeps a rule
+ *   from turning an error into a fake answer;
+ * - `struct statfs` counts blocks in `f_bsize` and `struct statvfs` in `f_frsize`, so each
+ *   wrapper has to hand its own unit over -- the stub records which one it got;
+ * - the total (`f_blocks`) is never touched: a filling filesystem is modelled, not a
+ *   shrinking one;
+ * - a rule that does not fire, and one whose effect is neither FREE nor FULL, leave the
+ *   kernel's counts in place;
+ * - ERRNO fails without a real call; LATENCY delays and then runs it;
+ * - the path forms resolve and match like every other path rule, the descriptor forms
+ *   through the fd cache.
+ */
+static void test_statfs_wrappers(void)
+{
+    struct statfs answer;
+    struct statvfs vanswer;
+
+    /* FULL through statfs: the real call runs, the free counts become the stub's answer,
+     * the total stays, and the unit handed over is f_bsize. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_match_path_result = 1;
+    g_config_rule.operation = CHAOS_IO_OP_STATFS;
+    g_config_rule.effect = CHAOS_IO_EFFECT_FULL;
+    g_rule_should_trigger_result = 1;
+    g_free_blocks_applies = 1;
+    g_free_blocks_result = 0U;
+    assert(statfs("/tmp/data.bin", &answer) == 0);
+    assert(g_real_statfs_calls == 1);
+    assert(g_real_statfs_guard == 1);
+    assert(g_last_free_unit == 4096U);
+    assert(answer.f_bfree == 0 && answer.f_bavail == 0);
+    assert(answer.f_blocks == 10000);
+
+    /* FREE through fstatfs: the descriptor form reaches the same effect. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/data.bin");
+    g_config_match_loaded_result = 1;
+    g_config_match_path_result = 1;
+    g_config_rule.operation = CHAOS_IO_OP_STATFS;
+    g_config_rule.effect = CHAOS_IO_EFFECT_FREE;
+    g_rule_should_trigger_result = 1;
+    g_free_blocks_applies = 1;
+    g_free_blocks_result = 7U;
+    assert(fstatfs(9, &answer) == 0);
+    assert(g_real_statfs_calls == 1);
+    assert(answer.f_bfree == 7 && answer.f_bavail == 7);
+    assert(answer.f_blocks == 10000);
+
+    /* More free space than the filesystem has is not a filesystem: every reader that
+     * works out used space as total minus free would underflow, so a rule written to
+     * clear a watermark would trip a used-space alarm instead -- the inverse of the
+     * fault, in the very code this effect exists for. The free count is capped at the
+     * total, which this effect never touches. */
+    g_free_blocks_result = 999999U;
+    assert(fstatfs(9, &answer) == 0);
+    assert(answer.f_blocks == 10000);
+    assert(answer.f_bfree == 10000 && answer.f_bavail == 10000);
+
+    /* statvfs hands over f_frsize, not f_bsize: the two differ here on purpose. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_real_statfs_bsize = 512UL;
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_match_path_result = 1;
+    g_config_rule.operation = CHAOS_IO_OP_STATFS;
+    g_config_rule.effect = CHAOS_IO_EFFECT_FREE;
+    g_rule_should_trigger_result = 1;
+    g_free_blocks_applies = 1;
+    g_free_blocks_result = 3U;
+    assert(statvfs("/tmp/data.bin", &vanswer) == 0);
+    assert(g_real_statvfs_calls == 1);
+    assert(g_last_free_unit == 512U);
+    assert(vanswer.f_bfree == 3 && vanswer.f_bavail == 3);
+    assert(vanswer.f_blocks == 10000);
+    /* And the same cap here: the two structures count in different units, so each does
+     * its own clamping against its own total. */
+    g_free_blocks_result = 999999U;
+    assert(statvfs("/tmp/data.bin", &vanswer) == 0);
+    assert(vanswer.f_blocks == 10000);
+    assert(vanswer.f_bfree == 10000 && vanswer.f_bavail == 10000);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/data.bin");
+    g_config_match_loaded_result = 1;
+    g_config_match_path_result = 1;
+    g_config_rule.operation = CHAOS_IO_OP_STATFS;
+    g_config_rule.effect = CHAOS_IO_EFFECT_FULL;
+    g_rule_should_trigger_result = 1;
+    g_free_blocks_applies = 1;
+    g_free_blocks_result = 0U;
+    vanswer.f_bfree = 1234U;
+    assert(fstatvfs(9, &vanswer) == 0);
+    assert(g_real_statvfs_calls == 1);
+    assert(vanswer.f_bfree == 0 && vanswer.f_bavail == 0);
+
+    /* A failing real call is reported as it is, and nothing is rewritten. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_match_path_result = 1;
+    g_config_rule.operation = CHAOS_IO_OP_STATFS;
+    g_config_rule.effect = CHAOS_IO_EFFECT_FULL;
+    g_rule_should_trigger_result = 1;
+    g_free_blocks_applies = 1;
+    g_real_statfs_return = -1;
+    assert(statfs("/tmp/data.bin", &answer) == -1);
+    assert(g_free_blocks_calls == 0);
+    g_real_statfs_return = 0;
+
+    /* A draw that misses leaves the kernel's counts alone. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_match_path_result = 1;
+    g_config_rule.operation = CHAOS_IO_OP_STATFS;
+    g_config_rule.effect = CHAOS_IO_EFFECT_FULL;
+    g_rule_should_trigger_result = 0;
+    g_free_blocks_applies = 1;
+    g_free_blocks_result = 0U;
+    assert(statfs("/tmp/data.bin", &answer) == 0);
+    assert(answer.f_bfree == 1000 && answer.f_bavail == 1000);
+
+    /* An effect that is not a free-space one: the counts stay, and no draw is spent. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_match_path_result = 1;
+    g_config_rule.operation = CHAOS_IO_OP_STATFS;
+    g_config_rule.effect = CHAOS_IO_EFFECT_TORN;
+    g_rule_should_trigger_result = 1;
+    g_free_blocks_applies = 0;
+    assert(statvfs("/tmp/data.bin", &vanswer) == 0);
+    assert(g_free_blocks_calls == 1);
+    assert(g_rule_should_trigger_calls == 0);
+    assert(vanswer.f_bfree == 1000 && vanswer.f_bavail == 1000);
+
+    /* ERRNO fails before the real call; LATENCY delays and then makes it. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_match_path_result = 1;
+    g_config_rule.operation = CHAOS_IO_OP_STATFS;
+    g_config_rule.effect = CHAOS_IO_EFFECT_ERRNO;
+    g_config_rule.errnum = EACCES;
+    g_rule_apply_errno_result = 1;
+    errno = 0;
+    assert(statfs("/tmp/data.bin", &answer) == -1);
+    assert(errno == EACCES);
+    assert(g_real_statfs_calls == 0);
+    errno = 0;
+    assert(statvfs("/tmp/data.bin", &vanswer) == -1);
+    assert(g_real_statvfs_calls == 0);
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/data.bin");
+    assert(fstatfs(9, &answer) == -1);
+    assert(fstatvfs(9, &vanswer) == -1);
+    assert(g_real_statfs_calls == 0 && g_real_statvfs_calls == 0);
+
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_config_match_loaded_result = 1;
+    g_config_match_path_result = 1;
+    g_config_rule.operation = CHAOS_IO_OP_STATFS;
+    g_config_rule.effect = CHAOS_IO_EFFECT_LATENCY;
+    assert(statfs("/tmp/data.bin", &answer) == 0);
+    assert(g_latency_calls == 1);
+    assert(g_real_statfs_calls == 1);
+    assert(statvfs("/tmp/data.bin", &vanswer) == 0);
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/data.bin");
+    assert(fstatfs(9, &answer) == 0);
+    assert(fstatvfs(9, &vanswer) == 0);
+    assert(g_latency_calls == 4);
+
+    /* Without a rule every form passes through to the real call. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    assert(statfs("/tmp/data.bin", &answer) == 0);
+    assert(statvfs("/tmp/data.bin", &vanswer) == 0);
+    assert(fstatfs(9, &answer) == 0);
+    assert(fstatvfs(9, &vanswer) == 0);
+    assert(g_real_statfs_calls == 2 && g_real_statvfs_calls == 2);
+    assert(g_free_blocks_calls == 0);
+
+    /* Before symbol resolution: statfs and fstatfs issue the system call themselves,
+     * statvfs and fstatvfs have none to issue and report ENOSYS. */
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    /* Consume the once flag, so the wrappers' own ensure_symbols() does not resolve the
+     * pointers again and the NULLs below stand. */
+    chaos_io_ensure_symbols();
+    g_chaos_io_real_statvfs = NULL;
+    g_chaos_io_real_fstatvfs = NULL;
+    errno = 0;
+    assert(statvfs("/tmp", &vanswer) == -1 && errno == ENOSYS);
+    errno = 0;
+    assert(fstatvfs(9, &vanswer) == -1 && errno == ENOSYS);
+    g_chaos_io_real_statfs = NULL;
+    g_chaos_io_real_fstatfs = NULL;
+    assert(statfs("/tmp", &answer) == 0);
+    {
+        const int fd = (int)chaos_test_raw_syscall(
+            SYS_openat, (long)AT_FDCWD, (long)"/tmp", (long)(O_RDONLY | O_DIRECTORY), 0L
+        );
+
+        assert(fd >= 0);
+        assert(fstatfs(fd, &answer) == 0);
+        chaos_test_raw_close(fd);
+    }
+    chaos_test_reset_state();
+}
+
+/** @brief A temporary file descriptor holding ten bytes, positioned at the start. */
+static int chaos_test_drop_fd(int flags)
+{
+    char path[] = "/tmp/chaos-drop-XXXXXX";
+    const int fd = mkstemp(path);
+    int reopened;
+
+    assert(fd >= 0);
+    assert(chaos_test_raw_syscall(SYS_write, (long)fd, (long)"0123456789", 10L) == 10);
+    reopened = (int)chaos_test_raw_syscall(SYS_openat, (long)AT_FDCWD, (long)path, (long)flags, 0L);
+    assert(reopened >= 0);
+    chaos_test_raw_close(fd);
+    assert(chaos_test_raw_syscall(SYS_unlinkat, (long)AT_FDCWD, (long)path, 0L) == 0);
+    return reopened;
+}
+
+/** @brief The descriptor's file offset, read with the system call. */
+static long chaos_test_offset(int fd)
+{
+    return chaos_test_raw_syscall(SYS_lseek, (long)fd, 0L, (long)SEEK_CUR);
+}
+
+/** @brief Arms a DROP rule on @p operation whose draw hits. */
+static void chaos_test_drop_rule(chaos_io_operation_t operation)
+{
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/drop.bin");
+    g_config_match_loaded_result = 1;
+    g_config_rule.operation = operation;
+    g_config_rule.effect = CHAOS_IO_EFFECT_DROP;
+    g_rule_should_trigger_result = 1;
+}
+
+/**
+ * @brief DROP reports a write as done without doing it, and leaves the offset consistent.
+ *
+ * @details The correction is the whole difficulty of the effect: a lost write that does
+ * not move the file offset makes the caller's next write land on top of the bytes it
+ * believes it already wrote, which damages the file in a way no real loss does. Covered:
+ * - a dropped `write` returns the full count, makes no real call, and advances the offset
+ *   by that many bytes, so two dropped writes leave the second at offset 10, not 5;
+ * - a draw that misses writes for real and moves nothing itself;
+ * - an `O_APPEND` descriptor is dropped without touching the offset: appends never
+ *   overwrite each other, and the offset is not what the kernel uses;
+ * - a descriptor with no offset (a pipe) keeps the rule from firing: the real write runs
+ *   and the draw is not even taken;
+ * - a descriptor whose flags cannot be read at all does not fire. No open descriptor
+ *   refuses F_GETFL, and one below 3 never matches a rule, so the guard is proved by
+ *   calling chaos_io_drop_write() itself rather than through a wrapper;
+ * - `writev` drops the vector's total, and a vector whose size is unknown is written;
+ * - `pwrite` and `pwritev` drop without any correction, since a positioned write does not
+ *   use the descriptor's offset -- asserted by the offset staying where it was.
+ */
+static void test_drop_write_wrappers(void)
+{
+    struct iovec vector[2];
+    struct iovec huge[1];
+    int fd;
+    int pipe_fds[2];
+
+    /* A segment longer than SSIZE_MAX has no usable byte count (the kernel rejects the
+     * call with EINVAL), which is how an unknown size is produced here. */
+    huge[0].iov_base = (void *)"x";
+    huge[0].iov_len = (size_t)SSIZE_MAX + 1U;
+
+    /* A dropped write: nothing written, full count reported, offset advanced. */
+    chaos_test_drop_rule(CHAOS_IO_OP_WRITE);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    assert(write(fd, "abcde", 5U) == 5);
+    assert(g_real_write_calls == 0);
+    assert(g_rule_should_trigger_calls == 1);
+    assert(chaos_test_offset(fd) == 5L);
+    assert(write(fd, "fghij", 5U) == 5);
+    assert(chaos_test_offset(fd) == 10L);
+    chaos_test_raw_close(fd);
+
+    /* A draw that misses: the real write runs and the wrapper moves nothing. */
+    chaos_test_drop_rule(CHAOS_IO_OP_WRITE);
+    g_rule_should_trigger_result = 0;
+    g_real_write_return = 5;
+    fd = chaos_test_drop_fd(O_WRONLY);
+    assert(write(fd, "abcde", 5U) == 5);
+    assert(g_real_write_calls == 1);
+    assert(chaos_test_offset(fd) == 0L);
+    chaos_test_raw_close(fd);
+
+    /* O_APPEND: dropped, and the offset is left alone. */
+    chaos_test_drop_rule(CHAOS_IO_OP_WRITE);
+    fd = chaos_test_drop_fd(O_WRONLY | O_APPEND);
+    assert(write(fd, "abcde", 5U) == 5);
+    assert(g_real_write_calls == 0);
+    assert(chaos_test_offset(fd) == 0L);
+    chaos_test_raw_close(fd);
+
+    /* A pipe has no offset to keep straight: the rule does not fire at all -- and the
+     * probe that establishes that is an lseek, which fails ESPIPE on a pipe. A wrapper
+     * that does not inject leaves errno as the real call left it, so a caller that writes
+     * successfully and then reads errno must not find the probe's failure there. */
+    chaos_test_drop_rule(CHAOS_IO_OP_WRITE);
+    g_real_write_return = 5;
+    assert(pipe(pipe_fds) == 0);
+    errno = 0;
+    assert(write(pipe_fds[1], "abcde", 5U) == 5);
+    assert(errno == 0);
+    assert(g_real_write_calls == 1);
+    assert(g_rule_should_trigger_calls == 0);
+    chaos_test_raw_close(pipe_fds[0]);
+    chaos_test_raw_close(pipe_fds[1]);
+
+    /* A descriptor whose flags cannot be read: no drop, and no draw spent on it. */
+    chaos_test_drop_rule(CHAOS_IO_OP_WRITE);
+    assert(chaos_io_drop_write(&g_config_rule, -1, 5U) == 0);
+    assert(g_rule_should_trigger_calls == 0);
+    /* A count no call could have returned: reported as written it would come back as a
+     * negative ssize_t -- an error with no errno -- and the offset correction would move
+     * backwards by as much. The kernel refuses such a call itself. No draw either. */
+    {
+        const int plain = chaos_test_drop_fd(O_WRONLY);
+
+        chaos_test_drop_rule(CHAOS_IO_OP_WRITE);
+        assert(chaos_io_drop_write(&g_config_rule, plain, (size_t)SSIZE_MAX + 1U) == 0);
+        assert(g_rule_should_trigger_calls == 0);
+        chaos_test_raw_close(plain);
+    }
+
+    /* writev drops the total of the vector. */
+    vector[0].iov_base = (void *)"abc";
+    vector[0].iov_len = 3U;
+    vector[1].iov_base = (void *)"de";
+    vector[1].iov_len = 2U;
+    chaos_test_drop_rule(CHAOS_IO_OP_WRITE);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    assert(writev(fd, vector, 2) == 5);
+    assert(g_real_writev_calls == 0);
+    assert(chaos_test_offset(fd) == 5L);
+    /* A vector the kernel would reject has no byte count, so there is nothing to report
+     * as written: the call goes through untouched. */
+    g_real_writev_return = 4;
+    assert(writev(fd, huge, 1) == 4);
+    assert(g_real_writev_calls == 1);
+    chaos_test_raw_close(fd);
+
+    /* pwrite and pwritev need no correction: the offset stays where it was. */
+    chaos_test_drop_rule(CHAOS_IO_OP_PWRITE);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    assert(pwrite(fd, "abcde", 5U, 3) == 5);
+    assert(g_real_pwrite_calls == 0);
+    assert(chaos_test_offset(fd) == 0L);
+    assert(pwritev(fd, vector, 2, 3) == 5);
+    assert(g_real_pwritev_calls == 0);
+    assert(chaos_test_offset(fd) == 0L);
+    g_real_pwritev_return = 4;
+    assert(pwritev(fd, huge, 1, 3) == 4);
+    assert(g_real_pwritev_calls == 1);
+    chaos_test_raw_close(fd);
+    chaos_test_reset_state();
+}
+
+/**
+ * @brief Arms a THROTTLE rule of @p rate bytes per second on write (or pwrite).
+ *
+ * @details Each case uses a rate of its own, which is also what gives it a bucket of its
+ * own: a slot is keyed by descriptor and rate and resets when either differs, and the
+ * bucket table outlives chaos_test_reset_state() -- it is the wrapper's own state, not the
+ * harness's.
+ */
+static void chaos_test_throttle_rule(chaos_io_operation_t operation, uint64_t rate)
+{
+    chaos_test_reset_state();
+    chaos_test_bind_real_functions();
+    g_config_prepare_result = 1;
+    g_fdcache_resolve_result = 1;
+    (void)snprintf(g_resolved_path, sizeof(g_resolved_path), "%s", "/tmp/throttle.bin");
+    g_config_match_loaded_result = 1;
+    g_config_rule.operation = operation;
+    g_config_rule.effect = CHAOS_IO_EFFECT_THROTTLE;
+    g_config_rule.rate_bps = rate;
+    g_rule_should_trigger_result = 1;
+    g_slept_ms = -1;
+}
+
+/**
+ * @brief THROTTLE holds the write side to a byte rate by writing less per call.
+ *
+ * @details The rates here are tiny on purpose: at 10 bytes per second a token takes 100 ms
+ * to arrive, so a call that follows another is reliably met by an empty bucket without the
+ * test depending on how fast the machine is. A tenth of a second's worth is what a call
+ * that has to wait gets, which is 1 byte at that rate and 100 ms of waiting. Covered:
+ * - the first call finds a full bucket, passes whole, and does not even ask the rule: an
+ *   allowance that changes nothing spends neither a hit nor a `@first` claim;
+ * - the next call finds it empty, waits for a tenth of a second's worth and writes that;
+ * - a non-blocking descriptor is told EAGAIN instead of being made to wait;
+ * - a rule that does not fire costs neither bytes nor the wait;
+ * - `writev` is trimmed to the allowance, and a vector whose size is unknown is written
+ *   whole;
+ * - `pwrite` is throttled the same way, which is the other operation the effect allows.
+ */
+static void test_throttle_write_wrappers(void)
+{
+    static const char block[64] = {0};
+    struct iovec vector[2];
+    struct iovec huge[1];
+    int fd;
+
+    huge[0].iov_base = (void *)"x";
+    huge[0].iov_len = (size_t)SSIZE_MAX + 1U;
+
+    /* A full bucket is one second's worth, so the first 10 bytes pass untouched. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 10U);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    g_real_write_return = 10;
+    assert(write(fd, block, 10U) == 10);
+    assert(g_real_write_calls == 1 && g_real_write_count == 10U);
+    assert(g_rule_should_trigger_calls == 0);
+    assert(g_slept_ms == -1);
+
+    /* Empty now: the next call waits 100 ms for one byte and writes exactly that. */
+    g_real_write_return = 1;
+    assert(write(fd, block, 10U) == 1);
+    assert(g_real_write_count == 1U);
+    assert(g_slept_ms == 100);
+    assert(g_rule_should_trigger_calls == 1);
+    /* The byte it waited for was charged when the wait started, so the call after it
+     * waits again instead of finding that byte in the bucket: without the charge the two
+     * calls would move two bytes in the time one byte takes to arrive, and the rate would
+     * come out double. */
+    g_slept_ms = -1;
+    g_real_write_return = 1;
+    assert(write(fd, block, 10U) == 1);
+    assert(g_slept_ms > 100);
+    chaos_test_raw_close(fd);
+
+    /* A part of what the call asked for is there: it writes that part and waits not at
+     * all, which is the short call the effect is built around. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 12U);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    g_real_write_return = 8;
+    assert(write(fd, block, 8U) == 8);
+    g_real_write_return = 4;
+    assert(write(fd, block, 12U) == 4);
+    assert(g_real_write_count == 4U);
+    assert(g_slept_ms == -1);
+    /* The same partial allowance with a rule that does not fire writes everything: the
+     * three bytes stay charged, but nothing is held back. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 11U);
+    g_real_write_return = 8;
+    assert(write(fd, block, 8U) == 8);
+    g_rule_should_trigger_result = 0;
+    g_real_write_return = 10;
+    assert(write(fd, block, 10U) == 10);
+    assert(g_real_write_count == 10U);
+    chaos_test_raw_close(fd);
+
+    /* Two descriptors whose numbers land on the same slot. The table is indexed by the
+     * descriptor modulo its size, so any process with more than that many open files has
+     * such a pair -- and a slot handed over used to be reset to "never used", which the
+     * refill reads as a full bucket. The two then gave each other a whole second's worth
+     * on every call, the rate was not enforced at all, and because the allowance covered
+     * the call the code returned before the draw: no hit either, so nothing reported it.
+     *
+     * Written alternately, the second write of each pair must be held back rather than
+     * pass whole. */
+    {
+        const int low = chaos_test_drop_fd(O_WRONLY);
+        const int high = (int)(low + CHAOS_IO_THROTTLE_SLOTS);
+
+        assert(low >= 0);
+        /* The raw call: dup2 is one of the wrappers under test here. */
+        assert((int)chaos_test_raw_syscall(SYS_dup3, (long)low, (long)high, 0L) == high);
+        chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 16U);
+        g_slept_ms = -1;
+        g_real_write_return = 16;
+        /* What the real call was handed is the measure, not what the wrapper returned:
+         * the stub answers with a fixed count, so a shortened call shows up here. */
+        assert(write(low, block, 16U) == 16);
+        assert(g_real_write_count == 16U);
+        assert(g_slept_ms == -1);
+        /* The second descriptor takes the slot over and starts empty, so its write waits
+         * and is cut to a chunk. Handed a full bucket instead -- which is what resetting
+         * the slot to "never used" does -- it would pass all sixteen bytes and move twice
+         * the rate, with no hit counted either. */
+        assert(write(high, block, 16U) == 16);
+        assert(g_real_write_count < 16U);
+        assert(g_slept_ms > 0);
+
+        /* Closed through the wrapper, which is what drops the bucket: the table is keyed
+         * by the descriptor number and the kernel reuses those, so a bucket left behind
+         * would hold back whoever gets the number next -- for bytes somebody else moved.
+         * The same number, taken again, is a first use and passes whole. */
+        assert(close(high) == 0);
+        assert((int)chaos_test_raw_syscall(SYS_dup3, (long)low, (long)high, 0L) == high);
+        g_real_write_return = 16;
+        assert(write(high, block, 16U) == 16);
+        assert(close(high) == 0);
+        chaos_test_raw_close(low);
+    }
+
+    /* A non-blocking descriptor: EAGAIN, no wait, nothing written. Its event loop is
+     * written for exactly that answer. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 20U);
+    fd = chaos_test_drop_fd(O_WRONLY | O_NONBLOCK);
+    g_real_write_return = 20;
+    assert(write(fd, block, 20U) == 20);
+    errno = 0;
+    assert(write(fd, block, 20U) == -1);
+    assert(errno == EAGAIN);
+    assert(g_real_write_calls == 1);
+    assert(g_slept_ms == -1);
+    chaos_test_raw_close(fd);
+
+    /* A non-blocking descriptor whose rule does not fire is not refused either: EAGAIN
+     * is an answer only a rule that fires may give. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 21U);
+    fd = chaos_test_drop_fd(O_WRONLY | O_NONBLOCK);
+    g_real_write_return = 21;
+    assert(write(fd, block, 21U) == 21);
+    g_rule_should_trigger_result = 0;
+    assert(write(fd, block, 21U) == 21);
+    assert(g_real_write_calls == 2);
+    chaos_test_raw_close(fd);
+
+    /* A rule that does not fire: the whole call goes through and nobody waits. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 30U);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    g_real_write_return = 30;
+    assert(write(fd, block, 30U) == 30);
+    g_rule_should_trigger_result = 0;
+    assert(write(fd, block, 30U) == 30);
+    assert(g_real_write_count == 30U);
+    assert(g_slept_ms == -1);
+    chaos_test_raw_close(fd);
+
+    /* writev: the vector is trimmed to the allowance, segment by segment. */
+    vector[0].iov_base = (void *)"abc";
+    vector[0].iov_len = 3U;
+    vector[1].iov_base = (void *)"de";
+    vector[1].iov_len = 2U;
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 5U);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    g_real_writev_return = 5;
+    assert(writev(fd, vector, 2) == 5);
+    assert(g_real_writev_iovcnt == 2);
+    g_real_writev_return = 1;
+    assert(writev(fd, vector, 2) == 1);
+    /* A tenth of 5 bytes per second is none, and the floor of the allowance is one byte:
+     * the vector is cut to the first segment's first byte, and the wait is the 200 ms that
+     * byte takes to arrive. */
+    assert(g_real_writev_iovcnt == 1 && g_real_writev_lengths[0] == 1U);
+    assert(g_slept_ms == 200);
+    /* A vector the kernel would reject has no byte count: written as it stands. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 50U);
+    g_real_writev_return = 4;
+    assert(writev(fd, huge, 1) == 4);
+    assert(g_real_writev_iovcnt == 1);
+    assert(g_rule_should_trigger_calls == 0);
+    chaos_test_raw_close(fd);
+
+    /* A non-blocking descriptor refuses a vectored write too. A plain write of the whole
+     * bucket empties it first: both forms carry the same `write` rule, so they share the
+     * descriptor's bucket. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 13U);
+    fd = chaos_test_drop_fd(O_WRONLY | O_NONBLOCK);
+    g_real_write_return = 13;
+    assert(write(fd, block, 13U) == 13);
+    errno = 0;
+    assert(writev(fd, vector, 2) == -1);
+    assert(errno == EAGAIN);
+    assert(g_real_writev_calls == 0);
+    chaos_test_raw_close(fd);
+
+    /* sendfile and copy_file_range carry a `write` rule on the destination and are
+     * shortened like TORN shortens them: the kernel moves both offsets on by what it
+     * transferred, so a shortened transfer is short, not lost. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 16U);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    g_real_sendfile_return = 16;
+    assert(sendfile(fd, 0, NULL, 16U) == 16);
+    assert(g_real_sendfile_count == 16U);
+    g_real_sendfile_return = 1;
+    assert(sendfile(fd, 0, NULL, 16U) == 1);
+    assert(g_real_sendfile_count == 1U);
+    /* One byte of sixteen per second: 63 ms, rounded up. */
+    assert(g_slept_ms == 63);
+    chaos_test_raw_close(fd);
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 17U);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    g_real_copy_file_range_return = 17;
+    assert(copy_file_range(0, NULL, fd, NULL, 17U, 0U) == 17);
+    g_real_copy_file_range_return = 1;
+    assert(copy_file_range(0, NULL, fd, NULL, 17U, 0U) == 1);
+    assert(g_real_copy_file_range_count == 1U);
+    chaos_test_raw_close(fd);
+    /* And both refuse a non-blocking destination, as write does. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 18U);
+    fd = chaos_test_drop_fd(O_WRONLY | O_NONBLOCK);
+    g_real_write_return = 18;
+    assert(write(fd, block, 18U) == 18);
+    errno = 0;
+    assert(sendfile(fd, 0, NULL, 18U) == -1);
+    assert(errno == EAGAIN);
+    errno = 0;
+    assert(copy_file_range(0, NULL, fd, NULL, 18U, 0U) == -1);
+    assert(errno == EAGAIN);
+    assert(g_real_sendfile_calls == 0 && g_real_copy_file_range_calls == 0);
+    chaos_test_raw_close(fd);
+
+    /* pwrite: the same bucket arithmetic, and the offset is the caller's own. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_PWRITE, 60U);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    g_real_pwrite_return = 60;
+    assert(pwrite(fd, block, 60U, 7) == 60);
+    assert(g_real_pwrite_count == 60U && g_real_pwrite_offset == 7);
+    g_real_pwrite_return = 6;
+    assert(pwrite(fd, block, 60U, 7) == 6);
+    assert(g_real_pwrite_count == 6U);
+    assert(g_slept_ms == 100);
+    chaos_test_raw_close(fd);
+
+    /* And pwrite refuses a non-blocking descriptor like write does. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_PWRITE, 61U);
+    fd = chaos_test_drop_fd(O_WRONLY | O_NONBLOCK);
+    g_real_pwrite_return = 61;
+    assert(pwrite(fd, block, 61U, 0) == 61);
+    errno = 0;
+    assert(pwrite(fd, block, 61U, 0) == -1);
+    assert(errno == EAGAIN);
+    assert(g_real_pwrite_calls == 1);
+    chaos_test_raw_close(fd);
+
+    /* pwritev is the vectored form of the same rule: trimmed to the allowance, refused on
+     * a non-blocking descriptor, and written whole when the size is unknown. */
+    chaos_test_throttle_rule(CHAOS_IO_OP_PWRITE, 14U);
+    fd = chaos_test_drop_fd(O_WRONLY);
+    g_real_pwrite_return = 14;
+    assert(pwrite(fd, block, 14U, 9) == 14);
+    g_real_pwritev_return = 1;
+    assert(pwritev(fd, vector, 2, 9) == 1);
+    assert(g_real_pwritev_iovcnt == 1 && g_real_pwritev_lengths[0] == 1U);
+    assert(g_real_pwritev_offset == 9);
+    /* One byte of fourteen per second: 72 ms, rounded up so the wait is never short. */
+    assert(g_slept_ms == 72);
+    chaos_test_raw_close(fd);
+    chaos_test_throttle_rule(CHAOS_IO_OP_PWRITE, 15U);
+    fd = chaos_test_drop_fd(O_WRONLY | O_NONBLOCK);
+    g_real_pwrite_return = 15;
+    assert(pwrite(fd, block, 15U, 0) == 15);
+    errno = 0;
+    assert(pwritev(fd, vector, 2, 0) == -1);
+    assert(errno == EAGAIN);
+    assert(g_real_pwritev_calls == 0);
+    /* A vector the kernel would reject has no byte count: written as it stands. */
+    g_real_pwritev_return = 4;
+    assert(pwritev(fd, huge, 1, 0) == 4);
+    assert(g_real_pwritev_calls == 1);
+    chaos_test_raw_close(fd);
+    chaos_test_reset_state();
 }
 
 /**
@@ -3287,6 +4064,7 @@ int main(void)
     test_call_real_open_and_match_fd_rule();
     test_wrappers_resolve_symbols_before_constructor();
     test_ensure_symbols_is_thread_safe();
+    test_seed_from_environment();
     test_init_runtime();
     test_open_wrapper();
     test_normalize_path();
@@ -3294,6 +4072,9 @@ int main(void)
     test_fsops_helpers_and_wrappers();
     test_path_form_wrappers();
     test_read_and_write_wrappers();
+    test_drop_write_wrappers();
+    test_throttle_write_wrappers();
+    test_statfs_wrappers();
     test_vectored_helpers();
     test_readv_and_writev_wrappers();
     test_vectored_input_checks();

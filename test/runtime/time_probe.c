@@ -9,6 +9,8 @@
  *
  * - 10      clock_gettime:ERRNO:EINVAL; -1 with errno EINVAL.
  * - 20-22   clock_gettime/monotonic:OFFSET:500; the clock reads >= 400 ms ahead.
+ * - 123-125 clock_gettime/monotonic:FREEZE:1; two reads 50 ms apart are identical, and
+ *   clearing the rule lets the clock run again
  * - 120-122 clock_gettime/monotonic:REGRESS:5000; the 2nd read is 4.9-5.1 s back, then the
  *           clock advances again.
  * - 130-132 monotonic OFFSET:3000; an absolute (TIMER_ABSTIME) deadline is converted to the
@@ -445,6 +447,62 @@ static int probe_clock_regress(void)
     return write_config("# clear");
 }
 
+/**
+ * @brief FREEZE:1 on clock_gettime/monotonic stops the clock (exit 123-125).
+ *
+ * The first read is real and is kept; two later reads, with a real 50 ms sleep between
+ * them, return exactly that value. The sleep is on the raw clock, so the frozen clock
+ * cannot explain it away: without the effect the two readings differ by ~50 ms. Finally
+ * the rule is cleared and the clock is real again, which proves the freeze was the rule's
+ * doing and not a stuck host clock. `CLOCK_MONOTONIC` is chosen on purpose: FREEZE is
+ * allowed there, where REGRESS is not.
+ */
+static int probe_clock_freeze(void)
+{
+    struct timespec first;
+    struct timespec frozen;
+    struct timespec still;
+    struct timespec thawed;
+    struct timespec pause;
+    int rc = write_config("clock_gettime/monotonic:FREEZE:1");
+
+    if (rc != 0)
+    {
+        return rc;
+    }
+    pause.tv_sec = 0;
+    pause.tv_nsec = 50000000L;
+    if (clock_gettime(CLOCK_MONOTONIC, &first) != 0 || clock_gettime(CLOCK_MONOTONIC, &frozen) != 0)
+    {
+        return 123;
+    }
+    /* No nanosleep rule is in the file, so this is a real sleep. */
+    (void)nanosleep(&pause, (struct timespec *)0);
+    if (clock_gettime(CLOCK_MONOTONIC, &still) != 0)
+    {
+        return 123;
+    }
+    /* Compared exactly, not in milliseconds: a frozen clock returns the same nanosecond. */
+    if (first.tv_sec != frozen.tv_sec || first.tv_nsec != frozen.tv_nsec ||
+        first.tv_sec != still.tv_sec || first.tv_nsec != still.tv_nsec)
+    {
+        return 124;
+    }
+    rc = write_config("# clear");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    /* The rule-file look interval is 1 ms, so one more sleep is enough for the clear to
+     * be seen. The clock must now be ahead of the value it was held at. */
+    (void)nanosleep(&pause, (struct timespec *)0);
+    if (clock_gettime(CLOCK_MONOTONIC, &thawed) != 0 || elapsed_ms(&first, &thawed) < 50LL)
+    {
+        return 125;
+    }
+    return 0;
+}
+
 /** @brief CLOCK_MONOTONIC via a raw system call, so no OFFSET or REGRESS rule applies. */
 static void raw_monotonic(struct timespec *now)
 {
@@ -512,6 +570,11 @@ int main(void)
         return rc;
     }
     rc = probe_clock_regress();
+    if (rc != 0)
+    {
+        return rc;
+    }
+    rc = probe_clock_freeze();
     if (rc != 0)
     {
         return rc;

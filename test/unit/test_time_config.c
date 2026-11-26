@@ -274,10 +274,12 @@ static void write_config_text(const char *text, time_t stamp)
  *   rejects 1 ms more and values beyond int64, which `strtoll` would clamp silently.
  * - `parse_payload_probability`: "42" (probability defaults), "25@0.25"; not "@0.25" or a
  *   probability above 1.0.
- * - `parse_clock_id`: every clock name this platform defines, the number "7"; not
- *   "bad-clock".
- * - `selector_parse` rejects "", "clock_gettime/" (empty clock) and a selector longer than
- *   `CHAOS_TIME_MAX_TEXT` (128).
+ * - `parse_clock_id`: every clock name this platform defines, the number "7" and a
+ *   negative dynamic id; not "bad-clock", and not an id outside clockid_t, which would be
+ *   truncated into a real clock ("4294967297" casts to CLOCK_MONOTONIC).
+ * - `selector_parse` rejects "", "clock_gettime/" (empty clock), a clock id outside
+ *   clockid_t, and a selector longer than `CHAOS_TIME_MAX_TEXT` (128) even when its id is
+ *   valid (trailing blanks are allowed after the number).
  * - `split_rule_fields` needs two colons and all output pointers.
  * - `effect_allowed` permits ERRNO and LATENCY on any selector, never INVALID.
  * - `hash_mtime(NULL)` is MTIME_MISSING; normalisation moves each reserved sentinel off its
@@ -303,8 +305,10 @@ static void test_helper_functions(void)
     chaos_time_config_state_t state;
     clockid_t clock_id = (clockid_t)0;
 
-    (void)memset(overlong_selector, '7', sizeof(overlong_selector));
-    (void)memcpy(overlong_selector, "clock_gettime/", sizeof("clock_gettime/") - 1U);
+    /* A valid id padded with the blanks the parser allows after it: the number is in
+     * range, so the selector is rejected for its length, not for its id. */
+    (void)memset(overlong_selector, ' ', sizeof(overlong_selector));
+    (void)memcpy(overlong_selector, "clock_gettime/7", sizeof("clock_gettime/7") - 1U);
     overlong_selector[sizeof(overlong_selector) - 1U] = '\0';
 
     assert(chaos_time_is_blank_char(' '));
@@ -412,10 +416,26 @@ static void test_helper_functions(void)
 #endif
     assert(chaos_time_parse_clock_id("7", &(clockid_t){0}));
     assert(!chaos_time_parse_clock_id("bad-clock", &(clockid_t){0}));
+    /* Dynamic clock ids are negative and stay valid: only the range is checked. */
+    {
+        clockid_t dynamic_id = 0;
+
+        assert(chaos_time_parse_clock_id("-2147483648", &dynamic_id));
+        assert(dynamic_id == (clockid_t)INT_MIN);
+        assert(chaos_time_parse_clock_id("2147483647", &dynamic_id));
+        assert(dynamic_id == (clockid_t)INT_MAX);
+    }
+    /* Outside clockid_t: the cast would land on a real clock instead of failing. */
+    assert(!chaos_time_parse_clock_id("4294967297", &(clockid_t){0}));
+    assert(!chaos_time_parse_clock_id("2147483648", &(clockid_t){0}));
+    assert(!chaos_time_parse_clock_id("-2147483649", &(clockid_t){0}));
+    assert(!chaos_time_parse_clock_id("99999999999999999999", &(clockid_t){0}));
 
     assert(!chaos_time_selector_parse(NULL, &selector));
     assert(!chaos_time_selector_parse("", &selector));
     assert(!chaos_time_selector_parse("clock_gettime/", NULL));
+    /* The range check reaches the selector, so the rule file is rejected as invalid. */
+    assert(!chaos_time_selector_parse("clock_gettime/4294967297", &selector));
     assert(!chaos_time_selector_parse(overlong_selector, &selector));
     assert(chaos_time_split_rule_fields(split_text, &selector_text, &effect_text, &value_text));
     assert(strcmp(selector_text, "clock_gettime/monotonic") == 0);
@@ -920,9 +940,25 @@ static void test_fork_takes_over_orphaned_reload(void)
     g_chaos_time_cached_mtime = CHAOS_TIME_MTIME_RELOADING;
     (void)chaos_time_config_prepare();
     assert(g_chaos_time_cached_mtime == CHAOS_TIME_MTIME_RELOADING);
-    g_chaos_time_tls_prng_state = UINT64_C(42);
+    g_chaos_time_lineage = 0U;
+    g_chaos_time_forks = 0U;
+    chaos_time_config_before_fork();
     chaos_time_config_after_fork();
-    assert(g_chaos_time_tls_prng_state == 0U);
+    assert(g_chaos_time_lineage != 0U);
+    /* And from its siblings': the ordinal the prepare handler counted in the parent is
+     * what tells two children apart, without which a pre-forking server would draw one
+     * sample for all of its backends. Deterministic, so the same fork order repeats. */
+    {
+        const uint64_t first_child = g_chaos_time_lineage;
+
+        g_chaos_time_lineage = 0U;
+        g_chaos_time_forks = 1U;
+        chaos_time_config_before_fork();
+        chaos_time_config_after_fork();
+        assert(g_chaos_time_lineage != first_child && g_chaos_time_lineage != 0U);
+    }
+    g_chaos_time_lineage = 0U;
+    g_chaos_time_forks = 0U;
     assert(g_chaos_time_cached_mtime == CHAOS_TIME_MTIME_UNKNOWN);
     assert(g_chaos_time_hits_pid == (uint64_t)getpid());
     assert(chaos_time_config_prepare());
@@ -1187,6 +1223,9 @@ static void test_prepare_reports_status(void)
     assert(!read_status_file(status, sizeof(status)));
 }
 
+/** @brief Header lines of the last read_hits_file(), without the rule lines. */
+static char g_hits_header[128];
+
 /** @brief Reads this process's hits file into @p buffer; 0 when it does not exist. */
 static int read_hits_file(char *buffer, size_t size)
 {
@@ -1203,6 +1242,22 @@ static int read_hits_file(char *buffer, size_t size)
     length = fread(buffer, 1U, size - 1U, file);
     buffer[length] = '\0';
     assert(fclose(file) == 0);
+
+    /* The header lines (`generation=`, no tab) are split off into g_hits_header, so the
+     * assertions on the rule lines stay about rule lines. That the header really is in
+     * front, and carries no tab, is asserted here for every reader below. */
+    {
+        const char *rules = strchr(buffer, '\n');
+
+        assert(strncmp(buffer, "generation=", 11U) == 0);
+        assert(rules != NULL);
+        ++rules;
+        assert((size_t)(rules - buffer) < sizeof(g_hits_header));
+        (void)memcpy(g_hits_header, buffer, (size_t)(rules - buffer));
+        g_hits_header[rules - buffer] = '\0';
+        assert(strchr(g_hits_header, '\t') == NULL);
+        (void)memmove(buffer, rules, strlen(rules) + 1U);
+    }
     return 1;
 }
 
@@ -1333,7 +1388,8 @@ static void test_rule_file_check_is_throttled(void)
 }
 
 /**
- * @brief Proves the qualifiers `@first`, `@from`, `@until`, `@size>` and `@size<` after a rule
+ * @brief Proves the qualifiers `@first`, `@from` and `@until` after a rule, and that a
+ * `@size` gate is rejected because no time call reports a byte count
  *   land in its policy, and that a bad qualifier rejects the line.
  *
  * @details A parsed rule starts with `call_size` = `CHAOS_POLICY_NO_SIZE`. Rejected: an
@@ -1343,12 +1399,12 @@ static void test_rule_file_check_is_throttled(void)
 static void test_rule_qualifiers(void)
 {
     static chaos_time_rule_t rules[CHAOS_TIME_MAX_RULES];
-    char qualified[] =
-        "nanosleep:ERRNO:EINTR @first=3 @from=1000 @until=2000 @size>10 @size<99 # owner\n";
+    char qualified[] = "nanosleep:ERRNO:EINTR @first=3 @from=1000 @until=2000 # owner\n";
     char unknown[] = "nanosleep:ERRNO:EINTR @bogus=1\n";
     char lonely[] = "# header\n  @first=3\n";
     char backwards[] = "nanosleep:ERRNO:EINTR @from=2000 @until=1000\n";
     char empty_first[] = "nanosleep:ERRNO:EINTR @first=0\n";
+    char sized[] = "nanosleep:ERRNO:EINTR @size>10\n";
     size_t count = 0U;
 
     assert(chaos_time_config_parse_buffer(qualified, rules, &count) == 0);
@@ -1356,8 +1412,6 @@ static void test_rule_qualifiers(void)
     assert(rules[0].policy.first == 3U);
     assert(rules[0].policy.from_ms == 1000);
     assert(rules[0].policy.until_ms == 2000);
-    assert(rules[0].policy.has_size_above && rules[0].policy.size_above == 10U);
-    assert(rules[0].policy.has_size_below && rules[0].policy.size_below == 99U);
     assert(rules[0].call_size == CHAOS_POLICY_NO_SIZE);
 
     assert(chaos_time_config_parse_buffer(unknown, rules, &count) == -1);
@@ -1366,6 +1420,9 @@ static void test_rule_qualifiers(void)
     assert(chaos_time_config_last_error()->line == 2U);
     assert(chaos_time_config_parse_buffer(backwards, rules, &count) == -1);
     assert(chaos_time_config_parse_buffer(empty_first, rules, &count) == -1);
+    /* No time call reports a byte count, so a size gate could never pass: the rule
+     * would load and never fire, which is the failure this rejection removes. */
+    assert(chaos_time_config_parse_buffer(sized, rules, &count) == -1);
 }
 
 /**
@@ -1394,6 +1451,44 @@ static void test_regress_rule(void)
     assert(chaos_time_config_parse_line(zero, &rule) == -1);
     assert(chaos_time_config_parse_line(negative, &rule) == -1);
     assert(chaos_time_config_parse_line(sleep_rule, &rule) == -1);
+}
+
+/**
+ * @brief Proves FREEZE needs a clock-read selector and takes the probability as its value.
+ *
+ * @details FREEZE carries no amount, so the one value field is the probability -- the same
+ * shape as net's `close:RESET:1`. A bare `clock_gettime` selector is allowed, unlike REGRESS:
+ * the frozen reading lives in the hit slot per rule, and a rule across all clocks freezing
+ * them all at one reading is the documented behaviour, not an accident. Sleep selectors and
+ * `*` are rejected, as are probabilities outside [0, 1] and a missing value.
+ */
+static void test_freeze_rule(void)
+{
+    chaos_time_rule_t rule;
+    char ok[] = "clock_gettime/realtime:FREEZE:1";
+    char gated[] = "clock_gettime/monotonic:FREEZE:0.25";
+    char every_clock[] = "clock_gettime:FREEZE:1";
+    char sleep_rule[] = "nanosleep:FREEZE:1";
+    char any_rule[] = "*:FREEZE:1";
+    char above_one[] = "clock_gettime/realtime:FREEZE:2";
+    char negative[] = "clock_gettime/realtime:FREEZE:-1";
+    char empty[] = "clock_gettime/realtime:FREEZE:";
+    char with_amount[] = "clock_gettime/realtime:FREEZE:5000@1";
+
+    assert(chaos_time_config_parse_line(ok, &rule) == 1);
+    assert(rule.effect == CHAOS_TIME_EFFECT_FREEZE && rule.probability == 1.0);
+    assert(chaos_time_config_parse_line(gated, &rule) == 1);
+    assert(rule.probability == 0.25);
+    assert(chaos_time_config_parse_line(every_clock, &rule) == 1);
+    assert(rule.effect == CHAOS_TIME_EFFECT_FREEZE);
+    assert(chaos_time_config_parse_line(sleep_rule, &rule) == -1);
+    assert(chaos_time_config_parse_line(any_rule, &rule) == -1);
+    assert(chaos_time_config_parse_line(above_one, &rule) == -1);
+    assert(chaos_time_config_parse_line(negative, &rule) == -1);
+    assert(chaos_time_config_parse_line(empty, &rule) == -1);
+    /* No amount field: `5000@1` is not a probability, so the line is rejected rather than
+     * silently read as a 5000 ms something. */
+    assert(chaos_time_config_parse_line(with_amount, &rule) == -1);
 }
 
 /**
@@ -1598,8 +1693,142 @@ static void test_open_errors(void)
     (void)unlink(CHAOS_TIME_CONFIG_PATH);
 }
 
+/**
+ * @brief Proves a rule an earlier one always wins against is kept and warned about.
+ *
+ * @details Two rules with the same selector and effect tie on everything but the line, so
+ * the earlier always wins and the later can never fire. It is valid, so the file loads and
+ * the status record names its line. A rule differing in its effect is not shadowed: both
+ * can fire.
+ */
+static void test_shadowed_rules_warn(void)
+{
+    static chaos_time_rule_t rules[CHAOS_TIME_MAX_RULES];
+    char duplicate[] = "nanosleep:ERRNO:EINTR\nnanosleep:ERRNO:EAGAIN\n";
+    char distinct[] = "nanosleep:ERRNO:EINTR\nnanosleep:LATENCY:5\n";
+    size_t count = 0U;
+
+    assert(chaos_time_config_parse_buffer(duplicate, rules, &count) == 0);
+    assert(count == 2U);
+    assert(chaos_time_config_last_error()->warning_count == 1U);
+    assert(chaos_time_config_last_error()->warnings[0].line == 2U);
+    assert(
+        strcmp(chaos_time_config_last_error()->warnings[0].reason, CHAOS_STATUS_WARN_SHADOWED) == 0
+    );
+    assert(chaos_time_config_last_error()->reason == NULL);
+
+    assert(chaos_time_config_parse_buffer(distinct, rules, &count) == 0);
+    assert(count == 2U);
+    assert(chaos_time_config_last_error()->warning_count == 0U);
+}
+
+/**
+ * @brief Proves a rule's draw key follows its text, not its place in the file.
+ *
+ * @details The key is what makes a fault reproducible, so it has to belong to the rule and
+ * not to the slot it occupies: chaos_hits_assign() hands a slot out again when a rule
+ * leaves the file, and a key from the slot index would make the next rule in that slot
+ * inherit the old one's decisions. Asserted by reloading the same two rules in the other
+ * order -- each text keeps its key -- and by adding one in front, which shifts every index
+ * and must leave the keys alone.
+ */
+static void test_draw_key_follows_the_rule_text(void)
+{
+    uint64_t first_key;
+    uint64_t second_key;
+    const chaos_time_config_state_t *state;
+
+    chaos_time_config_init();
+    write_config_text("nanosleep:LATENCY:25\nclock_gettime:LATENCY:25\n", 91);
+    assert(chaos_time_config_prepare() == 1);
+    state = chaos_time_config_active_state();
+    assert(state->rule_count == 2U);
+    assert(strcmp(state->text[0], "nanosleep:LATENCY:25") == 0);
+    first_key = state->rules[0].key;
+    second_key = state->rules[1].key;
+    assert(first_key != second_key);
+
+    write_config_text("clock_gettime:LATENCY:25\nnanosleep:LATENCY:25\n", 92);
+    g_chaos_time_cached_mtime = CHAOS_TIME_MTIME_UNKNOWN;
+    assert(chaos_time_config_prepare() == 1);
+    state = chaos_time_config_active_state();
+    assert(state->rule_count == 2U);
+    assert(state->rules[0].key == second_key);
+    assert(state->rules[1].key == first_key);
+
+    write_config_text("usleep:LATENCY:25\nclock_gettime:LATENCY:25\nnanosleep:LATENCY:25\n", 93);
+    g_chaos_time_cached_mtime = CHAOS_TIME_MTIME_UNKNOWN;
+    assert(chaos_time_config_prepare() == 1);
+    state = chaos_time_config_active_state();
+    assert(state->rule_count == 3U);
+    assert(state->rules[1].key == second_key);
+    assert(state->rules[2].key == first_key);
+    assert(state->rules[0].key != first_key && state->rules[0].key != second_key);
+
+    (void)unlink(CHAOS_TIME_CONFIG_PATH);
+}
+
+/**
+ * @brief Proves the hits file names the rule-file generation its counts belong to.
+ *
+ * @details A count of 0 after a reload can mean two things: the rule never fired, or the
+ * reload reset it. The generation tells them apart -- it rises with every published
+ * snapshot, so a reader that sees a new number knows the counts below restarted with it.
+ */
+static void test_hits_name_their_generation(void)
+{
+    char hits[1024];
+    char path[64];
+    const chaos_time_config_state_t *state;
+    uint64_t first_generation;
+
+    chaos_time_config_init();
+    write_config_text("nanosleep:LATENCY:5\n", 101);
+    assert(chaos_time_config_prepare() == 1);
+    first_generation = g_chaos_time_config_generation;
+    assert(first_generation > 0U);
+    state = chaos_time_config_active_state();
+    assert(state->rule_count == 1U);
+    chaos_hit_record(state->rules[0].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    {
+        char expected[40];
+
+        (void)snprintf(
+            expected, sizeof(expected), "generation=%llu\n", (unsigned long long)first_generation
+        );
+        assert(strncmp(g_hits_header, expected, strlen(expected)) == 0);
+    }
+
+    /* A reload publishes a new snapshot, so the number rises. */
+    write_config_text("usleep:LATENCY:5\n", 102);
+    g_chaos_time_cached_mtime = CHAOS_TIME_MTIME_UNKNOWN;
+    assert(chaos_time_config_prepare() == 1);
+    assert(g_chaos_time_config_generation == first_generation + 1U);
+    state = chaos_time_config_active_state();
+    chaos_hit_record(state->rules[0].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    {
+        char expected[40];
+
+        (void)snprintf(
+            expected,
+            sizeof(expected),
+            "generation=%llu\n",
+            (unsigned long long)(first_generation + 1U)
+        );
+        assert(strncmp(g_hits_header, expected, strlen(expected)) == 0);
+    }
+
+    (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_TIME_HITS_PREFIX, g_chaos_time_hits_file);
+    (void)unlink(path);
+    (void)unlink(CHAOS_TIME_CONFIG_PATH);
+}
+
 int main(void)
 {
+    test_hits_name_their_generation();
+    test_draw_key_follows_the_rule_text();
     /* Stat the rule file on every call so each write is seen at once; the throttle has its
      * own test. */
     g_chaos_time_check_interval_ns = 0U;
@@ -1609,6 +1838,7 @@ int main(void)
     test_rule_file_check_is_throttled();
     test_rule_qualifiers();
     test_regress_rule();
+    test_freeze_rule();
     test_read_file_rejects_changed_file();
     test_helper_functions();
     test_selector_matching();
@@ -1626,5 +1856,6 @@ int main(void)
     test_pending_hits_written_after_interval();
     test_parse_boundaries();
     test_open_errors();
+    test_shadowed_rules_warn();
     return 0;
 }

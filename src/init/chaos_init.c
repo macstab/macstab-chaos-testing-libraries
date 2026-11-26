@@ -58,11 +58,16 @@
 
 #include "chaos_init_core.h"
 #include "chaos_init_delay.h"
+#include "chaos_init_dns.h"
+#include "chaos_init_trace.h"
 #include "chaos_init_io.h"
 #include "chaos_init_memory.h"
 #include "chaos_init_net.h"
+#include "chaos_init_proc.h"
 #include "chaos_init_process.h"
+#include "chaos_init_time.h"
 #include "chaos_init_tracee.h"
+#include "chaos_init_vdso.h"
 #include "chaos_status.h"
 
 #include <errno.h>
@@ -71,10 +76,12 @@
 #include <linux/seccomp.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/inotify.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/ptrace.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -246,6 +253,33 @@ static int chaos_init_try_install(const struct sock_fprog *program)
 }
 
 /**
+ * @brief Non-zero once the application put itself under this process with PTRACE_TRACEME,
+ *        i.e. the filter has a traced group or time rules are loaded.
+ *
+ * @details File scope because the handover sets it and the serve loop reads it. The
+ * supervisor has one thread and one application, so one flag is the whole state.
+ */
+static int g_chaos_init_tracing = 0;
+
+/**
+ * @brief Non-zero once an image could not have its vDSO blinded (chaos_init_vdso.h).
+ *
+ * @details Its clock reads then never reach the filter, so time rules do nothing for that
+ * process -- the one thing this mode must not be quiet about. Reported in the status
+ * file, where a test can see it.
+ */
+static int g_chaos_init_vdso_failed = 0;
+
+/**
+ * @brief Whether this run disabled Go's Multipath TCP, kept so a status file written
+ *        again later (a failed vDSO blinding) says the same as the first one.
+ */
+static int g_chaos_init_mptcp_off = 0;
+
+/** @brief Whether the status file already says a process could not be read. */
+static int g_chaos_init_said_unreadable = 0;
+
+/**
  * @brief Child side of the handover: installs the filter if possible and sends the parent
  *        either the listener (SCM_RIGHTS) or the errno that prevented it.
  *
@@ -278,11 +312,64 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *in
         char space[CMSG_SPACE(sizeof(int))];
     } control;
     uint32_t notify = SECCOMP_RET_USER_NOTIF;
+    long traced[CHAOS_INIT_MAX_FILTER];
+    long rule_calls[16];
+    long time_clocks[16];
+    chaos_init_rule_filter_t rule_filter;
+    const chaos_init_rule_filter_t *rules = NULL;
+    size_t traced_count = 0U;
+    size_t dns_count = 0U;
+    /* [0] errno, [1] whether the parent is the tracer, [2] how many TRACE numbers follow,
+     * then the numbers: the filter is fixed once installed, so the parent has to know
+     * exactly which calls it can expect a stop for. Recomputing it there is not an option
+     * -- asking the rule cores publishes a snapshot, and the parent is the process serving
+     * notifications from them. */
+    long answer[3 + CHAOS_INIT_MAX_FILTER] = {0};
     int error = 0;
     int listener = -1;
+    int tracing;
 
-    program.len =
-        (unsigned short)chaos_init_build_filter(libs, handover, filter, CHAOS_INIT_MAX_FILTER);
+    /* Which calls need a ptrace stop is a property of the rules, and a filter is fixed
+     * once installed, so the rule file is read here, before the install. The child's copy
+     * of the configuration is thrown away at the exec; the parent reads it again for its
+     * decisions. */
+    if ((libs & CHAOS_INIT_LIB_IO) != 0U)
+    {
+        chaos_init_io_start();
+        traced_count = chaos_init_io_traced_calls(traced, sizeof(traced) / sizeof(traced[0]));
+    }
+    if ((libs & CHAOS_INIT_LIB_NET) != 0U)
+    {
+        chaos_init_net_start();
+        traced_count += chaos_init_net_traced_calls(
+            traced + traced_count, sizeof(traced) / sizeof(traced[0]) - traced_count
+        );
+    }
+    if ((libs & CHAOS_INIT_LIB_DNS) != 0U)
+    {
+        chaos_init_dns_start();
+        dns_count = chaos_init_dns_calls(rule_calls, sizeof(rule_calls) / sizeof(rule_calls[0]));
+    }
+    rule_filter.calls = rule_calls;
+    rule_filter.call_count = dns_count;
+    rule_filter.clocks = time_clocks;
+    rule_filter.clock_count = 0U;
+    if ((libs & CHAOS_INIT_LIB_TIME) != 0U)
+    {
+        chaos_init_time_start();
+        rule_filter.call_count += chaos_init_time_calls(
+            rule_calls + dns_count, sizeof(rule_calls) / sizeof(rule_calls[0]) - dns_count
+        );
+        rule_filter.clock_count =
+            chaos_init_time_clocks(time_clocks, sizeof(time_clocks) / sizeof(time_clocks[0]));
+    }
+    rules = rule_filter.call_count > 0U ? &rule_filter : NULL;
+    /* Time needs a tracer even with nothing traced: the vDSO of every image has to be
+     * blinded at its exec stop, or its clock reads never reach the filter at all. */
+    tracing = traced_count > 0U || (libs & CHAOS_INIT_LIB_TIME) != 0U;
+    program.len = (unsigned short)chaos_init_build_filter(
+        libs, handover, traced, traced_count, rules, filter, CHAOS_INIT_MAX_FILTER
+    );
     program.filter = filter;
     if (uname(&name) != 0 || !chaos_init_kernel_supported(CHAOS_INIT_RELEASE(&name)))
     {
@@ -302,6 +389,14 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *in
     {
         error = errno;
     }
+    /* Before the filter, because a RET_TRACE without a tracer fails the call with ENOSYS:
+     * the tracer has to exist the moment the filter does. PTRACE_TRACEME needs no
+     * capability -- the tracee asks for it itself -- and makes this child's parent, which
+     * is the process that owns the listener and runs the serve loop, its tracer. */
+    else if (tracing && ptrace(PTRACE_TRACEME, 0, NULL, NULL) != 0)
+    {
+        error = errno;
+    }
     else
     {
         listener = chaos_init_install(&program);
@@ -310,8 +405,12 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *in
 
     memset(&message, 0, sizeof(message));
     memset(&control, 0, sizeof(control));
-    payload.iov_base = &error;
-    payload.iov_len = sizeof(error);
+    answer[0] = error;
+    answer[1] = error == 0 && tracing;
+    answer[2] = (long)traced_count;
+    memcpy(&answer[3], traced, traced_count * sizeof(traced[0]));
+    payload.iov_base = answer;
+    payload.iov_len = sizeof(answer);
     message.msg_iov = &payload;
     message.msg_iovlen = 1;
     if (listener >= 0)
@@ -326,9 +425,23 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *in
     /* If this send fails, the parent would block in recvmsg() while this child blocks in
      * sigwait(). Returning -1 makes the child _exit(), which the parent sees as EOF. */
     *installed = listener >= 0;
-    if (CHAOS_INIT_SENDMSG(handover, &message, CHAOS_INIT_HANDOVER_FLAGS) != (ssize_t)sizeof(error))
+    if (CHAOS_INIT_SENDMSG(handover, &message, CHAOS_INIT_HANDOVER_FLAGS) !=
+        (ssize_t)sizeof(answer))
     {
         return -1;
+    }
+    /* Traced: stop once, so the parent can set its ptrace options before the application
+     * makes its first filtered call. The go signal is blocked and stays pending, so the
+     * sigwait() below returns as soon as the parent continues this thread.
+     *
+     * answer[1], not `tracing`: the stop has to be the one the parent was told about. A
+     * library that asks for a tracer (time does, with no rule loaded at all) sets
+     * `tracing` before it is known whether the filter can be installed, and on a kernel
+     * or in a container that refuses seccomp this child never called PTRACE_TRACEME --
+     * stopping then would park the application at a stop nobody continues. */
+    if (answer[1] != 0)
+    {
+        (void)raise(SIGSTOP);
     }
     return 0;
 }
@@ -374,11 +487,13 @@ static void chaos_init_exec_shell(const char *path, char **args)
  * @details MSG_CMSG_CLOEXEC marks the received fd close-on-exec atomically. Only the first
  * control message is inspected; the child sends at most one fd.
  *
- * @param error  Output: the child's errno payload, or 0 when nothing arrived.
+ * @param error   Output: the child's errno payload, or 0 when nothing arrived.
+ * @param traced  Output: non-zero when the child put itself under this process with
+ *                PTRACE_TRACEME and is now stopped, waiting for its ptrace options.
  * @return The listener; -1 when seccomp is unsupported (@p error > 0) or the child ended
  *         before sending (@p error == 0).
  */
-static int chaos_init_receive_listener(int socket, int *error)
+static int chaos_init_receive_listener(int socket, int *error, int *traced)
 {
     struct msghdr message;
     struct iovec payload;
@@ -388,21 +503,30 @@ static int chaos_init_receive_listener(int socket, int *error)
         struct cmsghdr header;
         char space[CMSG_SPACE(sizeof(int))];
     } control;
+    long answer[3 + CHAOS_INIT_MAX_FILTER] = {0};
     int listener = -1;
 
     *error = 0;
+    *traced = 0;
     memset(&message, 0, sizeof(message));
-    payload.iov_base = error;
-    payload.iov_len = sizeof(*error);
+    payload.iov_base = answer;
+    payload.iov_len = sizeof(answer);
     message.msg_iov = &payload;
     message.msg_iovlen = 1;
     message.msg_control = control.space;
     message.msg_controllen = sizeof(control.space);
-    if (recvmsg(socket, &message, MSG_CMSG_CLOEXEC) != (ssize_t)sizeof(*error))
+    if (recvmsg(socket, &message, MSG_CMSG_CLOEXEC) != (ssize_t)sizeof(answer))
     {
         *error = 0;
         return -1;
     }
+    *error = (int)answer[0];
+    *traced = (int)answer[1];
+    /* The TRACE set the child built the filter from: the deciders ask it before producing
+     * a verdict only a trace stop can carry. */
+    chaos_init_traced_set(
+        &answer[3], (size_t)answer[2] <= (size_t)CHAOS_INIT_MAX_FILTER ? (size_t)answer[2] : 0U
+    );
     header = CMSG_FIRSTHDR(&message);
     if (header != NULL && header->cmsg_type == SCM_RIGHTS)
     {
@@ -420,8 +544,16 @@ static int chaos_init_receive_listener(int socket, int *error)
 static void chaos_init_write_status(unsigned libs, const char *reason, int mptcp_off)
 {
     char text[CHAOS_STATUS_BUFFER_SIZE];
-    const size_t length =
-        chaos_init_format_status(text, sizeof(text), libs, reason, (long)getpid(), mptcp_off);
+    const size_t length = chaos_init_format_status(
+        text,
+        sizeof(text),
+        libs,
+        reason,
+        (long)getpid(),
+        mptcp_off,
+        g_chaos_init_vdso_failed,
+        chaos_init_unreadable()
+    );
 
     if (mkdir("/tmp", 01777) == 0)
     {
@@ -489,6 +621,289 @@ static void chaos_init_reply(
 }
 
 /**
+ * @brief Runs the deciders of @p libs over @p call and leaves their verdict in @p verdict.
+ *
+ * @details The libraries' system calls are disjoint except read, readv, write, writev and
+ * close: net claims them on sockets, io decides them on anything else. The first decider
+ * that recognises the call owns it, even when its verdict is PASS.
+ *
+ * Shared by the two paths a call can arrive on, so a traced call is decided by exactly the
+ * same rules, qualifiers and hit slots as a notified one.
+ */
+static void
+chaos_init_decide(unsigned libs, const chaos_init_call_t *call, chaos_init_verdict_t *verdict)
+{
+    memset(verdict, 0, sizeof(*verdict));
+    verdict->action = CHAOS_INIT_PASS;
+    /* dns first: the send that carries a query is net's call as well, and the name in it
+     * is the narrower match. A send that is no query falls through to net. */
+    if (!((libs & CHAOS_INIT_LIB_DNS) != 0U && chaos_init_dns_decide(call, verdict)) &&
+        !((libs & CHAOS_INIT_LIB_NET) != 0U && chaos_init_net_decide(call, verdict)) &&
+        !((libs & CHAOS_INIT_LIB_IO) != 0U && chaos_init_io_decide(call, verdict)) &&
+        !((libs & CHAOS_INIT_LIB_MEMORY) != 0U && chaos_init_memory_decide(call, verdict)) &&
+        !((libs & CHAOS_INIT_LIB_TIME) != 0U && chaos_init_time_decide(call, verdict)) &&
+        (libs & CHAOS_INIT_LIB_PROCESS) != 0U)
+    {
+        (void)chaos_init_process_decide(call, verdict);
+    }
+    /* A decision that could not look into the process matched no path and no endpoint,
+     * which is a rule looking applied and doing nothing. Said once, in the file a test
+     * reads, with the cure in the documentation: --cap-add SYS_PTRACE. */
+    if (chaos_init_unreadable() && g_chaos_init_said_unreadable == 0)
+    {
+        g_chaos_init_said_unreadable = 1;
+        chaos_init_write_status(libs, NULL, g_chaos_init_mptcp_off);
+    }
+}
+
+/**
+ * @brief Applies @p verdict to tracee @p tid, stopped at a seccomp stop, and continues it.
+ *
+ * @details The verdict kinds a notification answers with a reply are answered here through
+ * the registers instead: FAIL and RETURN skip the call and hand back the value, SHORTEN
+ * replaces the argument that carries the byte count, PASS runs the call untouched. A
+ * tracee that died meanwhile is simply continued -- the ptrace calls fail and there is
+ * nobody left to answer.
+ */
+static void chaos_init_trace_answer(pid_t tid, const chaos_init_verdict_t *verdict)
+{
+    chaos_init_trace_regs_t regs;
+
+    if (verdict->action != CHAOS_INIT_PASS && chaos_init_trace_read(tid, &regs) == 0)
+    {
+        if (verdict->action == CHAOS_INIT_FAIL)
+        {
+            (void)chaos_init_trace_skip(tid, &regs, -verdict->error);
+        }
+        else if (verdict->action == CHAOS_INIT_RETURN)
+        {
+            (void)chaos_init_trace_skip(tid, &regs, verdict->value);
+        }
+        else if (verdict->action == CHAOS_INIT_SHORTEN)
+        {
+            chaos_init_trace_set_arg(&regs, verdict->arg_index, (uint64_t)verdict->value);
+            (void)chaos_init_trace_write(tid, &regs);
+        }
+    }
+    (void)ptrace(PTRACE_CONT, tid, 0, 0);
+}
+
+/**
+ * @brief Sets @p tid up to run the call @p verdict asks for, data and all.
+ *
+ * @details The argument the call needs in memory goes into the tracee's stack scratch,
+ * which is dead space for the duration: nothing of the tracee runs between this stop and
+ * the substituted call.
+ *
+ * @return 0 when the thread is ready to be continued into that call; -1 otherwise.
+ */
+static int chaos_init_trace_substitute(
+    pid_t tid, chaos_init_trace_regs_t *regs, const chaos_init_verdict_t *verdict
+)
+{
+    uint64_t args[CHAOS_INIT_TRACE_ARGS];
+    unsigned index;
+
+    for (index = 0U; index < CHAOS_INIT_TRACE_ARGS; ++index)
+    {
+        args[index] = verdict->instead_args[index];
+    }
+    if (verdict->instead_size > 0U)
+    {
+        const uint64_t scratch = chaos_init_trace_scratch(regs);
+
+        if (scratch == 0U ||
+            chaos_init_write_memory(tid, scratch, verdict->instead_data, verdict->instead_size) !=
+                0)
+        {
+            return -1;
+        }
+        args[verdict->instead_arg] = scratch;
+    }
+    return chaos_init_trace_instead(tid, regs, verdict->instead_nr, args);
+}
+
+/**
+ * @brief Handles one ptrace stop of @p tid reported by @p status.
+ *
+ * @details Four kinds arrive here. A syscall-exit stop belongs to a call whose entry stop
+ * answered CHAOS_INIT_AFTER; it is told apart by PTRACE_O_TRACESYSGOOD and asks the
+ * deciders again with the call's result. A seccomp stop is a call the filter answered with
+ * TRACE: its arguments are read out of the registers, the deciders see the same
+ * chaos_init_call_t a notification would produce, and the verdict is applied to the
+ * registers. A new descendant appears in a stop of its own, and a fork or clone stops its
+ * parent; both are continued, the descendant already carrying the tracer and the options
+ * (PTRACE_O_TRACEFORK and friends inherit them). Anything else is a signal the application
+ * was about to receive, which is delivered rather than swallowed.
+ */
+static void chaos_init_trace_stop(unsigned libs, pid_t tid, int status)
+{
+    chaos_init_trace_regs_t regs;
+    chaos_init_call_t call;
+    chaos_init_verdict_t verdict;
+    unsigned index;
+
+    /* The exit stop of a call whose entry stop asked for it. The call comes from the
+     * parking table rather than from the registers, because the result overwrites the
+     * first argument on aarch64; only the result itself is read here. */
+    if (chaos_init_trace_is_syscall_stop(status))
+    {
+        long promised = 0;
+
+        /* The exit stop of a call the supervisor put there itself: what that call returned
+         * is none of the tracee's business, which is told the value the call it asked for
+         * would have reported -- or, for a call that only had to run first, gets its own
+         * call back and runs it. */
+        if (chaos_init_trace_claim(tid, &promised))
+        {
+            if (chaos_init_trace_read(tid, &regs) == 0)
+            {
+                if (promised == CHAOS_INIT_TRACE_AGAIN)
+                {
+                    if (chaos_init_trace_unpark(tid, &call))
+                    {
+                        (void)chaos_init_trace_resume(tid, &regs, call.nr, call.args);
+                    }
+                }
+                else
+                {
+                    (void)chaos_init_trace_set_result(tid, &regs, promised);
+                }
+            }
+            (void)ptrace(PTRACE_CONT, tid, 0, 0);
+            return;
+        }
+        if (chaos_init_trace_unpark(tid, &call) && chaos_init_trace_read(tid, &regs) == 0)
+        {
+            const long result = chaos_init_trace_result(&regs);
+            int claimed = 0;
+
+            /* The owner is the decider that claimed the call at the entry stop, found the
+             * same way: net takes read and write on a socket, io everything else. */
+            if ((libs & CHAOS_INIT_LIB_NET) != 0U)
+            {
+                claimed = chaos_init_net_decide_result(&call, result);
+            }
+            if (!claimed && (libs & CHAOS_INIT_LIB_IO) != 0U)
+            {
+                (void)chaos_init_io_decide_result(&call, result);
+            }
+        }
+        (void)ptrace(PTRACE_CONT, tid, 0, 0);
+        return;
+    }
+    /* A new image: its vDSO is fresh, and nothing in it has looked up a time symbol yet.
+     * This is the only moment the lookups can be made to fail, so a clock read reaches
+     * the filter at all. A process that cannot be written keeps its vDSO and reads the
+     * clock without anybody seeing it, which the status file says. */
+    if ((status >> 8) == (SIGTRAP | (PTRACE_EVENT_EXEC << 8)))
+    {
+        if ((libs & CHAOS_INIT_LIB_TIME) != 0U && chaos_init_vdso_blind(tid) < 0 &&
+            g_chaos_init_vdso_failed == 0)
+        {
+            /* Said once, in the file a test reads: this image reads the clock where
+             * nothing can see it, so its time rules do nothing. */
+            g_chaos_init_vdso_failed = 1;
+            chaos_init_write_status(libs, NULL, g_chaos_init_mptcp_off);
+        }
+        (void)ptrace(PTRACE_CONT, tid, 0, 0);
+        return;
+    }
+    if ((status >> 8) != (SIGTRAP | (PTRACE_EVENT_SECCOMP << 8)))
+    {
+        const int stopped = WSTOPSIG(status);
+        /* An event stop and a syscall stop carry SIGTRAP and must not have it
+         * re-delivered. A real signal must be, or the application would never see its own
+         * SIGTERM, SIGCHLD or SIGPIPE.
+         *
+         * The stop signals are the exception, and the reason is the whole point of this
+         * branch: without PTRACE_SEIZE the kernel reports a group-stop *and* the first
+         * stop of a newly attached descendant as a signal-delivery-stop of SIGSTOP, which
+         * cannot be told apart from a real one. Re-delivering it put every `fork` and
+         * `clone` of the application into a job-control stop before it had run an
+         * instruction -- its real parent then saw a stop notification through
+         * waitpid(WUNTRACED), and for a thread it stopped the whole group. A forking
+         * server broke. The cost of swallowing it instead is that a traced application
+         * cannot be suspended with Ctrl-Z or `kill -STOP` while chaos-init traces it,
+         * which is a limitation of the mode rather than a fault injected into the
+         * application. The earlier comment had this backwards: a group-stop never carries
+         * SIGTRAP. */
+        const int signal = (stopped == SIGTRAP || stopped == SIGSTOP || stopped == SIGTSTP ||
+                            stopped == SIGTTIN || stopped == SIGTTOU)
+                               ? 0
+                               : stopped;
+
+        (void)ptrace(PTRACE_CONT, tid, 0, (void *)(long)signal);
+        return;
+    }
+    /* A call the supervisor put back after running another one first: already decided, so
+     * deciding it again would count a second hit and put it back for ever. */
+    if (chaos_init_trace_passing(tid) || chaos_init_trace_read(tid, &regs) != 0)
+    {
+        (void)ptrace(PTRACE_CONT, tid, 0, 0);
+        return;
+    }
+    memset(&call, 0, sizeof(call));
+    call.tid = tid;
+    call.nr = (int)chaos_init_trace_number(&regs);
+    for (index = 0U; index < CHAOS_INIT_TRACE_ARGS; ++index)
+    {
+        call.args[index] = chaos_init_trace_arg(&regs, index);
+    }
+    chaos_init_decide(libs, &call, &verdict);
+    /* The effect depends on what the call returns, so it runs and stops again. The call is
+     * parked because the exit stop cannot read it back: on aarch64 the result arrives in
+     * the register that held the first argument. A table too full to park it runs the call
+     * without the effect rather than acting on the wrong descriptor. */
+    if (verdict.action == CHAOS_INIT_AFTER && chaos_init_trace_park(&call) == 0)
+    {
+        (void)ptrace(PTRACE_SYSCALL, tid, 0, 0);
+        return;
+    }
+    /* Another call in its place, or before it. Everything the second stop needs is
+     * reserved first -- the promise, and for BEFORE the parked call and the mark that lets
+     * the call through when it comes back -- so that a table too full to hold one of them
+     * leaves the call unchanged instead of losing it. */
+    if (verdict.action == CHAOS_INIT_INSTEAD || verdict.action == CHAOS_INIT_BEFORE)
+    {
+        const int before = verdict.action == CHAOS_INIT_BEFORE;
+        const long promise = before ? CHAOS_INIT_TRACE_AGAIN : verdict.value;
+
+        if (chaos_init_trace_promise(tid, promise) == 0 &&
+            (!before || (chaos_init_trace_park(&call) == 0 && chaos_init_trace_pass(tid) == 0)) &&
+            chaos_init_trace_substitute(tid, &regs, &verdict) == 0)
+        {
+            (void)ptrace(PTRACE_SYSCALL, tid, 0, 0);
+            return;
+        }
+        {
+            long dropped = 0;
+            chaos_init_call_t gone;
+
+            (void)chaos_init_trace_claim(tid, &dropped);
+            (void)chaos_init_trace_passing(tid);
+            (void)chaos_init_trace_unpark(tid, &gone);
+        }
+        verdict.action = CHAOS_INIT_PASS;
+    }
+    if (verdict.action == CHAOS_INIT_DELAY)
+    {
+        const chaos_init_verdict_t answer = chaos_init_delay_answer(&verdict);
+
+        /* Parked by tid: a thread is in one system call at a time, so that identifies it
+         * as a notification id does. It stays stopped until the timer wakes it. */
+        if (chaos_init_delay_add(
+                (uint64_t)tid, &call, chaos_init_now_ms() + verdict.delay_ms + 1U, &answer, 1
+            ) == 0)
+        {
+            return;
+        }
+        verdict = answer;
+    }
+    chaos_init_trace_answer(tid, &verdict);
+}
+
+/**
  * @brief Receives one notification, decides it and answers it now or parks it (DELAY).
  *
  * @details Order of operations, each step required by the next:
@@ -532,27 +947,27 @@ chaos_init_answer(int listener, unsigned libs, void *request, void *response, si
     {
         return;
     }
-    memset(&verdict, 0, sizeof(verdict));
-    verdict.action = CHAOS_INIT_PASS;
-    /* The libraries' system calls are disjoint except read, readv, write, writev and
-     * close: net claims them on sockets, io decides them on anything else. The first
-     * decider that recognises the call owns it, even when its verdict is PASS. */
-    if (!((libs & CHAOS_INIT_LIB_NET) != 0U && chaos_init_net_decide(&call, &verdict)) &&
-        !((libs & CHAOS_INIT_LIB_IO) != 0U && chaos_init_io_decide(&call, &verdict)) &&
-        !((libs & CHAOS_INIT_LIB_MEMORY) != 0U && chaos_init_memory_decide(&call, &verdict)) &&
-        (libs & CHAOS_INIT_LIB_PROCESS) != 0U)
-    {
-        (void)chaos_init_process_decide(&call, &verdict);
-    }
+    chaos_init_decide(libs, &call, &verdict);
     /* The decision read memory and /proc by tid: act on it only if that notification is
-     * still pending, i.e. the tid still names the waiting thread and not a reused pid. */
-    if (verdict.action != CHAOS_INIT_PASS &&
+     * still pending, i.e. the tid still names the waiting thread and not a reused pid. A
+     * PASS is checked too when the verdict writes the tracee's memory (REDIRECT): the
+     * reply cannot misfire, but the write would. */
+    if ((verdict.action != CHAOS_INIT_PASS || verdict.redirect_size > 0U) &&
         chaos_init_ioctl(listener, SECCOMP_IOCTL_NOTIF_ID_VALID, &notification->id) != 0 &&
         chaos_init_caller_gone(errno))
     {
         return;
     }
     chaos_init_net_commit(&call, &verdict);
+    /* Not a delayed clock read: that one is committed by chaos_init_on_time() when it is
+     * due, which is the whole point -- a clock read reports the moment it is answered.
+     * Committing here as well applied the value effect twice, with two independent draws:
+     * two hits for one read, `@every` and `@first` spent at twice the rate, and with a
+     * probability below 1 the two draws disagreeing about what the caller finally gets. */
+    if (verdict.action != CHAOS_INIT_DELAY)
+    {
+        chaos_init_time_commit(&call, &verdict);
+    }
     if (verdict.action == CHAOS_INIT_DELAY)
     {
         const chaos_init_verdict_t answer = chaos_init_delay_answer(&verdict);
@@ -560,7 +975,7 @@ chaos_init_answer(int listener, unsigned libs, void *request, void *response, si
         /* now_ms truncates, so "now" may be up to 1 ms late; +1 ms guarantees the call is
          * held at least delay_ms (at the cost of up to 1 ms extra). */
         if (chaos_init_delay_add(
-                notification->id, &call, chaos_init_now_ms() + verdict.delay_ms + 1U, &answer
+                notification->id, &call, chaos_init_now_ms() + verdict.delay_ms + 1U, &answer, 0
             ) == 0)
         {
             return;
@@ -587,12 +1002,24 @@ static void chaos_init_on_time(int timer, int listener, void *response, size_t r
     struct itimerspec next;
     uint64_t due = 0U;
     uint64_t id;
+    int due_traced = 0;
 
+    chaos_init_call_t due_call;
     chaos_init_verdict_t due_verdict;
 
-    while (chaos_init_delay_pop(now, &id, &due_verdict))
+    while (chaos_init_delay_pop(now, &id, &due_call, &due_verdict, &due_traced))
     {
-        chaos_init_reply(listener, id, &due_verdict, response, response_size);
+        /* A clock read reports the time of the moment it is answered, so the value is
+         * read and written here rather than when the call was parked. */
+        chaos_init_time_commit(&due_call, &due_verdict);
+        if (due_traced)
+        {
+            chaos_init_trace_answer((pid_t)id, &due_verdict);
+        }
+        else
+        {
+            chaos_init_reply(listener, id, &due_verdict, response, response_size);
+        }
     }
     if (chaos_init_tracee_pending() && now - last_flush_ms >= CHAOS_HITS_INTERVAL_MS)
     {
@@ -616,12 +1043,19 @@ static void chaos_init_on_time(int timer, int listener, void *response, size_t r
 }
 
 /**
- * @brief Reaps every exited child, the application and adopted orphans alike, with
- *        waitpid(-1, WNOHANG) until none is left (one SIGCHLD may stand for several exits).
+ * @brief Reaps every exited child, the application and adopted orphans alike, and hands
+ *        every ptrace stop to chaos_init_trace_stop(), with waitpid(-1, WNOHANG) until
+ *        none is left (one SIGCHLD may stand for several events).
+ *
+ * @details While the application is traced, the same SIGCHLD reports exits and stops, and
+ * a stop is not an exit: treating one as an exit would report the application as finished
+ * at its first traced system call. Nothing stops unless the filter has a traced group,
+ * so a run without data effects takes the same path it always did.
+ *
  * @param child_status  Output: the application's wait status, set only when it was reaped.
  * @return 1 when @p child was among those reaped, else 0.
  */
-static int chaos_init_reap(pid_t child, int *child_status)
+static int chaos_init_reap(unsigned libs, pid_t child, int *child_status)
 {
     int found = 0;
 
@@ -634,11 +1068,120 @@ static int chaos_init_reap(pid_t child, int *child_status)
         {
             return found;
         }
+        if (WIFSTOPPED(status))
+        {
+            chaos_init_trace_stop(libs, pid, status);
+            continue;
+        }
+        /* Whatever this thread still held in the trace tables goes with it: a thread
+         * killed on the way to the exit stop of a traced call never reaches the stop that
+         * would have taken its entry. */
+        chaos_init_trace_forget(pid);
         if (pid == child)
         {
             *child_status = status;
             found = 1;
         }
+    }
+}
+
+/**
+ * @brief Directory the rule files live in: every one of them is `/tmp/.chaos-<lib>.conf`,
+ *        a documented path, so one watch covers all six.
+ */
+#define CHAOS_INIT_RULE_DIR "/tmp"
+
+/**
+ * @brief Whether @p name is a rule file of one of the libraries.
+ *
+ * @details `.chaos-<lib>.conf`, matched by its ends. This is a cost measure, not a
+ * correctness one: a reload the rule files did not need stats them and returns, so
+ * answering every event would be right and wasteful. The watched directory is `/tmp`,
+ * where every program in the container puts its temporary files, and the libraries their
+ * own status and hits files -- waking the supervisor and stat'ing six files for each of
+ * those is what this avoids.
+ */
+static int chaos_init_rule_file(const char *name)
+{
+    const size_t length = strlen(name);
+
+    return length > sizeof(".chaos-.conf") - 1U && strncmp(name, ".chaos-", 7U) == 0 &&
+           strcmp(name + length - (sizeof(".conf") - 1U), ".conf") == 0;
+}
+
+/**
+ * @brief Re-reads the rule files of @p libs, as the first decision of a call would.
+ *
+ * @details Publishing a rule file also writes that library's status file, which is the
+ * point of doing it without a call: a rule file nobody has called into yet is reported
+ * all the same.
+ */
+static void chaos_init_reload(unsigned libs)
+{
+    if ((libs & CHAOS_INIT_LIB_IO) != 0U)
+    {
+        chaos_init_io_reload();
+    }
+    if ((libs & CHAOS_INIT_LIB_NET) != 0U)
+    {
+        chaos_init_net_reload();
+    }
+    if ((libs & CHAOS_INIT_LIB_DNS) != 0U)
+    {
+        chaos_init_dns_reload();
+    }
+    if ((libs & CHAOS_INIT_LIB_TIME) != 0U)
+    {
+        chaos_init_time_reload();
+    }
+    if ((libs & CHAOS_INIT_LIB_MEMORY) != 0U)
+    {
+        chaos_init_memory_reload();
+    }
+    if ((libs & CHAOS_INIT_LIB_PROCESS) != 0U)
+    {
+        chaos_init_process_reload();
+    }
+}
+
+/**
+ * @brief Reads the pending watch events and reloads the rule files when one of them names
+ *        a rule file.
+ *
+ * @details One reload for the whole batch, and of every library rather than the one named:
+ * a prepare whose file did not change stats it and returns, which is cheaper than keeping
+ * a name per library here. Events the kernel could not queue are dropped by it
+ * (IN_Q_OVERFLOW); the next change, or the next intercepted call, is seen anyway.
+ *
+ * One read per call, not a drain: a directory as busy as `/tmp` can deliver events as
+ * fast as they are read, and a loop here would hold the serve loop away from the
+ * notifications it exists for. What is left queued makes the next poll() return at once.
+ */
+static void chaos_init_watched(int watcher, unsigned libs)
+{
+    union
+    {
+        struct inotify_event event; /* the alignment read(2) requires of the buffer */
+        char bytes[4096];
+    } buffer;
+    const ssize_t got = read(watcher, buffer.bytes, sizeof(buffer.bytes));
+    size_t offset = 0U;
+    int reload = 0;
+
+    while (got > 0 && offset + sizeof(struct inotify_event) <= (size_t)got)
+    {
+        const struct inotify_event *event =
+            (const struct inotify_event *)(const void *)(buffer.bytes + offset);
+
+        if (event->len > 0U && chaos_init_rule_file(event->name))
+        {
+            reload = 1;
+        }
+        offset += sizeof(struct inotify_event) + event->len;
+    }
+    if (reload)
+    {
+        chaos_init_reload(libs);
     }
 }
 
@@ -658,14 +1201,37 @@ static int chaos_init_reap(pid_t child, int *child_status)
  * their memory, so their path and endpoint selectors stop matching. If fork() fails, no
  * copy exists and the leftovers get ENOSYS.
  *
- * @return 1 in the background copy, 0 in the process that is to exit (no listener, PID 1,
- *         fork() failed, or the parent side of the fork).
+ * **While tracing, no copy is made and this process keeps serving.** A ptrace link is not
+ * inherited across `fork`, so the copy cannot be the tracer: it would have to attach to
+ * each tracee again, which needs the capability, loses the stop they are sitting in and
+ * would have to set `PTRACE_O_TRACESECCOMP` once more -- a race it cannot win. Meanwhile
+ * the original exiting detaches every tracee, and the kernel then fails each call in the
+ * TRACE group with ENOSYS. So the exit code waits for the last leftover instead, which is
+ * the one thing this function exists to avoid; it is the smaller cost, because the
+ * alternative is a fault no rule asked for. Without tracing nothing changes.
+ *
+ * @return 0 in the process that is to exit (no listener, PID 1, fork() failed, or the
+ *         parent side of the fork), 1 in the background copy, and 2 in the original when
+ *         it stays on as the tracer. The two are not interchangeable: the copy has no
+ *         children and no tracees, so it drains signals and ignores them, while the
+ *         original still has to reap its tracees and answer their stops -- an orphan left
+ *         sitting at a stop nobody answers never exits, and then nothing ever reports that
+ *         the filter is unused either.
  */
 static int chaos_init_serve_the_rest(int listener)
 {
     int null_fd;
 
-    if (listener < 0 || getpid() == 1 || fork() != 0)
+    if (listener < 0 || getpid() == 1)
+    {
+        return 0;
+    }
+    /* The tracer cannot be handed over, so it stays here. */
+    if (g_chaos_init_tracing)
+    {
+        return 2;
+    }
+    if (fork() != 0)
     {
         return 0;
     }
@@ -688,6 +1254,13 @@ static int chaos_init_serve_the_rest(int listener)
  *        are unsigned long arrays so they carry the alignment of the kernel structures
  *        they are cast to.
  */
+#ifdef CHAOS_INIT_NO_MAIN
+/* A unit test includes this file to reach the decision helpers above -- the reply it sends
+ * for each verdict, the rule-file name filter, the inotify drain -- and brings its own
+ * main(). Everything below needs a container, a filter and a tracee, which is what the
+ * seccomp suite provides; the coverage gate records the share this leaves uncovered rather
+ * than leaving the file unmeasured, which is how five defects in here stayed invisible. */
+#else
 int main(int argc, char **argv)
 {
     static unsigned long request[CHAOS_INIT_NOTIF_BUFFER / sizeof(unsigned long)];
@@ -701,6 +1274,7 @@ int main(int argc, char **argv)
     int error;
     int signals;
     int timer;
+    int watcher = -1;
     int child_status = 0;
     int serving_the_rest = 0;
     int found;
@@ -800,8 +1374,31 @@ int main(int argc, char **argv)
     /* Closing our copy of the child's end makes recvmsg() see EOF if the child dies. */
     (void)close(pair[1]);
 
-    listener = chaos_init_receive_listener(pair[0], &error);
+    listener = chaos_init_receive_listener(pair[0], &error, &g_chaos_init_tracing);
     (void)close(pair[0]);
+    /* The child is stopped in the SIGSTOP it raised after the handover. Its options are
+     * set here, before it can make a filtered call: TRACESECCOMP turns a RET_TRACE into a
+     * stop, and the three descendant options matter just as much -- the filter survives
+     * fork and exec, and a RET_TRACE with no tracer fails the call with ENOSYS, so every
+     * descendant has to be attached as it appears. */
+    if (g_chaos_init_tracing)
+    {
+        int stop_status = 0;
+        if (waitpid(child, &stop_status, 0) != child || !WIFSTOPPED(stop_status) ||
+            ptrace(
+                PTRACE_SETOPTIONS,
+                child,
+                0,
+                (void *)(long)(PTRACE_O_TRACESECCOMP | PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK |
+                               PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC)
+            ) != 0)
+        {
+            (void)kill(child, SIGKILL);
+            (void)waitpid(child, &child_status, 0);
+            (void)fprintf(stderr, "chaos-init: cannot trace the application\n");
+            return CHAOS_INIT_EXIT_HANDOVER;
+        }
+    }
     if (listener >= 0 && (syscall(SYS_seccomp, SECCOMP_GET_NOTIF_SIZES, 0, &sizes) != 0 ||
                           sizes.seccomp_notif > CHAOS_INIT_NOTIF_BUFFER ||
                           sizes.seccomp_notif_resp > CHAOS_INIT_NOTIF_BUFFER))
@@ -834,17 +1431,33 @@ int main(int argc, char **argv)
     {
         chaos_init_memory_start();
     }
+    if (listener >= 0 && (options.libs & CHAOS_INIT_LIB_DNS) != 0U)
+    {
+        chaos_init_dns_start();
+    }
+    if (listener >= 0 && (options.libs & CHAOS_INIT_LIB_TIME) != 0U)
+    {
+        chaos_init_time_start();
+    }
     if (listener >= 0 && (options.libs & CHAOS_INIT_LIB_PROCESS) != 0U)
     {
         chaos_init_process_start(child);
     }
+    g_chaos_init_mptcp_off = mptcp_off && listener >= 0;
     chaos_init_write_status(
         options.libs,
         listener >= 0 ? NULL : chaos_init_unsupported_reason(error),
-        mptcp_off && listener >= 0
+        g_chaos_init_mptcp_off
     );
     /* Status first, then go: whoever sees the application run reads this run's status. */
     (void)kill(child, CHAOS_INIT_GO_SIGNAL);
+    /* The go signal is blocked and stays pending, so continuing the stopped child lets its
+     * sigwait() take it. Signal 0: the SIGSTOP it raised is swallowed rather than delivered
+     * again. */
+    if (g_chaos_init_tracing)
+    {
+        (void)ptrace(PTRACE_CONT, child, 0, 0);
+    }
 
     /* Created after go; signals that arrived meanwhile are still pending (blocked) and
      * are read from the signalfd on the first iteration. */
@@ -856,10 +1469,32 @@ int main(int argc, char **argv)
         (void)kill(child, SIGKILL);
         return CHAOS_INIT_EXIT_HANDOVER;
     }
+    /* A replaced rule file is read when it is replaced, not only when the next intercepted
+     * call arrives: that call may be seconds away, or may never come in a container that
+     * is waiting for the rules to be in place, and the status file a test reads to see
+     * them accepted is written by the reload. The watch is on the directory because the
+     * file is delivered by rename (`mv -f`), which a watch on the file itself never sees.
+     * Without rules to apply (no listener) there is nothing to reload, and a watch that
+     * cannot be created costs nothing: every rule file is still read by the next call. */
+    if (listener >= 0)
+    {
+        watcher = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (watcher >= 0 &&
+            inotify_add_watch(
+                watcher, CHAOS_INIT_RULE_DIR, IN_MOVED_TO | IN_CLOSE_WRITE | IN_DELETE
+            ) < 0)
+        {
+            (void)close(watcher);
+            watcher = -1;
+        }
+    }
     for (;;)
     {
-        struct pollfd watched[3];
+        struct pollfd watched[4];
         nfds_t count = 2;
+        /* Which slot the watch got, or 0 when there is none: the slots after the timer
+         * depend on what exists, and a count alone has been a trap here before. */
+        nfds_t watch_slot = 0;
 
         watched[0].fd = signals;
         watched[0].events = POLLIN;
@@ -871,6 +1506,13 @@ int main(int argc, char **argv)
             watched[2].events = POLLIN;
             count = 3;
         }
+        if (watcher >= 0)
+        {
+            watch_slot = count;
+            watched[count].fd = watcher;
+            watched[count].events = POLLIN;
+            ++count;
+        }
         if (poll(watched, count, -1) < 0)
         {
             continue; /* EINTR */
@@ -881,7 +1523,17 @@ int main(int argc, char **argv)
 
             if (read(signals, &info, sizeof(info)) == (ssize_t)sizeof(info))
             {
-                if (serving_the_rest)
+                if (serving_the_rest == 2)
+                {
+                    /* The original, still the tracer: its tracees report their stops here,
+                     * and a stop nobody answers leaves the process sitting in it for
+                     * ever. The application is already reaped, so the exit code is kept.
+                     */
+                    int ignored = 0;
+
+                    (void)chaos_init_reap(options.libs, -1, &ignored);
+                }
+                else if (serving_the_rest)
                 {
                     /* Background copy: the application is gone and this copy has no
                      * children; signals are drained and ignored. */
@@ -890,15 +1542,15 @@ int main(int argc, char **argv)
                 {
                     (void)kill(child, (int)info.ssi_signo);
                 }
-                else if (chaos_init_reap(child, &child_status))
+                else if (chaos_init_reap(options.libs, child, &child_status))
                 {
                     /* Every process's hits are on disk before the exit code is reported. */
                     chaos_init_tracee_flush(1);
-                    if (!chaos_init_serve_the_rest(listener))
+                    serving_the_rest = chaos_init_serve_the_rest(listener);
+                    if (serving_the_rest == 0)
                     {
                         return chaos_init_exit_code(child_status);
                     }
-                    serving_the_rest = 1;
                 }
             }
         }
@@ -916,11 +1568,11 @@ int main(int argc, char **argv)
         /* One notification per iteration keeps signals and due delays from starving
          * under a notification storm. POLLIN wins over POLLHUP; a hang-up is seen on a
          * later iteration once nothing is left to receive. */
-        if (count == 3 && (watched[2].revents & POLLIN) != 0)
+        if (listener >= 0 && (watched[2].revents & POLLIN) != 0)
         {
             chaos_init_answer(listener, options.libs, request, response, sizes.seccomp_notif_resp);
         }
-        else if (count == 3 && (watched[2].revents & (POLLHUP | POLLERR)) != 0)
+        else if (listener >= 0 && (watched[2].revents & (POLLHUP | POLLERR)) != 0)
         {
             /* No process uses the filter any more (Linux 5.8+). Parked calls died with
              * their threads. The main process keeps running until SIGCHLD reports the
@@ -930,8 +1582,13 @@ int main(int argc, char **argv)
             if (serving_the_rest)
             {
                 chaos_init_tracee_flush(1);
-                return 0;
+                /* The original kept the application's code to report; the copy has none. */
+                return serving_the_rest == 2 ? chaos_init_exit_code(child_status) : 0;
             }
+        }
+        if (watch_slot != 0 && (watched[watch_slot].revents & POLLIN) != 0)
+        {
+            chaos_init_watched(watcher, options.libs);
         }
         if (listener >= 0)
         {
@@ -939,3 +1596,4 @@ int main(int argc, char **argv)
         }
     }
 }
+#endif

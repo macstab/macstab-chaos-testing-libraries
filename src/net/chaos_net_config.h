@@ -41,6 +41,7 @@
 #include "chaos_policy.h"
 #include "chaos_status.h"
 
+#include <limits.h>
 #include <netinet/in.h>
 #include <sys/uio.h>
 
@@ -88,6 +89,7 @@ typedef enum chaos_net_operation
  *   | RESET   | close      | SO_LINGER {1, 0} before the close: the peer gets an RST |
  *   | TRICKLE | recv       | A stream receive returns at most chunk_bytes |
  *   | DUP     | recv       | The socket's previous payload is delivered once more |
+ *   | DROP    | send       | Datagram sockets: the byte count is reported, nothing is sent |
  *
  * chaos_net_effect_allowed() enforces the Operations column at parse time.
  * CHAOS_NET_EFFECT_INVALID (-1) is the parser's failure value.
@@ -101,7 +103,10 @@ typedef enum chaos_net_effect
     CHAOS_NET_EFFECT_TIMEOUT,      /**< POLL-only: wait out the timeout, return 0. */
     CHAOS_NET_EFFECT_RESET,        /**< CLOSE-only: abortive close, the peer receives an RST. */
     CHAOS_NET_EFFECT_TRICKLE,      /**< RECV-only: return at most chunk_bytes per call. */
-    CHAOS_NET_EFFECT_DUP           /**< RECV-only: deliver the previous payload once more. */
+    CHAOS_NET_EFFECT_DUP,          /**< RECV-only: deliver the previous payload once more. */
+    CHAOS_NET_EFFECT_DROP,         /**< SEND-only, datagrams: report the send, send nothing. */
+    CHAOS_NET_EFFECT_THROTTLE,     /**< SEND-only, streams: hold the send to a byte rate. */
+    CHAOS_NET_EFFECT_REDIRECT      /**< CONNECT-only: connect to another address instead. */
 } chaos_net_effect_t;
 
 /**
@@ -148,8 +153,11 @@ typedef enum chaos_net_endpoint_kind
  *     for each NUL (as /proc/net/unix shows it); an unnamed socket has an empty path,
  *     which only the wildcards match.
  *   - `wildcard_host != 0`: only `kind` and `port` take part in matching.
+ *   - `prefix_len`: how many leading address bits a selector compares. 32 or 128 for a
+ *     literal address, the written length for a `/N` prefix, 0 for a wildcard host, ANY
+ *     and UNIX. Unused on runtime endpoints (0).
  *   - `selector_len`: strlen of the selector text; breaks ties between rules of equal
- *     rank (longer = more specific). 0 for runtime endpoints.
+ *     rank and prefix length (longer = more specific). 0 for runtime endpoints.
  *
  * @par Ownership: by value, no heap; runtime endpoints live on the wrapper's stack.
  */
@@ -158,7 +166,25 @@ typedef struct chaos_net_endpoint
     chaos_net_endpoint_kind_t kind; /**< Address family + socket type discriminant. */
     size_t selector_len;            /**< Byte length of the original selector text; tie-breaker. */
     uint16_t port;                  /**< Port in host byte order; 0 for UNIX or ANY endpoints. */
-    int wildcard_host;              /**< Non-zero if the host part is `*` (or no address yet). */
+    /**
+     * @brief Address bits a selector compares: 32/128 for a literal, N for `/N`, 0 otherwise.
+     *
+     * A literal address is the `/32` (or `/128`) case of a prefix, so one masked comparison
+     * serves both and there is no second kind of IP selector. It is also the specificity
+     * stage between rank and selector text: of two prefixes that both contain an address,
+     * the longer one is meant.
+     */
+    unsigned int prefix_len;
+    int wildcard_host; /**< Non-zero if the host part is `*` (or no address yet). */
+    /**
+     * @brief Non-zero when this endpoint is a dual-stack wildcard listener.
+     *
+     * Set only on runtime endpoints, never on selectors: the address is the unspecified
+     * IPv6 address (`[::]`) and the socket has `IPV6_V6ONLY` off, so the kernel serves
+     * IPv4 and IPv6 clients on it. Such a listener is matched by a wildcard-host tcp4
+     * selector as well as a tcp6 one on the same port (likewise udp4 and udp6).
+     */
+    int dual_stack_wildcard;
     /** @brief Address storage; the active member follows @c kind. */
     union
     {
@@ -176,6 +202,8 @@ typedef struct chaos_net_endpoint
  *   - CORRUPT, TIMEOUT, DUP, RESET: `probability`.
  *   - LATENCY: `latency_ms`; `probability` is unused (0). The qualifiers still gate it.
  *   - TRICKLE: `chunk_bytes` (>= 1); `probability` is fixed at 1.0.
+ *   - THROTTLE: `rate_bps` (>= 1); `probability` is fixed at 1.0.
+ *   - REDIRECT: `redirect` and `probability`.
  *
  * Probabilities are sampled per call from the calling thread's PRNG. Wrappers copy the
  * rule out of the snapshot (seqlock-validated) and may set `call_size` on their copy.
@@ -192,6 +220,8 @@ typedef struct chaos_net_rule
     double probability;              /**< Firing probability [0.0, 1.0]; unused for LATENCY. */
     unsigned int latency_ms;         /**< LATENCY: delay in ms, at most UINT32_MAX. */
     unsigned int chunk_bytes;        /**< TRICKLE: most bytes one receive call returns. */
+    uint64_t rate_bps;               /**< THROTTLE: bytes per second, 1 .. 4294967295. */
+    chaos_net_redirect_t redirect;   /**< REDIRECT: where the connect goes instead. */
     /** Qualifiers written after the rule (`@first`, `@from`, `@until`, `@size`). */
     chaos_rule_policy_t policy;
     /**
@@ -203,7 +233,80 @@ typedef struct chaos_net_rule
     chaos_hit_slot_t *hit;
     /** Generation of @c hit when the rule was published; a later one means the rule left. */
     uint64_t hit_generation;
+    /**
+     * Draw key of the rule: `mix(process seed ^ hash(rule text))`, set when the snapshot is
+     * published. From the text, not the slot index: chaos_hits_assign() hands slots out
+     * again and another rule would inherit the key. See chaos_net_rule_draw().
+     */
+    uint64_t key;
+    /**
+     * Base of this call's draws, set by chaos_net_rule_should_trigger() from the key and
+     * the rule's evaluation number; the effects derive their samples from it. Belongs to
+     * the one call this copy was made for, not to the rule as parsed.
+     */
+    uint64_t draw_base;
 } chaos_net_rule_t;
+
+/**
+ * @brief Starts this call's draws: records the rule's evaluation number and derives the
+ *        base every sample of this call comes from.
+ *
+ * @details Two stages, not one. The first turns (rule, evaluation) into a base, the second
+ * turns (base, draw number) into a sample, so a rule that takes three draws cannot collide
+ * with its own next evaluation -- which is what a single `key + n * K + d` does as soon as
+ * `d` reaches K, a constant the next effect added would break silently.
+ *
+ * The evaluation number lives in the hit slot, so it survives a reload that keeps the rule
+ * and restarts in a forked child, whose lineage differs anyway.
+ *
+ * @param rule Rule copy for this call; NULL is a no-op returning 0. A rule outside a
+ *             snapshot (unit tests) has no slot and is evaluation 1 every time.
+ * @return The number of this evaluation of the rule, counting from 1; what `@every=N`
+ *         divides and what the draws are derived from.
+ */
+static inline uint64_t chaos_net_rule_draw_begin(chaos_net_rule_t *rule)
+{
+    uint64_t evaluation = 0U;
+
+    if (rule == NULL)
+    {
+        return 0U;
+    }
+    /* Only through a slot that is still this rule's: every other use of a slot checks
+     * the generation, and a rule copy held across a reload would otherwise bump the
+     * counter of whoever owns the slot now -- shifting that rule's `@every` phase and
+     * its draw numbering. */
+    if (rule->hit != NULL && chaos_hit_slot_current(rule->hit, rule->hit_generation))
+    {
+        evaluation = __sync_fetch_and_add(&rule->hit->evaluations, UINT64_C(1));
+    }
+    rule->draw_base = chaos_net_prng_mix((rule->key ^ g_chaos_net_lineage) + evaluation);
+    return evaluation + 1U;
+}
+
+/**
+ * @brief Sample @p draw of this call, uniform in [0, 2^32).
+ *
+ * @param rule Rule copy whose chaos_net_rule_draw_begin() ran.
+ * @param draw Which draw of this call: 0 is the probability, the effects follow.
+ * @return The sample.
+ */
+static inline uint32_t chaos_net_rule_draw(const chaos_net_rule_t *rule, uint64_t draw)
+{
+    return (uint32_t)(chaos_net_prng_mix(rule->draw_base + draw) >> 32);
+}
+
+/** @brief Draw number of the probability decision; effects number their draws after it. */
+#define CHAOS_NET_DRAW_PROBABILITY UINT64_C(0)
+
+/** @brief Draw number of CORRUPT's byte index. */
+#define CHAOS_NET_DRAW_FIRST_EFFECT UINT64_C(1)
+
+/** @brief Draw number of CORRUPT's bit index. */
+#define CHAOS_NET_DRAW_SECOND_EFFECT UINT64_C(2)
+
+/** @brief Draw number selecting one message of a `recvmmsg` batch to corrupt. */
+#define CHAOS_NET_DRAW_MESSAGE UINT64_C(3)
 
 /**
  * @brief Resets the rule subsystem to "nothing loaded yet".
@@ -292,8 +395,9 @@ int chaos_net_config_targets_loaded(chaos_net_operation_t operation);
  * When this returns non-zero, chaos_net_config_match_either_loaded() would pick the same
  * rule whatever the other end is, so the caller need not resolve the other end (two
  * system calls). It returns 0, and the caller searches both ends, when nothing matches or
- * some rule for @p operation has a higher rank (chaos_net_endpoint_selector_rank()) or the
- * same rank with a longer selector than the match.
+ * some rule for @p operation could be more specific than the match on another endpoint:
+ * a higher rank (chaos_net_endpoint_selector_rank()), or the same rank with a longer
+ * address prefix, or both the same with a longer selector text.
  *
  * @param operation The operation class of the intercepted call.
  * @param endpoint  The end that wins ties. Must not be NULL.
@@ -435,6 +539,12 @@ int chaos_net_config_select_endpoint_rule(
  *
  * @details An array longer than the kernel accepts is not read: the call fails
  * anyway, and its count need not describe memory the caller owns.
+ *
+ * A total above SSIZE_MAX is no byte count either, for the same reason: the call returns
+ * `ssize_t`, so the kernel rejects it with EINVAL and it transfers nothing. Summing it
+ * anyway would wrap and hand the gates a small number for a huge request -- `@size<10`
+ * would match a call asking for 2^64 bytes. The bound is checked per segment, before the
+ * addition that would wrap.
  */
 static inline uint64_t chaos_net_iovec_size(const struct iovec *iov, int iovcnt)
 {
@@ -447,6 +557,10 @@ static inline uint64_t chaos_net_iovec_size(const struct iovec *iov, int iovcnt)
     }
     for (index = 0; index < iovcnt; ++index)
     {
+        if ((uint64_t)iov[index].iov_len > (uint64_t)SSIZE_MAX - total)
+        {
+            return CHAOS_POLICY_NO_SIZE;
+        }
         total += (uint64_t)iov[index].iov_len;
     }
     return total;

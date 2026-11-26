@@ -675,7 +675,37 @@ static void test_constructor_init(void)
     assert(g_config_init_calls == config_calls_before + 1);
     assert(g_config_prepare_calls == prepare_calls_before + 1);
     assert(g_chaos_net_process_seed != 0U);
-    assert(g_chaos_net_tls_prng_state != 0U);
+    /* The lineage starts at 0: this is the process that loaded the library. */
+    assert(g_chaos_net_lineage == 0U);
+}
+
+/**
+ * @brief Proves `CHAOS_SEED` fixes the process seed, and that anything unusable falls back
+ *        to `/dev/urandom` rather than refusing to load.
+ *
+ * @details The seed decides which faults fire, so a test that wants to reproduce a run
+ * sets it. Refusing the rule file over an environment variable would cost the test its
+ * rules, so an unusable value is ignored. `-1` is not accepted as 2^64-1, which strtoull()
+ * would have wrapped it into without a word.
+ */
+static void test_seed_from_environment(void)
+{
+    static const char *const unusable[] = {"", "12x", "x", "-1", "99999999999999999999999"};
+    const uint64_t from_urandom = UINT64_C(0x1122334455667788);
+    size_t index;
+
+    assert(setenv("CHAOS_SEED", "42", 1) == 0);
+    assert(chaos_net_seed() == UINT64_C(42));
+    assert(setenv("CHAOS_SEED", "18446744073709551615", 1) == 0);
+    assert(chaos_net_seed() == UINT64_MAX);
+
+    for (index = 0U; index < sizeof(unusable) / sizeof(unusable[0]); ++index)
+    {
+        assert(setenv("CHAOS_SEED", unusable[index], 1) == 0);
+        assert(chaos_net_seed() == from_urandom);
+    }
+    assert(unsetenv("CHAOS_SEED") == 0);
+    assert(chaos_net_seed() == from_urandom);
 }
 
 /** @brief Run-once guard driven by the re-entrant initialiser below. */
@@ -718,5 +748,6 @@ int main(void)
     test_seed_fallback_paths();
 #endif
     test_constructor_init();
+    test_seed_from_environment();
     return 0;
 }

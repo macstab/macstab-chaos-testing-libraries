@@ -38,6 +38,7 @@ dependency is stated.
 - [15. Stack Walkdown](#15-stack-walkdown)
 - [16a. glibc Alternate Entry Points: LFS Names and _FORTIFY_SOURCE](#16a-glibc-alternate-entry-points-lfs-names-and-_fortify_source)
 - [16b. Non-Coverage: splice, tee, vmsplice](#16b-non-coverage-splice-tee-vmsplice)
+- [16e. Non-Coverage: asynchronous submission (`io_submit`, io_uring)](#16e-non-coverage-asynchronous-submission-io_submit-io_uring)
 - [16c. O_DIRECT and Kernel Bypass Implications](#16c-o_direct-and-kernel-bypass-implications)
 - [16. References](#16-references)
 
@@ -48,13 +49,17 @@ dependency is stated.
 `libchaos-io` makes a dynamically linked Linux process observe storage failures on
 the files you name. It interposes the C library's file and descriptor functions
 through `LD_PRELOAD`, matches each call against the rule file
-`/tmp/.chaos-io.conf` by path, and applies one of four effects:
+`/tmp/.chaos-io.conf` by path, and applies one of its effects:
 
 | Effect | When | What the caller sees |
 |---|---|---|
 | ERRNO | before the real call | `-1` (or the function's error value) with one of 8 errno values; the real call does not run (except `close`, §4) |
 | LATENCY | before the real call | the call completes normally, N ms later |
 | TORN | before the real call | a successful short write: the real call runs with a byte count in `[1, n-1]` |
+| DROP | instead of the real call | a successful full write that never happened: the byte count is reported, nothing is written |
+| THROTTLE | before the real call | a successful short write, again and again: the real call runs with what the rate allows, and a call that would get nothing waits for a tenth of a second's worth or is told `EAGAIN` |
+| FREE | after a successful `statfs` | the free-space counts of the answer, as if that many bytes were left |
+| FULL | after a successful `statfs` | the free-space counts of the answer as zero: no space left |
 | CORRUPT | after a successful read | the bytes returned, with exactly one bit flipped |
 
 The library is a fault injector for storage paths, not a filesystem simulator: it
@@ -126,7 +131,11 @@ the forms most programs use: the JDK deletes with `unlink()` and moves with
   (`items * size` for `fread`, `strlen(line)` for `fgets`, the returned length for
   `getdelim`, one byte for `fgetc`/`getc`).
 - TORN never applies: a short `fwrite` signals an error in stdio, not a partial
-  success. A TORN rule matched on a stream does nothing and counts no hit.
+  success. A TORN rule matched on a stream does nothing and counts no hit. DROP is
+  ignored the same way: stdio buffers, so what a dropped `fwrite` would lose is not
+  the bytes of one system call. THROTTLE is ignored for both reasons at once -- a
+  short `fwrite` is an error, and the bytes of an `fwrite` are not the bytes of a
+  write.
 - A rule fires once per stdio call, not once per system call the C library makes
   while filling or flushing its buffer.
 - Descriptors 0-2 are never faulted, so `printf`, `puts`, `putchar` and `getchar`,
@@ -151,8 +160,8 @@ the forms most programs use: the JDK deletes with `unlink()` and moves with
 
 - Static binaries in LD_PRELOAD mode (use SECCOMP mode).
 - Inode-identity matching: matching is by path string.
-- Writes through `mmap()` mappings, io_uring, POSIX AIO, `splice`/`tee`/`vmsplice`
-  (§16b).
+- Writes through `mmap()` mappings, `splice`/`tee`/`vmsplice` (§16b), io_uring and
+  POSIX AIO (§16e).
 - Network, DNS, time, process or memory faults (the other `libchaos-<lib>` libraries).
 - A public API: the only interface is the rule file and the files it produces.
 
@@ -242,7 +251,7 @@ the host's.
 Stable: the preload model, the rule file path, the rule grammar, the operation
 names, the effect semantics, the status and hits file formats.
 
-Internal: file layout under `src/`, helper names, cache size (32 slots), PRNG
+Internal: file layout under `src/`, helper names, cache size (32 slots), draw
 algorithm, constructor ordering.
 
 ## 3. Key Concepts and Terminology
@@ -252,9 +261,11 @@ algorithm, constructor ordering.
 | rule | One parsed line of `/tmp/.chaos-io.conf`. |
 | selector | The path part of a rule: an absolute path prefix, a literal name such as `pipe:[1234]`, or `*`. |
 | operation | The logical operation (`write`, `truncate`, ...); several functions map to one (§1). |
-| effect | ERRNO, LATENCY, TORN or CORRUPT. |
-| probability | Chance in [0, 1] that a matched ERRNO, TORN or CORRUPT rule fires. LATENCY has none. |
-| qualifier | `@first`, `@from`, `@until`, `@size` written after the rule ([DSL.md §7.1](DSL.md#71-todays-surface)). |
+| effect | ERRNO, LATENCY, TORN, DROP, THROTTLE, FREE, FULL or CORRUPT. |
+| probability | Chance in [0, 1] that a matched rule fires. For ERRNO, TORN, DROP and CORRUPT it is the value field; for LATENCY the optional `@probability` after the milliseconds, 1.0 without one. THROTTLE has none: a rate that applies to every other call is not a rate. |
+| rate | THROTTLE's value field: bytes per second, 1 to 4294967295. |
+| token bucket | Where a rate is kept: one per (rule, descriptor), holding at most one second's worth of bytes and refilling at the rate. |
+| qualifier | `@first`, `@every`, `@at`, `@from`, `@until`, `@size` written after the rule ([DSL.md §7.1](DSL.md#71-todays-surface)). |
 | hit | One application of a rule's effect; counted per rule in the hits file. |
 | active snapshot | The published rule array readers match against. |
 | inactive snapshot | The second array, rewritten by the thread that owns a reload. |
@@ -262,6 +273,7 @@ algorithm, constructor ordering.
 | fd cache | Process-wide, 32-slot, direct-mapped map from descriptor number to path. |
 | excluded path | Never faulted: any `/tmp/.chaos-*` control file of any library, anything under `/proc`, `/sys`, `/dev`, an empty or unresolvable path; also descriptors 0-2. |
 | torn write | A successful write of fewer bytes than requested. Not an error, not corruption. |
+| throttled write | A torn write with a reason: the rate had no more bytes to give this call. |
 | corrupt read | A successful read whose returned bytes have one bit flipped after the real call. |
 
 ## 4. End-to-End Behavior
@@ -283,10 +295,20 @@ For `write(fd, buf, count)` and every other descriptor-based wrapper:
      first in the file on a tie.
 4. No rule: forward unchanged.
 5. Apply the selected rule's effect. Only that rule's effect can fire on this call:
-   - LATENCY: sleep, then call the real function.
+   - LATENCY: if the qualifiers pass and the probability fires, sleep, then call the
+     real function.
    - ERRNO: if the qualifiers pass and the probability fires, set `errno` and
      return `-1` without calling the real function.
    - TORN (write class): if it fires, call the real function with a shorter count.
+   - DROP (write class): if it fires, skip the real function, report the full count,
+     and move the file offset on where there is one.
+   - THROTTLE (write class): take the call's bytes from the bucket; if it covers
+     them, call the real function unchanged and count no hit. Otherwise, if it fires,
+     call the real function with what the bucket held -- and if that was nothing,
+     either return `EAGAIN` (a non-blocking descriptor) or wait for a tenth of a
+     second's worth and write that.
+   - FREE, FULL (statfs class): after a successful call, rewrite the two free-space
+     counts of the answer.
    - CORRUPT (read class): call the real function; if it returned `> 0` bytes and
      the rule fires, flip one bit in the returned bytes.
 6. Return the real function's result.
@@ -388,8 +410,8 @@ other?
 title libchaos-io runtime components
 
 component "Target Application" as App
-component "Wrappers\n(open/rw/stdio/sync/fsops)" as Wrappers
-component "Runtime Core\n(symbols, guard, PRNG)" as Core
+component "Wrappers\n(open/rw/stdio/sync/fsops/statfs)" as Wrappers
+component "Runtime Core\n(symbols, guard, seed)" as Core
 component "Config Engine\n(parse, snapshots, match)" as Config
 component "FD Cache\nprocess-wide fd->path" as Cache
 component "Effect Engine\nerrno/latency/torn/corrupt" as Effects
@@ -444,6 +466,9 @@ else ERRNO fires
 else TORN fires
   Wrap -> Effects : torn count in [1, count-1]
   Wrap -> Libc : write(fd, buf, torn)
+else DROP fires
+  Wrap -> Libc : lseek(fd, count, SEEK_CUR)
+  Wrap --> App : count (nothing written)
 end
 Libc --> Wrap : rc
 Wrap --> App : rc
@@ -495,12 +520,12 @@ Main takeaway: everything is process-local and namespace-scoped.
 Files: `src/core/chaos_io.c`, `src/core/chaos_io_internal.h`,
 `src/core/chaos_io_wrappers.h`.
 
-- Owns the real-function pointers, the thread-local guard and PRNG state, and the
+- Owns the real-function pointers and the thread-local guard, and the
   process seed.
 - `chaos_io_init()` (constructor) resolves symbols, reads 8 bytes from
   `/dev/urandom` with raw `SYS_openat`/`SYS_read`/`SYS_close` (no interposed call
   during construction; fallback `0x6a09e667f3bcc909 ^ getpid()`), seeds the main
-  thread's PRNG, resets the config, **loads the rule file at once so a bad file is
+  process seed (`CHAOS_SEED`, else `/dev/urandom`), resets the config, **loads the rule file at once so a bad file is
   reported at start-up**, and resets the fd cache.
 - `chaos_io_match_fd_rule()` is the single lookup path for every descriptor-based
   wrapper; `chaos_io_match_fd_rule_sized()` also records the byte count for `@size`.
@@ -691,9 +716,21 @@ wrapper.
 - `@size` for `readv`/`writev`/`preadv`/`pwritev` is the sum of `iov_len`, computed
   in chunks of 64; an unreadable or oversized array has no size (size-gated rules do
   not match).
+- `@size` for `truncate` is the file's new length and for `allocate` the length of the
+  range: neither moves bytes, so the gate reads the length the call names. A negative
+  length is no byte count — the kernel rejects such a call with `EINVAL` — so those calls
+  report no size and a size-gated rule does not match them.
+- `open`, `close`, `fsync`, `fdatasync`, `rename` and `unlink` report no byte count, so a
+  size-gated rule on them is rejected when the file loads ([DSL.md §7.1](DSL.md#71-todays-surface)).
 - TORN on `writev`/`pwritev` applies only to arrays of at most 64 entries
   (`CHAOS_IO_TORN_MAX_IOV`); the shortened array is built on the stack from the
   checked copy. A longer or unreadable array is written whole and counts no hit.
+- DROP on `writev`/`pwritev` has no such entry limit, because it reports the total
+  rather than rebuilding the array; an array with no readable size is written whole
+  and counts no hit, since there is no count to report as written.
+- THROTTLE on `writev`/`pwritev` trims the array to the allowance with the same
+  64-entry stack copy TORN uses; a longer or unreadable array is written whole and
+  counts no hit.
 - CORRUPT on `readv`/`preadv` picks one byte across the returned bytes as one
   logical stream and maps it back to its segment.
 
@@ -707,9 +744,10 @@ wrapper.
 | `resolved_prefix`, `resolved_len` | The prefix with links resolved, when different; NULL otherwise. Points into the owning snapshot. |
 | `operation`, `effect` | Parsed enums; never `INVALID` in a published rule. |
 | `errnum` | ERRNO only. |
-| `probability` | ERRNO, TORN, CORRUPT. |
+| `probability` | ERRNO, TORN, DROP, CORRUPT. |
 | `latency_ms` | LATENCY only; 0 to 4 294 967 295. |
-| `policy` | Qualifiers (`@first`, `@from`, `@until`, `@size`). |
+| `rate_bps` | THROTTLE only; 1 to 4 294 967 295 bytes per second. |
+| `policy` | Qualifiers (`@first`, `@every`, `@at`, `@from`, `@until`, `@size`). |
 | `call_size` | Byte count of the call being decided; set on the caller's copy. |
 | `hit`, `hit_generation` | The rule's hit slot and the slot generation it was published with. |
 
@@ -721,10 +759,11 @@ matching.
 
 Process-wide: real-function pointers (written once), process seed, two snapshots
 (256 rules each, with rule texts and resolved paths), active index, cached change
-stamp, the 256 KiB read buffer, hit slot pool (512 slots), fd cache table and slot
-generations.
+stamp, the 256 KiB read buffer, hit slot pool (512 slots), fd cache table, slot
+generations and the 64 token buckets THROTTLE keeps its rates in (one 64-bit word
+each, keyed by descriptor and rate).
 
-Thread-local: recursion guard (`int`), PRNG state (`uint64_t`). Nothing else: the
+Thread-local: recursion guard (`int`). Nothing else: the
 read buffer and fd cache were moved out of TLS because large static TLS objects are
 reserved in every thread and broke runtimes that create threads with small stacks.
 
@@ -797,8 +836,10 @@ portability across the toolchains in the build matrix.
 - `pthread_atfork` child handler (`chaos_io_config_after_fork()`): releases a reload
   claim held by a thread that does not exist in the child, clears the hits writer
   state, resets hit counts and `@first` claims, gives the child its own hits file
-  number, and zeroes the forking thread's PRNG state so the child reseeds from its
-  own thread id (pre-fork workers would otherwise draw identical sequences).
+  number, and mixes the process lineage forward with the child's ordinal among its
+  siblings (counted by the prepare handler in the parent), so the child's rules decide
+  on their own and differently from its siblings -- pre-fork workers would otherwise
+  all fault alike, which at `p<1` means all of them or none.
 - `vfork` children and `posix_spawn` run no atfork handler. They share the parent's
   memory, see its reload claim as busy, may count into its slots, and never write a
   hits file (the writer checks `getpid()`).
@@ -828,7 +869,8 @@ active.
 
 The library never leaks its own `errno`: rule-file checks, `getcwd`, `readlink`,
 `fileno` on descriptor-less streams, seed reads and sleeps all save and restore it.
-`errno` changes only when an ERRNO rule fires (or the real function sets it).
+`errno` changes only when an ERRNO rule fires, when a THROTTLE rule refuses a
+non-blocking write with `EAGAIN` (or the real function sets it).
 
 ### Retry and idempotency
 
@@ -841,8 +883,17 @@ expose. Idempotency is the application's concern.
 /data:read:TORN:1.0
 ```
 
-TORN is legal only for `write` and `pwrite`. The whole file is rejected and the
+TORN is legal only for `write` and `pwrite`, as are DROP and THROTTLE, and FREE and
+FULL only for `statfs`. The whole file is rejected and the
 status file names this line.
+
+```text
+/data:write:THROTTLE:65536@0.5
+```
+
+THROTTLE takes a rate and nothing else: a rate that applies to half the calls is
+not a rate. So is `THROTTLE:0`, which would be a hang, and a rate above
+4 294 967 295, which the token bucket cannot hold. All three reject the file.
 
 ```text
 /database:write:EIO:0.5
@@ -875,8 +926,9 @@ behaviour:
 - No network exposure, no logging, no authentication surface; the library inherits
   the process's privileges.
 - Input validation is the parser: a fixed four-field grammar, bounded file size and
-  rule count, an operation whitelist, an effect/operation matrix and an 8-name errno
-  whitelist (no numeric errno values).
+  rule count, an operation whitelist, an effect/operation matrix and an errno field
+  that is one of 8 names or a positive number below 2^31 -- the number is range-checked
+  and never interpreted, so a rule can name an error this build has no name for.
 
 ## 11. Performance Model
 
@@ -929,9 +981,12 @@ an `int` and a `uint64_t` of TLS.
 
 - **Hits file** `/tmp/.chaos-io.hits.<n>`, one per process (`<n>` is the pid, or a
   derived number when that name is taken, e.g. after `execve`): one line per rule,
-  `<count><TAB><rule as written>`. Rewritten on each of the first 64 hits, then at
-  most every 100 ms, and at normal exit; a hit not due for a write makes no system
-  call. Sum the files of all processes.
+  `<count><TAB><rule as written>`, led by the tab-free line `generation=<n>` -- the
+  number of rule-file snapshots this process has published, so a count of 0 after a
+  reload can be told apart from a count the reload reset. Under `chaos-init` the
+  supervisor writes the same file with the same header. Rewritten on each of the first
+  64 hits, then at most every 100 ms, and at normal exit; a hit not due for a write
+  makes no system call. Sum the files of all processes.
 
 The application-visible outcomes are the injected errno values, the added latency,
 short write counts and corrupted read bytes.
@@ -966,14 +1021,16 @@ short write counts and corrupted read bytes.
 ### Grammar
 
 ```text
-<selector>:<operation>:<ERRNO-name|LATENCY|TORN|CORRUPT>:<value> [qualifier ...] [# comment]
+<selector>:<operation>:<ERRNO-name|LATENCY|TORN|DROP|THROTTLE|FREE|FULL|CORRUPT>:<value> [qualifier ...] [# comment]
 ```
 
 - Exactly four `:`-separated fields; whitespace around each field is trimmed. The
   selector cannot contain `:` (the first `:` ends it) or `#` (it starts a comment).
 - ERRNO is written as the errno name itself (`EIO`, not `ERRNO:EIO`).
-- `<value>`: a probability for an errno name, TORN and CORRUPT; milliseconds
-  (decimal, 0 to 4 294 967 295) for LATENCY.
+- `<value>`: a probability for an errno name, TORN, DROP, FULL and CORRUPT; a byte count
+  with an optional `@probability` for FREE; milliseconds
+  (decimal, 0 to 4 294 967 295) for LATENCY; bytes per second
+  (1 to 4 294 967 295, no probability) for THROTTLE.
 - Probability: `0`, `1`, `0.` followed by digits, or `1.` followed by zeros, parsed
   independently of `LC_NUMERIC` (a JVM sets it from the environment; `strtod` would
   stop at the `.` under a German locale). No `nan`, `inf`, exponents or hex.
@@ -990,6 +1047,7 @@ Examples:
 /data:pwrite:LATENCY:200
 /data/seg:write:TORN:0.1
 /data:read:CORRUPT:0.5
+/data:write:THROTTLE:65536 # 64 KiB/s on the write side
 *:open:EMFILE:0.05
 /data:write:ENOSPC:1.0 @first=3 # disk fills, then recovers
 ```
@@ -1002,11 +1060,18 @@ make unit 2>&1 | grep -E 'PROPTEST|test_config|OK'
 
 ### Operations and legal effects
 
-| Operation | ERRNO | LATENCY | TORN | CORRUPT |
-|---|---|---|---|---|
-| `read`, `pread` | yes | yes | — | yes |
-| `write`, `pwrite` | yes | yes | yes | — |
-| `open`, `close`, `fsync`, `fdatasync`, `truncate`, `allocate`, `unlink`, `rename_from`, `rename_to` | yes | yes | — | — |
+| Operation | ERRNO | LATENCY | TORN | DROP | THROTTLE | FREE, FULL | CORRUPT |
+|---|---|---|---|---|---|---|---|
+| `read`, `pread` | yes | yes | — | — | — | — | yes |
+| `write`, `pwrite` | yes | yes | yes | yes | yes | — | — |
+| `statfs` | yes | yes | — | — | — | yes | — |
+| `open`, `close`, `fsync`, `fdatasync`, `truncate`, `allocate`, `unlink`, `rename_from`, `rename_to` | yes | yes | — | — | — | — | — |
+
+`DROP` has no read counterpart: a read that reported bytes it did not read would
+hand the caller its own stale buffer, which is what `CORRUPT` does deliberately.
+It is also not offered on `fsync`: a dropped `fsync` is unobservable inside a
+container, since nothing there can take the power away to prove the data was
+never on the disk.
 
 ### Matching rules
 
@@ -1020,9 +1085,10 @@ make unit 2>&1 | grep -E 'PROPTEST|test_config|OK'
   through their link-resolved form (§4).
 - `*` matches every file: an absolute path that is not a memfd (`/memfd:...`). It
   never matches pipes (`pipe:[N]`), sockets (`socket:[N]`) or anonymous inodes
-  (`anon_inode:[eventfd]`, timerfd, ...): a TORN or CORRUPT meant for files would
-  break their protocols (an 8-byte eventfd write). A selector that names them
-  literally still reaches them.
+  (`anon_inode:[eventfd]`, timerfd, ...): a TORN, DROP or CORRUPT meant for files
+  would break their protocols (an 8-byte eventfd write). A selector that names them
+  literally still reaches them -- and a `write:DROP` on one of them does not fire,
+  because such a descriptor has no file offset to keep consistent.
 - `*` counts as length 1 for specificity, so it loses to every longer selector and
   ties with `/` (first in file wins).
 - No globbing, no regular expressions.
@@ -1033,13 +1099,42 @@ make unit 2>&1 | grep -E 'PROPTEST|test_config|OK'
 |---|---|---|---|
 | ERRNO | yes | before the call; the real call is skipped | `close`: after the real close. `posix_fallocate`: returned, `errno` untouched. stdio: error value plus `ferror()`. |
 | LATENCY | no | before the call | Always fires when matched and the qualifiers pass; raw `clock_nanosleep`, restarted on `EINTR`. |
-| TORN | yes | before the call | Count in `[1, n-1]`; `writev`/`pwritev` only up to 64 entries; no effect on stdio. |
+| TORN | yes | before the call | Count in `[1, n-1]`; `writev`/`pwritev` only up to 64 entries; no effect on stdio. A caller that loops over the remainder sees no short write at all (see below). |
+| FREE | yes | after a successful call | The free-space counts (`f_bfree`, `f_bavail`) report the rule's byte count, rounded down to whole blocks; the total is untouched. |
+| FULL | yes | after a successful call | The same two counts report zero. |
+| DROP | yes | instead of the call | The full count is reported written and nothing is written. On `write`/`writev` the file offset is moved on by that many bytes, so the caller's next write does not land on top of what it believes it already wrote; an `O_APPEND` descriptor needs no correction, and one with no offset at all (a pipe, a FIFO) keeps the rule from firing. `pwrite`/`pwritev` need no correction. No effect on stdio, on `sendfile` or on `copy_file_range`. |
+| THROTTLE | no (a rate, not a chance) | before the call | The call runs with what the (rule, descriptor) token bucket allows: a full bucket is one second's worth, so the rate only bites once a caller keeps going. An allowance covering the whole call changes nothing and counts no hit. An empty bucket means `EAGAIN` on a non-blocking descriptor and otherwise a wait for a tenth of a second's worth, which is then written. `writev`/`pwritev` are trimmed up to 64 entries; `sendfile` and `copy_file_range` are shortened as TORN shortens them, since the kernel moves both offsets by what it transferred; no effect on stdio. |
 | CORRUPT | yes, drawn after the call | after a call that returned `> 0` bytes | One bit of one returned byte. |
+
+### What a short write is visible to
+
+A torn (or throttled) write shortens the system call. Whether the **program** sees a short
+write depends on what it wrapped the call in:
+
+- a program that calls `write(2)` itself and reports what it returned sees the tear;
+- a wrapper that loops until the buffer is written re-issues the remainder, so the data
+  all arrives -- in several calls -- and the caller sees nothing. Measured with a static
+  Go binary: `syscall.Write` returns the shortened count, while `os.File.Write` returns
+  the full length, because `internal/poll.FD.Write` loops. Any wrapper written that way
+  behaves the same.
+
+Two consequences worth knowing before writing a rule:
+
+- the hits file counts **system calls the rule fired on**, not short writes the program
+  saw, so a looping caller produces several hits and no visible tear;
+- a rate (`THROTTLE`) is unaffected by the loop: it issues the remainder at the same rate,
+  so the program sees the time rather than the short count. Measured against the same Go
+  binary: 512 KiB at 256 KiB/s took 1003 ms through `os.File.Write`.
+
+To test a short write against a looping runtime, fault the operation the program cannot
+retry away instead -- `ERRNO`, `DROP`, or a rate.
 
 ### Supported errno names
 
-`EIO`, `ENOSPC`, `EDQUOT`, `EROFS`, `EACCES`, `EMFILE`, `ENFILE`, `ENOENT`. No other
-name and no numeric value is accepted.
+`EIO`, `ENOSPC`, `EDQUOT`, `EROFS`, `EACCES`, `EMFILE`, `ENFILE`, `ENOENT`, or a
+positive decimal number from 1 to 2 147 483 647 -- the value this build has no name for
+is passed through as it is written, which is how a rule reaches an errno a newer kernel
+defines. No other name is accepted.
 
 ### `@size` byte counts
 
@@ -1052,14 +1147,41 @@ name and no numeric value is accepted.
 | `fgets` | `size` (if positive) |
 | `fgetc`, `getc`, `fputc`, `putc` | 1 |
 | `fputs` | `strlen(text)` |
-| all others (`getline`, `getdelim`, `fflush`, printf family, `open`, `close`, sync, truncate, unlink, rename) | none: a size-gated rule never matches |
+| all others (`getline`, `getdelim`, `fflush`, printf family, `open`, `close`, sync, truncate, unlink, rename, statfs) | none: a size-gated rule never matches |
 
 ### SECCOMP mode
 
 `chaos-init` applies io rules to system calls of any process, including static
-binaries, with ERRNO and LATENCY. A rule file containing TORN, CORRUPT or ERRNO on
-`close` is rejected as a whole with `reason=unsupported in seccomp mode`. See
-[SECCOMP.md](SECCOMP.md).
+binaries, with ERRNO, LATENCY and DROP. `statfs` and `fstatfs` are notified,
+so ERRNO and LATENCY reach them there too. TORN applies as well, on `write` and
+`pwrite`: the byte count sits in a register, so those calls are answered with
+`SECCOMP_RET_TRACE` and shortened at the stop ([SECCOMP.md
+§3.3](SECCOMP.md#33-effects-that-need-the-registers-not-a-reply)). The vectored forms keep
+their count in memory and are written whole, counting no hit, as they are here. CORRUPT
+applies on `read` and `pread` as well, decided at the stop *after* the call, since how many
+bytes there are to corrupt is its result; a read that delivered nothing counts no hit, and
+a vectored read is left alone because its bytes are spread over segments.
+
+THROTTLE applies there too, on the same two operations and with the same token-bucket
+arithmetic: the count is shortened in the register, and a call the rate cannot serve at
+all is held in the delay queue of the supervisor rather than slept in the thread, so the
+other threads of the process keep being served. A non-blocking descriptor is told `EAGAIN`
+as it is here. The rate a process sees is therefore the same under both modes; what
+differs is only where the waiting happens. The vectored forms keep their count in memory
+and are written whole.
+
+`write:DROP` and `writev:DROP` apply there too, with the offset correction they need
+here: the write is replaced by the `lseek` that moves the offset on, which runs in the
+tracee itself, and the count is reported once it has. An `O_APPEND` descriptor needs no
+correction and is answered without a second call. What differs from this mode is how the
+descriptor is asked: the supervisor reads its flags from `/proc/<pid>/fdinfo/<fd>` and its
+type from the `/proc/<pid>/fd/<fd>` link rather than probing with an `lseek` of its own,
+so a regular file and a block device have an offset there, while a character device is
+left alone even where its own `lseek` would work. `pwrite:DROP` needs no correction in
+either mode.
+
+A rule file containing FREE, FULL or ERRNO on `close` is rejected as a whole with
+`reason=unsupported in seccomp mode`. See [SECCOMP.md](SECCOMP.md).
 
 ### Operational guidance
 
@@ -1117,7 +1239,7 @@ runtime behaviour is validated across all four.
 - all-or-nothing parsing with a status report;
 - one rule per call, longest prefix, file order on ties;
 - exclusion of control files, `/proc`, `/sys`, `/dev` and descriptors 0-2;
-- no heap allocation, no static TLS beyond the guard and PRNG state.
+- no heap allocation, no static TLS beyond the guard.
 
 ## 15. Stack Walkdown
 
@@ -1139,7 +1261,7 @@ native code calls interposed functions; there is no Java-specific contract.
 
 ### Memory and concurrency level
 
-Thread-local: the guard and the PRNG state. Process-wide, lock-free: snapshots
+Thread-local: the guard. Process-wide, lock-free: snapshots
 (CAS-owned reload, seqlock-validated reads), the fd cache (seqlock plus
 generations) and hit slots.
 
@@ -1199,6 +1321,28 @@ They are not interposed:
 The zero-copy paths file-copy tools actually take, `sendfile()` and
 `copy_file_range()`, are interposed as `write` on the output descriptor.
 
+## 16e. Non-Coverage: asynchronous submission (`io_submit`, io_uring)
+
+`io_submit(2)` (libaio) and `io_uring_enter(2)` hand the kernel a batch of
+operations in one call. Neither is interposed, and the reason differs:
+
+- **`io_submit`** lives in libaio, not in libc, so there is no libc symbol to
+  interpose; a program that uses it links libaio itself. Under `chaos-init` it is a
+  system call and could be notified, but a fault there acts on the **submission**: an
+  `ERRNO` fails the whole batch, and "every tenth read" is not expressible, because
+  the filter sees one call carrying many operations and the completions come back
+  through `io_getevents` without a call per operation.
+- **io_uring** makes no per-operation call at all -- submissions and completions
+  travel through shared rings -- so its reads, writes and opens are invisible to both
+  modes. Recent Docker default seccomp profiles block it outright.
+
+What this means for a test: a database or server told to use one of these engines is
+not faulted on its data path. Both PostgreSQL (`io_method`) and MySQL
+(`innodb_use_native_aio`) can be configured to issue one system call per operation,
+which is the configuration an io rule needs. The capability is stated here rather
+than worked around: a rule that silently applied to nothing would be the failure this
+project exists to remove.
+
 ## 16c. O_DIRECT and Kernel Bypass Implications
 
 `O_DIRECT` (Linux, not POSIX) transfers data between the user buffer and the device,
@@ -1206,8 +1350,8 @@ bypassing the page cache, and requires buffer, length and offset alignment
 (typically 512 or 4 096 bytes, filesystem dependent).
 
 - **open:** an `open`/`openat` with `O_DIRECT` is matched like any other. The
-  injectable errors are the 8 names in §13; `EINVAL`, the usual `O_DIRECT`
-  rejection, is not among them.
+  injectable errors are the 8 names in §13 and any positive number, so `EINVAL`, the
+  usual `O_DIRECT` rejection, is written as its number (22 on Linux).
 - **read/write:** descriptors opened with `O_DIRECT` are matched like any other;
   `EIO` on a direct write models a device error reaching user space.
 - **TORN:** the shortened count is not aligned in general, and the kernel then fails

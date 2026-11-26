@@ -43,11 +43,11 @@ CHAOS_TIME_DEFINE_TEST_GLOBALS();
 
 /**
  * @brief Rule returned by the match stub, indexed `[effect][operation]` by enum value; one
- *   row per effect up to REGRESS, one column per time operation.
+ *   row per effect up to FREEZE, one column per time operation.
  */
-static chaos_time_rule_t g_stub_rules[CHAOS_TIME_EFFECT_REGRESS + 1][3];
+static chaos_time_rule_t g_stub_rules[CHAOS_TIME_EFFECT_FREEZE + 1][3];
 /** @brief Non-zero makes the match stub report the rule in the same cell of `g_stub_rules`. */
-static int g_stub_match[CHAOS_TIME_EFFECT_REGRESS + 1][3];
+static int g_stub_match[CHAOS_TIME_EFFECT_FREEZE + 1][3];
 /** @brief Calls to the LATENCY action stub. */
 static int g_latency_calls = 0;
 /** @brief Non-zero lets a matched ERRNO rule fire; zero models a probability miss. */
@@ -57,6 +57,8 @@ static int g_offset_calls = 0;
 
 /** @brief Calls to the REGRESS action stub. */
 static int g_regress_calls = 0;
+/** @brief Calls to the FREEZE action stub. */
+static int g_freeze_calls = 0;
 /** @brief Calls to the real-`clock_gettime` stand-in. */
 static int g_real_clock_gettime_calls = 0;
 /** @brief Non-zero makes the real-`clock_gettime` stand-in fail with this errno. */
@@ -100,8 +102,8 @@ static void reset_wrapper_state(void)
     size_t operation_index;
 
     chaos_time_test_reset_runtime();
-    /* Clear every effect row up to REGRESS; a match left set leaks into later scenarios. */
-    for (effect_index = 0U; effect_index <= (size_t)CHAOS_TIME_EFFECT_REGRESS; ++effect_index)
+    /* Clear every effect row up to FREEZE; a match left set leaks into later scenarios. */
+    for (effect_index = 0U; effect_index <= (size_t)CHAOS_TIME_EFFECT_FREEZE; ++effect_index)
     {
         for (operation_index = 0U; operation_index < 3U; ++operation_index)
         {
@@ -117,6 +119,7 @@ static void reset_wrapper_state(void)
     g_errno_trigger = 0;
     g_offset_calls = 0;
     g_regress_calls = 0;
+    g_freeze_calls = 0;
     g_real_clock_gettime_calls = 0;
     g_real_clock_gettime_error = 0;
     g_real_nanosleep_calls = 0;
@@ -148,7 +151,7 @@ int chaos_time_config_match(
 )
 {
     (void)clock_id;
-    if (effect < 0 || effect > CHAOS_TIME_EFFECT_REGRESS || operation < 0 ||
+    if (effect < 0 || effect > CHAOS_TIME_EFFECT_FREEZE || operation < 0 ||
         operation > CHAOS_TIME_OP_USLEEP || rule == NULL || g_stub_match[effect][operation] == 0)
     {
         return 0;
@@ -159,7 +162,7 @@ int chaos_time_config_match(
 }
 
 /** @brief LATENCY seam: counts the call and does not sleep. */
-void chaos_time_rule_apply_latency(const chaos_time_rule_t *rule)
+void chaos_time_rule_apply_latency(chaos_time_rule_t *rule)
 {
     assert(rule != NULL);
     ++g_latency_calls;
@@ -169,7 +172,7 @@ void chaos_time_rule_apply_latency(const chaos_time_rule_t *rule)
  * @brief ERRNO seam: for an ERRNO rule while `g_errno_trigger` is set, stores `errnum` in
  *   errno and returns 1; otherwise returns 0 and leaves errno alone.
  */
-int chaos_time_rule_apply_errno(const chaos_time_rule_t *rule)
+int chaos_time_rule_apply_errno(chaos_time_rule_t *rule)
 {
     if (rule == NULL || rule->effect != CHAOS_TIME_EFFECT_ERRNO || g_errno_trigger == 0)
     {
@@ -180,11 +183,21 @@ int chaos_time_rule_apply_errno(const chaos_time_rule_t *rule)
 }
 
 /** @brief REGRESS seam: counts the call and leaves @p value unchanged. */
-void chaos_time_rule_apply_regress(const chaos_time_rule_t *rule, struct timespec *value)
+void chaos_time_rule_apply_regress(chaos_time_rule_t *rule, struct timespec *value)
 {
     assert(rule != NULL);
     assert(value != NULL);
     ++g_regress_calls;
+}
+
+/** @brief FREEZE stub: counts calls and stops the clock at a fixed, recognisable value. */
+void chaos_time_rule_apply_freeze(chaos_time_rule_t *rule, struct timespec *value)
+{
+    assert(rule != NULL);
+    assert(value != NULL);
+    ++g_freeze_calls;
+    value->tv_sec = 4242;
+    value->tv_nsec = 42;
 }
 
 /** @brief Calls to the deadline-conversion stub. */
@@ -214,7 +227,7 @@ int chaos_time_rule_unshift_deadline(
  * @brief OFFSET seam: counts the call and adds `offset_ms` to @p value with a forward carry
  *   only, which suffices for the positive offsets used here.
  */
-void chaos_time_rule_apply_offset(const chaos_time_rule_t *rule, struct timespec *value)
+void chaos_time_rule_apply_offset(chaos_time_rule_t *rule, struct timespec *value)
 {
     assert(rule != NULL);
     assert(value != NULL);
@@ -878,6 +891,31 @@ static void test_clock_read_applies_regress(void)
         CHAOS_TIME_EFFECT_REGRESS;
     assert(clock_gettime(CLOCK_MONOTONIC, &value) == 0);
     assert(g_regress_calls == 1);
+    assert(g_freeze_calls == 0);
+}
+
+/**
+ * @brief Proves a successful clock read passes a matching FREEZE rule to its action, and that
+ *   the value the action leaves behind is what the caller sees.
+ *
+ * @details The stub stops the clock at a recognisable value rather than at the reading, so a
+ * hook that called the real clock again after the action, or dropped the action's result,
+ * fails here. FREEZE comes last, so it also sees the value OFFSET left behind.
+ */
+static void test_clock_read_applies_freeze(void)
+{
+    struct timespec value;
+
+    reset_wrapper_state();
+    g_chaos_time_real_clock_gettime = chaos_time_test_clock_gettime;
+    g_stub_match[CHAOS_TIME_EFFECT_FREEZE][CHAOS_TIME_OP_CLOCK_GETTIME] = 1;
+    g_stub_rules[CHAOS_TIME_EFFECT_FREEZE][CHAOS_TIME_OP_CLOCK_GETTIME].effect =
+        CHAOS_TIME_EFFECT_FREEZE;
+    assert(clock_gettime(CLOCK_REALTIME, &value) == 0);
+    assert(g_freeze_calls == 1);
+    assert(value.tv_sec == 4242);
+    assert(value.tv_nsec == 42);
+    assert(g_real_clock_gettime_calls == 1);
 }
 
 /**
@@ -1055,6 +1093,7 @@ static void test_call_real_helpers_without_pointers(void)
 int main(void)
 {
     test_clock_read_applies_regress();
+    test_clock_read_applies_freeze();
     test_call_real_helpers();
     test_clock_gettime_paths();
     test_nanosleep_paths();

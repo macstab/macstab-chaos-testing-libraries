@@ -204,8 +204,108 @@ static void test_should_trigger_honours_qualifiers(void)
     assert(chaos_memory_rule_should_trigger(&rule) == 0);
 }
 
+/**
+ * @brief Proves a sample follows from the rule and the number of the evaluation, and from
+ *        nothing else.
+ *
+ * @details This is what makes a fault reproducible: the same rule at the same evaluation
+ * number gives the same sample; the next evaluation, a rule of different text and a forked
+ * child's lineage each give an unrelated one; and the draws within one evaluation differ
+ * from each other.
+ */
+static void test_draws_are_reproducible(void)
+{
+    chaos_memory_rule_t rule;
+    chaos_hit_slot_t slot;
+    uint32_t first;
+
+    (void)memset(&rule, 0, sizeof(rule));
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.hit = &slot;
+    rule.key = chaos_memory_prng_mix(g_chaos_memory_process_seed ^ chaos_memory_rule_hash("a"));
+
+    chaos_memory_rule_draw_begin(&rule);
+    assert(slot.evaluations == 1U);
+    first = chaos_memory_rule_draw(&rule, CHAOS_MEMORY_DRAW_PROBABILITY);
+    assert(chaos_memory_rule_draw(&rule, CHAOS_MEMORY_DRAW_PROBABILITY) == first);
+    assert(chaos_memory_rule_draw(&rule, CHAOS_MEMORY_DRAW_FIRST_EFFECT) != first);
+
+    chaos_memory_rule_draw_begin(&rule);
+    assert(slot.evaluations == 2U);
+    assert(chaos_memory_rule_draw(&rule, CHAOS_MEMORY_DRAW_PROBABILITY) != first);
+
+    /* A rule whose text differs is a different rule, even in the same slot. */
+    rule.key = chaos_memory_prng_mix(g_chaos_memory_process_seed ^ chaos_memory_rule_hash("b"));
+    slot.evaluations = 0U;
+    chaos_memory_rule_draw_begin(&rule);
+    assert(chaos_memory_rule_draw(&rule, CHAOS_MEMORY_DRAW_PROBABILITY) != first);
+
+    /* Same rule, same evaluation, different lineage: a forked child decides on its own. */
+    rule.key = chaos_memory_prng_mix(g_chaos_memory_process_seed ^ chaos_memory_rule_hash("a"));
+    slot.evaluations = 0U;
+    g_chaos_memory_lineage = chaos_memory_prng_mix(1U);
+    chaos_memory_rule_draw_begin(&rule);
+    assert(chaos_memory_rule_draw(&rule, CHAOS_MEMORY_DRAW_PROBABILITY) != first);
+    g_chaos_memory_lineage = 0U;
+
+    /* A rule outside a snapshot has no slot: evaluation 0 every time, which is what makes
+     * the unit tests reproducible without seeding anything. */
+    rule.hit = NULL;
+    chaos_memory_rule_draw_begin(&rule);
+    first = chaos_memory_rule_draw(&rule, CHAOS_MEMORY_DRAW_PROBABILITY);
+    chaos_memory_rule_draw_begin(&rule);
+    assert(chaos_memory_rule_draw(&rule, CHAOS_MEMORY_DRAW_PROBABILITY) == first);
+
+    assert(chaos_memory_rule_hash("a") == chaos_memory_rule_hash("a"));
+    assert(chaos_memory_rule_hash("a") != chaos_memory_rule_hash("b"));
+    assert(chaos_memory_rule_hash(NULL) != chaos_memory_rule_hash("a"));
+}
+
+/**
+ * @brief Proves `@every=N` lets only every Nth evaluation through, in the real gate.
+ *
+ * @details The gate itself is tested on values in test_common.c; what is asserted here is
+ * that chaos_memory_rule_should_trigger() actually consults it, and where. `@every` counts
+ * evaluations, so a rule at probability 1.0 and `@every=3` fires on the 3rd, 6th and 9th
+ * call and on no other -- and the two calls in between still count as evaluations, which is
+ * what makes the third one the third.
+ */
+static void test_every_gates_evaluations(void)
+{
+    chaos_memory_rule_t rule;
+    chaos_hit_slot_t slot;
+    unsigned call;
+    unsigned fired = 0U;
+
+    (void)memset(&rule, 0, sizeof(rule));
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.effect = CHAOS_MEMORY_EFFECT_ERRNO;
+    rule.probability = 1.0;
+    rule.hit = &slot;
+    rule.policy.every = 3U;
+
+    for (call = 1U; call <= 9U; ++call)
+    {
+        const int triggered = chaos_memory_rule_should_trigger(&rule) != 0;
+
+        assert(triggered == (call % 3U == 0U));
+        fired += (unsigned)triggered;
+    }
+    assert(fired == 3U);
+    assert(slot.evaluations == 9U);
+    assert(slot.count == 3U);
+
+    /* Without the qualifier every evaluation fires. */
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.policy.every = 0U;
+    assert(chaos_memory_rule_should_trigger(&rule) != 0);
+    assert(slot.count == 1U);
+}
+
 int main(void)
 {
+    test_every_gates_evaluations();
+    test_draws_are_reproducible();
     test_should_trigger_honours_qualifiers();
     test_should_trigger_counts_hits();
     test_probability_helpers();

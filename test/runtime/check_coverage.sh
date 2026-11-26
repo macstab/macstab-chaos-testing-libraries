@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# check_coverage.sh: 100% line-coverage gate for every library, chaos-init and the shared
+# check_coverage.sh: line-coverage gate for every library, chaos-init and the shared
 # headers.
 #
 # Proves: each listed source file reaches 100.00% executed lines in the unit test that owns it
@@ -23,7 +23,8 @@ set -eu
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 BUILD_DIR=${BUILD_DIR:-build-coverage}
 CC=${CC:-cc}
-CPPFLAGS=${CPPFLAGS:--D_GNU_SOURCE -Isrc -Isrc/core -Isrc/config -Isrc/effects -Isrc/wrappers}
+# The same list the Makefile's CPPFLAGS has, so a run without `make coverage` compiles too.
+CPPFLAGS=${CPPFLAGS:--D_GNU_SOURCE -Isrc -Isrc/common -Isrc/core -Isrc/config -Isrc/effects -Isrc/wrappers -Isrc/net -Isrc/dns -Isrc/time -Isrc/process -Isrc/memory}
 CFLAGS=${CFLAGS:--std=c99 -Wall -Wextra -Werror -pedantic -Os}
 
 cd "$ROOT_DIR"
@@ -119,6 +120,11 @@ CONFIG_GCNO=$(resolve_gcno test_config_parse)
 CHAOS_INIT_GCNO=$(resolve_gcno test_chaos_init)
 DNS_OWNED_GCNO=$(resolve_gcno test_dns_owned)
 CHAOS_INIT_IO_GCNO=$(resolve_gcno test_chaos_init_io)
+CHAOS_INIT_TRACE_GCNO=$(resolve_gcno test_chaos_init_trace)
+CHAOS_INIT_VDSO_GCNO=$(resolve_gcno test_chaos_init_vdso)
+CHAOS_INIT_MAIN_GCNO=$(resolve_gcno test_chaos_init_main)
+CHAOS_INIT_TIME_GCNO=$(resolve_gcno test_chaos_init_time)
+CHAOS_INIT_DNS_GCNO=$(resolve_gcno test_chaos_init_dns)
 CHAOS_INIT_NET_GCNO=$(resolve_gcno test_chaos_init_net)
 CHAOS_INIT_MEMORY_GCNO=$(resolve_gcno test_chaos_init_memory)
 CHAOS_INIT_PROCESS_GCNO=$(resolve_gcno test_chaos_init_process)
@@ -127,6 +133,7 @@ FDCACHE_GCNO=$(resolve_gcno test_fdcache)
 CHAOS_IO_GCNO=$(resolve_gcno test_chaos_io)
 NET_ACTIONS_GCNO=$(resolve_gcno test_net_actions)
 NET_ENDPOINT_GCNO=$(resolve_gcno test_net_endpoint)
+NET_OWNER_GCNO=$(resolve_gcno test_net_owner)
 NET_CONFIG_GCNO=$(resolve_gcno test_net_config)
 NET_RUNTIME_GCNO=$(resolve_gcno test_net_runtime)
 CHAOS_NET_GCNO=$(resolve_gcno test_chaos_net)
@@ -155,9 +162,11 @@ check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_open.c" "100.00"
 check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_rw.c" "100.00"
 check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_fsops.c" "100.00"
 check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_sync.c" "100.00"
+check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_statfs.c" "100.00"
 check_target "$CHAOS_IO_GCNO" "src/wrappers/chaos_io_stdio.c" "100.00"
 check_target "$NET_ACTIONS_GCNO" "src/net/chaos_net_actions.c" "100.00"
 check_target "$NET_ENDPOINT_GCNO" "src/net/chaos_net_endpoint.c" "100.00"
+check_target "$NET_OWNER_GCNO" "src/net/chaos_net_owner.c" "100.00"
 check_target "$NET_CONFIG_GCNO" "src/net/chaos_net_config.c" "100.00"
 check_target "$NET_RUNTIME_GCNO" "src/net/chaos_net.c" "100.00"
 check_target "$CHAOS_NET_GCNO" "src/net/chaos_net_extra.c" "100.00"
@@ -185,12 +194,26 @@ check_target "$CHAOS_INIT_GCNO" "src/init/chaos_init_core.c" "100.00"
 check_target "$CHAOS_INIT_GCNO" "src/init/chaos_init_delay.c" "100.00"
 check_target "$CHAOS_INIT_GCNO" "src/init/chaos_init_proc.c" "100.00"
 check_target "$CHAOS_INIT_GCNO" "src/init/chaos_init_tracee.c" "100.00"
+check_target "$CHAOS_INIT_TRACE_GCNO" "src/init/chaos_init_trace.c" "100.00"
+check_target "$CHAOS_INIT_VDSO_GCNO" "src/init/chaos_init_vdso.c" "100.00"
+# chaos_init.c is the supervisor's entry point: argument handling, the handover, the
+# filter and the serve loop, most of which needs a container, a filter and a tracee and is
+# covered by test_seccomp.sh. test_chaos_init_main.c reaches the part that decides without
+# any of that. The threshold is what those tests actually reach, not 100, because the rest
+# cannot be reached from a unit test -- but it is measured, which it was not: this file was
+# in no test and in no target here while this script's own header claimed to cover
+# chaos-init, and five defects in it were invisible to a green gate for that reason. Raise
+# the number when more of it comes under test; never lower it to make a change fit.
+check_target "$CHAOS_INIT_MAIN_GCNO" "src/init/chaos_init.c" "10.50"
+check_target "$CHAOS_INIT_TIME_GCNO" "src/init/chaos_init_time.c" "100.00"
+check_target "$CHAOS_INIT_DNS_GCNO" "src/init/chaos_init_dns.c" "100.00"
 check_target "$CHAOS_INIT_IO_GCNO" "src/init/chaos_init_io.c" "100.00"
 check_target "$CHAOS_INIT_NET_GCNO" "src/init/chaos_init_net.c" "100.00"
 check_target "$CHAOS_INIT_MEMORY_GCNO" "src/init/chaos_init_memory.c" "100.00"
 check_target "$CHAOS_INIT_PROCESS_GCNO" "src/init/chaos_init_process.c" "100.00"
-for header in src/common/chaos_clock.h src/common/chaos_hits.h src/common/chaos_once.h \
-    src/common/chaos_policy.h src/common/chaos_sleep.h src/common/chaos_status.h \
+for header in src/common/chaos_bucket.h src/common/chaos_clock.h src/common/chaos_hits.h \
+    src/common/chaos_once.h src/common/chaos_policy.h src/common/chaos_sleep.h \
+    src/common/chaos_status.h \
     src/core/chaos_io_internal.h src/net/chaos_net_internal.h src/dns/chaos_dns_internal.h \
     src/time/chaos_time_internal.h src/memory/chaos_memory_internal.h \
     src/process/chaos_process_internal.h; do

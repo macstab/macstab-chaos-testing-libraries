@@ -124,6 +124,15 @@ static int g_rule_should_trigger_calls = 0;
 static int g_rule_apply_errno_result = 0;
 /** @brief Value to return from the `chaos_io_rule_should_trigger()` stub. */
 static int g_rule_should_trigger_result = 0;
+/** @brief Calls to the `chaos_io_free_blocks()` stub. */
+static int g_free_blocks_calls = 0;
+/** @brief Unit the `chaos_io_free_blocks()` stub was last given. */
+static uint64_t g_last_free_unit = 0U;
+/** @brief Non-zero: the `chaos_io_free_blocks()` stub answers, as a firing rule would. */
+static int g_free_blocks_applies = 0;
+/** @brief Free-block count the `chaos_io_free_blocks()` stub answers with. */
+static uint64_t g_free_blocks_result = 0U;
+
 /** @brief Torn-count value to return from the `chaos_io_torn_count()` stub. */
 static size_t g_torn_count_result = 0U;
 /** @brief `requested` argument captured from the most recent `chaos_io_torn_count()` call. */
@@ -657,7 +666,7 @@ void chaos_io_fdcache_invalidate(int fd)
  * @brief Stub for chaos_io_rule_apply_latency(): counts calls and records the rule's
  *        `call_size` (the byte count the @size qualifier is matched against); never sleeps.
  */
-void chaos_io_rule_apply_latency(const chaos_io_rule_t *rule)
+void chaos_io_rule_apply_latency(chaos_io_rule_t *rule)
 {
     assert(rule != NULL);
     ++g_latency_calls;
@@ -665,21 +674,59 @@ void chaos_io_rule_apply_latency(const chaos_io_rule_t *rule)
 }
 
 /**
- * @brief Stub for chaos_io_rule_should_trigger(): counts calls and returns
- *        `g_rule_should_trigger_result` (1 = the probability draw hits, 0 = pass through).
+ * @brief Stub for chaos_io_rule_should_trigger(): counts calls, applies the real policy
+ *        gates and cans only the probability draw.
+ *
+ * @details The gates live in chaos_policy.h and are header-only, so the stub can run the
+ * real ones in the order the effects file uses: window, then `@size`. Only the draw itself
+ * is replaced by `g_rule_should_trigger_result` (1 = hits, 0 = pass through). A wrapper
+ * that fails to report its byte count is therefore visible here, instead of passing the
+ * gate because the stub never looked. A zeroed policy opens the window and leaves `@size`
+ * ungated, so a test that sets no policy behaves as before.
  */
-int chaos_io_rule_should_trigger(const chaos_io_rule_t *rule)
+int chaos_io_rule_should_trigger(chaos_io_rule_t *rule)
 {
     assert(rule != NULL);
     ++g_rule_should_trigger_calls;
+    if (!chaos_policy_window_open(&rule->policy) ||
+        !chaos_policy_size_ok(&rule->policy, rule->call_size))
+    {
+        return 0;
+    }
+    /* The real one starts this call's draws here; the effect stubs do not use them, but a
+     * wrapper that asks an effect for a sample without a trigger is then still visible. */
+    chaos_io_rule_draw_begin(rule);
     return g_rule_should_trigger_result;
+}
+
+/**
+ * @brief Stub for chaos_io_free_blocks(): records the unit it was given and answers
+ *        `g_free_blocks_result` while `g_free_blocks_applies` is set.
+ *
+ * @details The unit is the point: `struct statfs` counts blocks in `f_bsize` and
+ * `struct statvfs` in `f_frsize`, and a wrapper that hands over the wrong one is visible
+ * here rather than hidden inside correct-looking arithmetic. The arithmetic itself is
+ * tested against the real function in test_actions.c.
+ */
+int chaos_io_free_blocks(const chaos_io_rule_t *rule, uint64_t unit, uint64_t *blocks)
+{
+    assert(rule != NULL);
+    assert(blocks != NULL);
+    ++g_free_blocks_calls;
+    g_last_free_unit = unit;
+    if (!g_free_blocks_applies)
+    {
+        return 0;
+    }
+    *blocks = g_free_blocks_result;
+    return 1;
 }
 
 /**
  * @brief Stub for chaos_io_rule_apply_errno(): when `g_rule_apply_errno_result` is non-zero,
  *        sets errno to `rule->errnum`; returns `g_rule_apply_errno_result` either way.
  */
-int chaos_io_rule_apply_errno(const chaos_io_rule_t *rule)
+int chaos_io_rule_apply_errno(chaos_io_rule_t *rule)
 {
     assert(rule != NULL);
     ++g_rule_apply_errno_calls;
@@ -695,8 +742,9 @@ int chaos_io_rule_apply_errno(const chaos_io_rule_t *rule)
  *        `g_torn_count_result`, the shortened transfer size a TORN rule passes to the real
  *        function.
  */
-size_t chaos_io_torn_count(size_t requested)
+size_t chaos_io_torn_count(const chaos_io_rule_t *rule, size_t requested)
 {
+    assert(rule != NULL);
     g_last_torn_requested = requested;
     return g_torn_count_result;
 }
@@ -705,10 +753,11 @@ size_t chaos_io_torn_count(size_t requested)
  * @brief Stub for chaos_io_corrupt_buffer(): records @p size and flips bit 0 of byte 0, a
  *        deterministic corruption tests can assert without the PRNG.
  */
-void chaos_io_corrupt_buffer(void *buffer, size_t size)
+void chaos_io_corrupt_buffer(const chaos_io_rule_t *rule, void *buffer, size_t size)
 {
     unsigned char *bytes = (unsigned char *)buffer;
 
+    assert(rule != NULL);
     ++g_corrupt_calls;
     g_last_corrupt_size = size;
     if (bytes != NULL && size > 0U)
@@ -1154,6 +1203,75 @@ static int chaos_test_real_posix_fallocate_impl(int fd, off_t offset, off_t leng
     return g_real_posix_fallocate_return;
 }
 
+/** @brief Calls to the statfs family stubs. */
+static int g_real_statfs_calls = 0;
+/** @brief Calls to the statvfs family stubs. */
+static int g_real_statvfs_calls = 0;
+/** @brief Result the statfs family stubs return. */
+static int g_real_statfs_return = 0;
+/** @brief Block size the statfs stub reports (`f_bsize`), and the statvfs `f_frsize`. */
+static unsigned long g_real_statfs_bsize = 4096UL;
+/**
+ * @brief The statvfs stub's `f_bsize`, deliberately different from its `f_frsize`.
+ *
+ * @details `struct statvfs` counts blocks in `f_frsize`; a wrapper that hands `f_bsize`
+ * over instead is only visible if the two differ, so they do here.
+ */
+static unsigned long g_real_statvfs_bsize = 8192UL;
+/** @brief Free and available blocks the stubs report before any effect. */
+static unsigned long g_real_statfs_free = 1000UL;
+/** @brief Reentrancy guard observed inside the statfs stubs. */
+static int g_real_statfs_guard = 0;
+
+/** @brief Real-function stub for statfs: fills a plausible answer, records the guard. */
+static int chaos_test_real_statfs_impl(const char *path, struct statfs *buffer)
+{
+    (void)path;
+    ++g_real_statfs_calls;
+    g_real_statfs_guard = g_chaos_io_tls_guard;
+    if (buffer != NULL)
+    {
+        (void)memset(buffer, 0, sizeof(*buffer));
+        buffer->f_bsize = (__typeof__(buffer->f_bsize))g_real_statfs_bsize;
+        buffer->f_blocks = (__typeof__(buffer->f_blocks))10000;
+        buffer->f_bfree = (__typeof__(buffer->f_bfree))g_real_statfs_free;
+        buffer->f_bavail = (__typeof__(buffer->f_bavail))g_real_statfs_free;
+    }
+    return g_real_statfs_return;
+}
+
+/** @brief Real-function stub for fstatfs. */
+static int chaos_test_real_fstatfs_impl(int fd, struct statfs *buffer)
+{
+    (void)fd;
+    return chaos_test_real_statfs_impl(NULL, buffer);
+}
+
+/** @brief Real-function stub for statvfs: counts are in `f_frsize` units here. */
+static int chaos_test_real_statvfs_impl(const char *path, struct statvfs *buffer)
+{
+    (void)path;
+    ++g_real_statvfs_calls;
+    g_real_statfs_guard = g_chaos_io_tls_guard;
+    if (buffer != NULL)
+    {
+        (void)memset(buffer, 0, sizeof(*buffer));
+        buffer->f_bsize = g_real_statvfs_bsize;
+        buffer->f_frsize = g_real_statfs_bsize;
+        buffer->f_blocks = (fsblkcnt_t)10000;
+        buffer->f_bfree = (fsblkcnt_t)g_real_statfs_free;
+        buffer->f_bavail = (fsblkcnt_t)g_real_statfs_free;
+    }
+    return g_real_statfs_return;
+}
+
+/** @brief Real-function stub for fstatvfs. */
+static int chaos_test_real_fstatvfs_impl(int fd, struct statvfs *buffer)
+{
+    (void)fd;
+    return chaos_test_real_statvfs_impl(NULL, buffer);
+}
+
 /** @brief Real-function stub for truncate: records length and guard. */
 static int chaos_test_real_truncate_impl(const char *path, off_t length)
 {
@@ -1454,6 +1572,22 @@ static void *chaos_test_dlsym(void *handle, const char *symbol)
     {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_truncate_fn, chaos_test_real_truncate_impl);
     }
+    if (strcmp(symbol, "statfs") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_statfs_fn, chaos_test_real_statfs_impl);
+    }
+    if (strcmp(symbol, "fstatfs") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_fstatfs_fn, chaos_test_real_fstatfs_impl);
+    }
+    if (strcmp(symbol, "statvfs") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_statvfs_fn, chaos_test_real_statvfs_impl);
+    }
+    if (strcmp(symbol, "fstatvfs") == 0)
+    {
+        return CHAOS_TEST_DLSYM_RESULT(chaos_io_fstatvfs_fn, chaos_test_real_fstatvfs_impl);
+    }
     if (strcmp(symbol, "fopen") == 0)
     {
         return CHAOS_TEST_DLSYM_RESULT(chaos_io_fopen_fn, chaos_test_real_fopen_impl);
@@ -1643,6 +1777,7 @@ static long chaos_test_process_vm_readv(const struct iovec *local, const struct 
 #include "../../src/wrappers/chaos_io_rw.c"
 #include "../../src/wrappers/chaos_io_fsops.c"
 #include "../../src/wrappers/chaos_io_sync.c"
+#include "../../src/wrappers/chaos_io_statfs.c"
 #include "../../src/wrappers/chaos_io_stdio.c"
 #undef CHAOS_IO_CONSTRUCTOR
 #undef syscall
@@ -1899,6 +2034,17 @@ static void chaos_test_reset_state(void)
     g_real_posix_fallocate_return = 0;
 
     g_real_truncate_calls = 0;
+    g_real_statfs_calls = 0;
+    g_real_statvfs_calls = 0;
+    g_real_statfs_return = 0;
+    g_real_statfs_bsize = 4096UL;
+    g_real_statvfs_bsize = 8192UL;
+    g_real_statfs_free = 1000UL;
+    g_real_statfs_guard = 0;
+    g_free_blocks_calls = 0;
+    g_last_free_unit = 0U;
+    g_free_blocks_applies = 0;
+    g_free_blocks_result = 0U;
     g_real_truncate_return = 0;
     g_real_truncate_guard = 0;
     g_real_truncate_length = 0;
@@ -1996,7 +2142,7 @@ static void chaos_test_reset_state(void)
     g_chaos_io_real_copy_file_range = NULL;
 #endif
     g_chaos_io_tls_guard = 0;
-    g_chaos_io_tls_prng_state = 0U;
+    g_chaos_io_lineage = 0U;
     g_chaos_io_process_seed = 0U;
     chaos_test_bind_real_stdio();
 }
@@ -2033,6 +2179,10 @@ static void chaos_test_bind_real_functions(void)
     g_chaos_io_real_ftruncate = chaos_test_real_ftruncate_impl;
     g_chaos_io_real_unlinkat = chaos_test_real_unlinkat_impl;
     g_chaos_io_real_truncate = chaos_test_real_truncate_impl;
+    g_chaos_io_real_statfs = chaos_test_real_statfs_impl;
+    g_chaos_io_real_fstatfs = chaos_test_real_fstatfs_impl;
+    g_chaos_io_real_statvfs = chaos_test_real_statvfs_impl;
+    g_chaos_io_real_fstatvfs = chaos_test_real_fstatvfs_impl;
     g_chaos_io_real_fopen = chaos_test_real_fopen_impl;
     g_chaos_io_real_freopen = chaos_test_real_freopen_impl;
     g_chaos_io_real_renameat2 = chaos_test_real_renameat2_impl;
@@ -2109,6 +2259,22 @@ static void chaos_test_bind_libc_functions_for_exit(void)
     resolved = dlsym(RTLD_NEXT, "truncate");
     assert(resolved != NULL);
     (void)memcpy(&g_chaos_io_real_truncate, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "statfs");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_statfs, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "fstatfs");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_fstatfs, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "statvfs");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_statvfs, &resolved, sizeof(resolved));
+
+    resolved = dlsym(RTLD_NEXT, "fstatvfs");
+    assert(resolved != NULL);
+    (void)memcpy(&g_chaos_io_real_fstatvfs, &resolved, sizeof(resolved));
 
     resolved = dlsym(RTLD_NEXT, "fopen");
     assert(resolved != NULL);

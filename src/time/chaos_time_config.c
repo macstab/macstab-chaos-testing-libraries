@@ -66,6 +66,7 @@
 #include "chaos_clock.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -125,6 +126,17 @@ static int g_chaos_time_hit_pool_used = 0;
 static volatile unsigned int g_chaos_time_active_config_index = 0U;
 
 /**
+ * @brief Rule-file snapshots this process has published, reported as the hits file's
+ *        `generation=` line.
+ *
+ * @details Lets a reader tell which rules a count belongs to: after a reload that changed
+ * the file the number differs, so counts that restarted are not mistaken for counts that
+ * stalled. Written only by the reload owner, between the same barriers as the active
+ * index.
+ */
+static volatile uint64_t g_chaos_time_config_generation = 0U;
+
+/**
  * Change stamp of the loaded file, or a CHAOS_TIME_MTIME_* sentinel.
  *
  * Doubles as the reload lock: the thread that CASes it to CHAOS_TIME_MTIME_RELOADING
@@ -168,6 +180,21 @@ static char g_chaos_time_config_texts[CHAOS_TIME_MAX_RULES][CHAOS_STATUS_TEXT_MA
 /** @brief Hits-writer lock: set (by CAS) while a thread writes the hits file. */
 static volatile int g_chaos_time_hits_writing = 0;
 
+/**
+ * @brief pthread_atfork() prepare handler: counts this fork in the parent.
+ *
+ * @details The child reads the counter as its own ordinal among its siblings, which is
+ * what makes two children of one parent decide differently (g_chaos_time_forks). Counted
+ * here rather than in the child, because a child cannot tell how many siblings came
+ * before it. Atomic, so two threads forking at once get different ordinals rather than
+ * the same one; which of them gets which follows the order the kernel ran them in, as
+ * everything else about concurrent calls does.
+ */
+static void chaos_time_config_before_fork(void)
+{
+    (void)__sync_fetch_and_add(&g_chaos_time_forks, UINT64_C(1));
+}
+
 /** @brief Set once the atfork handler is registered; pthread_atfork() cannot unregister. */
 static int g_chaos_time_atfork_registered = 0;
 
@@ -191,7 +218,8 @@ static long g_chaos_time_hits_file = 0L;
 static int g_chaos_time_hits_owned = 0;
 
 /** @brief Scratch for the hits file; used only by the holder of the writer lock. */
-static char g_chaos_time_hits_buffer[CHAOS_TIME_MAX_RULES * CHAOS_HITS_LINE_MAX + 1U];
+static char g_chaos_time_hits_buffer
+    [CHAOS_TIME_MAX_RULES * CHAOS_HITS_LINE_MAX + CHAOS_HITS_HEADER_MAX + 1U];
 
 /**
  * Empties @p state and sets parse_ok; marks its sequence odd first.
@@ -253,6 +281,7 @@ static void chaos_time_config_publish(unsigned int next_index, uint64_t observed
     chaos_snapshot_write_end(&g_chaos_time_config_states[next_index].sequence);
     __sync_synchronize();
     g_chaos_time_active_config_index = next_index;
+    ++g_chaos_time_config_generation;
     __sync_synchronize();
     g_chaos_time_cached_mtime = observed_mtime;
 }
@@ -328,8 +357,13 @@ static void chaos_time_strip_comment(char *line)
  * Names: realtime, monotonic, and, where the C library defines the constant,
  * monotonic_raw, realtime_coarse, monotonic_coarse, boottime, tai, process_cputime_id,
  * thread_cputime_id. Any other text is read as a decimal id (strtol, trailing blanks
- * allowed, sign allowed) and not range-checked, so dynamic clock ids (negative, e.g.
- * per-process CPU clocks) and newer clocks can be selected; an unused id never matches.
+ * allowed, sign allowed), so dynamic clock ids (negative, e.g. per-process CPU clocks) and
+ * newer clocks can be selected; an unused id never matches.
+ *
+ * The id must fit in clockid_t, which is int on Linux and musl. Only the range is checked,
+ * never the meaning: an id that no clock uses is a valid selector that matches nothing. A
+ * value too large to fit would otherwise be truncated into a real clock -- 4294967297 is
+ * CLOCK_MONOTONIC once cast -- and fault a clock the rule never named.
  *
  * @param text      Clock text; NULL or empty returns 0.
  * @param clock_id  Receives the id.
@@ -404,8 +438,10 @@ static int chaos_time_parse_clock_id(const char *text, clockid_t *clock_id)
     }
 #endif
 
+    errno = 0;
     value = strtol(text, &end, 10);
-    if (end == text || *chaos_time_trim(end) != '\0')
+    if (end == text || *chaos_time_trim(end) != '\0' || errno == ERANGE || value > INT_MAX ||
+        value < INT_MIN)
     {
         return 0;
     }
@@ -765,7 +801,8 @@ chaos_time_effect_allowed(const chaos_time_selector_t *selector, chaos_time_effe
     {
         return 1;
     }
-    if (effect != CHAOS_TIME_EFFECT_OFFSET && effect != CHAOS_TIME_EFFECT_REGRESS)
+    if (effect != CHAOS_TIME_EFFECT_OFFSET && effect != CHAOS_TIME_EFFECT_REGRESS &&
+        effect != CHAOS_TIME_EFFECT_FREEZE)
     {
         return 0;
     }
@@ -1004,7 +1041,7 @@ void chaos_time_config_init(void)
     if (!g_chaos_time_atfork_registered)
     {
         g_chaos_time_atfork_registered = 1;
-        (void)pthread_atfork(NULL, NULL, chaos_time_config_after_fork);
+        (void)pthread_atfork(chaos_time_config_before_fork, NULL, chaos_time_config_after_fork);
     }
     /* Resolve the vDSO clock now, not first inside a wrapper a signal handler re-enters
      * (a lookup in progress there makes the throttle look on every call meanwhile). */
@@ -1085,6 +1122,17 @@ int chaos_time_config_parse_line(char *line, chaos_time_rule_t *rule)
         }
         return chaos_time_parse_latency(payload, &rule->latency_ms) == 0 ? 1 : -1;
     }
+    if (strcmp(effect_text, "FREEZE") == 0)
+    {
+        rule->effect = CHAOS_TIME_EFFECT_FREEZE;
+        if (!chaos_time_effect_allowed(&rule->selector, rule->effect))
+        {
+            return -1;
+        }
+        /* The value field is the probability, as net's `close:RESET:1` does it: FREEZE
+         * carries nothing else, and a two-field line is not in the grammar. */
+        return chaos_time_parse_probability(value_text, &rule->probability) == 0 ? 1 : -1;
+    }
     if (strcmp(effect_text, "OFFSET") == 0)
     {
         rule->effect = CHAOS_TIME_EFFECT_OFFSET;
@@ -1119,6 +1167,49 @@ int chaos_time_config_parse_line(char *line, chaos_time_rule_t *rule)
 
     return -1;
 }
+
+/**
+ * @brief Whether rule @p later can never win against one already accepted.
+ *
+ * @details Selection is rank, then the longer selector text, then the earlier line. Two
+ * rules with the same selector and effect tie on everything but the line, so the earlier
+ * one always wins and the later can never fire. It is a valid rule, so it is kept and the
+ * status file warns about it instead of the file being rejected. The selector holds no
+ * pointers and every rule is zeroed before it is filled, so comparing its bytes is exact.
+ *
+ * @param rules Rules accepted so far.
+ * @param count How many.
+ * @param later The rule about to be accepted.
+ * @return Non-zero when an earlier rule shadows @p later.
+ */
+static int chaos_time_rule_shadowed(
+    const chaos_time_rule_t *rules, size_t count, const chaos_time_rule_t *later
+)
+{
+    size_t index;
+
+    for (index = 0U; index < count; ++index)
+    {
+        if (rules[index].effect == later->effect &&
+            memcmp(&rules[index].selector, &later->selector, sizeof(later->selector)) == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
+ * @brief Build hook: whether a parsed rule can be applied at all in this mode.
+ *
+ * @details chaos-init (SECCOMP mode) compiles this file with its own definition: a rule
+ * it cannot apply from outside the process rejects the whole file with
+ * CHAOS_STATUS_REASON_UNSUPPORTED, so the status file says so instead of the rule
+ * silently doing nothing.
+ */
+#ifndef CHAOS_TIME_RULE_SUPPORTED
+#define CHAOS_TIME_RULE_SUPPORTED(rule) 1
+#endif
 
 /**
  * @copydoc chaos_time_config_parse_buffer
@@ -1181,6 +1272,14 @@ int chaos_time_config_parse_buffer(char *buffer, chaos_time_rule_t *rules, size_
             }
             continue;
         }
+        if (chaos_policy_has_size(&policy))
+        {
+            /* No time call reports a byte count, so a size gate can never pass and the
+             * rule would load and never fire. */
+            chaos_status_reject(&g_chaos_time_config_error, CHAOS_STATUS_REASON_INVALID);
+            *rule_count = 0U;
+            return -1;
+        }
         parsed.policy = policy;
         parsed.call_size = CHAOS_POLICY_NO_SIZE;
         if (count >= CHAOS_TIME_MAX_RULES)
@@ -1189,15 +1288,29 @@ int chaos_time_config_parse_buffer(char *buffer, chaos_time_rule_t *rules, size_
             *rule_count = 0U;
             return -1;
         }
+        if (!CHAOS_TIME_RULE_SUPPORTED(&parsed))
+        {
+            chaos_status_reject(&g_chaos_time_config_error, CHAOS_STATUS_REASON_UNSUPPORTED);
+            *rule_count = 0U;
+            return -1;
+        }
         (void)memcpy(
             g_chaos_time_config_texts[count],
             g_chaos_time_config_error.text,
             sizeof(g_chaos_time_config_texts[count])
         );
+        if (chaos_time_rule_shadowed(rules, count, &parsed))
+        {
+            chaos_status_warn(
+                &g_chaos_time_config_error,
+                g_chaos_time_config_error.line,
+                CHAOS_STATUS_WARN_SHADOWED
+            );
+        }
         rules[count++] = parsed;
     }
 
-    chaos_status_clear(&g_chaos_time_config_error);
+    chaos_status_clear_rejection(&g_chaos_time_config_error);
     *rule_count = count;
     return 0;
 }
@@ -1275,6 +1388,24 @@ static void chaos_time_config_reject_file(chaos_time_config_state_t *state, cons
 }
 
 /**
+ * @brief The tab-free header lines of this library's hits file: the reload generation.
+ *
+ * @details A named function rather than the expression it replaced, because chaos-init
+ * hands it to chaos_hits_write_for() when it writes this file for a traced process: the
+ * generation a reader correlates counts with must not depend on which mode produced them.
+ *
+ * @param out  Buffer of at least CHAOS_HITS_HEADER_MAX bytes.
+ * @param size Its size.
+ * @return @p out, or NULL when it could not be formatted (then no header is written).
+ */
+static const char *chaos_time_hits_header(char *out, size_t size)
+{
+    const size_t used = chaos_hits_header_generation(out, size, g_chaos_time_config_generation);
+
+    return used != 0U ? out : NULL;
+}
+
+/**
  * @brief Records a hit on @p slot and writes the hits file when due; NULL flushes.
  *
  * @details Writes on each of the first CHAOS_HITS_EAGER (64) hits, then at most every
@@ -1288,6 +1419,7 @@ static void chaos_time_config_reject_file(chaos_time_config_state_t *state, cons
  */
 static void chaos_time_config_report_hits(chaos_hit_slot_t *slot)
 {
+    char header[CHAOS_HITS_HEADER_MAX];
     chaos_time_config_state_t *state;
     const uint64_t now = chaos_hits_now_ms();
 
@@ -1335,6 +1467,7 @@ static void chaos_time_config_report_hits(chaos_hit_slot_t *slot)
                 state->hits,
                 (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) state->text,
                 state->rule_count,
+                chaos_time_hits_header(header, sizeof(header)),
                 g_chaos_time_hits_buffer,
                 sizeof(g_chaos_time_hits_buffer)
             );
@@ -1376,7 +1509,11 @@ static void chaos_time_config_after_fork(void)
     CHAOS_STORE_IF_CHANGED(g_chaos_time_hits_owned, 0);
     /* The child must not replay the parent's stream (pre-fork workers would all decide
      * alike): the forking thread reseeds from its new thread id on the next draw. */
-    CHAOS_STORE_IF_CHANGED(g_chaos_time_tls_prng_state, 0U);
+    /* The child decides differently from the parent and from its siblings without the
+     * rules' keys being rewritten: one global instead of every snapshot page. Mixed, not
+     * incremented, so sibling lineages are unrelated rather than adjacent. */
+    g_chaos_time_lineage = chaos_time_prng_mix(g_chaos_time_lineage + g_chaos_time_forks);
+    g_chaos_time_forks = 0U;
     if (g_chaos_time_hit_pool_used)
     {
         chaos_hits_pool_after_fork(
@@ -1435,6 +1572,11 @@ static void chaos_time_config_attach_hits(chaos_time_config_state_t *next_state)
         next_state->rules[index].hit = next_state->hits[index];
         next_state->rules[index].hit_generation =
             next_state->hits[index] != NULL ? next_state->hits[index]->generation : 0U;
+        /* From the text, so a rule keeps its decisions across a reload that keeps it and
+         * the rule that reuses its slot does not inherit them. */
+        next_state->rules[index].key = chaos_time_prng_mix(
+            g_chaos_time_process_seed ^ chaos_time_rule_hash(next_state->text[index])
+        );
     }
 }
 
@@ -1460,7 +1602,11 @@ chaos_time_config_report(uint64_t observed_mtime, const chaos_time_config_state_
     }
     else
     {
-        chaos_status_write(CHAOS_TIME_STATUS_PATH, CHAOS_STATUS_OK, state->rule_count, NULL);
+        /* The record is passed on success too: it carries the warnings, and its
+         * rejection fields were cleared when the parse succeeded. */
+        chaos_status_write(
+            CHAOS_TIME_STATUS_PATH, CHAOS_STATUS_OK, state->rule_count, &g_chaos_time_config_error
+        );
     }
 }
 

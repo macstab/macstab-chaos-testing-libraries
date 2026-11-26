@@ -17,9 +17,13 @@
  * |-----------|---------|
  * | `@first=N` | At most N hits per process (N >= 1), then inert: a self-clearing start-up fault. |
  * | `@from=T` | Active only when the wall clock, in Unix ms, is >= T. |
- * | `@until=T` | Active only when the wall clock, in Unix ms, is < T. |
- * | `@size>N` | Applies only to calls that move more than N bytes. |
- * | `@size<N` | Applies only to calls that move fewer than N bytes. |
+ * | `@until=T` | Active only when the wall clock, in Unix ms, is < T (T >= 1). |
+ * | `@size>N` | Applies only to calls whose byte count is above N. |
+ * | `@size<N` | Applies only to calls whose byte count is below N. |
+ *
+ * The byte count is what the call moves, except where nothing is moved: for `truncate` it
+ * is the file's new length and for `allocate` the length of the range. A library names per
+ * operation which of its calls report one at all.
  *
  * Why wall-clock windows: one rule file can hold a whole incident timeline and every
  * process agrees on it, which a time relative to each process's own load would not give.
@@ -28,8 +32,10 @@
  *
  * Grammar limits and validation:
  * - Numbers are plain decimal, 1 to 18 digits; no sign, no separators.
- * - An unknown or malformed qualifier, `@first=0`, or `@until` <= `@from` (both given)
- *   rejects the line like any other invalid rule, which rejects the whole rule file.
+ * - An unknown or malformed qualifier, `@first=0`, `@every=0`, `@until=0`, or `@until` <=
+ *   `@from` (both given) rejects the line like any other invalid rule, which rejects the
+ *   whole rule file. `@until=0` in particular: 0 is the stored value for "no upper bound",
+ *   so reading it as written would make a rule that can never be active always active.
  * - A repeated qualifier is accepted; the leftmost occurrence wins, because words are
  *   parsed right to left.
  * - A call without a byte count (CHAOS_POLICY_NO_SIZE) never matches a size-gated rule.
@@ -56,6 +62,8 @@
 typedef struct chaos_rule_policy
 {
     uint64_t first;               /**< `@first=N` hit limit per process; 0 for none. */
+    uint64_t every;               /**< `@every=N`: only every Nth evaluation; 0 for none. */
+    uint64_t at_ms;               /**< `@at=+N`: ms after the rule became active; 0 for none. */
     int64_t from_ms;              /**< `@from=T`, Unix ms; 0 for no lower bound. */
     int64_t until_ms;             /**< `@until=T`, Unix ms (exclusive); 0 for no upper bound. */
     uint64_t size_above;          /**< `@size>N` in bytes; meaningful when has_size_above. */
@@ -170,12 +178,32 @@ static inline int chaos_policy_parse_word(const char *word, chaos_rule_policy_t 
         policy->first = value;
         return 0;
     }
+    if (strncmp(word, "@every=", 7U) == 0 && chaos_policy_parse_number(word + 7, &value) == 0 &&
+        value > 0U)
+    {
+        policy->every = value;
+        return 0;
+    }
+    /* `@at=+N` is written with the sign, which is what says "from now on" rather than
+     * "at this Unix time": that is `@from`, and reading a bare number as either would be
+     * a rule meaning two things. */
+    if (strncmp(word, "@at=+", 5U) == 0 && chaos_policy_parse_number(word + 5, &value) == 0 &&
+        value > 0U)
+    {
+        policy->at_ms = value;
+        return 0;
+    }
     if (strncmp(word, "@from=", 6U) == 0 && chaos_policy_parse_number(word + 6, &value) == 0)
     {
         policy->from_ms = (int64_t)value;
         return 0;
     }
-    if (strncmp(word, "@until=", 7U) == 0 && chaos_policy_parse_number(word + 7, &value) == 0)
+    /* `@until=0` is rejected, not read as "no upper bound": 0 is how the absence of the
+     * qualifier is stored, so accepting it would turn "never active" -- the window
+     * [`@from`, 0) is empty -- into "always active", which is the opposite of what it
+     * says. Same reason as `@first=0` and `@every=0`. */
+    if (strncmp(word, "@until=", 7U) == 0 && chaos_policy_parse_number(word + 7, &value) == 0 &&
+        value > 0U)
     {
         policy->until_ms = (int64_t)value;
         return 0;
@@ -212,7 +240,8 @@ static inline int chaos_policy_parse_word(const char *word, chaos_rule_policy_t 
  * @param line    Mutable NUL-terminated rule line.
  * @param policy  Reset to all zero, then filled; partially filled on failure.
  * @return 0 on success; -1 for an unknown or malformed qualifier, or for `@until` <=
- *         `@from` when both are given.
+ *         `@from` when both are given, or a '#' that no blank precedes (which would
+ *         otherwise cut a value short).
  */
 static inline int chaos_policy_extract(char *line, chaos_rule_policy_t *policy)
 {
@@ -221,6 +250,15 @@ static inline int chaos_policy_extract(char *line, chaos_rule_policy_t *policy)
     char *cut = NULL;
 
     memset(policy, 0, sizeof(*policy));
+    /* A '#' with no blank before it is an operator error, not a comment. Cutting there
+     * would silently shorten a value -- dns://x:REWRITE:a#b would redirect to `a` -- so the
+     * line is rejected and the status file names it. A comment still starts anywhere a
+     * blank precedes the '#', and a line that begins with one is still a comment. */
+    if (comment != NULL && comment != line && comment[-1] != ' ' && comment[-1] != '\t' &&
+        comment[-1] != '\r')
+    {
+        return -1;
+    }
     for (;;)
     {
         char *word_end = end;
@@ -263,11 +301,26 @@ static inline int chaos_policy_extract(char *line, chaos_rule_policy_t *policy)
     return 0;
 }
 
+/**
+ * @brief Whether @p policy carries a `@size` gate.
+ *
+ * @details A library whose calls never report a byte count rejects such a rule at parse
+ * time: the gate could never pass, so the rule would load and never fire.
+ *
+ * @param policy Policy to inspect; NULL yields 0.
+ * @return Non-zero when `@size>N` or `@size<N` was given.
+ */
+static inline int chaos_policy_has_size(const chaos_rule_policy_t *policy)
+{
+    return policy != NULL && (policy->has_size_above || policy->has_size_below);
+}
+
 /** @brief Non-zero when @p policy carries no qualifier, so the rule needs no policy checks. */
 static inline int chaos_policy_is_empty(const chaos_rule_policy_t *policy)
 {
-    return policy->first == 0U && policy->from_ms == 0 && policy->until_ms == 0 &&
-           !policy->has_size_above && !policy->has_size_below;
+    return policy->first == 0U && policy->every == 0U && policy->at_ms == 0U &&
+           policy->from_ms == 0 && policy->until_ms == 0 && !policy->has_size_above &&
+           !policy->has_size_below;
 }
 
 /**
@@ -290,6 +343,36 @@ static inline int chaos_policy_window_open(const chaos_rule_policy_t *policy)
 }
 
 /**
+ * @brief Non-zero when the rule's `@at=+N` delay has passed, or it has none.
+ *
+ * @details The delay is measured from the moment the rule became active in this process,
+ * which the slot holds (chaos_hit_slot_t::armed_ms): a reload that leaves the rule alone
+ * does not restart it, and a reload that brings it back after a change starts it again.
+ *
+ * A rule with the qualifier and no slot does not fire -- there is no moment to count from
+ * -- and neither does one whose slot never got a readable clock.
+ *
+ * @param policy  The rule's qualifiers.
+ * @param slot    The rule's slot (chaos_time_rule_t::hit and its siblings); may be NULL.
+ */
+static inline int chaos_policy_at_ok(const chaos_rule_policy_t *policy, const void *slot)
+{
+    const chaos_hit_slot_t *hit = slot;
+    uint64_t now;
+
+    if (policy->at_ms == 0U)
+    {
+        return 1;
+    }
+    if (hit == NULL || hit->armed_ms == 0U)
+    {
+        return 0;
+    }
+    now = chaos_hits_now_ms();
+    return now >= hit->armed_ms && now - hit->armed_ms >= policy->at_ms;
+}
+
+/**
  * @brief Non-zero when a call moving @p size bytes passes the rule's `@size` gate.
  *
  * @param size  Byte count of the call, or CHAOS_POLICY_NO_SIZE, which fails any gate.
@@ -306,6 +389,24 @@ static inline int chaos_policy_size_ok(const chaos_rule_policy_t *policy, uint64
     }
     return (!policy->has_size_above || size > policy->size_above) &&
            (!policy->has_size_below || size < policy->size_below);
+}
+
+/**
+ * @brief Non-zero when @p evaluation is one the rule's `@every=N` lets through.
+ *
+ * @details Counts evaluations, not hits: `@every=10` picks the 10th, 20th, 30th call that
+ * got past the window and size gates, whether or not those calls then fire. That is why
+ * the gate sits before the probability -- `@every=10` with `p=0.5` means "of evaluations
+ * 10, 20, 30... half fire", which a test can reason about, rather than "every tenth of the
+ * calls that happened to pass the draw".
+ *
+ * @param policy      Rule's qualifiers.
+ * @param evaluation  Number of this evaluation of the rule, counting from 1.
+ * @return Non-zero when the rule may go on to its probability.
+ */
+static inline int chaos_policy_every_ok(const chaos_rule_policy_t *policy, uint64_t evaluation)
+{
+    return policy->every == 0U || (evaluation % policy->every) == 0U;
 }
 
 /**
