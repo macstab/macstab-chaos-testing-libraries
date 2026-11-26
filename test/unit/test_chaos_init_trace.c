@@ -415,6 +415,42 @@ static void test_parking_a_call(void)
     }
     assert(chaos_init_trace_park(&parked) == 0);
     assert(chaos_init_trace_unpark(parked.tid, &taken) == 1);
+
+    /* A thread that ends takes its entries with it. Without that the tables fill with
+     * threads killed on the way to the exit stop that would have consumed their entry,
+     * and once full every traced effect stops firing for the rest of the container's
+     * life, silently -- and before that a reused thread id claims a dead thread's
+     * promise. All three tables are keyed by the thread, so one call clears all three. */
+    for (index = 0U; index < CHAOS_INIT_TRACE_PENDING; ++index)
+    {
+        parked.tid = (pid_t)(2000 + index);
+        assert(chaos_init_trace_park(&parked) == 0);
+        assert(chaos_init_trace_promise(parked.tid, (long)index) == 0);
+        assert(chaos_init_trace_pass(parked.tid) == 0);
+    }
+    parked.tid = 1;
+    assert(chaos_init_trace_park(&parked) == -1);
+    assert(chaos_init_trace_promise(parked.tid, 7) == -1);
+    assert(chaos_init_trace_pass(parked.tid) == -1);
+    for (index = 0U; index < CHAOS_INIT_TRACE_PENDING; ++index)
+    {
+        chaos_init_trace_forget((pid_t)(2000 + index));
+    }
+    parked.tid = 1;
+    assert(chaos_init_trace_park(&parked) == 0);
+    assert(chaos_init_trace_promise(parked.tid, 7) == 0);
+    assert(chaos_init_trace_pass(parked.tid) == 0);
+    assert(chaos_init_trace_passing(parked.tid) == 1);
+    /* And forgetting a thread that holds nothing is not an error. */
+    chaos_init_trace_forget((pid_t)4242);
+    chaos_init_trace_forget(parked.tid);
+    assert(chaos_init_trace_passing(parked.tid) == 0);
+    {
+        long promised = 0;
+
+        assert(chaos_init_trace_claim(parked.tid, &promised) == 0);
+    }
+    assert(chaos_init_trace_unpark(parked.tid, &taken) == 0);
 }
 
 /**

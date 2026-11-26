@@ -305,6 +305,7 @@ CHAOS_INIT_MEMORY_TEST := $(BUILD_DIR)/test_chaos_init_memory
 CHAOS_INIT_PROCESS_TEST := $(BUILD_DIR)/test_chaos_init_process
 CHAOS_INIT_TRACE_TEST := $(BUILD_DIR)/test_chaos_init_trace
 CHAOS_INIT_VDSO_TEST := $(BUILD_DIR)/test_chaos_init_vdso
+CHAOS_INIT_MAIN_TEST := $(BUILD_DIR)/test_chaos_init_main
 COMMON_TEST := $(BUILD_DIR)/test_common
 UNIT_TESTS := $(CONFIG_TEST) $(ACTIONS_TEST) $(FDCACHE_TEST) $(CHAOS_IO_TEST) \
 	$(NET_ACTIONS_TEST) $(NET_ENDPOINT_TEST) $(NET_OWNER_TEST) $(NET_CONFIG_TEST) $(NET_RUNTIME_TEST) $(CHAOS_NET_TEST) \
@@ -316,7 +317,7 @@ UNIT_TESTS := $(CONFIG_TEST) $(ACTIONS_TEST) $(FDCACHE_TEST) $(CHAOS_IO_TEST) \
 	$(CHAOS_INIT_NET_TEST) $(CHAOS_INIT_DNS_TEST) $(CHAOS_INIT_TIME_TEST) \
 	$(CHAOS_INIT_MEMORY_TEST) \
 	$(CHAOS_INIT_PROCESS_TEST) \
-	$(CHAOS_INIT_TRACE_TEST) $(CHAOS_INIT_VDSO_TEST) $(COMMON_TEST)
+	$(CHAOS_INIT_TRACE_TEST) $(CHAOS_INIT_VDSO_TEST) $(CHAOS_INIT_MAIN_TEST) $(COMMON_TEST)
 # Runtime suites run by `make test` against the native build on the host. Several start Docker
 # containers; a suite that cannot run exits with ${CHAOS_SKIP_EXIT:-0}, i.e. it passes as
 # skipped unless the caller sets CHAOS_SKIP_EXIT=1 (as CI does). ci.yml keeps its own copy of
@@ -423,6 +424,7 @@ unit: $(UNIT_TESTS)
 	./$(CHAOS_INIT_PROCESS_TEST)
 	./$(CHAOS_INIT_TRACE_TEST)
 	./$(CHAOS_INIT_VDSO_TEST)
+	./$(CHAOS_INIT_MAIN_TEST)
 	./$(COMMON_TEST)
 
 # Coverage gate: check_coverage.sh rebuilds the unit tests with --coverage -O0 in

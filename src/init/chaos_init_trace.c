@@ -225,6 +225,40 @@ int chaos_init_trace_pass(pid_t tid)
     return 0;
 }
 
+/** @copydoc chaos_init_trace_forget */
+void chaos_init_trace_forget(pid_t tid)
+{
+    size_t index;
+
+    for (index = 0U; index < g_chaos_init_trace_pending_count; ++index)
+    {
+        if (g_chaos_init_trace_pending[index].tid == tid)
+        {
+            g_chaos_init_trace_pending[index] =
+                g_chaos_init_trace_pending[--g_chaos_init_trace_pending_count];
+            break;
+        }
+    }
+    for (index = 0U; index < g_chaos_init_trace_promise_count; ++index)
+    {
+        if (g_chaos_init_trace_promises[index].tid == tid)
+        {
+            g_chaos_init_trace_promises[index] =
+                g_chaos_init_trace_promises[--g_chaos_init_trace_promise_count];
+            break;
+        }
+    }
+    for (index = 0U; index < g_chaos_init_trace_pass_count; ++index)
+    {
+        if (g_chaos_init_trace_passes[index] == tid)
+        {
+            g_chaos_init_trace_passes[index] =
+                g_chaos_init_trace_passes[--g_chaos_init_trace_pass_count];
+            break;
+        }
+    }
+}
+
 /** @copydoc chaos_init_trace_passing */
 int chaos_init_trace_passing(pid_t tid)
 {

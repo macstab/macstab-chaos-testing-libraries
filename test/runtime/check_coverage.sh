@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# check_coverage.sh: 100% line-coverage gate for every library, chaos-init and the shared
+# check_coverage.sh: line-coverage gate for every library, chaos-init and the shared
 # headers.
 #
 # Proves: each listed source file reaches 100.00% executed lines in the unit test that owns it
@@ -122,6 +122,7 @@ DNS_OWNED_GCNO=$(resolve_gcno test_dns_owned)
 CHAOS_INIT_IO_GCNO=$(resolve_gcno test_chaos_init_io)
 CHAOS_INIT_TRACE_GCNO=$(resolve_gcno test_chaos_init_trace)
 CHAOS_INIT_VDSO_GCNO=$(resolve_gcno test_chaos_init_vdso)
+CHAOS_INIT_MAIN_GCNO=$(resolve_gcno test_chaos_init_main)
 CHAOS_INIT_TIME_GCNO=$(resolve_gcno test_chaos_init_time)
 CHAOS_INIT_DNS_GCNO=$(resolve_gcno test_chaos_init_dns)
 CHAOS_INIT_NET_GCNO=$(resolve_gcno test_chaos_init_net)
@@ -195,6 +196,15 @@ check_target "$CHAOS_INIT_GCNO" "src/init/chaos_init_proc.c" "100.00"
 check_target "$CHAOS_INIT_GCNO" "src/init/chaos_init_tracee.c" "100.00"
 check_target "$CHAOS_INIT_TRACE_GCNO" "src/init/chaos_init_trace.c" "100.00"
 check_target "$CHAOS_INIT_VDSO_GCNO" "src/init/chaos_init_vdso.c" "100.00"
+# chaos_init.c is the supervisor's entry point: argument handling, the handover, the
+# filter and the serve loop, most of which needs a container, a filter and a tracee and is
+# covered by test_seccomp.sh. test_chaos_init_main.c reaches the part that decides without
+# any of that. The threshold is what those tests actually reach, not 100, because the rest
+# cannot be reached from a unit test -- but it is measured, which it was not: this file was
+# in no test and in no target here while this script's own header claimed to cover
+# chaos-init, and five defects in it were invisible to a green gate for that reason. Raise
+# the number when more of it comes under test; never lower it to make a change fit.
+check_target "$CHAOS_INIT_MAIN_GCNO" "src/init/chaos_init.c" "11.00"
 check_target "$CHAOS_INIT_TIME_GCNO" "src/init/chaos_init_time.c" "100.00"
 check_target "$CHAOS_INIT_DNS_GCNO" "src/init/chaos_init_dns.c" "100.00"
 check_target "$CHAOS_INIT_IO_GCNO" "src/init/chaos_init_io.c" "100.00"

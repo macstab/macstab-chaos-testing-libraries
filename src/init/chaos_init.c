@@ -1073,6 +1073,10 @@ static int chaos_init_reap(unsigned libs, pid_t child, int *child_status)
             chaos_init_trace_stop(libs, pid, status);
             continue;
         }
+        /* Whatever this thread still held in the trace tables goes with it: a thread
+         * killed on the way to the exit stop of a traced call never reaches the stop that
+         * would have taken its entry. */
+        chaos_init_trace_forget(pid);
         if (pid == child)
         {
             *child_status = status;
@@ -1227,6 +1231,13 @@ static int chaos_init_serve_the_rest(int listener)
  *        are unsigned long arrays so they carry the alignment of the kernel structures
  *        they are cast to.
  */
+#ifdef CHAOS_INIT_NO_MAIN
+/* A unit test includes this file to reach the decision helpers above -- the reply it sends
+ * for each verdict, the rule-file name filter, the inotify drain -- and brings its own
+ * main(). Everything below needs a container, a filter and a tracee, which is what the
+ * seccomp suite provides; the coverage gate records the share this leaves uncovered rather
+ * than leaving the file unmeasured, which is how five defects in here stayed invisible. */
+#else
 int main(int argc, char **argv)
 {
     static unsigned long request[CHAOS_INIT_NOTIF_BUFFER / sizeof(unsigned long)];
@@ -1551,3 +1562,4 @@ int main(int argc, char **argv)
         }
     }
 }
+#endif

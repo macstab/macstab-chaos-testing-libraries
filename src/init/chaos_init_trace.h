@@ -275,4 +275,18 @@ int chaos_init_trace_promise(pid_t tid, long value);
  */
 int chaos_init_trace_claim(pid_t tid, long *value);
 
+/**
+ * @brief Drops every entry a thread held in the three per-thread tables.
+ *
+ * @details Called for each reaped process. A thread killed while continued towards the
+ * exit stop of a traced call -- the stop that would have consumed its entry -- never
+ * reaches it, so without this the tables fill up: after 256 such threads every CORRUPT,
+ * DUP, write DROP and close RESET rule stops firing for the rest of the container's life,
+ * with nothing said about it. Before that, a reused thread id claims the dead thread's
+ * promise and has an unrelated call's return value overwritten.
+ *
+ * @param tid  Thread that ended.
+ */
+void chaos_init_trace_forget(pid_t tid);
+
 #endif
