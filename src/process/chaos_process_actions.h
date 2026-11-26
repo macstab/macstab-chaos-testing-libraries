@@ -30,22 +30,13 @@
 int chaos_process_probability_hit_sample(double probability, uint32_t sample);
 
 /**
- * @brief chaos_process_probability_hit_sample() with one draw from the calling thread's
- *        PRNG (drawn even when @p probability is 0 or 1).
- *
- * @param probability Probability in [0.0, 1.0].
- * @return Non-zero on a hit.
- */
-int chaos_process_probability_hit(double probability);
-
-/**
  * @brief Whether @p rule fires on this call: window open, size gate passed, probability
  *        hit, then an `@first` claim; a firing counts one hit.
  *
  * @param rule Rule; NULL returns 0.
  * @return Non-zero when the rule fires.
  */
-int chaos_process_rule_should_trigger(const chaos_process_rule_t *rule);
+int chaos_process_rule_should_trigger(chaos_process_rule_t *rule);
 
 /**
  * @brief Sleeps `rule->latency_ms` if @p rule is a LATENCY rule that fires.
@@ -57,7 +48,7 @@ int chaos_process_rule_should_trigger(const chaos_process_rule_t *rule);
  *
  * @param rule Rule; NULL, another effect or no firing does nothing.
  */
-void chaos_process_rule_apply_latency(const chaos_process_rule_t *rule);
+void chaos_process_rule_apply_latency(chaos_process_rule_t *rule);
 
 /**
  * @brief Reports `rule->errnum` if @p rule is an ERRNO rule that fires.
@@ -66,7 +57,7 @@ void chaos_process_rule_apply_latency(const chaos_process_rule_t *rule);
  * @param errnum Receives the error; NULL returns 0.
  * @return Non-zero when the rule fired and *errnum was set.
  */
-int chaos_process_rule_error_number(const chaos_process_rule_t *rule, int *errnum);
+int chaos_process_rule_error_number(chaos_process_rule_t *rule, int *errnum);
 
 /**
  * @brief Advances the FAIL_AFTER counter of @p operation and reports `rule->errnum`
@@ -85,7 +76,7 @@ int chaos_process_rule_error_number(const chaos_process_rule_t *rule, int *errnu
  * @return Non-zero when the rule fired and *errnum was set.
  */
 int chaos_process_rule_fail_after_error(
-    const chaos_process_rule_t *rule, chaos_process_operation_t operation, int *errnum
+    chaos_process_rule_t *rule, chaos_process_operation_t operation, int *errnum
 );
 
 #endif

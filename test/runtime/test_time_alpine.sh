@@ -3,7 +3,7 @@
 # test_time_alpine.sh: libchaos-time end-to-end in LD_PRELOAD mode on musl (Alpine 3.20).
 #
 # Proves, for one architecture per run, that clock_gettime, gettimeofday, time, timespec_get,
-# nanosleep, clock_nanosleep, usleep and sleep honour ERRNO, LATENCY, OFFSET and REGRESS rules,
+# nanosleep, clock_nanosleep, usleep and sleep honour ERRNO, LATENCY, OFFSET, REGRESS and FREEZE rules,
 # including absolute-deadline conversion under OFFSET; time_probe.c lists every check.
 #
 # Method: docker buildx builds libchaos-time-musl-<arch>.so (make cross-musl-<arch>) from

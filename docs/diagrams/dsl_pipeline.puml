@@ -104,7 +104,7 @@ if (Rule selected?) then (yes)
   (TORN: shortened count,
    OVERRIDE: IP literals instead of the resolver);
   :Post-call effects
-  (CORRUPT, OFFSET, REGRESS,
+  (CORRUPT, OFFSET, REGRESS, FREEZE,
    FILTER_FAMILY, SHUFFLE, LIMIT);
   :Return result;
 else (no)
@@ -118,7 +118,7 @@ legend
   1. "*" is a selector in every library and the least specific one
   2. Specificity is a strict partial order on selectors (§10.3)
   3. io, net: one rule per call; dns, time, process, memory: one rule per effect
-  4. OFFSET, REGRESS, CORRUPT only post-call; ERRNO, EAI_*, FAIL_AFTER only pre-call
+  4. OFFSET, REGRESS, FREEZE, CORRUPT only post-call; ERRNO, EAI_*, FAIL_AFTER only pre-call
   5. FAIL_AFTER counts per operation, shared by all threads; every published reload resets it
   6. Probability 0 never fires but is still selected (it shadows weaker rules)
   7. No rule selected: wrapped(args) == real(args)

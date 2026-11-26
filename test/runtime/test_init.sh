@@ -152,9 +152,11 @@ if [ "$emulated" -eq 0 ]; then
     expect "file limit 256: the mode is active" "$( (ulimit -n 256; $init --libs io -- /tmp/probe status) | head -1)" "state=active"
 fi
 
-old=$(/tmp/chaos-init-old --libs io -- /tmp/probe status | head -2 | tr "\n" " ")
+old=$(timeout -s KILL 10 /tmp/chaos-init-old --libs io -- /tmp/probe status | head -2 | tr "\n" " ")
 expect "old kernel: unsupported, with the reason" "$old" "state=unsupported reason=kernel older than 5.5 "
-expect "old kernel: the application still runs" "$(/tmp/chaos-init-old --libs $all -- /tmp/probe work)" "work ok (0)"
+# With every library, so the set includes the ones that ask for a tracer: an unsupported
+# kernel must leave the application running, not hold it at a stop nobody continues.
+expect "old kernel: the application still runs" "$(timeout -s KILL 10 /tmp/chaos-init-old --libs $all -- /tmp/probe work)" "work ok (0)"
 code=0
 timeout -s KILL 10 /tmp/chaos-init-lost --libs io -- /tmp/probe work >/dev/null 2>&1 || code=$?
 expect "a handover that cannot be sent ends the start, no hang" "$code" "125"
@@ -197,7 +199,7 @@ refused=$(docker run --rm \
     --security-opt seccomp="$TMP_DIR/no-seccomp.json" \
     -v "$TMP_DIR/out:/out:ro" \
     alpine:3.20 \
-    sh -c "/out/chaos-init-$ARCH --libs io -- grep NoNewPrivs /proc/self/status | tr -d '\t '; sed -n 2p /tmp/.chaos-init.status")
+    sh -c "timeout -s KILL 10 /out/chaos-init-$ARCH --libs io,time -- grep NoNewPrivs /proc/self/status | tr -d '\t '; sed -n 2p /tmp/.chaos-init.status")
 want="NoNewPrivs:0
 reason=seccomp refused by the container's security settings"
 if [ "$refused" = "$want" ]; then
@@ -217,7 +219,7 @@ refused=$(docker run --rm \
     --security-opt seccomp="$TMP_DIR/no-filter.json" \
     -v "$TMP_DIR/out:/out:ro" \
     alpine:3.20 \
-    sh -c "/out/chaos-init-$ARCH --libs io -- grep NoNewPrivs /proc/self/status | tr -d '\t '; sed -n 2p /tmp/.chaos-init.status")
+    sh -c "timeout -s KILL 10 /out/chaos-init-$ARCH --libs io,time -- grep NoNewPrivs /proc/self/status | tr -d '\t '; sed -n 2p /tmp/.chaos-init.status")
 if [ "$refused" = "$want" ]; then
     echo "ok   filter refused: no chaos, no no_new_privs"
 else

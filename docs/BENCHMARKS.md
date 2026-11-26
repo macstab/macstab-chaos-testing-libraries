@@ -591,6 +591,7 @@ returns shifted or scaled timestamps.
 | ERRNO injection      | No                                   | Yes                                 |
 | LATENCY injection    | No                                   | Yes (sleeps too: `nanosleep`, `clock_nanosleep`, `sleep`, `usleep`) |
 | One-time step back   | —                                    | `REGRESS`                           |
+| Stopped clock        | —                                    | `FREEZE`                            |
 | Config syntax        | `FAKETIME=+2h`                       | `clock_gettime/realtime:OFFSET:7200000` |
 
 The previous comparison put both at ~150-300 ns per call in the no-injection

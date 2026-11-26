@@ -83,6 +83,46 @@ Out of scope:
   inside the target's mount namespace.
 - Correctness means correct on all four tuples, not on the build host.
 
+### What Counts as an Effect
+
+Three rules decide whether a proposed fault belongs in this repository at all.
+They are stated here because every argument about a new effect has turned out
+to be an argument about one of them.
+
+**The effect criterion.** A library changes the result of an intercepted call,
+or performs that call partially. A helper system call is allowed when it only
+parameterises the intercepted call and leaves behind no state that would not
+have existed without it.
+
+The test question is: *what remains after the call has returned?*
+
+| Allowed, and why | |
+|---|---|
+| `OFFSET`, `REGRESS`, `FREEZE` | the returned time is rewritten; the kernel clock is untouched |
+| `TORN`, `DROP`, `THROTTLE` | the call is performed partially, or not at all while reporting that it was |
+| `REDIRECT` | the call is performed with another argument; the kernel state it leaves is the connection it made, which the call was going to make anyway |
+| `THROTTLE`'s wait | it delays one call and leaves nothing behind; the rate lives in the process, not in the kernel, so no other process is slowed down |
+| `statfs` `FREE`, `FULL` | the returned structure is rewritten; the filesystem is untouched |
+| `RESET`'s `setsockopt(SO_LINGER)` | it parameterises the close that follows it, and only on a socket this process alone holds -- otherwise the option would outlive the call on a descriptor someone else still owns, which is exactly the state this rule forbids |
+| `DROP`'s `lseek` | it repairs the offset the skipped write would have moved, so nothing is left that a real lost write would not leave |
+
+| Not allowed, and why | |
+|---|---|
+| filling the disk for real | the next process to run sees it; nothing restores it |
+| cgroup limits | they outlive the call and the process |
+| `tc`/`netem` | they act on an interface, not on a call, and reach every process in the namespace |
+
+**The invariant.** An effect follows only from a call the rules selected. There
+is no background thread, no timer and no ambient degradation.
+
+**The safety rule.** `/proc`, `/sys` and `/dev` are never falsified
+([IO.md](IO.md), excluded paths). This is the repository's own rule and not a
+consequence of the criterion: a language runtime configures itself from those
+files -- the JVM sizes its heap from `memory.max`, Go its thread count from the
+cpu quota -- and a lie there changes what the program *is*, not what one of its
+calls returned. It is also why there is no pressure-stall or `memory.current`
+effect: those would be expressible under the criterion and are still refused.
+
 ### Non-Goals
 
 - One preload object that owns every symbol.
@@ -144,7 +184,8 @@ Consequences:
   program uses.
 - Pipes, eventfds, timerfds and memfds (`pipe:[N]`, `anon_inode:[...]`,
   `/memfd:<name>`) belong to neither domain unless an io rule names them
-  explicitly: a TORN or CORRUPT intended for files would break their protocols.
+  explicitly: a TORN, DROP, THROTTLE or CORRUPT intended for files would break their
+  protocols.
 - Descriptors 0, 1 and 2 are never decided by `libchaos-io`.
 
 ## 2. Architectural Context
@@ -258,7 +299,7 @@ layered fault models.
 | rule file | `/tmp/.chaos-<lib>.conf`, one per library; re-read when its change stamp changes (reload) |
 | rule | one line of a rule file: selector, operation, effect, value, optional probability and qualifiers |
 | selector | what a rule matches: path prefix (io), endpoint (net), DNS name or address (dns), operation[/target] (time, memory, process) |
-| effect | what a matching rule does: `ERRNO`, `LATENCY`, `TIMEOUT`, `CORRUPT`, `TORN`, `TRICKLE`, `DUP`, `RESET`, `OFFSET`, `REGRESS`, `GAI`, `REWRITE`, `OVERRIDE`, `SERVICE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT`, `FAIL_AFTER` |
+| effect | what a matching rule does: `ERRNO`, `LATENCY`, `TIMEOUT`, `CORRUPT`, `TORN`, `DROP`, `THROTTLE`, `REDIRECT`, `FREE`, `FULL`, `TRICKLE`, `DUP`, `RESET`, `OFFSET`, `REGRESS`, `FREEZE`, `GAI`, `REWRITE`, `OVERRIDE`, `SERVICE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT`, `FAIL_AFTER` |
 | probability | chance in [0, 1] that a matching rule fires on a call, sampled from a per-thread PRNG |
 | qualifier | `@first=N`, `@from=T`, `@until=T`, `@size>N`, `@size<N` (`src/common/chaos_policy.h`) |
 | hit | one application of a rule's effect; counted per rule |
@@ -320,15 +361,24 @@ unrelated site; failing at load is diagnosable.
    or the `openat` directory), endpoint (net), name or address (dns),
    operation and target (time, memory, process).
 5. **Select.** Scan the active snapshot linearly (at most 256 rules) for the
-   most specific matching rule per effect class; ties go to the longer
-   selector text, so line order never changes the outcome.
+   most specific matching rule per effect class. Ties go to the longer
+   address prefix in net (`tcp4://10.1.0.0/16:…` over `tcp4://10.0.0.0/8:…`,
+   a literal address being the full-width case), then to the longer selector
+   text, so line order never changes the outcome.
 6. **Gate.** Check `@from`/`@until` against `CLOCK_REALTIME`, `@size` against
    the call's byte count, then the probability, then claim an `@first` slot,
    then count the hit.
-7. **Effect.** Pre-call effects (`LATENCY`, `ERRNO`, `TIMEOUT`, `GAI`, ...)
-   run before the real call; post-call effects (`CORRUPT`, `OFFSET`,
-   `FILTER_FAMILY`, ...) transform its result. `TORN`, `TRICKLE` and `DUP`
-   reshape the request or the result.
+7. **Effect**, in full rather than by example, because which side of the real
+   call an effect acts on is what decides whether two of them can combine:
+   - before it: `LATENCY`, `ERRNO`, `GAI`, `FAIL_AFTER`, `TIMEOUT`;
+   - instead of it: `OVERRIDE` (a synthetic answer), `DROP` (success reported,
+     nothing done);
+   - after it: `CORRUPT`, `OFFSET`, `REGRESS`, `FREEZE`, `FREE`, `FULL`,
+     `REWRITE`, `SERVICE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT`;
+   - reshaping the request or the result: `TORN`, `THROTTLE`, `TRICKLE`, `DUP`,
+     `REDIRECT` (the address the call is made to);
+   - parameterising the call itself: `RESET`, whose `setsockopt` precedes the
+     close it belongs to.
 8. **Return** what libc would return, except for the injected fault. errno is
    left untouched on every path that does not inject.
 
@@ -354,7 +404,8 @@ grammar can express the other's domain.
 ### Distinct Failure Boundaries
 
 `libchaos-io` reasons about path prefixes, descriptor-to-path resolution,
-partial writes (`TORN`), read corruption and durability (`fsync`,
+partial writes (`TORN`), lost writes (`DROP`), a filesystem reported full
+(`FREE`, `FULL`), read corruption and durability (`fsync`,
 `fdatasync`). `libchaos-net` reasons about endpoints, receive corruption,
 short and duplicated receives, abortive close (`RESET`) and readiness
 timeouts. Flattening both into one grammar would make each less precise.
@@ -605,10 +656,11 @@ Responsibilities:
 - path-prefix selectors; boundary-aware prefix match (`/data` covers
   `/data/x`, not `/database`); `*` covers absolute paths except `/memfd:`
 - descriptor-to-path resolution through a process-wide fd cache
-- effects `ERRNO`, `LATENCY`, `TORN` (write side), `CORRUPT` (read side)
+- effects `ERRNO`, `LATENCY`, `TORN` and `DROP` (write side), `CORRUPT` (read
+  side), `FREE` and `FULL` (the free-space counts a `statfs` answer reports)
 - stdio streams: `ERRNO` raises the stream's error indicator (bit `0x20` of
   the first word of `FILE` on glibc and musl), so `ferror()` is true as after
-  a real failure; `TORN` does not apply
+  a real failure; `TORN` and `DROP` do not apply
 
 Operations: `read`, `write`, `open`, `close`, `fsync`, `fdatasync`, `pread`,
 `pwrite`, `truncate`, `allocate`, `unlink`, `rename_from`, `rename_to`. Every
@@ -627,13 +679,14 @@ domain is unambiguously another library's.
 Responsibilities:
 
 - endpoint selectors: `*`, `tcp4://`, `tcp6://`, `udp4://`, `udp6://`,
-  `unix://`, with wildcard host and port
+  `unix://`, with wildcard host and port, and `/N` address prefixes
 - operations `socket`, `bind`, `listen`, `connect`, `accept`, `shutdown`,
   `poll`, `send`, `recv`, `close`
 - effects `ERRNO`, `LATENCY`, `CORRUPT` (recv), `TIMEOUT` (poll),
   `RESET` (close: abortive close, the peer receives an RST), `TRICKLE`
   (recv on stream sockets: at most N bytes per call), `DUP` (recv: deliver
-  the previous payload once more)
+  the previous payload once more), `DROP` (send on datagram sockets: the
+  byte count is reported and nothing is sent)
 
 State: two snapshots; no socket identity cache (net shares `close` with io
 and cannot observe every way a descriptor is freed, so identity is derived
@@ -672,8 +725,13 @@ Effects: `ERRNO`, `LATENCY`, `OFFSET` (signed millisecond shift of the
 returned time, clamped at `{0, 0}`), `REGRESS` (one clock per rule: the first
 matching read is real, a later firing read jumps back by the offset, and the
 clock stays shifted from then on; its state survives reloads in the rule's
-hit slot). Neither `OFFSET` nor `REGRESS` preserves monotonicity of
-`CLOCK_MONOTONIC`; stepping a clock backwards is their purpose.
+hit slot), `FREEZE` (the reading of the call that fires the rule is kept in
+the hit slot and returned by every later read; the value field is the
+probability, since the effect carries no amount). Neither `OFFSET` nor
+`REGRESS` preserves monotonicity of `CLOCK_MONOTONIC`; stepping a clock
+backwards is their purpose. `FREEZE` does preserve it — a stopped clock is
+non-decreasing — and stops progress instead, so it is allowed on
+`CLOCK_MONOTONIC` where `REGRESS` is not.
 
 ### `libchaos-process`
 
@@ -724,8 +782,14 @@ answers each notification: fail, delay (held in a queue so other threads
 proceed), or continue unchanged, by the rules of the libraries named in
 `--libs`. It requires Linux 5.5 (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`) and uses
 `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` from Linux 5.19. Data effects
-(`CORRUPT`, `TORN`, ...) cannot be applied from outside and are rejected
-with reason `unsupported in seccomp mode`. Details: [SECCOMP.md](SECCOMP.md).
+(`TORN`, `CORRUPT`, `TRICKLE`, `DUP`, `DROP`) are applied through a ptrace stop
+instead of a notification, which reaches the tracee's registers, its memory and a
+system call of the supervisor's choosing; the vectored forms are left out of it and
+count no hit. A second call of the supervisor runs in the tracee where an
+effect needs one (`write:DROP`'s `lseek`, `close:RESET`'s `setsockopt`). What remains
+rejected with reason `unsupported in seccomp mode` is what rewrites a structure the
+kernel returned (io `FREE`/`FULL`) or answers one call twice (errno on `close`).
+Details: [SECCOMP.md](SECCOMP.md).
 
 ### Shared Internal Scaffold
 
@@ -880,7 +944,8 @@ intercepted call after it changes (within 1 ms of throttle plus the reload).
 2. The winner marks the inactive snapshot's sequence odd, reads the file with
    raw `openat`/`read`, parses into it, assigns hit slots (a rule whose text
    was already active keeps its slot, so its count, `@first` claims and
-   `REGRESS` state continue), writes the status file, releases slots of rules
+   `REGRESS` state and a frozen `FREEZE` reading continue), writes the status
+   file, releases slots of rules
    that left (bumping their generation), and publishes: full barrier
    (`__sync_synchronize`), flip the active index, store the new stamp.
 3. Readers copy a rule under the snapshot seqlock. Two reloads later the same
@@ -1103,10 +1168,10 @@ their own architecture (`matrix.yml`).
 
 | Library | Rule file | Effects |
 | --- | --- | --- |
-| `libchaos-io` | `/tmp/.chaos-io.conf` | `ERRNO`, `LATENCY`, `TORN` (write side), `CORRUPT` (read side) |
-| `libchaos-net` | `/tmp/.chaos-net.conf` | `ERRNO`, `LATENCY`, `CORRUPT` (recv), `TIMEOUT` (poll), `RESET` (close), `TRICKLE` (recv, stream), `DUP` (recv) |
+| `libchaos-io` | `/tmp/.chaos-io.conf` | `ERRNO`, `LATENCY`, `TORN` and `DROP` (write side), `CORRUPT` (read side), `FREE` and `FULL` (`statfs`) |
+| `libchaos-net` | `/tmp/.chaos-net.conf` | `ERRNO`, `LATENCY`, `CORRUPT` (recv), `TIMEOUT` (poll), `RESET` (close), `TRICKLE` (recv, stream), `DUP` (recv), `DROP` (send, datagram) |
 | `libchaos-dns` | `/tmp/.chaos-dns.conf` | `GAI`, `LATENCY`, `REWRITE`, `SERVICE`, `OVERRIDE`, `FILTER_FAMILY`, `SHUFFLE`, `LIMIT` |
-| `libchaos-time` | `/tmp/.chaos-time.conf` | `ERRNO`, `LATENCY`, `OFFSET` and `REGRESS` (clock_gettime selectors; `REGRESS` needs `clock_gettime/<clock>`) |
+| `libchaos-time` | `/tmp/.chaos-time.conf` | `ERRNO`, `LATENCY`, `OFFSET`, `REGRESS` and `FREEZE` (clock_gettime selectors; `REGRESS` needs `clock_gettime/<clock>`) |
 | `libchaos-memory` | `/tmp/.chaos-memory.conf` | `ERRNO`, `LATENCY` |
 | `libchaos-process` | `/tmp/.chaos-process.conf` | `ERRNO`, `LATENCY`, `FAIL_AFTER` |
 

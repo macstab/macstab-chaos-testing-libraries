@@ -209,13 +209,28 @@ extern chaos_time_clock_nanosleep_fn g_chaos_time_real_clock_nanosleep;
 extern __thread int g_chaos_time_tls_guard;
 
 /**
- * Per-thread xorshift64* state; 0 means "not seeded yet".
+ * @brief Lineage of this process: 0 in the one that loaded the library, mixed forward in
+ *        every forked child (the atfork handler).
  *
- * chaos_time_prng_ensure_seeded() replaces 0 with an odd value on the next draw. The
- * atfork child handler resets the forking thread's state to 0, so each child draws its
- * own stream instead of repeating the parent's decisions.
+ * @details XORed into a rule's draw key, so the children of a pre-forking server decide
+ * differently from the parent and from each other without the key itself being rewritten
+ * -- rewriting it would write every snapshot page in each child, the copy-on-write cost
+ * chaos_hits.h goes out of its way to avoid. Deterministic: a child's lineage follows from
+ * how many times this process has forked, which the test controls, not from a thread id or
+ * an address, which it does not.
  */
-extern __thread uint64_t g_chaos_time_tls_prng_state;
+extern uint64_t g_chaos_time_lineage;
+
+/**
+ * @brief How often this process has forked, counted before the fork (the atfork prepare
+ *        handler), so that the child sees its own ordinal among its siblings.
+ *
+ * @details Without it every child of one parent would mix the same value into its
+ * lineage and the siblings of a pre-forking server would all make the *same* decision:
+ * at `p=0.5` either all of them or none, which is not a probability any more. The child
+ * resets it, so each process counts the children it forks itself.
+ */
+extern uint64_t g_chaos_time_forks;
 
 /**
  * Process-wide seed: 8 bytes of /dev/urandom read by chaos_time_init().
@@ -331,23 +346,6 @@ chaos_time_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint64_t 
  * @{
  */
 
-/**
- * Kernel thread id of the caller, as seed material only.
- *
- * Raw `SYS_gettid`: the gettid() wrapper exists only since glibc 2.30. Off Linux the pid
- * stands in and the stack address separates the threads.
- *
- * @return Thread id (pid off Linux).
- */
-static inline uint64_t chaos_time_current_tid(void)
-{
-#ifdef __linux__
-    return (uint64_t)syscall(SYS_gettid);
-#else
-    return (uint64_t)getpid();
-#endif
-}
-
 /** @} */
 
 /**
@@ -382,58 +380,29 @@ static inline uint64_t chaos_time_prng_mix(uint64_t value)
 }
 
 /**
- * Seeds the calling thread's PRNG unless it already has a state.
+ * @brief Hash of a rule's text, for its draw key.
  *
- * Seed material is the process seed XOR thread id XOR the address of a local, mixed with
- * chaos_time_prng_mix() and forced odd, so the state is never 0 (the one state
- * xorshift64* never leaves). Async-signal-safe; errno is not touched.
+ * @details splitmix64 over the bytes. From the text rather than the slot index, because
+ * chaos_hits_assign() hands a slot out again when a rule leaves the file and the next rule
+ * in that slot would inherit its decisions. Two rules with the same text are one rule.
+ *
+ * @param text Rule as written; NULL hashes as the empty string.
+ * @return A well-mixed 64-bit hash.
  */
-static inline void chaos_time_prng_ensure_seeded(void)
+static inline uint64_t chaos_time_rule_hash(const char *text)
 {
-    uint64_t seed;
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    size_t index;
 
-    if (g_chaos_time_tls_prng_state != 0U)
+    if (text == NULL)
     {
-        return;
+        return chaos_time_prng_mix(hash);
     }
-
-    seed = g_chaos_time_process_seed;
-    seed ^= chaos_time_current_tid();
-    seed ^= (uint64_t)(uintptr_t)&seed;
-    /* Odd, hence never 0: the one state xorshift64* cannot leave. */
-    g_chaos_time_tls_prng_state = chaos_time_prng_mix(seed) | 1U;
-}
-
-/**
- * Seeds the calling thread's PRNG with mix(@p seed): the constructor seeds the main
- * thread this way, and unit tests use it for reproducible streams.
- *
- * Unlike chaos_time_prng_ensure_seeded() the result is not forced odd; a mixed value of
- * 0 is only treated as "unseeded" and replaced on the next draw.
- *
- * @param seed  Seed; 0 is replaced by 1 before mixing.
- */
-static inline void chaos_time_prng_seed_thread(uint64_t seed)
-{
-    g_chaos_time_tls_prng_state = chaos_time_prng_mix(seed == 0U ? UINT64_C(1) : seed);
-}
-
-/**
- * Next 32-bit value of the calling thread's xorshift64* stream; seeds it on first use.
- *
- * @return Uniform value in [0, 2^32).
- */
-static inline uint32_t chaos_time_prng_next_u32(void)
-{
-    uint64_t state;
-
-    chaos_time_prng_ensure_seeded();
-    state = g_chaos_time_tls_prng_state;
-    state ^= state >> 12;
-    state ^= state << 25;
-    state ^= state >> 27;
-    g_chaos_time_tls_prng_state = state;
-    return (uint32_t)((state * UINT64_C(0x2545f4914f6cdd1d)) >> 32);
+    for (index = 0U; text[index] != '\0'; ++index)
+    {
+        hash = chaos_time_prng_mix(hash + (uint64_t)(unsigned char)text[index]);
+    }
+    return hash;
 }
 
 /** @} */

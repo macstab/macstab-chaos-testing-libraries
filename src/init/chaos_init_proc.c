@@ -25,6 +25,30 @@
  */
 #define CHAOS_INIT_PAGE 4096U
 
+static int g_chaos_init_unreadable = 0;
+
+/**
+ * @brief Notes that the kernel refused a look into a tracee, by the errno of the attempt.
+ *
+ * @details EACCES, EPERM and EIO mean "not allowed to look", which is what a process that
+ * changed user answers: it is no longer dumpable, and from then on neither
+ * process_vm_readv() nor the tracer's own ptrace reads reach it without `CAP_SYS_PTRACE`
+ * (the kernel's `ptrace_access_vm()` checks both). ESRCH and EFAULT are ordinary: the
+ * thread ended, or the address is not mapped.
+ */
+static void chaos_init_proc_refused(int error)
+{
+    if (error == EACCES || error == EPERM || error == EIO)
+    {
+        g_chaos_init_unreadable = 1;
+    }
+}
+
+int chaos_init_unreadable(void)
+{
+    return g_chaos_init_unreadable;
+}
+
 int chaos_init_read_memory(pid_t pid, uint64_t address, void *out, size_t size)
 {
     struct iovec local;
@@ -34,12 +58,19 @@ int chaos_init_read_memory(pid_t pid, uint64_t address, void *out, size_t size)
     local.iov_len = size;
     remote.iov_base = (void *)(uintptr_t)address;
     remote.iov_len = size;
+    /* Cleared first, because a *short* transfer sets no errno and the test below is what
+     * turns that into EFAULT. Whatever the last failure left behind -- the EACCES the
+     * ownership scan collects walking /proc/<pid>/fd is the common one -- would otherwise
+     * be handed to chaos_init_proc_refused(), which latches `unreadable=yes` into the
+     * status file for a container that is perfectly readable. */
+    errno = 0;
     if (process_vm_readv(pid, &local, 1, &remote, 1, 0) != (ssize_t)size)
     {
         if (errno == 0)
         {
             errno = EFAULT; /* short read sets no errno: the rest is not mapped */
         }
+        chaos_init_proc_refused(errno);
         return -1;
     }
     return 0;
@@ -105,6 +136,7 @@ long chaos_init_proc_link(pid_t pid, const char *name, char *out, size_t size)
     length = readlink(path, out, size - 1U);
     if (length < 0)
     {
+        chaos_init_proc_refused(errno);
         return -1;
     }
     out[length] = '\0';

@@ -90,7 +90,8 @@
  * - chaos_net_ensure_symbols() as a no-op, so real functions stay what the test assigns.
  * - The five Linux-only pointers via CHAOS_NET_DEFINE_TEST_ACCEPT4_GLOBAL().
  * - `__thread int g_chaos_net_tls_guard` (reentrancy guard) = 0.
- * - `__thread uint64_t g_chaos_net_tls_prng_state` = 0, which makes the per-thread PRNG seed
+ * - `uint64_t g_chaos_net_lineage` = 0, the lineage of the process that
+ *   loaded the library; a forked child mixes it forward so it decides on its own.
  *   itself on first use.
  * - `uint64_t g_chaos_net_process_seed` = 1, a fixed process seed.
  */
@@ -124,7 +125,8 @@
     void chaos_net_ensure_symbols(void) {}                                                         \
     CHAOS_NET_DEFINE_TEST_ACCEPT4_GLOBAL()                                                         \
     __thread int g_chaos_net_tls_guard = 0;                                                        \
-    __thread uint64_t g_chaos_net_tls_prng_state = 0U;                                             \
+    uint64_t g_chaos_net_lineage = 0U;                                                             \
+    uint64_t g_chaos_net_forks = 0U;                                                               \
     uint64_t g_chaos_net_process_seed = 1U
 
 /**
@@ -207,7 +209,8 @@ static inline void chaos_net_test_reset_runtime(void)
     g_chaos_net_real_close = chaos_net_test_kernel_close;
     CHAOS_NET_RESET_TEST_ACCEPT4_GLOBAL()
     g_chaos_net_tls_guard = 0;
-    g_chaos_net_tls_prng_state = 0U;
+    g_chaos_net_lineage = 0U;
+    g_chaos_net_forks = 0U;
     g_chaos_net_process_seed = 1U;
 }
 

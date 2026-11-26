@@ -52,7 +52,7 @@
  * @param rule  Matched rule copy; NULL yields 0.
  * @return 0 to make the real call (after any delay); -1 to return -1 at once, errno set.
  */
-static int chaos_net_apply_simple_pre_call_rule(const chaos_net_rule_t *rule)
+static int chaos_net_apply_simple_pre_call_rule(chaos_net_rule_t *rule)
 {
     if (rule == NULL)
     {
@@ -178,7 +178,8 @@ static int chaos_net_call_real_recvmmsg(
  * @param count   Messages recvmmsg returned; 0 is a no-op.
  * @par Thread-safety: advances the calling thread's PRNG by up to three steps.
  */
-static void chaos_net_corrupt_mmsghdrs(struct mmsghdr *msgvec, unsigned int count)
+static void
+chaos_net_corrupt_mmsghdrs(const chaos_net_rule_t *rule, struct mmsghdr *msgvec, unsigned int count)
 {
     unsigned int selected;
 
@@ -188,7 +189,7 @@ static void chaos_net_corrupt_mmsghdrs(struct mmsghdr *msgvec, unsigned int coun
     }
 
     /* One message of the batch, uniformly (up to modulo bias). */
-    selected = chaos_net_prng_next_u32() % count;
+    selected = chaos_net_rule_draw(rule, CHAOS_NET_DRAW_MESSAGE) % count;
     if (msgvec[selected].msg_len > 0U && msgvec[selected].msg_hdr.msg_iov != NULL &&
         msgvec[selected].msg_hdr.msg_iovlen > 0)
     {
@@ -206,8 +207,8 @@ static void chaos_net_corrupt_mmsghdrs(struct mmsghdr *msgvec, unsigned int coun
             }
             if (segment_len > 0U)
             {
-                uint32_t index_sample = chaos_net_prng_next_u32();
-                uint32_t bit_sample = chaos_net_prng_next_u32();
+                uint32_t index_sample = chaos_net_rule_draw(rule, CHAOS_NET_DRAW_FIRST_EFFECT);
+                uint32_t bit_sample = chaos_net_rule_draw(rule, CHAOS_NET_DRAW_SECOND_EFFECT);
 
                 chaos_net_corrupt_buffer_sample(
                     iov[iov_index].iov_base, segment_len, index_sample, bit_sample
@@ -430,7 +431,7 @@ CHAOS_NET_EXPORT int recvmmsg(
     /* One bit in one randomly selected message of the batch. */
     if (rc > 0 && rule.effect == CHAOS_NET_EFFECT_CORRUPT && chaos_net_rule_should_trigger(&rule))
     {
-        chaos_net_corrupt_mmsghdrs(msgvec, (unsigned int)rc);
+        chaos_net_corrupt_mmsghdrs(&rule, msgvec, (unsigned int)rc);
     }
     return rc;
 }

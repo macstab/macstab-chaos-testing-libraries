@@ -12,6 +12,7 @@
  *   follow the locale-independent grammar of `chaos_policy_parse_probability()`; qualifiers
  *   land in the rule's policy; a rejected line fails the whole file with its line number;
  * - checks: ERRNO is valid for every operation; CORRUPT, TRICKLE and DUP only for recv,
+ *   DROP only for send,
  *   TIMEOUT only for poll, RESET only for close; `socket` rules take only `*`, a wildcard
  *   host with port 0, or `unix://\*` (no address exists at socket() time); a build hook
  *   (`CHAOS_NET_RULE_SUPPORTED`, defined by `chaos-init`) can reject rules as UNSUPPORTED;
@@ -403,6 +404,18 @@ static void test_helper_functions(void)
     }
     assert(chaos_net_parse_errno_name(NULL) == -1);
     assert(chaos_net_parse_errno_name("ENOPE") == -1);
+    /* A number the C library has no name for, as the other libraries accept: only the
+     * range is checked. Zero, a negative, a float, trailing text and a value past int are
+     * not errnos. */
+    assert(chaos_net_parse_errno_name("5") == 5);
+    assert(chaos_net_parse_errno_name("2147483647") == 2147483647);
+    assert(chaos_net_parse_errno_name("5 ") == 5);
+    assert(chaos_net_parse_errno_name("0") == -1);
+    assert(chaos_net_parse_errno_name("-5") == -1);
+    assert(chaos_net_parse_errno_name("5.5") == -1);
+    assert(chaos_net_parse_errno_name("5x") == -1);
+    assert(chaos_net_parse_errno_name("2147483648") == -1);
+    assert(chaos_net_parse_errno_name("") == -1);
 
     {
         double probability = 0.0;
@@ -466,6 +479,9 @@ static void test_helper_functions(void)
     assert(chaos_net_effect_allowed(CHAOS_NET_OP_RECV, CHAOS_NET_EFFECT_ERRNO));
     assert(chaos_net_effect_allowed(CHAOS_NET_OP_RECV, CHAOS_NET_EFFECT_CORRUPT));
     assert(chaos_net_effect_allowed(CHAOS_NET_OP_POLL, CHAOS_NET_EFFECT_TIMEOUT));
+    assert(chaos_net_effect_allowed(CHAOS_NET_OP_SEND, CHAOS_NET_EFFECT_DROP));
+    assert(!chaos_net_effect_allowed(CHAOS_NET_OP_RECV, CHAOS_NET_EFFECT_DROP));
+    assert(!chaos_net_effect_allowed(CHAOS_NET_OP_CLOSE, CHAOS_NET_EFFECT_DROP));
     assert(!chaos_net_effect_allowed(CHAOS_NET_OP_INVALID, CHAOS_NET_EFFECT_LATENCY));
     assert(!chaos_net_effect_allowed(CHAOS_NET_OP_CONNECT, (chaos_net_effect_t)9999));
 
@@ -671,6 +687,76 @@ static void test_selection_and_buffer_edges(void)
 }
 
 /**
+ * @brief Proves the longer address prefix wins, whatever the selector texts are.
+ *
+ * @details The prefix stage sits between rank and selector text, so the two have to be
+ * made to disagree. The `/8` rule is given a selector text longer than any real selector
+ * while keeping its parsed prefix: text length alone would then pick it for an address both
+ * prefixes contain, and the prefix stage picks the `/16` anyway. A literal address is the
+ * full-width prefix and beats both. On a full tie the earlier rule stands.
+ */
+static void test_prefix_beats_selector_text(void)
+{
+    chaos_net_rule_t rules[3];
+    chaos_net_rule_t rule;
+    chaos_net_endpoint_t endpoint = {0};
+    size_t index;
+
+    /* The prefix is split out of the host text, so the buffer that holds it has to fit
+     * the address *and* the suffix. Every example in the documentation and in these tests
+     * happens to stay under sixteen characters, which is what an address alone needs --
+     * these are the ones that do not, and the shortest of them is a /24 on a private
+     * network, the first thing anyone writes. */
+    {
+        chaos_net_endpoint_t wide = {0};
+
+        assert(chaos_net_endpoint_parse_selector("tcp4://192.168.100.0/24:5432", &wide));
+        assert(wide.prefix_len == 24U);
+        assert(chaos_net_endpoint_parse_selector("tcp4://172.16.100.128/25:443", &wide));
+        assert(wide.prefix_len == 25U);
+        assert(chaos_net_endpoint_parse_selector("tcp4://255.255.255.255/32:80", &wide));
+        assert(wide.prefix_len == 32U);
+    }
+
+    (void)memset(rules, 0, sizeof(rules));
+    assert(chaos_net_endpoint_parse_selector("tcp4://10.0.0.0/8:80", &rules[0].selector));
+    assert(chaos_net_endpoint_parse_selector("tcp4://10.1.0.0/16:80", &rules[1].selector));
+    assert(chaos_net_endpoint_parse_selector("tcp4://10.1.2.3:80", &rules[2].selector));
+    assert(rules[0].selector.prefix_len == 8U && rules[1].selector.prefix_len == 16U);
+    assert(rules[2].selector.prefix_len == 32U);
+    for (index = 0U; index < 3U; ++index)
+    {
+        rules[index].operation = CHAOS_NET_OP_CONNECT;
+        rules[index].effect = CHAOS_NET_EFFECT_LATENCY;
+        rules[index].latency_ms = (uint32_t)rules[index].selector.prefix_len;
+    }
+    /* Longer than any selector text in the file, so the text stage would pick this rule. */
+    rules[0].selector.selector_len = 200U;
+
+    assert(chaos_net_endpoint_parse_selector("tcp4://10.1.2.3:80", &endpoint));
+    assert(chaos_net_config_select_endpoint_rule(rules, 2U, CHAOS_NET_OP_CONNECT, &endpoint, &rule)
+    );
+    assert(rule.latency_ms == 16U);
+    assert(chaos_net_config_select_endpoint_rule(rules, 3U, CHAOS_NET_OP_CONNECT, &endpoint, &rule)
+    );
+    assert(rule.latency_ms == 32U);
+
+    /* An address only the /8 contains falls back to it, long text and all. */
+    assert(chaos_net_endpoint_parse_selector("tcp4://10.9.9.9:80", &endpoint));
+    assert(chaos_net_config_select_endpoint_rule(rules, 3U, CHAOS_NET_OP_CONNECT, &endpoint, &rule)
+    );
+    assert(rule.latency_ms == 8U);
+
+    /* Equal rank, equal prefix, equal text: the earlier rule stands. */
+    rules[2] = rules[1];
+    rules[2].latency_ms = 99U;
+    assert(chaos_net_endpoint_parse_selector("tcp4://10.1.2.3:80", &endpoint));
+    assert(chaos_net_config_select_endpoint_rule(rules, 3U, CHAOS_NET_OP_CONNECT, &endpoint, &rule)
+    );
+    assert(rule.latency_ms == 16U);
+}
+
+/**
  * @brief Proves every malformed line is rejected with -1 and a comment-only line returns 0.
  *
  * @details Rejected: missing fields; an empty selector, operation, effect or value; an
@@ -716,6 +802,63 @@ static void test_invalid_lines(void)
     assert(chaos_net_config_parse_line(invalid_latency_value, &rule) == -1);
     assert(chaos_net_config_parse_line(invalid_corrupt_value, &rule) == -1);
     assert(chaos_net_config_parse_line(invalid_timeout_value, &rule) == -1);
+}
+
+/**
+ * @brief Proves `LATENCY:ms[@probability]` parses and that every malformed form is rejected.
+ *
+ * @details LATENCY used to be the one effect without a probability, which made
+ * `recv:LATENCY:200` fire on every matching call and left no way to delay only some of them.
+ * It now takes the same optional `@probability` the other four libraries have, so the
+ * trigger gate needs no LATENCY exception any more.
+ *
+ * Accepted: plain milliseconds (probability 1.0, which is what the form always meant) and
+ * `ms@p`. Rejected: no milliseconds before the `@`, a probability out of range or malformed,
+ * a second `@`, milliseconds too long to be a number, and a blank before the `@` -- that
+ * makes it a qualifier word, and `@0.5` is not a qualifier.
+ */
+static void test_latency_probability(void)
+{
+    char plain[] = "tcp4://127.0.0.1:5432:connect:LATENCY:200";
+    char with_probability[] = "tcp4://127.0.0.1:5432:connect:LATENCY:200@0.25";
+    char zero_probability[] = "tcp4://127.0.0.1:5432:connect:LATENCY:200@0";
+    char no_milliseconds[] = "tcp4://127.0.0.1:5432:connect:LATENCY:@0.25";
+    char out_of_range[] = "tcp4://127.0.0.1:5432:connect:LATENCY:200@2";
+    char malformed[] = "tcp4://127.0.0.1:5432:connect:LATENCY:200@x";
+    char two_at_signs[] = "tcp4://127.0.0.1:5432:connect:LATENCY:200@0.5@0.5";
+    char long_milliseconds[] = "tcp4://127.0.0.1:5432:connect:LATENCY:00000000000000200@1";
+    char blank_before_at[] = "tcp4://127.0.0.1:5432:connect:LATENCY:200 @0.25";
+    chaos_net_rule_t rule;
+
+    assert(chaos_net_config_parse_line(plain, &rule) == 1);
+    assert(rule.effect == CHAOS_NET_EFFECT_LATENCY);
+    assert(rule.latency_ms == 200U && rule.probability == 1.0);
+
+    assert(chaos_net_config_parse_line(with_probability, &rule) == 1);
+    assert(rule.latency_ms == 200U && rule.probability == 0.25);
+
+    /* 0 is a legal probability: the rule is loaded, reported and never fires. */
+    assert(chaos_net_config_parse_line(zero_probability, &rule) == 1);
+    assert(rule.latency_ms == 200U && rule.probability == 0.0);
+
+    assert(chaos_net_config_parse_line(no_milliseconds, &rule) == -1);
+    assert(chaos_net_config_parse_line(out_of_range, &rule) == -1);
+    assert(chaos_net_config_parse_line(malformed, &rule) == -1);
+    assert(chaos_net_config_parse_line(two_at_signs, &rule) == -1);
+    assert(chaos_net_config_parse_line(long_milliseconds, &rule) == -1);
+    assert(chaos_net_config_parse_line(blank_before_at, &rule) == -1);
+
+    /* The NULL guards cannot be reached through a rule file -- the value field is never
+     * NULL and neither is the rule's probability -- so the value parser is called directly,
+     * the way io's counterpart is tested in test_config_parse.c. */
+    {
+        unsigned int latency_ms = 0U;
+        double probability = 0.0;
+
+        assert(chaos_net_parse_latency_value(NULL, &latency_ms, &probability) == -1);
+        assert(chaos_net_parse_latency_value("200@0.5", &latency_ms, NULL) == -1);
+        assert(chaos_net_parse_latency_value("200@0.5", NULL, &probability) == -1);
+    }
 }
 
 /**
@@ -826,6 +969,24 @@ static void test_file_and_state_edges(void)
         g_chaos_net_cached_mtime = CHAOS_NET_MTIME_UNKNOWN;
         assert(chaos_net_config_prepare());
         assert(!chaos_net_config_match_final_loaded(CHAOS_NET_OP_RECV, &local, &rule));
+
+        /* Equal rank, shorter selector text, but a longer address prefix: the other end
+         * could still win, so the match is not final. Without the prefix stage here the
+         * caller would skip resolving the other end and apply the /8 rule where the
+         * exact rule belongs -- the text comparison alone calls it final. */
+        write_config_text(
+            "tcp4://10.0.0.0/8:5433:recv:ECONNRESET:1.0\n"
+            "tcp4://10.9.9.9:5433:recv:ETIMEDOUT:1.0\n",
+            36
+        );
+        g_chaos_net_cached_mtime = CHAOS_NET_MTIME_UNKNOWN;
+        assert(chaos_net_config_prepare());
+        {
+            chaos_net_endpoint_t inside;
+
+            assert(chaos_net_endpoint_parse_selector("tcp4://10.1.1.1:5433", &inside));
+            assert(!chaos_net_config_match_final_loaded(CHAOS_NET_OP_RECV, &inside, &rule));
+        }
 
         /* Wildcard rules only: any match is final. */
         write_config_text("*:recv:LATENCY:10\n", 35);
@@ -1015,9 +1176,43 @@ static void test_fork_takes_over_orphaned_reload(void)
     g_chaos_net_cached_mtime = CHAOS_NET_MTIME_RELOADING;
     (void)chaos_net_config_prepare();
     assert(g_chaos_net_cached_mtime == CHAOS_NET_MTIME_RELOADING);
-    g_chaos_net_tls_prng_state = UINT64_C(42);
+    /* The child's lineage must differ from its parent's -- and, which is the harder half,
+     * from its siblings': every backend of a pre-forking server drawing the same sample
+     * turns a probability into all or none. The ordinal that distinguishes them is counted
+     * by the prepare handler in the parent, so the two handlers are exercised in the order
+     * a fork runs them, with the parent's state restored in between. */
+    g_chaos_net_lineage = 0U;
+    g_chaos_net_forks = 0U;
+    chaos_net_config_before_fork();
+    assert(g_chaos_net_forks == 1U);
     chaos_net_config_after_fork();
-    assert(g_chaos_net_tls_prng_state == 0U);
+    assert(g_chaos_net_lineage != 0U);
+    /* The child counts its own children from zero. */
+    assert(g_chaos_net_forks == 0U);
+    {
+        const uint64_t first_child = g_chaos_net_lineage;
+
+        /* Back to what the parent holds after that fork, then fork a second child. */
+        g_chaos_net_lineage = 0U;
+        g_chaos_net_forks = 1U;
+        chaos_net_config_before_fork();
+        chaos_net_config_after_fork();
+        assert(g_chaos_net_lineage != first_child);
+        assert(g_chaos_net_lineage != 0U);
+        {
+            const uint64_t second_child = g_chaos_net_lineage;
+
+            /* And it follows from the ordinal alone: the same fork order, the same
+             * lineage, which is what makes a run with CHAOS_SEED reproducible. */
+            g_chaos_net_lineage = 0U;
+            g_chaos_net_forks = 1U;
+            chaos_net_config_before_fork();
+            chaos_net_config_after_fork();
+            assert(g_chaos_net_lineage == second_child);
+        }
+    }
+    g_chaos_net_lineage = 0U;
+    g_chaos_net_forks = 0U;
     assert(g_chaos_net_cached_mtime == CHAOS_NET_MTIME_UNKNOWN);
     assert(g_chaos_net_hits_pid == (uint64_t)getpid());
     assert(chaos_net_config_prepare());
@@ -1316,12 +1511,22 @@ static void test_prepare_reports_status(void)
     assert(!read_status_file(status, sizeof(status)));
 }
 
-/** @brief Reads this process's hits file into @p buffer (NUL-terminated); 0 when absent. */
+/** @brief Header lines of the last read_hits_file(), without the rule lines. */
+static char g_hits_header[128];
+
+/**
+ * @brief Reads this process's hits file into @p buffer (NUL-terminated); 0 when absent.
+ *
+ * @details The header lines (`generation=`, `suppressed.*`, none with a tab) are split off
+ * into g_hits_header, so the assertions on the rule lines stay about rule lines. That the header
+ * really is in front, and really carries no tab, is asserted here once for every reader below.
+ */
 static int read_hits_file(char *buffer, size_t size)
 {
     char path[64];
     FILE *file;
     size_t length;
+    const char *rules;
 
     (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_NET_HITS_PREFIX, g_chaos_net_hits_file);
     file = fopen(path, "r");
@@ -1332,6 +1537,21 @@ static int read_hits_file(char *buffer, size_t size)
     length = fread(buffer, 1U, size - 1U, file);
     buffer[length] = '\0';
     assert(fclose(file) == 0);
+
+    /* Three header lines -- the shared generation, then the two suppression counters --
+     * and after them the rule lines; the first tab is in the rule lines. */
+    assert(strncmp(buffer, "generation=", 11U) == 0);
+    assert(strstr(buffer, "\nsuppressed.shared=") != NULL);
+    rules = strstr(buffer, "suppressed.unknown=");
+    assert(rules != NULL);
+    rules = strchr(rules, '\n');
+    assert(rules != NULL);
+    ++rules;
+    assert((size_t)(rules - buffer) < sizeof(g_hits_header));
+    (void)memcpy(g_hits_header, buffer, (size_t)(rules - buffer));
+    g_hits_header[rules - buffer] = '\0';
+    assert(strchr(g_hits_header, '\t') == NULL);
+    (void)memmove(buffer, rules, strlen(rules) + 1U);
     return 1;
 }
 
@@ -1474,6 +1694,127 @@ static void test_hits_are_counted_and_reported(void)
 }
 
 /**
+ * @brief Proves a rule's draw key follows its text, not its place in the file.
+ *
+ * @details The key is what makes a fault reproducible, so it has to belong to the rule and
+ * not to the slot it occupies: chaos_hits_assign() hands a slot out again when a rule
+ * leaves the file, and a key from the slot index would make the next rule in that slot
+ * inherit the old one's decisions. Asserted by reloading the same two rules in the other
+ * order -- each text keeps its key -- and by adding one in front, which shifts every index
+ * and must leave the keys alone.
+ */
+static void test_draw_key_follows_the_rule_text(void)
+{
+    uint64_t first_key;
+    uint64_t second_key;
+    const chaos_net_config_state_t *state;
+
+    chaos_net_config_init();
+    write_config_text(
+        "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0\n"
+        "tcp4://127.0.0.1:9011:connect:ECONNREFUSED:1.0\n",
+        81
+    );
+    assert(chaos_net_config_prepare() == 1);
+    state = chaos_net_config_active_state();
+    assert(state->rule_count == 2U);
+    assert(strcmp(state->text[0], "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0") == 0);
+    first_key = state->rules[0].key;
+    second_key = state->rules[1].key;
+    assert(first_key != second_key);
+
+    write_config_text(
+        "tcp4://127.0.0.1:9011:connect:ECONNREFUSED:1.0\n"
+        "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0\n",
+        82
+    );
+    g_chaos_net_cached_mtime = CHAOS_NET_MTIME_UNKNOWN;
+    assert(chaos_net_config_prepare() == 1);
+    state = chaos_net_config_active_state();
+    assert(state->rule_count == 2U);
+    assert(state->rules[0].key == second_key);
+    assert(state->rules[1].key == first_key);
+
+    write_config_text(
+        "tcp4://127.0.0.1:9012:connect:ECONNREFUSED:1.0\n"
+        "tcp4://127.0.0.1:9011:connect:ECONNREFUSED:1.0\n"
+        "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0\n",
+        83
+    );
+    g_chaos_net_cached_mtime = CHAOS_NET_MTIME_UNKNOWN;
+    assert(chaos_net_config_prepare() == 1);
+    state = chaos_net_config_active_state();
+    assert(state->rule_count == 3U);
+    assert(state->rules[1].key == second_key);
+    assert(state->rules[2].key == first_key);
+    assert(state->rules[0].key != first_key && state->rules[0].key != second_key);
+
+    (void)unlink(CHAOS_NET_CONFIG_PATH);
+}
+
+/**
+ * @brief Proves suppressed RESETs reach the hits file, split by cause and never silently.
+ *
+ * @details A RESET on a socket this process does not own alone applies nothing
+ * (chaos_net_socket.c). What a test must still be able to see is *that* it applied nothing,
+ * which is what these two header lines are for. Asserted here on the file the library really
+ * writes, not on the counters in memory:
+ * - both lines are present while both counts are zero -- "no suppression" has to be
+ *   distinguishable from "this library does not report it";
+ * - a shared socket and an unreadable one are counted apart, because the first is a
+ *   pre-forking server behaving as designed and the second is a broken environment;
+ * - the counts belong to the process, so a fork child starts at zero.
+ */
+static void test_reset_suppressions_are_reported(void)
+{
+    char hits[1024];
+    char path[64];
+    chaos_net_config_state_t *state;
+
+    chaos_net_config_init();
+    write_config_text("tcp4://127.0.0.1:9010:close:RESET:1 # a\n", 71);
+    assert(chaos_net_config_prepare() == 1);
+    state = (chaos_net_config_state_t *)chaos_net_config_active_state();
+
+    /* Zeros are written too, so a reader can tell them from a missing report. */
+    chaos_hit_record(state->rules[0].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(strstr(g_hits_header, "suppressed.shared=0\nsuppressed.unknown=0\n") != NULL);
+    assert(strcmp(hits, "1\ttcp4://127.0.0.1:9010:close:RESET:1 # a\n") == 0);
+
+    /* Each cause counts on its own line, and a suppression writes the file by itself: a
+     * rule that is only ever suppressed records no hit, so nothing else would. The rule's
+     * hit count stays where it was, because a suppressed RESET spends no hit. */
+    chaos_net_reset_suppressed(CHAOS_NET_OWNER_SHARED);
+    chaos_net_reset_suppressed(CHAOS_NET_OWNER_SHARED);
+    chaos_net_reset_suppressed(CHAOS_NET_OWNER_UNKNOWN);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(strstr(g_hits_header, "suppressed.shared=2\nsuppressed.unknown=1\n") != NULL);
+    assert(strcmp(hits, "1\ttcp4://127.0.0.1:9010:close:RESET:1 # a\n") == 0);
+
+    /* A fork child reports its own suppressions only, like its own hits. */
+    chaos_net_config_after_fork();
+    chaos_net_reset_suppressed(CHAOS_NET_OWNER_SHARED);
+    assert(read_hits_file(hits, sizeof(hits)));
+    assert(strstr(g_hits_header, "suppressed.shared=1\nsuppressed.unknown=0\n") != NULL);
+
+    /* A buffer too small for the header writes none at all rather than a truncated line a
+     * reader cannot classify. Unreachable through the writer, whose buffer is sized for
+     * the whole block, so the formatter is called directly. */
+    {
+        char tiny[4];
+        char room[CHAOS_HITS_HEADER_MAX];
+
+        assert(chaos_net_hits_header(tiny, sizeof(tiny)) == NULL);
+        assert(chaos_net_hits_header(room, sizeof(room)) == room);
+    }
+
+    (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_NET_HITS_PREFIX, g_chaos_net_hits_file);
+    (void)unlink(path);
+    (void)unlink(CHAOS_NET_CONFIG_PATH);
+}
+
+/**
  * @brief Proves a fork child writes only its own hits, to its own hits file.
  *
  * @details The parent hits the rule 3 times and forks (a real fork(), so the pthread_atfork
@@ -1593,8 +1934,10 @@ static void test_vdso_lookup_rejects_bad_input(void)
 static void test_rule_qualifiers(void)
 {
     static chaos_net_rule_t rules[CHAOS_NET_MAX_RULES];
-    char qualified[] = "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 @first=3 @from=1000 "
+    /* send reports a byte count, so a size gate is meaningful on it. */
+    char qualified[] = "tcp4://127.0.0.1:9010:send:ECONNRESET:1.0 @first=3 @from=1000 "
                        "@until=2000 @size>10 @size<99 # owner\n";
+    char sized_connect[] = "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 @size>10\n";
     char unknown[] = "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 @bogus=1\n";
     char lonely[] = "# header\n  @first=3\n";
     char backwards[] = "tcp4://127.0.0.1:9010:connect:ECONNREFUSED:1.0 @from=2000 @until=1000\n";
@@ -1620,14 +1963,19 @@ static void test_rule_qualifiers(void)
     assert(chaos_net_config_parse_buffer(lonely, rules, &count) == -1);
     assert(chaos_net_config_last_error()->line == 2U);
     assert(chaos_net_config_parse_buffer(backwards, rules, &count) == -1);
+    /* connect reports no byte count, so the gate could never pass: the rule would
+     * load and never fire. */
+    assert(chaos_net_config_parse_buffer(sized_connect, rules, &count) == -1);
     assert(chaos_net_config_parse_buffer(empty_first, rules, &count) == -1);
 }
 
 /**
- * @brief Proves TRICKLE and DUP are recv-only and validate their values.
+ * @brief Proves TRICKLE and DUP are recv-only, DROP and THROTTLE send-only, and that all
+ *        four validate their values.
  *
  * @details TRICKLE takes a chunk size >= 1 in bytes and always fires (probability 1.0); 0 and
- * text are rejected. DUP takes a probability. Both are rejected on send.
+ * text are rejected. DUP takes a probability. Both are rejected on send. THROTTLE takes a
+ * rate in bytes per second and no probability.
  */
 static void test_trickle_rule(void)
 {
@@ -1654,6 +2002,140 @@ static void test_trickle_rule(void)
         assert(rule.effect == CHAOS_NET_EFFECT_DUP && rule.probability == 0.5);
         assert(chaos_net_config_parse_line(dup_send, &rule) == -1);
         assert(chaos_net_config_parse_line(dup_bad, &rule) == -1);
+    }
+
+    /* DROP is send-only and takes a probability. Whether the socket is a datagram one is
+     * not knowable from the rule text, so it is decided per call, not here. */
+    {
+        char drop[] = "udp4://127.0.0.1:9000:send:DROP:0.25";
+        char drop_any[] = "*:send:DROP:1";
+        char drop_recv[] = "udp4://127.0.0.1:9000:recv:DROP:1";
+        char drop_close[] = "udp4://127.0.0.1:9000:close:DROP:1";
+        char drop_bad[] = "udp4://127.0.0.1:9000:send:DROP:lots";
+        char drop_above_one[] = "udp4://127.0.0.1:9000:send:DROP:1.5";
+
+        assert(chaos_net_config_parse_line(drop, &rule) == 1);
+        assert(rule.effect == CHAOS_NET_EFFECT_DROP && rule.probability == 0.25);
+        assert(chaos_net_config_parse_line(drop_any, &rule) == 1);
+        assert(rule.effect == CHAOS_NET_EFFECT_DROP && rule.probability == 1.0);
+        assert(chaos_net_config_parse_line(drop_recv, &rule) == -1);
+        assert(chaos_net_config_parse_line(drop_close, &rule) == -1);
+        assert(chaos_net_config_parse_line(drop_bad, &rule) == -1);
+        assert(chaos_net_config_parse_line(drop_above_one, &rule) == -1);
+    }
+
+    /* REDIRECT is connect-only and takes an address with a port, optionally a
+     * probability. Its value is the one in this grammar that carries a colon of its own,
+     * so the line is split at the keyword rather than from the right; a selector that
+     * happens to contain the keyword still has to parse as a selector. */
+    {
+        char redirect[] = "tcp4://127.0.0.1:5432:connect:REDIRECT:10.0.0.1:5433";
+        char ipv6[] = "*:connect:REDIRECT:[2001:db8::1]:443";
+        char chance[] = "*:connect:REDIRECT:10.0.0.1:5433@0.25";
+        char on_send[] = "*:send:REDIRECT:10.0.0.1:5433";
+        char on_close[] = "*:close:REDIRECT:10.0.0.1:5433";
+        char no_port[] = "*:connect:REDIRECT:10.0.0.1";
+        char zero_port[] = "*:connect:REDIRECT:10.0.0.1:0";
+        char wildcard[] = "*:connect:REDIRECT:*:5433";
+        char prefix[] = "*:connect:REDIRECT:10.0.0.0/8:5433";
+        char bad_address[] = "*:connect:REDIRECT:10.0.0.999:5433";
+        char bare_ipv6[] = "*:connect:REDIRECT:2001:db8::1:443";
+        char bad_chance[] = "*:connect:REDIRECT:10.0.0.1:5433@2";
+        char empty[] = "*:connect:REDIRECT:";
+        char in_selector[] = "tcp4://x:REDIRECT:connect:REDIRECT:10.0.0.1:1";
+        struct in_addr expected;
+
+        assert(inet_pton(AF_INET, "10.0.0.1", &expected) == 1);
+        assert(chaos_net_config_parse_line(redirect, &rule) == 1);
+        assert(rule.effect == CHAOS_NET_EFFECT_REDIRECT);
+        assert(rule.redirect.family == AF_INET && rule.redirect.port == 5433U);
+        assert(memcmp(&rule.redirect.value.ipv4, &expected, sizeof(expected)) == 0);
+        assert(rule.probability == 1.0);
+        assert(chaos_net_config_parse_line(ipv6, &rule) == 1);
+        assert(rule.redirect.family == AF_INET6 && rule.redirect.port == 443U);
+        assert(chaos_net_config_parse_line(chance, &rule) == 1);
+        assert(rule.redirect.port == 5433U && rule.probability == 0.25);
+        assert(chaos_net_config_parse_line(on_send, &rule) == -1);
+        assert(chaos_net_config_parse_line(on_close, &rule) == -1);
+        /* A target needs one address and a port connect can use. */
+        assert(chaos_net_config_parse_line(no_port, &rule) == -1);
+        assert(chaos_net_config_parse_line(zero_port, &rule) == -1);
+        assert(chaos_net_config_parse_line(wildcard, &rule) == -1);
+        assert(chaos_net_config_parse_line(prefix, &rule) == -1);
+        assert(chaos_net_config_parse_line(bad_address, &rule) == -1);
+        /* An IPv6 target needs its brackets, as an IPv6 selector does. */
+        assert(chaos_net_config_parse_line(bare_ipv6, &rule) == -1);
+        assert(chaos_net_config_parse_line(bad_chance, &rule) == -1);
+        assert(chaos_net_config_parse_line(empty, &rule) == -1);
+        assert(chaos_net_config_parse_line(in_selector, &rule) == -1);
+        /* A UNIX selector can never be given an address with a port: rejected at load
+         * time rather than accepted and silent. The wildcard stays valid -- it matches the
+         * IP sockets the target fits. */
+        {
+            char unix_selector[] = "unix:///run/app.sock:connect:REDIRECT:10.0.0.1:5433";
+            char wildcard[] = "*:connect:REDIRECT:10.0.0.1:5433";
+
+            assert(chaos_net_config_parse_line(unix_selector, &rule) == -1);
+            assert(chaos_net_config_parse_line(wildcard, &rule) == 1);
+            assert(rule.effect == CHAOS_NET_EFFECT_REDIRECT && rule.redirect.port == 5433U);
+        }
+        /* The keyword with nothing but a selector in front of it: no operation field. */
+        {
+            char no_operation[] = "x:REDIRECT:10.0.0.1:1";
+
+            assert(chaos_net_config_parse_line(no_operation, &rule) == -1);
+        }
+        /* A target longer than the buffer the scheme is put in front of it in, and the
+         * arguments no line can produce: the parser passes its own fields, so those
+         * guards are proved by calling the helper directly. */
+        {
+            char line[CHAOS_NET_MAX_TEXT + 64U];
+            char address[CHAOS_NET_MAX_TEXT + 16U];
+            chaos_net_redirect_t target;
+            double chance = 0.0;
+
+            (void)memset(address, '1', sizeof(address) - 1U);
+            address[sizeof(address) - 1U] = '\0';
+            (void)snprintf(line, sizeof(line), "*:connect:REDIRECT:%s", address);
+            assert(chaos_net_config_parse_line(line, &rule) == -1);
+            /* The same length with a probability behind it, which is read first. */
+            (void)snprintf(line, sizeof(line), "*:connect:REDIRECT:%s@0.5", address);
+            assert(chaos_net_config_parse_line(line, &rule) == -1);
+            assert(chaos_net_parse_redirect(NULL, &target, &chance) == -1);
+            assert(chaos_net_parse_redirect("10.0.0.1:1", NULL, &chance) == -1);
+            assert(chaos_net_parse_redirect("10.0.0.1:1", &target, NULL) == -1);
+            assert(chaos_net_parse_redirect("", &target, &chance) == -1);
+            assert(chaos_net_parse_redirect("10.0.0.1:1", &target, &chance) == 0);
+            assert(target.port == 1U && chance == 1.0);
+        }
+    }
+
+    /* THROTTLE is send-only and takes a rate in bytes per second, no probability: a rate
+     * that fires on every other call is not a rate. Whether the socket is a stream is
+     * decided per call, as DROP's datagram test is. */
+    {
+        char throttle[] = "tcp4://127.0.0.1:9000:send:THROTTLE:65536";
+        char top[] = "*:send:THROTTLE:4294967295";
+        char recv_rule[] = "tcp4://127.0.0.1:9000:recv:THROTTLE:65536";
+        char close_rule[] = "tcp4://127.0.0.1:9000:close:THROTTLE:65536";
+        char zero_rate[] = "tcp4://127.0.0.1:9000:send:THROTTLE:0";
+        char text_rate[] = "tcp4://127.0.0.1:9000:send:THROTTLE:slowly";
+        char with_probability[] = "tcp4://127.0.0.1:9000:send:THROTTLE:65536@0.5";
+        char above_bucket[] = "tcp4://127.0.0.1:9000:send:THROTTLE:4294967296";
+
+        assert(chaos_net_config_parse_line(throttle, &rule) == 1);
+        assert(rule.effect == CHAOS_NET_EFFECT_THROTTLE);
+        assert(rule.rate_bps == 65536U);
+        assert(rule.probability == 1.0);
+        assert(chaos_net_config_parse_line(top, &rule) == 1);
+        assert(rule.rate_bps == 4294967295U);
+        assert(chaos_net_config_parse_line(recv_rule, &rule) == -1);
+        assert(chaos_net_config_parse_line(close_rule, &rule) == -1);
+        assert(chaos_net_config_parse_line(zero_rate, &rule) == -1);
+        assert(chaos_net_config_parse_line(text_rate, &rule) == -1);
+        assert(chaos_net_config_parse_line(with_probability, &rule) == -1);
+        /* One above what the bucket's token half holds: rejected, not truncated. */
+        assert(chaos_net_config_parse_line(above_bucket, &rule) == -1);
     }
 }
 
@@ -2048,14 +2530,126 @@ static void test_read_file_open_errors(void)
     free_backup(&backup);
 }
 
+/**
+ * @brief Proves a rule an earlier one always wins against is kept and warned about.
+ *
+ * @details Two rules with the same selector and effect tie on everything but the line, so
+ * the earlier always wins and the later can never fire. It is valid, so the file loads and
+ * the status record names its line. A rule differing in its effect is not shadowed: both
+ * can fire.
+ */
+static void test_shadowed_rules_warn(void)
+{
+    static chaos_net_rule_t rules[CHAOS_NET_MAX_RULES];
+    char duplicate[] = "*:recv:LATENCY:10\n*:recv:LATENCY:20\n";
+    char distinct[] = "*:recv:LATENCY:10\n*:recv:ECONNRESET:1.0\n";
+    char other_operation[] = "*:recv:LATENCY:10\n*:send:LATENCY:10\n";
+    size_t count = 0U;
+
+    assert(chaos_net_config_parse_buffer(duplicate, rules, &count) == 0);
+    assert(count == 2U);
+    assert(chaos_net_config_last_error()->warning_count == 1U);
+    assert(chaos_net_config_last_error()->warnings[0].line == 2U);
+    assert(
+        strcmp(chaos_net_config_last_error()->warnings[0].reason, CHAOS_STATUS_WARN_SHADOWED) == 0
+    );
+    assert(chaos_net_config_last_error()->reason == NULL);
+
+    /* A different effect on the same selector and operation is *not* a second selection:
+     * net matches on the operation and the endpoint and never on the effect, so the later
+     * rule is as dead as a literal duplicate. Proved through the selection rather than
+     * argued -- the file is written, prepared and asked, and it answers with the first
+     * rule's effect. */
+    assert(chaos_net_config_parse_buffer(distinct, rules, &count) == 0);
+    assert(count == 2U);
+    assert(chaos_net_config_last_error()->warning_count == 1U);
+    assert(chaos_net_config_last_error()->warnings[0].line == 2U);
+    {
+        chaos_net_endpoint_t any = {0};
+        chaos_net_rule_t picked;
+
+        write_config_text("*:recv:LATENCY:10\n*:recv:ECONNRESET:1.0\n", 31);
+        assert(chaos_net_endpoint_parse_selector("tcp4://127.0.0.1:9011", &any));
+        g_chaos_net_cached_mtime = CHAOS_NET_MTIME_UNKNOWN;
+        assert(chaos_net_config_prepare());
+        assert(chaos_net_config_match_endpoint_loaded(CHAOS_NET_OP_RECV, &any, &picked));
+        assert(picked.effect == CHAOS_NET_EFFECT_LATENCY);
+    }
+
+    /* The operation counts as much as the selector: recv and send never shadow. */
+    assert(chaos_net_config_parse_buffer(other_operation, rules, &count) == 0);
+    assert(count == 2U);
+    assert(chaos_net_config_last_error()->warning_count == 0U);
+}
+
+/**
+ * @brief Proves the hits file names the rule-file generation its counts belong to.
+ *
+ * @details A count of 0 after a reload can mean two things: the rule never fired, or the
+ * reload reset it. The generation tells them apart -- it rises with every published
+ * snapshot, so a reader that sees a new number knows the counts below restarted with it.
+ */
+static void test_hits_name_their_generation(void)
+{
+    char hits[1024];
+    char path[64];
+    const chaos_net_config_state_t *state;
+    uint64_t first_generation;
+
+    chaos_net_config_init();
+    write_config_text("tcp4://127.0.0.1:9020:connect:ECONNREFUSED:1.0\n", 101);
+    assert(chaos_net_config_prepare() == 1);
+    first_generation = g_chaos_net_config_generation;
+    assert(first_generation > 0U);
+    state = chaos_net_config_active_state();
+    assert(state->rule_count == 1U);
+    chaos_hit_record(state->rules[0].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    {
+        char expected[40];
+
+        (void)snprintf(
+            expected, sizeof(expected), "generation=%llu\n", (unsigned long long)first_generation
+        );
+        assert(strncmp(g_hits_header, expected, strlen(expected)) == 0);
+    }
+
+    /* A reload publishes a new snapshot, so the number rises. */
+    write_config_text("tcp4://127.0.0.1:9021:connect:ECONNREFUSED:1.0\n", 102);
+    g_chaos_net_cached_mtime = CHAOS_NET_MTIME_UNKNOWN;
+    assert(chaos_net_config_prepare() == 1);
+    assert(g_chaos_net_config_generation == first_generation + 1U);
+    state = chaos_net_config_active_state();
+    chaos_hit_record(state->rules[0].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    {
+        char expected[40];
+
+        (void)snprintf(
+            expected,
+            sizeof(expected),
+            "generation=%llu\n",
+            (unsigned long long)(first_generation + 1U)
+        );
+        assert(strncmp(g_hits_header, expected, strlen(expected)) == 0);
+    }
+
+    (void)snprintf(path, sizeof(path), "%s.%ld", CHAOS_NET_HITS_PREFIX, g_chaos_net_hits_file);
+    (void)unlink(path);
+    (void)unlink(CHAOS_NET_CONFIG_PATH);
+}
+
 int main(void)
 {
+    test_hits_name_their_generation();
     /* Stat the rule file on every call so each write is seen at once; the throttle has its
      * own test. */
     g_chaos_net_check_interval_ns = 0U;
     test_parse_buffer_reports_rejected_line();
     test_prepare_reports_status();
     test_hits_are_counted_and_reported();
+    test_draw_key_follows_the_rule_text();
+    test_reset_suppressions_are_reported();
     test_forked_child_reports_own_hits();
     test_first_budget_is_per_process();
     test_rule_file_check_is_throttled();
@@ -2065,8 +2659,10 @@ int main(void)
     test_read_file_rejects_changed_file();
     test_helper_functions();
     test_parse_and_select_rules();
+    test_prefix_beats_selector_text();
     test_selection_and_buffer_edges();
     test_invalid_lines();
+    test_latency_probability();
     test_file_and_state_edges();
     test_prepare_and_match();
     test_reload_in_progress_is_not_joined();
@@ -2081,5 +2677,6 @@ int main(void)
     test_rule_copies_across_reloads();
     test_rule_checks_and_selection_order();
     test_read_file_open_errors();
+    test_shadowed_rules_warn();
     return 0;
 }

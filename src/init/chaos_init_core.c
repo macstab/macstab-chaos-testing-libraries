@@ -15,7 +15,9 @@
 #include <linux/seccomp.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -129,7 +131,7 @@ static const long g_chaos_init_io_calls[] = {
     __NR_pread64,   __NR_preadv,   __NR_pwrite64,  __NR_pwritev,         __NR_sendfile,
     __NR_ftruncate, __NR_truncate, __NR_fallocate, __NR_unlinkat,        __NR_renameat2,
     __NR_close,     __NR_fsync,    __NR_fdatasync, __NR_copy_file_range, __NR_preadv2,
-    __NR_pwritev2,
+    __NR_pwritev2,  __NR_statfs,   __NR_fstatfs,
 #ifdef __NR_openat2
     __NR_openat2,
 #endif
@@ -210,10 +212,33 @@ static const long g_chaos_init_process_calls[] = {
         }                                                                                          \
     } while (0)
 
-size_t
-chaos_init_build_filter(unsigned libs, int handover_fd, struct sock_filter *out, size_t capacity)
+/** @brief Whether @p nr is one of the @p count numbers in @p table. */
+static int chaos_init_in_set(long nr, const long *table, size_t count)
+{
+    size_t index;
+
+    for (index = 0U; index < count; ++index)
+    {
+        if (table[index] == nr)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+size_t chaos_init_build_filter(
+    unsigned libs,
+    int handover_fd,
+    const long *traced,
+    size_t traced_count,
+    const chaos_init_rule_filter_t *clock,
+    struct sock_filter *out,
+    size_t capacity
+)
 {
     long calls[CHAOS_INIT_MAX_FILTER];
+    const size_t clock_count = clock != NULL ? clock->clock_count : 0U;
     size_t count = 0U;
     size_t index;
     size_t length = 0U;
@@ -235,6 +260,21 @@ chaos_init_build_filter(unsigned libs, int handover_fd, struct sock_filter *out,
     {
         CHAOS_INIT_ADD_ALL(g_chaos_init_process_calls, calls, &count);
     }
+    /* The time calls come from the rules, not from a table: a clock read reaches the
+     * filter at all only because the vDSO lookups were made to fail, and which reads are
+     * worth that round trip is what the rule file says. clock_gettime is left out when
+     * the clocks are known, because it gets a test of its own on the clock argument. */
+    for (index = 0U; clock != NULL && index < clock->call_count; ++index)
+    {
+        if (clock_count > 0U && clock->calls[index] == __NR_clock_gettime)
+        {
+            continue;
+        }
+        if (count < sizeof(calls) / sizeof(calls[0]))
+        {
+            calls[count++] = clock->calls[index];
+        }
+    }
     /* sendmsg leaves the JEQ chain for its own block, which exempts the handover. */
     for (index = 0U; index < count; ++index)
     {
@@ -245,9 +285,24 @@ chaos_init_build_filter(unsigned libs, int handover_fd, struct sock_filter *out,
             break;
         }
     }
-    /* Fixed part: 4 (arch, nr) + 2 (x32) + 7 (handover) + 2 (tail) = 15 at most. The
-     * bound also keeps (count - index) within the 8-bit jt field. */
-    if (count + 16U > capacity)
+    /* A traced call is not also notified: USER_NOTIF outranks TRACE across filters, and
+     * within one filter the first matching test decides, so a number in both sets would
+     * only waste an instruction. Removed from the notified set, not from the traced one. */
+    for (index = 0U; index < count;)
+    {
+        if (chaos_init_in_set(calls[index], traced, traced_count))
+        {
+            calls[index] = calls[--count];
+        }
+        else
+        {
+            ++index;
+        }
+    }
+    /* Fixed part: 4 (arch, nr) + 2 (x32) + 7 (handover) + 3 (tail) = 16 at most; a clock
+     * block adds its test, the load of the clock argument and its own two returns. The
+     * bound also keeps the longest forward jump within the 8-bit jt field. */
+    if (count + traced_count + 17U + (clock_count > 0U ? clock_count + 4U : 0U) > capacity)
     {
         return 0U;
     }
@@ -282,16 +337,68 @@ chaos_init_build_filter(unsigned libs, int handover_fd, struct sock_filter *out,
         out[length++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
         out[length++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF);
     }
+    /* Traced tests first, then notified ones, so the tail is ALLOW, USER_NOTIF, TRACE and
+     * every test is a forward jump. A traced test at `index` jumps over the remaining
+     * traced tests, every notified test, the ALLOW and the USER_NOTIF. */
+    for (index = 0U; index < traced_count; ++index)
+    {
+        out[length++] = (struct sock_filter)BPF_JUMP(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            (unsigned)traced[index],
+            (unsigned char)(traced_count - index + count + (clock_count > 0U ? 2U : 1U)),
+            0
+        );
+    }
     for (index = 0U; index < count; ++index)
     {
         /* Test `index` jumps count - index instructions: over the remaining tests and the ALLOW,
-         * onto the final USER_NOTIF. */
+         * onto the final USER_NOTIF. One more when the clock test sits between them. */
         out[length++] = (struct sock_filter)BPF_JUMP(
-            BPF_JMP | BPF_JEQ | BPF_K, (unsigned)calls[index], (unsigned char)(count - index), 0
+            BPF_JMP | BPF_JEQ | BPF_K,
+            (unsigned)calls[index],
+            (unsigned char)(count - index + (clock_count > 0U ? 1U : 0U)),
+            0
+        );
+    }
+    if (clock_count > 0U)
+    {
+        /* Over ALLOW, USER_NOTIF and the TRACE if there is one, onto the block below. */
+        out[length++] = (struct sock_filter)BPF_JUMP(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            (unsigned)__NR_clock_gettime,
+            (unsigned char)(traced_count > 0U ? 3U : 2U),
+            0
         );
     }
     out[length++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
     out[length++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF);
+    /* Only when something is traced: without it the program is byte for byte the one this
+     * supervisor built before traced effects existed, which is the property that keeps a
+     * run with no data effect at exactly today's cost. */
+    if (traced_count > 0U)
+    {
+        out[length++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE);
+    }
+    /* The clock block, after the tail so every jump into and inside it is forward: the
+     * clock argument replaces nr in the accumulator, which is why it cannot sit in the
+     * chain above. A clock no rule names runs untouched. */
+    if (clock_count > 0U)
+    {
+        out[length++] = (struct sock_filter
+        )BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]));
+        for (index = 0U; index < clock_count; ++index)
+        {
+            /* Over the remaining tests and the ALLOW, onto this block's USER_NOTIF. */
+            out[length++] = (struct sock_filter)BPF_JUMP(
+                BPF_JMP | BPF_JEQ | BPF_K,
+                (unsigned)clock->clocks[index],
+                (unsigned char)(clock_count - index),
+                0
+            );
+        }
+        out[length++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+        out[length++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF);
+    }
     return length;
 }
 
@@ -407,7 +514,14 @@ int chaos_init_godebug_mptcp_off(const char *current, char *out, size_t size)
 }
 
 size_t chaos_init_format_status(
-    char *buffer, size_t size, unsigned libs, const char *reason, long pid, int mptcp_off
+    char *buffer,
+    size_t size,
+    unsigned libs,
+    const char *reason,
+    long pid,
+    int mptcp_off,
+    int vdso_failed,
+    int unreadable
 )
 {
     /* All six names joined take 30 bytes; strcat() cannot overflow 64. */
@@ -431,10 +545,12 @@ size_t chaos_init_format_status(
         written = snprintf(
             buffer,
             size,
-            "state=active\nlibs=%s\npid=%ld\n%s",
+            "state=active\nlibs=%s\npid=%ld\n%s%s%s",
             names,
             pid,
-            mptcp_off ? "mptcp=off\n" : ""
+            mptcp_off ? "mptcp=off\n" : "",
+            vdso_failed ? "vdso=failed\n" : "",
+            unreadable ? "unreadable=yes\n" : ""
         );
     }
     else
@@ -448,4 +564,74 @@ size_t chaos_init_format_status(
         return 0U;
     }
     return (size_t)written;
+}
+
+/* Test seam: a failing entropy source cannot be provoked from outside. */
+#ifndef CHAOS_INIT_GETRANDOM
+#define CHAOS_INIT_GETRANDOM(buffer, size) getrandom((buffer), (size), 0)
+#endif
+
+/** @brief The TRACE set of the installed filter; fixed once the filter is in place. */
+static long g_chaos_init_traced[CHAOS_INIT_MAX_FILTER];
+static size_t g_chaos_init_traced_count = 0U;
+
+/** @copydoc chaos_init_traced_set */
+void chaos_init_traced_set(const long *calls, size_t count)
+{
+    size_t index;
+
+    g_chaos_init_traced_count = 0U;
+    if (calls == NULL)
+    {
+        return;
+    }
+    for (index = 0U;
+         index < count && index < sizeof(g_chaos_init_traced) / sizeof(g_chaos_init_traced[0]);
+         ++index)
+    {
+        g_chaos_init_traced[index] = calls[index];
+        ++g_chaos_init_traced_count;
+    }
+}
+
+/** @copydoc chaos_init_traced */
+int chaos_init_traced(long nr)
+{
+    size_t index;
+
+    for (index = 0U; index < g_chaos_init_traced_count; ++index)
+    {
+        if (g_chaos_init_traced[index] == nr)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/** @copydoc chaos_init_seed */
+uint64_t chaos_init_seed(void)
+{
+    const char *text = getenv("CHAOS_SEED");
+    char *end = NULL;
+    unsigned long long value;
+    uint64_t random_seed;
+
+    /* Digits only: strtoull() accepts a sign and blanks, and "-1" would wrap silently
+     * into UINT64_MAX -- a seed the user did not ask for. */
+    if (text != NULL && text[0] >= '0' && text[0] <= '9')
+    {
+        errno = 0;
+        value = strtoull(text, &end, 10);
+        if (errno == 0 && end != text && *end == '\0')
+        {
+            return (uint64_t)value;
+        }
+    }
+    if (CHAOS_INIT_GETRANDOM(&random_seed, sizeof(random_seed)) == (ssize_t)sizeof(random_seed))
+    {
+        return random_seed;
+    }
+    /* No entropy: the pid at least differs between the processes of a container. */
+    return (uint64_t)getpid();
 }

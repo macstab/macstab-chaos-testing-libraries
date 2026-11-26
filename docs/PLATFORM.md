@@ -15,7 +15,11 @@
 
 > The layer below the per-library docs: what the kernel, the dynamic loader and the C library do when an `LD_PRELOAD` object defines `read`, why the wrappers work, and where they are bypassed.
 >
-> Scope: ELF on Linux, x86_64 (amd64) and aarch64 (arm64), glibc and musl. Release objects are built with gcc:10 on glibc 2.31 and on Alpine 3.20 (musl); glibc 2.31 is the oldest glibc the runtime suites load them into, and `test/runtime/check_glibc_baseline.sh` rejects any imported glibc symbol version above `GLIBC_2.17`. SECCOMP mode (`chaos-init`) needs Linux 5.5 or later. No other operating system or loader is covered.
+> Scope: ELF on Linux, x86_64 (amd64) and aarch64 (arm64), glibc and musl. The arm64
+> objects are linked with `max-page-size=65536`, so they load on an aarch64 kernel
+> configured for 4, 16 or 64 KiB pages; the amd64 ones stay at 4096, which is every
+> x86_64 kernel. The alignment is a property of the file (`readelf -lW`, `p_align`
+> 0x10000) and is checked that way, because a load test needs a kernel with those pages. Release objects are built with gcc:10 on glibc 2.31 and on Alpine 3.20 (musl); glibc 2.31 is the oldest glibc the runtime suites load them into, and `test/runtime/check_glibc_baseline.sh` rejects any imported glibc symbol version above `GLIBC_2.17`. SECCOMP mode (`chaos-init`) needs Linux 5.5 or later. No other operating system or loader is covered.
 
 ---
 
@@ -377,7 +381,7 @@ else Passthrough to real
         Kernel --> Glibc: ts
     end
     Glibc   --> Wrapper : 0, ts
-    Wrapper ->  Wrapper : maybe OFFSET / REGRESS\n(post-call mutation)
+    Wrapper ->  Wrapper : maybe OFFSET / REGRESS / FREEZE\n(post-call mutation)
     Wrapper --> App     : 0, possibly mutated ts
 end
 
@@ -735,7 +739,7 @@ Named patterns help reviewers find the load-bearing structure.
 | **Reentrancy guard** | `__thread int g_chaos_<lib>_tls_guard`; enter returns the previous value, leave restores it | Common interposer idiom |
 | **Double buffer + seqlock** | Rule snapshots: rewrite the inactive one, publish by index; readers validate a sequence | McKenney, *perfbook* (sequence locks) |
 | **Once-only initialisation** | `chaos_once()` resolves the real-function table on first need | POSIX `pthread_once` semantics |
-| **Per-thread PRNG** | `__thread uint64_t g_chaos_<lib>_tls_prng_state`, xorshift64\* seeded through SplitMix64 | Vigna, "An experimental exploration of Marsaglia's xorshift generators, scrambled" |
+| **Counter-based draws** | No generator state: `mix(mix((key ^ lineage) + n) + d)` with SplitMix64 as the mixer | Steele, Lea, Flood, "Fast splittable pseudorandom number generators", OOPSLA 2014 |
 | **Fail-open / safe default** | Missing, rejected or unreadable rule file → no rules; internal error → real call | Kleppmann, *Designing Data-Intensive Applications*, "Reliability" |
 
 ### 13.1. Specifically-not-used patterns (with reasons)

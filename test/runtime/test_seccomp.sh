@@ -11,6 +11,11 @@
 #   delays the open (C, Go), also under SIGALRM every 20 ms, where the delay is neither cut
 #   short nor restarted per signal and counts one hit (also with the pre-5.19 test build,
 #   CHAOS_INIT_TEST_NO_KILLABLE_WAIT); a rule naming a symlink covers the real file;
+#   the hits files carry the reload generation as the libraries write it;
+# - a probability on a pre-forking server resets some of its backends rather than all or
+#   none, and the same CHAOS_SEED gives the same number twice;
+# - a rule file that is put in place while nothing calls is read at once, reported in the
+#   status file, and applied to the call that follows;
 #   @first=1 fires once per process, a forked child included, one hits file per process; an
 #   execve starts a new process for @first while the old image keeps its hits file; the
 #   status file reports the rules;
@@ -25,7 +30,17 @@
 # - process: an execve rule never blocks the start of the application itself (direct, PATH
 #   search, #!-less script via /bin/sh), a non-executable command exits 126, a later exec is
 #   refused, a fork rule fails fork (C), a posix_spawn rule fails Go os/exec;
-# - a rule SECCOMP mode cannot apply (TORN) rejects the whole file, named in the status;
+# - a rule SECCOMP mode cannot apply (CORRUPT) rejects the whole file, named in the status;
+# - the data effects reach a static Go binary too: TORN shortens the raw write it makes
+#   itself (its os.File write loops and still writes everything), THROTTLE holds those
+#   writes to the rate all the same, and TRICKLE cuts a net.Conn.Read to the chunk;
+# - TORN is applied through a ptrace stop: the returned count and the file size both drop
+#   below ten and agree, and a fork of the traced application still runs; TRICKLE cuts a
+#   stream receive to its chunk and leaves the rest in the socket; REDIRECT lands a connect
+#   on the address of the rule, which getpeername then reports; CORRUPT flips one bit of
+#   what a read delivered, decided at the stop after the call; THROTTLE holds 512 KiB of
+#   writes to about a second and shortens them, while the same writes without a matching
+#   rule stay immediate;
 # - without chaos-init the same rules change nothing.
 #
 # Under emulation (a foreign architecture through QEMU) seccomp user notification is unavailable:
@@ -102,6 +117,35 @@ if ! docker version >/dev/null 2>&1; then
     echo "seccomp test skipped: docker daemon not accessible" >&2
     exit "${CHAOS_SKIP_EXIT:-0}"
 fi
+
+# The user-switch case with CAP_SYS_PTRACE; run in its own container, because the main run
+# proves chaos-init needs no capability at all.
+PTRACE_SCRIPT='
+set -eu
+failures=0
+expect() {
+    if [ "$2" = "$3" ]; then
+        echo "ok   $LIBC $1"
+    else
+        echo "FAIL $LIBC $1: got \"$2\", want \"$3\"" >&2
+        failures=$((failures + 1))
+    fi
+}
+gcc -D_GNU_SOURCE -std=c99 -Wall -Wextra -Werror -pedantic -O2 -static -o /tmp/probe /work/test/runtime/seccomp_probe.c
+init=/out/chaos-init-'"$ARCH"'
+state=$($init --libs io -- /bin/cat /tmp/.chaos-init.status | head -1)
+if [ "$state" != "state=active" ]; then
+    echo "skip $LIBC: seccomp mode unavailable here ($($init --libs io -- /bin/cat /tmp/.chaos-init.status | sed -n 2p))"
+    exit "${CHAOS_SKIP_EXIT:-0}"
+fi
+mkdir -p /tmp/sec/drop && chmod 777 /tmp/sec/drop
+printf "%s\n" "/tmp/sec/drop:open:EIO:1.0 # t" > /tmp/.chaos-io.conf
+expect "C: with CAP_SYS_PTRACE the path rule matches after the switch" \
+    "$($init --libs io -- /tmp/probe setuid /tmp/sec/drop/x)" "open=EIO mmap=ok"
+expect "C: and nothing was unreadable" \
+    "$(grep -c "^unreadable=yes$" /tmp/.chaos-init.status || true)" "0"
+[ "$failures" -eq 0 ]
+'
 
 CHECK_SCRIPT='
 set -eu
@@ -180,6 +224,19 @@ else
 fi
 expect "the background chaos-init ends with the last process" \
     "$(grep -l chaos-init /proc/[0-9]*/comm 2>/dev/null | wc -l | tr -d " ")" "0"
+# The same, with a rule that needs a trace stop. A ptrace link is not inherited across
+# fork, so there is no background copy to hand the tracees to: this process keeps serving,
+# and the exit code waits for the last leftover instead of arriving at once. What must not
+# happen is the leftover getting ENOSYS for every write, which is what a detached tracer
+# leaves behind -- a fault no rule asked for.
+rm -f /tmp/sec/orphan.out
+printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/data:write:TORN:1.0 # t" > /tmp/.chaos-io.conf
+code=0
+$init --libs io -- /tmp/probe orphan /tmp/sec/data/x /tmp/sec/orphan.out >/dev/null || code=$?
+expect "tracing: the orphan is answered, and the exit code waited for it" \
+    "$code $(cat /tmp/sec/orphan.out 2>/dev/null || echo none)" "3 EIO"
+printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/slow:open:LATENCY:150 # t" \
+    "/tmp/sec/once:open:EACCES:1.0 @first=1 # t" > /tmp/.chaos-io.conf
 # A rule written with the name of a symlink covers the files under its real name, which is the
 # name /proc reports for an open descriptor.
 mkdir -p /tmp/sec/real && echo data > /tmp/sec/real/f && ln -sfn /tmp/sec/real /tmp/sec/link
@@ -208,6 +265,10 @@ expect "@first=1 again after an execve, as for a new process" \
 files=$(ls /tmp/.chaos-io.hits.* | wc -l)
 once=$(cat /tmp/.chaos-io.hits.* | awk -F "\t" "\$2 ~ /once/ { s += \$1 } END { print s + 0 }")
 expect "the image an execve replaced keeps its hits file" "$files $once" "2 2"
+# The hits files the supervisor writes carry the same tab-free header the library writes,
+# so a reader correlates the counts with a reload generation whichever mode produced them.
+expect "the hits file names the reload generation" \
+    "$(head -1 /tmp/.chaos-io.hits.* | sed -n "s/^generation=[0-9]*$/named/p" | head -1)" "named"
 expect "io status reports the rules" "$(head -2 /tmp/.chaos-io.status | tr "\n" " ")" "state=ok rules=3 "
 
 printf "%s\n" "tcp4://127.0.0.1:7777:connect:ECONNREFUSED:1.0 # t" \
@@ -262,10 +323,283 @@ expect "Go: without chaos-init os/exec works" "$($go spawn)" "ok"
 rm -f /tmp/.chaos-process.conf
 expect "all libraries at once" "$($init --libs io,net,memory,process -- $go dial 7777)" "ECONNREFUSED"
 
-printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/data:write:TORN:1.0 # t" > /tmp/.chaos-io.conf
+printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/data:statfs:FULL:1.0 # t" > /tmp/.chaos-io.conf
 expect "a rule SECCOMP mode cannot apply rejects the file" "$($init --libs io -- /tmp/probe open /tmp/sec/data/x)" "ok"
 expect "the status file names it" "$(sed -n 3,4p /tmp/.chaos-io.status | tr "\n" " ")" \
     "line=2 reason=unsupported in seccomp mode "
+
+# A rule file that is put in place while nothing calls is read when it is put in place, not
+# only when the next intercepted call arrives: the status file a test reads to see the rules
+# accepted is written by that read, and the call it is waiting for may be seconds away. The
+# watch is on the directory, because the file arrives by rename and a watch on the file
+# itself never sees that. The probe makes its one call three seconds in, so both checks
+# below happen before any call of its own.
+rm -f /tmp/.chaos-io.conf /tmp/.chaos-io.status
+$init --libs io -- /tmp/probe late /tmp/sec/data/x > /tmp/late.out 2>&1 &
+late_pid=$!
+sleep 1
+printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" > /tmp/.chaos-io.conf.new
+expect "no status file before the rule file is in place" \
+    "$(cat /tmp/.chaos-io.status 2>/dev/null | wc -l | tr -d " ")" "0"
+mv -f /tmp/.chaos-io.conf.new /tmp/.chaos-io.conf
+sleep 1
+expect "a replaced rule file is read before any intercepted call" \
+    "$(sed -n 1,2p /tmp/.chaos-io.status | tr "\n" " ")" "state=ok rules=1 "
+wait "$late_pid"
+expect "and the rule applies to the call that follows" "$(cat /tmp/late.out)" "EIO"
+rm -f /tmp/late.out
+
+# TORN through a ptrace stop: the count is shortened in the register before the kernel reads
+# it, so the returned count and the file size drop together and both stay under ten. A
+# supervisor that faked the count without shortening the call would leave ten bytes behind.
+printf "%s\n" "/tmp/sec/data:write:TORN:1.0 # t" > /tmp/.chaos-io.conf
+torn=$($init --libs io -- /tmp/probe torn /tmp/sec/data/torn)
+expect "C: TORN reports a shortened count" "$(echo "$torn" | sed -n "s/^wrote=\\([1-9]\\) file=.*/short/p")" "short"
+expect "C: TORN really shortened the write" "$(echo "$torn" | sed -n "s/^wrote=\\([1-9]\\) file=\\1$/match/p")" "match"
+expect "C: the TORN rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-io.status | tr "\n" " ")" "state=ok rules=1 "
+# THROTTLE through a trace stop: the count is shortened to what the rate allows, and once
+# the bucket is empty the call waits in the delay queue of the supervisor rather than in
+# the thread. 512 KiB against 256 KiB per second therefore takes about a second and the
+# writes come back short, which is what the library does too.
+printf "%s\n" "/tmp/sec/data:write:THROTTLE:262144 # t" > /tmp/.chaos-io.conf
+throttled=$($init --libs io -- /tmp/probe throttle /tmp/sec/data/rate)
+at_least "C: THROTTLE holds the writes to the rate" \
+    "$(echo "$throttled" | sed -n "s/^ms=\\([0-9]*\\) short=[01]$/\\1/p")" 700
+expect "C: THROTTLE shortens the writes" \
+    "$(echo "$throttled" | sed -n "s/^ms=[0-9]* short=1$/short/p")" "short"
+expect "C: the THROTTLE rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-io.status | tr "\n" " ")" "state=ok rules=1 "
+# The same writes with the rate on another path are immediate and whole, so what the check
+# above measured is the rule and not the machine.
+printf "%s\n" "/tmp/sec/other:write:THROTTLE:262144 # t" > /tmp/.chaos-io.conf
+quick=$($init --libs io -- /tmp/probe throttle /tmp/sec/data/rate)
+quick_ms=$(echo "$quick" | sed -n "s/^ms=\\([0-9]*\\) short=0$/\\1/p")
+expect "C: and only where a rule matches" "$(( ${quick_ms:-99999} < 300 ? 1 : 0 ))" "1"
+
+# TRICKLE through a trace stop: every receive is cut to the chunk, so the first returns 4
+# of the ten bytes sent and the second -- which asks for the remaining 6 -- is cut to 4 as
+# well. Both numbers below the request is what shows the register was shortened.
+printf "%s\n" "*:recv:TRICKLE:4 # t" > /tmp/.chaos-net.conf
+expect "C: TRICKLE shortens every receive" "$($init --libs net -- /tmp/probe trickle 7801)" \
+    "first=4 rest=4"
+expect "C: the TRICKLE rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-net.status | tr "\n" " ")" "state=ok rules=1 "
+rm -f /tmp/.chaos-net.conf
+
+# The data effects against a static Go binary, which is what SECCOMP mode exists for: Go
+# makes its system calls without libc, so no preload can reach them, and its runtime is
+# the one that has to cope with a short write or a chunked read. What it does with them is
+# measured here rather than assumed: a raw syscall.Write shows the tear, while
+# os.File.Write returns ten all the same, because internal/poll re-issues what the
+# shortened call left. A TORN rule is therefore visible to a Go program only where the
+# program makes the call itself -- and the hits file counts one hit per system call, not
+# per short write the program saw.
+printf "%s\n" "/tmp/sec/data:write:TORN:1.0 # t" > /tmp/.chaos-io.conf
+go_torn=$($init --libs io -- $go torn /tmp/sec/data/gotorn)
+expect "Go: TORN shortens the raw write it makes itself" \
+    "$(echo "$go_torn" | sed -n "s/^raw=\\([1-9]\\) wrapped=10$/short/p")" "short"
+expect "Go: without a rule both write all ten bytes" \
+    "$(printf "%s\n" "/tmp/sec/other:write:TORN:1.0 # t" > /tmp/.chaos-io.conf;
+       $init --libs io -- $go torn /tmp/sec/data/gotorn)" "raw=10 wrapped=10"
+# The same loop is why a rate still bites: it issues the remainder at the rate, so what a
+# Go program sees is time instead of a short write.
+printf "%s\n" "/tmp/sec/data:write:THROTTLE:262144 # t" > /tmp/.chaos-io.conf
+at_least "Go: THROTTLE holds its writes to the rate" \
+    "$($init --libs io -- $go throttle /tmp/sec/data/gorate)" 700
+printf "%s\n" "*:recv:TRICKLE:4 # t" > /tmp/.chaos-net.conf
+expect "Go: TRICKLE cuts a net.Conn.Read to the chunk" \
+    "$($init --libs net -- $go trickle 7907)" "first=4"
+expect "Go: without a rule the whole message arrives at once" \
+    "$(rm -f /tmp/.chaos-net.conf; $init --libs net -- $go trickle 7908)" "first=10"
+
+# A probabilistic rule on a pre-forking server: every backend evaluates the rule for the
+# first time, so if they all drew the same sample the count would be 0 or 24 and never
+# anything between. The supervisor gives each process it decides for a lineage of its own,
+# taken from the order the processes appeared in, which is what makes the count a count.
+# CHAOS_SEED fixes it, so this is a number and not a coin toss.
+printf "%s\n" "tcp4://127.0.0.1:7905:close:RESET:0.5 # t" > /tmp/.chaos-net.conf
+preforked=$(CHAOS_SEED=42 $init --libs net -- /tmp/probe prefork 7905)
+expect "C: a probability on a pre-forking server resets some backends, not all or none" \
+    "$(echo "$preforked" | sed -n "s/^resets=\\([0-9]*\\) of 24$/\\1/p" |
+       awk "{ print (\$1 > 0 && \$1 < 24) ? \"some\" : \"all-or-none\" }")" "some"
+expect "C: and the same seed gives the same number again" \
+    "$(CHAOS_SEED=42 $init --libs net -- /tmp/probe prefork 7905)" "$preforked"
+rm -f /tmp/.chaos-net.conf
+
+# REDIRECT: the address `connect` was given is in the memory of the tracee, and a reply of
+# CONTINUE makes the kernel read it from there after the answer -- so the supervisor writes
+# the new address and lets the call run. Nothing listens on the port the probe dials, so a
+# connection at all is the redirect, and the port getpeername reports is where it landed.
+printf "%s\n" "tcp4://127.0.0.1:7902:connect:REDIRECT:127.0.0.1:7901 # t" > /tmp/.chaos-net.conf
+expect "C: REDIRECT lands the connection on the address of the rule" \
+    "$($init --libs net -- /tmp/probe redirect 7901)" "peer=7901"
+expect "C: the REDIRECT rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-net.status | tr "\n" " ")" "state=ok rules=1 "
+# Without the rule the same dial fails, which is what tells a redirect from a port that
+# was open anyway.
+printf "%s\n" "tcp4://127.0.0.1:7903:connect:REDIRECT:127.0.0.1:7901 # t" > /tmp/.chaos-net.conf
+expect "C: and only where a rule matches" \
+    "$($init --libs net -- /tmp/probe redirect 7901)" "peer=ECONNREFUSED"
+rm -f /tmp/.chaos-net.conf
+
+# CORRUPT through the stop after the call: the entry stop cannot know how many bytes a read
+# will deliver, so the thread runs on into its syscall-exit stop and one bit of what it
+# delivered is flipped there. Exactly one byte differs and exactly one of its bits.
+printf "%s\n" "/tmp/sec/data:read:CORRUPT:1.0 # t" > /tmp/.chaos-io.conf
+expect "C: CORRUPT flips one bit of a read" \
+    "$($init --libs io -- /tmp/probe corrupt /tmp/sec/data/c)" "changed=1 onebit=1"
+expect "C: the CORRUPT rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-io.status | tr "\n" " ")" "state=ok rules=1 "
+# The same effect on a receive, the net path to the same stop.
+printf "%s\n" "*:recv:CORRUPT:1.0 # t" > /tmp/.chaos-net.conf
+expect "C: CORRUPT flips one bit of a receive" \
+    "$($init --libs net -- /tmp/probe netcorrupt 7802)" "changed=1 onebit=1"
+expect "C: the net CORRUPT rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-net.status | tr "\n" " ")" "state=ok rules=1 "
+
+# DUP needs both stops: the first receive runs and its bytes are kept at the exit stop, the
+# next read is answered with them without running, and the payload that arrived meanwhile
+# follows. A replay that did not happen would show as first=one second=two.
+printf "%s\n" "*:recv:DUP:1.0 # t" > /tmp/.chaos-net.conf
+expect "C: DUP replays the kept payload once" "$($init --libs net -- /tmp/probe dup 7803)" \
+    "first=one second=one third=two"
+expect "C: the DUP rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-net.status | tr "\n" " ")" "state=ok rules=1 "
+rm -f /tmp/.chaos-net.conf
+
+# write:DROP needs a call of the supervisor in the tracee: the write is replaced by
+# the lseek that moves the offset on by the count it reports, so the next write lands past
+# the hole. The second write is the one that proves it -- its bytes are at offset ten.
+printf "%s\n" "/tmp/sec/data:write:DROP:1.0 @first=1 # t" > /tmp/.chaos-io.conf
+expect "C: a dropped write moves the offset on" \
+    "$($init --libs io -- /tmp/probe drop /tmp/sec/data/dropped)" \
+    "wrote=10,4 zeros=1 tenth=B"
+expect "C: the write DROP rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-io.status | tr "\n" " ")" "state=ok rules=1 "
+
+# close:RESET is the other half of that machinery: the setsockopt has to run before the
+# close, not instead of it, so the supervisor substitutes it, puts the close back and lets
+# the second stop through. The peer is what proves it -- a FIN reads as end of file, an RST
+# as ECONNRESET.
+expect "C: without a rule the peer reads end of file" "$($init --libs net -- /tmp/probe reset 7804)" \
+    "peer=eof"
+printf "%s\n" "*:close:RESET:1.0 # t" > /tmp/.chaos-net.conf
+expect "C: close RESET aborts the connection" "$($init --libs net -- /tmp/probe reset 7805)" \
+    "peer=ECONNRESET"
+expect "C: the RESET rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-net.status | tr "\n" " ")" "state=ok rules=1 "
+# A socket a forked child still holds is left alone -- SO_LINGER would reset it at the
+# close of that child, where no rule is looking. The suppression is reported in the header
+# lines of the hits file, so a rule that never gets to fire is not silent about it.
+rm -f /tmp/.chaos-net.hits.*
+expect "C: a shared socket is not reset" "$($init --libs net -- /tmp/probe shared 7806)" \
+    "peer=eof"
+expect "C: the suppression is reported" \
+    "$(cat /tmp/.chaos-net.hits.* | sed -n "s/^suppressed.shared=\([1-9][0-9]*\)$/counted/p" | head -1)" \
+    "counted"
+rm -f /tmp/.chaos-net.conf
+
+# Time: a clock read is served from the vDSO, so the supervisor makes the lookups of every
+# new image fail and then answers the reads itself. OFFSET shows in the wall second, FREEZE
+# makes two reads agree, REGRESS makes the second one earlier -- and a rule on one clock
+# leaves the others alone, because the filter tests the clock argument.
+reference=$($init --libs time -- /tmp/probe clock realtime)
+expect "C: without a rule the clock behaves" \
+    "$(echo "$reference" | sed -n "s/^sec=[0-9]* same=0 back=0$/behaves/p")" "behaves"
+printf "%s\n" "clock_gettime/realtime:OFFSET:3600000 # t" > /tmp/.chaos-time.conf
+shifted=$($init --libs time -- /tmp/probe clock realtime)
+expect "C: OFFSET moves the wall clock" \
+    "$(( $(echo "$shifted" | sed -n "s/^sec=\([0-9]*\) .*/\1/p") - \
+         $(echo "$reference" | sed -n "s/^sec=\([0-9]*\) .*/\1/p") >= 3599 ? 1 : 0 ))" "1"
+expect "C: the time rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-time.status | tr "\n" " ")" "state=ok rules=1 "
+expect "C: another clock is left alone" \
+    "$($init --libs time -- /tmp/probe clock monotonic | sed -n "s/^sec=[0-9]* same=0 back=0$/behaves/p")" \
+    "behaves"
+printf "%s\n" "clock_gettime/realtime:FREEZE:1.0 # t" > /tmp/.chaos-time.conf
+expect "C: FREEZE holds the clock" \
+    "$($init --libs time -- /tmp/probe clock realtime | sed -n "s/^sec=[0-9]* same=1 back=0$/frozen/p")" \
+    "frozen"
+printf "%s\n" "clock_gettime/monotonic:REGRESS:5000 # t" > /tmp/.chaos-time.conf
+expect "C: REGRESS steps the clock back" \
+    "$($init --libs time -- /tmp/probe clock monotonic | sed -n "s/^sec=[0-9]* same=0 back=1$/stepped/p")" \
+    "stepped"
+# The same against a static Go binary, which is the case LD_PRELOAD cannot reach at all:
+# time.Now() takes both clocks from the vDSO, so the offset has to show in the wall second
+# while time.Since stays right. The sleep it measures is 20 ms, and anything up to three
+# digits proves the point: an hour of offset in that difference would be seven of them.
+# A tighter bound would be measuring the load on the machine, not the rule.
+printf "%s\n" "clock_gettime/realtime:OFFSET:3600000 # t" > /tmp/.chaos-time.conf
+go_clock=$($init --libs time -- $go clock)
+expect "Go: the wall clock is shifted and time.Since is not" \
+    "$(echo "$go_clock" | sed -n "s/^sec=[0-9]* same=true since=[0-9]\\{2,3\\}ms$/shifted/p")" "shifted"
+# What proves the blinding is the check above: a static Go binary reads the clock through
+# the vDSO, so a shifted time.Now() can only come from the fallback the renamed symbols
+# force. This one says the weaker thing it actually measures -- no image reported that its
+# vDSO could not be written -- which is equally true when nothing was attempted, so it is
+# named for that rather than for the blinding.
+expect "Go: no image reported an unwritable vDSO" \
+    "$(grep -c "^vdso=failed$" /tmp/.chaos-init.status)" "0"
+rm -f /tmp/.chaos-time.conf
+
+# `@at=+N` holds a rule back until N ms after it became active for that process, which is
+# the only qualifier whose clock starts at the load rather than at a wall-clock time. One
+# run, two opens around a wait: the first comes too early for the rule, the second does
+# not. The arming is per process, so both have to be in the same run.
+printf "%s\n" "/tmp/sec/data:open:EIO:1.0 @at=+300 # t" > /tmp/.chaos-io.conf
+expect "C: a rule with @at fires only after its delay" \
+    "$($init --libs io -- /tmp/probe atwait /tmp/sec/data/x)" "before=ok after=EIO"
+
+# dns: the lookup is a library function, so what SECCOMP mode sees is the query the
+# resolver sends -- and that carries the name. A LATENCY rule for one name holds exactly
+# that query; another name goes out at once. The answer-changing effects are rejected,
+# because the answer is assembled inside the resolver.
+printf "%s\n" "dns://slow.example.com:LATENCY:200 # t" > /tmp/.chaos-dns.conf
+at_least "C: a dns rule holds the query for its name" \
+    "$($init --libs dns -- /tmp/probe dnsquery slow.example.com)" 200
+# Under the 200 ms of the rule, not exactly zero: the query still goes through a
+# notification, and a millisecond of that is the machine rather than the rule.
+fast_ms=$($init --libs dns -- /tmp/probe dnsquery fast.example.com)
+expect "C: and lets another name through" "$(( ${fast_ms:-99999} < 100 ? 1 : 0 ))" "1"
+expect "C: the dns rule is applied, not rejected" \
+    "$(sed -n 1,2p /tmp/.chaos-dns.status | tr "\n" " ")" "state=ok rules=1 "
+printf "%s\n" "dns://slow.example.com:EAI_NONAME:1.0 # t" > /tmp/.chaos-dns.conf
+rejected_ms=$($init --libs dns -- /tmp/probe dnsquery slow.example.com)
+expect "C: an answer-changing dns rule rejects the file" \
+    "$(( ${rejected_ms:-99999} < 100 ? 1 : 0 ))" "1"
+expect "C: and says why" \
+    "$(sed -n 3,4p /tmp/.chaos-dns.status | tr "\n" " ")" \
+    "line=1 reason=unsupported in seccomp mode "
+rm -f /tmp/.chaos-dns.conf
+
+# A process that drops privileges becomes non-dumpable, and the kernel then refuses every
+# look into it: its path cannot be read, so a path rule does not match it. That is a rule
+# that looks applied and does nothing, so the supervisor says so in its status file. The
+# same case with CAP_SYS_PTRACE is further down, in a container that has it.
+mkdir -p /tmp/sec/drop && chmod 777 /tmp/sec/drop
+printf "%s\n" "*:open:EIO:1.0 # t" > /tmp/.chaos-io.conf
+printf "%s\n" "mmap/anon:ERRNO:ENOMEM @size>1048576 # t" > /tmp/.chaos-memory.conf
+# Not even a `*` path rule matches: every io selector is a path, and the path of this open
+# lives in the process the kernel will not let the supervisor read. A memory rule names no
+# path and still fires, which is the line between what survives a user switch and what
+# does not.
+expect "C: no path rule matches a process that dropped privileges" \
+    "$($init --libs io,memory -- /tmp/probe setuid /tmp/sec/drop/x)" "open=ok mmap=ENOMEM"
+expect "C: and the supervisor says why" \
+    "$(grep -c "^unreadable=yes$" /tmp/.chaos-init.status)" "1"
+rm -f /tmp/.chaos-memory.conf
+
+# A forked child of the tracee is traced too: without PTRACE_O_TRACEFORK its filtered calls
+# would fail with ENOSYS, because a RET_TRACE with no tracer does.
+printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/data:write:TORN:1.0 # t" > /tmp/.chaos-io.conf
+expect "C: a fork of a traced application still runs" \
+    "$($init --libs io -- /tmp/probe first /tmp/sec/data/x)" "parent=EIO,EIO child=EIO"
+# And it runs without being suspended first: the stop a newly attached descendant reports
+# cannot be told from a real SIGSTOP without PTRACE_SEIZE, and re-delivering it put every
+# child of a forking server into a job-control stop its own parent could see.
+expect "C: a forked child is not suspended on the way in" \
+    "$($init --libs io -- /tmp/probe stopped)" "ran"
 [ "$failures" -eq 0 ]
 '
 
@@ -304,3 +638,17 @@ for libc in glibc musl; do
         "$base" \
         sh -c "$CHECK_SCRIPT"
 done
+
+# The other half of the user-switch case, in a container that holds CAP_SYS_PTRACE: the
+# kernel then lets the supervisor read a non-dumpable process, so the path rule matches
+# after all and nothing is reported. This is the documented cure for it, so it is tested
+# rather than claimed. One libc is enough: the check is the kernel's, not the library's.
+docker run --rm \
+    --platform "$DOCKER_PLATFORM" \
+    --cap-add SYS_PTRACE \
+    -e LIBC="privileged" \
+    -e CHAOS_SKIP_EXIT="${CHAOS_SKIP_EXIT:-0}" \
+    -v "$TMP_DIR/out:/out:ro" \
+    -v "$ROOT_DIR:/work:ro" \
+    gcc:bookworm \
+    sh -c "$PTRACE_SCRIPT"

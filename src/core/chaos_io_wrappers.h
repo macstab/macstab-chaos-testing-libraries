@@ -79,4 +79,14 @@ int chaos_io_resolve_at_path(
     int dirfd, const char *path, char *resolved_path, size_t resolved_path_size
 );
 
+/**
+ * @brief Drops the THROTTLE bucket a closed descriptor held (chaos_io_rw.c).
+ *
+ * @details The table is keyed by the descriptor number, which the kernel reuses, so a
+ * bucket left behind would hold back the next owner of that number.
+ *
+ * @param fd  Descriptor being closed.
+ */
+void chaos_io_throttle_forget(int fd);
+
 #endif

@@ -64,13 +64,30 @@ typedef struct chaos_init_rules
      * @return Number of rules.
      */
     size_t (*snapshot)(const chaos_init_text_t **texts, uint64_t *generation);
+    /**
+     * Builds the tab-free header lines of this library's hits file, or NULL for none.
+     * Optional: a library with nothing to report there leaves it out.
+     * @return @p out, or NULL when nothing is to be written.
+     */
+    const char *(*header)(char *out, size_t size);
+    /**
+     * @brief Sets this library's draw lineage for the process whose allocation serial is
+     *        given, or NULL to leave it alone.
+     *
+     * @details Called before every decision, because the sample of a rule must differ
+     * between two processes the same rule is evaluated in: a pre-forking server whose
+     * backends all drew alike would turn a probability into all-or-nothing. The serial is
+     * the supervisor's own count of the processes it has seen, so the answer follows the
+     * order they appeared in and nothing the kernel assigns.
+     */
+    void (*lineage)(uint64_t serial);
     chaos_hit_slot_t *slots; /**< CHAOS_INIT_MAX_TRACEES * max_rules */
     uint64_t *hashes;        /**< Text hash per slot, to carry counts over reloads. */
     uint64_t *generation;    /**< Per process: the snapshot its slots belong to. */
     size_t *count;           /**< Per process: rules in that snapshot. */
     uint64_t *total;         /**< Per process: hits counted. */
     unsigned char *pending;  /**< Per process: hits not yet written. */
-    char *buffer;            /**< Hits file scratch: max_rules * CHAOS_HITS_LINE_MAX + 1. */
+    char *buffer;            /**< Hits file scratch: the rule lines plus the header. */
     long *file;              /**< Per process: its hits file's number; 0 before the first. */
 } chaos_init_rules_t;
 
@@ -85,7 +102,7 @@ typedef struct chaos_init_rules
     static size_t name##_count[CHAOS_INIT_MAX_TRACEES];                                            \
     static uint64_t name##_total[CHAOS_INIT_MAX_TRACEES];                                          \
     static unsigned char name##_pending[CHAOS_INIT_MAX_TRACEES];                                   \
-    static char name##_buffer[(max) * CHAOS_HITS_LINE_MAX + 1U];                                   \
+    static char name##_buffer[(max) * CHAOS_HITS_LINE_MAX + 1U + CHAOS_HITS_HEADER_MAX];           \
     static long name##_file[CHAOS_INIT_MAX_TRACEES]
 
 /**

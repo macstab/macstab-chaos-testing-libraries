@@ -6,7 +6,7 @@
  * Proves that rules in the rule file `/tmp/.chaos-net.conf`
  * (`<selector>:<operation>:<ERRNO-name | effect>:<value>`) are matched against real loopback
  * sockets and fault every wrapped socket call with the documented result. Each check uses its
- * own 127.0.0.1 port (41001-41036) so a rule can only match the socket under test. Exit code of
+ * own 127.0.0.1 port (41001-41042) so a rule can only match the socket under test. Exit code of
  * each check, in main()'s order:
  *
  * - 10-11   bind:EMFILE; bind returns -1/EMFILE.
@@ -18,6 +18,18 @@
  * - 50-51   the accept rule also fails accept4 (one operation covers both).
  * - 60-64   send:LATENCY:200; send in a forked client takes >= 150 ms, the data arrives.
  * - 70-75   recv:CORRUPT:1.0; 4 bytes arrive but differ from what was sent.
+ * - 250-254 send:THROTTLE:4096 holds 8 KiB of stream sends to about a second and makes them
+ *           short, while the same rate on another port leaves them whole and immediate.
+ * - 234-239, 242 close:RESET on a pre-forking server (accept, fork, parent closes its copy):
+ *           the parent suppresses every close and resets nothing, each child's hits file
+ *           holds 1 exactly when its client saw an RST, and `p=0.5` resets some and not
+ *           all -- the shape the leaked SO_LINGER defect lived in.
+ * - 214-218 close:RESET outside its `@until` window ends the stream with an EOF rather
+ *           than an RST (the defect this release fixed armed SO_LINGER either way), while
+ *           the same rule without the qualifier still resets.
+ * - 205-208 connect:REDIRECT lands the connection on the address of the rule, which
+ *           getpeername then reports; without the rule the same dial fails, because
+ *           nothing listens on the port the probe asked for.
  * - 180-183 recv:TRICKLE:3; recv, read, readv and recvmsg each return 1-3 bytes and the pieces
  *           reassemble to the sent bytes exactly.
  * - 190-194 recv:DUP:1.0; a payload is delivered, then delivered again on the next read
@@ -1315,6 +1327,391 @@ static int probe_recvmmsg_corrupt(void)
 }
 
 /**
+ * @brief Sends @p total bytes on @p fd in one loop and reports the milliseconds it took,
+ *        with @p short_send set when any send moved less than it was given.
+ *
+ * @return 0, or the exit code of the failing step.
+ */
+static int send_timed(int fd, size_t total, long long *elapsed_ms, int *short_send)
+{
+    static char block[8192];
+    struct timespec start;
+    struct timespec end;
+    size_t done = 0U;
+
+    *short_send = 0;
+    memset(block, 'x', sizeof(block));
+    if (total > sizeof(block) || clock_gettime(CLOCK_MONOTONIC, &start) != 0)
+    {
+        return 251;
+    }
+    while (done < total)
+    {
+        const ssize_t sent = send(fd, block + done, total - done, 0);
+
+        if (sent <= 0)
+        {
+            return 252;
+        }
+        if ((size_t)sent < total - done)
+        {
+            *short_send = 1;
+        }
+        done += (size_t)sent;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0)
+    {
+        return 251;
+    }
+    *elapsed_ms =
+        (long long)(end.tv_sec - start.tv_sec) * 1000 + (end.tv_nsec - start.tv_nsec) / 1000000;
+    return 0;
+}
+
+/**
+ * @brief The hit count a process wrote for @p rule, or -1 when it wrote no file.
+ *
+ * @details Each process writes its own `/tmp/.chaos-net.hits.<pid>`, so a forked child's
+ * counts are read by its pid -- which is how "hits = RSTs" is checked per process rather
+ * than as one sum nobody can attribute.
+ */
+static long hits_of_process(long pid, const char *rule)
+{
+    char path[64];
+    char text[1024] = {0};
+    const char *line;
+    FILE *file;
+
+    (void)snprintf(path, sizeof(path), "/tmp/.chaos-net.hits.%ld", pid);
+    file = fopen(path, "r");
+    if (file == NULL)
+    {
+        return -1;
+    }
+    text[fread(text, 1U, sizeof(text) - 1U, file)] = '\0';
+    (void)fclose(file);
+    line = strstr(text, rule);
+    if (line == NULL)
+    {
+        return 0;
+    }
+    /* The count is the number in front of the tab that precedes the rule text. */
+    while (line > text && line[-1] != '\n')
+    {
+        --line;
+    }
+    return strtol(line, NULL, 10);
+}
+
+/** @brief Whether the hits file of @p pid reports @p key with the value @p want. */
+static int hits_header_says(long pid, const char *key, int want)
+{
+    char path[64];
+    char text[1024] = {0};
+    char expected[64];
+    FILE *file;
+
+    (void)snprintf(path, sizeof(path), "/tmp/.chaos-net.hits.%ld", pid);
+    file = fopen(path, "r");
+    if (file == NULL)
+    {
+        return 0;
+    }
+    text[fread(text, 1U, sizeof(text) - 1U, file)] = '\0';
+    (void)fclose(file);
+    (void)snprintf(expected, sizeof(expected), "%s=%d\n", key, want);
+    return strstr(text, expected) != NULL;
+}
+
+/**
+ * @brief close:RESET on a pre-forking server: the backend resets, the parent never does,
+ *        and every hit is an RST a client saw (exit 234-239 and 242).
+ *
+ * @details This is the shape the defect lived in. A pre-forking server accepts, forks, and
+ * the parent closes its copy at once while the child serves; `SO_LINGER` armed on that
+ * shared description sent no RST then and sent one later, out of reach of any rule, and
+ * the hit counts were the number of closes rather than the number of resets. Here, with
+ * `p=0.5` over 24 connections:
+ *
+ * - the parent's close is suppressed every time (`suppressed.shared=24`, 0 hits): it is
+ *   not the sole owner, so it must not even try;
+ * - each child's hits file holds 1 when the client saw an RST and 0 when it did not --
+ *   per process, so the equality is attributed, not summed over a total;
+ * - the probability is applied: some connections reset and some end with EOF.
+ *
+ * The client sockets are kept open until the counts have been read: closing one matches
+ * the same rule through its peer -- a connected socket is matched at both ends -- and
+ * would add a hit nobody can observe to the parent's file. They are closed afterwards,
+ * because an ephemeral port is drawn from the range the probe's own fixed ports lie in,
+ * and a leaked one makes a later scenario fail to bind.
+ */
+static int probe_close_reset_preforking(void)
+{
+    static const char *rule = "tcp4://127.0.0.1:41043:close:RESET:0.5";
+    const int rounds = 24;
+    int clients[24];
+    int listener;
+    int resets = 0;
+    int round;
+    int rc;
+    int result;
+
+    rc = write_config(rule);
+    if (rc != 0)
+    {
+        return rc;
+    }
+    listener = create_tcp_listener(41043U);
+    if (listener < 0)
+    {
+        return 234;
+    }
+    for (round = 0; round < rounds; ++round)
+    {
+        char buffer[8];
+        pid_t child;
+        ssize_t got;
+        long hits;
+        int client = connect_tcp(41043U);
+        int served = client < 0 ? -1 : accept(listener, NULL, NULL);
+        int reset;
+
+        clients[round] = client;
+        if (client < 0 || served < 0)
+        {
+            close(listener);
+            return 235;
+        }
+        child = fork();
+        if (child < 0)
+        {
+            close(listener);
+            return 236;
+        }
+        if (child == 0)
+        {
+            /* The backend: it closes nothing it shares, so its hits file holds exactly
+             * what its own close of the connection did. */
+            struct timespec pause_for = {0, 20000000L};
+
+            (void)nanosleep(&pause_for, NULL);
+            (void)close(served);
+            exit(0);
+        }
+        /* The parent lets go while the child still holds it: no RST may leave here. */
+        if (close(served) != 0)
+        {
+            close(listener);
+            return 237;
+        }
+        got = read(client, buffer, sizeof(buffer));
+        reset = got < 0 && errno == ECONNRESET;
+        resets += reset;
+        if (waitpid(child, NULL, 0) != child)
+        {
+            close(listener);
+            return 238;
+        }
+        hits = hits_of_process((long)child, rule);
+        /* A child that reset wrote 1; one that did not wrote 0 or no file at all. */
+        if (hits != (reset ? 1L : 0L) && !(reset == 0 && hits == -1L))
+        {
+            close(listener);
+            return 239;
+        }
+    }
+    /* Read before the listener is closed: that close matches the same rule -- the
+     * listening socket's own address is this port -- and the parent is its sole owner, so
+     * it would add a hit of its own to the file this asserts on. The parent suppressed
+     * every one of its own connection closes and reset nothing, and the probability is
+     * applied, so neither all nor none of the backends reset. */
+    result = hits_header_says((long)getpid(), "suppressed.shared", rounds) &&
+                     hits_of_process((long)getpid(), rule) == 0L && resets > 0 && resets < rounds
+                 ? 0
+                 : 242;
+    close(listener);
+    for (round = 0; round < rounds; ++round)
+    {
+        close(clients[round]);
+    }
+    return result;
+}
+
+/**
+ * @brief A closed `@until` window suppresses the RST, an open rule still produces one
+ *        (exit 214-218).
+ *
+ * @details The defect this release fixed left `SO_LINGER` armed on the socket whether the
+ * rule fired or not, so a close outside the rule's window still sent an RST -- an effect
+ * from a call no rule had selected. The peer is what tells the two apart: a suppressed
+ * reset ends the stream (`read` returns 0), a real one fails it with ECONNRESET. The
+ * second half uses the same port and the same effect without the qualifier, so an EOF in
+ * the first half cannot be a rule that simply never matched.
+ */
+static int probe_close_reset_window(void)
+{
+    char rule[128];
+    char buffer[8];
+    long long past;
+    int server;
+    int client;
+    int rc;
+
+    past = (long long)time(NULL) * 1000LL - 60000LL;
+    (void)snprintf(rule, sizeof(rule), "tcp4://127.0.0.1:41042:close:RESET:1.0 @until=%lld", past);
+    rc = write_config(rule);
+    if (rc != 0)
+    {
+        return rc;
+    }
+    if (create_tcp_pair(41042U, &server, &client) != 0)
+    {
+        return 214;
+    }
+    if (close(server) != 0)
+    {
+        close(client);
+        return 215;
+    }
+    if (read(client, buffer, sizeof(buffer)) != 0)
+    {
+        close(client);
+        return 216;
+    }
+    close(client);
+
+    rc = write_config("tcp4://127.0.0.1:41042:close:RESET:1.0");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    if (create_tcp_pair(41042U, &server, &client) != 0)
+    {
+        return 217;
+    }
+    if (close(server) != 0)
+    {
+        close(client);
+        return 218;
+    }
+    if (read(client, buffer, sizeof(buffer)) != -1 || errno != ECONNRESET)
+    {
+        close(client);
+        return 218;
+    }
+    close(client);
+    return 0;
+}
+
+/**
+ * @brief connect:REDIRECT sends the connection to the address of the rule, which the
+ *        kernel then treats as the one it was made to (exit 205-208).
+ *
+ * @details Nothing listens on the port the probe dials, so without the rule the connect
+ * fails: what makes it succeed is the redirect, and `getpeername` naming the other port
+ * is what shows the kernel agrees.
+ */
+static int probe_connect_redirect(void)
+{
+    struct sockaddr_in peer;
+    socklen_t peer_length = sizeof(peer);
+    int listener;
+    int client;
+    int rc;
+
+    rc = write_config("tcp4://127.0.0.1:41040:connect:REDIRECT:127.0.0.1:41039");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    listener = create_tcp_listener(41039U);
+    if (listener < 0)
+    {
+        return 205;
+    }
+    client = connect_tcp(41040U);
+    if (client < 0)
+    {
+        close(listener);
+        return 206;
+    }
+    if (getpeername(client, (struct sockaddr *)&peer, &peer_length) != 0 ||
+        ntohs(peer.sin_port) != 41039U)
+    {
+        close(client);
+        close(listener);
+        return 207;
+    }
+    close(client);
+    /* The same dial with the rule on another port: nothing listens on 41040, so it fails
+     * -- which is what tells a redirect from a port that was open anyway. */
+    rc = write_config("tcp4://127.0.0.1:41041:connect:REDIRECT:127.0.0.1:41039");
+    if (rc != 0)
+    {
+        close(listener);
+        return rc;
+    }
+    client = connect_tcp(41040U);
+    close(listener);
+    if (client >= 0)
+    {
+        close(client);
+        return 208;
+    }
+    return 0;
+}
+
+/**
+ * @brief send:THROTTLE:4096 on a stream socket: 8 KiB takes about a second and arrives in
+ *        short sends, while the same rate on another port leaves them whole and immediate
+ *        (exit 250-254).
+ */
+static int probe_send_throttle(void)
+{
+    long long elapsed_ms = 0;
+    int short_send = 0;
+    int server;
+    int client;
+    int rc;
+
+    rc = write_config("tcp4://127.0.0.1:41037:send:THROTTLE:4096");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    if (create_tcp_pair(41037U, &server, &client) != 0)
+    {
+        return 250;
+    }
+    /* The bucket starts full, so the first 4 KiB go at once and the second take a second,
+     * in tenth-of-a-second pieces. */
+    rc = send_timed(client, 8192U, &elapsed_ms, &short_send);
+    if (rc != 0)
+    {
+        return rc;
+    }
+    if (elapsed_ms < 700 || !short_send)
+    {
+        return 253;
+    }
+    /* The same sends with the rate on another port: immediate and whole, so the check
+     * above measured the rule and not this machine. */
+    rc = write_config("tcp4://127.0.0.1:41038:send:THROTTLE:4096");
+    if (rc != 0)
+    {
+        return rc;
+    }
+    rc = send_timed(client, 8192U, &elapsed_ms, &short_send);
+    if (rc != 0)
+    {
+        return rc;
+    }
+    close(client);
+    close(server);
+    return elapsed_ms < 300 && !short_send ? 0 : 254;
+}
+
+/**
  * @brief TRICKLE:3 on recv: recv, read, readv (split 2+6 iovec) and recvmsg, in rotation, each
  *        return 1-3 bytes, and the pieces reassemble to the sent bytes (exit 180-183).
  */
@@ -1629,6 +2026,18 @@ int main(void)
     if (rc != 0)
         return rc;
     rc = probe_recv_corrupt();
+    if (rc != 0)
+        return rc;
+    rc = probe_close_reset_window();
+    if (rc != 0)
+        return rc;
+    rc = probe_close_reset_preforking();
+    if (rc != 0)
+        return rc;
+    rc = probe_connect_redirect();
+    if (rc != 0)
+        return rc;
+    rc = probe_send_throttle();
     if (rc != 0)
         return rc;
     rc = probe_recv_trickle();

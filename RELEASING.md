@@ -155,6 +155,22 @@ docker run --rm -v "$D":/d debian:12 sh -c \
 # expect "cat: /tmp/x: Input/output error" and exit=1
 ```
 
+The arm64 objects must be aligned to 64 KiB, which is what lets them load on an aarch64
+kernel configured for 16 KiB or 64 KiB pages (RHEL, Oracle Linux, Asahi):
+
+```sh
+docker run --rm -v "$D":/d debian:12 sh -c \
+  'apt-get -qq update && apt-get -qq install -y binutils >/dev/null;
+   for f in /d/*-arm64.so; do readelf -lW "$f" | awk "/LOAD/ {print \$NF}" | sort -u; done' |
+  sort -u
+# expect 0x10000 only
+```
+
+That is the whole check that can be made anywhere: a *load* test needs a kernel with
+those pages, and neither the GitHub runners nor Docker Desktop has one, so the alignment
+is verified in the file and the load is left to a host that has it. An amd64 object stays
+at 0x1000 on purpose -- aligning it would pad the file for no kernel that needs it.
+
 `CHANGELOG.md` must open with a `## [X.Y.Z]` section listing this release's commits; if
 it shows `[Unreleased]` or another version's range, see §8.
 

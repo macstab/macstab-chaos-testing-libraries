@@ -160,6 +160,11 @@ rm -f /tmp/.chaos-io.conf /tmp/.chaos-io.hits.*
 - The library constructor loads the rule file, so rules written before the program
   starts apply from its first call. A rewrite while it runs takes effect within about
   1 ms ([Runtime Behavior](#runtime-behavior)).
+- Write a rule file by renaming a temporary file from the same directory over it
+  (`{ cat old; new; } > tmp && mv -f tmp file`): `rename(2)` is atomic, so a reader
+  sees the complete old file or the complete new one. Writing in place can be caught
+  mid-line, which rejects the whole file and reports an error that belongs to the
+  delivery rather than to the rules ([`docs/DSL.md` §2.1](docs/DSL.md#21-common-rule-envelope)).
 - Rule files are trusted input: any user who can write `/tmp` can create them
   ([`docs/SAFETY.md` §9](docs/SAFETY.md#9-config-file-security)).
 
@@ -210,6 +215,8 @@ separate whitespace-delimited words after the rule and before any `#` comment:
 | Qualifier | Meaning |
 |---|---|
 | `@first=N` | Fire at most N times per process (N ≥ 1), then go inert. |
+| `@every=N` | Only every Nth evaluation of the rule (N ≥ 1), counted per process. |
+| `@at=+N` | Active only from N ms after the rule became active for that process -- the moment its file was loaded there, not a wall-clock time. A reload that leaves the rule unchanged does not restart the delay. |
 | `@from=T` | Active once the wall clock reaches T (Unix milliseconds). |
 | `@until=T` | Active while the wall clock is before T; the window is `[from, until)`. `@until` ≤ `@from` rejects the line. |
 | `@size>N`, `@size<N` | Only calls that move more / fewer than N bytes. A call without a byte count never matches a size-gated rule (list in [`docs/DSL.md` §7.1](docs/DSL.md#71-todays-surface)). |
@@ -218,6 +225,7 @@ separate whitespace-delimited words after the rule and before any `#` comment:
 tcp4://127.0.0.1:5432:connect:ECONNREFUSED:1.0 @first=3 # net
 /data:write:EIO:1.0 @from=1760000000000 @until=1760000005000 # disk
 tcp4://127.0.0.1:9092:send:LATENCY:200 @size>65536
+/data:fsync:EIO:1.0 @at=+30000 # half a minute after this file was loaded
 ```
 
 - Windows are absolute so that every process in a container agrees on them. The time
@@ -287,6 +295,7 @@ Rule file `/tmp/.chaos-io.conf`. Each rule is exactly four fields:
 /data:write:LATENCY:200
 /data:write:TORN:0.1
 /data:read:CORRUPT:0.5
+/data:write:THROTTLE:65536
 *:open:EMFILE:0.05
 ```
 
@@ -307,10 +316,12 @@ Rule file `/tmp/.chaos-io.conf`. Each rule is exactly four fields:
 | `unlink` | `unlink`, `unlinkat`, `rmdir`, `remove` |
 | `rename_from` | `rename`, `renameat`, `renameat2`, matched on the source path |
 | `rename_to` | `rename`, `renameat`, `renameat2`, matched on the destination path |
+| `statfs` | `statfs`, `fstatfs`, `statvfs`, `fstatvfs` |
 
 On 64-bit glibc the large-file names (`open64`, `openat64`, `creat64`, `pread64`,
 `pwrite64`, `preadv64`, `pwritev64`, `truncate64`, `ftruncate64`, `fallocate64`,
-`posix_fallocate64`, `sendfile64`, `fopen64`, `freopen64`, `__open64_2`,
+`posix_fallocate64`, `sendfile64`, `statfs64`, `fstatfs64`, `statvfs64`, `fstatvfs64`,
+`fopen64`, `freopen64`, `__open64_2`,
 `__openat64_2`, `__pread64_chk`) are aliases of the same wrappers. The JDK, Redis,
 nginx and MySQL bind to the `64` names and `_FORTIFY_SOURCE` builds to the `_chk`/`_2`
 names, so each is interposed.
@@ -322,11 +333,17 @@ names, so each is interposed.
 | an errno name (`ERRNO`) | probability | every operation | Returns the call's failure value with `errno` set, without calling the real function. On `close` the real close runs first and the error is reported after it. Stdio calls fail as stdio does (0 items, `NULL`, `EOF`, -1) and raise the stream's error indicator, so `ferror()` is true. |
 | `LATENCY` | milliseconds | every operation | Sleeps before the real call. Always fires: io `LATENCY` takes no probability. |
 | `TORN` | probability | `write`, `pwrite` (not stdio) | Calls the real function with a shortened count: a short write, the rest of the buffer never written. |
+| `DROP` | probability | `write`, `pwrite` (not stdio, `sendfile`, `copy_file_range`) | Reports the full count as written and writes nothing. On `write` the file offset is moved on by that many bytes, so the caller's next write does not overwrite what it believes it already wrote; `O_APPEND` needs no correction, and a descriptor without an offset (a pipe) keeps the rule from firing. |
+| `THROTTLE` | bytes per second, no probability | `write`, `pwrite`, `sendfile`, `copy_file_range` (not stdio) | Holds the descriptor to that rate: each call writes what a token bucket of one second's worth allows, so the first second passes untouched and only a caller that keeps going is slowed down. An empty bucket returns `EAGAIN` on a non-blocking descriptor and otherwise waits for a tenth of a second's worth and writes that. |
+| `FREE` | bytes, optionally `@probability` | `statfs` | Calls the real function, then reports that many bytes free (`f_bfree` and `f_bavail`, rounded down to whole blocks). The total is left as the kernel reported it. |
+| `FULL` | probability | `statfs` | The same two counts report zero: a filesystem with nothing left. For the recipe "full disk, writes still succeed physically", pair it with a `write:ENOSPC` rule — a real filling disk makes a program's own threshold check fail long before the writes do. |
 | `CORRUPT` | probability | `read`, `pread`, stdio reads | Calls the real function, then flips a bit in the bytes it returned. |
 
 ### Supported Errnos
 
-`EIO`, `ENOSPC`, `EDQUOT`, `EROFS`, `EACCES`, `EMFILE`, `ENFILE`, `ENOENT`.
+`EIO`, `ENOSPC`, `EDQUOT`, `EROFS`, `EACCES`, `EMFILE`, `ENFILE`, `ENOENT`, or a
+positive decimal number up to 2 147 483 647, which is passed through as written (an
+errno this build has no name for).
 
 ### Matching Rules
 
@@ -340,7 +357,8 @@ names, so each is interposed.
   (`/lib` matches `/usr/lib` where `/lib` links there).
 - `*` matches regular paths only. Pipes, sockets, anonymous inodes and memfds
   (`pipe:[N]`, `socket:[N]`, `anon_inode:[…]`, `/memfd:…`) are left to rules that
-  name them, so a `*` `TORN` rule cannot break an eventfd or a socket protocol.
+  name them, so a `*` `TORN` or `THROTTLE` rule cannot break an eventfd or a socket
+  protocol.
 - Never faulted: descriptors 0–2, every libchaos control file (`/tmp/.chaos-*`), and
   anything under `/proc`, `/sys` or `/dev`.
 
@@ -358,17 +376,34 @@ tcp4://*:8080:listen:LATENCY:250
 udp4://127.0.0.1:5353:send:EHOSTUNREACH:0.2
 tcp4://127.0.0.1:9000:recv:CORRUPT:0.1
 tcp4://127.0.0.1:6379:recv:TRICKLE:1
+tcp4://127.0.0.1:9000:send:THROTTLE:65536
+tcp4://127.0.0.1:5432:connect:REDIRECT:127.0.0.1:5433
 tcp4://127.0.0.1:9092:recv:DUP:0.05
 tcp4://*:5432:close:RESET:1.0
+tcp4://10.0.0.0/8:5432:connect:ECONNREFUSED:0.1
 *:connect:ETIMEDOUT:0.05
 ```
 
-**Endpoint selectors.** `*`; `tcp4://<ipv4>:<port>`, `tcp4://*:<port>`;
-`tcp6://[<ipv6>]:<port>`, `tcp6://*:<port>`; the same for `udp4`/`udp6`;
+**Endpoint selectors.** `*`; `tcp4://<ipv4>[/<prefix>]:<port>`, `tcp4://*:<port>`;
+`tcp6://[<ipv6>][/<prefix>]:<port>`, `tcp6://*:<port>`; the same for `udp4`/`udp6`;
 `unix://<path>`, `unix://*`, and `unix://@name` for abstract sockets. The port is a
 decimal number 0–65535; there is no port wildcard. Rank, lowest to highest: `*`, a
-wildcard host or `unix://*`, an exact address and port, an exact UNIX path. The
+wildcard host or `unix://*`, an address and port, an exact UNIX path. The
 family must match: `tcp4` never matches a `tcp6` or UDP socket.
+
+`/<prefix>` selects a network: `tcp4://10.0.0.0/8:5432` is every address in `10.0.0.0/8`
+on port 5432, `tcp6://[2001:db8::]/32:443` the IPv6 equivalent, with the prefix outside
+the brackets. It is 0–32 bits for IPv4 and 0–128 for IPv6 and must be canonical: every
+bit after it zero, so `10.0.0.1/8` rejects the rule file instead of being read as the
+network around it. A prefix has the same rank as a literal address, and between two that
+both contain an address the longer prefix wins -- a literal address being the `/32` (or
+`/128`) case of it. This is how a rule names a Docker bridge network, whose address a
+container is given rather than choosing.
+
+The order of selection is therefore: highest rank, then longest address prefix, then
+longest selector text, then the earlier line. Only the last stage depends on where a rule
+sits in the file, so reordering a file never changes which rule a call gets unless two
+rules are equally specific in all three respects.
 
 **Operations and the address they match.**
 
@@ -401,11 +436,16 @@ call passes through.
 | `CORRUPT` | probability | `recv` | Flips one bit within the bytes the real receive wrote. |
 | `TRICKLE` | bytes per call (≥ 1) | `recv` | Every receive on a stream socket returns at most that many bytes; data stays complete and in order. Not applied to datagram sockets, `MSG_WAITALL` receives, requests no larger than the chunk, or `recvmsg`/`readv` with more than 64 iovecs. No probability. |
 | `DUP` | probability | `recv` | Delivers the socket's previous payload again (with its sender address for datagrams) instead of new data: at-least-once delivery. Payloads are kept per socket up to 4 KiB (longer ones replay truncated) for 64 sockets at once. Skipped for `MSG_PEEK`, `MSG_TRUNC`, `MSG_OOB`, `MSG_WAITALL` and empty buffers. |
-| `RESET` | probability | `close` | Sets `SO_LINGER` to 0 before the close, so the peer receives an RST (`ECONNRESET`) instead of a FIN, as after a crashed process or a load balancer drop. |
+| `RESET` | probability | `close` | Sets `SO_LINGER` to 0 before the close, so the peer receives an RST (`ECONNRESET`) instead of a FIN, as after a crashed process or a load balancer drop. Only where this process alone holds the socket: a shared one would be reset later, out of any rule's reach, so such a close is suppressed and counted in the hits file. A server that ends connections by exiting rather than closing them -- PostgreSQL's backends, measured -- therefore resets nothing; fault the client with `recv:ECONNRESET` instead ([`docs/NETWORK.md`](docs/NETWORK.md)). |
+| `DROP` | probability | `send` | Reports the full byte count as sent and sends nothing: a lost packet. Datagram sockets only, decided per call from `SO_TYPE`, so a `*:send:DROP` rule leaves stream sends alone and counts no hit for them — a silent gap in a TCP stream is a state no network produces. Not applied to `sendmmsg`, whose result is a message count. |
+
+| `REDIRECT` | `ADDRESS:PORT`, optionally `@probability` | `connect` | Connects to that address instead of the one the program asked for: the misconfiguration no errno models. The kernel treats the new address as the destination, so `getpeername` reports it and every later rule matches it; a rule on the original destination fires only on the connect. An IPv4 target over an `AF_INET6` address becomes the IPv4-mapped form; an IPv6 target over an `AF_INET` address fits nowhere and the rule does not fire. |
+| `THROTTLE` | bytes per second, no probability | `send` | Holds the send side to that rate: each send moves what a token bucket of one second's worth allows, so the first second passes untouched. A stream send comes back short; a datagram is never cut and waits for its whole message instead. An empty bucket returns `EAGAIN` on a non-blocking socket and otherwise waits for a tenth of a second's worth. Not applied to `sendmsg` or `sendmmsg`, whose length is in memory. |
 
 **Errnos.** `ECONNREFUSED`, `ETIMEDOUT`, `ECONNRESET`, `EHOSTUNREACH`, `ENETUNREACH`,
 `EADDRINUSE`, `EADDRNOTAVAIL`, `EAFNOSUPPORT`, `EPROTONOSUPPORT`, `EPIPE`, `ENOTCONN`,
-`EOPNOTSUPP`, `EINVAL`, `EINTR`, `ENOMEM`, `ENOBUFS`, `EMFILE`, `ENFILE`, `EAGAIN`.
+`EOPNOTSUPP`, `EINVAL`, `EINTR`, `ENOMEM`, `ENOBUFS`, `EMFILE`, `ENFILE`, `EAGAIN`, or
+a positive decimal number up to 2 147 483 647.
 
 **Boundaries.**
 
@@ -442,7 +482,8 @@ rdns://[::1]:SERVICE:https
 
 **Selectors.** Forward lookups: `*` (same as `dns://*`), `dns://<name>`,
 `dns://*.<suffix>`. Reverse lookups: `rdns://<ipv4>`, `rdns://[<ipv6>]`, `rdns://*`.
-An exact name beats a suffix, a suffix beats `*`.
+An exact name beats a suffix, a suffix beats `*`; between two suffixes that both match,
+the longer one wins, and on a full tie the earlier line does.
 
 **Interposed calls.** `getaddrinfo` and the legacy `gethostbyname`,
 `gethostbyname2`, `gethostbyname_r`, `gethostbyname2_r` use the `dns://` rules, so a
@@ -483,6 +524,7 @@ optional:
 clock_gettime:ERRNO:EFAULT@0.01
 clock_gettime/monotonic:OFFSET:500
 clock_gettime/monotonic:REGRESS:5000
+clock_gettime/realtime:FREEZE:1
 nanosleep:LATENCY:200
 usleep:ERRNO:EINTR@0.1
 ```
@@ -490,7 +532,8 @@ usleep:ERRNO:EINTR@0.1
 **Selectors.** `*`, `clock_gettime`, `clock_gettime/<clock>`, `nanosleep`, `usleep`.
 `<clock>` is `realtime`, `monotonic`, `monotonic_raw`, `realtime_coarse`,
 `monotonic_coarse`, `boottime`, `tai`, `process_cputime_id`, `thread_cputime_id`, or a
-decimal clock id.
+decimal clock id. `clock_gettime/<clock>` beats `clock_gettime`, which beats `*`; on a
+tie the longer selector text wins, and then the earlier line.
 
 **Interposed calls.**
 
@@ -509,12 +552,16 @@ decimal clock id.
 | `LATENCY` | milliseconds | every selector | Sleeps before the real call. |
 | `OFFSET` | signed milliseconds, ±100 years | `clock_gettime[/<clock>]` | Adds the offset to every returned time the probability gate lets through. |
 | `REGRESS` | positive milliseconds, ≤ 100 years | `clock_gettime/<clock>` only | Steps that clock back once: the first read under the rule is real, the next read where the gate fires is that much earlier, and every read after stays shifted, so the clock keeps advancing from the earlier time. `clock_gettime/monotonic:REGRESS:5000` is `CLOCK_MONOTONIC` going back 5 s, as after a VM migration. A clock is required because the jump state is per rule. |
+| `FREEZE` | the probability itself (`FREEZE:1`, `FREEZE:0.25`) | `clock_gettime[/<clock>]` | Stops that clock at the reading of the call that fires the rule: that call returns the real time, every later read returns the same value. It carries no amount, so the one value field is the probability. Standing still is non-decreasing, so unlike `OFFSET` and `REGRESS` it is allowed on `CLOCK_MONOTONIC` without breaking monotonicity — it breaks progress, which is the fault watchdogs, leases and backoff loops are meant to survive. |
 
-- `REGRESS` state is per process and survives a reload that keeps the rule's text; a
-  forked child starts its own.
+- `REGRESS` and `FREEZE` state is per process and survives a reload that keeps the rule's
+  text; a forked child inherits it, so a child of a jumped or frozen parent is jumped or
+  frozen too.
 - A `clock_nanosleep` with `TIMER_ABSTIME` computed from a shifted clock is translated
   back to the real clock (deterministic `OFFSET` at probability 1 and `REGRESS`), so
-  a shifted clock neither stalls nor shortens absolute sleeps.
+  a shifted clock neither stalls nor shortens absolute sleeps. A frozen clock is not
+  translated: it has no shift to undo, so a sleep until "frozen now + 100 ms" is already
+  in the past and returns at once.
 - Not interposed: `alarm`, `setitimer`, timer and `timerfd` APIs, futex timeouts.
 
 ## libchaos-memory
@@ -656,21 +703,26 @@ chaos-init --libs io,net,memory,process -- /usr/local/bin/nats-server -js
 - `src/init/chaos_init_<lib>.c` turns a system call into what the library's wrapper
   would pass to the rule core; parsing, reload, matching, qualifiers and the status and
   hits files are the libraries' own source files.
+- A rule file that is renamed into place, written or removed is read at once (an inotify
+  watch on `/tmp`), so the library's status file reports it without waiting for the next
+  intercepted call; the filter itself cannot change after it is installed.
 - `/tmp/.chaos-init.status` reports `state=active` with `libs=` and `pid=` (and
   `mptcp=off` when chaos-init disabled Go's Multipath TCP), or `state=unsupported` with
   a `reason=`. The application starts in both cases; unsupported means no chaos.
 
 | Library | Applied in SECCOMP mode |
 |---|---|
-| io | errno and `LATENCY` on every operation (`close`: `LATENCY` only) |
-| net | errno and `LATENCY` on every operation (`close`: `LATENCY` only); `TIMEOUT` on `poll` |
+| io | errno and `LATENCY` on every operation (`close`: `LATENCY` only); `TORN`, `THROTTLE`, `CORRUPT` and `DROP` through a ptrace stop |
+| net | errno and `LATENCY` on every operation (`close`: `LATENCY` only); `TIMEOUT` on `poll`, `REDIRECT` on `connect`, `DROP` on a datagram send; `THROTTLE`, `TRICKLE`, `CORRUPT`, `DUP` and `RESET` through a ptrace stop |
 | memory | `ERRNO`, `LATENCY` |
 | process | `ERRNO`, `LATENCY`, `FAIL_AFTER`; `clone` is classified as `pthread_create` (`CLONE_THREAD`), `posix_spawn` (`CLONE_VFORK`) or `fork` |
-| dns, time | nothing: name resolution is a library function, clocks are read from the vDSO |
+| time | `ERRNO`, `LATENCY` on a clock read and on `nanosleep`; `OFFSET`, `REGRESS`, `FREEZE` on a clock read. The vDSO lookups of each image are made to fail first, so the reads become system calls; a `usleep` rule is rejected |
+| dns | `LATENCY`, matched by the name in the query the resolver sends (which is how it reaches a static binary); the answer-changing effects are rejected, because the answer is the resolver's |
 
 - Rules seccomp cannot carry out reject their whole file with
-  `reason=unsupported in seccomp mode`: io `TORN`/`CORRUPT`, net
-  `CORRUPT`/`TRICKLE`/`DUP`/`RESET`, errno on `close`, and any `posix_spawnp` rule.
+  `reason=unsupported in seccomp mode`: io `FREE`/`FULL`, errno on `close`, and any
+  `posix_spawnp` rule. The data effects are applied through a ptrace stop, which the
+  vectored forms are left out of, counting no hit.
 - Per-process state follows the libraries (hits, `@first`, a new count after
   `execve`), with one difference: a forked child continues its parent's `FAIL_AFTER`
   counts, where the library's atfork handler resets them to 0.
@@ -678,9 +730,12 @@ chaos-init --libs io,net,memory,process -- /usr/local/bin/nats-server -js
   `mmap` and the allocator's mappings. Narrow paths, `@size`, `@first` or `@from`
   keep a rule to the calls meant.
 - Requires kernel 5.5 or newer, x86_64 or aarch64 (native, not emulated), and no
-  privilege beyond Docker's default seccomp profile. One notified call costs about
-  2.5 µs instead of 0.2 µs (Docker Desktop, kernel 6.10); only the requested
-  libraries' system calls are notified.
+  privilege beyond Docker's default seccomp profile. A notified call costs tens of
+  microseconds where a plain one costs hundreds of nanoseconds, and a trace stop
+  1.1-1.5× a notification; the measurements, and what follows from them for a budget,
+  are in [`docs/SECCOMP.md` §7.1](docs/SECCOMP.md#71-what-it-costs-measured). Only the
+  requested libraries' system calls are notified -- and a clock rule costs a system
+  call per clock read (+195 ns), not a notification, unless the rule names that clock.
 
 ## Limits
 
@@ -704,7 +759,8 @@ chaos-init --libs io,net,memory,process -- /usr/local/bin/nats-server -js
 ```text
 src/
   common/      shared headers: qualifiers (chaos_policy.h), status file (chaos_status.h),
-               hits files and seqlock (chaos_hits.h), vDSO clock (chaos_clock.h), sleep
+               hits files and seqlock (chaos_hits.h), vDSO clock (chaos_clock.h), sleep,
+               token bucket (chaos_bucket.h)
   core/        libchaos-io runtime state, symbol resolution, path filters
   config/      libchaos-io rule parser and reload; fd-to-path cache
   effects/     libchaos-io effect decisions (ERRNO, LATENCY, TORN, CORRUPT)
@@ -853,7 +909,7 @@ The shared objects carry only the wrappers and their rule engine:
 | `-fomit-frame-pointer`, `-fno-ident` | no frame-pointer setup, no compiler ident string |
 | `-fno-stack-protector` | no canary: `__stack_chk_fail` would write to stderr through the interposed `write` ([`docs/ENGINEERING.md`](docs/ENGINEERING.md)) |
 | `-Wl,--strip-all`, `-Wl,--build-id=none` | no symbol table beyond the dynamic one, no build-id note |
-| `-Wl,-z,max-page-size=4096 -Wl,-z,common-page-size=4096` | 4 KiB segment alignment; the aarch64 GNU ld default of 64 KiB pads every segment |
+| `-Wl,-z,max-page-size=4096` (amd64) / `=65536` (arm64), `-Wl,-z,common-page-size=4096` | Segment alignment at least the kernel's page size: a 4 KiB-aligned object does not load on an arm64 kernel configured with 64 KiB pages |
 
 No C++ runtime, no allocator in the hot path, `-ldl` as the only link library.
 
@@ -862,6 +918,7 @@ No C++ runtime, no allocator in the hot path, `-ldl` as the only link library.
 | Document | Content |
 |---|---|
 | [`docs/DSL.md`](docs/DSL.md) | Rule grammar (ABNF), qualifiers, specificity order, cross-layer mapping |
+| [`docs/UPGRADING.md`](docs/UPGRADING.md) | What changes for an existing rule file, per release |
 | [`docs/PLATFORM.md`](docs/PLATFORM.md) | ELF link map, PLT/GOT, `RTLD_NEXT`, IFUNC, symbol versioning, vDSO, `AT_SECURE`, static binaries |
 | [`docs/SYSTEM.md`](docs/SYSTEM.md) | Loader/libc/kernel interaction, one-symbol-one-owner invariant, composition |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Component map, call flow, reload protocol, status and hits files, fd cache |

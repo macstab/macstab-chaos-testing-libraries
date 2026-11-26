@@ -44,12 +44,6 @@ int chaos_io_probability_hit_sample(double probability, uint32_t sample)
     return (double)sample < threshold;
 }
 
-/** @copydoc chaos_io_probability_hit */
-int chaos_io_probability_hit(double probability)
-{
-    return chaos_io_probability_hit_sample(probability, chaos_io_prng_next_u32());
-}
-
 /**
  * @copydoc chaos_io_torn_count_sample
  *
@@ -71,9 +65,11 @@ size_t chaos_io_torn_count_sample(size_t requested, uint32_t sample)
 }
 
 /** @copydoc chaos_io_torn_count */
-size_t chaos_io_torn_count(size_t requested)
+size_t chaos_io_torn_count(const chaos_io_rule_t *rule, size_t requested)
 {
-    return chaos_io_torn_count_sample(requested, chaos_io_prng_next_u32());
+    return chaos_io_torn_count_sample(
+        requested, chaos_io_rule_draw(rule, CHAOS_IO_DRAW_FIRST_EFFECT)
+    );
 }
 
 /** @copydoc chaos_io_corrupt_buffer_sample */
@@ -96,21 +92,41 @@ void chaos_io_corrupt_buffer_sample(
 }
 
 /** @copydoc chaos_io_corrupt_buffer */
-void chaos_io_corrupt_buffer(void *buffer, size_t size)
+void chaos_io_corrupt_buffer(const chaos_io_rule_t *rule, void *buffer, size_t size)
 {
-    uint32_t index_sample = chaos_io_prng_next_u32();
-    uint32_t bit_sample = chaos_io_prng_next_u32();
+    chaos_io_corrupt_buffer_sample(
+        buffer,
+        size,
+        chaos_io_rule_draw(rule, CHAOS_IO_DRAW_FIRST_EFFECT),
+        chaos_io_rule_draw(rule, CHAOS_IO_DRAW_SECOND_EFFECT)
+    );
+}
 
-    /* Drawn into locals, not as call arguments: C leaves argument evaluation order
-     * unspecified, and the byte/bit assignment must not depend on the compiler. */
-    chaos_io_corrupt_buffer_sample(buffer, size, index_sample, bit_sample);
+/** @copydoc chaos_io_free_blocks */
+int chaos_io_free_blocks(const chaos_io_rule_t *rule, uint64_t unit, uint64_t *blocks)
+{
+    if (rule == NULL || blocks == NULL || unit == 0U)
+    {
+        return 0;
+    }
+    if (rule->effect == CHAOS_IO_EFFECT_FULL)
+    {
+        *blocks = 0U;
+        return 1;
+    }
+    if (rule->effect != CHAOS_IO_EFFECT_FREE)
+    {
+        return 0;
+    }
+    *blocks = rule->free_bytes / unit;
+    return 1;
 }
 
 /** @copydoc chaos_io_rule_apply_latency */
-void chaos_io_rule_apply_latency(const chaos_io_rule_t *rule)
+void chaos_io_rule_apply_latency(chaos_io_rule_t *rule)
 {
-    /* A delay is gated by the qualifiers (@first, @from, @until, @size) and counted as a
-     * hit like any other effect; it only skips the probability. */
+    /* A delay is gated and counted like any other effect: qualifiers (@first, @from,
+     * @until, @size) and the probability of `LATENCY:ms@p`, which is 1.0 without one. */
     if (rule == NULL || rule->effect != CHAOS_IO_EFFECT_LATENCY ||
         !chaos_io_rule_should_trigger(rule))
     {
@@ -125,18 +141,24 @@ void chaos_io_rule_apply_latency(const chaos_io_rule_t *rule)
  * chaos_policy_fire() runs last so a `@first` allowance is consumed only by a call that
  * actually injects.
  */
-int chaos_io_rule_should_trigger(const chaos_io_rule_t *rule)
+int chaos_io_rule_should_trigger(chaos_io_rule_t *rule)
 {
     if (rule == NULL || !chaos_policy_window_open(&rule->policy) ||
+        !chaos_policy_at_ok(&rule->policy, rule->hit) ||
         !chaos_policy_size_ok(&rule->policy, rule->call_size))
     {
         return 0;
     }
-    if (rule->effect == CHAOS_IO_EFFECT_LATENCY)
+    /* Past the gates that cost nothing: this call is an evaluation of the rule and gets
+     * its number. `@every=N` picks evaluations, so it gates here, before the draw; every
+     * sample of this call follows from the same number. */
+    if (!chaos_policy_every_ok(&rule->policy, chaos_io_rule_draw_begin(rule)))
     {
-        return chaos_policy_fire(&rule->policy, rule->hit, rule->hit_generation);
+        return 0;
     }
-    if (!chaos_io_probability_hit(rule->probability))
+    if (!chaos_io_probability_hit_sample(
+            rule->probability, chaos_io_rule_draw(rule, CHAOS_IO_DRAW_PROBABILITY)
+        ))
     {
         return 0;
     }
@@ -144,7 +166,7 @@ int chaos_io_rule_should_trigger(const chaos_io_rule_t *rule)
 }
 
 /** @copydoc chaos_io_rule_apply_errno */
-int chaos_io_rule_apply_errno(const chaos_io_rule_t *rule)
+int chaos_io_rule_apply_errno(chaos_io_rule_t *rule)
 {
     if (rule == NULL || rule->effect != CHAOS_IO_EFFECT_ERRNO)
     {

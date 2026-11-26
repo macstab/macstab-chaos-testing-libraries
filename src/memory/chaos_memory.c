@@ -67,7 +67,10 @@ chaos_memory_posix_madvise_fn g_chaos_memory_real_posix_madvise = NULL;
 __thread int g_chaos_memory_tls_guard = 0;
 
 /** @brief Per-thread xorshift64* state; 0 until the thread's first draw seeds it. */
-__thread uint64_t g_chaos_memory_tls_prng_state = 0U;
+uint64_t g_chaos_memory_lineage = 0U;
+
+/** @copydoc g_chaos_memory_forks */
+uint64_t g_chaos_memory_forks = 0U;
 
 /**
  * @brief Process seed; replaced by the constructor with /dev/urandom bytes.
@@ -192,6 +195,42 @@ static uint64_t chaos_memory_read_seed_material(void)
     return seed;
 }
 
+/**
+ * @brief The process seed: `CHAOS_SEED` from the environment, else 64 random bits.
+ *
+ * @details `CHAOS_SEED=<decimal u64>` makes every decision of this container reproducible:
+ * a rule's draws follow from the seed, the rule's text and the number of the evaluation,
+ * nothing else. Without it the seed is random, which is what a chaos test wants when it is
+ * not trying to reproduce one particular run.
+ *
+ * `getenv()` is safe here and nowhere else in the library: this runs in the ELF
+ * constructor, before `main`, single-threaded, before the application can call `setenv`.
+ * Anything unusable is ignored rather than rejected -- the seed decides which faults fire,
+ * not whether the rules are valid, and a rule file that loads is worth more to a test than
+ * a refusal over an environment variable. Digits only: strtoull() takes a sign, and "-1"
+ * would wrap silently into UINT64_MAX, a seed nobody asked for.
+ *
+ * @return The seed.
+ */
+static uint64_t chaos_memory_seed(void)
+{
+    const char *text = getenv("CHAOS_SEED");
+    char *end = NULL;
+    unsigned long long value;
+
+    if (text == NULL || text[0] < '0' || text[0] > '9')
+    {
+        return chaos_memory_read_seed_material();
+    }
+    errno = 0;
+    value = strtoull(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0')
+    {
+        return chaos_memory_read_seed_material();
+    }
+    return (uint64_t)value;
+}
+
 /* =========================================================================
  * Real function lookup and constructor
  * =========================================================================
@@ -247,8 +286,7 @@ CHAOS_MEMORY_CONSTRUCTOR
 static void chaos_memory_init(void)
 {
     chaos_memory_ensure_symbols();
-    g_chaos_memory_process_seed = chaos_memory_read_seed_material();
-    chaos_memory_prng_seed_thread(g_chaos_memory_process_seed);
+    g_chaos_memory_process_seed = chaos_memory_seed();
     chaos_memory_config_init();
     /* Load the rules now so a bad rule file is reported at start-up. */
     (void)chaos_memory_config_prepare();

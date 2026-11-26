@@ -111,7 +111,17 @@ typedef enum chaos_time_effect
      * and every read after that stays shifted, so the clock advances again from the
      * earlier time. State lives in the rule's hit slot (chaos_time_rule_apply_regress()).
      */
-    CHAOS_TIME_EFFECT_REGRESS
+    CHAOS_TIME_EFFECT_REGRESS,
+    /**
+     * After a successful clock read: stop the clock at the reading of the call that fired
+     * the rule. Every later read of that clock returns the kept value, so the application
+     * sees time standing still -- a watchdog that waits for a deadline waits for ever, a
+     * cache that expires by wall clock never expires. The probability decides when the
+     * freeze starts, not each read. The kept value lives in the rule's hit slot
+     * (chaos_time_rule_apply_freeze()), so every thread and a reload that keeps the rule
+     * see the same frozen time.
+     */
+    CHAOS_TIME_EFFECT_FREEZE
 } chaos_time_effect_t;
 
 /**
@@ -160,7 +170,71 @@ typedef struct chaos_time_rule
     chaos_hit_slot_t *hit;
     /** Generation of @c hit when the rule was published; a later one means the rule left. */
     uint64_t hit_generation;
+    /**
+     * Draw key of the rule: `mix(process seed ^ hash(rule text))`, set when the snapshot is
+     * published. From the text, not the slot index: chaos_hits_assign() hands slots out
+     * again and another rule would inherit the key.
+     */
+    uint64_t key;
+    /**
+     * Base of this call's draws, set by chaos_time_rule_should_trigger() from the key and the
+     * rule's evaluation number; the effects derive their samples from it. Belongs to the one
+     * call this copy was made for, not to the rule as parsed.
+     */
+    uint64_t draw_base;
 } chaos_time_rule_t;
+
+/**
+ * @brief Starts this call's draws: records the rule's evaluation number and derives the
+ *        base every sample of this call comes from.
+ *
+ * @details Two stages, not one. The first turns (rule, evaluation) into a base, the second
+ * turns (base, draw number) into a sample, so a rule that takes several draws cannot
+ * collide with its own next evaluation -- which is what a single `key + n * K + d` does as
+ * soon as `d` reaches K, a constant the next effect added would break silently.
+ *
+ * @param rule Rule copy for this call; NULL is a no-op returning 0. A rule outside a
+ *             snapshot (unit tests) has no slot and is evaluation 1 every time.
+ * @return The number of this evaluation of the rule, counting from 1; what `@every=N`
+ *         divides and what the draws are derived from.
+ */
+static inline uint64_t chaos_time_rule_draw_begin(chaos_time_rule_t *rule)
+{
+    uint64_t evaluation = 0U;
+
+    if (rule == NULL)
+    {
+        return 0U;
+    }
+    /* Only through a slot that is still this rule's: every other use of a slot checks
+     * the generation, and a rule copy held across a reload would otherwise bump the
+     * counter of whoever owns the slot now -- shifting that rule's `@every` phase and
+     * its draw numbering. */
+    if (rule->hit != NULL && chaos_hit_slot_current(rule->hit, rule->hit_generation))
+    {
+        evaluation = __sync_fetch_and_add(&rule->hit->evaluations, UINT64_C(1));
+    }
+    rule->draw_base = chaos_time_prng_mix((rule->key ^ g_chaos_time_lineage) + evaluation);
+    return evaluation + 1U;
+}
+
+/**
+ * @brief Sample @p draw of this call, uniform in [0, 2^32).
+ *
+ * @param rule Rule copy whose chaos_time_rule_draw_begin() ran.
+ * @param draw Which draw of this call: 0 is the probability, the effects follow.
+ * @return The sample.
+ */
+static inline uint32_t chaos_time_rule_draw(const chaos_time_rule_t *rule, uint64_t draw)
+{
+    return (uint32_t)(chaos_time_prng_mix(rule->draw_base + draw) >> 32);
+}
+
+/** @brief Draw number of the probability decision; effects number their draws after it. */
+#define CHAOS_TIME_DRAW_PROBABILITY UINT64_C(0)
+
+/** @brief First draw an effect may take after the probability. */
+#define CHAOS_TIME_DRAW_FIRST_EFFECT UINT64_C(1)
 
 /**
  * Resets the rule state: both snapshots empty, hit pool cleared, change stamp unknown.

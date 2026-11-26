@@ -143,6 +143,17 @@ static int g_chaos_io_hit_pool_used = 0;
 static volatile unsigned int g_chaos_io_active_config_index = 0U;
 
 /**
+ * @brief Rule-file snapshots this process has published, reported as the hits file's
+ *        `generation=` line.
+ *
+ * @details Lets a reader tell which rules a count belongs to: after a reload that changed
+ * the file the number differs, so counts that restarted are not mistaken for counts that
+ * stalled. Written only by the reload owner, between the same barriers as the active
+ * index.
+ */
+static volatile uint64_t g_chaos_io_config_generation = 0U;
+
+/**
  * @brief Change stamp of the loaded rule file, or a sentinel (CHAOS_IO_MTIME_*).
  *
  * @details Freshness token and, as CHAOS_IO_MTIME_RELOADING, the reload claim; see the
@@ -185,6 +196,21 @@ static char g_chaos_io_config_texts[CHAOS_IO_MAX_RULES][CHAOS_STATUS_TEXT_MAX + 
 /** @brief Hits-writer flag: non-zero while one thread writes the hits file. */
 static volatile int g_chaos_io_hits_writing = 0;
 
+/**
+ * @brief pthread_atfork() prepare handler: counts this fork in the parent.
+ *
+ * @details The child reads the counter as its own ordinal among its siblings, which is
+ * what makes two children of one parent decide differently (g_chaos_io_forks). Counted
+ * here rather than in the child, because a child cannot tell how many siblings came
+ * before it. Atomic, so two threads forking at once get different ordinals rather than
+ * the same one; which of them gets which follows the order the kernel ran them in, as
+ * everything else about concurrent calls does.
+ */
+static void chaos_io_config_before_fork(void)
+{
+    (void)__sync_fetch_and_add(&g_chaos_io_forks, UINT64_C(1));
+}
+
 /** @brief Non-zero once the atfork handler is registered (once per image, not per init). */
 static int g_chaos_io_atfork_registered = 0;
 
@@ -215,7 +241,8 @@ static long g_chaos_io_hits_file = 0L;
 static int g_chaos_io_hits_owned = 0;
 
 /** @brief Hits-file scratch, 256 lines of CHAOS_HITS_LINE_MAX; used only by the writer. */
-static char g_chaos_io_hits_buffer[CHAOS_IO_MAX_RULES * CHAOS_HITS_LINE_MAX + 1U];
+static char
+    g_chaos_io_hits_buffer[CHAOS_IO_MAX_RULES * CHAOS_HITS_LINE_MAX + CHAOS_HITS_HEADER_MAX + 1U];
 
 /* --- Internal helpers ------------------------------------------------------------ */
 
@@ -284,6 +311,7 @@ static void chaos_io_config_publish(unsigned int next_index, uint64_t observed_m
     chaos_snapshot_write_end(&g_chaos_io_config_states[next_index].sequence);
     __sync_synchronize();
     g_chaos_io_active_config_index = next_index;
+    ++g_chaos_io_config_generation;
     __sync_synchronize();
     g_chaos_io_cached_mtime = observed_mtime;
 }
@@ -417,6 +445,10 @@ static chaos_io_operation_t chaos_io_parse_operation(const char *text)
     {
         return CHAOS_IO_OP_RENAME_TO;
     }
+    if (strcmp(text, "statfs") == 0)
+    {
+        return CHAOS_IO_OP_STATFS;
+    }
     return CHAOS_IO_OP_INVALID;
 }
 
@@ -433,6 +465,9 @@ static chaos_io_operation_t chaos_io_parse_operation(const char *text)
  */
 static int chaos_io_parse_errno_name(const char *text)
 {
+    char *end = NULL;
+    long value;
+
     if (text == NULL)
     {
         return -1;
@@ -469,7 +504,21 @@ static int chaos_io_parse_errno_name(const char *text)
     {
         return ENOENT;
     }
-    return -1;
+    /* A number the C library has no name for, as the other libraries accept: a io rule can
+     * then reach an errno this build knows nothing about. Only the range is checked, never
+     * the meaning. */
+    value = strtol(text, &end, 10);
+    if (end == text || value <= 0L || value > 0x7fffffffL)
+    {
+        return -1;
+    }
+    /* Trailing blanks are skipped by reading, not by chaos_io_trim(), which terminates the text
+     * it is given: this function takes a const string and must not write through it. */
+    while (*end != '\0' && chaos_io_is_blank_char(*end))
+    {
+        ++end;
+    }
+    return *end == '\0' ? (int)value : -1;
 }
 
 /** @brief Locale-independent probability parser; see chaos_policy_parse_probability(). */
@@ -479,18 +528,13 @@ static int chaos_io_parse_probability(const char *text, double *probability)
 }
 
 /**
- * @brief Parses a LATENCY parameter: decimal milliseconds, 0 to 4294967295 (about 49.7
- *        days).
- *
- * @details strtoul() base 10 with the whole token consumed (trailing blanks allowed).
- * strtoul() also accepts leading blanks and a sign; "-N" wraps to a value above the limit
- * on LP64 and is rejected, except "-0", which reads as 0.
+ * @brief Parses the milliseconds of a LATENCY parameter, whole token.
  *
  * @param[in]  text        Field; NULL returns -1.
  * @param[out] latency_ms  Receives the value; NULL returns -1.
  * @return 0 on success; -1 on a syntax or range error.
  */
-static int chaos_io_parse_latency(const char *text, unsigned int *latency_ms)
+static int chaos_io_parse_latency_ms(const char *text, unsigned int *latency_ms)
 {
     char *end = NULL;
     unsigned long value;
@@ -515,6 +559,141 @@ static int chaos_io_parse_latency(const char *text, unsigned int *latency_ms)
 }
 
 /**
+ * @brief Parses a FREE parameter: `<bytes>[@probability]`.
+ *
+ * @details The byte count is 64 bits, so a rule can name more free space than any file
+ * system has; `strtoull` out of range rejects the line. The `@` form is the same as
+ * LATENCY's and must follow a digit directly, so a blank before it stays a qualifier word.
+ *
+ * @param[in]  text         Field; NULL returns -1.
+ * @param[out] free_bytes   Receives the byte count; NULL returns -1.
+ * @param[out] probability  Receives the probability, 1.0 without one; NULL returns -1.
+ * @return 0 on success; -1 on a syntax or range error.
+ */
+static int chaos_io_parse_free_bytes(const char *text, uint64_t *free_bytes, double *probability)
+{
+    char digits[24];
+    const char *at_sign;
+    char *end = NULL;
+    unsigned long long value;
+    size_t length;
+
+    if (text == NULL || free_bytes == NULL || probability == NULL)
+    {
+        return -1;
+    }
+    *probability = 1.0;
+    at_sign = strrchr(text, '@');
+    if (at_sign != NULL)
+    {
+        length = (size_t)(at_sign - text);
+        if (at_sign == text || at_sign[-1] < '0' || at_sign[-1] > '9' || length >= sizeof(digits))
+        {
+            return -1;
+        }
+        (void)memcpy(digits, text, length);
+        digits[length] = '\0';
+        if (chaos_io_parse_probability(at_sign + 1, probability) != 0)
+        {
+            return -1;
+        }
+        text = digits;
+    }
+    if (*text < '0' || *text > '9')
+    {
+        return -1;
+    }
+    errno = 0;
+    value = strtoull(text, &end, 10);
+    if (end == text || *chaos_io_trim(end) != '\0' || errno == ERANGE)
+    {
+        return -1;
+    }
+    *free_bytes = (uint64_t)value;
+    return 0;
+}
+
+/**
+ * @brief Parses a THROTTLE rate: digits only, 1 to 4294967295 bytes per second.
+ *
+ * @details No probability: see the parser's THROTTLE branch. The upper bound is what the
+ * token bucket can hold (chaos_bucket.h).
+ *
+ * @return 0 with @p rate written, or -1.
+ */
+static int chaos_io_parse_rate(const char *text, uint64_t *rate)
+{
+    char *end = NULL;
+    unsigned long long value;
+
+    if (text == NULL || *text < '0' || *text > '9')
+    {
+        return -1;
+    }
+    errno = 0;
+    value = strtoull(text, &end, 10);
+    if (end == text || *chaos_io_trim(end) != '\0' || errno == ERANGE || value == 0U ||
+        value > 0xffffffffULL)
+    {
+        return -1;
+    }
+    *rate = (uint64_t)value;
+    return 0;
+}
+
+/**
+ * @brief Parses a LATENCY parameter: decimal milliseconds, 0 to 4294967295 (about 49.7
+ *        days), optionally followed by `@probability`.
+ *
+ * @details strtoul() base 10 with the whole token consumed (trailing blanks allowed).
+ * strtoul() also accepts leading blanks and a sign; "-N" wraps to a value above the limit
+ * on LP64 and is rejected, except "-0", which reads as 0.
+ *
+ * Without `@probability` the rule is certain (1.0), which is what `LATENCY:ms` has always
+ * meant. A blank before the `@` makes it a qualifier word instead and the line is rejected,
+ * as everywhere else in the grammar: the milliseconds then have a trailing blank, which the
+ * whole-token rule refuses.
+ *
+ * @param[in]  text         Field; NULL returns -1.
+ * @param[out] latency_ms   Receives the value; NULL returns -1.
+ * @param[out] probability  Receives the probability, 1.0 without one; NULL returns -1.
+ * @return 0 on success; -1 on a syntax or range error.
+ */
+static int chaos_io_parse_latency(const char *text, unsigned int *latency_ms, double *probability)
+{
+    char milliseconds[16];
+    const char *at_sign;
+    size_t length;
+
+    if (text == NULL || probability == NULL)
+    {
+        return -1;
+    }
+    *probability = 1.0;
+    at_sign = strrchr(text, '@');
+    if (at_sign != NULL)
+    {
+        length = (size_t)(at_sign - text);
+        /* The `@` must follow a digit directly. A blank before it would make it a
+         * qualifier word, and the line is rejected one level up; requiring the digit keeps
+         * this function's contract exactly `ms [ "@" probability ]` either way. */
+        if (at_sign == text || at_sign[-1] < '0' || at_sign[-1] > '9' ||
+            length >= sizeof(milliseconds))
+        {
+            return -1;
+        }
+        (void)memcpy(milliseconds, text, length);
+        milliseconds[length] = '\0';
+        if (chaos_io_parse_latency_ms(milliseconds, latency_ms) != 0)
+        {
+            return -1;
+        }
+        return chaos_io_parse_probability(at_sign + 1, probability);
+    }
+    return chaos_io_parse_latency_ms(text, latency_ms);
+}
+
+/**
  * @brief Non-zero when @p effect may be combined with @p operation.
  *
  * @details
@@ -523,6 +702,14 @@ static int chaos_io_parse_latency(const char *text, unsigned int *latency_ms)
  *   so a "torn read" would add nothing a caller does not already handle.
  * - CORRUPT: `read`, `pread` only. Flipping a bit in the caller's buffer after a write
  *   changes nothing the caller can observe in the file.
+ * - DROP: `write`, `pwrite` only. It reports a write as fully done without doing it, which
+ *   is a lost write; the read side has no counterpart -- a read that reports bytes it did
+ *   not read would hand the caller its own stale buffer, which is CORRUPT's territory.
+ * - FREE, FULL: `statfs` only. They rewrite the free-space fields of the answer, which no
+ *   other operation returns.
+ * - THROTTLE: `write`, `pwrite` only. It holds the write side to a byte rate by writing
+ *   less per call; a read is already allowed to return less than asked for, and limiting
+ *   how much a caller may read is not a failure any device produces.
  */
 static int chaos_io_effect_allowed(chaos_io_operation_t operation, chaos_io_effect_t effect)
 {
@@ -537,6 +724,18 @@ static int chaos_io_effect_allowed(chaos_io_operation_t operation, chaos_io_effe
     if (effect == CHAOS_IO_EFFECT_CORRUPT)
     {
         return operation == CHAOS_IO_OP_READ || operation == CHAOS_IO_OP_PREAD;
+    }
+    if (effect == CHAOS_IO_EFFECT_DROP)
+    {
+        return operation == CHAOS_IO_OP_WRITE || operation == CHAOS_IO_OP_PWRITE;
+    }
+    if (effect == CHAOS_IO_EFFECT_FREE || effect == CHAOS_IO_EFFECT_FULL)
+    {
+        return operation == CHAOS_IO_OP_STATFS;
+    }
+    if (effect == CHAOS_IO_EFFECT_THROTTLE)
+    {
+        return operation == CHAOS_IO_OP_WRITE || operation == CHAOS_IO_OP_PWRITE;
     }
     return 0;
 }
@@ -655,7 +854,7 @@ static int chaos_io_config_read_file(size_t *size_out, uint64_t expected_stamp)
     previous = chaos_io_enter_internal();
     do
     {
-        fd = g_chaos_io_real_open(CHAOS_IO_CONFIG_PATH, O_RDONLY);
+        fd = g_chaos_io_real_open(CHAOS_IO_CONFIG_PATH, O_RDONLY | O_CLOEXEC);
     } while (fd < 0 && errno == EINTR);
     if (fd < 0)
     {
@@ -738,12 +937,70 @@ static int chaos_io_prefix_covers(const char *prefix, size_t length, const char 
 }
 
 /**
+ * @brief Whether rule @p later can never win against one already accepted.
+ *
+ * @details Rules are selected by rank, then by the longer selector text, then by the
+ * earlier line. Two rules with the same prefix, operation and effect therefore tie on
+ * everything but the line, and the earlier one always wins: the later can never fire. It
+ * is a valid rule, so it is kept and the status file warns about it rather than rejecting
+ * the file.
+ *
+ * @param rules Rules accepted so far.
+ * @param count How many.
+ * @param later The rule about to be accepted.
+ * @return Non-zero when an earlier rule shadows @p later.
+ */
+static int
+chaos_io_rule_shadowed(const chaos_io_rule_t *rules, size_t count, const chaos_io_rule_t *later)
+{
+    size_t index;
+
+    for (index = 0U; index < count; ++index)
+    {
+        /* The effect is not part of this, because it is not part of the selection:
+         * chaos_io_config_select_rule() picks on the operation and the prefix and keeps
+         * the earliest of equal-length prefixes, so a later rule with the same two can
+         * never be picked whatever effect it carries. Comparing effects here let
+         * `/data:read:EIO` followed by `/data:read:LATENCY:200` load with `state=ok` and
+         * no warning while the second never fired -- the silent never-fires this channel
+         * exists to surface. The libraries whose selection takes the effect (dns, time,
+         * memory, process) do compare it, and are right to. */
+        if (rules[index].operation == later->operation &&
+            strcmp(rules[index].path_prefix, later->path_prefix) == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
+ * @brief Whether operation @p operation reports a byte count to a rule.
+ *
+ * @details Only the calls that move bytes do: read, write, pread and pwrite (including
+ * their iovec forms, sendfile and copy_file_range, which are decided as write), fallocate
+ * and truncate, whose lengths are passed. open, close, fsync, fdatasync, rename, unlink and
+ * statfs pass CHAOS_POLICY_NO_SIZE, so a `@size` gate on them could never pass and the rule
+ * would load and never fire.
+ *
+ * @param operation Operation of the rule.
+ * @return Non-zero when the operation reports a byte count.
+ */
+static int chaos_io_operation_has_size(chaos_io_operation_t operation)
+{
+    return operation == CHAOS_IO_OP_READ || operation == CHAOS_IO_OP_WRITE ||
+           operation == CHAOS_IO_OP_PREAD || operation == CHAOS_IO_OP_PWRITE ||
+           operation == CHAOS_IO_OP_ALLOCATE || operation == CHAOS_IO_OP_TRUNCATE;
+}
+
+/**
  * @brief Non-zero when @p rule's prefix, as written or link-resolved, covers @p path.
  *
- * @details `*` covers every absolute path except memfds (`/memfd:<name>`); pipes, sockets
- * and anonymous inodes resolve to names without a leading `/` and are reached only by a
- * rule that names them. A relative prefix never covers anything, since every path matched
- * is absolute.
+ * @details `*` covers every absolute path except memfds (`/memfd:<name>`). Pipes, sockets
+ * and anonymous inodes resolve to names without a leading `/` (`pipe:[N]`, `socket:[N]`,
+ * `anon_inode:[...]`) and no rule reaches them: a selector is the first colon-separated
+ * field, so their names cannot be written, and a prefix that is neither `*` nor absolute
+ * is rejected at parse time. Every path matched here is therefore absolute.
  */
 static int chaos_io_rule_prefix_matches(const chaos_io_rule_t *rule, const char *path)
 {
@@ -781,6 +1038,24 @@ static void chaos_io_config_reject_file(chaos_io_config_state_t *state, const ch
 }
 
 /**
+ * @brief The tab-free header lines of this library's hits file: the reload generation.
+ *
+ * @details A named function rather than the expression it replaced, because chaos-init
+ * hands it to chaos_hits_write_for() when it writes this file for a traced process: the
+ * generation a reader correlates counts with must not depend on which mode produced them.
+ *
+ * @param out  Buffer of at least CHAOS_HITS_HEADER_MAX bytes.
+ * @param size Its size.
+ * @return @p out, or NULL when it could not be formatted (then no header is written).
+ */
+static const char *chaos_io_hits_header(char *out, size_t size)
+{
+    const size_t used = chaos_hits_header_generation(out, size, g_chaos_io_config_generation);
+
+    return used != 0U ? out : NULL;
+}
+
+/**
  * @brief Report hook of every hit slot: writes this process's hits file when due.
  *
  * @details With @p slot non-NULL (a hit): counts it and writes on each of the first
@@ -799,6 +1074,7 @@ static void chaos_io_config_reject_file(chaos_io_config_state_t *state, const ch
  */
 static void chaos_io_config_report_hits(chaos_hit_slot_t *slot)
 {
+    char header[CHAOS_HITS_HEADER_MAX];
     chaos_io_config_state_t *state;
     const uint64_t now = chaos_hits_now_ms();
 
@@ -845,6 +1121,7 @@ static void chaos_io_config_report_hits(chaos_hit_slot_t *slot)
                 state->hits,
                 (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) state->text,
                 state->rule_count,
+                chaos_io_hits_header(header, sizeof(header)),
                 g_chaos_io_hits_buffer,
                 sizeof(g_chaos_io_hits_buffer)
             );
@@ -886,8 +1163,11 @@ static void chaos_io_config_after_fork(void)
      * this pid is caught by the exclusive first write, which then picks another suffix. */
     g_chaos_io_hits_file = (long)g_chaos_io_hits_pid;
     CHAOS_STORE_IF_CHANGED(g_chaos_io_hits_owned, 0);
-    /* Zero forces a reseed on the next draw, mixing in the child's own tid. */
-    CHAOS_STORE_IF_CHANGED(g_chaos_io_tls_prng_state, 0U);
+    /* The child decides differently from the parent and from its siblings, without the
+     * rules' keys being rewritten: one global instead of every snapshot page. Mixed, not
+     * incremented, so sibling lineages are unrelated rather than adjacent. */
+    g_chaos_io_lineage = chaos_io_prng_mix(g_chaos_io_lineage + g_chaos_io_forks);
+    g_chaos_io_forks = 0U;
     if (g_chaos_io_hit_pool_used)
     {
         chaos_hits_pool_after_fork(
@@ -1095,6 +1375,11 @@ static void chaos_io_config_attach_hits(chaos_io_config_state_t *next_state)
         next_state->rules[index].hit = next_state->hits[index];
         next_state->rules[index].hit_generation =
             next_state->hits[index] != NULL ? next_state->hits[index]->generation : 0U;
+        /* From the text, so a rule keeps its decisions across a reload that keeps it and
+         * the rule that reuses its slot does not inherit them. */
+        next_state->rules[index].key = chaos_io_prng_mix(
+            g_chaos_io_process_seed ^ chaos_io_rule_hash(next_state->text[index])
+        );
     }
 }
 
@@ -1117,7 +1402,11 @@ static void chaos_io_config_report(uint64_t observed_mtime, const chaos_io_confi
     }
     else
     {
-        chaos_status_write(CHAOS_IO_STATUS_PATH, CHAOS_STATUS_OK, state->rule_count, NULL);
+        /* The record is passed on success too: it carries the warnings, and its
+         * rejection fields were cleared when the parse succeeded. */
+        chaos_status_write(
+            CHAOS_IO_STATUS_PATH, CHAOS_STATUS_OK, state->rule_count, &g_chaos_io_config_error
+        );
     }
 }
 
@@ -1242,7 +1531,7 @@ void chaos_io_config_init(void)
     if (!g_chaos_io_atfork_registered)
     {
         g_chaos_io_atfork_registered = 1;
-        (void)pthread_atfork(NULL, NULL, chaos_io_config_after_fork);
+        (void)pthread_atfork(chaos_io_config_before_fork, NULL, chaos_io_config_after_fork);
     }
     /* Look up the vDSO clock now, not first inside a wrapper a signal handler may
      * re-enter (a lookup in progress makes the clock read 0 and disables the throttle). */
@@ -1400,6 +1689,14 @@ int chaos_io_config_parse_line(char *line, chaos_io_rule_t *rule)
     {
         return -1;
     }
+    /* A prefix that is neither the wildcard nor absolute never covers anything
+     * (chaos_io_rule_prefix_matches): every path matched is absolute. Such a rule used to
+     * load with state=ok and never fire, which is indistinguishable from a rule whose
+     * selector simply did not come up. */
+    if (strcmp(fields[0], "*") != 0 && fields[0][0] != '/')
+    {
+        return -1;
+    }
 
     (void)memset(rule, 0, sizeof(*rule));
     (void)memcpy(rule->path_prefix, fields[0], strlen(fields[0]) + 1U);
@@ -1424,11 +1721,12 @@ int chaos_io_config_parse_line(char *line, chaos_io_rule_t *rule)
     else if (strcmp(fields[2], "LATENCY") == 0)
     {
         rule->effect = CHAOS_IO_EFFECT_LATENCY;
-        if (chaos_io_parse_latency(fields[3], &latency_ms) != 0)
+        if (chaos_io_parse_latency(fields[3], &latency_ms, &probability) != 0)
         {
             return -1;
         }
         rule->latency_ms = latency_ms;
+        rule->probability = probability;
     }
     else if (strcmp(fields[2], "TORN") == 0)
     {
@@ -1442,6 +1740,47 @@ int chaos_io_config_parse_line(char *line, chaos_io_rule_t *rule)
     else if (strcmp(fields[2], "CORRUPT") == 0)
     {
         rule->effect = CHAOS_IO_EFFECT_CORRUPT;
+        if (chaos_io_parse_probability(fields[3], &probability) != 0)
+        {
+            return -1;
+        }
+        rule->probability = probability;
+    }
+    else if (strcmp(fields[2], "DROP") == 0)
+    {
+        rule->effect = CHAOS_IO_EFFECT_DROP;
+        if (chaos_io_parse_probability(fields[3], &probability) != 0)
+        {
+            return -1;
+        }
+        rule->probability = probability;
+    }
+    else if (strcmp(fields[2], "THROTTLE") == 0)
+    {
+        rule->effect = CHAOS_IO_EFFECT_THROTTLE;
+        /* A rate in bytes per second, and nothing else: a probability on a rate would
+         * have to mean "every other call is limited", which is not a rate. TRICKLE, the
+         * other effect that carries a byte count, says the same. The bucket keeps its
+         * tokens in 32 bits, so a rate it could not hold is rejected rather than quietly
+         * reduced. */
+        if (chaos_io_parse_rate(fields[3], &rule->rate_bps) != 0)
+        {
+            return -1;
+        }
+        rule->probability = 1.0;
+    }
+    else if (strcmp(fields[2], "FREE") == 0)
+    {
+        rule->effect = CHAOS_IO_EFFECT_FREE;
+        if (chaos_io_parse_free_bytes(fields[3], &rule->free_bytes, &probability) != 0)
+        {
+            return -1;
+        }
+        rule->probability = probability;
+    }
+    else if (strcmp(fields[2], "FULL") == 0)
+    {
+        rule->effect = CHAOS_IO_EFFECT_FULL;
         if (chaos_io_parse_probability(fields[3], &probability) != 0)
         {
             return -1;
@@ -1536,6 +1875,12 @@ int chaos_io_config_parse_buffer(char *buffer, chaos_io_rule_t *rules, size_t *r
             }
             continue;
         }
+        if (chaos_policy_has_size(&policy) && !chaos_io_operation_has_size(parsed.operation))
+        {
+            chaos_status_reject(&g_chaos_io_config_error, CHAOS_STATUS_REASON_INVALID);
+            *rule_count = 0U;
+            return -1;
+        }
         parsed.policy = policy;
         parsed.call_size = CHAOS_POLICY_NO_SIZE;
         if (count >= CHAOS_IO_MAX_RULES)
@@ -1550,6 +1895,12 @@ int chaos_io_config_parse_buffer(char *buffer, chaos_io_rule_t *rules, size_t *r
             *rule_count = 0U;
             return -1;
         }
+        if (chaos_io_rule_shadowed(rules, count, &parsed))
+        {
+            chaos_status_warn(
+                &g_chaos_io_config_error, g_chaos_io_config_error.line, CHAOS_STATUS_WARN_SHADOWED
+            );
+        }
         (void)memcpy(
             g_chaos_io_config_texts[count],
             g_chaos_io_config_error.text,
@@ -1558,7 +1909,7 @@ int chaos_io_config_parse_buffer(char *buffer, chaos_io_rule_t *rules, size_t *r
         rules[count++] = parsed;
     }
 
-    chaos_status_clear(&g_chaos_io_config_error);
+    chaos_status_clear_rejection(&g_chaos_io_config_error);
     *rule_count = count;
     return 0;
 }

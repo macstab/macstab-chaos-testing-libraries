@@ -145,6 +145,17 @@ static int g_chaos_net_hit_pool_used = 0;
 static volatile unsigned int g_chaos_net_active_config_index = 0U;
 
 /**
+ * @brief Rule-file snapshots this process has published, reported as the hits file's
+ *        `generation=` line.
+ *
+ * @details Lets a reader tell which rules a count belongs to: after a reload that changed
+ * the file the number differs, so counts that restarted are not mistaken for counts that
+ * stalled. Written only by the reload owner, between the same barriers as the active
+ * index.
+ */
+static volatile uint64_t g_chaos_net_config_generation = 0U;
+
+/**
  * @brief Change stamp of the loaded rule file, and the reload claim.
  *
  * @details Holds a chaos_net_config_hash_mtime() stamp or one of three reserved values:
@@ -190,6 +201,21 @@ static char g_chaos_net_config_texts[CHAOS_NET_MAX_RULES][CHAOS_STATUS_TEXT_MAX 
 /** @brief Hits-writer flag: set (by CAS) while one thread writes the hits file. */
 static volatile int g_chaos_net_hits_writing = 0;
 
+/**
+ * @brief pthread_atfork() prepare handler: counts this fork in the parent.
+ *
+ * @details The child reads the counter as its own ordinal among its siblings, which is
+ * what makes two children of one parent decide differently (g_chaos_net_forks). Counted
+ * here rather than in the child, because a child cannot tell how many siblings came
+ * before it. Atomic, so two threads forking at once get different ordinals rather than
+ * the same one; which of them gets which follows the order the kernel ran them in, as
+ * everything else about concurrent calls does.
+ */
+static void chaos_net_config_before_fork(void)
+{
+    (void)__sync_fetch_and_add(&g_chaos_net_forks, UINT64_C(1));
+}
+
 /** @brief Whether the pthread_atfork handler is registered (once per image). */
 static int g_chaos_net_atfork_registered = 0;
 
@@ -212,8 +238,22 @@ static long g_chaos_net_hits_file = 0L;
 /** @brief Whether this image created that file (chaos_hits_write_for()). */
 static int g_chaos_net_hits_owned = 0;
 
+/**
+ * @brief Closes on which a matched RESET rule was suppressed because the socket was shared.
+ *
+ * @details Counted per close, not per rule and not per would-be fault: ownership is settled
+ * before the rule fires (chaos_net_socket.c), so whether the probability would have let this
+ * call through is unknown here and must not be guessed. With the usual `RESET:1.0` the count
+ * is exact; below that it is an upper bound. NETWORK.md says so too.
+ */
+static volatile uint64_t g_chaos_net_reset_suppressed_shared = 0U;
+
+/** @brief The same for a socket whose ownership could not be established at all. */
+static volatile uint64_t g_chaos_net_reset_suppressed_unknown = 0U;
+
 /** @brief Scratch for formatting the hits file; used only by the hits writer. */
-static char g_chaos_net_hits_buffer[CHAOS_NET_MAX_RULES * CHAOS_HITS_LINE_MAX + 1U];
+static char
+    g_chaos_net_hits_buffer[CHAOS_NET_MAX_RULES * CHAOS_HITS_LINE_MAX + CHAOS_HITS_HEADER_MAX + 1U];
 
 /*---------------------------------------------------------------------------
  * Internal helpers
@@ -286,6 +326,7 @@ static void chaos_net_config_publish(unsigned int next_index, uint64_t observed_
     /* Release: the snapshot's contents before the index. */
     __sync_synchronize();
     g_chaos_net_active_config_index = next_index;
+    ++g_chaos_net_config_generation;
     /* The index before the claim release. */
     __sync_synchronize();
     g_chaos_net_cached_mtime = observed_mtime;
@@ -355,6 +396,22 @@ static void chaos_net_strip_comment(char *line)
     {
         *comment = '\0';
     }
+}
+
+/**
+ * @brief Whether operation @p operation reports a byte count to a rule.
+ *
+ * @details Only send and recv do, for every call decided as one of them (send, sendto,
+ * sendmsg, sendmmsg, write, writev and their recv counterparts). socket, bind, listen,
+ * connect, accept, shutdown, close and the poll family pass CHAOS_POLICY_NO_SIZE, so a
+ * `@size` gate on them could never pass and the rule would load and never fire.
+ *
+ * @param operation Operation of the rule.
+ * @return Non-zero when the operation reports a byte count.
+ */
+static int chaos_net_operation_has_size(chaos_net_operation_t operation)
+{
+    return operation == CHAOS_NET_OP_SEND || operation == CHAOS_NET_OP_RECV;
 }
 
 /**
@@ -429,6 +486,9 @@ static chaos_net_operation_t chaos_net_parse_operation(const char *text)
  */
 static int chaos_net_parse_errno_name(const char *text)
 {
+    char *end = NULL;
+    long value;
+
     if (text == NULL)
     {
         return -1;
@@ -509,7 +569,21 @@ static int chaos_net_parse_errno_name(const char *text)
     {
         return EAGAIN;
     }
-    return -1;
+    /* A number the C library has no name for, as the other libraries accept: a net rule can
+     * then reach an errno this build knows nothing about. Only the range is checked, never
+     * the meaning. */
+    value = strtol(text, &end, 10);
+    if (end == text || value <= 0L || value > 0x7fffffffL)
+    {
+        return -1;
+    }
+    /* Trailing blanks are skipped by reading, not by chaos_net_trim(), which terminates the text
+     * it is given: this function takes a const string and must not write through it. */
+    while (*end != '\0' && chaos_net_is_blank_char(*end))
+    {
+        ++end;
+    }
+    return *end == '\0' ? (int)value : -1;
 }
 
 /**
@@ -572,6 +646,53 @@ static int chaos_net_parse_latency(const char *text, unsigned int *latency_ms)
 }
 
 /**
+ * @brief Parses a LATENCY value: milliseconds, optionally followed by `@probability`.
+ *
+ * @details Without `@probability` the rule is certain (1.0), which is what `LATENCY:ms` has
+ * always meant. The milliseconds go through chaos_net_parse_latency(), which is shared with
+ * TRICKLE and stays as it is; a blank before the `@` makes it a qualifier word instead and
+ * the line is rejected, because the milliseconds then have a trailing blank.
+ *
+ * @param[in]  text         Value field; NULL returns -1.
+ * @param[out] latency_ms   Receives the delay in ms.
+ * @param[out] probability  Receives the probability, 1.0 without one; NULL returns -1.
+ * @return 0 on success; -1 on a syntax or range error.
+ */
+static int
+chaos_net_parse_latency_value(const char *text, unsigned int *latency_ms, double *probability)
+{
+    char milliseconds[16];
+    const char *at_sign;
+    size_t length;
+
+    if (text == NULL || probability == NULL)
+    {
+        return -1;
+    }
+    *probability = 1.0;
+    at_sign = strrchr(text, '@');
+    if (at_sign == NULL)
+    {
+        return chaos_net_parse_latency(text, latency_ms);
+    }
+    length = (size_t)(at_sign - text);
+    /* The `@` must follow a digit directly. A blank before it would make it a qualifier
+     * word, and the line is rejected one level up; requiring the digit keeps this
+     * function's contract exactly `ms [ "@" probability ]` either way. */
+    if (at_sign == text || at_sign[-1] < '0' || at_sign[-1] > '9' || length >= sizeof(milliseconds))
+    {
+        return -1;
+    }
+    (void)memcpy(milliseconds, text, length);
+    milliseconds[length] = '\0';
+    if (chaos_net_parse_latency(milliseconds, latency_ms) != 0)
+    {
+        return -1;
+    }
+    return chaos_net_parse_probability(at_sign + 1, probability);
+}
+
+/**
  * @brief Whether @p effect may be used with @p operation.
  *
  * @details The compatibility matrix:
@@ -579,6 +700,8 @@ static int chaos_net_parse_latency(const char *text, unsigned int *latency_ms)
  *   - CORRUPT, TRICKLE, DUP: RECV only; they act on received bytes.
  *   - TIMEOUT: POLL only; it fakes a wait that found nothing ready.
  *   - RESET: CLOSE only; it turns the close into an abortive one.
+ *   - DROP: SEND only; it reports a send that did not happen. The socket has to be a
+ *     datagram one, which only the call can tell (chaos_net_drops()).
  *
  * @param operation  The rule's operation.
  * @param effect     The rule's effect.
@@ -607,9 +730,26 @@ static int chaos_net_effect_allowed(chaos_net_operation_t operation, chaos_net_e
     {
         return operation == CHAOS_NET_OP_POLL;
     }
+    if (effect == CHAOS_NET_EFFECT_THROTTLE)
+    {
+        /* The send side only: a receive is already allowed to return less than asked for,
+         * and TRICKLE is the chunking effect for that direction. */
+        return operation == CHAOS_NET_OP_SEND;
+    }
     if (effect == CHAOS_NET_EFFECT_RESET)
     {
         return operation == CHAOS_NET_OP_CLOSE;
+    }
+    if (effect == CHAOS_NET_EFFECT_REDIRECT)
+    {
+        /* The destination is an argument of `connect` and of nothing else: `bind` names a
+         * local address, and a datagram send names its destination per call, which a rule
+         * cannot rewrite without also rewriting what the caller believes it sent. */
+        return operation == CHAOS_NET_OP_CONNECT;
+    }
+    if (effect == CHAOS_NET_EFFECT_DROP)
+    {
+        return operation == CHAOS_NET_OP_SEND;
     }
     return 0;
 }
@@ -838,10 +978,95 @@ static int chaos_net_config_read_file(size_t *size_out, uint64_t expected_stamp)
 }
 
 /**
+ * @brief Parses a REDIRECT address: `ADDRESS:PORT`, or `[ADDRESS]:PORT` for IPv6.
+ *
+ * @details Parsed by the selector parser itself, with a scheme put in front, so that an
+ * address and a port are read and bounded in exactly one place. What a selector allows and
+ * a target does not: a wildcard host, a `/N` prefix and port 0 -- a redirect needs one
+ * address and a port `connect` can use. The family follows the notation, so `[::1]:443` is
+ * IPv6 and `127.0.0.1:443` IPv4.
+ *
+ * @return 0 with @p target written, or -1.
+ */
+static int chaos_net_parse_redirect_address(const char *text, chaos_net_redirect_t *target)
+{
+    char scheme[CHAOS_NET_MAX_TEXT];
+    chaos_net_endpoint_t endpoint;
+    const int ipv6 = *text == '[';
+
+    if ((size_t)snprintf(scheme, sizeof(scheme), "%s%s", ipv6 ? "tcp6://" : "tcp4://", text) >=
+        sizeof(scheme))
+    {
+        return -1;
+    }
+    if (!chaos_net_endpoint_parse_selector(scheme, &endpoint) || endpoint.wildcard_host ||
+        endpoint.port == 0U || endpoint.prefix_len != (ipv6 ? 128U : 32U))
+    {
+        return -1;
+    }
+    (void)memset(target, 0, sizeof(*target));
+    target->family = ipv6 ? AF_INET6 : AF_INET;
+    target->port = endpoint.port;
+    if (ipv6)
+    {
+        target->value.ipv6 = endpoint.value.ipv6;
+    }
+    else
+    {
+        target->value.ipv4 = endpoint.value.ipv4;
+    }
+    return 0;
+}
+
+/**
+ * @brief Parses a REDIRECT value: an address with a port, optionally `@probability`.
+ *
+ * @details The probability is written after the address as LATENCY writes it after the
+ * milliseconds, and is 1.0 without one. No address of either family contains an `@`, so
+ * the last one in the value is the separator.
+ *
+ * @return 0 with @p target and @p probability written, or -1.
+ */
+static int
+chaos_net_parse_redirect(const char *text, chaos_net_redirect_t *target, double *probability)
+{
+    const char *at;
+
+    if (text == NULL || target == NULL || probability == NULL || *text == '\0')
+    {
+        return -1;
+    }
+    *probability = 1.0;
+    at = strrchr(text, '@');
+    if (at == NULL)
+    {
+        return chaos_net_parse_redirect_address(text, target);
+    }
+    {
+        char address[CHAOS_NET_MAX_TEXT];
+
+        if ((size_t)(at - text) >= sizeof(address) ||
+            chaos_net_parse_probability(at + 1, probability) != 0)
+        {
+            return -1;
+        }
+        (void)memcpy(address, text, (size_t)(at - text));
+        address[at - text] = '\0';
+        return chaos_net_parse_redirect_address(address, target);
+    }
+}
+
+/**
  * @brief Splits a rule line into selector, operation, effect and value.
  *
  * @details Splits right to left at the last three `:` so that colons inside the selector
  * (`tcp6://[::1]:443`, the port separator) stay in it. Each field is trimmed.
+ *
+ * REDIRECT is the one effect whose **value** carries a colon as well (`ADDRESS:PORT`), so
+ * a line that holds the keyword `:REDIRECT:` is split there instead: everything after it
+ * is the value, and the part in front is split from the right once for the operation. A
+ * right-to-left split would read the port as the value and the address as the effect, and
+ * reject the line.
  *
  * @param line            Writable NUL-terminated rule line; modified in place.
  * @param selector_text   Output: selector field.
@@ -864,6 +1089,26 @@ static int chaos_net_split_rule_fields(
         return 0;
     }
 
+    value_sep = strstr(line, ":REDIRECT:");
+    if (value_sep != NULL)
+    {
+        char *keyword = value_sep + 1;
+        char *target = value_sep + sizeof(":REDIRECT:") - 1U;
+
+        *value_sep = '\0';
+        target[-1] = '\0';
+        operation_sep = strrchr(line, ':');
+        if (operation_sep == NULL)
+        {
+            return 0;
+        }
+        *operation_sep++ = '\0';
+        *selector_text = chaos_net_trim(line);
+        *operation_text = chaos_net_trim(operation_sep);
+        *effect_text = keyword;
+        *value_text = chaos_net_trim(target);
+        return 1;
+    }
     value_sep = strrchr(line, ':');
     if (value_sep == NULL)
     {
@@ -913,7 +1158,7 @@ void chaos_net_config_init(void)
     if (!g_chaos_net_atfork_registered)
     {
         g_chaos_net_atfork_registered = 1;
-        (void)pthread_atfork(NULL, NULL, chaos_net_config_after_fork);
+        (void)pthread_atfork(chaos_net_config_before_fork, NULL, chaos_net_config_after_fork);
     }
     /* Resolve the vDSO clock now, not first inside a wrapper a signal handler re-entered. */
     (void)chaos_clock_now_ns();
@@ -997,7 +1242,7 @@ int chaos_net_config_parse_line(char *line, chaos_net_rule_t *rule)
     else if (strcmp(effect_text, "LATENCY") == 0)
     {
         rule->effect = CHAOS_NET_EFFECT_LATENCY;
-        if (chaos_net_parse_latency(value_text, &rule->latency_ms) != 0)
+        if (chaos_net_parse_latency_value(value_text, &rule->latency_ms, &rule->probability) != 0)
         {
             return -1;
         }
@@ -1028,6 +1273,22 @@ int chaos_net_config_parse_line(char *line, chaos_net_rule_t *rule)
             return -1;
         }
     }
+    else if (strcmp(effect_text, "THROTTLE") == 0)
+    {
+        /* A rate in bytes per second, and nothing else: a probability on a rate would have
+         * to mean "every other call is limited", which is not a rate -- TRICKLE, the other
+         * effect that carries a byte count, says the same. The upper bound is what the
+         * token bucket can hold (chaos_bucket.h). */
+        unsigned int rate = 0U;
+
+        rule->effect = CHAOS_NET_EFFECT_THROTTLE;
+        rule->probability = 1.0;
+        if (chaos_net_parse_latency(value_text, &rate) != 0 || rate == 0U)
+        {
+            return -1;
+        }
+        rule->rate_bps = rate;
+    }
     else if (strcmp(effect_text, "DUP") == 0)
     {
         rule->effect = CHAOS_NET_EFFECT_DUP;
@@ -1039,6 +1300,27 @@ int chaos_net_config_parse_line(char *line, chaos_net_rule_t *rule)
     else if (strcmp(effect_text, "RESET") == 0)
     {
         rule->effect = CHAOS_NET_EFFECT_RESET;
+        if (chaos_net_parse_probability(value_text, &rule->probability) != 0)
+        {
+            return -1;
+        }
+    }
+    else if (strcmp(effect_text, "REDIRECT") == 0)
+    {
+        rule->effect = CHAOS_NET_EFFECT_REDIRECT;
+        /* A UNIX selector matches a UNIX socket, and an address with a port cannot be
+         * written over a sockaddr_un: such a rule could never fire, which is a rejection
+         * here rather than a silence at run time. A `*` selector is kept -- it matches the
+         * IP sockets the target fits as well. */
+        if (rule->selector.kind == CHAOS_NET_ENDPOINT_UNIX ||
+            chaos_net_parse_redirect(value_text, &rule->redirect, &rule->probability) != 0)
+        {
+            return -1;
+        }
+    }
+    else if (strcmp(effect_text, "DROP") == 0)
+    {
+        rule->effect = CHAOS_NET_EFFECT_DROP;
         if (chaos_net_parse_probability(value_text, &rule->probability) != 0)
         {
             return -1;
@@ -1063,6 +1345,40 @@ int chaos_net_config_parse_line(char *line, chaos_net_rule_t *rule)
 #ifndef CHAOS_NET_RULE_SUPPORTED
 #define CHAOS_NET_RULE_SUPPORTED(rule) 1
 #endif
+
+/**
+ * @brief Whether rule @p later can never win against one already accepted.
+ *
+ * @details Selection is rank, then the longer selector text, then the earlier line. Two
+ * rules with the same selector, operation and effect tie on everything but the line, so the earlier
+ * one always wins and the later can never fire. It is a valid rule, so it is kept and the
+ * status file warns about it instead of the file being rejected. The selector holds no
+ * pointers and every rule is zeroed before it is filled, so comparing its bytes is exact.
+ *
+ * @param rules Rules accepted so far.
+ * @param count How many.
+ * @param later The rule about to be accepted.
+ * @return Non-zero when an earlier rule shadows @p later.
+ */
+static int
+chaos_net_rule_shadowed(const chaos_net_rule_t *rules, size_t count, const chaos_net_rule_t *later)
+{
+    size_t index;
+
+    for (index = 0U; index < count; ++index)
+    {
+        /* Not the effect: the selection does not look at it (see chaos_io_config.c), and
+         * two rules with the same operation and the same selector tie on every
+         * specificity stage down to the line, so the later one is dead whatever it
+         * carries. */
+        if (rules[index].operation == later->operation &&
+            memcmp(&rules[index].selector, &later->selector, sizeof(later->selector)) == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
 
 /**
  * @brief Parses a whole rule file (contract in chaos_net_config.h).
@@ -1127,6 +1443,12 @@ int chaos_net_config_parse_buffer(char *buffer, chaos_net_rule_t *rules, size_t 
             }
             continue;
         }
+        if (chaos_policy_has_size(&policy) && !chaos_net_operation_has_size(parsed.operation))
+        {
+            chaos_status_reject(&g_chaos_net_config_error, CHAOS_STATUS_REASON_INVALID);
+            *rule_count = 0U;
+            return -1;
+        }
         parsed.policy = policy;
         parsed.call_size = CHAOS_POLICY_NO_SIZE;
         if (count >= CHAOS_NET_MAX_RULES)
@@ -1146,10 +1468,16 @@ int chaos_net_config_parse_buffer(char *buffer, chaos_net_rule_t *rules, size_t 
             g_chaos_net_config_error.text,
             sizeof(g_chaos_net_config_texts[count])
         );
+        if (chaos_net_rule_shadowed(rules, count, &parsed))
+        {
+            chaos_status_warn(
+                &g_chaos_net_config_error, g_chaos_net_config_error.line, CHAOS_STATUS_WARN_SHADOWED
+            );
+        }
         rules[count++] = parsed;
     }
 
-    chaos_status_clear(&g_chaos_net_config_error);
+    chaos_status_clear_rejection(&g_chaos_net_config_error);
     *rule_count = count;
     return 0;
 }
@@ -1163,17 +1491,52 @@ const chaos_status_error_t *chaos_net_config_last_error(void)
 typedef struct chaos_net_best_rule
 {
     unsigned int rank;
+    unsigned int prefix;
     size_t length;
     int found;
 } chaos_net_best_rule_t;
 
 /**
  * @brief Updates @p rule and @p best with any rule for @p operation that matches
- *        @p endpoint more specifically (higher rank, then longer selector) than @p best.
+ *        @p endpoint more specifically (higher rank, then longer address prefix, then
+ *        longer selector text) than @p best.
  *
  * @details Strict comparisons: on a full tie the rule found first is kept. That makes the
  * first endpoint passed by chaos_net_config_match_either_loaded() win ties.
+ *
+ * The prefix stage is what orders `tcp4://10.1.0.0/16:5432` above `tcp4://10.0.0.0/8:5432`
+ * for an address both contain. Comparing prefixes of different families never arises: a
+ * rule only reaches this point with a kind the endpoint's own kind allows, and the one
+ * cross-family case (a dual-stack listener) is reserved to wildcard hosts, whose prefix is
+ * 0 on both sides. Selector text alone would order `10.0.0.0/8` above `10.1.0.0/16`,
+ * because it is one character longer.
  */
+/**
+ * @brief Whether a rule that matched at @p rank beats @p best.
+ *
+ * @details The order is rank, then address prefix length, then selector text length; each
+ * stage decides only when the one before it ties, and a full tie keeps the earlier rule.
+ *
+ * @param selector  Selector of the candidate rule.
+ * @param rank      Rank it matched the endpoint at.
+ * @param best      Current best.
+ * @return Non-zero when the candidate is more specific.
+ */
+static int chaos_net_config_is_more_specific(
+    const chaos_net_endpoint_t *selector, unsigned int rank, const chaos_net_best_rule_t *best
+)
+{
+    if (rank != best->rank)
+    {
+        return rank > best->rank;
+    }
+    if (selector->prefix_len != best->prefix)
+    {
+        return selector->prefix_len > best->prefix;
+    }
+    return selector->selector_len > best->length;
+}
+
 static void chaos_net_config_select_better(
     const chaos_net_rule_t *rules,
     size_t rule_count,
@@ -1197,12 +1560,11 @@ static void chaos_net_config_select_better(
         {
             continue;
         }
-        /* Higher rank wins; equal rank, the longer (more specific) selector text. */
-        if (!best->found || rank > best->rank ||
-            (rank == best->rank && rules[index].selector.selector_len > best->length))
+        if (!best->found || chaos_net_config_is_more_specific(&rules[index].selector, rank, best))
         {
             *rule = rules[index];
             best->rank = rank;
+            best->prefix = rules[index].selector.prefix_len;
             best->length = rules[index].selector.selector_len;
             best->found = 1;
         }
@@ -1217,7 +1579,7 @@ int chaos_net_config_select_endpoint_rule(
     chaos_net_rule_t *rule
 )
 {
-    chaos_net_best_rule_t best = {0U, 0U, 0};
+    chaos_net_best_rule_t best = {0U, 0U, 0U, 0};
 
     if (rules == NULL || endpoint == NULL || rule == NULL)
     {
@@ -1243,6 +1605,38 @@ static void chaos_net_config_reject_file(chaos_net_config_state_t *state, const 
 }
 
 /**
+ * @brief Formats this library's hits-file header: the generation, then the suppression
+ *        counters.
+ *
+ * @details The suppression counters are written on every report, also as zeros: a reader
+ * must be able to tell "no suppression" from "this library does not report it", and only a
+ * present line does that.
+ *
+ * @param out  Buffer of at least CHAOS_HITS_HEADER_MAX bytes.
+ * @param size Its size.
+ * @return @p out, or NULL when it could not be formatted (then no header is written).
+ */
+static const char *chaos_net_hits_header(char *out, size_t size)
+{
+    const size_t used = chaos_hits_header_generation(out, size, g_chaos_net_config_generation);
+    int rc;
+
+    if (used == 0U)
+    {
+        return NULL;
+    }
+    rc = snprintf(
+        out + used,
+        size - used,
+        "suppressed.shared=%llu\nsuppressed.unknown=%llu\n",
+        (unsigned long long)g_chaos_net_reset_suppressed_shared,
+        (unsigned long long)g_chaos_net_reset_suppressed_unknown
+    );
+
+    return rc > 0 && (size_t)rc < size - used ? out : NULL;
+}
+
+/**
  * @brief Writes this process's hit counts after a hit on @p slot (NULL: forced, e.g. at
  *        exit or after an idle interval).
  *
@@ -1253,12 +1647,13 @@ static void chaos_net_config_reject_file(chaos_net_config_state_t *state, const 
  * busy leaves `pending` set, and the writer loops until nothing is pending. Only the pid
  * the counts belong to writes, which keeps a vfork() child, sharing this memory, out.
  */
-static void chaos_net_config_report_hits(chaos_hit_slot_t *slot)
+static void chaos_net_config_report_hits_counted(int counted)
 {
     chaos_net_config_state_t *state;
+    char header[CHAOS_HITS_HEADER_MAX];
     const uint64_t now = chaos_hits_now_ms();
 
-    if (slot != NULL)
+    if (counted)
     {
         ++g_chaos_net_hits_total;
         if (g_chaos_net_hits_pending == 0)
@@ -1302,6 +1697,7 @@ static void chaos_net_config_report_hits(chaos_hit_slot_t *slot)
                 state->hits,
                 (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) state->text,
                 state->rule_count,
+                chaos_net_hits_header(header, sizeof(header)),
                 g_chaos_net_hits_buffer,
                 sizeof(g_chaos_net_hits_buffer)
             );
@@ -1311,6 +1707,31 @@ static void chaos_net_config_report_hits(chaos_hit_slot_t *slot)
         __sync_synchronize();
         /* A hit that found the writer busy after the last check is written now. */
     } while (g_chaos_net_hits_pending != 0);
+}
+
+/** @brief The hit-slot report hook; a NULL slot forces whatever is pending. */
+static void chaos_net_config_report_hits(chaos_hit_slot_t *slot)
+{
+    chaos_net_config_report_hits_counted(slot != NULL);
+}
+
+/**
+ * @copydoc chaos_net_reset_suppressed
+ */
+void chaos_net_reset_suppressed(chaos_net_ownership_t ownership)
+{
+    if (ownership == CHAOS_NET_OWNER_SHARED)
+    {
+        (void)__sync_fetch_and_add(&g_chaos_net_reset_suppressed_shared, 1U);
+    }
+    else
+    {
+        (void)__sync_fetch_and_add(&g_chaos_net_reset_suppressed_unknown, 1U);
+    }
+    /* Reported like a hit, on the same cadence: a rule that only ever gets suppressed
+     * records no hit, so without this the count would reach the test at process exit and
+     * the suppression would be silent for as long as the test runs. */
+    chaos_net_config_report_hits_counted(1);
 }
 
 /**
@@ -1335,14 +1756,19 @@ static void chaos_net_config_after_fork(void)
     CHAOS_STORE_IF_CHANGED(g_chaos_net_hits_pending, 0);
     CHAOS_STORE_IF_CHANGED(g_chaos_net_hits_total, 0U);
     CHAOS_STORE_IF_CHANGED(g_chaos_net_hits_last_ms, 0U);
+    /* Suppressions are the parent's, like its hits: the child reports only its own. */
+    CHAOS_STORE_IF_CHANGED(g_chaos_net_reset_suppressed_shared, 0U);
+    CHAOS_STORE_IF_CHANGED(g_chaos_net_reset_suppressed_unknown, 0U);
     g_chaos_net_hits_pid = (uint64_t)getpid();
     /* The child's own pid, without probing /tmp: a stale file of an earlier process with
      * this pid is caught by the exclusive first write, which then picks another suffix. */
     g_chaos_net_hits_file = (long)g_chaos_net_hits_pid;
     CHAOS_STORE_IF_CHANGED(g_chaos_net_hits_owned, 0);
-    /* The child must not draw the parent's numbers (pre-fork workers would all decide
-     * alike): its PRNG reseeds from its own thread id on the next draw. */
-    CHAOS_STORE_IF_CHANGED(g_chaos_net_tls_prng_state, 0U);
+    /* The child decides differently from the parent and from its siblings without the
+     * rules' keys being rewritten: one global instead of every snapshot page. Mixed, not
+     * incremented, so sibling lineages are unrelated rather than adjacent. */
+    g_chaos_net_lineage = chaos_net_prng_mix(g_chaos_net_lineage + g_chaos_net_forks);
+    g_chaos_net_forks = 0U;
     if (g_chaos_net_hit_pool_used)
     {
         chaos_hits_pool_after_fork(
@@ -1400,6 +1826,11 @@ static void chaos_net_config_attach_hits(chaos_net_config_state_t *next_state)
         next_state->rules[index].hit = next_state->hits[index];
         next_state->rules[index].hit_generation =
             next_state->hits[index] != NULL ? next_state->hits[index]->generation : 0U;
+        /* From the text, so a rule keeps its decisions across a reload that keeps it and
+         * the rule that reuses its slot does not inherit them. */
+        next_state->rules[index].key = chaos_net_prng_mix(
+            g_chaos_net_process_seed ^ chaos_net_rule_hash(next_state->text[index])
+        );
     }
 }
 
@@ -1424,7 +1855,11 @@ static void chaos_net_config_report(uint64_t observed_mtime, const chaos_net_con
     }
     else
     {
-        chaos_status_write(CHAOS_NET_STATUS_PATH, CHAOS_STATUS_OK, state->rule_count, NULL);
+        /* The record is passed on success too: it carries the warnings, and its
+         * rejection fields were cleared when the parse succeeded. */
+        chaos_status_write(
+            CHAOS_NET_STATUS_PATH, CHAOS_STATUS_OK, state->rule_count, &g_chaos_net_config_error
+        );
     }
 }
 
@@ -1645,7 +2080,7 @@ int chaos_net_config_match_final_loaded(
 {
     const chaos_net_config_state_t *state = chaos_net_config_active_state();
     const uint64_t sequence = chaos_snapshot_read_begin(&state->sequence);
-    chaos_net_best_rule_t best = {0U, 0U, 0};
+    chaos_net_best_rule_t best = {0U, 0U, 0U, 0};
     size_t index;
 
     if (state->parse_ok == 0)
@@ -1665,8 +2100,7 @@ int chaos_net_config_match_final_loaded(
         const unsigned int rank = chaos_net_endpoint_selector_rank(&state->rules[index].selector);
 
         if (state->rules[index].operation == operation &&
-            (rank > best.rank ||
-             (rank == best.rank && state->rules[index].selector.selector_len > best.length)))
+            chaos_net_config_is_more_specific(&state->rules[index].selector, rank, &best))
         {
             return 0;
         }
@@ -1683,7 +2117,7 @@ int chaos_net_config_match_either_loaded(
 {
     const chaos_net_config_state_t *state = chaos_net_config_active_state();
     const uint64_t sequence = chaos_snapshot_read_begin(&state->sequence);
-    chaos_net_best_rule_t best = {0U, 0U, 0};
+    chaos_net_best_rule_t best = {0U, 0U, 0U, 0};
 
     if (state->parse_ok == 0)
     {

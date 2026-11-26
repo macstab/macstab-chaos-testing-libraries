@@ -69,6 +69,10 @@ chaos_io_pwritev_fn g_chaos_io_real_pwritev = NULL;
 chaos_io_ftruncate_fn g_chaos_io_real_ftruncate = NULL;
 chaos_io_unlinkat_fn g_chaos_io_real_unlinkat = NULL;
 chaos_io_truncate_fn g_chaos_io_real_truncate = NULL;
+chaos_io_statfs_fn g_chaos_io_real_statfs = NULL;
+chaos_io_fstatfs_fn g_chaos_io_real_fstatfs = NULL;
+chaos_io_statvfs_fn g_chaos_io_real_statvfs = NULL;
+chaos_io_fstatvfs_fn g_chaos_io_real_fstatvfs = NULL;
 chaos_io_fopen_fn g_chaos_io_real_fopen = NULL;
 chaos_io_fclose_fn g_chaos_io_real_fclose = NULL;
 chaos_io_fread_fn g_chaos_io_real_fread = NULL;
@@ -99,11 +103,16 @@ chaos_io_copy_file_range_fn g_chaos_io_real_copy_file_range = NULL;
 /* --- Thread-local guard and PRNG state ------------------------------------------- */
 
 __thread int g_chaos_io_tls_guard = 0;
-__thread uint64_t g_chaos_io_tls_prng_state = 0U;
+/** @copydoc g_chaos_io_lineage */
+uint64_t g_chaos_io_lineage = 0U;
+
+/** @copydoc g_chaos_io_forks */
+uint64_t g_chaos_io_forks = 0U;
 
 /**
- * @brief Process-wide entropy base; replaced in the constructor by 64 bits from
- *        `/dev/urandom` (or a pid-derived value). The initialiser is a non-zero placeholder.
+ * @brief Process-wide entropy base; replaced in the constructor by `CHAOS_SEED`, or by 64
+ *        bits from `/dev/urandom` (or a pid-derived value). The initialiser is a non-zero
+ *        placeholder.
  */
 uint64_t g_chaos_io_process_seed = UINT64_C(0x2545f4914f6cdd1d);
 
@@ -231,6 +240,47 @@ static uint64_t chaos_io_read_seed_material(void)
     return seed;
 }
 
+/**
+ * @brief The process seed: `CHAOS_SEED` from the environment, else 64 random bits.
+ *
+ * @details `CHAOS_SEED=<decimal u64>` makes every decision of this container reproducible:
+ * a rule's draws follow from the seed, the rule's text and the number of the evaluation,
+ * nothing else. Without it the seed is random, which is what a chaos test wants when it is
+ * not trying to reproduce one particular run.
+ *
+ * `getenv()` is safe here and nowhere else in the library: this runs in the ELF
+ * constructor, before `main`, single-threaded, before the application can call `setenv`.
+ * A malformed or out-of-range value is ignored rather than rejected -- the seed decides
+ * which faults fire, not whether the rules are valid, and a rule file that loads is worth
+ * more to a test than a refusal over an environment variable.
+ *
+ * @return The seed.
+ */
+static uint64_t chaos_io_seed(void)
+{
+    const char *text = getenv("CHAOS_SEED");
+    char *end = NULL;
+    unsigned long long value;
+
+    if (text == NULL || *text == '\0')
+    {
+        return chaos_io_read_seed_material();
+    }
+    /* Digits only: strtoull() accepts a sign and blanks, and "-1" would wrap silently
+     * into UINT64_MAX -- a seed the user did not ask for. */
+    if (text[0] < '0' || text[0] > '9')
+    {
+        return chaos_io_read_seed_material();
+    }
+    errno = 0;
+    value = strtoull(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0')
+    {
+        return chaos_io_read_seed_material();
+    }
+    return (uint64_t)value;
+}
+
 /* --- Shared wrapper helper ------------------------------------------------------- */
 
 /**
@@ -328,6 +378,10 @@ static void chaos_io_resolve_all_symbols(void)
     chaos_io_resolve_symbol(&g_chaos_io_real_ftruncate, "ftruncate");
     chaos_io_resolve_symbol(&g_chaos_io_real_unlinkat, "unlinkat");
     chaos_io_resolve_symbol(&g_chaos_io_real_truncate, "truncate");
+    chaos_io_resolve_symbol(&g_chaos_io_real_statfs, "statfs");
+    chaos_io_resolve_symbol(&g_chaos_io_real_fstatfs, "fstatfs");
+    chaos_io_resolve_symbol(&g_chaos_io_real_statvfs, "statvfs");
+    chaos_io_resolve_symbol(&g_chaos_io_real_fstatvfs, "fstatvfs");
     chaos_io_resolve_symbol(&g_chaos_io_real_fopen, "fopen");
     chaos_io_resolve_symbol(&g_chaos_io_real_freopen, "freopen");
     chaos_io_resolve_symbol(&g_chaos_io_real_fclose, "fclose");
@@ -383,8 +437,7 @@ static void chaos_io_init(void)
 {
     chaos_io_ensure_symbols();
 
-    g_chaos_io_process_seed = chaos_io_read_seed_material();
-    chaos_io_prng_seed_thread(g_chaos_io_process_seed);
+    g_chaos_io_process_seed = chaos_io_seed();
     chaos_io_config_init();
     /* Load the rules now so a bad rule file is reported at start-up. */
     (void)chaos_io_config_prepare();

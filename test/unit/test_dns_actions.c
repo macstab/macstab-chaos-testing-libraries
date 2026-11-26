@@ -26,7 +26,8 @@
  * - `CHAOS_DNS_DEFINE_TEST_GLOBALS()` defines the real-function pointers and TLS state the
  *   source links against; `reset_actions_state()` installs `chaos_dns_test_freeaddrinfo()` as
  *   the real freeaddrinfo, which frees `make_result_node()` lists and counts every node.
- * - The PRNG state `g_chaos_dns_tls_prng_state` is set directly where order matters.
+ * - `uint64_t g_chaos_dns_lineage` = 0, the lineage of the process that
+ *   loaded the library; a forked child mixes it forward so it decides on its own.
  *
  * Out of scope: the interposed entry points (`test_chaos_dns.c`), rule parsing and matching
  * (`test_dns_config.c`), and symbol resolution / constructor behaviour (`test_dns_runtime.c`).
@@ -165,8 +166,6 @@ static void test_probability_and_gai_helpers(void)
     assert(chaos_dns_probability_hit_sample(1.0, 0U));
     assert(chaos_dns_probability_hit_sample(0.5, 0U));
     assert(!chaos_dns_probability_hit_sample(0.5, 0xffffffffU));
-    assert(!chaos_dns_probability_hit(0.0));
-    assert(chaos_dns_probability_hit(1.0));
 
     (void)memset(&rule, 0, sizeof(rule));
     rule.effect = CHAOS_DNS_EFFECT_GAI;
@@ -271,29 +270,33 @@ static void test_filter_and_limit_helpers(void)
 static void test_shuffle_helper(void)
 {
     struct addrinfo *head;
+    /* The permutation follows from this rule's draws; a zeroed rule has no slot, so it is
+     * evaluation 0 and the same permutation in every run. */
+    chaos_dns_rule_t shuffle_rule;
 
     reset_actions_state();
+    (void)memset(&shuffle_rule, 0, sizeof(shuffle_rule));
+    chaos_dns_rule_draw_begin(&shuffle_rule);
     head = make_result_node(AF_INET, "one");
     head->ai_next = make_result_node(AF_INET6, "two");
     head->ai_next->ai_next = make_result_node(AF_INET, "three");
-    g_chaos_dns_tls_prng_state = 1U;
-    chaos_dns_shuffle_result_list(&head);
+    chaos_dns_shuffle_result_list(&shuffle_rule, &head);
     assert(chaos_dns_result_count(head) == 3U);
     chaos_dns_test_freeaddrinfo(head);
 
     head = make_result_node(AF_INET, "single");
-    chaos_dns_shuffle_result_list(&head);
+    chaos_dns_shuffle_result_list(&shuffle_rule, &head);
     assert(chaos_dns_result_count(head) == 1U);
     chaos_dns_test_freeaddrinfo(head);
 
-    chaos_dns_shuffle_result_list(NULL);
+    chaos_dns_shuffle_result_list(&shuffle_rule, NULL);
     head = NULL;
-    chaos_dns_shuffle_result_list(&head);
+    chaos_dns_shuffle_result_list(&shuffle_rule, &head);
 
     g_force_calloc_fail = 1;
     head = make_result_node(AF_INET, "a");
     head->ai_next = make_result_node(AF_INET6, "b");
-    chaos_dns_shuffle_result_list(&head);
+    chaos_dns_shuffle_result_list(&shuffle_rule, &head);
     assert(chaos_dns_result_count(head) == 2U);
     chaos_dns_test_freeaddrinfo(head);
 
@@ -411,9 +414,16 @@ static void test_canonname_and_owned_lists(void)
     assert(head->ai_canonname != NULL && strcmp(head->ai_canonname, "canon") == 0);
     assert(head->ai_next->ai_canonname == NULL);
 
+    /* A different key per round, so the canonical name survives every permutation and not
+     * just the one a fixed rule happens to produce. */
     for (index = 0; index < 20; ++index)
     {
-        chaos_dns_shuffle_result_list(&head);
+        chaos_dns_rule_t shuffle_rule;
+
+        (void)memset(&shuffle_rule, 0, sizeof(shuffle_rule));
+        shuffle_rule.key = (uint64_t)index;
+        chaos_dns_rule_draw_begin(&shuffle_rule);
+        chaos_dns_shuffle_result_list(&shuffle_rule, &head);
         assert(head->ai_canonname != NULL && head->ai_next->ai_canonname == NULL);
     }
     chaos_dns_test_freeaddrinfo(head);
@@ -499,8 +509,184 @@ static void test_filter_and_limit_edges(void)
     chaos_dns_rule_apply_latency(NULL);
 }
 
+/**
+ * @brief Proves a sample follows from the rule and the number of the evaluation, and from
+ *        nothing else.
+ *
+ * @details This is what makes a fault reproducible: the same rule at the same evaluation
+ * number gives the same sample; the next evaluation, a rule of different text and a forked
+ * child's lineage each give an unrelated one; and the draws within one evaluation differ
+ * from each other.
+ */
+/**
+ * @brief Proves every swap of a SHUFFLE takes its own draw, not one shared by all of them.
+ *
+ * @details A Fisher-Yates sweep over N addresses needs N-1 samples. Reusing one sample for
+ * all of them still permutes the list, so a test that only counts the entries afterwards
+ * would pass -- the order has to be checked. The permutation is computed here from the
+ * per-swap draws, and the test first proves that the shared-draw variant would differ, so
+ * the assertion cannot be vacuous.
+ */
+static void test_shuffle_takes_one_draw_per_swap(void)
+{
+    chaos_dns_rule_t rule;
+    struct addrinfo *head;
+    size_t per_swap[3];
+    size_t shared[3];
+    size_t index;
+    size_t swap_index;
+    size_t tmp;
+
+    (void)memset(&rule, 0, sizeof(rule));
+    for (rule.key = 1U; rule.key < 256U; ++rule.key)
+    {
+        chaos_dns_rule_draw_begin(&rule);
+        for (index = 0U; index < 3U; ++index)
+        {
+            per_swap[index] = index;
+            shared[index] = index;
+        }
+        /* The real sweep: draw FIRST_EFFECT + k for the kth swap. */
+        for (index = 2U; index > 0U; --index)
+        {
+            const uint64_t draw = CHAOS_DNS_DRAW_FIRST_EFFECT + (uint64_t)(2U - index);
+
+            swap_index = (size_t)(chaos_dns_rule_draw(&rule, draw) % (uint32_t)(index + 1U));
+            tmp = per_swap[index];
+            per_swap[index] = per_swap[swap_index];
+            per_swap[swap_index] = tmp;
+        }
+        /* The mutant: one draw for every swap. */
+        for (index = 2U; index > 0U; --index)
+        {
+            swap_index = (size_t)(chaos_dns_rule_draw(&rule, CHAOS_DNS_DRAW_FIRST_EFFECT) %
+                                  (uint32_t)(index + 1U));
+            tmp = shared[index];
+            shared[index] = shared[swap_index];
+            shared[swap_index] = tmp;
+        }
+        if (per_swap[0] != shared[0] || per_swap[1] != shared[1] || per_swap[2] != shared[2])
+        {
+            break;
+        }
+    }
+    assert(rule.key < 256U);
+
+    head = make_result_node(AF_INET, "zero");
+    head->ai_next = make_result_node(AF_INET6, "one");
+    head->ai_next->ai_next = make_result_node(AF_INET, "two");
+    chaos_dns_rule_draw_begin(&rule);
+    chaos_dns_shuffle_result_list(&rule, &head);
+    assert(chaos_dns_result_count(head) == 3U);
+    /* The family of each node identifies it: INET, INET6, INET in list order. */
+    {
+        const struct addrinfo *node = head;
+        static const int family_of[3] = {AF_INET, AF_INET6, AF_INET};
+
+        for (index = 0U; index < 3U; ++index)
+        {
+            assert(node != NULL);
+            assert(node->ai_family == family_of[per_swap[index]]);
+            node = node->ai_next;
+        }
+    }
+    chaos_dns_test_freeaddrinfo(head);
+}
+
+static void test_draws_are_reproducible(void)
+{
+    chaos_dns_rule_t rule;
+    chaos_hit_slot_t slot;
+    uint32_t first;
+
+    (void)memset(&rule, 0, sizeof(rule));
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.hit = &slot;
+    rule.key = chaos_dns_prng_mix(g_chaos_dns_process_seed ^ chaos_dns_rule_hash("a"));
+
+    chaos_dns_rule_draw_begin(&rule);
+    assert(slot.evaluations == 1U);
+    first = chaos_dns_rule_draw(&rule, CHAOS_DNS_DRAW_PROBABILITY);
+    assert(chaos_dns_rule_draw(&rule, CHAOS_DNS_DRAW_PROBABILITY) == first);
+    assert(chaos_dns_rule_draw(&rule, CHAOS_DNS_DRAW_FIRST_EFFECT) != first);
+
+    chaos_dns_rule_draw_begin(&rule);
+    assert(slot.evaluations == 2U);
+    assert(chaos_dns_rule_draw(&rule, CHAOS_DNS_DRAW_PROBABILITY) != first);
+
+    /* A rule whose text differs is a different rule, even in the same slot. */
+    rule.key = chaos_dns_prng_mix(g_chaos_dns_process_seed ^ chaos_dns_rule_hash("b"));
+    slot.evaluations = 0U;
+    chaos_dns_rule_draw_begin(&rule);
+    assert(chaos_dns_rule_draw(&rule, CHAOS_DNS_DRAW_PROBABILITY) != first);
+
+    /* Same rule, same evaluation, different lineage: a forked child decides on its own. */
+    rule.key = chaos_dns_prng_mix(g_chaos_dns_process_seed ^ chaos_dns_rule_hash("a"));
+    slot.evaluations = 0U;
+    g_chaos_dns_lineage = chaos_dns_prng_mix(1U);
+    chaos_dns_rule_draw_begin(&rule);
+    assert(chaos_dns_rule_draw(&rule, CHAOS_DNS_DRAW_PROBABILITY) != first);
+    g_chaos_dns_lineage = 0U;
+
+    /* A rule outside a snapshot has no slot: evaluation 0 every time, which is what makes
+     * the unit tests reproducible without seeding anything. */
+    rule.hit = NULL;
+    chaos_dns_rule_draw_begin(&rule);
+    first = chaos_dns_rule_draw(&rule, CHAOS_DNS_DRAW_PROBABILITY);
+    chaos_dns_rule_draw_begin(&rule);
+    assert(chaos_dns_rule_draw(&rule, CHAOS_DNS_DRAW_PROBABILITY) == first);
+
+    assert(chaos_dns_rule_hash("a") == chaos_dns_rule_hash("a"));
+    assert(chaos_dns_rule_hash("a") != chaos_dns_rule_hash("b"));
+    assert(chaos_dns_rule_hash(NULL) != chaos_dns_rule_hash("a"));
+}
+
+/**
+ * @brief Proves `@every=N` lets only every Nth evaluation through, in the real gate.
+ *
+ * @details The gate itself is tested on values in test_common.c; what is asserted here is
+ * that chaos_dns_rule_should_trigger() actually consults it, and where. `@every` counts
+ * evaluations, so a rule at probability 1.0 and `@every=3` fires on the 3rd, 6th and 9th
+ * call and on no other -- and the two calls in between still count as evaluations, which is
+ * what makes the third one the third.
+ */
+static void test_every_gates_evaluations(void)
+{
+    chaos_dns_rule_t rule;
+    chaos_hit_slot_t slot;
+    unsigned call;
+    unsigned fired = 0U;
+
+    (void)memset(&rule, 0, sizeof(rule));
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.effect = CHAOS_DNS_EFFECT_GAI;
+    rule.probability = 1.0;
+    rule.hit = &slot;
+    rule.policy.every = 3U;
+
+    for (call = 1U; call <= 9U; ++call)
+    {
+        const int triggered = chaos_dns_rule_should_trigger(&rule) != 0;
+
+        assert(triggered == (call % 3U == 0U));
+        fired += (unsigned)triggered;
+    }
+    assert(fired == 3U);
+    assert(slot.evaluations == 9U);
+    assert(slot.count == 3U);
+
+    /* Without the qualifier every evaluation fires. */
+    (void)memset(&slot, 0, sizeof(slot));
+    rule.policy.every = 0U;
+    assert(chaos_dns_rule_should_trigger(&rule) != 0);
+    assert(slot.count == 1U);
+}
+
 int main(void)
 {
+    test_every_gates_evaluations();
+    test_shuffle_takes_one_draw_per_swap();
+    test_draws_are_reproducible();
     test_canonname_and_owned_lists();
     test_should_trigger_honours_qualifiers();
     test_should_trigger_counts_hits();

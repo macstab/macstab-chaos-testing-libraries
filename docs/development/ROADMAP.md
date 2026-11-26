@@ -130,7 +130,7 @@ Implemented: `getaddrinfo`, `freeaddrinfo`, `getnameinfo`, `gethostbyname`,
 
 Implemented: `clock_gettime`, `gettimeofday`, `time`, `timespec_get`,
 `nanosleep`, `clock_nanosleep`, `sleep`, `usleep`. Effects: `ERRNO`,
-`LATENCY`, `OFFSET`, `REGRESS`.
+`LATENCY`, `OFFSET`, `REGRESS`, `FREEZE`.
 
 ### `libchaos-memory`
 

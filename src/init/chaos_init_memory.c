@@ -20,6 +20,7 @@
 
 #include "../memory/chaos_memory_actions.c"
 #include "../memory/chaos_memory_config.c"
+#include "chaos_init_core.h"
 #include "chaos_init_tracee.h"
 
 #include <sys/random.h>
@@ -28,7 +29,10 @@
 /* Symbols the rule core expects from the preload library; the seed is replaced from
  * getrandom() in chaos_init_memory_start(). */
 __thread int g_chaos_memory_tls_guard = 0;
-__thread uint64_t g_chaos_memory_tls_prng_state = 0U;
+uint64_t g_chaos_memory_lineage = 0U;
+
+/** @copydoc g_chaos_memory_forks (the supervisor never forks a tracee itself). */
+uint64_t g_chaos_memory_forks = 0U;
 uint64_t g_chaos_memory_process_seed = UINT64_C(0x6a09e667f3bcc909);
 
 /* Per-process hit slots of the memory rules. */
@@ -55,10 +59,29 @@ static size_t chaos_init_memory_snapshot(const chaos_init_text_t **texts, uint64
     return state->rule_count;
 }
 
+/**
+ * @brief Sets the memory draw lineage for the process with allocation serial @p serial.
+ *
+ * @details Serial 1 is the application itself and gets lineage 0, so a single-process run
+ * decides exactly as it would under `LD_PRELOAD`. Every later process is a descendant and
+ * gets a lineage of its own, which is what keeps the backends of a pre-forking server from
+ * all drawing the same sample -- the library reaches the same end from the other side, by
+ * mixing each child's ordinal among its siblings in the atfork handler.
+ */
+static void chaos_init_memory_lineage(uint64_t serial)
+{
+    g_chaos_memory_lineage = serial > 1U ? chaos_memory_prng_mix(serial - 1U) : 0U;
+}
+
 static chaos_init_rules_t g_chaos_init_memory_rules = {
     CHAOS_MEMORY_HITS_PREFIX,
     CHAOS_MEMORY_MAX_RULES,
     chaos_init_memory_snapshot,
+    /* The same header the library writes, so a reader correlates the counts with the
+     * same reload generation whichever mode produced them. */
+    chaos_memory_hits_header,
+    /* Each process the supervisor decides for draws with a lineage of its own. */
+    chaos_init_memory_lineage,
     g_chaos_init_memory_slots,
     g_chaos_init_memory_hashes,
     g_chaos_init_memory_generation,
@@ -71,14 +94,16 @@ static chaos_init_rules_t g_chaos_init_memory_rules = {
 
 void chaos_init_memory_start(void)
 {
-    uint64_t seed;
 
     chaos_memory_config_init();
-    if (getrandom(&seed, sizeof(seed), 0) == (ssize_t)sizeof(seed))
-    {
-        g_chaos_memory_process_seed = seed;
-    }
+    g_chaos_memory_process_seed = chaos_init_seed();
     (void)chaos_init_tracee_register(&g_chaos_init_memory_rules);
+}
+
+/** @copydoc chaos_init_memory_reload */
+void chaos_init_memory_reload(void)
+{
+    (void)chaos_memory_config_prepare();
 }
 
 /**

@@ -38,10 +38,21 @@ LDLIBS ?= -ldl
 #                           no .eh_frame or .comment payload; smaller object
 #   -fno-stack-protector    no canary checks, so no __stack_chk_fail import
 #   --build-id=none, --strip-all   no build-id note, no symbol table beyond .dynsym
-#   max-page-size=4096, common-page-size=4096   4 KiB segment alignment instead of the 64 KiB
-#                           aarch64 default, which pads the file; segments then assume 4 KiB pages
+#   max-page-size           segment alignment (p_align). It must be at least the kernel's page
+#                           size or the loader cannot map the object at all. x86_64 is always
+#                           4 KiB; aarch64 kernels run 4, 16 or 64 KiB (RHEL and Oracle Linux on
+#                           aarch64, and Asahi, use 64 KiB), so arm64 objects are aligned to
+#                           64 KiB. common-page-size stays 4 KiB, which keeps the file from being
+#                           padded out to the larger boundary.
 SHARED_CFLAGS := $(CPPFLAGS) $(CFLAGS) -fPIC -fvisibility=hidden -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables -fomit-frame-pointer -fno-ident -fno-stack-protector
-SHARED_LDFLAGS := $(LDFLAGS) -Wl,--gc-sections -Wl,--build-id=none -Wl,--strip-all -Wl,-z,max-page-size=4096 -Wl,-z,common-page-size=4096
+SHARED_LDFLAGS := $(LDFLAGS) -Wl,--gc-sections -Wl,--build-id=none -Wl,--strip-all
+PAGE_LDFLAGS_4K := -Wl,-z,max-page-size=4096 -Wl,-z,common-page-size=4096
+PAGE_LDFLAGS_64K := -Wl,-z,max-page-size=65536 -Wl,-z,common-page-size=4096
+ifneq ($(filter aarch64 arm64,$(HOST_ARCH)),)
+NATIVE_PAGE_LDFLAGS := $(PAGE_LDFLAGS_64K)
+else
+NATIVE_PAGE_LDFLAGS := $(PAGE_LDFLAGS_4K)
+endif
 
 BUILD_DIR := build
 DIST_DIR := dist
@@ -87,6 +98,7 @@ LIB_SRCS_io := \
 	$(SRC_WRAPPERS_DIR)/chaos_io_rw.c \
 	$(SRC_WRAPPERS_DIR)/chaos_io_fsops.c \
 	$(SRC_WRAPPERS_DIR)/chaos_io_sync.c \
+	$(SRC_WRAPPERS_DIR)/chaos_io_statfs.c \
 	$(SRC_WRAPPERS_DIR)/chaos_io_stdio.c \
 	$(SRC_EFFECTS_DIR)/chaos_io_actions.c \
 	$(SRC_CONFIG_DIR)/chaos_io_config.c \
@@ -105,6 +117,7 @@ LIB_SRCS_net := \
 	$(SRC_NET_DIR)/chaos_net_config.c \
 	$(SRC_NET_DIR)/chaos_net_endpoint.c \
 	$(SRC_NET_DIR)/chaos_net_extra.c \
+	$(SRC_NET_DIR)/chaos_net_owner.c \
 	$(SRC_NET_DIR)/chaos_net_socket.c \
 	$(SRC_NET_DIR)/chaos_net_wait.c
 
@@ -168,8 +181,12 @@ INIT_SRCS := \
 	$(SRC_INIT_DIR)/chaos_init_delay.c \
 	$(SRC_INIT_DIR)/chaos_init_proc.c \
 	$(SRC_INIT_DIR)/chaos_init_tracee.c \
+	$(SRC_INIT_DIR)/chaos_init_trace.c \
+	$(SRC_INIT_DIR)/chaos_init_vdso.c \
 	$(SRC_INIT_DIR)/chaos_init_io.c \
 	$(SRC_INIT_DIR)/chaos_init_net.c \
+	$(SRC_INIT_DIR)/chaos_init_dns.c \
+	$(SRC_INIT_DIR)/chaos_init_time.c \
 	$(SRC_INIT_DIR)/chaos_init_memory.c \
 	$(SRC_INIT_DIR)/chaos_init_process.c
 INIT_HDRS := \
@@ -178,8 +195,12 @@ INIT_HDRS := \
 	$(SRC_INIT_DIR)/chaos_init_delay.h \
 	$(SRC_INIT_DIR)/chaos_init_proc.h \
 	$(SRC_INIT_DIR)/chaos_init_tracee.h \
+	$(SRC_INIT_DIR)/chaos_init_trace.h \
+	$(SRC_INIT_DIR)/chaos_init_vdso.h \
 	$(SRC_INIT_DIR)/chaos_init_io.h \
 	$(SRC_INIT_DIR)/chaos_init_net.h \
+	$(SRC_INIT_DIR)/chaos_init_dns.h \
+	$(SRC_INIT_DIR)/chaos_init_time.h \
 	$(SRC_INIT_DIR)/chaos_init_memory.h \
 	$(SRC_INIT_DIR)/chaos_init_process.h \
 	$(SRC_COMMON_DIR)/chaos_status.h \
@@ -253,6 +274,7 @@ FDCACHE_TEST := $(BUILD_DIR)/test_fdcache
 CHAOS_IO_TEST := $(BUILD_DIR)/test_chaos_io
 NET_ACTIONS_TEST := $(BUILD_DIR)/test_net_actions
 NET_ENDPOINT_TEST := $(BUILD_DIR)/test_net_endpoint
+NET_OWNER_TEST := $(BUILD_DIR)/test_net_owner
 NET_CONFIG_TEST := $(BUILD_DIR)/test_net_config
 NET_RUNTIME_TEST := $(BUILD_DIR)/test_net_runtime
 CHAOS_NET_TEST := $(BUILD_DIR)/test_chaos_net
@@ -277,17 +299,25 @@ PROPTEST_TEST := $(BUILD_DIR)/test_config_proptest
 CHAOS_INIT_TEST := $(BUILD_DIR)/test_chaos_init
 CHAOS_INIT_IO_TEST := $(BUILD_DIR)/test_chaos_init_io
 CHAOS_INIT_NET_TEST := $(BUILD_DIR)/test_chaos_init_net
+CHAOS_INIT_DNS_TEST := $(BUILD_DIR)/test_chaos_init_dns
+CHAOS_INIT_TIME_TEST := $(BUILD_DIR)/test_chaos_init_time
 CHAOS_INIT_MEMORY_TEST := $(BUILD_DIR)/test_chaos_init_memory
 CHAOS_INIT_PROCESS_TEST := $(BUILD_DIR)/test_chaos_init_process
+CHAOS_INIT_TRACE_TEST := $(BUILD_DIR)/test_chaos_init_trace
+CHAOS_INIT_VDSO_TEST := $(BUILD_DIR)/test_chaos_init_vdso
+CHAOS_INIT_MAIN_TEST := $(BUILD_DIR)/test_chaos_init_main
 COMMON_TEST := $(BUILD_DIR)/test_common
 UNIT_TESTS := $(CONFIG_TEST) $(ACTIONS_TEST) $(FDCACHE_TEST) $(CHAOS_IO_TEST) \
-	$(NET_ACTIONS_TEST) $(NET_ENDPOINT_TEST) $(NET_CONFIG_TEST) $(NET_RUNTIME_TEST) $(CHAOS_NET_TEST) \
+	$(NET_ACTIONS_TEST) $(NET_ENDPOINT_TEST) $(NET_OWNER_TEST) $(NET_CONFIG_TEST) $(NET_RUNTIME_TEST) $(CHAOS_NET_TEST) \
 	$(DNS_ACTIONS_TEST) $(DNS_CONFIG_TEST) $(DNS_RUNTIME_TEST) $(DNS_OWNED_TEST) $(CHAOS_DNS_TEST) \
 	$(TIME_ACTIONS_TEST) $(TIME_CONFIG_TEST) $(TIME_RUNTIME_TEST) $(CHAOS_TIME_TEST) \
 	$(MEMORY_ACTIONS_TEST) $(MEMORY_CONFIG_TEST) $(MEMORY_RUNTIME_TEST) $(CHAOS_MEMORY_TEST) \
 	$(PROCESS_ACTIONS_TEST) $(PROCESS_CONFIG_TEST) $(PROCESS_RUNTIME_TEST) $(CHAOS_PROCESS_TEST) \
 	$(PROPTEST_TEST) $(CHAOS_INIT_TEST) $(CHAOS_INIT_IO_TEST) \
-	$(CHAOS_INIT_NET_TEST) $(CHAOS_INIT_MEMORY_TEST) $(CHAOS_INIT_PROCESS_TEST) $(COMMON_TEST)
+	$(CHAOS_INIT_NET_TEST) $(CHAOS_INIT_DNS_TEST) $(CHAOS_INIT_TIME_TEST) \
+	$(CHAOS_INIT_MEMORY_TEST) \
+	$(CHAOS_INIT_PROCESS_TEST) \
+	$(CHAOS_INIT_TRACE_TEST) $(CHAOS_INIT_VDSO_TEST) $(CHAOS_INIT_MAIN_TEST) $(COMMON_TEST)
 # Runtime suites run by `make test` against the native build on the host. Several start Docker
 # containers; a suite that cannot run exits with ${CHAOS_SKIP_EXIT:-0}, i.e. it passes as
 # skipped unless the caller sets CHAOS_SKIP_EXIT=1 (as CI does). ci.yml keeps its own copy of
@@ -363,6 +393,7 @@ unit: $(UNIT_TESTS)
 	./$(CHAOS_IO_TEST)
 	./$(NET_ACTIONS_TEST)
 	./$(NET_ENDPOINT_TEST)
+	./$(NET_OWNER_TEST)
 	./$(NET_CONFIG_TEST)
 	./$(NET_RUNTIME_TEST)
 	./$(CHAOS_NET_TEST)
@@ -387,8 +418,13 @@ unit: $(UNIT_TESTS)
 	./$(CHAOS_INIT_TEST)
 	./$(CHAOS_INIT_IO_TEST)
 	./$(CHAOS_INIT_NET_TEST)
+	./$(CHAOS_INIT_DNS_TEST)
+	./$(CHAOS_INIT_TIME_TEST)
 	./$(CHAOS_INIT_MEMORY_TEST)
 	./$(CHAOS_INIT_PROCESS_TEST)
+	./$(CHAOS_INIT_TRACE_TEST)
+	./$(CHAOS_INIT_VDSO_TEST)
+	./$(CHAOS_INIT_MAIN_TEST)
 	./$(COMMON_TEST)
 
 # Coverage gate: check_coverage.sh rebuilds the unit tests with --coverage -O0 in
@@ -589,23 +625,23 @@ $(BUILD_DIR)/test_%: $(TEST_UNIT_DIR)/test_%.c $(LIB_SRCS_io) $(LIB_HDRS_io) $(L
 define define_lib_rules
 $$(NATIVE_$(1)_LIB): $$(LIB_SRCS_$(1)) $$(LIB_HDRS_$(1)) $$(COMMON_HDRS) | $$(BUILD_DIR)
 ifeq ($$(UNAME_S),Linux)
-	$$(CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(LDLIBS)
+	$$(CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(NATIVE_PAGE_LDFLAGS) $$(LDLIBS)
 else
 	@echo "native shared library build requires Linux (host is $$(UNAME_S))" >&2
 	@exit 1
 endif
 
 $$(DIST_glibc-amd64_$(1)_LIB): $$(LIB_SRCS_$(1)) $$(LIB_HDRS_$(1)) $$(COMMON_HDRS) | $$(DIST_DIR)
-	$$(GLIBC_AMD64_CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(LDLIBS)
+	$$(GLIBC_AMD64_CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(PAGE_LDFLAGS_4K) $$(LDLIBS)
 
 $$(DIST_glibc-arm64_$(1)_LIB): $$(LIB_SRCS_$(1)) $$(LIB_HDRS_$(1)) $$(COMMON_HDRS) | $$(DIST_DIR)
-	$$(GLIBC_ARM64_CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(LDLIBS)
+	$$(GLIBC_ARM64_CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(PAGE_LDFLAGS_64K) $$(LDLIBS)
 
 $$(DIST_musl-amd64_$(1)_LIB): $$(LIB_SRCS_$(1)) $$(LIB_HDRS_$(1)) $$(COMMON_HDRS) | $$(DIST_DIR)
-	$$(MUSL_AMD64_CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(LDLIBS)
+	$$(MUSL_AMD64_CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(PAGE_LDFLAGS_4K) $$(LDLIBS)
 
 $$(DIST_musl-arm64_$(1)_LIB): $$(LIB_SRCS_$(1)) $$(LIB_HDRS_$(1)) $$(COMMON_HDRS) | $$(DIST_DIR)
-	$$(MUSL_ARM64_CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(LDLIBS)
+	$$(MUSL_ARM64_CC) $$(SHARED_CFLAGS) -shared -o $$@ $$(LIB_SRCS_$(1)) $$(SHARED_LDFLAGS) $$(PAGE_LDFLAGS_64K) $$(LDLIBS)
 
 native-$(1): $$(NATIVE_$(1)_LIB)
 cross-glibc-amd64-$(1): $$(DIST_glibc-amd64_$(1)_LIB)

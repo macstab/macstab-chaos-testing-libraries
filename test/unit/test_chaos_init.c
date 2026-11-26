@@ -60,6 +60,12 @@ static unsigned long long g_fake_start[TEST_PIDS];
 static int test_process_of(pid_t tid, pid_t *tgid, uint64_t *start);
 #define CHAOS_INIT_PROCESS_OF(tid, tgid, start) test_process_of((tid), (tgid), (start))
 
+/* Seam: the entropy source. -1 models a kernel without getrandom(); a short read models
+ * an interrupted one. */
+static int g_getrandom_fails = 0;
+static ssize_t test_getrandom(void *buffer, size_t size);
+#define CHAOS_INIT_GETRANDOM(buffer, size) test_getrandom((buffer), (size))
+
 #include "../../src/init/chaos_init_core.c"
 #include "../../src/init/chaos_init_delay.c"
 #include "../../src/init/chaos_init_proc.c"
@@ -96,6 +102,9 @@ static int test_process_of(pid_t tid, pid_t *tgid, uint64_t *start)
 #include <assert.h>
 #include <linux/audit.h>
 #include <stdint.h>
+
+/* The time rules' share of the filter; NULL unless a case builds one. */
+static const chaos_init_rule_filter_t *g_test_clock = NULL;
 
 /**
  * @brief Interprets @p filter (as built by chaos_init_build_filter()) over @p data and
@@ -144,15 +153,25 @@ run_filter(const struct sock_filter *filter, size_t length, const struct seccomp
 static int g_test_handover = 1000;
 
 /**
- * @brief Builds the filter for @p libs and returns its verdict for system call @p nr on
- *        architecture @p arch, with @p fd as args[0] and @p flags as args[2] (sendmsg).
+ * @brief Builds the filter for @p libs, with @p traced answered by TRACE, and returns its
+ *        verdict for system call @p nr on architecture @p arch, with @p fd as args[0] and
+ *        @p flags as args[2] (sendmsg).
  */
-static uint32_t decide(unsigned libs, long nr, uint64_t fd, uint64_t flags, uint32_t arch)
+static uint32_t decide_traced(
+    unsigned libs,
+    const long *traced,
+    size_t traced_count,
+    long nr,
+    uint64_t fd,
+    uint64_t flags,
+    uint32_t arch
+)
 {
     struct sock_filter filter[CHAOS_INIT_MAX_FILTER];
     struct seccomp_data data;
-    const size_t length =
-        chaos_init_build_filter(libs, g_test_handover, filter, CHAOS_INIT_MAX_FILTER);
+    const size_t length = chaos_init_build_filter(
+        libs, g_test_handover, traced, traced_count, g_test_clock, filter, CHAOS_INIT_MAX_FILTER
+    );
 
     assert(length > 0U);
     memset(&data, 0, sizeof(data));
@@ -163,6 +182,13 @@ static uint32_t decide(unsigned libs, long nr, uint64_t fd, uint64_t flags, uint
     return run_filter(filter, length, &data);
 }
 
+/** @brief decide_traced() with nothing traced. */
+static uint32_t decide(unsigned libs, long nr, uint64_t fd, uint64_t flags, uint32_t arch)
+{
+    return decide_traced(libs, NULL, 0U, nr, fd, flags, arch);
+}
+
+#define TRACE SECCOMP_RET_TRACE
 #define NOTIFY SECCOMP_RET_USER_NOTIF
 #define ALLOW SECCOMP_RET_ALLOW
 #define ARCH CHAOS_INIT_AUDIT_ARCH
@@ -243,7 +269,178 @@ static void test_filter_decisions(void)
 #endif
 
     /* An output buffer too small for the program returns 0 rather than overrunning. */
-    assert(chaos_init_build_filter(0x3fU, 4, small, sizeof(small) / sizeof(small[0])) == 0U);
+    assert(
+        chaos_init_build_filter(
+            0x3fU, 4, NULL, 0U, NULL, small, sizeof(small) / sizeof(small[0])
+        ) == 0U
+    );
+}
+
+/**
+ * @brief Proves the traced group: a traced number answers TRACE, the rest of its library
+ *   stays notified, and a number in both groups is traced rather than notified.
+ *
+ * @details The two cannot be combined for one number -- across stacked filters USER_NOTIF
+ * outranks TRACE -- so the builder has to resolve the overlap itself, and the direction it
+ * resolves it in is what the data effects need: a traced call carries all of its effects
+ * through ptrace. Also asserted: with nothing traced the program contains no TRACE at all,
+ * which is what keeps a run without data effects at exactly the old cost; a traced set
+ * naming a number the library does not filter leaves everything else alone; and the
+ * capacity bound still refuses a buffer that is too small once the traced tests are added.
+ */
+/**
+ * @brief The time share of the filter: which calls are notified, and which clocks.
+ *
+ * @details A clock read is notified only for the clocks the rules name, which is what
+ * keeps a monotonic read cheap while a rule works on the wall clock; the clock sits in the
+ * first argument, so the test for it must come after the tail of the chain, with its own
+ * returns. An empty clock list means every clock.
+ */
+static void test_clock_group(void)
+{
+    static const long calls[] = {__NR_clock_gettime, __NR_nanosleep};
+    static const long wall[] = {CLOCK_REALTIME};
+    static const long traced[] = {__NR_write};
+    chaos_init_rule_filter_t filter;
+
+    filter.calls = calls;
+    filter.call_count = sizeof(calls) / sizeof(calls[0]);
+    filter.clocks = wall;
+    filter.clock_count = sizeof(wall) / sizeof(wall[0]);
+    g_test_clock = &filter;
+
+    /* The named clock is notified, every other one runs; the sleep is notified whatever
+     * its arguments are, because it carries no clock. */
+    assert(decide(CHAOS_INIT_LIB_TIME, __NR_clock_gettime, CLOCK_REALTIME, 0U, ARCH) == NOTIFY);
+    assert(decide(CHAOS_INIT_LIB_TIME, __NR_clock_gettime, CLOCK_MONOTONIC, 0U, ARCH) == ALLOW);
+    assert(decide(CHAOS_INIT_LIB_TIME, __NR_nanosleep, 0U, 0U, ARCH) == NOTIFY);
+    assert(decide(CHAOS_INIT_LIB_TIME, __NR_getpid, 0U, 0U, ARCH) == ALLOW);
+    /* The clock test keeps its distance over a traced group as well. */
+    assert(
+        decide_traced(
+            CHAOS_INIT_LIB_TIME | CHAOS_INIT_LIB_IO,
+            traced,
+            1U,
+            __NR_clock_gettime,
+            CLOCK_REALTIME,
+            0U,
+            ARCH
+        ) == NOTIFY
+    );
+    assert(
+        decide_traced(
+            CHAOS_INIT_LIB_TIME | CHAOS_INIT_LIB_IO, traced, 1U, __NR_write, 3U, 0U, ARCH
+        ) == TRACE
+    );
+    assert(
+        decide_traced(
+            CHAOS_INIT_LIB_TIME | CHAOS_INIT_LIB_IO,
+            traced,
+            1U,
+            __NR_clock_gettime,
+            CLOCK_MONOTONIC,
+            0U,
+            ARCH
+        ) == ALLOW
+    );
+
+    /* No clock named: every clock is notified, and clock_gettime is an ordinary test in
+     * the chain rather than a block of its own. */
+    filter.clock_count = 0U;
+    assert(decide(CHAOS_INIT_LIB_TIME, __NR_clock_gettime, CLOCK_MONOTONIC, 0U, ARCH) == NOTIFY);
+    assert(decide(CHAOS_INIT_LIB_TIME, __NR_clock_gettime, CLOCK_REALTIME, 0U, ARCH) == NOTIFY);
+
+    /* A rule file about sleeps alone leaves clock reads out of the filter entirely. */
+    filter.calls = calls + 1;
+    filter.call_count = 1U;
+    assert(decide(CHAOS_INIT_LIB_TIME, __NR_clock_gettime, CLOCK_REALTIME, 0U, ARCH) == ALLOW);
+    assert(decide(CHAOS_INIT_LIB_TIME, __NR_nanosleep, 0U, 0U, ARCH) == NOTIFY);
+    /* Without time among the libraries nothing of it is in the filter, whatever the
+     * rules say: the bits decide which deciders run. */
+    g_test_clock = NULL;
+    assert(decide(CHAOS_INIT_LIB_TIME, __NR_clock_gettime, CLOCK_REALTIME, 0U, ARCH) == ALLOW);
+}
+
+static void test_traced_group(void)
+{
+    static const long write_only[] = {__NR_write};
+    static const long two[] = {__NR_write, __NR_read};
+    static const long foreign[] = {__NR_getpid};
+    struct sock_filter filter[CHAOS_INIT_MAX_FILTER];
+    struct sock_filter small[22];
+    size_t length;
+    size_t index;
+
+    assert(decide_traced(CHAOS_INIT_LIB_IO, write_only, 1U, __NR_write, 0U, 0U, ARCH) == TRACE);
+    /* Everything else of the library is still notified, and non-members still pass. */
+    assert(decide_traced(CHAOS_INIT_LIB_IO, write_only, 1U, __NR_read, 0U, 0U, ARCH) == NOTIFY);
+    assert(decide_traced(CHAOS_INIT_LIB_IO, write_only, 1U, __NR_openat, 0U, 0U, ARCH) == NOTIFY);
+    assert(decide_traced(CHAOS_INIT_LIB_IO, write_only, 1U, __NR_connect, 0U, 0U, ARCH) == ALLOW);
+    /* The handover exemption survives a traced set. */
+    assert(
+        decide_traced(
+            CHAOS_INIT_LIB_NET,
+            write_only,
+            1U,
+            __NR_sendmsg,
+            (uint64_t)g_test_handover,
+            CHAOS_INIT_HANDOVER_FLAGS,
+            ARCH
+        ) == ALLOW
+    );
+    /* A foreign architecture passes before either group is reached. */
+    assert(
+        decide_traced(CHAOS_INIT_LIB_IO, write_only, 1U, __NR_write, 0U, 0U, 0x12345678U) == ALLOW
+    );
+
+    assert(decide_traced(CHAOS_INIT_LIB_IO, two, 2U, __NR_write, 0U, 0U, ARCH) == TRACE);
+    assert(decide_traced(CHAOS_INIT_LIB_IO, two, 2U, __NR_read, 0U, 0U, ARCH) == TRACE);
+    assert(decide_traced(CHAOS_INIT_LIB_IO, two, 2U, __NR_writev, 0U, 0U, ARCH) == NOTIFY);
+
+    /* A traced number the library does not filter is traced; its neighbours are untouched. */
+    assert(decide_traced(CHAOS_INIT_LIB_IO, foreign, 1U, __NR_getpid, 0U, 0U, ARCH) == TRACE);
+    assert(decide_traced(CHAOS_INIT_LIB_IO, foreign, 1U, __NR_openat, 0U, 0U, ARCH) == NOTIFY);
+
+    /* Nothing traced: no TRACE instruction exists in the program at all. */
+    length = chaos_init_build_filter(
+        0x3fU, g_test_handover, NULL, 0U, NULL, filter, CHAOS_INIT_MAX_FILTER
+    );
+    assert(length > 0U);
+    for (index = 0U; index < length; ++index)
+    {
+        assert(!(filter[index].code == (BPF_RET | BPF_K) && filter[index].k == SECCOMP_RET_TRACE));
+    }
+    /* And with something traced it does. */
+    length = chaos_init_build_filter(
+        0x3fU, g_test_handover, two, 2U, NULL, filter, CHAOS_INIT_MAX_FILTER
+    );
+    assert(length > 0U);
+    {
+        int found = 0;
+
+        for (index = 0U; index < length; ++index)
+        {
+            if (filter[index].code == (BPF_RET | BPF_K) && filter[index].k == SECCOMP_RET_TRACE)
+            {
+                found = 1;
+            }
+        }
+        assert(found);
+    }
+
+    /* The capacity bound counts the traced tests too: `small` is big enough for memory's
+     * four calls plus the fixed part, and too small once two traced tests are added. A
+     * bound that forgot them would overrun it. */
+    assert(
+        chaos_init_build_filter(
+            CHAOS_INIT_LIB_MEMORY, 4, NULL, 0U, NULL, small, sizeof(small) / sizeof(small[0])
+        ) > 0U
+    );
+    assert(
+        chaos_init_build_filter(
+            CHAOS_INIT_LIB_MEMORY, 4, two, 2U, NULL, small, sizeof(small) / sizeof(small[0])
+        ) == 0U
+    );
 }
 
 /** @brief Wait status maps to the shell convention: exit status, or 128 + signal. */
@@ -291,21 +488,34 @@ static void test_status_text(void)
 
     assert(
         chaos_init_format_status(
-            text, sizeof(text), CHAOS_INIT_LIB_PROCESS | CHAOS_INIT_LIB_IO, NULL, 1L, 0
+            text, sizeof(text), CHAOS_INIT_LIB_PROCESS | CHAOS_INIT_LIB_IO, NULL, 1L, 0, 0, 0
         ) > 0U
     );
     assert(strcmp(text, "state=active\nlibs=io,process\npid=1\n") == 0);
     assert(
         chaos_init_format_status(
-            text, sizeof(text), CHAOS_INIT_LIB_NET, "kernel older than 5.5", 7L, 1
+            text, sizeof(text), CHAOS_INIT_LIB_NET, "kernel older than 5.5", 7L, 1, 0, 0
         ) > 0U
     );
     assert(strcmp(text, "state=unsupported\nreason=kernel older than 5.5\nlibs=net\npid=7\n") == 0);
-    assert(chaos_init_format_status(tiny, sizeof(tiny), CHAOS_INIT_LIB_NET, NULL, 1L, 0) == 0U);
+    assert(
+        chaos_init_format_status(tiny, sizeof(tiny), CHAOS_INIT_LIB_NET, NULL, 1L, 0, 0, 0) == 0U
+    );
     /* A too-small buffer returns 0 (above). When MPTCP was turned off for the
      * application, the active status says so with `mptcp=off`. */
-    assert(chaos_init_format_status(text, sizeof(text), CHAOS_INIT_LIB_NET, NULL, 1L, 1) > 0U);
+    assert(
+        chaos_init_format_status(text, sizeof(text), CHAOS_INIT_LIB_NET, NULL, 1L, 1, 0, 0) > 0U
+    );
     assert(strcmp(text, "state=active\nlibs=net\npid=1\nmptcp=off\n") == 0);
+    /* An image whose vDSO could not be blinded reads the clock where nothing sees it, and
+     * a process the kernel will not let the supervisor read matches no path and no
+     * endpoint: the status says both rather than leaving a rule looking applied. */
+    assert(
+        chaos_init_format_status(text, sizeof(text), CHAOS_INIT_LIB_TIME, NULL, 1L, 0, 1, 0) > 0U
+    );
+    assert(strcmp(text, "state=active\nlibs=time\npid=1\nvdso=failed\n") == 0);
+    assert(chaos_init_format_status(text, sizeof(text), CHAOS_INIT_LIB_IO, NULL, 1L, 0, 0, 1) > 0U);
+    assert(strcmp(text, "state=active\nlibs=io\npid=1\nunreadable=yes\n") == 0);
 
     /* GODEBUG gets `multipathtcp=0` appended to existing settings; a user's own
      * `multipathtcp=` setting (first, or after a comma) is left alone (returns 0), a
@@ -384,11 +594,24 @@ static void test_find_command(void)
 }
 
 /** @brief The queue of calls held back by LATENCY until their due time. */
+
+/* chaos_init_delay_pop() hands the parked call back with the answer (a clock read needs
+ * it to write its value); these cases only look at the id and the answer, so the call
+ * goes into one buffer and is checked where it matters. */
+static chaos_init_call_t g_test_popped;
+
+static int
+chaos_init_delay_pop_at(uint64_t now_ms, uint64_t *id, chaos_init_verdict_t *answer, int *traced)
+{
+    return chaos_init_delay_pop(now_ms, id, &g_test_popped, answer, traced);
+}
+
 static void test_delays(void)
 {
     chaos_init_call_t call;
     chaos_init_call_t other;
     uint64_t due = 0U;
+    int traced = 0;
     uint64_t id = 0U;
     chaos_init_verdict_t answer;
     chaos_init_verdict_t eio;
@@ -410,28 +633,42 @@ static void test_delays(void)
      * call and in no guaranteed order (8 and 9 are both due by 250); a full queue of
      * CHAOS_INIT_MAX_DELAYED refuses the next add. */
     assert(chaos_init_delay_next(&due) == 0);
-    assert(chaos_init_delay_pop(1000U, &id, &answer) == 0);
-    assert(chaos_init_delay_add(7U, &call, 300U, &run) == 0);
-    assert(chaos_init_delay_add(8U, &call, 100U, &eio) == 0);
-    assert(chaos_init_delay_add(9U, &call, 200U, &run) == 0);
+    /* A traced entry is never rebound to a notification id. It keeps the thread id in the
+     * same field an id goes into, so an entry rebound that way would stay marked traced
+     * with a notification id in it, and the answer when it came due would ptrace()
+     * whatever process holds that number. A call is either notified or traced -- the
+     * filter decides -- so the two never belong to the same caller. */
+    {
+        chaos_init_call_t stopped = call;
+
+        stopped.tid = 4321;
+        assert(chaos_init_delay_add((uint64_t)stopped.tid, &stopped, 900U, &eio, 1) == 0);
+        assert(chaos_init_delay_resume(&stopped, 99U) == 0);
+        assert(chaos_init_delay_pop_at(900U, &id, &answer, &traced) == 1);
+        assert(traced == 1 && id == (uint64_t)stopped.tid);
+    }
+    assert(chaos_init_delay_pop_at(1000U, &id, &answer, &traced) == 0);
+    assert(chaos_init_delay_add(7U, &call, 300U, &run, 0) == 0);
+    assert(chaos_init_delay_add(8U, &call, 100U, &eio, 0) == 0);
+    assert(chaos_init_delay_add(9U, &call, 200U, &run, 0) == 0);
     assert(chaos_init_delay_next(&due) == 1 && due == 100U);
-    assert(chaos_init_delay_pop(50U, &id, &answer) == 0);
+    assert(chaos_init_delay_pop_at(50U, &id, &answer, &traced) == 0);
     assert(
-        chaos_init_delay_pop(250U, &id, &answer) == 1 &&
+        chaos_init_delay_pop_at(250U, &id, &answer, &traced) == 1 &&
         (id == 8U ? answer.error == EIO : id == 9U && answer.action == CHAOS_INIT_PASS)
     );
     assert(
-        chaos_init_delay_pop(250U, &id, &answer) == 1 &&
+        chaos_init_delay_pop_at(250U, &id, &answer, &traced) == 1 &&
         (id == 8U ? answer.error == EIO : id == 9U && answer.action == CHAOS_INIT_PASS)
     );
-    assert(chaos_init_delay_pop(250U, &id, &answer) == 0);
-    assert(chaos_init_delay_pop(300U, &id, &answer) == 1 && id == 7U);
+    assert(chaos_init_delay_pop_at(250U, &id, &answer, &traced) == 0);
+    assert(chaos_init_delay_pop_at(300U, &id, &answer, &traced) == 1 && id == 7U);
     for (index = 0U; index < CHAOS_INIT_MAX_DELAYED; ++index)
     {
-        assert(chaos_init_delay_add(index, &call, 1U, &run) == 0);
+        assert(chaos_init_delay_add(index, &call, 1U, &run, 0) == 0);
     }
-    assert(chaos_init_delay_add(1U, &call, 1U, &run) == -1);
-    while (chaos_init_delay_pop(1U, &id, &answer))
+    assert(chaos_init_delay_add(1U, &call, 1U, &run, 0) == -1);
+    while (chaos_init_delay_pop_at(1U, &id, &answer, &traced))
     {
     }
 
@@ -439,7 +676,7 @@ static void test_delays(void)
      * matches it by tid, number and all six arguments and rebinds the id, keeping the
      * due time and answer. A different tid, number or argument is a new call. */
     assert(chaos_init_delay_resume(&call, 20U) == 0);
-    assert(chaos_init_delay_add(10U, &call, 500U, &eio) == 0);
+    assert(chaos_init_delay_add(10U, &call, 500U, &eio, 0) == 0);
     other = call;
     other.tid = 42;
     assert(chaos_init_delay_resume(&other, 21U) == 0);
@@ -451,8 +688,11 @@ static void test_delays(void)
     assert(chaos_init_delay_resume(&other, 21U) == 0);
     assert(chaos_init_delay_resume(&call, 22U) == 1);
     assert(chaos_init_delay_next(&due) == 1 && due == 500U);
-    assert(chaos_init_delay_pop(499U, &id, &answer) == 0);
-    assert(chaos_init_delay_pop(500U, &id, &answer) == 1 && id == 22U && answer.error == EIO);
+    assert(chaos_init_delay_pop_at(499U, &id, &answer, &traced) == 0);
+    assert(
+        chaos_init_delay_pop_at(500U, &id, &answer, &traced) == 1 && id == 22U &&
+        answer.error == EIO
+    );
     assert(chaos_init_delay_next(&due) == 0);
 
     /* The answer sent when a delay expires, delay cleared: FAIL if an errno is set,
@@ -467,6 +707,24 @@ static void test_delays(void)
         verdict.returns = 1;
         assert(chaos_init_delay_answer(&verdict).action == CHAOS_INIT_RETURN);
         assert(chaos_init_delay_answer(&verdict).delay_ms == 0U);
+        verdict.error = EIO;
+        assert(chaos_init_delay_answer(&verdict).action == CHAOS_INIT_FAIL);
+        /* A delay a rate parked (THROTTLE) ends in a shortened call, not a whole one: the
+         * answer carries the count the wait bought and the argument to put it in. A PASS
+         * here would let the whole call through and leave the rate unenforced. */
+        memset(&verdict, 0, sizeof(verdict));
+        verdict.action = CHAOS_INIT_DELAY;
+        verdict.delay_ms = 100U;
+        verdict.shortens = 1;
+        verdict.arg_index = 2U;
+        verdict.value = 64L;
+        assert(chaos_init_delay_answer(&verdict).action == CHAOS_INIT_SHORTEN);
+        assert(chaos_init_delay_answer(&verdict).value == 64L);
+        assert(chaos_init_delay_answer(&verdict).arg_index == 2U);
+        assert(chaos_init_delay_answer(&verdict).delay_ms == 0U);
+        /* FAIL and RETURN still outrank it: an error is an error however the call ends. */
+        verdict.returns = 1;
+        assert(chaos_init_delay_answer(&verdict).action == CHAOS_INIT_RETURN);
         verdict.error = EIO;
         assert(chaos_init_delay_answer(&verdict).action == CHAOS_INIT_FAIL);
     }
@@ -546,6 +804,23 @@ static void test_memory_and_proc(void)
     );
     assert(chaos_init_proc_read(getpid(), "fd", link, sizeof(link)) == -1); /* a directory */
 
+    /* "Not allowed to look" is told apart from the ordinary failures, because only the
+     * first means a rule cannot be matched at all: a process that changed user answers
+     * EPERM to a memory read, EIO to the tracer's own peek and EACCES to a /proc link,
+     * while ESRCH (the thread ended) and EFAULT (the address is not mapped) are everyday
+     * answers that say nothing about access. The reads above produced those two, so
+     * nothing is reported yet. */
+    assert(chaos_init_unreadable() == 0);
+    chaos_init_proc_refused(ESRCH);
+    chaos_init_proc_refused(EFAULT);
+    chaos_init_proc_refused(ENOENT);
+    assert(chaos_init_unreadable() == 0);
+    chaos_init_proc_refused(EACCES);
+    assert(chaos_init_unreadable() != 0);
+    chaos_init_proc_refused(EPERM);
+    chaos_init_proc_refused(EIO);
+    assert(chaos_init_unreadable() != 0);
+
     /* Thread -> (tgid, start time from stat field 22). A gone pid, a status without
      * Tgid, a truncated stat, a non-numeric field 22 fail. The comm field may contain
      * ')' ("a) b"), so parsing starts at the last ')'. */
@@ -624,10 +899,31 @@ static size_t test_snapshot(const chaos_init_text_t **texts, uint64_t *generatio
     return g_test_text_count;
 }
 
+/* A library that has something to say in the header lines of its hits file, as net has
+ * (its RESET suppressions): the hook is optional, and what it returns leads the file. */
+static int g_test_header = 0;
+static const char *test_header(char *out, size_t size)
+{
+    if (!g_test_header || (size_t)snprintf(out, size, "suppressed.shared=3\n") >= size)
+    {
+        return NULL;
+    }
+    return out;
+}
+
+/** @brief The serial the lineage hook was last given, which every decision must set. */
+static uint64_t g_test_lineage_serial = 0U;
+static void test_lineage(uint64_t serial)
+{
+    g_test_lineage_serial = serial;
+}
+
 static chaos_init_rules_t g_test_lib = {
     "/tmp/.chaos-inittest.hits",
     4U,
     test_snapshot,
+    test_header,
+    test_lineage,
     g_test_rules_slots,
     g_test_rules_hashes,
     g_test_rules_generation,
@@ -642,13 +938,13 @@ static chaos_init_rules_t g_test_lib = {
  * @brief Reads and deletes the hits file `/tmp/.chaos-inittest.hits.<tgid>`; returns 0
  *        when it does not exist. Deleting makes the next call prove a fresh write.
  */
-static int read_hits(pid_t tgid, char *out, size_t size)
+static int read_hits(long tgid, char *out, size_t size)
 {
     char path[64];
     FILE *file;
     size_t length;
 
-    (void)snprintf(path, sizeof(path), "/tmp/.chaos-inittest.hits.%ld", (long)tgid);
+    (void)snprintf(path, sizeof(path), "/tmp/.chaos-inittest.hits.%ld", tgid);
     file = fopen(path, "r");
     if (file == NULL)
     {
@@ -699,6 +995,15 @@ static void test_tracee_table(void)
     /* find() looks up by tgid without allocating; tgid 0 never matches a free entry. */
     assert(chaos_init_tracee_find(10) == first && chaos_init_tracee_tgid(first) == 10);
     assert(chaos_init_tracee_find(12) == -1 && chaos_init_tracee_find(0) == -1);
+
+    /* Looking a slot up is also what sets the library's draw lineage for the process
+     * being decided for: two processes must not draw the same sample, or the backends of
+     * a pre-forking server would all decide alike at `p<1`. The serial is the
+     * supervisor's own count of the processes it has seen. */
+    g_test_lineage_serial = 0U;
+    (void)chaos_init_tracee_slot(&g_test_lib, first, 0U);
+    assert(g_test_lineage_serial == chaos_init_tracee_serial(first));
+    assert(g_test_lineage_serial != 0U);
 
     /* A hit is counted in the process's slot and the hits file is written at once;
      * slots exist only for the snapshot's 2 rules. */
@@ -752,6 +1057,11 @@ static void test_tracee_table(void)
     foreign.report = chaos_init_tracee_report;
     chaos_hit_record(&foreign);
 
+    /* The same write, with a header hook: its lines lead the file, which is how a
+     * library reports what no hit count can say -- net counts its suppressed RESETs
+     * there. The hook is optional (the other libraries pass none) and one that cannot
+     * format its lines writes none, so the counts arrive either way. */
+    g_test_header = 1;
     /* Pid reuse: process 10 gets a new start time. The old entry is dropped (its
      * pending hits written first) and the new process starts from 0 under a new serial. */
     chaos_hit_record(slot);
@@ -778,7 +1088,9 @@ static void test_tracee_table(void)
         (void)snprintf(path, sizeof(path), "/tmp/.chaos-inittest.hits.%ld", number);
         assert(unlink(path) == 0);
     }
-    assert(read_hits(10, hits, sizeof(hits)) && strncmp(hits, "67\t", 3U) == 0);
+    assert(read_hits(10, hits, sizeof(hits)));
+    assert(strncmp(hits, "suppressed.shared=3\n67\t", 23U) == 0);
+    g_test_header = 0;
 
     /* A full table (CHAOS_INIT_MAX_TRACEES = 128: process 10, 20..139, 140..146) first
      * reclaims ended processes: process 30 ends and 150 takes its entry... */
@@ -888,10 +1200,99 @@ static void test_tracee_table(void)
     }
 }
 
+/** @brief Entropy stub: fills the buffer with a fixed value, or fails when armed. */
+static ssize_t test_getrandom(void *buffer, size_t size)
+{
+    if (g_getrandom_fails != 0)
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+    (void)memset(buffer, 0x5a, size);
+    return (ssize_t)size;
+}
+
+/**
+ * @brief Proves `CHAOS_SEED` fixes chaos-init's seed exactly as it fixes the libraries',
+ *        and that nothing usable falls back to entropy, then to the pid.
+ *
+ * @details The two modes must agree: a test that reproduces a run under LD_PRELOAD has to
+ * reproduce it under chaos-init too, or the seed is worth nothing. "-1" is rejected rather
+ * than wrapped into UINT64_MAX, which is a seed nobody asked for.
+ */
+/**
+ * @brief The TRACE set of the installed filter: what was recorded, and nothing else.
+ *
+ * @details A seccomp filter is fixed once installed while the rule file is not, so a
+ * reload can ask for an effect that needs a trace stop this container does not have. The
+ * deciders ask this before producing such a verdict, so the answer has to be exact: a
+ * call that was never recorded must come back 0, and so must every call before anything
+ * was recorded at all -- a supervisor that installed no TRACE instruction.
+ */
+static void test_installed_trace_set(void)
+{
+    static const long calls[] = {__NR_write, __NR_read, __NR_close};
+    long many[CHAOS_INIT_MAX_FILTER + 4];
+    size_t index;
+
+    /* Nothing recorded yet: a supervisor that traces nothing traces nothing. */
+    chaos_init_traced_set(NULL, 0U);
+    assert(chaos_init_traced(__NR_write) == 0);
+
+    chaos_init_traced_set(calls, sizeof(calls) / sizeof(calls[0]));
+    assert(chaos_init_traced(__NR_write) && chaos_init_traced(__NR_close));
+    assert(chaos_init_traced(__NR_openat) == 0);
+
+    /* A set larger than the store is truncated rather than overrunning it; what fits is
+     * still answered. */
+    for (index = 0U; index < sizeof(many) / sizeof(many[0]); ++index)
+    {
+        many[index] = (long)(index + 1000U);
+    }
+    chaos_init_traced_set(many, sizeof(many) / sizeof(many[0]));
+    assert(chaos_init_traced(1000L));
+    assert(chaos_init_traced((long)(CHAOS_INIT_MAX_FILTER + 1003U)) == 0);
+
+    /* A NULL set clears what was there, so a later question is not answered from a set
+     * that no longer applies. */
+    chaos_init_traced_set(NULL, 3U);
+    assert(chaos_init_traced(1000L) == 0);
+}
+
+static void test_seed_from_environment(void)
+{
+    static const char *const unusable[] = {"", "12x", "x", "-1", "99999999999999999999999"};
+    const uint64_t from_entropy = UINT64_C(0x5a5a5a5a5a5a5a5a);
+    size_t index;
+
+    g_getrandom_fails = 0;
+    assert(setenv("CHAOS_SEED", "42", 1) == 0);
+    assert(chaos_init_seed() == UINT64_C(42));
+    assert(setenv("CHAOS_SEED", "18446744073709551615", 1) == 0);
+    assert(chaos_init_seed() == UINT64_MAX);
+
+    for (index = 0U; index < sizeof(unusable) / sizeof(unusable[0]); ++index)
+    {
+        assert(setenv("CHAOS_SEED", unusable[index], 1) == 0);
+        assert(chaos_init_seed() == from_entropy);
+    }
+    assert(unsetenv("CHAOS_SEED") == 0);
+    assert(chaos_init_seed() == from_entropy);
+
+    /* No entropy source: the pid at least differs between the processes of a container. */
+    g_getrandom_fails = 1;
+    assert(chaos_init_seed() == (uint64_t)getpid());
+    g_getrandom_fails = 0;
+}
+
 int main(void)
 {
+    test_installed_trace_set();
+    test_seed_from_environment();
     test_parse_args();
     test_filter_decisions();
+    test_traced_group();
+    test_clock_group();
     test_exit_code();
     test_kernel_and_reasons();
     test_status_text();

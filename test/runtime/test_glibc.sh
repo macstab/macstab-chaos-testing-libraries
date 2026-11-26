@@ -14,7 +14,9 @@
 # - write:TORN and pwrite:TORN shorten write, writev, pwritev, sendfile and copy_file_range
 #   to 1..n-1 bytes;
 # - LATENCY:200 delays fsync, ftruncate, fallocate, unlinkat and renameat (rename_to) by
-#   >= 150 ms.
+#   >= 150 ms;
+# - write:THROTTLE:262144 holds 512 KiB of writes to about a second and makes them short,
+#   while the same writes with the rate on another path are immediate and whole.
 #
 # Method: docker buildx builds libchaos-io-glibc-<arch>.so (make cross-glibc-<arch>) on
 # gcc:bookworm. An inline C probe is compiled in a gcc:bookworm stage and copied with the library
@@ -27,7 +29,7 @@
 #          CHAOS_SKIP_EXIT  exit status of a skip (default 0; CI sets 1)
 # Prereqs: docker with buildx; QEMU binfmt for a foreign platform. Run by `make test` and,
 #          once per platform, by `make test-matrix`.
-# Exit:    0 when every check passes; the probe's step number (1-61, in main() order) at
+# Exit:    0 when every check passes; the probe's step number (1-65, in main() order) at
 #          the first failing check; non-zero when the build fails or yields no library;
 #          2 on bad usage; CHAOS_SKIP_EXIT when the host or platform is not amd64/arm64,
 #          docker is missing or its daemon is unreachable.
@@ -256,6 +258,74 @@ static int torn_write_payload(const char *path, const char *payload)
 
     if (close(fd) != 0) {
         return 43;
+    }
+
+    return 0;
+}
+
+/*
+ * THROTTLE: 512 KiB written in two 256 KiB rounds against a rate of 256 KiB/s. The bucket
+ * starts full, so the first round passes at once and the second takes about a second,
+ * arriving in short writes. Without a matching rule the same loop is immediate and every
+ * write is whole -- which is what tells a real rate from a slow machine.
+ */
+static int throttle_write_payload(const char *path, int expect_slow)
+{
+    static char block[262144];
+    struct timespec start;
+    struct timespec end;
+    long long elapsed_ms;
+    int short_write = 0;
+    int round;
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+
+    if (fd < 0) {
+        return 80;
+    }
+
+    memset(block, 'x', sizeof(block));
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        close(fd);
+        return 81;
+    }
+
+    for (round = 0; round < 2; ++round) {
+        size_t done = 0U;
+
+        while (done < sizeof(block)) {
+            ssize_t rc = write(fd, block + done, sizeof(block) - done);
+
+            if (rc <= 0) {
+                close(fd);
+                return 82;
+            }
+            if ((size_t)rc < sizeof(block) - done) {
+                short_write = 1;
+            }
+            done += (size_t)rc;
+        }
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        close(fd);
+        return 83;
+    }
+
+    if (close(fd) != 0) {
+        return 84;
+    }
+
+    elapsed_ms = (long long)(end.tv_sec - start.tv_sec) * 1000 +
+                 (end.tv_nsec - start.tv_nsec) / 1000000;
+    if (expect_slow) {
+        if (elapsed_ms < 700 || !short_write) {
+            return 85;
+        }
+        return 0;
+    }
+
+    if (elapsed_ms >= 300 || short_write) {
+        return 86;
     }
 
     return 0;
@@ -1189,6 +1259,24 @@ int main(void)
 
     if (renameat_with_latency("/tmp/rename-old", "source.bin", "/tmp/rename-new", "dest.bin") != 0) {
         return 61;
+    }
+
+    if (write_config("/tmp/throttle.bin:write:THROTTLE:262144", now + 23) != 0) {
+        return 62;
+    }
+
+    if (throttle_write_payload("/tmp/throttle.bin", 1) != 0) {
+        return 63;
+    }
+
+    /* The same writes with the rate on another path: immediate and whole, so the second
+     * above measured the rule and not this machine. */
+    if (write_config("/tmp/elsewhere.bin:write:THROTTLE:262144", now + 24) != 0) {
+        return 64;
+    }
+
+    if (throttle_write_payload("/tmp/throttle.bin", 0) != 0) {
+        return 65;
     }
 
     return 0;

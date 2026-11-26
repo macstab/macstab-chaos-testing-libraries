@@ -54,11 +54,11 @@ document wins where the two would disagree.
 | Hits file | `/tmp/.chaos-net.hits.<n>` |
 | Rule grammar | `<selector>:<operation>:<effect>:<value> [qualifier ...]` |
 | Operations | `socket`, `bind`, `listen`, `connect`, `accept`, `shutdown`, `send`, `recv`, `close`, `poll` |
-| Effects | ERRNO, LATENCY, CORRUPT, TIMEOUT, RESET, TRICKLE, DUP |
-| Qualifiers | `@first=N`, `@from=T`, `@until=T`, `@size>N`, `@size<N` |
+| Effects | ERRNO, LATENCY, CORRUPT, TIMEOUT, RESET, TRICKLE, DUP, DROP, THROTTLE, REDIRECT |
+| Qualifiers | `@first=N`, `@every=N`, `@at=+N`, `@from=T`, `@until=T`, `@size>N`, `@size<N` |
 | Limits | 256 rules; rule file under 256 KiB (262 144 bytes) |
 | Failure mode | fail-open: no rule, bad rule file or unresolvable endpoint means passthrough |
-| SECCOMP mode | ERRNO (not on `close`), LATENCY and TIMEOUT only; see [`docs/SECCOMP.md`](SECCOMP.md) |
+| SECCOMP mode | ERRNO (not on `close`), LATENCY, TIMEOUT, REDIRECT on connect, DROP on a datagram send, THROTTLE on a send, TRICKLE, CORRUPT and DUP on a receive, RESET on close; see [`docs/SECCOMP.md`](SECCOMP.md) |
 
 ## 1. Overview
 
@@ -135,7 +135,7 @@ Out of scope, by design:
 
 | File | Responsibility |
 |------|----------------|
-| `src/net/chaos_net.c` | constructor, real-symbol table, PRNG seeding |
+| `src/net/chaos_net.c` | constructor, real-symbol table, process seed (`CHAOS_SEED`) |
 | `src/net/chaos_net_config.c` | rule file loading, parsing, reload, status and hits reporting, rule selection |
 | `src/net/chaos_net_endpoint.c` | selector parsing, `sockaddr` and descriptor to endpoint conversion, matching rank |
 | `src/net/chaos_net_actions.c` | probability decision, LATENCY sleep, bit flip, ERRNO |
@@ -196,7 +196,7 @@ a file reaches the io rules in any order.
 - **Effect**: what a firing rule does to the call.
 - **Probability**: the chance, in `[0, 1]`, that a matching rule fires on one
   call.
-- **Qualifier**: a gate after the rule (`@first`, `@from`, `@until`, `@size`)
+- **Qualifier**: a gate after the rule (`@first`, `@every`, `@at`, `@from`, `@until`, `@size`)
   that every effect must also pass.
 - **Hit**: one firing of a rule, counted in the hits file.
 - **Real function**: the next definition of the symbol, found by
@@ -220,8 +220,8 @@ Every wrapper runs the same sequence:
    With no rules, or no resolvable endpoint, call the real function.
 4. Select the single best rule for `(operation, endpoint)`. If none, call the
    real function.
-5. Apply the effect: pre-call (ERRNO, LATENCY, TIMEOUT, RESET, TRICKLE, DUP
-   replay) or post-call (CORRUPT, DUP store, ERRNO on `close`).
+5. Apply the effect: pre-call (ERRNO, LATENCY, TIMEOUT, RESET, TRICKLE, THROTTLE,
+   REDIRECT, DROP, DUP replay) or post-call (CORRUPT, DUP store, ERRNO on `close`).
 
 Exactly one rule applies to a call. Two rules for the same operation and endpoint
 do not compose; the more specific one wins (see below). To combine, for example,
@@ -236,12 +236,18 @@ gets a rank:
 | Rank | Selector |
 |------|----------|
 | 4 | `unix://<path>`, exact path |
-| 3 | `tcp4://`, `tcp6://`, `udp4://`, `udp6://` with exact address and port |
+| 3 | `tcp4://`, `tcp6://`, `udp4://`, `udp6://` with an address and exact port; a `/N` prefix counts as an address |
 | 2 | `<scheme>://*:<port>` (any host, exact port) or `unix://*` |
 | 1 | `*` |
 
-The highest rank wins. A tie goes to the longer selector text, then to the rule
-that comes first in the file.
+The highest rank wins. A tie goes to the longer address prefix, then to the longer
+selector text, then to the rule that comes first in the file.
+
+The prefix stage sits above the text stage because the text would order the wrong way
+round: `tcp4://10.0.0.0/8:5432` is written one byte longer than `tcp4://10.1.0.0/16:5432`
+is not, and for an address both contain the `/16` rule is the one meant. A literal address
+is the `/32` (or `/128`) case of the same comparison, so it beats every shorter prefix
+without a rule of its own.
 
 For `send` and `recv` on a connected socket both ends are searched in one pass,
 so a wildcard for one end never shadows a more specific rule for the other. A
@@ -306,7 +312,7 @@ title libchaos-net components
 component "Target application" as App
 component "Socket wrappers\n(socket ... close, read/write on sockets)" as Sock
 component "Wait wrappers\n(poll, select, epoll)" as Wait
-component "Runtime core\n(once-resolved symbols, TLS guard, PRNG)" as Core
+component "Runtime core\n(once-resolved symbols, TLS guard, seed)" as Core
 component "Config engine\n(rule file, two snapshots, reload, status, hits)" as Config
 component "Endpoint resolver\n(sockaddr, getsockname, getpeername, SO_TYPE)" as Resolver
 component "Effects\n(ERRNO, LATENCY, CORRUPT, TIMEOUT,\nRESET, TRICKLE, DUP)" as Effects
@@ -416,8 +422,9 @@ acts only on its own descriptor kind and forwards the rest.
   the system call directly (`sendto` for `send`, `recvfrom` for `recv`, `ppoll`
   for `poll`, `pselect6` for `select`, `epoll_pwait` for `epoll_wait`, since
   arm64 lacks the older system calls).
-- The constructor seeds the PRNG from 8 bytes of `/dev/urandom`, read with raw
-  `openat`/`read`/`close` system calls (fallback `0x6a09e667f3bcc909 ^ getpid()`),
+- The constructor takes the process seed from `CHAOS_SEED`, else from 8 bytes of
+  `/dev/urandom` read with raw `openat`/`read`/`close` system calls (fallback
+  `0x6a09e667f3bcc909 ^ getpid()`),
   initialises the config engine and loads the rule file once, so a bad rule file
   is reported in the status file at start-up.
 
@@ -436,15 +443,19 @@ and `getsockopt` it issues runs under the reentrancy guard and preserves `errno`
 ### Effects (`chaos_net_actions.c` and the wrappers)
 
 ERRNO, LATENCY and the probability decision are shared. CORRUPT, TIMEOUT, RESET,
-TRICKLE and DUP are implemented where the call's buffers are, in the wrappers.
+TRICKLE, DROP, THROTTLE, REDIRECT and DUP are implemented where the call's buffers and
+addresses are, in the wrappers.
 
 ### Why there is no socket cache
 
 A cache of descriptor → endpoint would need `close()`, `dup2()`, `fork()` and
 `exec` invalidation to stay correct, and descriptor numbers are reused within
-microseconds. The library resolves endpoints per call instead and keeps only one
-piece of per-descriptor state, the DUP payload table, which tags each payload
-with the socket's inode and device and is cleared on `close()`.
+microseconds. The library resolves endpoints per call instead and keeps
+little per-descriptor state: the DUP payload table, which tags each payload with the
+socket's inode and device and is cleared on `close()`, and the THROTTLE bucket table,
+whose entries are tagged with the descriptor and the rate and are taken over by whatever
+pair lands in the slot next -- a bucket holds no data, so a stale one costs at most one
+second of allowance.
 
 ## 7. Data Model and State
 
@@ -453,8 +464,10 @@ with the socket's inode and device and is cleared on `close()`.
 | Selector | Matches |
 |----------|---------|
 | `tcp4://10.0.0.15:5432` | TCP over IPv4 to/from that address and port (also IPv4-mapped IPv6) |
+| `tcp4://10.0.0.0/8:5432` | TCP over IPv4 to/from any address in that network, port 5432 |
 | `tcp4://*:5432` | TCP over IPv4, any address, port 5432 |
 | `tcp6://[::1]:443` | TCP over IPv6, that address and port; brackets are required |
+| `tcp6://[2001:db8::]/32:443` | TCP over IPv6 in that network; the prefix sits outside the brackets |
 | `tcp6://*:443` | TCP over IPv6, any address, port 443 |
 | `udp4://8.8.8.8:53`, `udp6://[2001:db8::1]:53` | the UDP equivalents |
 | `unix:///var/run/docker.sock` | a UNIX socket with exactly that path |
@@ -466,6 +479,15 @@ with the socket's inode and device and is cleared on `close()`.
   wildcard the port. `tcp4://*:0` therefore matches only endpoints with port 0
   (unbound sockets, and the endpoint built at `socket()` time).
 - The kind must match: `tcp4://` never matches UDP or IPv6 traffic.
+- A `/N` prefix is 0 to 32 bits for IPv4 and 0 to 128 for IPv6, and must be written
+  canonically: every bit after the prefix has to be zero, so `10.0.0.0/8` is accepted and
+  `10.0.0.1/8` rejects the rule file rather than being read as the network containing it.
+  A selector's text is a rule's identity -- it keys the rule's hit slot and breaks
+  specificity ties -- so two spellings of one network would be two rules matching exactly
+  the same traffic. The rejection also catches the mistake behind it, which is usually a
+  prefix length the author did not mean. `*` takes no prefix: it compares no address bits.
+- A prefix selector does not reach a dual-stack `[::]` listener (§4.6). That listener has
+  no IPv4 address to compare against; only a wildcard host matches it across families.
 - A UNIX path may be up to 255 bytes. It cannot contain `#` (comment start).
 - `socket` rules accept only selectors that describe no address: `*`,
   `<scheme>://*:0` and `unix://*`. Anything else rejects the rule file.
@@ -486,6 +508,7 @@ tcp4://*:5432:accept:LATENCY:150
 unix:///var/run/docker.sock:recv:CORRUPT:0.01
 *:poll:TIMEOUT:0.1
 tcp4://127.0.0.1:5432:connect:ECONNREFUSED:1.0 @first=3
+udp4://10.0.0.5:53:send:DROP:0.1
 ```
 
 ### Effects
@@ -493,16 +516,79 @@ tcp4://127.0.0.1:5432:connect:ECONNREFUSED:1.0 @first=3
 | Effect | Value | Operations | When it acts |
 |--------|-------|------------|--------------|
 | ERRNO (`<errno name>`) | probability | all ten | before the call; on `close` after it |
-| LATENCY | milliseconds, 0–4294967295 | all ten | before the call |
+| LATENCY | milliseconds, 0–4294967295, optionally `@probability` | all ten | before the call |
 | CORRUPT | probability | `recv` | after a receive that returned bytes |
 | TIMEOUT | probability | `poll` | instead of the wait |
 | RESET | probability | `close` | before the close |
 | TRICKLE | bytes per receive, 1–4294967295 | `recv` | before the receive |
 | DUP | probability | `recv` | instead of the next receive |
+| DROP | probability | `send` | instead of the send, on datagram sockets |
+| THROTTLE | bytes per second, 1–4294967295 | `send` | before the send |
+| REDIRECT | `ADDRESS:PORT`, optionally `@probability` | `connect` | instead of the address |
 
-An effect/operation pair outside this table rejects the rule file. LATENCY has no
-probability: it fires on every matching call that passes its qualifiers. TRICKLE
-takes a byte count, not a probability, and fires whenever it applies.
+An effect/operation pair outside this table rejects the rule file.
+
+`REDIRECT` is the one effect whose value carries a `:` of its own, so a line holding the
+keyword `:REDIRECT:` is split there rather than from the right. An IPv6 target needs its
+brackets, as an IPv6 selector does: `[2001:db8::1]:443`.
+
+A `unix://` selector with a `REDIRECT` target **rejects the rule file**. The target is an
+address and a port, so the rule could only fire on a UNIX `connect` by writing an IP
+address over a `sockaddr_un` -- it would never fire, and a rule that is loaded, reported
+and silent is the one outcome this library rejects on sight. Redirecting a UNIX socket
+elsewhere is not expressible: name the socket the program should reach instead.
+
+Under `chaos-init`, `TRICKLE` applies to `recv`, `recvfrom` and `read` on a stream socket:
+their length sits in a register, so those calls are answered with `SECCOMP_RET_TRACE` and
+shortened at the stop ([SECCOMP.md
+§3.3](SECCOMP.md#33-effects-that-need-the-registers-not-a-reply)). `recvmsg` and the
+batches keep their length in memory and run whole, counting no hit, as they do here.
+
+`CORRUPT` applies there as well, but at the stop *after* the call: how many bytes a
+receive delivered is its return value, so the entry stop has nothing to draw from. The
+byte and the bit are drawn at the second stop and written into the tracee's buffer, which
+keeps the rule's own promise -- a receive that delivered nothing counts no hit. The same
+two limits hold as here: `MSG_TRUNC` on a stream socket wrote nothing, and `recvmsg` and
+the batches keep their buffer in an iovec and are left alone, counting no hit.
+
+`DUP` applies there too, across both stops: the receive that finds no kept payload runs and
+its bytes are kept at the exit stop, and the next one is answered with them without running.
+The bypassed flags, the replay-once rule and the sender address of a datagram are the same
+as here. One difference: the supervisor keeps a payload per **socket** (by inode, 16 at a
+time, the oldest giving way), where the library keeps one per descriptor in the table of its
+own address space. Two processes that share the descriptor therefore share one kept payload
+under `chaos-init`, and a `fork` child does not inherit a copy of it.
+
+DROP reports a send as done and sends nothing, which is a lost packet. It applies to
+datagram sockets only, decided per call from `SO_TYPE` rather than from the selector: a
+`*:send:DROP` rule is accepted and leaves stream sends alone, counting no hit for them. A
+hole in a TCP stream is not packet loss -- the kernel retransmits until the bytes arrive
+or the connection breaks, so a stream with a silent gap is a state no network produces,
+and a program could not be written to survive it. `sendmmsg` is left alone as well: its
+result is a message count, not a byte count. A send whose byte count is not a value the
+call could return (an unreadable vector, or an iovec total above `SSIZE_MAX`) is sent for
+real, since reporting it would hand the caller a negative count. LATENCY takes its
+probability as an optional `@probability` after the milliseconds
+(`tcp4://127.0.0.1:6379:recv:LATENCY:200@0.1`); without one it is 1.0 and the rule
+fires on every matching call that passes its qualifiers, which is what `LATENCY:ms`
+has always meant. TRICKLE takes a byte count, not a probability, and fires whenever
+it applies, and THROTTLE takes a rate on the same terms.
+
+THROTTLE holds the send side of a socket to a byte rate. Each send takes its bytes from a
+token bucket of one second's worth, kept per rule and per descriptor: a full bucket lets
+the first second's worth through untouched, so only a sender that keeps going is slowed
+down, and an allowance that covers the whole send changes nothing and counts no hit.
+A stream send that gets part of what it asked for sends that part, which is what a
+socket under back pressure does anyway. A datagram is never cut -- half a datagram is not
+a datagram, and the kernel would deliver the shortened message as the whole one -- so such
+a send waits until its whole message is paid for and then goes out intact. When the bucket
+is empty, a non-blocking socket is told `EAGAIN`, which is what its event loop is written
+for, and a blocking one waits for a tenth of a second's worth: short sends rather than
+long sleeps, so a rate does not stall an event loop that shares the thread. `sendmsg` and
+the batches keep their length in memory and are left alone, counting no hit, as TRICKLE
+leaves `recvmsg` alone. The receive side has no THROTTLE: holding back data the kernel has
+already buffered would not be a rate, and TRICKLE is the chunking effect for that
+direction.
 
 ### Probability
 
@@ -510,8 +596,10 @@ A probability is written `0`, `1`, `0.` followed by digits, or `1.` followed by
 zeros; trailing blanks are allowed. Parsing is independent of `LC_NUMERIC` (the
 JVM calls `setlocale(LC_ALL, "")`, and under a German locale `strtod` would stop
 at the `.`), and rejects `nan`, `inf`, hexadecimal and exponents. The first 15
-decimals are exact. A rule fires when a 32-bit sample from the per-thread PRNG is
-below `probability × 2^32`; 0 never fires and 1 always does.
+decimals are exact. A rule fires when its 32-bit probability sample is below
+`probability × 2^32`; 0 never fires and 1 always does. The sample follows from the
+rule, the number of this evaluation of it and `CHAOS_SEED`, so the same run
+reproduces (`docs/DSL.md` §6.4) -- there is no stream another thread could shift.
 
 ### ERRNO values
 
@@ -525,10 +613,15 @@ The errno names accepted in the effect field, with no per-operation filtering:
 | `EINVAL` | `EINTR` | `ENOMEM` | `ENOBUFS` |
 | `EMFILE` | `ENFILE` | `EAGAIN` | |
 
-The set is a whitelist: `EFAULT`, `EBADF` and similar values that would make a
-correct program look buggy are not accepted. Pick a value the real function can
-return for the operation (`EADDRINUSE` on `bind`, `ECONNREFUSED` on `connect`,
-`EAGAIN` on a non-blocking `recv`); the library does not check.
+A positive decimal number from 1 to 2 147 483 647 is accepted too and passed through
+as written, which is how a rule reaches an error this build has no name for; the number
+is range-checked and never interpreted.
+
+The names are a whitelist: `EFAULT`, `EBADF` and similar values that would make a
+correct program look buggy have no name here -- though the number of one still works,
+which is the price of being able to name an unknown error. Pick a value the real
+function can return for the operation (`EADDRINUSE` on `bind`, `ECONNREFUSED` on
+`connect`, `EAGAIN` on a non-blocking `recv`); the library does not check.
 
 ### Effect semantics
 
@@ -547,7 +640,8 @@ preserved. The sleep also happens on non-blocking sockets (`O_NONBLOCK`,
 which is exactly what a slow system call does to such a loop.
 
 **CORRUPT.** After a receive that returned bytes, one bit of the received data is
-inverted: byte index and bit index come from two independent PRNG draws. The
+inverted: the byte index is this evaluation's first effect draw and the bit its
+second. The
 target stays within what the call wrote: for `recv`, `recvfrom` and `recvmsg` the
 smaller of the return value and the buffer size, and nothing at all for a
 `MSG_TRUNC` receive on a stream socket (the kernel discards the data without
@@ -582,6 +676,82 @@ an RST (`ECONNRESET`) instead of an orderly end of stream. This is what a crashe
 or killed process, or a load balancer dropping a connection, looks like from the
 other side. `errno` is preserved across the `setsockopt`; the close itself always
 runs, so `libchaos-io`'s descriptor cache still sees it.
+
+`SO_LINGER` belongs to the open file description, not to the descriptor, and a
+close frees the description only when it is the last one referring to it. On a
+socket another descriptor still holds, the option would reset nothing now and
+reset the connection at some later close, in another process, for no rule. The
+effect therefore applies only once this process is the sole owner, which is
+established by looking for the socket's inode in `/proc/<pid>/fd` — so `fork`,
+`dup`, `posix_spawn` and `SCM_RIGHTS` are all covered alike. Anything that cannot
+be read counts as shared, because a wrong "sole owner" is what leaves the option
+behind. Ownership is settled before the rule fires, so a suppressed RESET spends
+neither a hit nor a `@first` claim.
+
+On a pre-forking server this means `close:RESET` takes effect in the process that
+closes last. A rule that only ever matches the parent's close — a Postgres
+postmaster handing the connection to a backend, for instance — does nothing, and
+its hit count stays at zero rather than claiming an RST that never left.
+
+**Measured against PostgreSQL 16 (alpine, musl, `LD_PRELOAD` in the server), and it is
+the limiting case:** a `close:RESET` rule resets nothing there. The postmaster closes its
+copy of each accepted socket right after forking the backend, and that close is suppressed
+because the backend still holds it; the backend then ends the session by **exiting**, and a
+process that exits closes its descriptors in the kernel, where no interposed `close` exists
+to decide. The rule says so rather than lying about it: `suppressed.shared` counts up and
+the hit count stays 0. Everything else in that backend works -- a `send:LATENCY:200` rule
+on the same endpoint produced two hits per backend in the same setup -- so this is about
+the one call that is never made, not about the library reaching the process.
+
+To model "the server dropped the connection" against such a server, fault the **client**
+side instead: `recv:ECONNRESET` on the client gives it exactly what an RST gives it, from a
+call the client does make. `close:RESET` is for a process that closes the socket itself,
+which is the common case in application code and in single-process servers.
+
+A hit count of zero alone would not say whether the rule never matched or matched
+and was suppressed, so every suppression is counted and published. The hits file
+carries two header lines in front of the rule lines:
+
+```
+generation=4
+suppressed.shared=3
+suppressed.unknown=0
+12	tcp4://127.0.0.1:5432:close:RESET:1 # pg
+```
+
+The `generation` line is written by every library (`chaos_hits.h`) and, under
+`chaos-init`, by the supervisor on their behalf: it counts the rule-file snapshots
+this process has published, so a count of 0 after a reload can be told apart from a
+count the reload reset, whichever mode produced the counts.
+
+`shared` means the socket was held elsewhere — a pre-forking server behaving as
+designed. `unknown` means the ownership could not be established at all (a
+process of another user or PID namespace, an unreadable `/proc`), which is an
+environment to fix rather than a result to interpret. Both lines are written even
+while both counts are zero, so "nothing was suppressed" is distinguishable from
+"this library does not report it".
+
+The counts are per matched close, not per fault that would have fired: ownership
+is settled before the probability is drawn, so with the usual `RESET:1` the count
+is exact and below that it is an upper bound. They belong to the process, like
+hit counts, and a `fork` child starts at zero. A suppression also triggers the
+hits-file write on its own cadence, so a rule that is only ever suppressed still
+reports during the test instead of at process exit.
+
+Both lines carry no tab. A reader that splits each line on the first tab and
+skips what has none therefore ignores them without changes — which is why they
+are header lines rather than another column.
+
+Under `chaos-init` all of this holds, with the `setsockopt` running inside the
+traced process: the close is answered with `SECCOMP_RET_TRACE`, the option is set
+through a call the supervisor substitutes at that stop, and the close is then put
+back and runs for real ([SECCOMP.md
+§3.3](SECCOMP.md#33-effects-that-need-the-registers-not-a-reply)). The ownership
+scan reads the same `/proc` links from the other side, under the group leader of
+the calling thread, and the two suppression counts reach the same header lines of
+the hits file. A process whose `/proc` the supervisor cannot read counts as
+unknown there as it does here -- though a supervisor running as the container's
+PID 1 can read more than a library inside one process can.
 
 **TRICKLE:N.** A receive asks the kernel for at most N bytes. `recv`, `recvfrom`
 and `read` pass N as the length; `recvmsg` and `readv` pass a copy of the iovec
@@ -635,17 +805,73 @@ rarely tested (double charges, double writes, repeated side effects).
   buffer reached. A `fork()` child releases slot locks that other threads held at
   the fork.
 
+**REDIRECT:address:port.** The connection is made to that address instead of the one the
+program asked for -- the misconfiguration no errno models: the staging database, a service
+that answers and is the wrong one, a sidecar that has moved.
+
+- The real `connect` is called with the address of the rule, so the kernel treats it as the
+  destination: `getpeername` reports it, and so does `ss`. Nothing in the program is told
+  that the address it passed was replaced, which is the point.
+- **Every later rule matches the redirected address.** A rule on the original destination
+  fires once, on the connect; the sends and receives that follow match rules for the
+  address the connection actually reached. Writing both is how a test says "the connection
+  goes there, and there it is slow".
+- The family of the address the program passed decides what can be written into it: an
+  IPv4 target over an `AF_INET6` address becomes the IPv4-mapped form
+  (`::ffff:a.b.c.d`), which is how such a socket reaches an IPv4 host; an IPv6 target over
+  an `AF_INET` address fits nowhere, so the rule does not fire and counts no hit -- decided
+  per call, before the draw, as DROP decides stream against datagram.
+- `connect` is the only operation: `bind` names a local address, and a datagram send names
+  its destination per call, which a rule cannot rewrite without also rewriting what the
+  caller believes it sent.
+- Under `chaos-init` the address lives in the memory of the traced process. The supervisor
+  writes it there once the notification is confirmed and then lets the call run, because a
+  reply of CONTINUE makes the kernel read the arguments again. A write that fails leaves
+  the original address in place, and the connection goes where the program meant.
+- That write is the one way the two modes differ, and it is visible: under `LD_PRELOAD` the
+  wrapper passes a copy and the caller's sockaddr is untouched, while the supervisor has to
+  overwrite the caller's own buffer -- the kernel reads the argument from there and nothing
+  but a register could point it elsewhere. A program that keeps the sockaddr and dials it
+  again therefore reaches the target a second time under `chaos-init`, with no rule firing
+  and no hit counted, where under `LD_PRELOAD` it would reach the address it stored. Build
+  the sockaddr per connect, as every runtime does, and the difference does not arise.
+
+**THROTTLE:rate.** A byte rate on the send side, in bytes per second. Each send takes
+what it needs from a token bucket; the bucket holds one second's worth and refills at
+the rate, as a single 64-bit word per (rule, descriptor) updated with one compare and
+swap, so threads sharing a socket share the rate without waiting for each other.
+
+- A full bucket -- which is what a rule that has just been loaded finds -- passes the
+  whole send untouched and counts no hit. The rate therefore only bites a sender that
+  keeps going, and a test that sends one message never sees it.
+- A stream send takes what is there and sends that; the caller sees a short send, which
+  is what a socket under back pressure gives it anyway.
+- A datagram is sent whole or waited for: a shortened buffer would be delivered as the
+  whole message. Such a send waits for the bytes it is short of and then goes out intact.
+- An empty bucket means `EAGAIN` on a non-blocking socket and otherwise a wait for a
+  tenth of a second's worth, which bounds the wait at about 100 ms. The bytes are charged
+  when the wait starts, so two threads waiting on one socket are told to wait one after
+  the other instead of both for the same bytes.
+- `sendmsg`, `sendmmsg` and `writev` keep their length in memory rather than in the
+  length argument and are left alone, counting no hit.
+- Under `chaos-init` the same arithmetic runs in the supervisor, which parks the call in
+  its delay queue instead of sleeping in the thread, so the other threads of the traced
+  process keep being served. The rate a process sees is the same; only the place where
+  the waiting happens differs.
+
 ### Qualifiers
 
 Qualifiers are whitespace-separated words starting with `@` at the end of the
-rule, before any comment. An unknown or malformed qualifier, or `@until` not after
-`@from`, rejects the rule file.
+rule, before any comment. An unknown or malformed qualifier, `@until=0`, or `@until` not
+after `@from`, rejects the rule file.
 
 | Qualifier | Meaning |
 |-----------|---------|
 | `@first=N` | fire at most N times in this process (N ≥ 1, at most 18 digits), then go inert |
+| `@every=N` | only every Nth evaluation of the rule (N ≥ 1): evaluations, not hits, counted per process as the `@first` budget is |
+| `@at=+N` | only from N ms after the rule became active for that process, which is when its rule file was loaded there; a reload that leaves the rule unchanged does not restart the delay |
 | `@from=T` | active only when the wall clock is at or after T (Unix milliseconds) |
-| `@until=T` | active only before T (Unix milliseconds) |
+| `@until=T` | active only before T (Unix milliseconds, T >= 1: 0 is how "no upper bound" is stored, so it is rejected rather than read as never) |
 | `@size>N`, `@size<N` | apply only to calls that move more (fewer) than N bytes |
 
 Only data-moving calls carry a byte count: `send`, `sendto`, `recv`, `recvfrom`,
@@ -682,7 +908,8 @@ runs inside whichever wrapper call notices the change.
 |-------|-------|-----------------|
 | Rule snapshots (two) | process | single-writer reload claim, sequence counter per snapshot |
 | Reentrancy guard | thread (`__thread int`) | none needed |
-| PRNG state | thread (`__thread uint64_t`) | none needed |
+| Process lineage | process (`uint64_t`) | written only by the atfork child handler |
+| Fork counter | process (`uint64_t`) | atomic increment in the atfork prepare handler |
 | Endpoints | stack, per call | none needed |
 | DUP slot table | process | per-slot try-lock, lock-free close path |
 | Hit counters | process | atomic increments; one writer of the hits file at a time |
@@ -726,9 +953,16 @@ fires nor counts.
 
 - `pthread_atfork` child handlers release a reload claim and the hits-writer flag
   held by threads that do not exist in the child, reset hit counts and `@first`
-  claims, give the child its own hits file, reset the forking thread's PRNG state
-  (it reseeds from its own thread id on the next draw, so pre-fork workers do not
-  all decide alike), and release DUP slot locks.
+  claims, give the child its own hits file, mix the process lineage forward, and
+  release DUP slot locks.
+- What is mixed forward is the child's **ordinal among its siblings**, counted by
+  the prepare handler in the parent before each fork. Mixing a constant would give
+  every child of one parent the same lineage, and the backends of a pre-forking
+  server -- each evaluating a rule for the first time -- would then draw the same
+  sample: `tcp4://*:5432:close:RESET:0.5` would reset every connection or none of
+  them. With the ordinal they draw independently, and the same fork order repeats
+  the same run under `CHAOS_SEED`
+  ([`docs/DSL.md` §6.4](DSL.md#64-reproducibility)).
 - A `vfork()` child and `posix_spawn()` run no atfork handler. They share the
   parent's memory, see its claims as busy, and never write a hits file.
 - After `exec` the new image loads the library afresh if `LD_PRELOAD` is still
@@ -911,6 +1145,12 @@ tcp4://*:8443:accept:LATENCY:200
 # Redis replies arrive one byte at a time (client side: the server is the peer).
 tcp4://10.0.0.5:6379:recv:TRICKLE:1
 
+# The connection to the primary lands on the read replica instead.
+tcp4://10.0.0.15:5432:connect:REDIRECT:10.0.0.16:5432
+
+# The link to the object store gives 64 KiB/s on the send side.
+tcp4://10.0.0.7:9000:send:THROTTLE:65536
+
 # 5 % of Kafka fetch responses are delivered twice.
 tcp4://10.0.0.9:9092:recv:DUP:0.05
 
@@ -969,7 +1209,8 @@ any service-mesh sidecar connection in the process.
 ### Private
 
 - helper names and file layout, endpoint representation, snapshot layout;
-- the DUP table geometry (64 slots, 4096 bytes);
+- the DUP table geometry (64 slots, 4096 bytes), and the THROTTLE bucket table
+  (64 slots) with the tenth of a second a waiting send asks for;
 - the reload throttle (1 ms) and racy window (20 ms).
 
 ### Adding an effect
@@ -994,7 +1235,8 @@ any service-mesh sidecar connection in the process.
 - **Dynamic linker.** Interposition requires a dynamically linked target that
   honours `LD_PRELOAD` (not set-uid under `AT_SECURE`). Statically linked
   programs and runtimes with their own system-call layer bypass the library;
-  SECCOMP mode covers them for ERRNO, LATENCY and TIMEOUT.
+  SECCOMP mode covers them for ERRNO, LATENCY, TIMEOUT, DROP, THROTTLE, REDIRECT, TRICKLE, CORRUPT, DUP
+  and RESET.
 - **Kernel.** Endpoint identity comes from `getsockname`, `getpeername` and
   `SO_TYPE`; `epoll` membership from `/proc/self/fdinfo`. TIMEOUT waits with
   `ppoll` and the kernel's 8-byte signal set.

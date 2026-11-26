@@ -30,6 +30,27 @@
 #include "../../src/init/chaos_init_proc.c"
 #include "../../src/init/chaos_init_tracee.c"
 
+/* The seed source lives in chaos_init_core.c, which this test does not include; the
+ * declaration comes from chaos_init_core.h, so the definition may follow the include. A
+ * fixed value keeps the rules' draw keys the same in every run. */
+uint64_t chaos_init_seed(void)
+{
+    return UINT64_C(0x5eed5eed5eed5eed);
+}
+
+/* The installed TRACE set lives in chaos_init_core.c, which this file does not include.
+ * Nothing here decides a traced effect, so a fixed answer will do. */
+void chaos_init_traced_set(const long *calls, size_t count)
+{
+    (void)calls;
+    (void)count;
+}
+int chaos_init_traced(long nr)
+{
+    (void)nr;
+    return 1;
+}
+
 #include <assert.h>
 #include <sys/mman.h>
 
@@ -137,5 +158,21 @@ int main(void)
     assert(access(hits, F_OK) == 0);
     (void)unlink(hits);
     (void)unlink("/tmp/.chaos-memory.conf");
+    /* A reload without a call: what the inotify watch of chaos_init.c asks for when a
+     * rule file is put in place, so that the status file reports the rules before anything
+     * has called into them. Two rules, because every file loaded above has one or none: a
+     * status that said anything else would mean the reload did nothing. */
+    write_rules("mmap:ERRNO:ENOMEM\nmunmap:ERRNO:EINVAL\n");
+    chaos_init_memory_reload();
+    {
+        FILE *reloaded = fopen("/tmp/.chaos-memory.status", "r");
+        char text[256] = {0};
+
+        assert(reloaded != NULL);
+        text[fread(text, 1U, sizeof(text) - 1U, reloaded)] = '\0';
+        (void)fclose(reloaded);
+        assert(strncmp(text, "state=ok\nrules=2\n", strlen("state=ok\nrules=2\n")) == 0);
+    }
+
     return 0;
 }

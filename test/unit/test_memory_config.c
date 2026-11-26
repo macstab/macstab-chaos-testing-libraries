@@ -861,9 +861,25 @@ static void test_fork_takes_over_orphaned_reload(void)
     g_chaos_memory_cached_mtime = CHAOS_MEMORY_MTIME_RELOADING;
     (void)chaos_memory_config_prepare();
     assert(g_chaos_memory_cached_mtime == CHAOS_MEMORY_MTIME_RELOADING);
-    g_chaos_memory_tls_prng_state = UINT64_C(42);
+    g_chaos_memory_lineage = 0U;
+    g_chaos_memory_forks = 0U;
+    chaos_memory_config_before_fork();
     chaos_memory_config_after_fork();
-    assert(g_chaos_memory_tls_prng_state == 0U);
+    assert(g_chaos_memory_lineage != 0U);
+    /* And from its siblings': the ordinal the prepare handler counted in the parent is
+     * what tells two children apart, without which a pre-forking server would draw one
+     * sample for all of its backends. Deterministic, so the same fork order repeats. */
+    {
+        const uint64_t first_child = g_chaos_memory_lineage;
+
+        g_chaos_memory_lineage = 0U;
+        g_chaos_memory_forks = 1U;
+        chaos_memory_config_before_fork();
+        chaos_memory_config_after_fork();
+        assert(g_chaos_memory_lineage != first_child && g_chaos_memory_lineage != 0U);
+    }
+    g_chaos_memory_lineage = 0U;
+    g_chaos_memory_forks = 0U;
     assert(g_chaos_memory_cached_mtime == CHAOS_MEMORY_MTIME_UNKNOWN);
     assert(g_chaos_memory_hits_pid == (uint64_t)getpid());
     assert(chaos_memory_config_prepare());
@@ -1126,6 +1142,9 @@ static void test_prepare_reports_status(void)
     assert(!read_status_file(status, sizeof(status)));
 }
 
+/** @brief Header lines of the last read_hits_file(), without the rule lines. */
+static char g_hits_header[128];
+
 /** @brief Reads this process's hits file into @p buffer; returns 0 when it does not exist. */
 static int read_hits_file(char *buffer, size_t size)
 {
@@ -1143,6 +1162,22 @@ static int read_hits_file(char *buffer, size_t size)
     length = fread(buffer, 1U, size - 1U, file);
     buffer[length] = '\0';
     assert(fclose(file) == 0);
+
+    /* The header lines (`generation=`, no tab) are split off into g_hits_header, so the
+     * assertions on the rule lines stay about rule lines. That the header really is in
+     * front, and carries no tab, is asserted here for every reader below. */
+    {
+        const char *rules = strchr(buffer, '\n');
+
+        assert(strncmp(buffer, "generation=", 11U) == 0);
+        assert(rules != NULL);
+        ++rules;
+        assert((size_t)(rules - buffer) < sizeof(g_hits_header));
+        (void)memcpy(g_hits_header, buffer, (size_t)(rules - buffer));
+        g_hits_header[rules - buffer] = '\0';
+        assert(strchr(g_hits_header, '\t') == NULL);
+        (void)memmove(buffer, rules, strlen(rules) + 1U);
+    }
     return 1;
 }
 
@@ -1489,8 +1524,144 @@ static void test_open_errors(void)
     (void)unlink(CHAOS_MEMORY_CONFIG_PATH);
 }
 
+/**
+ * @brief Proves a rule an earlier one always wins against is kept and warned about.
+ *
+ * @details Two rules with the same selector and effect tie on everything but the line, so
+ * the earlier always wins and the later can never fire. It is valid, so the file loads and
+ * the status record names its line. A rule differing in its effect is not shadowed: both
+ * can fire.
+ */
+static void test_shadowed_rules_warn(void)
+{
+    static chaos_memory_rule_t rules[CHAOS_MEMORY_MAX_RULES];
+    char duplicate[] = "mprotect:LATENCY:25\nmprotect:LATENCY:30\n";
+    char distinct[] = "mprotect:LATENCY:25\nmprotect:ERRNO:ENOMEM\n";
+    size_t count = 0U;
+
+    assert(chaos_memory_config_parse_buffer(duplicate, rules, &count) == 0);
+    assert(count == 2U);
+    assert(chaos_memory_config_last_error()->warning_count == 1U);
+    assert(chaos_memory_config_last_error()->warnings[0].line == 2U);
+    assert(
+        strcmp(chaos_memory_config_last_error()->warnings[0].reason, CHAOS_STATUS_WARN_SHADOWED) ==
+        0
+    );
+    assert(chaos_memory_config_last_error()->reason == NULL);
+
+    assert(chaos_memory_config_parse_buffer(distinct, rules, &count) == 0);
+    assert(count == 2U);
+    assert(chaos_memory_config_last_error()->warning_count == 0U);
+}
+
+/**
+ * @brief Proves a rule's draw key follows its text, not its place in the file.
+ *
+ * @details The key is what makes a fault reproducible, so it has to belong to the rule and
+ * not to the slot it occupies: chaos_hits_assign() hands a slot out again when a rule
+ * leaves the file, and a key from the slot index would make the next rule in that slot
+ * inherit the old one's decisions. Asserted by reloading the same two rules in the other
+ * order -- each text keeps its key -- and by adding one in front, which shifts every index
+ * and must leave the keys alone.
+ */
+static void test_draw_key_follows_the_rule_text(void)
+{
+    uint64_t first_key;
+    uint64_t second_key;
+    const chaos_memory_config_state_t *state;
+
+    chaos_memory_config_init();
+    write_config_text("mmap/anon:LATENCY:25\nmadvise:LATENCY:25\n", 91);
+    assert(chaos_memory_config_prepare() == 1);
+    state = chaos_memory_config_active_state();
+    assert(state->rule_count == 2U);
+    assert(strcmp(state->text[0], "mmap/anon:LATENCY:25") == 0);
+    first_key = state->rules[0].key;
+    second_key = state->rules[1].key;
+    assert(first_key != second_key);
+
+    write_config_text("madvise:LATENCY:25\nmmap/anon:LATENCY:25\n", 92);
+    g_chaos_memory_cached_mtime = CHAOS_MEMORY_MTIME_UNKNOWN;
+    assert(chaos_memory_config_prepare() == 1);
+    state = chaos_memory_config_active_state();
+    assert(state->rule_count == 2U);
+    assert(state->rules[0].key == second_key);
+    assert(state->rules[1].key == first_key);
+
+    write_config_text("mprotect:LATENCY:25\nmadvise:LATENCY:25\nmmap/anon:LATENCY:25\n", 93);
+    g_chaos_memory_cached_mtime = CHAOS_MEMORY_MTIME_UNKNOWN;
+    assert(chaos_memory_config_prepare() == 1);
+    state = chaos_memory_config_active_state();
+    assert(state->rule_count == 3U);
+    assert(state->rules[1].key == second_key);
+    assert(state->rules[2].key == first_key);
+    assert(state->rules[0].key != first_key && state->rules[0].key != second_key);
+
+    (void)unlink(CHAOS_MEMORY_CONFIG_PATH);
+}
+
+/**
+ * @brief Proves the hits file names the rule-file generation its counts belong to.
+ *
+ * @details A count of 0 after a reload can mean two things: the rule never fired, or the
+ * reload reset it. The generation tells them apart -- it rises with every published
+ * snapshot, so a reader that sees a new number knows the counts below restarted with it.
+ */
+static void test_hits_name_their_generation(void)
+{
+    char hits[1024];
+    char path[64];
+    const chaos_memory_config_state_t *state;
+    uint64_t first_generation;
+
+    chaos_memory_config_init();
+    write_config_text("mmap/anon:LATENCY:5\n", 101);
+    assert(chaos_memory_config_prepare() == 1);
+    first_generation = g_chaos_memory_config_generation;
+    assert(first_generation > 0U);
+    state = chaos_memory_config_active_state();
+    assert(state->rule_count == 1U);
+    chaos_hit_record(state->rules[0].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    {
+        char expected[40];
+
+        (void)snprintf(
+            expected, sizeof(expected), "generation=%llu\n", (unsigned long long)first_generation
+        );
+        assert(strncmp(g_hits_header, expected, strlen(expected)) == 0);
+    }
+
+    /* A reload publishes a new snapshot, so the number rises. */
+    write_config_text("madvise:LATENCY:5\n", 102);
+    g_chaos_memory_cached_mtime = CHAOS_MEMORY_MTIME_UNKNOWN;
+    assert(chaos_memory_config_prepare() == 1);
+    assert(g_chaos_memory_config_generation == first_generation + 1U);
+    state = chaos_memory_config_active_state();
+    chaos_hit_record(state->rules[0].hit);
+    assert(read_hits_file(hits, sizeof(hits)));
+    {
+        char expected[40];
+
+        (void)snprintf(
+            expected,
+            sizeof(expected),
+            "generation=%llu\n",
+            (unsigned long long)(first_generation + 1U)
+        );
+        assert(strncmp(g_hits_header, expected, strlen(expected)) == 0);
+    }
+
+    (void
+    )snprintf(path, sizeof(path), "%s.%ld", CHAOS_MEMORY_HITS_PREFIX, g_chaos_memory_hits_file);
+    (void)unlink(path);
+    (void)unlink(CHAOS_MEMORY_CONFIG_PATH);
+}
+
 int main(void)
 {
+    test_hits_name_their_generation();
+    test_draw_key_follows_the_rule_text();
     /* Look at the rule file on every call; the throttle has its own test. */
     g_chaos_memory_check_interval_ns = 0U;
     test_parse_buffer_reports_rejected_line();
@@ -1514,5 +1685,6 @@ int main(void)
     test_pending_hits_written_after_interval();
     test_parse_boundaries();
     test_open_errors();
+    test_shadowed_rules_warn();
     return 0;
 }

@@ -139,6 +139,17 @@ static int g_chaos_process_hit_pool_used = 0;
 static volatile unsigned int g_chaos_process_active_config_index = 0U;
 
 /**
+ * @brief Rule-file snapshots this process has published, reported as the hits file's
+ *        `generation=` line.
+ *
+ * @details Lets a reader tell which rules a count belongs to: after a reload that changed
+ * the file the number differs, so counts that restarted are not mistaken for counts that
+ * stalled. Written only by the reload owner, between the same barriers as the active
+ * index.
+ */
+static volatile uint64_t g_chaos_process_config_generation = 0U;
+
+/**
  * Change stamp of the loaded file (hash of mtime s/ns, size, inode, device), or a
  * CHAOS_PROCESS_MTIME_* sentinel.
  *
@@ -184,6 +195,21 @@ static char g_chaos_process_config_texts[CHAOS_PROCESS_MAX_RULES][CHAOS_STATUS_T
 /** @brief Hits-writer lock: set (by CAS) while a thread writes the hits file. */
 static volatile int g_chaos_process_hits_writing = 0;
 
+/**
+ * @brief pthread_atfork() prepare handler: counts this fork in the parent.
+ *
+ * @details The child reads the counter as its own ordinal among its siblings, which is
+ * what makes two children of one parent decide differently (g_chaos_process_forks). Counted
+ * here rather than in the child, because a child cannot tell how many siblings came
+ * before it. Atomic, so two threads forking at once get different ordinals rather than
+ * the same one; which of them gets which follows the order the kernel ran them in, as
+ * everything else about concurrent calls does.
+ */
+static void chaos_process_config_before_fork(void)
+{
+    (void)__sync_fetch_and_add(&g_chaos_process_forks, UINT64_C(1));
+}
+
 /** @brief Set once the atfork handler is registered; pthread_atfork() cannot unregister. */
 static int g_chaos_process_atfork_registered = 0;
 
@@ -207,7 +233,8 @@ static long g_chaos_process_hits_file = 0L;
 static int g_chaos_process_hits_owned = 0;
 
 /** @brief Scratch for the hits file; used only by the holder of the writer lock. */
-static char g_chaos_process_hits_buffer[CHAOS_PROCESS_MAX_RULES * CHAOS_HITS_LINE_MAX + 1U];
+static char g_chaos_process_hits_buffer
+    [CHAOS_PROCESS_MAX_RULES * CHAOS_HITS_LINE_MAX + CHAOS_HITS_HEADER_MAX + 1U];
 
 /* -------------------------------------------------------------------------
  * Internal helpers
@@ -294,6 +321,7 @@ static void chaos_process_config_publish(unsigned int next_index, uint64_t obser
     chaos_process_reset_fail_after_counters();
     __sync_synchronize();
     g_chaos_process_active_config_index = next_index;
+    ++g_chaos_process_config_generation;
     __sync_synchronize();
     g_chaos_process_cached_mtime = observed_mtime;
 }
@@ -986,7 +1014,8 @@ void chaos_process_config_init(void)
     if (!g_chaos_process_atfork_registered)
     {
         g_chaos_process_atfork_registered = 1;
-        (void)pthread_atfork(NULL, NULL, chaos_process_config_after_fork);
+        (void
+        )pthread_atfork(chaos_process_config_before_fork, NULL, chaos_process_config_after_fork);
     }
     /* Find the vDSO clock now, not first inside a wrapper a signal handler may re-enter. */
     (void)chaos_clock_now_ns();
@@ -1102,6 +1131,37 @@ int chaos_process_config_parse_line(char *line, chaos_process_rule_t *rule)
 #endif
 
 /**
+ * @brief Whether rule @p later can never win against one already accepted.
+ *
+ * @details Selection is rank, then the longer selector text, then the earlier line. Two
+ * rules with the same selector and effect tie on everything but the line, so the earlier
+ * one always wins and the later can never fire. It is a valid rule, so it is kept and the
+ * status file warns about it instead of the file being rejected. The selector holds no
+ * pointers and every rule is zeroed before it is filled, so comparing its bytes is exact.
+ *
+ * @param rules Rules accepted so far.
+ * @param count How many.
+ * @param later The rule about to be accepted.
+ * @return Non-zero when an earlier rule shadows @p later.
+ */
+static int chaos_process_rule_shadowed(
+    const chaos_process_rule_t *rules, size_t count, const chaos_process_rule_t *later
+)
+{
+    size_t index;
+
+    for (index = 0U; index < count; ++index)
+    {
+        if (rules[index].effect == later->effect &&
+            memcmp(&rules[index].selector, &later->selector, sizeof(later->selector)) == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
  * @copydoc chaos_process_config_parse_buffer
  *
  * Implementation notes: all or nothing. The first rejected line sets *rule_count to 0
@@ -1165,6 +1225,14 @@ int chaos_process_config_parse_buffer(char *buffer, chaos_process_rule_t *rules,
             }
             continue;
         }
+        if (chaos_policy_has_size(&policy))
+        {
+            /* No process call reports a byte count, so a size gate can never pass and the
+             * rule would load and never fire. */
+            chaos_status_reject(&g_chaos_process_config_error, CHAOS_STATUS_REASON_INVALID);
+            *rule_count = 0U;
+            return -1;
+        }
         parsed.policy = policy;
         parsed.call_size = CHAOS_POLICY_NO_SIZE;
         if (count >= CHAOS_PROCESS_MAX_RULES)
@@ -1184,10 +1252,18 @@ int chaos_process_config_parse_buffer(char *buffer, chaos_process_rule_t *rules,
             g_chaos_process_config_error.text,
             sizeof(g_chaos_process_config_texts[count])
         );
+        if (chaos_process_rule_shadowed(rules, count, &parsed))
+        {
+            chaos_status_warn(
+                &g_chaos_process_config_error,
+                g_chaos_process_config_error.line,
+                CHAOS_STATUS_WARN_SHADOWED
+            );
+        }
         rules[count++] = parsed;
     }
 
-    chaos_status_clear(&g_chaos_process_config_error);
+    chaos_status_clear_rejection(&g_chaos_process_config_error);
     *rule_count = count;
     return 0;
 }
@@ -1264,6 +1340,24 @@ chaos_process_config_reject_file(chaos_process_config_state_t *state, const char
 }
 
 /**
+ * @brief The tab-free header lines of this library's hits file: the reload generation.
+ *
+ * @details A named function rather than the expression it replaced, because chaos-init
+ * hands it to chaos_hits_write_for() when it writes this file for a traced process: the
+ * generation a reader correlates counts with must not depend on which mode produced them.
+ *
+ * @param out  Buffer of at least CHAOS_HITS_HEADER_MAX bytes.
+ * @param size Its size.
+ * @return @p out, or NULL when it could not be formatted (then no header is written).
+ */
+static const char *chaos_process_hits_header(char *out, size_t size)
+{
+    const size_t used = chaos_hits_header_generation(out, size, g_chaos_process_config_generation);
+
+    return used != 0U ? out : NULL;
+}
+
+/**
  * @brief Reports this process's hit counts after a hit on @p slot (NULL: at exit).
  *
  * @details Writes the hits file on each of the first CHAOS_HITS_EAGER hits, then at
@@ -1275,6 +1369,7 @@ chaos_process_config_reject_file(chaos_process_config_state_t *state, const char
  */
 static void chaos_process_config_report_hits(chaos_hit_slot_t *slot)
 {
+    char header[CHAOS_HITS_HEADER_MAX];
     chaos_process_config_state_t *state;
     const uint64_t now = chaos_hits_now_ms();
 
@@ -1322,6 +1417,7 @@ static void chaos_process_config_report_hits(chaos_hit_slot_t *slot)
                 state->hits,
                 (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) state->text,
                 state->rule_count,
+                chaos_process_hits_header(header, sizeof(header)),
                 g_chaos_process_hits_buffer,
                 sizeof(g_chaos_process_hits_buffer)
             );
@@ -1362,7 +1458,12 @@ static void chaos_process_config_after_fork(void)
     CHAOS_STORE_IF_CHANGED(g_chaos_process_hits_owned, 0);
     /* The child must not draw the parent's numbers (pre-fork workers would all
      * decide alike): its PRNG reseeds from its own thread id on the next draw. */
-    CHAOS_STORE_IF_CHANGED(g_chaos_process_tls_prng_state, 0U);
+    /* The child decides differently from the parent and from its siblings without the
+     * rules' keys being rewritten: one global instead of every snapshot page. Mixed, not
+     * incremented, so sibling lineages are unrelated rather than adjacent. */
+    g_chaos_process_lineage =
+        chaos_process_prng_mix(g_chaos_process_lineage + g_chaos_process_forks);
+    g_chaos_process_forks = 0U;
     /* FAIL_AFTER counts per process, like @first, and as chaos-init counts it. */
     chaos_process_reset_fail_after_counters();
     if (g_chaos_process_hit_pool_used)
@@ -1422,6 +1523,11 @@ static void chaos_process_config_attach_hits(chaos_process_config_state_t *next_
         next_state->rules[index].hit = next_state->hits[index];
         next_state->rules[index].hit_generation =
             next_state->hits[index] != NULL ? next_state->hits[index]->generation : 0U;
+        /* From the text, so a rule keeps its decisions across a reload that keeps it and
+         * the rule that reuses its slot does not inherit them. */
+        next_state->rules[index].key = chaos_process_prng_mix(
+            g_chaos_process_process_seed ^ chaos_process_rule_hash(next_state->text[index])
+        );
     }
 }
 
@@ -1446,7 +1552,14 @@ chaos_process_config_report(uint64_t observed_mtime, const chaos_process_config_
     }
     else
     {
-        chaos_status_write(CHAOS_PROCESS_STATUS_PATH, CHAOS_STATUS_OK, state->rule_count, NULL);
+        /* The record is passed on success too: it carries the warnings, and its
+         * rejection fields were cleared when the parse succeeded. */
+        chaos_status_write(
+            CHAOS_PROCESS_STATUS_PATH,
+            CHAOS_STATUS_OK,
+            state->rule_count,
+            &g_chaos_process_config_error
+        );
     }
 }
 

@@ -26,10 +26,15 @@
  * at most CHAOS_INIT_NET_MAX_WAIT (1024) per call.
  *
  * @par Supported effects
- * ERRNO (not on close), LATENCY, and TIMEOUT on the poll family. CORRUPT, TRICKLE and DUP
- * change received data; RESET needs the socket itself (SO_LINGER); ERRNO on close would
- * have to close and fail at once. A rule file with any of them is rejected at parse time
- * via CHAOS_NET_RULE_SUPPORTED (`unsupported in seccomp mode`).
+ * ERRNO (not on close), LATENCY, TIMEOUT on the poll family, DROP on a datagram send, and
+ * TRICKLE and CORRUPT through a ptrace stop.
+ * DUP needs a payload kept from an earlier call; RESET needs the socket itself (SO_LINGER);
+ * ERRNO on close would have to close and fail at once. A rule file with any of them is
+ * rejected at parse time via CHAOS_NET_RULE_SUPPORTED (`unsupported in seccomp mode`).
+ * DROP needs nothing from the data: the reply carries the byte count and the call does not
+ * run, which is the whole effect. It is left to the real call for a stream socket, as in
+ * the library, and for `sendmmsg`, whose result is a message count rather than a byte
+ * count.
  *
  * @par Cost
  * Endpoint lookups read /proc files per descriptor, so they run only when a loaded rule
@@ -48,6 +53,13 @@
 
 #include "chaos_init_net.h"
 
+#include "chaos_bucket.h"
+
+/** @brief Test seam: the /proc identity lookup, as in chaos_init_tracee.c. */
+#ifndef CHAOS_INIT_PROCESS_OF
+#define CHAOS_INIT_PROCESS_OF(tid, tgid, start) chaos_init_process_of((tid), (tgid), (start))
+#endif
+
 /* Parser hook, defined before the core is included: rules this mode cannot apply reject
  * their file at load time. */
 struct chaos_net_rule;
@@ -57,9 +69,12 @@ static int chaos_init_net_supported(const struct chaos_net_rule *rule);
 #include "../net/chaos_net_actions.c"
 #include "../net/chaos_net_config.c"
 #include "../net/chaos_net_endpoint.c"
+#include "../net/chaos_net_owner.c"
 #include "chaos_init_proc.h"
+#include "chaos_init_core.h"
 #include "chaos_init_tracee.h"
 
+#include <limits.h>
 #include <poll.h>
 #include <linux/inet_diag.h>
 #include <linux/netlink.h>
@@ -73,11 +88,36 @@ static int chaos_init_net_supported(const struct chaos_net_rule *rule);
 #include <sys/un.h>
 #include <sys/xattr.h>
 
-/* CHAOS_NET_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, TIMEOUT. */
+/**
+ * @brief Whether @p rule's effect needs the tracee's registers rather than a reply.
+ *
+ * @details TRICKLE shortens the requested length before the kernel reads it; CORRUPT
+ * changes a byte the receive wrote and DUP keeps the bytes it wrote, both of which need
+ * the stop after it; RESET needs a `setsockopt` to run in the tracee before its close;
+ * THROTTLE shortens the length to what its rate allows. A notification can do none of
+ * them. The predicate decides the filter's traced group
+ * (chaos_init_net_traced_calls()), so adding an effect here without teaching the trace
+ * path to apply it would load a rule that never fires.
+ */
+static int chaos_init_net_traced_effect(const struct chaos_net_rule *rule)
+{
+    return rule->effect == CHAOS_NET_EFFECT_TRICKLE || rule->effect == CHAOS_NET_EFFECT_CORRUPT ||
+           rule->effect == CHAOS_NET_EFFECT_DUP || rule->effect == CHAOS_NET_EFFECT_RESET ||
+           rule->effect == CHAOS_NET_EFFECT_THROTTLE;
+}
+
+/* CHAOS_NET_RULE_SUPPORTED: ERRNO on anything but close, LATENCY, TIMEOUT, DROP, REDIRECT,
+ * and the traced effects TRICKLE, CORRUPT, DUP, RESET and THROTTLE, which the trace path
+ * applies through the registers, the tracee's memory and a call of its own. ERRNO on close
+ * stays out: the library closes and then reports the error, which is two answers to one
+ * call. REDIRECT needs no register: the address it rewrites is in the tracee's memory, and
+ * a notification answered with CONTINUE makes the kernel read it from there. */
 static int chaos_init_net_supported(const struct chaos_net_rule *rule)
 {
     return (rule->effect == CHAOS_NET_EFFECT_ERRNO && rule->operation != CHAOS_NET_OP_CLOSE) ||
-           rule->effect == CHAOS_NET_EFFECT_LATENCY || rule->effect == CHAOS_NET_EFFECT_TIMEOUT;
+           rule->effect == CHAOS_NET_EFFECT_LATENCY || rule->effect == CHAOS_NET_EFFECT_TIMEOUT ||
+           rule->effect == CHAOS_NET_EFFECT_DROP || rule->effect == CHAOS_NET_EFFECT_REDIRECT ||
+           chaos_init_net_traced_effect(rule);
 }
 
 /**
@@ -521,8 +561,27 @@ chaos_net_getsockname_fn g_chaos_net_real_getsockname = chaos_init_net_getsockna
 chaos_net_getpeername_fn g_chaos_net_real_getpeername = chaos_init_net_getpeername;
 chaos_net_getsockopt_fn g_chaos_net_real_getsockopt = chaos_init_net_getsockopt;
 __thread int g_chaos_net_tls_guard = 0;
-__thread uint64_t g_chaos_net_tls_prng_state = 0U;
+uint64_t g_chaos_net_lineage = 0U;
+
+/** @copydoc g_chaos_net_forks (the supervisor never forks a tracee itself). */
+uint64_t g_chaos_net_forks = 0U;
 uint64_t g_chaos_net_process_seed = UINT64_C(0x9e3779b97f4a7c15);
+
+/** @brief Whether the tracee's descriptor @p fd is a datagram socket; 0 when unknown. */
+static int chaos_init_net_is_datagram(uint64_t fd)
+{
+    const chaos_init_net_protocol_t *protocol = chaos_init_net_protocol((int)fd);
+
+    return protocol != NULL && protocol->type == SOCK_DGRAM;
+}
+
+/** @brief Whether the tracee's descriptor @p fd is a stream socket; 0 when unknown. */
+static int chaos_init_net_is_stream(uint64_t fd)
+{
+    const chaos_init_net_protocol_t *protocol = chaos_init_net_protocol((int)fd);
+
+    return protocol != NULL && protocol->type == SOCK_STREAM;
+}
 
 /** @brief How a system call names the socket(s) it acts on, i.e. which endpoint is matched. */
 typedef enum chaos_init_net_kind
@@ -591,6 +650,76 @@ static const chaos_init_net_call_t g_chaos_init_net_calls[] = {
 #endif
 };
 
+/**
+ * @brief Whether @p rule needs a trace stop for @p entry in particular.
+ *
+ * @details TRICKLE, CORRUPT and DUP need the length or the buffer in a register, which
+ * recvmsg and the batches keep in memory: they stay notified, as the library leaves them
+ * alone too. RESET needs no register of the close, only a stop to run a `setsockopt`
+ * before it.
+ */
+static int
+chaos_init_net_traced_call(const struct chaos_net_rule *rule, const chaos_init_net_call_t *entry)
+{
+    if (rule->operation != entry->operation)
+    {
+        return 0;
+    }
+    return rule->effect == CHAOS_NET_EFFECT_RESET || entry->size >= 0;
+}
+
+/** @copydoc chaos_init_net_traced_calls */
+size_t chaos_init_net_traced_calls(long *out, size_t capacity)
+{
+    const chaos_net_config_state_t *state;
+    size_t count = 0U;
+    size_t rule_index;
+
+    if (out == NULL || !chaos_net_config_prepare())
+    {
+        return 0U;
+    }
+    state = chaos_net_config_active_state();
+    for (rule_index = 0U; rule_index < state->rule_count; ++rule_index)
+    {
+        size_t entry;
+
+        if (!chaos_init_net_traced_effect(&state->rules[rule_index]))
+        {
+            continue;
+        }
+        for (entry = 0U; entry < sizeof(g_chaos_init_net_calls) / sizeof(g_chaos_init_net_calls[0]);
+             ++entry)
+        {
+            size_t seen;
+
+            if (!chaos_init_net_traced_call(
+                    &state->rules[rule_index], &g_chaos_init_net_calls[entry]
+                ))
+            {
+                continue;
+            }
+            for (seen = 0U; seen < count; ++seen)
+            {
+                if (out[seen] == g_chaos_init_net_calls[entry].nr)
+                {
+                    break;
+                }
+            }
+            if (seen < count)
+            {
+                continue;
+            }
+            if (count == capacity)
+            {
+                return count;
+            }
+            out[count++] = g_chaos_init_net_calls[entry].nr;
+        }
+    }
+    return count;
+}
+
 /* Per-process hit slots of the net rules. */
 CHAOS_INIT_RULES_STORAGE(g_chaos_init_net, CHAOS_NET_MAX_RULES);
 
@@ -615,10 +744,29 @@ static size_t chaos_init_net_snapshot(const chaos_init_text_t **texts, uint64_t 
     return state->rule_count;
 }
 
+/**
+ * @brief Sets the net draw lineage for the process with allocation serial @p serial.
+ *
+ * @details Serial 1 is the application itself and gets lineage 0, so a single-process run
+ * decides exactly as it would under `LD_PRELOAD`. Every later process is a descendant and
+ * gets a lineage of its own, which is what keeps the backends of a pre-forking server from
+ * all drawing the same sample -- the library reaches the same end from the other side, by
+ * mixing each child's ordinal among its siblings in the atfork handler.
+ */
+static void chaos_init_net_lineage(uint64_t serial)
+{
+    g_chaos_net_lineage = serial > 1U ? chaos_net_prng_mix(serial - 1U) : 0U;
+}
+
 static chaos_init_rules_t g_chaos_init_net_rules = {
     CHAOS_NET_HITS_PREFIX,
     CHAOS_NET_MAX_RULES,
     chaos_init_net_snapshot,
+    /* The same header the library writes: the reload generation, and the RESET
+     * suppressions, which are the one thing a rule reports without a hit. */
+    chaos_net_hits_header,
+    /* Each process the supervisor decides for draws with a lineage of its own. */
+    chaos_init_net_lineage,
     g_chaos_init_net_slots,
     g_chaos_init_net_hashes,
     g_chaos_init_net_generation,
@@ -631,14 +779,16 @@ static chaos_init_rules_t g_chaos_init_net_rules = {
 
 void chaos_init_net_start(void)
 {
-    uint64_t seed;
 
     chaos_net_config_init();
-    if (getrandom(&seed, sizeof(seed), 0) == (ssize_t)sizeof(seed))
-    {
-        g_chaos_net_process_seed = seed;
-    }
+    g_chaos_net_process_seed = chaos_init_seed();
     (void)chaos_init_tracee_register(&g_chaos_init_net_rules);
+}
+
+/** @copydoc chaos_init_net_reload */
+void chaos_init_net_reload(void)
+{
+    (void)chaos_net_config_prepare();
 }
 
 /**
@@ -671,6 +821,13 @@ static uint64_t chaos_init_net_iov_size(uint64_t address, uint64_t count)
         }
         for (index = 0U; index < chunk; ++index)
         {
+            /* A total above SSIZE_MAX is no byte count: the call returns ssize_t, so the
+             * kernel rejects it with EINVAL. Summing it anyway would wrap and hand the
+             * gates a small number for a huge request. Checked before the addition. */
+            if ((uint64_t)vector[index].iov_len > (uint64_t)SSIZE_MAX - total)
+            {
+                return CHAOS_POLICY_NO_SIZE;
+            }
             total += (uint64_t)vector[index].iov_len;
         }
         done += chunk;
@@ -697,6 +854,46 @@ chaos_init_net_sockaddr(int fd, uint64_t address, uint64_t length, chaos_net_end
     return chaos_net_endpoint_from_sockaddr_fd(
         fd, (const struct sockaddr *)&copy, (socklen_t)size, endpoint
     );
+}
+
+/**
+ * @brief Builds the address a REDIRECT rule sends @p call to instead, from the sockaddr
+ *        the tracee passed.
+ *
+ * @details The family of that sockaddr decides what the target may be
+ * (chaos_net_redirect_sockaddr()), and that is all this needs from it, so only the family
+ * is read back out of the tracee. The result fits the length the caller passed whenever it
+ * was built: the family is kept, so the length is.
+ *
+ * @return 1 with @p out and @p size written, else 0 (the rule then does not fire).
+ */
+static int chaos_init_net_redirect(
+    const chaos_init_call_t *call,
+    const chaos_net_redirect_t *target,
+    unsigned char *out,
+    unsigned *size
+)
+{
+    struct sockaddr original;
+    struct sockaddr_storage built;
+    socklen_t built_length = 0;
+
+    *size = 0U;
+    (void)memset(&original, 0, sizeof(original));
+    if (chaos_init_read_memory(
+            call->tid, call->args[1], &original.sa_family, sizeof(original.sa_family)
+        ) != 0)
+    {
+        return 0;
+    }
+    if (!chaos_net_redirect_sockaddr(target, &original, &built, &built_length) ||
+        (uint64_t)built_length > call->args[2])
+    {
+        return 0;
+    }
+    (void)memcpy(out, &built, (size_t)built_length);
+    *size = (unsigned)built_length;
+    return 1;
 }
 
 /** @brief Payload bytes of a msghdr in tracee memory; CHAOS_POLICY_NO_SIZE if unknown. */
@@ -1199,16 +1396,323 @@ static void chaos_init_net_clear_ready(const chaos_init_call_t *call)
     }
 }
 
+/*---------------------------------------------------------------------------*
+ * THROTTLE: the same token bucket as the library's, one per tracee socket
+ *---------------------------------------------------------------------------*/
+
+/** @brief Sockets whose send rate the supervisor tracks at once. */
+#define CHAOS_INIT_NET_THROTTLE_SLOTS 64U
+
+/**
+ * @brief One socket's bucket, keyed by the process and the descriptor number.
+ *
+ * @details As in libchaos-io's supervisor side: the library keys by descriptor alone
+ * because its buckets belong to one process, and the supervisor serves a container, so the
+ * thread group is part of the key. A colliding entry takes the slot over.
+ */
+typedef struct chaos_init_net_throttle
+{
+    pid_t tgid;
+    int fd;
+    uint64_t rate;
+    chaos_bucket_t bucket;
+    /** Whether this slot has ever had an owner: a takeover starts empty, a first use full. */
+    int taken;
+} chaos_init_net_throttle_t;
+
+static chaos_init_net_throttle_t g_chaos_init_net_throttles[CHAOS_INIT_NET_THROTTLE_SLOTS];
+
+/** @brief The bucket of (@p tgid, @p fd, @p rate), reset when the slot held something else. */
+static chaos_bucket_t *chaos_init_net_throttle_bucket(pid_t tgid, uint64_t fd, uint64_t rate)
+{
+    chaos_init_net_throttle_t *entry =
+        &g_chaos_init_net_throttles
+            [((unsigned)fd + (unsigned)tgid) % CHAOS_INIT_NET_THROTTLE_SLOTS];
+
+    if (entry->tgid != tgid || entry->fd != (int)fd || entry->rate != rate)
+    {
+        /* Empty for a new owner, full only the first time: see chaos_io_rw.c. */
+        const int stolen = entry->taken && (entry->fd != (int)fd || entry->tgid != tgid);
+
+        entry->bucket.state = stolen ? chaos_bucket_state(0U, chaos_hits_now_ms()) : 0U;
+        entry->taken = 1;
+        entry->rate = rate;
+        entry->fd = (int)fd;
+        entry->tgid = tgid;
+    }
+    return &entry->bucket;
+}
+
+/** @brief Whether socket @p fd of @p tid is non-blocking; 0 when its flags are unreadable. */
+static int chaos_init_net_nonblocking(pid_t tid, uint64_t fd)
+{
+    char name[64];
+    char line[128];
+    FILE *file;
+    long flags = -1;
+
+    (void)snprintf(name, sizeof(name), "/proc/%ld/fdinfo/%d", (long)tid, (int)fd);
+    file = fopen(name, "r");
+    if (file == NULL)
+    {
+        return 0;
+    }
+    while (fgets(line, sizeof(line), file) != NULL)
+    {
+        if (strncmp(line, "flags:", 6U) == 0)
+        {
+            flags = strtol(line + 6, NULL, 8);
+            break;
+        }
+    }
+    (void)fclose(file);
+    return flags >= 0 && (flags & O_NONBLOCK) != 0;
+}
+
+/**
+ * @brief Who holds the socket behind descriptor @p fd of thread @p tid.
+ *
+ * @details The same scan the library makes (chaos_net_socket_ownership()), from the other
+ * side: the inode comes from the `/proc/<tid>/fd/<fd>` link rather than from an `fstat`,
+ * and the descriptor table searched first is the tracee's process, not the supervisor's.
+ * A process is what owns descriptors, so the thread's group leader is the one to look
+ * under -- `/proc` lists no threads, so a search that excluded the tid would find the
+ * group's own link again and read it as somebody else's.
+ *
+ * @return SOLE when this descriptor is the only one anywhere, SHARED when another holds
+ *         the same socket, UNKNOWN when the scan could establish neither.
+ */
+static chaos_net_ownership_t chaos_init_net_ownership(pid_t tid, uint64_t fd)
+{
+    char target[CHAOS_NET_OWNER_TARGET_MAX];
+    char directory[32];
+    char owner[16];
+    const unsigned long inode = chaos_init_net_inode((int)fd);
+    uint64_t image = 0U;
+    pid_t tgid = 0;
+    size_t own = 0U;
+    int other;
+
+    if (inode == 0U || CHAOS_INIT_PROCESS_OF(tid, &tgid, &image) != 0)
+    {
+        return CHAOS_NET_OWNER_UNKNOWN;
+    }
+    (void)snprintf(target, sizeof(target), "socket:[%lu]", inode);
+    (void)snprintf(directory, sizeof(directory), "/proc/%ld/fd", (long)tgid);
+    (void)snprintf(owner, sizeof(owner), "%ld", (long)tgid);
+    /* The link was there a moment ago, so a scan that does not find it did not see what
+     * must be there: nothing may be concluded from it. */
+    if (chaos_net_owner_count(directory, target, &own) != 0 || own == 0U)
+    {
+        return CHAOS_NET_OWNER_UNKNOWN;
+    }
+    if (own > 1U)
+    {
+        return CHAOS_NET_OWNER_SHARED;
+    }
+    other = chaos_net_owner_other_holder(target, owner);
+    return other > 0 ? CHAOS_NET_OWNER_SHARED
+                     : (other == 0 ? CHAOS_NET_OWNER_SOLE : CHAOS_NET_OWNER_UNKNOWN);
+}
+
+/*---------------------------------------------------------------------------*
+ * DUP: keep what a receive delivered and deliver it again
+ *---------------------------------------------------------------------------*/
+
+/** @brief Sockets whose last payload the supervisor keeps at once. */
+#define CHAOS_INIT_NET_DUP_SLOTS 16U
+
+/** @brief Longest kept payload, as in the library (CHAOS_NET_DUP_MAX_BYTES). */
+#define CHAOS_INIT_NET_DUP_MAX_BYTES 4096U
+
+/** @brief Receive flags that bypass DUP, as in the library (CHAOS_NET_DUP_SKIP_FLAGS). */
+#ifdef MSG_ERRQUEUE
+#define CHAOS_INIT_NET_DUP_SKIP (MSG_PEEK | MSG_TRUNC | MSG_OOB | MSG_WAITALL | MSG_ERRQUEUE)
+#else
+#define CHAOS_INIT_NET_DUP_SKIP (MSG_PEEK | MSG_TRUNC | MSG_OOB | MSG_WAITALL)
+#endif
+
+/**
+ * @brief The last payload received on one socket, kept for a DUP rule.
+ *
+ * @details Keyed by the socket inode rather than by descriptor and process: the inode
+ * names the socket itself, so a descriptor that was closed and reused no longer finds the
+ * payload, and two processes that share the socket share one -- they share the byte stream
+ * too. The library keeps its table per address space instead, which is the one difference
+ * (NETWORK.md).
+ */
+typedef struct chaos_init_net_dup
+{
+    unsigned long inode;   /**< The socket the payload came from; 0 when the slot is empty. */
+    uint64_t stamp;        /**< Store order, for evicting the oldest slot. */
+    size_t length;         /**< Bytes kept in `data`. */
+    socklen_t name_length; /**< Sender address length (datagrams); 0 when none. */
+    struct sockaddr_storage name;
+    unsigned char data[CHAOS_INIT_NET_DUP_MAX_BYTES];
+} chaos_init_net_dup_t;
+
+static chaos_init_net_dup_t g_chaos_init_net_dups[CHAOS_INIT_NET_DUP_SLOTS];
+static uint64_t g_chaos_init_net_dup_stamp = 0U;
+
+/** @brief The slot holding @p inode's payload, or NULL when none does. */
+static chaos_init_net_dup_t *chaos_init_net_dup_find(unsigned long inode)
+{
+    size_t index;
+
+    for (index = 0U; index < CHAOS_INIT_NET_DUP_SLOTS; ++index)
+    {
+        if (g_chaos_init_net_dups[index].inode == inode)
+        {
+            return &g_chaos_init_net_dups[index];
+        }
+    }
+    return NULL;
+}
+
+/**
+ * @brief Keeps the bytes @p result reports as @p inode's payload.
+ *
+ * @details Called at the exit stop of a receive the entry stop let run, which is where
+ * @p inode was established as a socket's. A datagram longer
+ * than the cap is not kept at all (replayed cut it would be another message), a stream
+ * payload is kept cut, exactly as in the library. The oldest slot gives way when all are
+ * taken, so a container with more such sockets than slots keeps the newest payloads.
+ */
+static void chaos_init_net_dup_store(
+    const chaos_init_call_t *call,
+    const chaos_init_net_call_t *entry,
+    unsigned long inode,
+    long result,
+    uint64_t size
+)
+{
+    chaos_init_net_dup_t *slot;
+    uint64_t length;
+    size_t index;
+
+    if (result <= 0)
+    {
+        return;
+    }
+    length = (uint64_t)result < size ? (uint64_t)result : size;
+    if (length > CHAOS_INIT_NET_DUP_MAX_BYTES)
+    {
+        if (!chaos_init_net_is_stream(call->args[0]))
+        {
+            return;
+        }
+        length = CHAOS_INIT_NET_DUP_MAX_BYTES;
+    }
+    slot = chaos_init_net_dup_find(inode);
+    if (slot == NULL)
+    {
+        slot = chaos_init_net_dup_find(0U);
+    }
+    if (slot == NULL)
+    {
+        slot = &g_chaos_init_net_dups[0];
+        for (index = 1U; index < CHAOS_INIT_NET_DUP_SLOTS; ++index)
+        {
+            if (g_chaos_init_net_dups[index].stamp < slot->stamp)
+            {
+                slot = &g_chaos_init_net_dups[index];
+            }
+        }
+    }
+    slot->inode = 0U;
+    if (chaos_init_read_memory(call->tid, call->args[1], slot->data, (size_t)length) != 0)
+    {
+        return;
+    }
+    slot->length = (size_t)length;
+    slot->name_length = 0;
+    /* The sender address of a datagram, for a recvfrom replay. The kernel reports the
+     * full length even when it cut the address to the caller's buffer, so only what it
+     * wrote is kept. Of the traced calls only recvfrom has an address at all. */
+    if (entry->nr == __NR_recvfrom && call->args[4] != 0U && call->args[5] != 0U)
+    {
+        socklen_t reported = 0;
+
+        if (chaos_init_read_memory(call->tid, call->args[5], &reported, sizeof(reported)) == 0 &&
+            reported > 0 && (size_t)reported <= sizeof(slot->name) &&
+            chaos_init_read_memory(call->tid, call->args[4], &slot->name, (size_t)reported) == 0)
+        {
+            slot->name_length = reported;
+        }
+    }
+    slot->inode = inode;
+    slot->stamp = ++g_chaos_init_net_dup_stamp;
+}
+
+/**
+ * @brief Delivers @p slot's payload into the receive's buffer and empties the slot.
+ *
+ * @details Each payload replays at most once, so the next receive reads the socket again.
+ * The sender address is written back truncated to the caller's capacity with the full
+ * length reported, as the kernel does.
+ *
+ * @return The bytes delivered, or -1 when the tracee's buffer could not be written, in
+ *         which case the call has to run for real.
+ */
+static long chaos_init_net_dup_replay(
+    const chaos_init_call_t *call,
+    const chaos_init_net_call_t *entry,
+    chaos_init_net_dup_t *slot,
+    uint64_t size
+)
+{
+    const uint64_t delivered = (uint64_t)slot->length < size ? (uint64_t)slot->length : size;
+
+    if (chaos_init_write_memory(call->tid, call->args[1], slot->data, (size_t)delivered) != 0)
+    {
+        return -1;
+    }
+    if (entry->nr == __NR_recvfrom && call->args[4] != 0U && call->args[5] != 0U)
+    {
+        const void *name = &slot->name;
+        socklen_t capacity = 0;
+
+        if (chaos_init_read_memory(call->tid, call->args[5], &capacity, sizeof(capacity)) == 0)
+        {
+            const socklen_t copied = capacity < slot->name_length ? capacity : slot->name_length;
+
+            if (copied > 0)
+            {
+                (void)chaos_init_write_memory(call->tid, call->args[4], name, (size_t)copied);
+            }
+            (void)chaos_init_write_memory(
+                call->tid, call->args[5], &slot->name_length, sizeof(slot->name_length)
+            );
+        }
+    }
+    slot->inode = 0U;
+    return (long)delivered;
+}
+
+/** @brief Result value that means "the call has not run yet" (the entry stop). */
+#define CHAOS_INIT_NET_NO_RESULT LONG_MIN
+
 /* Decode by table; shared calls only on sockets; cheap rejections (no rule for the
  * operation) before any endpoint lookup; then match, measure, and trigger on the
- * per-process slot. */
-int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *verdict)
+ * per-process slot.
+ *
+ * chaos_init_net_decide() and chaos_init_net_decide_result() share this body: the two stops
+ * of a traced call have to select the same rule. @p result is CHAOS_INIT_NET_NO_RESULT at
+ * the entry stop and the call's return value at the exit stop. */
+static int
+chaos_init_net_decide_at(const chaos_init_call_t *call, long result, chaos_init_verdict_t *verdict)
 {
     const chaos_init_net_call_t *entry = NULL;
     const chaos_net_config_state_t *state;
     chaos_net_rule_t rule;
+    chaos_init_net_dup_t *kept = NULL;
     uint64_t size = CHAOS_POLICY_NO_SIZE;
     int64_t timeout_ms = -1;
+    unsigned char redirect[sizeof(struct sockaddr_storage)];
+    unsigned redirect_size = 0U;
+    chaos_bucket_t *throttle_bucket = NULL;
+    uint64_t throttle_allowed = 0U;
+    int throttle_stream = 0;
     size_t index;
 
     for (index = 0U; index < sizeof(g_chaos_init_net_calls) / sizeof(g_chaos_init_net_calls[0]);
@@ -1248,13 +1752,163 @@ int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *v
     {
         size = chaos_init_net_batch_size(call->args[1], call->args[2]);
     }
-    /* A loaded rule is ERRNO, LATENCY or TIMEOUT only (chaos_init_net_supported()). A
-     * wait without a timeout never times out, so TIMEOUT does not apply to it; checked
+    /* A loaded rule is ERRNO, LATENCY, TIMEOUT or DROP only (chaos_init_net_supported()).
+     * A wait without a timeout never times out, so TIMEOUT does not apply to it; checked
      * before triggering, so such a call counts no hit. */
+    /* An effect that only a trace stop can carry, on a call the installed filter does not
+     * trace: see chaos_init_io.c. Before the draw, so no hit is reported for a fault that
+     * cannot be injected. */
+    if (chaos_init_net_traced_effect(&rule) && chaos_init_net_traced_call(&rule, entry) &&
+        !chaos_init_traced(call->nr))
+    {
+        return 1;
+    }
     if (rule.effect == CHAOS_NET_EFFECT_TIMEOUT &&
         (timeout_ms = chaos_init_net_wait_timeout(call)) < 0)
     {
         return 1;
+    }
+    /* DROP answers with the byte count, so it needs a count the call could have returned
+     * and a datagram socket (chaos_net_drops() in the library decides the same two things).
+     * A batch reports a message count instead, which is why sendmmsg is left alone. Also
+     * checked before triggering, so a call it leaves alone counts no hit. */
+    if (rule.effect == CHAOS_NET_EFFECT_DROP && (size > (uint64_t)SSIZE_MAX || entry->size == -4 ||
+                                                 !chaos_init_net_is_datagram(call->args[0])))
+    {
+        return 1;
+    }
+    if (rule.effect == CHAOS_NET_EFFECT_CORRUPT)
+    {
+        /* How many bytes there are to corrupt is the receive's result, so the entry stop
+         * only asks to be called again; the draw then happens after the call, as the
+         * library's does. The forms that keep their buffer in memory are left alone and
+         * count no hit. */
+        if (result == CHAOS_INIT_NET_NO_RESULT)
+        {
+            verdict->action = entry->size < 0 ? CHAOS_INIT_PASS : CHAOS_INIT_AFTER;
+            return 1;
+        }
+        /* chaos_net_received_bytes(): nothing written means nothing to corrupt, and a
+         * MSG_TRUNC receive on a stream socket discards the data instead of writing it.
+         *
+         * `size == 0` is the third of those and not a theoretical one: a MSG_TRUNC receive
+         * on a datagram socket reports the whole datagram although the buffer took none of
+         * it, so the byte to flip would be drawn out of a length of zero. On x86-64 that
+         * divide kills the supervisor with SIGFPE -- and the supervisor is PID 1. On
+         * aarch64 it does not trap at all (UDIV yields 0), so it would write a byte into a
+         * buffer the call never wrote to. The library guards the same thing twice. */
+        if (result <= 0 || size == CHAOS_POLICY_NO_SIZE || size == 0U ||
+            ((entry->nr == __NR_recvfrom && (call->args[3] & (uint64_t)MSG_TRUNC) != 0U) &&
+             chaos_init_net_is_stream(call->args[0])))
+        {
+            return 1;
+        }
+    }
+    else if (rule.effect == CHAOS_NET_EFFECT_RESET)
+    {
+        /* Ownership is settled before the draw, as in the library: SO_LINGER on a socket
+         * another descriptor still holds would reset nothing now and reset it later, out
+         * of any rule's reach. A suppression is counted for the hits file's header rather
+         * than passed over in silence, and spends neither a hit nor a `@first` claim. */
+        const chaos_net_ownership_t ownership = chaos_init_net_ownership(call->tid, call->args[0]);
+
+        if (ownership != CHAOS_NET_OWNER_SOLE)
+        {
+            chaos_net_reset_suppressed(ownership);
+            return 1;
+        }
+    }
+    else if (rule.effect == CHAOS_NET_EFFECT_DUP)
+    {
+        /* chaos_net_dups(): a request of zero or unknown length, the forms that keep their
+         * buffer in an iovec, and the flags that are not the plain data stream are left
+         * alone. An unreadable descriptor is too -- the payload belongs to a socket, and
+         * without its inode there is nothing to tie it to. All checked before the draw, so
+         * such a call counts no hit. */
+        const uint64_t flags = entry->nr == __NR_recvfrom ? call->args[3] : 0U;
+        const unsigned long inode = chaos_init_net_inode((int)call->args[0]);
+
+        if (entry->size < 0 || size == CHAOS_POLICY_NO_SIZE || size == 0U || inode == 0U ||
+            (flags & (uint64_t)CHAOS_INIT_NET_DUP_SKIP) != 0U)
+        {
+            return 1;
+        }
+        if (result != CHAOS_INIT_NET_NO_RESULT)
+        {
+            /* The exit stop of a receive that ran: keep what it delivered and draw
+             * nothing. A hit is a delivered duplicate, and only a replay is one. */
+            chaos_init_net_dup_store(call, entry, inode, result, size);
+            return 1;
+        }
+        /* Let the receive run whatever the draw decides: it either replaces the payload it
+         * did not get, or leaves the first one behind. */
+        verdict->action = CHAOS_INIT_AFTER;
+        kept = chaos_init_net_dup_find(inode);
+        if (kept == NULL)
+        {
+            return 1;
+        }
+    }
+    else if (result != CHAOS_INIT_NET_NO_RESULT)
+    {
+        /* Every other effect was applied at the entry stop; the exit stop must not draw
+         * again. Reachable when the rule file changed between the two stops. */
+        return 1;
+    }
+    /* TRICKLE shortens the requested length where it sits in a register, and only where
+     * the library shortens it: a stream socket (a shorter buffer truncates a datagram),
+     * not MSG_WAITALL (the caller asked for the whole count), and only a request larger
+     * than the chunk. Of the traced calls only recvfrom carries flags; read has none.
+     * Checked before the draw, so a call it leaves alone counts no hit. */
+    if (rule.effect == CHAOS_NET_EFFECT_TRICKLE)
+    {
+        const uint64_t flags = entry->nr == __NR_recvfrom ? call->args[3] : 0U;
+
+        if (entry->size < 0 || size == CHAOS_POLICY_NO_SIZE || size <= rule.chunk_bytes ||
+            (flags & (uint64_t)MSG_WAITALL) != 0U || !chaos_init_net_is_stream(call->args[0]))
+        {
+            return 1;
+        }
+    }
+    /* REDIRECT needs an address this socket can be given: an IPv6 target cannot be
+     * written over the sockaddr of an AF_INET one. Built before the draw, as in the
+     * library, so a call it cannot reach counts no hit. */
+    if (rule.effect == CHAOS_NET_EFFECT_REDIRECT &&
+        !chaos_init_net_redirect(call, &rule.redirect, redirect, &redirect_size))
+    {
+        return 1;
+    }
+    /* THROTTLE shortens the length where it sits in a register, or waits for a whole
+     * datagram; either way it needs that register. recvmsg and the batches keep the
+     * length in memory and are left alone, as in the library. A send whose byte count is
+     * not knowable cannot be charged to a rate either. Before the draw, so such a call
+     * counts no hit and no tokens. */
+    if (rule.effect == CHAOS_NET_EFFECT_THROTTLE &&
+        (entry->size < 0 || size == CHAOS_POLICY_NO_SIZE || size == 0U))
+    {
+        return 1;
+    }
+    /* THROTTLE takes its bytes before the rule is asked, as the library does: an
+     * allowance that covers the whole send changes nothing, so it must spend neither a hit
+     * nor a `@first` claim. The bytes are charged either way. */
+    if (rule.effect == CHAOS_NET_EFFECT_THROTTLE)
+    {
+        pid_t throttle_tgid = 0;
+        uint64_t throttle_image = 0U;
+
+        throttle_bucket =
+            CHAOS_INIT_PROCESS_OF(call->tid, &throttle_tgid, &throttle_image) == 0
+                ? chaos_init_net_throttle_bucket(throttle_tgid, call->args[0], rule.rate_bps)
+                : NULL;
+        throttle_stream = chaos_init_net_is_stream(call->args[0]);
+        throttle_allowed =
+            throttle_bucket != NULL
+                ? chaos_bucket_take(throttle_bucket, rule.rate_bps, size, chaos_hits_now_ms())
+                : size;
+        if (throttle_allowed >= size)
+        {
+            return 1;
+        }
     }
     /* Swap the snapshot's shared slot for the calling process's (see chaos_init_io.c). */
     state = chaos_net_config_active_state();
@@ -1277,6 +1931,114 @@ int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *v
         verdict->action = CHAOS_INIT_DELAY;
         verdict->delay_ms = rule.latency_ms;
     }
+    else if (rule.effect == CHAOS_NET_EFFECT_DROP)
+    {
+        verdict->action = CHAOS_INIT_RETURN;
+        verdict->value = (long)size;
+    }
+    else if (rule.effect == CHAOS_NET_EFFECT_REDIRECT)
+    {
+        /* The call runs, with the address the supervisor writes into the tracee once the
+         * notification is confirmed: a reply of CONTINUE makes the kernel read the
+         * arguments from the tracee again, which is exactly what this needs. */
+        (void)memcpy(verdict->redirect, redirect, redirect_size);
+        verdict->redirect_size = redirect_size;
+    }
+    else if (rule.effect == CHAOS_NET_EFFECT_THROTTLE)
+    {
+        /* The bytes were taken before the draw (above). What is left is the same pair of
+         * answers the library gives: a stream is shortened to what the rate allowed, a
+         * datagram is never cut -- half a datagram is not a datagram -- and waits for its
+         * whole message instead. The waiting happens in the delay queue rather than in the
+         * thread, so the other threads of the tracee keep being served, and the bytes are
+         * reserved when the call is parked, so the rate matches the library's. A
+         * non-blocking socket is told EAGAIN, as in the library. */
+        if (throttle_allowed > 0U && throttle_stream)
+        {
+            verdict->action = CHAOS_INIT_SHORTEN;
+            verdict->arg_index = (unsigned)entry->size;
+            verdict->value = (long)throttle_allowed;
+        }
+        else if (chaos_init_net_nonblocking(call->tid, call->args[0]))
+        {
+            /* Nothing is sent, so the bytes the take handed out go back: see
+             * chaos_net_socket.c. */
+            chaos_bucket_return(
+                throttle_bucket, rule.rate_bps, throttle_allowed, chaos_hits_now_ms()
+            );
+            verdict->action = CHAOS_INIT_FAIL;
+            verdict->error = EAGAIN;
+        }
+        else
+        {
+            const uint64_t chunk = chaos_bucket_chunk(rule.rate_bps);
+            const uint64_t held = !throttle_stream ? size : (chunk < size ? chunk : size);
+
+            verdict->action = CHAOS_INIT_DELAY;
+            verdict->delay_ms = (unsigned)chaos_bucket_reserve(
+                throttle_bucket, rule.rate_bps, held - throttle_allowed, chaos_hits_now_ms()
+            );
+            verdict->shortens = held < size;
+            verdict->arg_index = (unsigned)entry->size;
+            verdict->value = (long)held;
+        }
+    }
+    else if (rule.effect == CHAOS_NET_EFFECT_TRICKLE)
+    {
+        /* Always the chunk, never a draw: TRICKLE carries a byte count, not a
+         * probability, and fires on every call it applies to. */
+        verdict->action = CHAOS_INIT_SHORTEN;
+        verdict->arg_index = (unsigned)entry->size;
+        verdict->value = (long)rule.chunk_bytes;
+    }
+    else if (rule.effect == CHAOS_NET_EFFECT_RESET)
+    {
+        /* The close has to abort the connection, which means a
+         * `setsockopt(SO_LINGER{1,0})` on the same socket first: the option lives on the
+         * file description, so only a call inside the tracee can set it. Its argument goes
+         * into the tracee's stack scratch, and the close itself runs afterwards. */
+        const struct linger abort_linger = {1, 0};
+
+        verdict->action = CHAOS_INIT_BEFORE;
+        verdict->instead_nr = __NR_setsockopt;
+        verdict->instead_args[0] = call->args[0];
+        verdict->instead_args[1] = (uint64_t)SOL_SOCKET;
+        verdict->instead_args[2] = (uint64_t)SO_LINGER;
+        verdict->instead_args[4] = (uint64_t)sizeof(abort_linger);
+        (void)memcpy(verdict->instead_data, &abort_linger, sizeof(abort_linger));
+        verdict->instead_size = (unsigned)sizeof(abort_linger);
+        verdict->instead_arg = 3U;
+    }
+    else if (rule.effect == CHAOS_NET_EFFECT_DUP)
+    {
+        /* The kept payload instead of a receive, which the reply can return without the
+         * call running. A buffer the supervisor cannot write leaves the verdict at AFTER:
+         * the receive then runs for real, as a busy slot makes it in the library. */
+        const long delivered = chaos_init_net_dup_replay(call, entry, kept, size);
+
+        if (delivered >= 0)
+        {
+            verdict->action = CHAOS_INIT_RETURN;
+            verdict->value = delivered;
+        }
+    }
+    else if (rule.effect == CHAOS_NET_EFFECT_CORRUPT)
+    {
+        /* One byte of what the receive delivered, capped at the buffer: with MSG_TRUNC a
+         * datagram receive reports the whole datagram, which can be longer than what it
+         * wrote. The byte is read out of the tracee, one bit flipped, written back. */
+        const uint64_t length = (uint64_t)result < size ? (uint64_t)result : size;
+        const uint64_t offset =
+            (uint64_t)chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_FIRST_EFFECT) % length;
+        const unsigned bit = chaos_net_rule_draw(&rule, CHAOS_NET_DRAW_SECOND_EFFECT) & 7U;
+        unsigned char byte = 0U;
+
+        if (chaos_init_read_memory(call->tid, call->args[1] + offset, &byte, sizeof(byte)) == 0)
+        {
+            byte ^= (unsigned char)(1U << bit);
+            (void)chaos_init_write_memory(call->tid, call->args[1] + offset, &byte, sizeof(byte));
+        }
+    }
     else
     {
         /* Simulate "nothing became ready": hold the call for its own timeout (RETURN at
@@ -1297,6 +2059,15 @@ void chaos_init_net_commit(const chaos_init_call_t *call, const chaos_init_verdi
     {
         g_chaos_init_net_tid = call->tid;
         chaos_init_net_clear_ready(call);
+    }
+    if (verdict->redirect_size > 0U)
+    {
+        /* A failed write leaves the original address in place, so the connect goes where
+         * the caller meant: the hit is already counted, which is the one case where a hit
+         * can be a byte ahead of its effect. */
+        (void)chaos_init_write_memory(
+            call->tid, call->args[1], verdict->redirect, verdict->redirect_size
+        );
     }
 }
 
@@ -1338,4 +2109,18 @@ int chaos_init_net_mptcp_diag_available(void)
         );
     (void)close(probe);
     return !unresolvable;
+}
+
+/** @copydoc chaos_init_net_decide */
+int chaos_init_net_decide(const chaos_init_call_t *call, chaos_init_verdict_t *verdict)
+{
+    return chaos_init_net_decide_at(call, CHAOS_INIT_NET_NO_RESULT, verdict);
+}
+
+/** @copydoc chaos_init_net_decide_result */
+int chaos_init_net_decide_result(const chaos_init_call_t *call, long result)
+{
+    chaos_init_verdict_t verdict;
+
+    return chaos_init_net_decide_at(call, result, &verdict);
 }

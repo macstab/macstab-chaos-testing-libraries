@@ -487,7 +487,7 @@ file:
 - **Slots survive reloads.** Counters live in a pool of `2 × 256` slots beside the two
   snapshots; every rule copy a wrapper takes carries a pointer to its slot and the slot's
   generation. A rule whose text is unchanged by a reload keeps the same slot, so its count,
-  `@first` claims and REGRESS state continue, and a firing through a copy taken before the
+  `@first` claims, REGRESS state and a frozen FREEZE reading continue, and a firing through a copy taken before the
   reload still lands. A slot whose rule left the file gets a new generation: a copy held
   across a blocking call then neither fires nor counts, also after the slot is reused.
   `@first` claims are one CAS on a word holding the claim count (low 32 bits) and the
@@ -498,7 +498,10 @@ file:
   written makes no system call (the time comes from the vDSO). One thread writes at a time;
   a hit that finds the writer busy sets a pending flag the writer drains before it lets go.
 - **Per process.** A forked child starts from zero, so the parent's hits are not reported
-  twice; `@first` budgets and once-only effects (REGRESS) restart in the child too. A `vfork`
+  twice, and `@first` budgets restart in the child. The state word is the exception: a child
+  of a parent whose REGRESS rule has jumped, or whose FREEZE rule has fired, inherits that,
+  because a clock that steps back or stops only for the parent would be a fault no program
+  can be written against. Only a decision caught in progress is reset. A `vfork`
   child counts into the parent's slots and writes no file of its own.
 - **File number.** Normally the pid. A program started by `execve` keeps its pid but loads
   the library anew, and the replaced image ran no exit report: when a file of that pid
@@ -642,7 +645,7 @@ end note
 [`src/effects/chaos_io_actions.c`](../src/effects/chaos_io_actions.c)
 
 `libchaos-io` effects (other libraries: see their references). Every effect is gated by the
-qualifiers (`@first`, `@from`, `@until`, `@size`); all but LATENCY also by the probability.
+qualifiers (`@first`, `@every`, `@from`, `@until`, `@size`) and by the probability.
 Probability `p` fires when a 32-bit sample from the thread's xorshift64\* PRNG is below
 `p × 2^32`; 0 never fires, 1 always.
 

@@ -44,22 +44,69 @@
  *   (rounded up to ms, capped at INT32_MAX) and returns 0 with the ready sets cleared at
  *   commit; a wait without a timeout, or with one the kernel would refuse (EINVAL), is
  *   left to the real call;
- * - CORRUPT, RESET and ERRNO on close reject the whole rule file in SECCOMP mode.
+ * - TRICKLE shortens a receive in the register, CORRUPT flips a bit of what one
+ *   delivered and DUP delivers a kept payload again, all through a trace stop;
+ * - RESET and ERRNO on close reject the whole rule file in SECCOMP mode.
  */
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/types.h>
 
 static int g_fail_process = 0;
+static pid_t g_fake_tgid = 0;
 static const char *g_fake_protocol = NULL;
 int chaos_init_process_of(pid_t tid, pid_t *tgid, uint64_t *start);
 static int test_process_of(pid_t tid, pid_t *tgid, uint64_t *start)
 {
-    return g_fail_process ? -1 : chaos_init_process_of(tid, tgid, start);
+    if (g_fail_process)
+    {
+        return -1;
+    }
+    if (g_fake_tgid != 0)
+    {
+        /* A process that does not exist: its descriptor table cannot be read, so the
+         * ownership of a socket cannot be established. */
+        *tgid = g_fake_tgid;
+        *start = 0U;
+        return 0;
+    }
+    return chaos_init_process_of(tid, tgid, start);
 }
 #define CHAOS_INIT_PROCESS_OF(tid, tgid, start) test_process_of((tid), (tgid), (start))
+
+/* Seam of the ownership scan (chaos_net_owner.c): a directory it cannot read may hide a
+ * holder of the socket, which no test can provoke from outside. With `g_deaf_proc` set,
+ * every directory but the one named in `g_own_fd_dir` refuses to open, with EACCES: the
+ * errno matters, because ENOENT is the one failure the scan skips instead of counting.
+ *
+ * `g_lone_proc` is the other direction, and it is what makes these checks independent of
+ * the host they run on: every process but this one reports ENOENT, so the scan concludes
+ * SOLE whatever else is running. Without it, an ordinary user beside a root process whose
+ * descriptors cannot be read -- a CI runner -- gets UNKNOWN and every RESET here is
+ * suppressed. That answer is correct, and test_net_owner.c is where it is tested; here it
+ * would only hide what these assertions are about. */
+static int g_deaf_proc = 0;
+static int g_lone_proc = 0;
+static char g_own_fd_dir[32] = "";
+static int test_owner_open(const char *path)
+{
+    if (g_deaf_proc && strcmp(path, g_own_fd_dir) != 0)
+    {
+        errno = EACCES;
+        return -1;
+    }
+    if (g_lone_proc && strcmp(path, "/proc") != 0 && strcmp(path, g_own_fd_dir) != 0)
+    {
+        errno = ENOENT;
+        return -1;
+    }
+    return open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+}
+#define CHAOS_NET_OWNER_OPEN(path) test_owner_open(path)
 
 #include <sys/xattr.h>
 static unsigned g_protocol_lookups = 0U;
@@ -94,6 +141,30 @@ static int test_mptcp_socket(void);
 #include "../../src/init/chaos_init_net.c"
 #include "../../src/init/chaos_init_proc.c"
 #include "../../src/init/chaos_init_tracee.c"
+
+/* The seed source lives in chaos_init_core.c, which this test does not include; the
+ * declaration comes from chaos_init_core.h, so the definition may follow the include. A
+ * fixed value keeps the rules' draw keys the same in every run. */
+uint64_t chaos_init_seed(void)
+{
+    return UINT64_C(0x5eed5eed5eed5eed);
+}
+
+/* The installed TRACE set lives in chaos_init_core.c, which this test does not include.
+ * `g_traced_all` is the seam: with it set every call counts as traced, which is the state
+ * a container starts in when its rule file already asked for those effects; cleared, it
+ * is a filter that traces nothing, which is what a reload adding such an effect meets. */
+static int g_traced_all = 1;
+void chaos_init_traced_set(const long *calls, size_t count)
+{
+    (void)calls;
+    (void)count;
+}
+int chaos_init_traced(long nr)
+{
+    (void)nr;
+    return g_traced_all;
+}
 
 static int test_mptcp_socket(void)
 {
@@ -185,6 +256,21 @@ static void write_rules(const char *rules)
 
     assert(file != NULL && fputs(rules, file) >= 0 && fclose(file) == 0);
     assert(rename("/tmp/.chaos-net.conf.new", "/tmp/.chaos-net.conf") == 0);
+}
+
+/** @brief Whether every byte of @p area still holds @p fill, i.e. nothing was corrupted. */
+static int untouched(const unsigned char *area, size_t size, unsigned char fill)
+{
+    size_t index;
+
+    for (index = 0U; index < size; ++index)
+    {
+        if (area[index] != fill)
+        {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 /**
@@ -733,6 +819,18 @@ int main(void)
     assert(FAILS(decide(__NR_sendto, (uint64_t)client, P(buffer), 20U, 0, 0, 0), EPIPE));
     assert(FAILS(decide(__NR_sendmsg, (uint64_t)client, P(&message), 0, 0, 0, 0), EPIPE));
     assert(PASSES(decide(__NR_sendmsg, (uint64_t)client, 0U, 0, 0, 0, 0))); /* size unknown */
+    /* So is a total above SSIZE_MAX: the call returns ssize_t and the kernel rejects it,
+     * and a wrapping sum would have handed `@size>10` a small number for a request larger
+     * than the address space. */
+    {
+        struct iovec huge[2];
+
+        huge[0].iov_base = buffer;
+        huge[0].iov_len = (size_t)SSIZE_MAX;
+        huge[1].iov_base = buffer;
+        huge[1].iov_len = (size_t)SSIZE_MAX;
+        assert(PASSES(decide(__NR_writev, (uint64_t)client, P(huge), 2U, 0, 0, 0)));
+    }
     /* The accepted socket's peer (client port) matches nothing; its local end does. */
     assert(FAILS(decide(__NR_write, (uint64_t)server, P(buffer), 20U, 0, 0, 0), EPIPE));
     /* A socket of a protocol chaos-init does not resolve (netlink): neither end
@@ -1024,6 +1122,55 @@ int main(void)
     assert(PASSES(decide(__NR_listen, (uint64_t)listener, 4U, 0, 0, 0, 0)));
     g_fail_process = 0;
 
+    /* DROP: a datagram send is answered with its byte count and never runs, while the
+     * same rule leaves a stream send alone -- the supervisor decides the two cases exactly
+     * as the library does. sendmmsg reports a message count, so it is left alone too. */
+    (void)snprintf(
+        rules, sizeof(rules), "udp4://127.0.0.1:%u:send:DROP:1.0\n", ntohs(udp_address.sin_port)
+    );
+    write_rules(rules);
+    {
+        chaos_init_verdict_t dropped = decide(
+            __NR_sendto, (uint64_t)udp, P(buffer), 20U, 0, P(&udp_address), sizeof(udp_address)
+        );
+
+        assert(dropped.action == CHAOS_INIT_RETURN && dropped.value == 20L);
+        memset(messages, 0, sizeof(messages));
+        messages[0].msg_hdr.msg_name = &udp_address;
+        messages[0].msg_hdr.msg_namelen = sizeof(udp_address);
+        assert(PASSES(decide(__NR_sendmmsg, (uint64_t)udp, P(messages), 1U, 0, 0, 0)));
+    }
+    (void)snprintf(
+        rules, sizeof(rules), "tcp4://127.0.0.1:%u:send:DROP:1.0\n", ntohs(server_address.sin_port)
+    );
+    write_rules(rules);
+    assert(PASSES(decide(__NR_write, (uint64_t)server, P(buffer), 8U, 0, 0, 0)));
+
+    /* A `/N` prefix selector works here too: the supervisor reads the sockaddr out of the
+     * tracee and matches it with the same code the library uses, so the Docker bridge
+     * network a container is given can be named without knowing its address. */
+    (void)snprintf(
+        rules,
+        sizeof(rules),
+        "tcp4://127.0.0.0/8:%u:connect:EHOSTUNREACH:1.0\n",
+        ntohs(server_address.sin_port)
+    );
+    write_rules(rules);
+    assert(FAILS(
+        decide(
+            __NR_connect, (uint64_t)unbound, P(&server_address), sizeof(server_address), 0, 0, 0
+        ),
+        EHOSTUNREACH
+    ));
+    /* Outside the prefix, nothing matches: the port alone does not carry the rule. */
+    {
+        struct sockaddr_in outside = server_address;
+
+        assert(inet_pton(AF_INET, "10.1.2.3", &outside.sin_addr) == 1);
+        assert(PASSES(decide(__NR_connect, (uint64_t)unbound, P(&outside), sizeof(outside), 0, 0, 0)
+        ));
+    }
+
     /* With rules only for connect, recv and poll calls must not touch /proc at all
      * (zero protocol lookups), so a busy event loop costs nothing; connect still does. */
     write_rules("*:connect:ECONNREFUSED:1.0\n");
@@ -1057,9 +1204,9 @@ int main(void)
     );
 
     /* Effects SECCOMP mode cannot apply reject the whole rule file, status naming the
-     * line: CORRUPT (rewrites received data), ERRNO on close (would need close and fail
-     * at once), RESET (needs the socket itself). LATENCY on close is allowed. */
-    write_rules("*:connect:ECONNREFUSED:1.0\n*:recv:CORRUPT:1.0\n");
+     * line: ERRNO on close (would need close and fail at once) and RESET (needs a second
+     * call to run inside the tracee). LATENCY on close is allowed. */
+    write_rules("*:connect:ECONNREFUSED:1.0\n*:close:ECONNRESET:1.0\n");
     assert(PASSES(
         decide(__NR_connect, (uint64_t)unbound, P(&server_address), sizeof(server_address), 0, 0, 0)
     ));
@@ -1071,10 +1218,705 @@ int main(void)
         (void)fclose(file);
         assert(strstr(status, "line=2\nreason=unsupported in seccomp mode\n") != NULL);
     }
+    /* CORRUPT is applied here too, but only at the exit stop: the entry stop cannot know
+     * how many bytes a receive will deliver, so it asks to be called again and draws
+     * nothing. Over twelve rounds exactly one byte inside the received length changes each
+     * time, nothing beyond it does, and both the byte and its bit vary -- they are drawn.
+     * A MSG_TRUNC receive on a stream socket wrote nothing and is left alone, and so is a
+     * receive that returned nothing. */
+    write_rules("*:recv:CORRUPT:1.0\n");
+    {
+        unsigned char area[128];
+        chaos_init_call_t after;
+        size_t round;
+        size_t first_offset = sizeof(area);
+        unsigned char first_mask = 0U;
+        int saw_another = 0;
+        int saw_another_bit = 0;
+
+        assert(
+            decide(__NR_recvfrom, (uint64_t)server, P(area), sizeof(area), 0, 0, 0).action ==
+            CHAOS_INIT_AFTER
+        );
+        assert(PASSES(decide(__NR_recvmsg, (uint64_t)server, P(&message), 0, 0, 0, 0)));
+
+        memset(&after, 0, sizeof(after));
+        after.tid = getpid();
+        after.nr = __NR_recvfrom;
+        after.args[0] = (uint64_t)server;
+        after.args[1] = P(area);
+        after.args[2] = sizeof(area);
+        /* Nothing delivered: nothing to corrupt and no draw. */
+        (void)memset(area, 'A', sizeof(area));
+        assert(chaos_init_net_decide_result(&after, 0) == 1);
+        assert(chaos_init_net_decide_result(&after, -1) == 1);
+        assert(untouched(area, sizeof(area), 'A'));
+        /* MSG_TRUNC on a stream socket discards the data instead of writing it. */
+        after.args[3] = (uint64_t)MSG_TRUNC;
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        assert(untouched(area, sizeof(area), 'A'));
+        /* A receive that reports more than the buffer could hold -- what MSG_TRUNC does on
+         * a datagram socket -- with no buffer at all. The byte to corrupt would be drawn
+         * out of a length of zero: SIGFPE on x86-64, where the supervisor is PID 1, and a
+         * write into a buffer the call never touched on aarch64, which does not trap. */
+        {
+            chaos_init_call_t empty = after;
+            char hits[256] = {0};
+            char path[64];
+            FILE *file;
+
+            empty.args[2] = 0U;
+            empty.args[3] = 0U;
+            (void)memset(area, 'A', sizeof(area));
+            assert(chaos_init_net_decide_result(&empty, 8) == 1);
+            assert(untouched(area, sizeof(area), 'A'));
+            /* The buffer alone does not settle it: on aarch64 a modulo by zero yields the
+             * dividend rather than trapping, so the byte would be written at a drawn
+             * offset far outside this buffer -- somewhere else in the tracee. What both
+             * architectures show is the draw itself: the guard sits before it, so no hit
+             * may have been counted, and a hit rewrites the file. */
+            (void)snprintf(path, sizeof(path), "/tmp/.chaos-net.hits.%ld", (long)getpid());
+            file = fopen(path, "r");
+            if (file != NULL)
+            {
+                hits[fread(hits, 1U, sizeof(hits) - 1U, file)] = '\0';
+                (void)fclose(file);
+            }
+            assert(strstr(hits, "*:recv:CORRUPT:1.0") == NULL);
+        }
+        after.args[3] = 0U;
+        for (round = 0U; round < 12U; ++round)
+        {
+            size_t index;
+            size_t offset = sizeof(area);
+            unsigned char mask = 0U;
+            int differences = 0;
+
+            (void)memset(area, 'A', sizeof(area));
+            assert(chaos_init_net_decide_result(&after, 8) == 1);
+            for (index = 0U; index < sizeof(area); ++index)
+            {
+                const unsigned char changed = (unsigned char)(area[index] ^ 'A');
+
+                if (changed != 0U)
+                {
+                    ++differences;
+                    offset = index;
+                    mask = changed;
+                    assert(index < 8U);
+                    assert((changed & (unsigned char)(changed - 1U)) == 0U);
+                }
+            }
+            assert(differences == 1);
+            if (round == 0U)
+            {
+                first_offset = offset;
+                first_mask = mask;
+            }
+            saw_another = saw_another || offset != first_offset;
+            saw_another_bit = saw_another_bit || mask != first_mask;
+        }
+        assert(saw_another);
+        assert(saw_another_bit);
+
+        /* An effect other than CORRUPT can only reach the exit stop if the rule file
+         * changed between the two stops. It must do nothing there: the call has already
+         * run, and drawing again would charge a hit for an effect nobody can apply. */
+        write_rules("*:recv:ECONNRESET:1.0\n");
+        (void)memset(area, 'A', sizeof(area));
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        assert(untouched(area, sizeof(area), 'A'));
+        /* One real hit through the entry stop, and the two exit-stop calls above added
+         * none: a count of three here would mean the guard let them draw. The hits file is
+         * rewritten by each hit, so it is current without a flush. */
+        assert(FAILS(decide(__NR_recvfrom, (uint64_t)server, P(area), 8U, 0, 0, 0), ECONNRESET));
+        {
+            char hits[256] = {0};
+            char path[64];
+            FILE *file;
+
+            (void)snprintf(path, sizeof(path), "/tmp/.chaos-net.hits.%ld", (long)getpid());
+            file = fopen(path, "r");
+            assert(file != NULL);
+            hits[fread(hits, 1U, sizeof(hits) - 1U, file)] = '\0';
+            (void)fclose(file);
+            /* The file leads with the tab-free header lines the library writes there
+             * (generation, RESET suppressions), so the count line is looked up rather
+             * than compared against the whole file. */
+            assert(strstr(hits, "\n1\t*:recv:ECONNRESET:1.0\n") != NULL);
+        }
+    }
+
+    /* TRICKLE is applied here now: the requested length sits in a register, so the filter
+     * answers the call with TRACE and the stop shortens it to the chunk. The library's
+     * limits hold -- a stream socket only, not MSG_WAITALL, and only a request larger than
+     * the chunk -- and the forms that keep their length in memory stay notified. */
+    write_rules("*:recv:TRICKLE:4\n");
+    {
+        const chaos_init_verdict_t shortened =
+            decide(__NR_recvfrom, (uint64_t)server, P(buffer), 32U, 0, 0, 0);
+
+        assert(shortened.action == CHAOS_INIT_SHORTEN);
+        assert(shortened.arg_index == 2U);
+        assert(shortened.value == 4);
+    }
+    /* read on a socket is a recv, and carries its length in a register too. */
+    assert(
+        decide(__NR_read, (uint64_t)server, P(buffer), 32U, 0, 0, 0).action == CHAOS_INIT_SHORTEN
+    );
+    /* A request already within the chunk is left alone, as is MSG_WAITALL. */
+    assert(PASSES(decide(__NR_recvfrom, (uint64_t)server, P(buffer), 4U, 0, 0, 0)));
+    assert(
+        PASSES(decide(__NR_recvfrom, (uint64_t)server, P(buffer), 32U, (uint64_t)MSG_WAITALL, 0, 0))
+    );
+    /* A datagram socket is left alone: a shorter buffer truncates the datagram. */
+    assert(PASSES(decide(__NR_recvfrom, (uint64_t)udp, P(buffer), 32U, 0, 0, 0)));
+    /* recvmsg keeps its length in the message, so one argument cannot shorten it. */
+    assert(PASSES(decide(__NR_recvmsg, (uint64_t)server, P(&message), 0, 0, 0, 0)));
+    /* The traced set names exactly the register-length receives, each once. Three rules on
+     * purpose: a second recv rule must not name the same calls twice, and the connect rule
+     * must not contribute at all. */
+    write_rules("*:recv:TRICKLE:4\n"
+                "tcp4://127.0.0.1:9999:recv:TRICKLE:8\n"
+                "*:connect:ECONNREFUSED:1.0\n");
+    {
+        long traced[8];
+        const size_t count =
+            chaos_init_net_traced_calls(traced, sizeof(traced) / sizeof(traced[0]));
+        size_t index;
+        int saw_recvfrom = 0;
+        int saw_read = 0;
+        int saw_recvmsg = 0;
+
+        for (index = 0U; index < count; ++index)
+        {
+            saw_recvfrom = saw_recvfrom || traced[index] == __NR_recvfrom;
+            saw_read = saw_read || traced[index] == __NR_read;
+            saw_recvmsg = saw_recvmsg || traced[index] == __NR_recvmsg;
+        }
+        assert(count == 2U && saw_recvfrom && saw_read && !saw_recvmsg);
+        assert(chaos_init_net_traced_calls(traced, 1U) == 1U);
+        assert(chaos_init_net_traced_calls(traced, 0U) == 0U);
+        assert(chaos_init_net_traced_calls(NULL, 4U) == 0U);
+    }
+    /* With nothing traced the set is empty, so the filter stays the one it always was. */
+    /* DUP keeps what a receive delivered and hands it to the next one: the entry stop
+     * lets the call run because nothing is kept yet, the exit stop keeps the bytes, and
+     * the next entry stop returns them without the call running. Each payload replays
+     * once. Only the replay is a hit -- keeping is not. */
+    write_rules("*:recv:DUP:1.0\n");
+    {
+        unsigned char area[16];
+        chaos_init_call_t after;
+        chaos_init_verdict_t replay;
+
+        memset(&after, 0, sizeof(after));
+        after.tid = getpid();
+        after.nr = __NR_recvfrom;
+        after.args[0] = (uint64_t)server;
+        after.args[1] = P(area);
+        after.args[2] = sizeof(area);
+
+        assert(
+            decide(__NR_recvfrom, (uint64_t)server, P(area), sizeof(area), 0, 0, 0).action ==
+            CHAOS_INIT_AFTER
+        );
+        /* Nothing delivered is nothing to keep, so the next receive still finds no
+         * payload. */
+        assert(chaos_init_net_decide_result(&after, 0) == 1);
+        assert(
+            decide(__NR_recvfrom, (uint64_t)server, P(area), sizeof(area), 0, 0, 0).action ==
+            CHAOS_INIT_AFTER
+        );
+        memcpy(area, "payload!", 8U);
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        (void)memset(area, 'A', sizeof(area));
+        replay = decide(__NR_recvfrom, (uint64_t)server, P(area), sizeof(area), 0, 0, 0);
+        assert(replay.action == CHAOS_INIT_RETURN && replay.value == 8);
+        assert(memcmp(area, "payload!", 8U) == 0 && area[8] == 'A');
+        /* Replayed once: the slot is empty, so the next receive runs again. */
+        assert(
+            decide(__NR_recvfrom, (uint64_t)server, P(area), sizeof(area), 0, 0, 0).action ==
+            CHAOS_INIT_AFTER
+        );
+        /* The forms DUP does not take, each counting no hit: MSG_PEEK (consumes nothing),
+         * a zero-length request (a replay into it would read as EOF), recvmsg (its buffer
+         * is an iovec) and a descriptor without a socket behind it. */
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        assert(PASSES(decide(__NR_recvfrom, (uint64_t)server, P(area), sizeof(area), MSG_PEEK, 0, 0)
+        ));
+        assert(PASSES(decide(__NR_recvfrom, (uint64_t)server, P(area), 0, 0, 0, 0)));
+        assert(PASSES(decide(__NR_recvmsg, (uint64_t)server, P(&message), 0, 0, 0, 0)));
+        {
+            char hits[256] = {0};
+            char path[64];
+            FILE *file;
+
+            (void)snprintf(path, sizeof(path), "/tmp/.chaos-net.hits.%ld", (long)getpid());
+            file = fopen(path, "r");
+            assert(file != NULL);
+            hits[fread(hits, 1U, sizeof(hits) - 1U, file)] = '\0';
+            (void)fclose(file);
+            assert(strstr(hits, "\n1\t*:recv:DUP:1.0\n") != NULL);
+        }
+        /* A buffer the supervisor cannot read keeps nothing, and one it cannot write
+         * leaves the verdict at AFTER: the receive runs for real. */
+        after.args[1] = 0U;
+        after.args[2] = 8U;
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        assert(decide(__NR_recvfrom, (uint64_t)server, 0, 8U, 0, 0, 0).action == CHAOS_INIT_AFTER);
+        after.args[1] = P(area);
+        after.args[2] = sizeof(area);
+        memcpy(area, "payload!", 8U);
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        assert(decide(__NR_recvfrom, (uint64_t)server, 0, 8U, 0, 0, 0).action == CHAOS_INIT_AFTER);
+    }
+    /* A stream payload longer than the cap is kept cut, a datagram that long is not kept
+     * at all: replayed cut it would be another message. */
+    {
+        static unsigned char wide[CHAOS_INIT_NET_DUP_MAX_BYTES * 2U];
+        chaos_init_call_t after;
+        chaos_init_verdict_t replay;
+
+        memset(&after, 0, sizeof(after));
+        after.tid = getpid();
+        after.nr = __NR_read;
+        after.args[0] = (uint64_t)server;
+        after.args[1] = P(wide);
+        after.args[2] = sizeof(wide);
+        (void)memset(wide, 'B', sizeof(wide));
+        assert(chaos_init_net_decide_result(&after, (long)sizeof(wide)) == 1);
+        replay = decide(__NR_read, (uint64_t)server, P(wide), sizeof(wide), 0, 0, 0);
+        assert(
+            replay.action == CHAOS_INIT_RETURN && replay.value == (long)CHAOS_INIT_NET_DUP_MAX_BYTES
+        );
+
+        after.args[0] = (uint64_t)udp;
+        assert(chaos_init_net_decide_result(&after, (long)sizeof(wide)) == 1);
+        assert(
+            decide(__NR_read, (uint64_t)udp, P(wide), sizeof(wide), 0, 0, 0).action ==
+            CHAOS_INIT_AFTER
+        );
+    }
+    /* A datagram replay carries the sender address the kept receive reported, truncated to
+     * the caller's capacity with the full length reported, as the kernel does. */
+    {
+        unsigned char area[16];
+        struct sockaddr_in sender;
+        socklen_t sender_length = sizeof(sender);
+        chaos_init_call_t after;
+        chaos_init_verdict_t replay;
+
+        sender = udp_address;
+        memset(&after, 0, sizeof(after));
+        after.tid = getpid();
+        after.nr = __NR_recvfrom;
+        after.args[0] = (uint64_t)udp;
+        after.args[1] = P(area);
+        after.args[2] = sizeof(area);
+        after.args[4] = P(&sender);
+        after.args[5] = P(&sender_length);
+        memcpy(area, "datagram", 8U);
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+
+        memset(&sender, 0, sizeof(sender));
+        sender_length = sizeof(sender);
+        replay = decide(
+            __NR_recvfrom, (uint64_t)udp, P(area), sizeof(area), 0, P(&sender), P(&sender_length)
+        );
+        assert(replay.action == CHAOS_INIT_RETURN && replay.value == 8);
+        assert(sender_length == (socklen_t)sizeof(struct sockaddr_in));
+        assert(sender.sin_port == udp_address.sin_port);
+        /* Room for half the address gets half of it and nothing past that, and the full
+         * length is reported all the same. */
+        memcpy(area, "datagram", 8U);
+        sender_length = sizeof(sender);
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        {
+            unsigned char room[sizeof(struct sockaddr_in) * 2U];
+            const socklen_t half = (socklen_t)(sizeof(struct sockaddr_in) / 2U);
+
+            (void)memset(room, 'Z', sizeof(room));
+            sender_length = half;
+            replay = decide(
+                __NR_recvfrom, (uint64_t)udp, P(area), sizeof(area), 0, P(room), P(&sender_length)
+            );
+            assert(replay.action == CHAOS_INIT_RETURN);
+            assert(sender_length == (socklen_t)sizeof(struct sockaddr_in));
+            assert(memcmp(room, &udp_address, (size_t)half) == 0);
+            assert(untouched(room + half, sizeof(room) - (size_t)half, 'Z'));
+        }
+        /* No room at all for the address: the length is still reported. */
+        memcpy(area, "datagram", 8U);
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        sender_length = 0;
+        replay = decide(
+            __NR_recvfrom, (uint64_t)udp, P(area), sizeof(area), 0, P(&sender), P(&sender_length)
+        );
+        assert(replay.action == CHAOS_INIT_RETURN);
+        assert(sender_length == (socklen_t)sizeof(struct sockaddr_in));
+    }
+    /* More sockets with a payload at once than there are slots: the oldest gives way, so
+     * the newest payloads are the ones that replay. */
+    {
+        unsigned char area[16];
+        int sockets[CHAOS_INIT_NET_DUP_SLOTS + 1U];
+        chaos_init_call_t after;
+        size_t index;
+
+        memset(&after, 0, sizeof(after));
+        after.tid = getpid();
+        after.nr = __NR_read;
+        after.args[1] = P(area);
+        after.args[2] = sizeof(area);
+        memcpy(area, "payload!", 8U);
+        for (index = 0U; index < sizeof(sockets) / sizeof(sockets[0]); ++index)
+        {
+            sockets[index] = socket(AF_INET, SOCK_DGRAM, 0);
+            assert(sockets[index] >= 0);
+            after.args[0] = (uint64_t)sockets[index];
+            assert(chaos_init_net_decide_result(&after, 8) == 1);
+        }
+        /* The first socket's payload was evicted by the last one's. */
+        assert(
+            decide(__NR_read, (uint64_t)sockets[0], P(area), sizeof(area), 0, 0, 0).action ==
+            CHAOS_INIT_AFTER
+        );
+        index = sizeof(sockets) / sizeof(sockets[0]) - 1U;
+        assert(
+            decide(__NR_read, (uint64_t)sockets[index], P(area), sizeof(area), 0, 0, 0).action ==
+            CHAOS_INIT_RETURN
+        );
+        /* Age decides, not position: the first socket's slot is the newest again once it
+         * keeps another payload, so the next store takes the second socket's. */
+        memcpy(area, "payload!", 8U);
+        after.args[0] = (uint64_t)sockets[0];
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        after.args[0] = (uint64_t)sockets[index];
+        assert(chaos_init_net_decide_result(&after, 8) == 1);
+        assert(
+            decide(__NR_read, (uint64_t)sockets[1], P(area), sizeof(area), 0, 0, 0).action ==
+            CHAOS_INIT_AFTER
+        );
+        assert(
+            decide(__NR_read, (uint64_t)sockets[0], P(area), sizeof(area), 0, 0, 0).action ==
+            CHAOS_INIT_RETURN
+        );
+        for (index = 0U; index < sizeof(sockets) / sizeof(sockets[0]); ++index)
+        {
+            (void)close(sockets[index]);
+        }
+    }
+
     write_rules("*:close:ECONNRESET:1.0\n");
+    {
+        long traced[8];
+
+        assert(chaos_init_net_traced_calls(traced, sizeof(traced) / sizeof(traced[0])) == 0U);
+    }
     assert(PASSES(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0)));
+    /* RESET aborts the connection, which is a setsockopt(SO_LINGER{1,0}) on the socket
+     * before the close -- a call of its own, run inside the tracee, with its argument in
+     * the tracee's stack scratch. The close itself still runs, so the verdict is BEFORE
+     * and not INSTEAD. Only the close is traced for it: the option needs no register of
+     * the call. */
     write_rules("*:close:RESET:1.0\n");
-    assert(PASSES(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0)));
+    (void)snprintf(g_own_fd_dir, sizeof(g_own_fd_dir), "/proc/%ld/fd", (long)getpid());
+    g_lone_proc = 1;
+    {
+        long traced[8];
+        struct linger expected;
+        chaos_init_verdict_t aborting = decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0);
+
+        assert(chaos_init_net_traced_calls(traced, sizeof(traced) / sizeof(traced[0])) == 1U);
+        assert(traced[0] == __NR_close);
+        assert(aborting.action == CHAOS_INIT_BEFORE);
+        assert(aborting.instead_nr == __NR_setsockopt);
+        assert(aborting.instead_args[0] == (uint64_t)server);
+        assert(aborting.instead_args[1] == (uint64_t)SOL_SOCKET);
+        assert(aborting.instead_args[2] == (uint64_t)SO_LINGER);
+        assert(aborting.instead_args[4] == sizeof(struct linger));
+        assert(aborting.instead_size == (unsigned)sizeof(struct linger));
+        assert(aborting.instead_arg == 3U);
+        (void)memcpy(&expected, aborting.instead_data, sizeof(expected));
+        assert(expected.l_onoff == 1 && expected.l_linger == 0);
+
+        /* A socket a second descriptor still holds is not reset: the option would reset it
+         * later, when no rule is looking. The suppression is counted instead of passed
+         * over, and spends no hit. A table that cannot be read leaves the ownership
+         * unknown, which is counted apart -- that is an environment problem, not a
+         * pre-forking server. */
+        {
+            const int shared_fd = dup(server);
+
+            assert(shared_fd > 2);
+            assert(PASSES(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0)));
+            (void)close(shared_fd);
+        }
+        g_fake_tgid = 0x7ffffff;
+        assert(PASSES(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0)));
+        g_fake_tgid = 0;
+        /* A /proc directory the supervisor cannot read may hide a second holder, so the
+         * ownership is unknown rather than sole. */
+        g_deaf_proc = 1;
+        assert(PASSES(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0)));
+        g_deaf_proc = 0;
+        g_fail_process = 1;
+        assert(PASSES(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0)));
+        g_fail_process = 0;
+        /* The two counts are apart and go into the header lines of the hits file, which
+         * chaos-init writes on the hits cadence (chaos_init_rules_t::header) -- a rule
+         * that only ever gets suppressed reports nothing otherwise. */
+        {
+            char header[CHAOS_HITS_HEADER_MAX];
+            const char *lines = chaos_net_hits_header(header, sizeof(header));
+
+            assert(lines != NULL);
+            assert(strstr(lines, "suppressed.shared=1\n") != NULL);
+            assert(strstr(lines, "suppressed.unknown=3\n") != NULL);
+        }
+    }
+    g_lone_proc = 0;
+    /* REDIRECT: the address `connect` was given is in the tracee, and a notification
+     * answered with CONTINUE makes the kernel read it from there again -- so the verdict
+     * carries the new address and the call is let through. Here the tracee is this
+     * process, so the write can be read back from the buffer that was passed. */
+    (void)snprintf(
+        rules,
+        sizeof(rules),
+        "tcp4://127.0.0.1:%u:connect:REDIRECT:10.0.0.7:5433\n",
+        ntohs(server_address.sin_port)
+    );
+    write_rules(rules);
+    {
+        struct sockaddr_in wanted = server_address;
+        struct in_addr target;
+        chaos_net_redirect_t rule_target;
+        chaos_init_call_t call;
+        chaos_init_verdict_t verdict;
+
+        assert(inet_pton(AF_INET, "10.0.0.7", &target) == 1);
+        memset(&rule_target, 0, sizeof(rule_target));
+        rule_target.family = AF_INET;
+        rule_target.port = 5433U;
+        rule_target.value.ipv4 = target;
+        memset(&call, 0, sizeof(call));
+        call.tid = getpid();
+        call.nr = __NR_connect;
+        call.args[0] = (uint64_t)unbound;
+        call.args[1] = P(&wanted);
+        call.args[2] = sizeof(wanted);
+        memset(&verdict, 0, sizeof(verdict));
+        verdict.action = CHAOS_INIT_FAIL;
+        verdict.error = -1;
+        assert(chaos_init_net_decide(&call, &verdict) == 1);
+        /* The call runs: the kernel is to connect to the address the commit writes. */
+        assert(verdict.action == CHAOS_INIT_PASS);
+        assert(verdict.redirect_size == sizeof(wanted));
+        /* Nothing is written before the notification is confirmed, which the supervisor
+         * does between the decision and the commit. */
+        assert(wanted.sin_addr.s_addr == server_address.sin_addr.s_addr);
+        chaos_init_net_commit(&call, &verdict);
+        assert(memcmp(&wanted.sin_addr, &target, sizeof(target)) == 0);
+        assert(ntohs(wanted.sin_port) == 5433U);
+        /* An address the supervisor cannot read builds nothing. Not reachable through a
+         * decision -- the endpoint the rule matched was resolved from that same sockaddr
+         * -- so the guard is proved by calling the builder itself, as the io tests prove
+         * theirs. */
+        {
+            unsigned char built[sizeof(struct sockaddr_storage)];
+            unsigned built_size = 1U;
+            chaos_init_call_t unreadable = call;
+
+            unreadable.args[1] = 8U;
+            assert(chaos_init_net_redirect(&unreadable, &rule_target, built, &built_size) == 0);
+            assert(built_size == 0U);
+            /* And an address that would not fit the length the caller passed. */
+            unreadable = call;
+            unreadable.args[2] = 1U;
+            assert(chaos_init_net_redirect(&unreadable, &rule_target, built, &built_size) == 0);
+        }
+    }
+    /* Each process the supervisor decides for draws with a lineage of its own, or the
+     * backends of a pre-forking server would all make the same decision at `p<1`. Serial 1
+     * is the application itself and keeps lineage 0, so a single process decides exactly as
+     * it would under LD_PRELOAD. */
+    {
+        chaos_init_net_lineage(1U);
+        assert(g_chaos_net_lineage == 0U);
+        chaos_init_net_lineage(2U);
+        {
+            const uint64_t second = g_chaos_net_lineage;
+
+            assert(second != 0U);
+            chaos_init_net_lineage(3U);
+            assert(g_chaos_net_lineage != second && g_chaos_net_lineage != 0U);
+            chaos_init_net_lineage(2U);
+            assert(g_chaos_net_lineage == second);
+        }
+        chaos_init_net_lineage(1U);
+    }
+
+    /* A target of the other family fits no sockaddr this socket can pass: the rule does
+     * not fire, and the draw is not spent on it. */
+    (void)snprintf(
+        rules,
+        sizeof(rules),
+        "tcp4://127.0.0.1:%u:connect:REDIRECT:[2001:db8::7]:5433\n",
+        ntohs(server_address.sin_port)
+    );
+    write_rules(rules);
+    {
+        struct sockaddr_in wanted = server_address;
+
+        assert(PASSES(decide(__NR_connect, (uint64_t)unbound, P(&wanted), sizeof(wanted), 0, 0, 0))
+        );
+        assert(wanted.sin_addr.s_addr == server_address.sin_addr.s_addr);
+    }
+
+    /* A filter that does not trace this call cannot carry a shortened send, and a filter
+     * cannot be changed once installed -- so a rule file replaced at run time can ask for
+     * an effect this container will never deliver. It must then not fire, and the check
+     * sits before the draw so no hit is reported for a fault nobody injected. */
+    (void)snprintf(
+        rules,
+        sizeof(rules),
+        "tcp4://127.0.0.1:%u:send:THROTTLE:10\n",
+        ntohs(server_address.sin_port)
+    );
+    write_rules(rules);
+    g_traced_all = 0;
+    assert(PASSES(decide(__NR_write, (uint64_t)server, P(buffer), 4096U, 0, 0, 0)));
+    assert(PASSES(decide(__NR_write, (uint64_t)server, P(buffer), 4096U, 0, 0, 0)));
+    g_traced_all = 1;
+
+    /* THROTTLE: the same bucket arithmetic as the library's, applied through the
+     * registers. Ten bytes per second, so the bucket holds ten and a byte takes 100 ms to
+     * arrive -- slow enough that the test does not depend on how fast this machine is. */
+    (void)snprintf(
+        rules,
+        sizeof(rules),
+        "tcp4://127.0.0.1:%u:send:THROTTLE:10\n",
+        ntohs(server_address.sin_port)
+    );
+    write_rules(rules);
+    {
+        chaos_init_verdict_t held;
+
+        /* A full bucket covers the whole send: it passes, and the rule is not even asked,
+         * so an allowance that changes nothing spends no hit. */
+        assert(PASSES(decide(__NR_write, (uint64_t)server, P(buffer), 7U, 0, 0, 0)));
+        /* Three bytes left of the ten: a stream send is shortened to exactly those. */
+        held = decide(__NR_write, (uint64_t)server, P(buffer), 10U, 0, 0, 0);
+        assert(held.action == CHAOS_INIT_SHORTEN);
+        assert(held.arg_index == 2U && held.value == 3L);
+        /* Nothing left: the call is parked rather than slept in, so the tracee's other
+         * threads keep being served, and the answer when it is due shortens it to the one
+         * byte the wait bought.
+         *
+         * A range, not 100 exactly: the bucket keeps the part of a millisecond it could
+         * not turn into a token, so the wait is what is left of the byte's 100 ms after
+         * the few milliseconds these calls themselves took. Pinning 100 would pin the
+         * loss of that remainder, which is the defect the bucket test now covers. */
+        held = decide(__NR_write, (uint64_t)server, P(buffer), 10U, 0, 0, 0);
+        assert(held.action == CHAOS_INIT_DELAY);
+        assert(held.delay_ms > 50U && held.delay_ms <= 100U);
+        assert(held.shortens && held.value == 1L);
+        assert(held.arg_index == 2U);
+        /* The byte is charged when the call is parked, so the next caller waits for the
+         * one after it rather than for the same one: a second wait on top of what is left
+         * of the first. Without the charge both would be told 100 ms and the rate would
+         * come out double. */
+        held = decide(__NR_write, (uint64_t)server, P(buffer), 10U, 0, 0, 0);
+        assert(held.action == CHAOS_INIT_DELAY);
+        assert(held.delay_ms > 100U && held.delay_ms <= 200U);
+        /* sendmsg keeps its length in the message, so no register can shorten it: left
+         * alone and charged nothing, as in the library. */
+        assert(PASSES(decide(__NR_sendmsg, (uint64_t)server, P(&message), 0, 0, 0, 0)));
+
+        /* A send the rate lets through whole spends neither a hit nor a `@first` claim,
+         * as in the library: with `@first=1` the untouched send must leave the claim for
+         * the one that is actually held back. */
+        (void)snprintf(
+            rules,
+            sizeof(rules),
+            "tcp4://127.0.0.1:%u:send:THROTTLE:13 @first=1\n",
+            ntohs(server_address.sin_port)
+        );
+        write_rules(rules);
+        assert(PASSES(decide(__NR_write, (uint64_t)server, P(buffer), 13U, 0, 0, 0)));
+        held = decide(__NR_write, (uint64_t)server, P(buffer), 13U, 0, 0, 0);
+        assert(held.action == CHAOS_INIT_DELAY && held.shortens);
+        (void)snprintf(
+            rules,
+            sizeof(rules),
+            "tcp4://127.0.0.1:%u:send:THROTTLE:10\n",
+            ntohs(server_address.sin_port)
+        );
+        write_rules(rules);
+    }
+    /* A datagram is never cut -- half a datagram is not a datagram -- so it waits for its
+     * whole message and then sends it whole. Five bytes per second: the first message
+     * takes three of the five in the bucket, the second waits for the eight it is short
+     * of, 1600 ms, and keeps its length. */
+    (void)snprintf(
+        rules, sizeof(rules), "udp4://127.0.0.1:%u:send:THROTTLE:5\n", ntohs(udp_address.sin_port)
+    );
+    write_rules(rules);
+    {
+        chaos_init_verdict_t held = decide(
+            __NR_sendto, (uint64_t)udp, P(buffer), 3U, 0, P(&udp_address), sizeof(udp_address)
+        );
+
+        assert(PASSES(held));
+        held = decide(
+            __NR_sendto, (uint64_t)udp, P(buffer), 10U, 0, P(&udp_address), sizeof(udp_address)
+        );
+        assert(held.action == CHAOS_INIT_DELAY);
+        /* Eight bytes still owed at five a second is 1600 ms, less the part of a
+         * millisecond the bucket kept from the first send: a range, for the same reason
+         * the stream case above is one. */
+        assert(held.delay_ms > 1400U && held.delay_ms <= 1600U);
+        /* And no shortening: the message goes out as the caller wrote it. */
+        assert(!held.shortens);
+        /* A non-blocking socket is told EAGAIN instead of being parked, as in the
+         * library: its event loop is written for that answer. */
+        {
+            const int impatient = (int)syscall(SYS_socket, AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+            struct sockaddr_in bound;
+            socklen_t bound_length = sizeof(bound);
+
+            assert(impatient > 2);
+            memset(&bound, 0, sizeof(bound));
+            bound.sin_family = AF_INET;
+            bound.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            assert(bind(impatient, (struct sockaddr *)&bound, sizeof(bound)) == 0);
+            assert(getsockname(impatient, (struct sockaddr *)&bound, &bound_length) == 0);
+            (void)snprintf(
+                rules,
+                sizeof(rules),
+                "udp4://127.0.0.1:%u:send:THROTTLE:20\n",
+                ntohs(bound.sin_port)
+            );
+            write_rules(rules);
+            assert(PASSES(decide(
+                __NR_sendto, (uint64_t)impatient, P(buffer), 20U, 0, P(&bound), sizeof(bound)
+            )));
+            assert(FAILS(
+                decide(
+                    __NR_sendto, (uint64_t)impatient, P(buffer), 20U, 0, P(&bound), sizeof(bound)
+                ),
+                EAGAIN
+            ));
+            (void)close(impatient);
+            /* The descriptor is closed now, so its flags cannot be read: that counts as
+             * blocking rather than as non-blocking, so a rate holds the call back instead
+             * of refusing a socket whose mode nobody knows. */
+            assert(chaos_init_net_nonblocking(getpid(), (uint64_t)impatient) == 0);
+        }
+    }
+
     write_rules("*:close:LATENCY:5\n");
     assert(decide(__NR_close, (uint64_t)server, 0, 0, 0, 0, 0).action == CHAOS_INIT_DELAY);
 
@@ -1082,5 +1924,21 @@ int main(void)
     (void)unlink("/tmp/initnet.sock");
     (void)snprintf(rules, sizeof(rules), "/tmp/.chaos-net.hits.%ld", (long)getpid());
     (void)unlink(rules);
+    /* A reload without a call: what the inotify watch of chaos_init.c asks for when a
+     * rule file is put in place, so that the status file reports the rules before anything
+     * has called into them. Two rules, because every file loaded above has one or none: a
+     * status that said anything else would mean the reload did nothing. */
+    write_rules("*:close:LATENCY:5\n*:connect:ECONNREFUSED:1.0\n");
+    chaos_init_net_reload();
+    {
+        FILE *reloaded = fopen("/tmp/.chaos-net.status", "r");
+        char text[256] = {0};
+
+        assert(reloaded != NULL);
+        text[fread(text, 1U, sizeof(text) - 1U, reloaded)] = '\0';
+        (void)fclose(reloaded);
+        assert(strncmp(text, "state=ok\nrules=2\n", strlen("state=ok\nrules=2\n")) == 0);
+    }
+
     return 0;
 }

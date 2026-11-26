@@ -115,6 +115,12 @@ static void chaos_init_tracee_sync(chaos_init_rules_t *rules, int tracee)
             }
         }
         slots[index].report = chaos_init_tracee_report;
+        if (slots[index].armed_ms == 0U)
+        {
+            /* A rule that is new to this process becomes active now, which is where
+             * `@at=+N` starts counting; one carried over keeps the moment it got. */
+            slots[index].armed_ms = chaos_hits_now_ms();
+        }
     }
     rules->generation[tracee] = generation;
     rules->count[tracee] = new_count;
@@ -131,6 +137,8 @@ static void chaos_init_tracee_write(chaos_init_rules_t *rules, int tracee)
     const size_t count = rules->snapshot(&texts, &generation);
 
     static chaos_hit_slot_t *slots[CHAOS_INIT_MAX_RULES];
+    char header[CHAOS_HITS_HEADER_MAX];
+    const char *lines = rules->header != NULL ? rules->header(header, sizeof(header)) : NULL;
     size_t index;
 
     chaos_init_tracee_sync(rules, tracee);
@@ -159,8 +167,12 @@ static void chaos_init_tracee_write(chaos_init_rules_t *rules, int tracee)
         slots,
         (const char(*)[CHAOS_STATUS_TEXT_MAX + 1U]) texts,
         count < rules->max_rules ? count : rules->max_rules,
+        lines,
         rules->buffer,
-        rules->max_rules * CHAOS_HITS_LINE_MAX + 1U
+        /* The header too: chaos_hits_write_for() wants room for the rule lines *plus* the
+         * header it is given, and with a full rule set a buffer sized for the lines alone
+         * made it drop the whole file rather than one line. */
+        rules->max_rules * CHAOS_HITS_LINE_MAX + 1U + CHAOS_HITS_HEADER_MAX
     );
     rules->file[tracee] = owned ? number : 0;
 }
@@ -326,6 +338,12 @@ uint64_t chaos_init_tracee_serial(int tracee)
 chaos_hit_slot_t *chaos_init_tracee_slot(chaos_init_rules_t *rules, int tracee, size_t rule_index)
 {
     chaos_init_tracee_sync(rules, tracee);
+    /* Before the rule is drawn: the lineage belongs to the process being decided for, and
+     * every decision reaches this function to find its slot. */
+    if (rules->lineage != NULL)
+    {
+        rules->lineage(g_chaos_init_tracees[tracee].serial);
+    }
     if (rule_index >= rules->count[tracee] || rule_index >= rules->max_rules)
     {
         return NULL;

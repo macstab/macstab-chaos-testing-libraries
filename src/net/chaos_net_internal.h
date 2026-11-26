@@ -282,6 +282,42 @@ extern chaos_net_pselect_fn g_chaos_net_real_pselect;
 extern chaos_net_getsockname_fn g_chaos_net_real_getsockname;
 extern chaos_net_getpeername_fn g_chaos_net_real_getpeername;
 extern chaos_net_getsockopt_fn g_chaos_net_real_getsockopt;
+
+/** @brief How many descriptors hold a socket, as far as this process can tell. */
+typedef enum chaos_net_ownership
+{
+    CHAOS_NET_OWNER_SOLE = 0,   /**< No other descriptor anywhere refers to it. */
+    CHAOS_NET_OWNER_SHARED = 1, /**< Another descriptor, here or in another process, does. */
+    CHAOS_NET_OWNER_UNKNOWN = 2 /**< Could not be established; treat as shared. */
+} chaos_net_ownership_t;
+
+/**
+ * @brief Whether socket @p fd is held by more descriptors than this one.
+ *
+ * @details Reads the state out of `/proc/<pid>/fd`, so it covers every way of sharing an
+ * open file description rather than the ones a tracker would know (chaos_net_owner.c).
+ * Runs only for a close a RESET rule matched. Anything unreadable answers UNKNOWN, which
+ * the caller must treat as shared: a wrong SOLE leaves SO_LINGER behind on a socket that
+ * outlives the close.
+ *
+ * @param fd Socket about to be closed.
+ * @return One of chaos_net_ownership_t.
+ */
+chaos_net_ownership_t chaos_net_socket_ownership(int fd);
+
+/**
+ * @brief Records that a matched RESET rule was suppressed on a socket this process does not
+ *        own alone.
+ *
+ * @details The count reaches the test through the hits file's header lines
+ * (`suppressed.shared=`, `suppressed.unknown=`), published by the existing write cadence --
+ * no file I/O on the interposition path. Counted per matched close, independent of the
+ * probability draw, because ownership is settled before the rule fires.
+ *
+ * @param ownership What the scan answered; anything but SHARED counts as unknown.
+ */
+void chaos_net_reset_suppressed(chaos_net_ownership_t ownership);
+
 extern chaos_net_setsockopt_fn g_chaos_net_real_setsockopt;
 extern chaos_net_read_fn g_chaos_net_real_read;
 extern chaos_net_write_fn g_chaos_net_real_write;
@@ -329,14 +365,27 @@ extern chaos_net_epoll_pwait_fn g_chaos_net_real_epoll_pwait;
 extern __thread int g_chaos_net_tls_guard;
 
 /**
- * @brief Per-thread xorshift64* state; 0 means not yet seeded.
+ * @brief Lineage of this process: 0 in the one that loaded the library, mixed forward in
+ *        every forked child (the atfork handler).
  *
- * @details The first draw on a thread seeds it from the process seed, the thread id and a
- * stack address (chaos_net_prng_ensure_seeded()). Per-thread state needs no lock and
- * gives every thread its own stream. A fork() child zeroes it in its atfork handler so
- * pre-fork workers do not all draw the parent's sequence.
+ * @details XORed into a rule's draw key, so the children of a pre-forking server decide
+ * differently from the parent and from each other without the key itself being rewritten
+ * -- rewriting it would write every snapshot page in each child, the copy-on-write cost
+ * chaos_hits.h goes out of its way to avoid. Deterministic: a child's lineage follows
+ * from how many times this process has forked, which the test controls.
  */
-extern __thread uint64_t g_chaos_net_tls_prng_state;
+extern uint64_t g_chaos_net_lineage;
+
+/**
+ * @brief How often this process has forked, counted before the fork (the atfork prepare
+ *        handler), so that the child sees its own ordinal among its siblings.
+ *
+ * @details Without it every child of one parent would mix the same value into its
+ * lineage and the siblings of a pre-forking server would all make the *same* decision:
+ * at `p=0.5` either all of them or none, which is not a probability any more. The child
+ * resets it, so each process counts the children it forks itself.
+ */
+extern uint64_t g_chaos_net_forks;
 
 /**
  * @brief Process-wide seed, the base of every per-thread seed.
@@ -441,33 +490,18 @@ chaos_net_atomic_cas_u64(volatile uint64_t *value, uint64_t expected, uint64_t d
  * Thread id
  *---------------------------------------------------------------------------*/
 
-/**
- * @brief Kernel thread id of the caller, used only to seed the per-thread PRNG.
- *
- * @details Linux: the raw SYS_gettid system call (glibc exports gettid() only since 2.30,
- * and a raw call cannot be interposed). Elsewhere getpid(), so threads differ only by the
- * stack address mixed into their seed.
- *
- * @return The caller's thread id (Linux) or process id.
- */
-static inline uint64_t chaos_net_current_tid(void)
-{
-#ifdef __linux__
-    return (uint64_t)syscall(SYS_gettid);
-#else
-    return (uint64_t)getpid();
-#endif
-}
-
 /*---------------------------------------------------------------------------
- * PRNG: xorshift64*, seeded through the splitmix64 finaliser
+ * Draws: counter-based, no stream
  *---------------------------------------------------------------------------*/
 
 /**
  * @brief splitmix64 finaliser: maps a 64-bit word to a well-mixed one.
  *
- * @details Seed inputs (process seed, tid, stack address) differ in few bits; this
- * spreads every input bit over the whole output before it becomes xorshift state.
+ * @details This is the whole generator. There is no state to advance: a sample is a pure
+ * function of the rule and the number of the evaluation it belongs to, so no other thread
+ * can shift it and the decision for the nth evaluation of a rule is the same in every run
+ * with the same CHAOS_SEED. Not cryptographic, and it need not be: what is wanted is that
+ * neighbouring counters give unrelated samples, which is splitmix64's avalanche property.
  *
  * @param value Input word.
  * @return Mixed word.
@@ -481,68 +515,113 @@ static inline uint64_t chaos_net_prng_mix(uint64_t value)
 }
 
 /**
- * @brief Seeds the calling thread's PRNG on its first draw.
+ * @brief Hash of a rule's text, for its draw key.
  *
- * @details Called before every draw by chaos_net_prng_next_u32(); a no-op once seeded.
- * The seed mixes:
- *   1. g_chaos_net_process_seed -- differs between processes.
- *   2. chaos_net_current_tid()  -- differs between threads of a process.
- *   3. The address of a local  -- differs with stack placement (ASLR, per-thread stacks).
- * The result is forced odd, so it is never 0, the one state xorshift64* cannot leave.
+ * @details splitmix64 over the bytes. From the text rather than the slot index, because
+ * chaos_hits_assign() hands a slot out again when a rule leaves the file and the next rule
+ * in that slot would inherit its decisions. Two rules with the same text are one rule.
  *
- * @par Thread-safety: thread-local state only; async-signal-safe.
+ * @param text Rule as written; NULL hashes as the empty string.
+ * @return A well-mixed 64-bit hash.
  */
-static inline void chaos_net_prng_ensure_seeded(void)
+static inline uint64_t chaos_net_rule_hash(const char *text)
 {
-    uint64_t seed;
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    size_t index;
 
-    if (g_chaos_net_tls_prng_state != 0U)
+    if (text == NULL)
     {
-        return;
+        return chaos_net_prng_mix(hash);
     }
-
-    seed = g_chaos_net_process_seed;
-    seed ^= chaos_net_current_tid();
-    seed ^= (uint64_t)(uintptr_t)&seed;
-    /* Odd: never 0, the one state xorshift64* cannot leave. */
-    g_chaos_net_tls_prng_state = chaos_net_prng_mix(seed) | 1U;
+    for (index = 0U; text[index] != '\0'; ++index)
+    {
+        hash = chaos_net_prng_mix(hash + (uint64_t)(unsigned char)text[index]);
+    }
+    return hash;
 }
 
 /**
- * @brief Seeds the calling thread's PRNG with @p seed.
+ * @brief REDIRECT: the address `connect` is sent to instead of the one it was given.
  *
- * @details @p seed passes through chaos_net_prng_mix(); 0 is replaced by 1 first. Called
- * by chaos_net_init() for the thread that runs the constructor.
- *
- * @param seed Seed value.
- * @par Thread-safety: thread-local state only; async-signal-safe.
+ * @details Not a chaos_net_endpoint_t, which carries a UNIX path and selector
+ * bookkeeping a target has no use for: a redirect needs a family, an address and a port.
  */
-static inline void chaos_net_prng_seed_thread(uint64_t seed)
+typedef struct chaos_net_redirect
 {
-    g_chaos_net_tls_prng_state = chaos_net_prng_mix(seed == 0U ? UINT64_C(1) : seed);
-}
+    int family;    /**< AF_INET or AF_INET6; 0 when the rule is no REDIRECT. */
+    uint16_t port; /**< Host byte order; never 0, which `connect` could not use. */
+    /** @brief Address storage; the active member follows @c family. */
+    union
+    {
+        struct in_addr ipv4;  /**< Active when family is AF_INET. */
+        struct in6_addr ipv6; /**< Active when family is AF_INET6. */
+    } value;
+} chaos_net_redirect_t;
 
 /**
- * @brief Advances the calling thread's xorshift64* generator and returns 32 bits.
+ * @brief Builds the sockaddr a REDIRECT rule sends a `connect` to instead of @p address.
  *
- * @details Marsaglia's xorshift64 step (shifts 12, 25, 27), then the xorshift64*
- * multiplier 0x2545F4914F6CDD1D; the high 32 bits of the product are returned because
- * the low bits of xorshift64* are the weakest. No lock, no allocation, no system call.
+ * @details The socket decides what can be written into it, so the family of the address
+ * the caller passed is what the target has to fit:
+ * - same family: the target as it stands;
+ * - an IPv4 target on an AF_INET6 socket: the IPv4-mapped form (`::ffff:a.b.c.d`), which
+ *   is how such a socket reaches an IPv4 host and how `getpeername` reports it afterwards
+ *   -- the case a runtime that opens AF_INET6 sockets and connects to a v4 address hits,
+ *   and the one a `tcp4://` rule matched to get here;
+ * - an IPv6 target on an AF_INET socket: nothing to build, so the rule does not fire and
+ *   counts no hit, as DROP does not fire on a stream.
  *
- * @return A pseudo-random 32-bit value from the calling thread's stream.
- * @par Thread-safety: thread-local state only; async-signal-safe.
+ * The length never changes, because the family never does: a caller that passed 16 bytes
+ * gets 16 back. Here rather than in one of the modules because both the `connect` wrapper
+ * and chaos-init build the address, and from the same arithmetic.
+ *
+ * @param target      Parsed REDIRECT target.
+ * @param address     The sockaddr the caller passed; its family decides.
+ * @param out         Output storage, zeroed first.
+ * @param out_length  Output: bytes of @p out that are valid.
+ * @return 1 with @p out and @p out_length written, else 0.
  */
-static inline uint32_t chaos_net_prng_next_u32(void)
+static inline int chaos_net_redirect_sockaddr(
+    const chaos_net_redirect_t *target,
+    const struct sockaddr *address,
+    struct sockaddr_storage *out,
+    socklen_t *out_length
+)
 {
-    uint64_t state;
+    (void)memset(out, 0, sizeof(*out));
+    if (address->sa_family == AF_INET && target->family == AF_INET)
+    {
+        struct sockaddr_in *ipv4 = (struct sockaddr_in *)(void *)out;
 
-    chaos_net_prng_ensure_seeded();
-    state = g_chaos_net_tls_prng_state;
-    state ^= state >> 12;
-    state ^= state << 25;
-    state ^= state >> 27;
-    g_chaos_net_tls_prng_state = state;
-    return (uint32_t)((state * UINT64_C(0x2545f4914f6cdd1d)) >> 32);
+        ipv4->sin_family = AF_INET;
+        ipv4->sin_port = htons(target->port);
+        ipv4->sin_addr = target->value.ipv4;
+        *out_length = (socklen_t)sizeof(*ipv4);
+        return 1;
+    }
+    if (address->sa_family == AF_INET6)
+    {
+        struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)(void *)out;
+
+        ipv6->sin6_family = AF_INET6;
+        ipv6->sin6_port = htons(target->port);
+        if (target->family == AF_INET6)
+        {
+            ipv6->sin6_addr = target->value.ipv6;
+        }
+        else
+        {
+            unsigned char *bytes = (unsigned char *)&ipv6->sin6_addr;
+
+            (void)memset(bytes, 0, 10U);
+            bytes[10] = 0xffU;
+            bytes[11] = 0xffU;
+            (void)memcpy(bytes + 12, &target->value.ipv4, 4U);
+        }
+        *out_length = (socklen_t)sizeof(*ipv6);
+        return 1;
+    }
+    return 0;
 }
 
 #endif
