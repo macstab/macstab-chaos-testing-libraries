@@ -106,6 +106,34 @@ void chaos_net_rule_apply_latency(chaos_net_rule_t *rule);
 int chaos_net_rule_should_trigger(chaos_net_rule_t *rule);
 
 /**
+ * @brief The same decision without claiming anything: would this rule fire on this call?
+ *
+ * @details Everything chaos_net_rule_should_trigger() does except the last step -- the
+ * window, `@at`, `@size`, the evaluation number, `@every` and the probability -- and
+ * stops before chaos_policy_fire(). For an effect that has a further condition of its own
+ * which is expensive to establish: `close:RESET` has to know whether this process is the
+ * socket's sole owner, which is a walk of `/proc`, and asking that on every matched close
+ * costs it even when the probability was going to say no. The pair lets the cheap
+ * question go first and the claim happen only if the effect is really applied.
+ *
+ * Counts an evaluation, so a call that is then dropped by the caller's own condition has
+ * consumed an evaluation number -- it was evaluated -- but no hit and no `@first` claim.
+ *
+ * @param rule  Matched rule copy; NULL yields 0.
+ * @return Non-zero when every gate up to the probability passed.
+ */
+int chaos_net_rule_would_trigger(chaos_net_rule_t *rule);
+
+/**
+ * @brief Claims the firing chaos_net_rule_would_trigger() allowed: the `@first` slot, the
+ *        rule-copy generation check, and the hit.
+ *
+ * @param rule  The same rule copy; NULL yields 0.
+ * @return Non-zero when the hit was counted and the effect is to be applied.
+ */
+int chaos_net_rule_claim(chaos_net_rule_t *rule);
+
+/**
  * @brief Applies an ERRNO rule: sets errno and returns 1 when it fires.
  *
  * @details Wrappers return -1 at once on 1 and skip the real call:

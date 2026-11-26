@@ -693,6 +693,16 @@ closes last. A rule that only ever matches the parent's close — a Postgres
 postmaster handing the connection to a backend, for instance — does nothing, and
 its hit count stays at zero rather than claiming an RST that never left.
 
+**What a suppressed close does consume is an evaluation number.** The probability is drawn
+before the ownership is established, and deliberately: establishing it is a walk of
+`/proc`, and asking it on every matched close means a rule with `p=0.01` pays for a
+hundred answers to reset once. So the order is probability, then ownership, then the hit
+and the `@first` claim -- which is what keeps a suppressed reset free of both. The one
+visible consequence is `@every=N`: the suppressed closes of a pre-forking server's
+postmaster count towards the next Nth evaluation, because the rule was evaluated on them.
+The alternative -- paying the walk on every close -- was measured at about 2.2 ms per
+close with twenty processes of two hundred descriptors each.
+
 **Measured against PostgreSQL 16 (alpine, musl, `LD_PRELOAD` in the server), and it is
 the limiting case:** a `close:RESET` rule resets nothing there. The postmaster closes its
 copy of each accepted socket right after forking the backend, and that close is suppressed

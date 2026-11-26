@@ -1201,14 +1201,37 @@ static void chaos_init_watched(int watcher, unsigned libs)
  * their memory, so their path and endpoint selectors stop matching. If fork() fails, no
  * copy exists and the leftovers get ENOSYS.
  *
- * @return 1 in the background copy, 0 in the process that is to exit (no listener, PID 1,
- *         fork() failed, or the parent side of the fork).
+ * **While tracing, no copy is made and this process keeps serving.** A ptrace link is not
+ * inherited across `fork`, so the copy cannot be the tracer: it would have to attach to
+ * each tracee again, which needs the capability, loses the stop they are sitting in and
+ * would have to set `PTRACE_O_TRACESECCOMP` once more -- a race it cannot win. Meanwhile
+ * the original exiting detaches every tracee, and the kernel then fails each call in the
+ * TRACE group with ENOSYS. So the exit code waits for the last leftover instead, which is
+ * the one thing this function exists to avoid; it is the smaller cost, because the
+ * alternative is a fault no rule asked for. Without tracing nothing changes.
+ *
+ * @return 0 in the process that is to exit (no listener, PID 1, fork() failed, or the
+ *         parent side of the fork), 1 in the background copy, and 2 in the original when
+ *         it stays on as the tracer. The two are not interchangeable: the copy has no
+ *         children and no tracees, so it drains signals and ignores them, while the
+ *         original still has to reap its tracees and answer their stops -- an orphan left
+ *         sitting at a stop nobody answers never exits, and then nothing ever reports that
+ *         the filter is unused either.
  */
 static int chaos_init_serve_the_rest(int listener)
 {
     int null_fd;
 
-    if (listener < 0 || getpid() == 1 || fork() != 0)
+    if (listener < 0 || getpid() == 1)
+    {
+        return 0;
+    }
+    /* The tracer cannot be handed over, so it stays here. */
+    if (g_chaos_init_tracing)
+    {
+        return 2;
+    }
+    if (fork() != 0)
     {
         return 0;
     }
@@ -1500,7 +1523,17 @@ int main(int argc, char **argv)
 
             if (read(signals, &info, sizeof(info)) == (ssize_t)sizeof(info))
             {
-                if (serving_the_rest)
+                if (serving_the_rest == 2)
+                {
+                    /* The original, still the tracer: its tracees report their stops here,
+                     * and a stop nobody answers leaves the process sitting in it for
+                     * ever. The application is already reaped, so the exit code is kept.
+                     */
+                    int ignored = 0;
+
+                    (void)chaos_init_reap(options.libs, -1, &ignored);
+                }
+                else if (serving_the_rest)
                 {
                     /* Background copy: the application is gone and this copy has no
                      * children; signals are drained and ignored. */
@@ -1513,11 +1546,11 @@ int main(int argc, char **argv)
                 {
                     /* Every process's hits are on disk before the exit code is reported. */
                     chaos_init_tracee_flush(1);
-                    if (!chaos_init_serve_the_rest(listener))
+                    serving_the_rest = chaos_init_serve_the_rest(listener);
+                    if (serving_the_rest == 0)
                     {
                         return chaos_init_exit_code(child_status);
                     }
-                    serving_the_rest = 1;
                 }
             }
         }
@@ -1549,7 +1582,8 @@ int main(int argc, char **argv)
             if (serving_the_rest)
             {
                 chaos_init_tracee_flush(1);
-                return 0;
+                /* The original kept the application's code to report; the copy has none. */
+                return serving_the_rest == 2 ? chaos_init_exit_code(child_status) : 0;
             }
         }
         if (watch_slot != 0 && (watched[watch_slot].revents & POLLIN) != 0)

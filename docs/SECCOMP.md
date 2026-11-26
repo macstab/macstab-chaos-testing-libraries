@@ -43,7 +43,23 @@ container PID 1: chaos-init --libs io,net -- <entrypoint> [args...]
        └─ exits with the application's exit code (128 + signal if killed);
           when it is not PID 1, a background copy goes on answering the
           processes the application left behind until the last of them ends
+          -- except while tracing, where this process stays on instead and
+          the exit code waits for the last of them
 ```
+
+**Why tracing changes that.** A ptrace link is not inherited across `fork`, so the
+background copy cannot be the tracer: it would have to attach to each leftover again,
+which needs the capability, loses the stop they are sitting in, and would have to set
+`PTRACE_O_TRACESECCOMP` once more. Meanwhile the original exiting detaches every tracee,
+and the kernel then fails each call in the TRACE group with **ENOSYS** -- a fault no rule
+asked for, in processes nobody is watching any more. Measured: with `write:TORN` loaded,
+an orphan's output file stayed empty, because its `write` failed rather than ran.
+
+So with any traced effect in the rule file (`TORN`, `TRICKLE`, `CORRUPT`, `DUP`, write
+`DROP`, close `RESET`, send `THROTTLE`), `chaos-init` keeps serving from the process that
+holds the tracees and reports the application's exit code once the last of them is gone. A
+double-forked daemon therefore holds it until the container stops. Without a traced effect
+nothing changes and the exit code arrives at once, which is the common case.
 
 - **One core, two front ends.** `chaos-init` compiles each library's rule core
   (`chaos_<lib>_config.c`, `chaos_<lib>_actions.c`, the shared `src/common` headers)

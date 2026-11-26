@@ -25,6 +25,14 @@
  * could not be read answers `UNKNOWN`, on which the caller leaves the connection alone and
  * says so, because a wrong `SOLE` is what leaves the option behind.
  *
+ * @par Stack
+ * About 2.6 KiB over the whole chain, measured with `-fstack-usage`
+ * (`chaos_net_socket_ownership` 1440 plus `chaos_net_owner_count` 1152). It has to fit a
+ * signal stack: `close()` is async-signal-safe, so this can run inside a handler on the
+ * stack the application sized from `SIGSTKSZ`, which is 16 KiB on current glibc and as
+ * little as `MINSIGSTKSZ` elsewhere. Keep it there -- the directory buffer is what decides
+ * it, and a larger one buys only fewer getdents64 rounds.
+ *
  * @par Module: chaos-net
  * @par Stability: private / internal
  */
@@ -40,8 +48,22 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-/** @brief Bytes read from a directory per getdents64 call; two pages hold many entries. */
-#define CHAOS_NET_OWNER_DIRENT_BYTES 8192U
+/**
+ * @brief Bytes read from a directory per getdents64 call.
+ *
+ * @details A kilobyte, not a page or two, because the whole scan happens inside `close()`
+ * -- which POSIX lists as async-signal-safe, so an application may call it from a signal
+ * handler running on the stack it set up with `sigaltstack()`. That stack is almost always
+ * sized from `SIGSTKSZ`, which is 16 KiB on current glibc, and two 8 KiB buffers in this
+ * call chain came to 16 992 bytes measured with `-fstack-usage`: an overrun, and a SIGSEGV
+ * inside the library in the one path that promises to fail open. Small-stack threads
+ * (`pthread_attr_setstacksize`) are the same story.
+ *
+ * The cost is more getdents64 rounds -- about eight times as many -- on an operation that
+ * already takes milliseconds when it has processes to walk. chaos_net_wait.c budgets its
+ * stack the same way and says so.
+ */
+#define CHAOS_NET_OWNER_DIRENT_BYTES 1024U
 
 /** @brief Longest `socket:[<inode>]` a 64-bit inode can produce, plus the NUL. */
 #define CHAOS_NET_OWNER_TARGET_MAX 40U

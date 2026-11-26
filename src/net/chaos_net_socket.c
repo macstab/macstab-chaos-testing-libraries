@@ -2104,25 +2104,37 @@ CHAOS_NET_EXPORT int close(int fd)
     {
         chaos_net_rule_apply_latency(&rule);
     }
-    /* Ownership is settled before the rule fires, so a suppressed RESET spends neither a hit
-     * nor a `@first` claim: SO_LINGER on a socket another descriptor still holds would not
-     * reset anything now and would reset it later, out of any rule's reach. A suppression is
-     * not silent -- it is counted for the hits file's header lines. */
+    /* The cheap question first, the walk of `/proc` second, the claim last.
+     *
+     * Ownership still decides before anything is claimed, so a suppressed RESET spends
+     * neither a hit nor a `@first` slot: SO_LINGER on a socket another descriptor still
+     * holds would not reset anything now and would reset it later, out of any rule's
+     * reach. A suppression is not silent -- it is counted for the hits file's header
+     * lines. What changed is the order: asking first costs the scan on every matched
+     * close, and at `p=0.01` that is a hundred closes paying for one. The probability now
+     * goes first, so only a close that was going to be reset pays for the answer.
+     *
+     * The price is that a suppressed close consumes an evaluation number, which it did not
+     * before: with `@every=N` the suppressed closes of a pre-forking server's postmaster
+     * count towards the next Nth. Documented in NETWORK.md -- the close was evaluated, so
+     * counting it is the more defensible of the two. */
     else if (matched && rule.effect == CHAOS_NET_EFFECT_RESET &&
-             (ownership = CHAOS_NET_OWNERSHIP(fd)) != CHAOS_NET_OWNER_SOLE)
+             chaos_net_rule_would_trigger(&rule))
     {
-        CHAOS_NET_RESET_SUPPRESSED(ownership);
-    }
-    else if (matched && rule.effect == CHAOS_NET_EFFECT_RESET &&
-             chaos_net_rule_should_trigger(&rule))
-    {
-        abort_linger.l_onoff = 1;
-        abort_linger.l_linger = 0;
-        saved_errno = errno;
-        (void)chaos_net_call_real_setsockopt(
-            fd, SOL_SOCKET, SO_LINGER, &abort_linger, (socklen_t)sizeof(abort_linger)
-        );
-        errno = saved_errno;
+        if ((ownership = CHAOS_NET_OWNERSHIP(fd)) != CHAOS_NET_OWNER_SOLE)
+        {
+            CHAOS_NET_RESET_SUPPRESSED(ownership);
+        }
+        else if (chaos_net_rule_claim(&rule))
+        {
+            abort_linger.l_onoff = 1;
+            abort_linger.l_linger = 0;
+            saved_errno = errno;
+            (void)chaos_net_call_real_setsockopt(
+                fd, SOL_SOCKET, SO_LINGER, &abort_linger, (socklen_t)sizeof(abort_linger)
+            );
+            errno = saved_errno;
+        }
     }
 
     chaos_net_dup_forget(fd);

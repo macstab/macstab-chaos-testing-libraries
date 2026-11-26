@@ -474,6 +474,23 @@ int chaos_net_rule_should_trigger(chaos_net_rule_t *rule)
     return g_should_trigger;
 }
 
+/** @brief The same answer through the split pair the RESET path uses: the question first,
+ *   the claim second. Counted as one trigger, because together they are one decision. */
+int chaos_net_rule_would_trigger(chaos_net_rule_t *rule)
+{
+    ++g_should_trigger_calls;
+    chaos_net_rule_draw_begin(rule);
+    return g_should_trigger;
+}
+
+static int g_claim_calls = 0;
+int chaos_net_rule_claim(chaos_net_rule_t *rule)
+{
+    (void)rule;
+    ++g_claim_calls;
+    return g_should_trigger;
+}
+
 /** @brief CORRUPT stub: counts calls, records the length, and flips the selected bit like the
  *   real one, so tests can see which bytes changed. */
 void chaos_net_corrupt_buffer_sample(
@@ -2948,10 +2965,16 @@ static void test_descriptor_calls_on_sockets(void)
     g_ownership_calls = 0;
     g_suppressed_shared = 0;
     g_suppressed_unknown = 0;
+    g_claim_calls = 0;
     assert(close(5) == 0);
     assert(g_setsockopt_calls == 1);
     assert(g_ownership_calls == 1);
-    assert(g_should_trigger_calls == 0);
+    /* The question is asked first now -- it is the cheap one, and asking the walk of
+     * /proc on every matched close costs a hundred closes for one reset at p=0.01 -- but
+     * nothing is claimed: no hit, no `@first` slot. That is what makes a suppression free,
+     * and it is the claim, not the question, that has to stay unspent. */
+    assert(g_should_trigger_calls == 1);
+    assert(g_claim_calls == 0);
     /* Not silent: the suppression is counted for the hits file, under its cause. */
     assert(g_suppressed_shared == 1 && g_suppressed_unknown == 0);
 
@@ -2961,14 +2984,16 @@ static void test_descriptor_calls_on_sockets(void)
     g_stub_ownership = (int)CHAOS_NET_OWNER_UNKNOWN;
     assert(close(5) == 0);
     assert(g_setsockopt_calls == 1);
-    assert(g_should_trigger_calls == 0);
+    assert(g_should_trigger_calls == 2 && g_claim_calls == 0);
     assert(g_suppressed_shared == 1 && g_suppressed_unknown == 1);
 
     /* Sole ownership resets as before, and counts no suppression. */
     g_stub_ownership = (int)CHAOS_NET_OWNER_SOLE;
     assert(close(5) == 0);
     assert(g_setsockopt_calls == 2);
-    assert(g_should_trigger_calls == 1);
+    /* Asked a third time, and this time claimed: the hit belongs to the reset that
+     * happened, which is the property the order exists to protect. */
+    assert(g_should_trigger_calls == 3 && g_claim_calls == 1);
     assert(g_suppressed_shared == 1 && g_suppressed_unknown == 1);
 
     /* Negative: a close without a RESET rule neither scans ownership nor counts anything,

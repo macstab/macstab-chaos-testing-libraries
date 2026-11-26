@@ -224,6 +224,19 @@ else
 fi
 expect "the background chaos-init ends with the last process" \
     "$(grep -l chaos-init /proc/[0-9]*/comm 2>/dev/null | wc -l | tr -d " ")" "0"
+# The same, with a rule that needs a trace stop. A ptrace link is not inherited across
+# fork, so there is no background copy to hand the tracees to: this process keeps serving,
+# and the exit code waits for the last leftover instead of arriving at once. What must not
+# happen is the leftover getting ENOSYS for every write, which is what a detached tracer
+# leaves behind -- a fault no rule asked for.
+rm -f /tmp/sec/orphan.out
+printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/data:write:TORN:1.0 # t" > /tmp/.chaos-io.conf
+code=0
+$init --libs io -- /tmp/probe orphan /tmp/sec/data/x /tmp/sec/orphan.out >/dev/null || code=$?
+expect "tracing: the orphan is answered, and the exit code waited for it" \
+    "$code $(cat /tmp/sec/orphan.out 2>/dev/null || echo none)" "3 EIO"
+printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/slow:open:LATENCY:150 # t" \
+    "/tmp/sec/once:open:EACCES:1.0 @first=1 # t" > /tmp/.chaos-io.conf
 # A rule written with the name of a symlink covers the files under its real name, which is the
 # name /proc reports for an open descriptor.
 mkdir -p /tmp/sec/real && echo data > /tmp/sec/real/f && ln -sfn /tmp/sec/real /tmp/sec/link
