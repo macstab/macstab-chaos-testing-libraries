@@ -139,6 +139,14 @@ static void chaos_io_apply_statfs(chaos_io_rule_t *rule, struct statfs *buffer)
     {
         return;
     }
+    /* Never more free than there is: the total is left alone on purpose, so a free count
+     * above it would make `total - free` underflow for every reader that works out used
+     * space that way -- a rule written to clear a watermark would trip a used-space alarm
+     * instead. */
+    if (blocks > (uint64_t)buffer->f_blocks)
+    {
+        blocks = (uint64_t)buffer->f_blocks;
+    }
     buffer->f_bfree = (__typeof__(buffer->f_bfree))blocks;
     buffer->f_bavail = (__typeof__(buffer->f_bavail))blocks;
 }
@@ -157,6 +165,10 @@ static void chaos_io_apply_statvfs(chaos_io_rule_t *rule, struct statvfs *buffer
         !chaos_io_rule_should_trigger(rule))
     {
         return;
+    }
+    if (blocks > (uint64_t)buffer->f_blocks)
+    {
+        blocks = (uint64_t)buffer->f_blocks;
     }
     buffer->f_bfree = (fsblkcnt_t)blocks;
     buffer->f_bavail = (fsblkcnt_t)blocks;

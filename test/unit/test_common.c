@@ -1238,6 +1238,11 @@ static void test_hits_reload(void)
     chaos_hits_assign(pool, 3U, NULL, NULL, 0U, slots, first, 2U, NULL);
     assert(slots[0] == &pool[0] && slots[1] == &pool[1]);
     pool[1].count = 7U;
+    /* The evaluation ordinal of whoever held a slot before must not be inherited: it is
+     * what the draw key is mixed with, so a rule starting at somebody else's ordinal
+     * makes different decisions for the same seed, and `@every=N` fires on the wrong
+     * calls. Slot 2 below is handed to a rule that is new to this process. */
+    pool[2].evaluations = 11U;
     /* As if this rule had been active for five seconds already, which the reload below
      * must not forget: within one millisecond a re-armed slot would be indistinguishable
      * from one that kept its moment. */
@@ -1254,6 +1259,7 @@ static void test_hits_reload(void)
     chaos_hits_assign(pool, 3U, active, active_texts, 3U, next, next_texts, 2U, count_report);
     assert(next[0] == &pool[1] && pool[1].count == 7U && pool[1].report == count_report);
     assert(next[1] == &pool[2] && pool[2].count == 0U && pool[2].used);
+    assert(pool[2].evaluations == 0U);
     /* The moment a rule became active, which `@at=+N` counts from: the slot carried over
      * keeps the moment it got at the first assignment, so a reload that leaves a rule
      * alone does not restart its delay; the slot that is new to this process gets one

@@ -30,7 +30,14 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef __linux__
 #include <sys/statfs.h>
+#else
+/* `struct statfs` lives in <sys/mount.h> on the BSDs and on macOS, where <sys/statfs.h>
+ * does not exist at all. The unit tests build and run there (Makefile line 13), so the
+ * header has to parse without it; `statvfs` below is portable. */
+#include <sys/mount.h>
+#endif
 #include <sys/statvfs.h>
 #include <sys/types.h>
 #include <sys/uio.h>

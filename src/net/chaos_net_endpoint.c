@@ -213,7 +213,11 @@ static int chaos_net_parse_ipv4_selector(
 {
     const char *port_text;
     size_t host_len;
-    char host[INET_ADDRSTRLEN];
+    /* The address and its prefix suffix: `/32` is three characters, as the IPv6 parser's
+     * own `+ 4U` accounts for. Sized for the address alone, this refused every selector
+     * of sixteen characters or more -- `192.168.100.0/24` is one -- and because parsing
+     * is all-or-nothing that discarded the whole rule file. */
+    char host[INET_ADDRSTRLEN + 3U];
 
     port_text = strrchr(body, ':');
     if (port_text == NULL || port_text == body)

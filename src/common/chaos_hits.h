@@ -360,6 +360,12 @@ static inline void chaos_hits_assign(
             next[index]->count = 0U;
             next[index]->claimed = chaos_hit_claims_none(next[index]->generation);
             next[index]->state = 0U;
+            /* The evaluation ordinal too: it is mixed into the draw key, so a rule that
+             * inherited the previous occupant's count would make its first decision with
+             * somebody else's sample number -- and then the nth evaluation of a rule no
+             * longer decides the same thing for a given CHAOS_SEED, which is the whole
+             * point of the counter. The fork and reset paths already clear it. */
+            next[index]->evaluations = 0U;
             /* A rule that is new to this process becomes active now, which is where
              * `@at=+N` starts counting. A slot carried over keeps the moment it got. */
             next[index]->armed_ms = chaos_hits_now_ms();

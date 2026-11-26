@@ -702,6 +702,22 @@ static void test_prefix_beats_selector_text(void)
     chaos_net_endpoint_t endpoint = {0};
     size_t index;
 
+    /* The prefix is split out of the host text, so the buffer that holds it has to fit
+     * the address *and* the suffix. Every example in the documentation and in these tests
+     * happens to stay under sixteen characters, which is what an address alone needs --
+     * these are the ones that do not, and the shortest of them is a /24 on a private
+     * network, the first thing anyone writes. */
+    {
+        chaos_net_endpoint_t wide = {0};
+
+        assert(chaos_net_endpoint_parse_selector("tcp4://192.168.100.0/24:5432", &wide));
+        assert(wide.prefix_len == 24U);
+        assert(chaos_net_endpoint_parse_selector("tcp4://172.16.100.128/25:443", &wide));
+        assert(wide.prefix_len == 25U);
+        assert(chaos_net_endpoint_parse_selector("tcp4://255.255.255.255/32:80", &wide));
+        assert(wide.prefix_len == 32U);
+    }
+
     (void)memset(rules, 0, sizeof(rules));
     assert(chaos_net_endpoint_parse_selector("tcp4://10.0.0.0/8:80", &rules[0].selector));
     assert(chaos_net_endpoint_parse_selector("tcp4://10.1.0.0/16:80", &rules[1].selector));

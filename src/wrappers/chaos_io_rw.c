@@ -610,11 +610,19 @@ static chaos_bucket_t *chaos_io_throttle_bucket(int fd, uint64_t rate)
     return &entry->bucket;
 }
 
-/** @brief Whether @p fd was opened non-blocking; 0 when the flags cannot be read. */
+/**
+ * @brief Whether @p fd was opened non-blocking; 0 when the flags cannot be read.
+ *
+ * @details With errno preserved, as the net side's descriptor queries are: a wrapper that
+ * does not inject leaves errno exactly as the real call left it, and this query runs on
+ * the way to deciding whether to inject at all.
+ */
 static int chaos_io_nonblocking(int fd)
 {
+    const int saved_errno = errno;
     const long flags = CHAOS_IO_SYSCALL(SYS_fcntl, fd, F_GETFL, 0);
 
+    errno = saved_errno;
     return flags >= 0 && (flags & O_NONBLOCK) != 0;
 }
 
@@ -735,11 +743,17 @@ static int chaos_io_throttle_iovecs(
  */
 static int chaos_io_drop_write(chaos_io_rule_t *rule, int fd, size_t count)
 {
+    /* Both queries below are asked on the way to a decision, so errno has to come out of
+     * here as it went in: the common case is that this returns 0 and the real write runs
+     * and succeeds, and a caller that then reads errno must not find the ESPIPE of the
+     * probe on a pipe or a socket. */
+    const int saved_errno = errno;
     const long flags = CHAOS_IO_SYSCALL(SYS_fcntl, fd, F_GETFL, 0);
     int correct;
 
     if (flags < 0)
     {
+        errno = saved_errno;
         return 0;
     }
     correct = (flags & O_APPEND) == 0 && count > 0U;
@@ -747,8 +761,10 @@ static int chaos_io_drop_write(chaos_io_rule_t *rule, int fd, size_t count)
      * probability draw; it is also the only way to learn whether there is one. */
     if (correct && CHAOS_IO_SYSCALL(SYS_lseek, fd, (long)0, SEEK_CUR) < 0)
     {
+        errno = saved_errno;
         return 0;
     }
+    errno = saved_errno;
     if (!chaos_io_rule_should_trigger(rule))
     {
         return 0;
@@ -756,6 +772,7 @@ static int chaos_io_drop_write(chaos_io_rule_t *rule, int fd, size_t count)
     if (correct)
     {
         (void)CHAOS_IO_SYSCALL(SYS_lseek, fd, (long)count, SEEK_CUR);
+        errno = saved_errno;
     }
     return 1;
 }

@@ -3188,6 +3188,16 @@ static void test_statfs_wrappers(void)
     assert(answer.f_bfree == 7 && answer.f_bavail == 7);
     assert(answer.f_blocks == 10000);
 
+    /* More free space than the filesystem has is not a filesystem: every reader that
+     * works out used space as total minus free would underflow, so a rule written to
+     * clear a watermark would trip a used-space alarm instead -- the inverse of the
+     * fault, in the very code this effect exists for. The free count is capped at the
+     * total, which this effect never touches. */
+    g_free_blocks_result = 999999U;
+    assert(fstatfs(9, &answer) == 0);
+    assert(answer.f_blocks == 10000);
+    assert(answer.f_bfree == 10000 && answer.f_bavail == 10000);
+
     /* statvfs hands over f_frsize, not f_bsize: the two differ here on purpose. */
     chaos_test_reset_state();
     chaos_test_bind_real_functions();
@@ -3205,6 +3215,12 @@ static void test_statfs_wrappers(void)
     assert(g_last_free_unit == 512U);
     assert(vanswer.f_bfree == 3 && vanswer.f_bavail == 3);
     assert(vanswer.f_blocks == 10000);
+    /* And the same cap here: the two structures count in different units, so each does
+     * its own clamping against its own total. */
+    g_free_blocks_result = 999999U;
+    assert(statvfs("/tmp/data.bin", &vanswer) == 0);
+    assert(vanswer.f_blocks == 10000);
+    assert(vanswer.f_bfree == 10000 && vanswer.f_bavail == 10000);
 
     chaos_test_reset_state();
     chaos_test_bind_real_functions();
@@ -3442,11 +3458,16 @@ static void test_drop_write_wrappers(void)
     assert(chaos_test_offset(fd) == 0L);
     chaos_test_raw_close(fd);
 
-    /* A pipe has no offset to keep straight: the rule does not fire at all. */
+    /* A pipe has no offset to keep straight: the rule does not fire at all -- and the
+     * probe that establishes that is an lseek, which fails ESPIPE on a pipe. A wrapper
+     * that does not inject leaves errno as the real call left it, so a caller that writes
+     * successfully and then reads errno must not find the probe's failure there. */
     chaos_test_drop_rule(CHAOS_IO_OP_WRITE);
     g_real_write_return = 5;
     assert(pipe(pipe_fds) == 0);
+    errno = 0;
     assert(write(pipe_fds[1], "abcde", 5U) == 5);
+    assert(errno == 0);
     assert(g_real_write_calls == 1);
     assert(g_rule_should_trigger_calls == 0);
     chaos_test_raw_close(pipe_fds[0]);

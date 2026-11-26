@@ -781,10 +781,14 @@ int main(void)
         assert(held.arg_index == 2U && held.value == 3L);
         /* Nothing left: the call is parked rather than slept in, which is the one
          * difference from the library -- the tracee's other threads keep being served.
-         * A tenth of a second's worth is one byte at this rate, 100 ms away. */
+         * A tenth of a second's worth is one byte at this rate, 100 ms away -- less
+         * whatever these calls themselves took, because the bucket keeps the part of a
+         * millisecond it could not turn into a token. Pinning 100 pins that loss, and
+         * passed only while the calls fell inside one millisecond. */
         held = decide(__NR_write, (uint64_t)torn, P(buffer), 10U, 0, 0);
         assert(held.action == CHAOS_INIT_DELAY);
-        assert(held.delay_ms == 100U && held.shortens && held.value == 1L);
+        assert(held.delay_ms > 50U && held.delay_ms <= 100U);
+        assert(held.shortens && held.value == 1L);
         assert(held.arg_index == 2U);
         /* What that delay turns into when it is due -- a shortened call, not a whole one
          * -- is chaos_init_delay_answer()'s own test in test_chaos_init.c. */
