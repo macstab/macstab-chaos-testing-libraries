@@ -60,6 +60,8 @@
  *                       milliseconds apart and prints the wall second, whether both reads
  *                       agree and whether the second one is earlier, for the time effects.
  * - fork                fork + waitpid: "ok" or the errno name.
+ * - stopped             fork + waitpid(WUNTRACED): "ran", or "stopped" when the
+ *                       supervisor suspended the child before it ran.
  * - exec                execl("/bin/true"); prints the errno name only when it fails.
  *
  * Exit: 0 after printing (orphan: 3); 1 on a setup failure; 2 on bad usage.
@@ -271,6 +273,38 @@ int main(int argc, char **argv)
         (void)waitpid(child, NULL, 0);
         (void)read(pipe_fds[0], child_result, sizeof(child_result) - 1U);
         (void)printf("parent=%s,%s child=%s\n", first, second, child_result);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "stopped") == 0)
+    {
+        /* Whether a forked child was put into a job-control stop before it ran. Without
+         * PTRACE_SEIZE the kernel reports the first stop of a newly attached descendant as
+         * a signal-delivery-stop of SIGSTOP, and a supervisor that re-delivers it suspends
+         * every child of the application -- which this parent then sees through
+         * WUNTRACED, exactly as a shell would. */
+        const pid_t child = fork();
+        int status = 0;
+
+        if (child == 0)
+        {
+            _exit(0);
+        }
+        if (child < 0)
+        {
+            (void)printf("fork=%s\n", strerror(errno));
+            return 1;
+        }
+        if (waitpid(child, &status, WUNTRACED) != child)
+        {
+            (void)printf("wait=%s\n", strerror(errno));
+            return 1;
+        }
+        (void)printf("%s\n", WIFSTOPPED(status) ? "stopped" : "ran");
+        if (WIFSTOPPED(status))
+        {
+            (void)kill(child, SIGCONT);
+            (void)waitpid(child, &status, 0);
+        }
         return 0;
     }
     if (argc == 4 && strcmp(argv[1], "orphan") == 0)

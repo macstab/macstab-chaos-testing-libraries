@@ -572,6 +572,11 @@ rm -f /tmp/.chaos-memory.conf
 printf "%s\n" "/tmp/sec/data:open:EIO:1.0 # t" "/tmp/sec/data:write:TORN:1.0 # t" > /tmp/.chaos-io.conf
 expect "C: a fork of a traced application still runs" \
     "$($init --libs io -- /tmp/probe first /tmp/sec/data/x)" "parent=EIO,EIO child=EIO"
+# And it runs without being suspended first: the stop a newly attached descendant reports
+# cannot be told from a real SIGSTOP without PTRACE_SEIZE, and re-delivering it put every
+# child of a forking server into a job-control stop its own parent could see.
+expect "C: a forked child is not suspended on the way in" \
+    "$($init --libs io -- /tmp/probe stopped)" "ran"
 [ "$failures" -eq 0 ]
 '
 

@@ -319,7 +319,12 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *in
     const chaos_init_rule_filter_t *rules = NULL;
     size_t traced_count = 0U;
     size_t dns_count = 0U;
-    int answer[2] = {0, 0};
+    /* [0] errno, [1] whether the parent is the tracer, [2] how many TRACE numbers follow,
+     * then the numbers: the filter is fixed once installed, so the parent has to know
+     * exactly which calls it can expect a stop for. Recomputing it there is not an option
+     * -- asking the rule cores publishes a snapshot, and the parent is the process serving
+     * notifications from them. */
+    long answer[3 + CHAOS_INIT_MAX_FILTER] = {0};
     int error = 0;
     int listener = -1;
     int tracing;
@@ -402,6 +407,8 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *in
     memset(&control, 0, sizeof(control));
     answer[0] = error;
     answer[1] = error == 0 && tracing;
+    answer[2] = (long)traced_count;
+    memcpy(&answer[3], traced, traced_count * sizeof(traced[0]));
     payload.iov_base = answer;
     payload.iov_len = sizeof(answer);
     message.msg_iov = &payload;
@@ -432,7 +439,7 @@ static int chaos_init_install_and_hand_over(unsigned libs, int handover, int *in
      * `tracing` before it is known whether the filter can be installed, and on a kernel
      * or in a container that refuses seccomp this child never called PTRACE_TRACEME --
      * stopping then would park the application at a stop nobody continues. */
-    if (answer[1])
+    if (answer[1] != 0)
     {
         (void)raise(SIGSTOP);
     }
@@ -496,7 +503,7 @@ static int chaos_init_receive_listener(int socket, int *error, int *traced)
         struct cmsghdr header;
         char space[CMSG_SPACE(sizeof(int))];
     } control;
-    int answer[2] = {0, 0};
+    long answer[3 + CHAOS_INIT_MAX_FILTER] = {0};
     int listener = -1;
 
     *error = 0;
@@ -513,8 +520,13 @@ static int chaos_init_receive_listener(int socket, int *error, int *traced)
         *error = 0;
         return -1;
     }
-    *error = answer[0];
-    *traced = answer[1];
+    *error = (int)answer[0];
+    *traced = (int)answer[1];
+    /* The TRACE set the child built the filter from: the deciders ask it before producing
+     * a verdict only a trace stop can carry. */
+    chaos_init_traced_set(
+        &answer[3], (size_t)answer[2] <= (size_t)CHAOS_INIT_MAX_FILTER ? (size_t)answer[2] : 0U
+    );
     header = CMSG_FIRSTHDR(&message);
     if (header != NULL && header->cmsg_type == SCM_RIGHTS)
     {
@@ -799,10 +811,28 @@ static void chaos_init_trace_stop(unsigned libs, pid_t tid, int status)
     }
     if ((status >> 8) != (SIGTRAP | (PTRACE_EVENT_SECCOMP << 8)))
     {
-        const int signal = (status >> 8) == SIGTRAP ? 0 : WSTOPSIG(status);
+        const int stopped = WSTOPSIG(status);
+        /* An event stop and a syscall stop carry SIGTRAP and must not have it
+         * re-delivered. A real signal must be, or the application would never see its own
+         * SIGTERM, SIGCHLD or SIGPIPE.
+         *
+         * The stop signals are the exception, and the reason is the whole point of this
+         * branch: without PTRACE_SEIZE the kernel reports a group-stop *and* the first
+         * stop of a newly attached descendant as a signal-delivery-stop of SIGSTOP, which
+         * cannot be told apart from a real one. Re-delivering it put every `fork` and
+         * `clone` of the application into a job-control stop before it had run an
+         * instruction -- its real parent then saw a stop notification through
+         * waitpid(WUNTRACED), and for a thread it stopped the whole group. A forking
+         * server broke. The cost of swallowing it instead is that a traced application
+         * cannot be suspended with Ctrl-Z or `kill -STOP` while chaos-init traces it,
+         * which is a limitation of the mode rather than a fault injected into the
+         * application. The earlier comment had this backwards: a group-stop never carries
+         * SIGTRAP. */
+        const int signal = (stopped == SIGTRAP || stopped == SIGSTOP || stopped == SIGTSTP ||
+                            stopped == SIGTTIN || stopped == SIGTTOU)
+                               ? 0
+                               : stopped;
 
-        /* A group-stop or an event stop carries SIGTRAP, which must not be re-delivered;
-         * a real signal must. */
         (void)ptrace(PTRACE_CONT, tid, 0, (void *)(long)signal);
         return;
     }
@@ -1320,29 +1350,6 @@ int main(int argc, char **argv)
     if (g_chaos_init_tracing)
     {
         int stop_status = 0;
-        long installed[CHAOS_INIT_MAX_FILTER];
-        size_t installed_count = 0U;
-
-        /* The same set the child put in the filter, computed again from the same rule
-         * file, because a filter cannot be changed once installed while the rule file can
-         * be replaced. A decider that produced a verdict only a trace stop can carry for a
-         * call this set does not hold would have its answer sent as CONTINUE, with a hit
-         * already counted -- a fault reported and never injected. Nothing else runs
-         * between the child's computation and this one. */
-        if ((options.libs & CHAOS_INIT_LIB_IO) != 0U)
-        {
-            installed_count =
-                chaos_init_io_traced_calls(installed, sizeof(installed) / sizeof(installed[0]));
-        }
-        if ((options.libs & CHAOS_INIT_LIB_NET) != 0U)
-        {
-            installed_count += chaos_init_net_traced_calls(
-                installed + installed_count,
-                sizeof(installed) / sizeof(installed[0]) - installed_count
-            );
-        }
-        chaos_init_traced_set(installed, installed_count);
-
         if (waitpid(child, &stop_status, 0) != child || !WIFSTOPPED(stop_status) ||
             ptrace(
                 PTRACE_SETOPTIONS,
