@@ -108,7 +108,7 @@ void chaos_net_rule_apply_latency(chaos_net_rule_t *rule)
  * call the window or the size gate rejects neither consumes a random number nor claims
  * an `@first` slot.
  */
-int chaos_net_rule_would_trigger(chaos_net_rule_t *rule)
+int chaos_net_rule_should_trigger(chaos_net_rule_t *rule)
 {
     if (rule == NULL || !chaos_policy_window_open(&rule->policy) ||
         !chaos_policy_at_ok(&rule->policy, rule->hit) ||
@@ -123,19 +123,13 @@ int chaos_net_rule_would_trigger(chaos_net_rule_t *rule)
     {
         return 0;
     }
-    return chaos_net_probability_hit_sample(
-        rule->probability, chaos_net_rule_draw(rule, CHAOS_NET_DRAW_PROBABILITY)
-    );
-}
-
-int chaos_net_rule_claim(chaos_net_rule_t *rule)
-{
-    return rule != NULL && chaos_policy_fire(&rule->policy, rule->hit, rule->hit_generation);
-}
-
-int chaos_net_rule_should_trigger(chaos_net_rule_t *rule)
-{
-    return chaos_net_rule_would_trigger(rule) && chaos_net_rule_claim(rule);
+    if (!chaos_net_probability_hit_sample(
+            rule->probability, chaos_net_rule_draw(rule, CHAOS_NET_DRAW_PROBABILITY)
+        ))
+    {
+        return 0;
+    }
+    return chaos_policy_fire(&rule->policy, rule->hit, rule->hit_generation);
 }
 
 /**
