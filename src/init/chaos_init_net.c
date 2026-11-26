@@ -1416,6 +1416,8 @@ typedef struct chaos_init_net_throttle
     int fd;
     uint64_t rate;
     chaos_bucket_t bucket;
+    /** Whether this slot has ever had an owner: a takeover starts empty, a first use full. */
+    int taken;
 } chaos_init_net_throttle_t;
 
 static chaos_init_net_throttle_t g_chaos_init_net_throttles[CHAOS_INIT_NET_THROTTLE_SLOTS];
@@ -1429,7 +1431,11 @@ static chaos_bucket_t *chaos_init_net_throttle_bucket(pid_t tgid, uint64_t fd, u
 
     if (entry->tgid != tgid || entry->fd != (int)fd || entry->rate != rate)
     {
-        entry->bucket.state = 0U;
+        /* Empty for a new owner, full only the first time: see chaos_io_rw.c. */
+        const int stolen = entry->taken && (entry->fd != (int)fd || entry->tgid != tgid);
+
+        entry->bucket.state = stolen ? chaos_bucket_state(0U, chaos_hits_now_ms()) : 0U;
+        entry->taken = 1;
         entry->rate = rate;
         entry->fd = (int)fd;
         entry->tgid = tgid;

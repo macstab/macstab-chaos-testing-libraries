@@ -3606,6 +3606,50 @@ static void test_throttle_write_wrappers(void)
     assert(g_real_write_count == 10U);
     chaos_test_raw_close(fd);
 
+    /* Two descriptors whose numbers land on the same slot. The table is indexed by the
+     * descriptor modulo its size, so any process with more than that many open files has
+     * such a pair -- and a slot handed over used to be reset to "never used", which the
+     * refill reads as a full bucket. The two then gave each other a whole second's worth
+     * on every call, the rate was not enforced at all, and because the allowance covered
+     * the call the code returned before the draw: no hit either, so nothing reported it.
+     *
+     * Written alternately, the second write of each pair must be held back rather than
+     * pass whole. */
+    {
+        const int low = chaos_test_drop_fd(O_WRONLY);
+        const int high = (int)(low + CHAOS_IO_THROTTLE_SLOTS);
+
+        assert(low >= 0);
+        /* The raw call: dup2 is one of the wrappers under test here. */
+        assert((int)chaos_test_raw_syscall(SYS_dup3, (long)low, (long)high, 0L) == high);
+        chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 16U);
+        g_slept_ms = -1;
+        g_real_write_return = 16;
+        /* What the real call was handed is the measure, not what the wrapper returned:
+         * the stub answers with a fixed count, so a shortened call shows up here. */
+        assert(write(low, block, 16U) == 16);
+        assert(g_real_write_count == 16U);
+        assert(g_slept_ms == -1);
+        /* The second descriptor takes the slot over and starts empty, so its write waits
+         * and is cut to a chunk. Handed a full bucket instead -- which is what resetting
+         * the slot to "never used" does -- it would pass all sixteen bytes and move twice
+         * the rate, with no hit counted either. */
+        assert(write(high, block, 16U) == 16);
+        assert(g_real_write_count < 16U);
+        assert(g_slept_ms > 0);
+
+        /* Closed through the wrapper, which is what drops the bucket: the table is keyed
+         * by the descriptor number and the kernel reuses those, so a bucket left behind
+         * would hold back whoever gets the number next -- for bytes somebody else moved.
+         * The same number, taken again, is a first use and passes whole. */
+        assert(close(high) == 0);
+        assert((int)chaos_test_raw_syscall(SYS_dup3, (long)low, (long)high, 0L) == high);
+        g_real_write_return = 16;
+        assert(write(high, block, 16U) == 16);
+        assert(close(high) == 0);
+        chaos_test_raw_close(low);
+    }
+
     /* A non-blocking descriptor: EAGAIN, no wait, nothing written. Its event loop is
      * written for exactly that answer. */
     chaos_test_throttle_rule(CHAOS_IO_OP_WRITE, 20U);

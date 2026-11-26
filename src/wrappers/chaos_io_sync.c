@@ -199,6 +199,7 @@ CHAOS_IO_EXPORT int close(int fd)
 
     rc = chaos_io_call_real_close(fd);
     chaos_io_fdcache_invalidate(fd);
+    chaos_io_throttle_forget(fd);
 
     if (matched && rule.effect != CHAOS_IO_EFFECT_LATENCY && chaos_io_rule_apply_errno(&rule))
     {

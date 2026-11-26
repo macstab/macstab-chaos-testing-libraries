@@ -592,6 +592,8 @@ typedef struct chaos_io_throttle
     volatile int fd;
     volatile uint64_t rate;
     chaos_bucket_t bucket;
+    /** Whether this slot has ever had an owner: a takeover starts empty, a first use full. */
+    int taken;
 } chaos_io_throttle_t;
 
 static chaos_io_throttle_t g_chaos_io_throttles[CHAOS_IO_THROTTLE_SLOTS];
@@ -603,11 +605,44 @@ static chaos_bucket_t *chaos_io_throttle_bucket(int fd, uint64_t rate)
 
     if (entry->fd != fd || entry->rate != rate)
     {
-        entry->bucket.state = 0U;
+        /* A slot that already belonged to somebody starts empty for its new owner, not
+         * full: `state = 0` means "never used" to the refill, which hands out a whole
+         * second's worth. Two descriptors that collide here would then reset each other on
+         * every call and the rate would not be enforced at all -- measured at 479 MB/s
+         * under a 16 KiB/s rule, with no hit counted either, so nothing showed it. Two
+         * live descriptors on one slot now hold each other back instead, which errs on the
+         * side of the rate the rule asked for. A new *rate* on the same descriptor is a
+         * different thing -- the rule changed, and a newly loaded rule does not punish the
+         * first call -- so that one still starts full. */
+        const int stolen = entry->taken && entry->fd != fd;
+
+        entry->bucket.state = stolen ? chaos_bucket_state(0U, chaos_hits_now_ms()) : 0U;
+        entry->taken = 1;
         entry->rate = rate;
         entry->fd = fd;
     }
     return &entry->bucket;
+}
+
+/**
+ * @brief Drops the rate bucket of @p fd, if it holds one.
+ *
+ * @details Called when the descriptor is closed. Without it the next descriptor to get
+ * that number inherits a drained bucket and is held back for bytes somebody else moved --
+ * and since a taken-over slot now starts empty rather than full, inheriting one is no
+ * longer harmless. The number is the whole key here, so there is nothing else to check.
+ */
+void chaos_io_throttle_forget(int fd)
+{
+    chaos_io_throttle_t *entry = &g_chaos_io_throttles[(unsigned)fd % CHAOS_IO_THROTTLE_SLOTS];
+
+    if (entry->taken && entry->fd == fd)
+    {
+        entry->taken = 0;
+        entry->fd = -1;
+        entry->rate = 0U;
+        entry->bucket.state = 0U;
+    }
 }
 
 /**

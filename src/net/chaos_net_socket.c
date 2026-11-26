@@ -962,6 +962,8 @@ typedef struct chaos_net_throttle
     volatile int fd;
     volatile uint64_t rate;
     chaos_bucket_t bucket;
+    /** Whether this slot has ever had an owner: a takeover starts empty, a first use full. */
+    int taken;
 } chaos_net_throttle_t;
 
 static chaos_net_throttle_t g_chaos_net_throttles[CHAOS_NET_THROTTLE_SLOTS];
@@ -988,7 +990,11 @@ static chaos_bucket_t *chaos_net_throttle_bucket(int fd, uint64_t rate)
 
     if (entry->fd != fd || entry->rate != rate)
     {
-        entry->bucket.state = 0U;
+        /* Empty for a new owner, full only the first time: see chaos_io_rw.c. */
+        const int stolen = entry->taken && entry->fd != fd;
+
+        entry->bucket.state = stolen ? chaos_bucket_state(0U, chaos_hits_now_ms()) : 0U;
+        entry->taken = 1;
         entry->rate = rate;
         entry->fd = fd;
     }
