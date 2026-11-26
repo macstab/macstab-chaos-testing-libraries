@@ -267,4 +267,26 @@ int chaos_init_godebug_mptcp_off(const char *current, char *out, size_t size);
  */
 uint64_t chaos_init_seed(void);
 
+/**
+ * @brief Records the system calls the installed filter answers with TRACE.
+ *
+ * @details A seccomp filter cannot be changed once installed, so this set is fixed for the
+ * life of the container while the rule file is not: a reload can add an effect that needs
+ * a trace stop the filter does not provide. Without knowing the set, the deciders produce
+ * a verdict only a trace stop can carry, the notification path answers CONTINUE, and a
+ * hit is reported for a fault that never happened. Called once, after the handover.
+ *
+ * @param calls  Numbers to remember; NULL or @p count 0 records an empty set.
+ * @param count  How many, truncated to what the store holds.
+ */
+void chaos_init_traced_set(const long *calls, size_t count);
+
+/**
+ * @brief Whether the installed filter answers @p nr with TRACE.
+ *
+ * @return 1 when it does, else 0 -- including when no set was recorded, which is the case
+ *         for a supervisor that installed no TRACE instruction at all.
+ */
+int chaos_init_traced(long nr);
+
 #endif

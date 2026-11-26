@@ -1206,6 +1206,45 @@ static ssize_t test_getrandom(void *buffer, size_t size)
  * reproduce it under chaos-init too, or the seed is worth nothing. "-1" is rejected rather
  * than wrapped into UINT64_MAX, which is a seed nobody asked for.
  */
+/**
+ * @brief The TRACE set of the installed filter: what was recorded, and nothing else.
+ *
+ * @details A seccomp filter is fixed once installed while the rule file is not, so a
+ * reload can ask for an effect that needs a trace stop this container does not have. The
+ * deciders ask this before producing such a verdict, so the answer has to be exact: a
+ * call that was never recorded must come back 0, and so must every call before anything
+ * was recorded at all -- a supervisor that installed no TRACE instruction.
+ */
+static void test_installed_trace_set(void)
+{
+    static const long calls[] = {__NR_write, __NR_read, __NR_close};
+    long many[CHAOS_INIT_MAX_FILTER + 4];
+    size_t index;
+
+    /* Nothing recorded yet: a supervisor that traces nothing traces nothing. */
+    chaos_init_traced_set(NULL, 0U);
+    assert(chaos_init_traced(__NR_write) == 0);
+
+    chaos_init_traced_set(calls, sizeof(calls) / sizeof(calls[0]));
+    assert(chaos_init_traced(__NR_write) && chaos_init_traced(__NR_close));
+    assert(chaos_init_traced(__NR_openat) == 0);
+
+    /* A set larger than the store is truncated rather than overrunning it; what fits is
+     * still answered. */
+    for (index = 0U; index < sizeof(many) / sizeof(many[0]); ++index)
+    {
+        many[index] = (long)(index + 1000U);
+    }
+    chaos_init_traced_set(many, sizeof(many) / sizeof(many[0]));
+    assert(chaos_init_traced(1000L));
+    assert(chaos_init_traced((long)(CHAOS_INIT_MAX_FILTER + 1003U)) == 0);
+
+    /* A NULL set clears what was there, so a later question is not answered from a set
+     * that no longer applies. */
+    chaos_init_traced_set(NULL, 3U);
+    assert(chaos_init_traced(1000L) == 0);
+}
+
 static void test_seed_from_environment(void)
 {
     static const char *const unusable[] = {"", "12x", "x", "-1", "99999999999999999999999"};
@@ -1234,6 +1273,7 @@ static void test_seed_from_environment(void)
 
 int main(void)
 {
+    test_installed_trace_set();
     test_seed_from_environment();
     test_parse_args();
     test_filter_decisions();

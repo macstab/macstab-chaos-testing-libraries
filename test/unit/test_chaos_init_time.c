@@ -65,6 +65,19 @@ uint64_t chaos_init_seed(void)
     return UINT64_C(0x5eed5eed5eed5eed);
 }
 
+/* The installed TRACE set lives in chaos_init_core.c, which this file does not include.
+ * Nothing here decides a traced effect, so a fixed answer will do. */
+void chaos_init_traced_set(const long *calls, size_t count)
+{
+    (void)calls;
+    (void)count;
+}
+int chaos_init_traced(long nr)
+{
+    (void)nr;
+    return 1;
+}
+
 #include <assert.h>
 #include <stdio.h>
 #include <sys/wait.h>
@@ -219,6 +232,17 @@ int main(void)
     /* Without a rule it is the kernel's call to answer. */
     write_rules("clock_gettime/monotonic:OFFSET:1000\n");
     assert(serve(__NR_time, P(&seconds), 0).action == CHAOS_INIT_PASS);
+
+    /* One call, one draw. The return value and the buffer have to agree -- POSIX requires
+     * it -- and they only do if the value is drawn once and carried. `@first=1` makes a
+     * second draw visible: the first spends the single allowance, so an effect applied
+     * again for the buffer finds nothing left and writes the unshifted clock while the
+     * return value carries the shifted one. */
+    write_rules("clock_gettime:OFFSET:1000 @first=1\n");
+    seconds = 0;
+    verdict = serve(__NR_time, P(&seconds), 0);
+    assert(verdict.action == CHAOS_INIT_RETURN && verdict.value == 1001);
+    assert(seconds == (time_t)verdict.value);
 #endif
 
     /* FREEZE holds the clock at the reading of the call that started it: the second read

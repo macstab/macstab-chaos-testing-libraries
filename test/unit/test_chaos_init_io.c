@@ -90,6 +90,22 @@ uint64_t chaos_init_seed(void)
     return UINT64_C(0x5eed5eed5eed5eed);
 }
 
+/* The installed TRACE set lives in chaos_init_core.c, which this test does not include.
+ * `g_traced_all` is the seam: with it set every call counts as traced, which is the state
+ * a container starts in when its rule file already asked for those effects; cleared, it
+ * is a filter that traces nothing, which is what a reload adding such an effect meets. */
+static int g_traced_all = 1;
+void chaos_init_traced_set(const long *calls, size_t count)
+{
+    (void)calls;
+    (void)count;
+}
+int chaos_init_traced(long nr)
+{
+    (void)nr;
+    return g_traced_all;
+}
+
 #include <assert.h>
 #include <signal.h>
 #include <sys/stat.h>
@@ -802,6 +818,29 @@ int main(void)
          * the allowance changed nothing, so there was no effect to charge for. The budget
          * is the sharpest way to say it: with `@first=1` the untouched call must leave the
          * claim for the call that is actually shortened. */
+        /* A filter that does not trace this call cannot carry a shortened write, and a
+         * filter cannot be changed once installed -- so a rule file replaced at run time
+         * can ask for an effect this container will never deliver. It must then not fire
+         * and not count a hit: a hit reported for a fault nobody injected is worse than a
+         * rule that visibly does nothing. */
+        g_traced_all = 0;
+        assert(PASSES(decide(__NR_write, (uint64_t)torn, P(buffer), 13U, 0, 0)));
+        {
+            char hits[256] = {0};
+            char path[64];
+            FILE *file;
+
+            (void)snprintf(path, sizeof(path), "/tmp/.chaos-io.hits.%ld", (long)getpid());
+            file = fopen(path, "r");
+            if (file != NULL)
+            {
+                hits[fread(hits, 1U, sizeof(hits) - 1U, file)] = '\0';
+                (void)fclose(file);
+            }
+            assert(strstr(hits, "THROTTLE:13") == NULL);
+        }
+        g_traced_all = 1;
+
         write_rules("/tmp/initio/torn:write:THROTTLE:13 @first=1\n");
         assert(PASSES(decide(__NR_write, (uint64_t)torn, P(buffer), 13U, 0, 0)));
         held = decide(__NR_write, (uint64_t)torn, P(buffer), 13U, 0, 0);

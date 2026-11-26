@@ -1749,6 +1749,13 @@ chaos_init_net_decide_at(const chaos_init_call_t *call, long result, chaos_init_
     /* A loaded rule is ERRNO, LATENCY, TIMEOUT or DROP only (chaos_init_net_supported()).
      * A wait without a timeout never times out, so TIMEOUT does not apply to it; checked
      * before triggering, so such a call counts no hit. */
+    /* An effect that only a trace stop can carry, on a call the installed filter does not
+     * trace: see chaos_init_io.c. Before the draw, so no hit is reported for a fault that
+     * cannot be injected. */
+    if (chaos_init_net_traced_call(&rule, entry) && !chaos_init_traced(call->nr))
+    {
+        return 1;
+    }
     if (rule.effect == CHAOS_NET_EFFECT_TIMEOUT &&
         (timeout_ms = chaos_init_net_wait_timeout(call)) < 0)
     {

@@ -150,6 +150,22 @@ uint64_t chaos_init_seed(void)
     return UINT64_C(0x5eed5eed5eed5eed);
 }
 
+/* The installed TRACE set lives in chaos_init_core.c, which this test does not include.
+ * `g_traced_all` is the seam: with it set every call counts as traced, which is the state
+ * a container starts in when its rule file already asked for those effects; cleared, it
+ * is a filter that traces nothing, which is what a reload adding such an effect meets. */
+static int g_traced_all = 1;
+void chaos_init_traced_set(const long *calls, size_t count)
+{
+    (void)calls;
+    (void)count;
+}
+int chaos_init_traced(long nr)
+{
+    (void)nr;
+    return g_traced_all;
+}
+
 static int test_mptcp_socket(void)
 {
     if (g_mptcp_absent)
@@ -1759,6 +1775,22 @@ int main(void)
         assert(wanted.sin_addr.s_addr == server_address.sin_addr.s_addr);
     }
 
+    /* A filter that does not trace this call cannot carry a shortened send, and a filter
+     * cannot be changed once installed -- so a rule file replaced at run time can ask for
+     * an effect this container will never deliver. It must then not fire, and the check
+     * sits before the draw so no hit is reported for a fault nobody injected. */
+    (void)snprintf(
+        rules,
+        sizeof(rules),
+        "tcp4://127.0.0.1:%u:send:THROTTLE:10\n",
+        ntohs(server_address.sin_port)
+    );
+    write_rules(rules);
+    g_traced_all = 0;
+    assert(PASSES(decide(__NR_write, (uint64_t)server, P(buffer), 4096U, 0, 0, 0)));
+    assert(PASSES(decide(__NR_write, (uint64_t)server, P(buffer), 4096U, 0, 0, 0)));
+    g_traced_all = 1;
+
     /* THROTTLE: the same bucket arithmetic as the library's, applied through the
      * registers. Ten bytes per second, so the bucket holds ten and a byte takes 100 ms to
      * arrive -- slow enough that the test does not depend on how fast this machine is. */
@@ -1842,7 +1874,10 @@ int main(void)
             __NR_sendto, (uint64_t)udp, P(buffer), 10U, 0, P(&udp_address), sizeof(udp_address)
         );
         assert(held.action == CHAOS_INIT_DELAY);
-        assert(held.delay_ms == 1600U);
+        /* Eight bytes still owed at five a second is 1600 ms, less the part of a
+         * millisecond the bucket kept from the first send: a range, for the same reason
+         * the stream case above is one. */
+        assert(held.delay_ms > 1400U && held.delay_ms <= 1600U);
         /* And no shortening: the message goes out as the caller wrote it. */
         assert(!held.shortens);
         /* A non-blocking socket is told EAGAIN instead of being parked, as in the

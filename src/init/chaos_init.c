@@ -929,7 +929,15 @@ chaos_init_answer(int listener, unsigned libs, void *request, void *response, si
         return;
     }
     chaos_init_net_commit(&call, &verdict);
-    chaos_init_time_commit(&call, &verdict);
+    /* Not a delayed clock read: that one is committed by chaos_init_on_time() when it is
+     * due, which is the whole point -- a clock read reports the moment it is answered.
+     * Committing here as well applied the value effect twice, with two independent draws:
+     * two hits for one read, `@every` and `@first` spent at twice the rate, and with a
+     * probability below 1 the two draws disagreeing about what the caller finally gets. */
+    if (verdict.action != CHAOS_INIT_DELAY)
+    {
+        chaos_init_time_commit(&call, &verdict);
+    }
     if (verdict.action == CHAOS_INIT_DELAY)
     {
         const chaos_init_verdict_t answer = chaos_init_delay_answer(&verdict);
@@ -1312,6 +1320,28 @@ int main(int argc, char **argv)
     if (g_chaos_init_tracing)
     {
         int stop_status = 0;
+        long installed[CHAOS_INIT_MAX_FILTER];
+        size_t installed_count = 0U;
+
+        /* The same set the child put in the filter, computed again from the same rule
+         * file, because a filter cannot be changed once installed while the rule file can
+         * be replaced. A decider that produced a verdict only a trace stop can carry for a
+         * call this set does not hold would have its answer sent as CONTINUE, with a hit
+         * already counted -- a fault reported and never injected. Nothing else runs
+         * between the child's computation and this one. */
+        if ((options.libs & CHAOS_INIT_LIB_IO) != 0U)
+        {
+            installed_count =
+                chaos_init_io_traced_calls(installed, sizeof(installed) / sizeof(installed[0]));
+        }
+        if ((options.libs & CHAOS_INIT_LIB_NET) != 0U)
+        {
+            installed_count += chaos_init_net_traced_calls(
+                installed + installed_count,
+                sizeof(installed) / sizeof(installed[0]) - installed_count
+            );
+        }
+        chaos_init_traced_set(installed, installed_count);
 
         if (waitpid(child, &stop_status, 0) != child || !WIFSTOPPED(stop_status) ||
             ptrace(

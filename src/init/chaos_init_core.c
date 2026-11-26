@@ -571,6 +571,44 @@ size_t chaos_init_format_status(
 #define CHAOS_INIT_GETRANDOM(buffer, size) getrandom((buffer), (size), 0)
 #endif
 
+/** @brief The TRACE set of the installed filter; fixed once the filter is in place. */
+static long g_chaos_init_traced[CHAOS_INIT_MAX_FILTER];
+static size_t g_chaos_init_traced_count = 0U;
+
+/** @copydoc chaos_init_traced_set */
+void chaos_init_traced_set(const long *calls, size_t count)
+{
+    size_t index;
+
+    g_chaos_init_traced_count = 0U;
+    if (calls == NULL)
+    {
+        return;
+    }
+    for (index = 0U;
+         index < count && index < sizeof(g_chaos_init_traced) / sizeof(g_chaos_init_traced[0]);
+         ++index)
+    {
+        g_chaos_init_traced[index] = calls[index];
+        ++g_chaos_init_traced_count;
+    }
+}
+
+/** @copydoc chaos_init_traced */
+int chaos_init_traced(long nr)
+{
+    size_t index;
+
+    for (index = 0U; index < g_chaos_init_traced_count; ++index)
+    {
+        if (g_chaos_init_traced[index] == nr)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /** @copydoc chaos_init_seed */
 uint64_t chaos_init_seed(void)
 {

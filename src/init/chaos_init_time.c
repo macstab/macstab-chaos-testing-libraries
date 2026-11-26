@@ -378,7 +378,10 @@ void chaos_init_time_commit(const chaos_init_call_t *call, const chaos_init_verd
     {
         return;
     }
-    chaos_init_time_shift(call, clock, &reading);
+    if (shape != CHAOS_INIT_TIME_SECONDS)
+    {
+        chaos_init_time_shift(call, clock, &reading);
+    }
     if (shape == CHAOS_INIT_TIME_TIMEVAL)
     {
         struct timeval value;
@@ -391,7 +394,12 @@ void chaos_init_time_commit(const chaos_init_call_t *call, const chaos_init_verd
 #ifdef __NR_time
     if (shape == CHAOS_INIT_TIME_SECONDS)
     {
-        const time_t seconds = reading.tv_sec;
+        /* The value the decision already drew, not a second shift of a second reading:
+         * `time` carries its result in the return value, so the decision has to shift the
+         * clock to build it, and shifting again here would draw again -- two hits for one
+         * call, and with a probability below 1 a return value and a `*t` that disagree,
+         * where POSIX requires them to be equal. */
+        const time_t seconds = (time_t)verdict->value;
 
         (void)chaos_init_write_memory(call->tid, target, &seconds, sizeof(seconds));
         return;

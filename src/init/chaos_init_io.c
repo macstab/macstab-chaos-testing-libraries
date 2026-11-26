@@ -745,6 +745,14 @@ chaos_init_io_decide_at(const chaos_init_call_t *call, long result, chaos_init_v
      * keep it in memory, so one argument cannot shorten them and they are written whole --
      * the same answer the library gives a vector it cannot tear or hold back. Checked
      * before the draw, so such a call counts no hit and no tokens. */
+    /* An effect that only a trace stop can carry, on a call the installed filter does not
+     * trace: the filter is fixed for the life of the container, so a reload that adds such
+     * a rule cannot make it work. Before the draw, so the rule reports no hit for a fault
+     * nobody injected -- which is what the documented "loads and does not fire" means. */
+    if (chaos_init_io_traced_call(&rule, entry) && !chaos_init_traced(call->nr))
+    {
+        return 1;
+    }
     if ((rule.effect == CHAOS_IO_EFFECT_TORN || rule.effect == CHAOS_IO_EFFECT_THROTTLE) &&
         entry->size < 0)
     {
