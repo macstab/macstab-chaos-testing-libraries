@@ -260,7 +260,11 @@ static inline uint64_t chaos_dns_rule_draw_begin(chaos_dns_rule_t *rule)
     {
         return 0U;
     }
-    if (rule->hit != NULL)
+    /* Only through a slot that is still this rule's: every other use of a slot checks
+     * the generation, and a rule copy held across a reload would otherwise bump the
+     * counter of whoever owns the slot now -- shifting that rule's `@every` phase and
+     * its draw numbering. */
+    if (rule->hit != NULL && chaos_hit_slot_current(rule->hit, rule->hit_generation))
     {
         evaluation = __sync_fetch_and_add(&rule->hit->evaluations, UINT64_C(1));
     }

@@ -778,6 +778,7 @@ static int chaos_io_throttle_iovecs(
  */
 static int chaos_io_drop_write(chaos_io_rule_t *rule, int fd, size_t count)
 {
+
     /* Both queries below are asked on the way to a decision, so errno has to come out of
      * here as it went in: the common case is that this returns 0 and the real write runs
      * and succeeds, and a caller that then reads errno must not find the ESPIPE of the
@@ -786,7 +787,12 @@ static int chaos_io_drop_write(chaos_io_rule_t *rule, int fd, size_t count)
     const long flags = CHAOS_IO_SYSCALL(SYS_fcntl, fd, F_GETFL, 0);
     int correct;
 
-    if (flags < 0)
+    /* A count the call could not have returned is left alone: reported as written it would
+     * come back as a negative ssize_t -- an error with no errno -- and the offset
+     * correction would move backwards by the same amount. The kernel refuses such a call
+     * with EINVAL anyway. The net twin bounds the same thing and says so; asked before the
+     * draw, so a call this leaves alone counts no hit. */
+    if (flags < 0 || count > (size_t)SSIZE_MAX)
     {
         errno = saved_errno;
         return 0;

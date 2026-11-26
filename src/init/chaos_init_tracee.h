@@ -87,7 +87,7 @@ typedef struct chaos_init_rules
     size_t *count;           /**< Per process: rules in that snapshot. */
     uint64_t *total;         /**< Per process: hits counted. */
     unsigned char *pending;  /**< Per process: hits not yet written. */
-    char *buffer;            /**< Hits file scratch: max_rules * CHAOS_HITS_LINE_MAX + 1. */
+    char *buffer;            /**< Hits file scratch: the rule lines plus the header. */
     long *file;              /**< Per process: its hits file's number; 0 before the first. */
 } chaos_init_rules_t;
 
@@ -102,7 +102,7 @@ typedef struct chaos_init_rules
     static size_t name##_count[CHAOS_INIT_MAX_TRACEES];                                            \
     static uint64_t name##_total[CHAOS_INIT_MAX_TRACEES];                                          \
     static unsigned char name##_pending[CHAOS_INIT_MAX_TRACEES];                                   \
-    static char name##_buffer[(max) * CHAOS_HITS_LINE_MAX + 1U];                                   \
+    static char name##_buffer[(max) * CHAOS_HITS_LINE_MAX + 1U + CHAOS_HITS_HEADER_MAX];           \
     static long name##_file[CHAOS_INIT_MAX_TRACEES]
 
 /**

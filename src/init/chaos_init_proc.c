@@ -58,6 +58,12 @@ int chaos_init_read_memory(pid_t pid, uint64_t address, void *out, size_t size)
     local.iov_len = size;
     remote.iov_base = (void *)(uintptr_t)address;
     remote.iov_len = size;
+    /* Cleared first, because a *short* transfer sets no errno and the test below is what
+     * turns that into EFAULT. Whatever the last failure left behind -- the EACCES the
+     * ownership scan collects walking /proc/<pid>/fd is the common one -- would otherwise
+     * be handed to chaos_init_proc_refused(), which latches `unreadable=yes` into the
+     * status file for a container that is perfectly readable. */
+    errno = 0;
     if (process_vm_readv(pid, &local, 1, &remote, 1, 0) != (ssize_t)size)
     {
         if (errno == 0)

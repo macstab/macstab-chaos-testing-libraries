@@ -133,6 +133,11 @@ expect() {
 }
 gcc -D_GNU_SOURCE -std=c99 -Wall -Wextra -Werror -pedantic -O2 -static -o /tmp/probe /work/test/runtime/seccomp_probe.c
 init=/out/chaos-init-'"$ARCH"'
+state=$($init --libs io -- /bin/cat /tmp/.chaos-init.status | head -1)
+if [ "$state" != "state=active" ]; then
+    echo "skip $LIBC: seccomp mode unavailable here ($($init --libs io -- /bin/cat /tmp/.chaos-init.status | sed -n 2p))"
+    exit "${CHAOS_SKIP_EXIT:-0}"
+fi
 mkdir -p /tmp/sec/drop && chmod 777 /tmp/sec/drop
 printf "%s\n" "/tmp/sec/drop:open:EIO:1.0 # t" > /tmp/.chaos-io.conf
 expect "C: with CAP_SYS_PTRACE the path rule matches after the switch" \
@@ -516,7 +521,12 @@ printf "%s\n" "clock_gettime/realtime:OFFSET:3600000 # t" > /tmp/.chaos-time.con
 go_clock=$($init --libs time -- $go clock)
 expect "Go: the wall clock is shifted and time.Since is not" \
     "$(echo "$go_clock" | sed -n "s/^sec=[0-9]* same=true since=[0-9]\\{2,3\\}ms$/shifted/p")" "shifted"
-expect "Go: the vDSO of the Go image was blinded" \
+# What proves the blinding is the check above: a static Go binary reads the clock through
+# the vDSO, so a shifted time.Now() can only come from the fallback the renamed symbols
+# force. This one says the weaker thing it actually measures -- no image reported that its
+# vDSO could not be written -- which is equally true when nothing was attempted, so it is
+# named for that rather than for the blinding.
+expect "Go: no image reported an unwritable vDSO" \
     "$(grep -c "^vdso=failed$" /tmp/.chaos-init.status)" "0"
 rm -f /tmp/.chaos-time.conf
 
@@ -624,6 +634,7 @@ docker run --rm \
     --platform "$DOCKER_PLATFORM" \
     --cap-add SYS_PTRACE \
     -e LIBC="privileged" \
+    -e CHAOS_SKIP_EXIT="${CHAOS_SKIP_EXIT:-0}" \
     -v "$TMP_DIR/out:/out:ro" \
     -v "$ROOT_DIR:/work:ro" \
     gcc:bookworm \

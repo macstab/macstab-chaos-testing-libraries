@@ -169,7 +169,10 @@ static void chaos_init_tracee_write(chaos_init_rules_t *rules, int tracee)
         count < rules->max_rules ? count : rules->max_rules,
         lines,
         rules->buffer,
-        rules->max_rules * CHAOS_HITS_LINE_MAX + 1U
+        /* The header too: chaos_hits_write_for() wants room for the rule lines *plus* the
+         * header it is given, and with a full rule set a buffer sized for the lines alone
+         * made it drop the whole file rather than one line. */
+        rules->max_rules * CHAOS_HITS_LINE_MAX + 1U + CHAOS_HITS_HEADER_MAX
     );
     rules->file[tracee] = owned ? number : 0;
 }

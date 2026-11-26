@@ -3477,6 +3477,17 @@ static void test_drop_write_wrappers(void)
     chaos_test_drop_rule(CHAOS_IO_OP_WRITE);
     assert(chaos_io_drop_write(&g_config_rule, -1, 5U) == 0);
     assert(g_rule_should_trigger_calls == 0);
+    /* A count no call could have returned: reported as written it would come back as a
+     * negative ssize_t -- an error with no errno -- and the offset correction would move
+     * backwards by as much. The kernel refuses such a call itself. No draw either. */
+    {
+        const int plain = chaos_test_drop_fd(O_WRONLY);
+
+        chaos_test_drop_rule(CHAOS_IO_OP_WRITE);
+        assert(chaos_io_drop_write(&g_config_rule, plain, (size_t)SSIZE_MAX + 1U) == 0);
+        assert(g_rule_should_trigger_calls == 0);
+        chaos_test_raw_close(plain);
+    }
 
     /* writev drops the total of the vector. */
     vector[0].iov_base = (void *)"abc";
