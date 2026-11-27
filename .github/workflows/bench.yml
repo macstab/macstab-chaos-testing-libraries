@@ -49,6 +49,14 @@ on:
           five runs per side do not resolve ten percentage points.
         required: false
         default: '5'
+      base:
+        description: >-
+          What to measure against; empty uses the merge base with develop. Give a tag such
+          as 2.0.0 to answer "is this release slower than that one" on one machine, which
+          the release gate cannot answer: it compares against envelopes recorded weeks ago
+          on another runner, and that drift is larger than the effects being looked for.
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -100,9 +108,17 @@ jobs:
       - name: Pick the libraries this branch touched
         id: pick
         run: |
-          git fetch --no-tags origin +refs/heads/develop:refs/remotes/origin/develop
-          base=$(git merge-base origin/develop HEAD)
+          given="${{ inputs.base }}"
+          if [ -n "$given" ]; then
+            git fetch --tags --force origin
+            base=$(git rev-parse --verify "$given^{commit}")
+            echo "::notice::base given by hand: $given ($base)"
+          else
+            git fetch --no-tags origin +refs/heads/develop:refs/remotes/origin/develop
+            base=$(git merge-base origin/develop HEAD)
+          fi
           echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "base_given=${given:+yes}" >> "$GITHUB_OUTPUT"
           libs=
           add() {
             case ",$libs," in
@@ -137,12 +153,22 @@ jobs:
 
       # The merge base is measured by THIS branch's harness: only src/ and the build differ,
       # so a change to the suite or the driver cannot show up as a code regression.
-      - name: Lay out the merge base
+      - name: Lay out the base
         if: steps.pick.outputs.libs != ''
         run: |
           git worktree add /tmp/base "${{ steps.pick.outputs.base }}"
           rm -rf /tmp/base/benchmark
           cp -R benchmark /tmp/base/benchmark
+
+      # Measuring against an older release runs this branch's scenarios against that release's
+      # libraries. One it rejects (an effect or qualifier that did not exist yet) loads zero
+      # rules, and the arm then measures no rule at all and reads as the old side being fast.
+      # --check-scenarios proves every scenario loads and fires before anything is believed.
+      - name: Prove the scenarios load against the base
+        if: steps.pick.outputs.libs != '' && steps.pick.outputs.base_given == 'yes'
+        run: |
+          /tmp/base/benchmark/run-bench.sh --check-scenarios \
+            --libs=${{ steps.pick.outputs.libs }} --libc=${{ matrix.libc }}
 
       # A B A B, not AAAA BBBB: a runner drifts within a job (thermal, noisy neighbours), and
       # measuring one side to completion before the other turns that drift into a verdict.

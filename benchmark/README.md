@@ -272,6 +272,23 @@ Five runs per side is the minimum the driver needs for p < 0.01, and it does not
 ten percentage points of overhead. Raise `runs` before concluding anything from a small
 difference.
 
+**Is this release slower than the last one?** That is a third question, and neither the
+merge base nor the release gate answers it: the merge base already contains whatever the
+release did, and the gate compares against envelopes recorded weeks earlier on another
+runner. `base` points the same A/B machinery at any ref, so both releases are built and
+measured on one machine, alternating:
+
+```sh
+gh workflow run bench.yml --ref feat/xyz -f base=2.0.0 -f libs=net,process -f runs=15
+```
+
+Both sides are then measured by this branch's harness against each release's own `src/`
+and `Makefile`, so a build-flag change (segment alignment, for instance) counts as part
+of the release, which it is. With an explicit `base` the job first runs
+`--check-scenarios` against that release's libraries: a scenario using an effect or
+qualifier that did not exist yet would load zero rules, and the arm would then measure no
+rule at all and read as the old side being fast.
+
 **On a merge gate: is this release slower than the last one?** A pull request into
 `develop` or into `main` sweeps the **whole** suite against the last published
 non-prerelease, and `libs` is ignored there. That is deliberate: a gate that measured a
