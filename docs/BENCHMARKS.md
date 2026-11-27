@@ -195,6 +195,27 @@ architectures without a vDSO clock symbol known to `src/common/chaos_clock.h`
 (anything but amd64 and arm64) the throttle is disabled and the model below
 still applies.
 
+**One look per call, not one per effect.** The throttle is cheap but not free: the
+check itself reads the vDSO clock, so a wrapper that looks up each of its effects
+through `chaos_<lib>_config_match()` pays for one clock read per effect. A clock read
+is the cheapest call the library intercepts, which makes it the one call where that
+multiplication is visible -- `clock_gettime` looks for LATENCY, ERRNO, OFFSET, REGRESS
+and FREEZE, and until `9c2031b` it checked the rule file five times per read. It now
+calls `chaos_time_config_prepare()` once and looks the five effects up with
+`chaos_time_config_match_loaded()`, which is the protocol `src/time/chaos_time_config.h`
+documents, and skips the lookups outright when no rule is loaded. Measured against the
+merge base on one runner: 169 to 172 percentage points of overhead off both the
+passthrough and the match-no-fire arm, on glibc and musl aarch64 alike. A wrapper that
+grows an effect inherits this: look the new effect up with `*_match_loaded()` inside the
+existing check, never with a second `*_config_match()`.
+
+Attributing a change like that to a cause needs a comparison the runner cannot colour.
+The release-over-release gate cannot give one -- it compares against envelopes recorded
+weeks earlier on another machine, and that drift exceeds the effects being looked for.
+The A/B job on a feature branch measures both sides on one runner, alternating, which is
+what the numbers above come from; `benchmark/README.md`, "Running it in CI", has the
+invocation.
+
 ### 2.1 Zero Rules (Empty Config / No Config File) — pre-throttle model
 
 > Model (estimate) of the code before `9e630e2`: one `stat()` per call.

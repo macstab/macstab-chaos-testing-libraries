@@ -237,6 +237,56 @@ Exit codes: 0 no regression, 1 regression flagged, 2 fatal input error.
 
 ---
 
+## Running it in CI
+
+`.github/workflows/bench.yml` answers two different questions, and which one it answers
+follows from the branch.
+
+**On a feature branch: did my change cost anything?** Every push measures the branch
+against its own merge base with `develop` -- both sides on one runner, in one job,
+alternating A B A B, and only the libraries the branch touched. That comparison is the
+only one that holds: the runner drifts between jobs, and between a job today and the
+envelopes of a release published weeks ago, by more than the effects being looked for.
+
+```sh
+git push origin feat/xyz                 # the libraries follow from the diff
+```
+
+The diff is mapped per path: `src/time/` picks `time`, `src/core`, `src/config`,
+`src/effects` and `src/wrappers` pick `io`, and anything under `src/common` picks all six,
+because the hit slots, the policy and the token bucket are on every library's hot path.
+`src/init/` picks none -- chaos-init has no benchmark in `suite.tsv` -- and the job then
+says so and measures nothing.
+
+To ask a narrower question, or a close one that needs more samples, dispatch it by hand:
+
+```sh
+# only these libraries, fifteen runs per side instead of five
+gh workflow run bench.yml --ref feat/xyz -f libs=net,process -f runs=15
+
+# watch it, then read the per-variant reports from the artifacts
+gh run watch "$(gh run list --branch feat/xyz --workflow bench.yml     --limit 1 --json databaseId --jq '.[0].databaseId')" --exit-status
+```
+
+Five runs per side is the minimum the driver needs for p < 0.01, and it does not resolve
+ten percentage points of overhead. Raise `runs` before concluding anything from a small
+difference.
+
+**On a merge gate: is this release slower than the last one?** A pull request into
+`develop` or into `main` sweeps the **whole** suite against the last published
+non-prerelease, and `libs` is ignored there. That is deliberate: a gate that measured a
+different subset per pull request would quietly stop covering whatever that pull request
+did not happen to touch. Nothing needs to be invoked -- opening the pull request runs it.
+Dispatching the workflow on `develop` or `main` runs the same full gate.
+
+One limitation to know before reading a report: the amd64 runners do not expose hardware
+performance counters even with `perf_event_paranoid=1`, so their envelopes carry no cycle
+counts and only the arm64 variants give a cycle comparison. Wall-clock numbers from amd64
+are still same-runner in the A/B job, which is better than the gate's cross-run medians,
+but cycles are the metric that survives a busy runner.
+
+---
+
 ## Adding a new benchmark
 
 1. **Kernel**: in `benchmark/kernels/bench_<category>.c`, a state struct and

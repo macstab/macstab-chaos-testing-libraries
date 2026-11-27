@@ -34,6 +34,21 @@ on:
     paths-ignore:
       - '**/*.md'
   workflow_dispatch:
+    inputs:
+      libs:
+        description: >-
+          Libraries to measure, comma separated (io, net, dns, time, memory, process).
+          Empty derives them from the diff against the merge base. Only the A/B job on a
+          feature branch reads this; a run on develop or main is a merge gate and never
+          filters.
+        required: false
+        default: ''
+      runs:
+        description: >-
+          Runs per side in the A/B job (default 5). Raise it when a question is close:
+          five runs per side do not resolve ten percentage points.
+        required: false
+        default: '5'
 
 permissions:
   contents: read
@@ -46,7 +61,11 @@ concurrency:
 jobs:
   ab:
     name: branch vs merge base (${{ matrix.libc }}-${{ matrix.arch }})
-    if: github.event_name == 'push'
+    # A pull request reports refs/pull/N/merge, which is neither main nor develop, so the
+    # event has to be excluded as well: a pull request is a merge gate and sweeps everything.
+    if: >-
+      github.event_name != 'pull_request' && github.ref != 'refs/heads/main' &&
+      github.ref != 'refs/heads/develop'
     strategy:
       fail-fast: false
       matrix:
@@ -104,6 +123,11 @@ jobs:
               src/core/*|src/config/*|src/effects/*|src/wrappers/*) add io ;;
             esac
           done
+          chosen="${{ inputs.libs }}"
+          if [ -n "$chosen" ]; then
+            echo "::notice::--libs given by hand: $chosen (the diff would have said ${libs:-none})"
+            libs="$chosen"
+          fi
           echo "libs=$libs" >> "$GITHUB_OUTPUT"
           if [ -z "$libs" ]; then
             echo "::notice::no library source changed since $base; nothing to measure"
@@ -127,10 +151,11 @@ jobs:
         env:
           BENCH_WARMUP: 5000
           BENCH_ITERS: 100000
+          SIDE_RUNS: ${{ inputs.runs || '5' }}
         run: |
           mkdir -p ab/base ab/head
           i=0
-          while [ "$i" -lt 5 ]; do
+          while [ "$i" -lt "$SIDE_RUNS" ]; do
             BENCH_REPORT_DIR="$PWD/ab/base" /tmp/base/benchmark/run-bench.sh \
               --libs=${{ steps.pick.outputs.libs }} --runs=1 --run-offset="$i" \
               --libc=${{ matrix.libc }}
@@ -170,7 +195,9 @@ jobs:
 
   sweep:
     name: sweep (${{ matrix.libc }}-${{ matrix.arch }})
-    if: github.event_name != 'push'
+    if: >-
+      github.event_name == 'pull_request' || github.ref == 'refs/heads/main' ||
+      github.ref == 'refs/heads/develop'
     strategy:
       fail-fast: false
       matrix:
