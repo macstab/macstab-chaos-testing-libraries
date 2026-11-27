@@ -17,6 +17,7 @@ envelope per run with statistics, hardware counters, environment provenance and 
 ./benchmark/run-bench.sh --full                   # every library and benchmark (default)
 ./benchmark/run-bench.sh --full --libc=alpine     # the same on musl (Alpine 3.19)
 ./benchmark/run-bench.sh --full --runs=10 --compare
+./benchmark/run-bench.sh --libs=time,net --runs=1 --run-offset=3   # one A/B round of two libraries
 ./benchmark/run-bench.sh --check-scenarios       # every scenario loads and fires (CI gate)
 ```
 
@@ -33,6 +34,8 @@ regression. The driver needs at least 5 runs per arm to reach p < 0.01.
 | `--smoke` / `--full` | two `clock_gettime` cells / every cell (default) |
 | `--libc=glibc` / `--libc=alpine` (`musl`) | Debian 12 image (default) / Alpine 3.19 image |
 | `--runs=N` | repeat the whole sweep N times (default 1) |
+| `--libs=a,b,c` | only these libraries of `suite.tsv` (default all). The feature-branch A/B job measures just the libraries the branch touched; neither merge gate filters, because a gate that measured a different subset per pull request would stop covering what that pull request did not touch |
+| `--run-offset=N` | number the envelopes from N+1, so a second invocation adds runs to a report directory instead of overwriting them. Lets a caller interleave two trees A B A B, which is the only way a comparison survives drift within one job |
 | `--compare` | run `driver/chaos_bench_driver.py` on the host afterwards (needs `python3`) |
 | `--check-scenarios` | instead of a sweep, prove every scenario loads and every errno scenario fires on each of 64 calls; exit 1 on any failure |
 | `BENCH_WARMUP` | warmup iterations per run (default 10 000) |

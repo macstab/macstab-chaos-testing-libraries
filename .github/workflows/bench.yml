@@ -19,6 +19,14 @@
 name: bench
 
 on:
+  # A feature branch measures itself against its merge base, A B A B on one runner, and only
+  # the libraries it touched (the ab job). Both merge gates measure the whole suite against
+  # the last release instead: a gate that measured a different subset per pull request would
+  # stop covering whatever that pull request did not happen to touch.
+  push:
+    branches-ignore: [main, develop]
+    paths-ignore:
+      - '**/*.md'
   pull_request:
     branches: [main, develop]
     # A pull request that changes only Markdown (the release workflow's CHANGELOG and
@@ -36,8 +44,133 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  ab:
+    name: branch vs merge base (${{ matrix.libc }}-${{ matrix.arch }})
+    if: github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - libc: glibc
+            arch: amd64
+            runner: ubuntu-24.04
+          - libc: musl
+            arch: amd64
+            runner: ubuntu-24.04
+          - libc: glibc
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - libc: musl
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    # Two sides of five runs each. With a filter that picks one library this is minutes; a
+    # change under src/common picks all six and then it costs about what the full sweep does.
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Lower perf_event_paranoid
+        run: echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid
+
+      # One library per changed path, and every library for anything shared: src/common holds
+      # the hit slots, the policy and the token bucket, so a change there is on the hot path of
+      # all six. src/init is the supervisor and has no benchmark in suite.tsv.
+      - name: Pick the libraries this branch touched
+        id: pick
+        run: |
+          git fetch --no-tags origin +refs/heads/develop:refs/remotes/origin/develop
+          base=$(git merge-base origin/develop HEAD)
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          libs=
+          add() {
+            case ",$libs," in
+              *",$1,"*) ;;
+              *) libs="${libs:+$libs,}$1" ;;
+            esac
+          }
+          for f in $(git diff --name-only "$base"..HEAD); do
+            case "$f" in
+              src/common/*|Makefile|benchmark/suite.tsv)
+                libs=io,net,dns,time,memory,process
+                break ;;
+              src/time/*)                                      add time ;;
+              src/net/*)                                       add net ;;
+              src/dns/*)                                       add dns ;;
+              src/memory/*)                                    add memory ;;
+              src/process/*)                                   add process ;;
+              src/core/*|src/config/*|src/effects/*|src/wrappers/*) add io ;;
+            esac
+          done
+          echo "libs=$libs" >> "$GITHUB_OUTPUT"
+          if [ -z "$libs" ]; then
+            echo "::notice::no library source changed since $base; nothing to measure"
+          else
+            echo "::notice::measuring $libs against $base"
+          fi
+
+      # The merge base is measured by THIS branch's harness: only src/ and the build differ,
+      # so a change to the suite or the driver cannot show up as a code regression.
+      - name: Lay out the merge base
+        if: steps.pick.outputs.libs != ''
+        run: |
+          git worktree add /tmp/base "${{ steps.pick.outputs.base }}"
+          rm -rf /tmp/base/benchmark
+          cp -R benchmark /tmp/base/benchmark
+
+      # A B A B, not AAAA BBBB: a runner drifts within a job (thermal, noisy neighbours), and
+      # measuring one side to completion before the other turns that drift into a verdict.
+      - name: Measure both sides, alternating
+        if: steps.pick.outputs.libs != ''
+        env:
+          BENCH_WARMUP: 5000
+          BENCH_ITERS: 100000
+        run: |
+          mkdir -p ab/base ab/head
+          i=0
+          while [ "$i" -lt 5 ]; do
+            BENCH_REPORT_DIR="$PWD/ab/base" /tmp/base/benchmark/run-bench.sh \
+              --libs=${{ steps.pick.outputs.libs }} --runs=1 --run-offset="$i" \
+              --libc=${{ matrix.libc }}
+            BENCH_REPORT_DIR="$PWD/ab/head" ./benchmark/run-bench.sh \
+              --libs=${{ steps.pick.outputs.libs }} --runs=1 --run-offset="$i" \
+              --libc=${{ matrix.libc }}
+            i=$((i + 1))
+          done
+
+      # Exit 1 is the driver flagging the branch slower than its merge base. On a feature
+      # branch that is the whole point of the job, so it fails here.
+      - name: Compare
+        if: steps.pick.outputs.libs != ''
+        run: |
+          mkdir -p ab-reports
+          rc=0
+          python3 benchmark/driver/chaos_bench_driver.py \
+            --vs-prev ab/base --vs-prev-pct 15 --vs-prev-min-ns 25 \
+            --md --output ab-reports/branch-vs-base-${{ matrix.libc }}-${{ matrix.arch }}.md \
+            ab/head || rc=$?
+          cat ab-reports/branch-vs-base-${{ matrix.libc }}-${{ matrix.arch }}.md >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::${{ matrix.libc }}-${{ matrix.arch }}: slower than the merge base"
+            exit 1
+          fi
+
+      - name: Upload the comparison
+        if: steps.pick.outputs.libs != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ab-${{ matrix.libc }}-${{ matrix.arch }}
+          path: |
+            ab-reports/
+            ab/
+          retention-days: 14
+          if-no-files-found: error
+
   sweep:
     name: sweep (${{ matrix.libc }}-${{ matrix.arch }})
+    if: github.event_name != 'push'
     strategy:
       fail-fast: false
       matrix:

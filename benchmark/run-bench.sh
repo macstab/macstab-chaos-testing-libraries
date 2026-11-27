@@ -15,6 +15,13 @@
 #   --libc=alpine     Alpine 3.19 musl image (alias: --libc=musl)
 #   --runs=N          repeat the whole sweep N times (default 1); the driver
 #                     needs >= 5 runs per arm to flag a regression at p < 0.01
+#   --libs=a,b,c      only these libraries of benchmark/suite.tsv (default all).
+#                     For the A/B run on a feature branch, which measures just the
+#                     libraries the branch touched. A merge gate never filters.
+#   --run-offset=N    number the envelopes from N+1 instead of 1, so a second
+#                     invocation adds runs to a report dir instead of overwriting
+#                     them. Lets a caller interleave two trees A B A B, which is
+#                     the only way a comparison survives drift within one job.
 #   --compare         after the sweep, write <report-dir>/comparison.md with
 #                     benchmark/driver/chaos_bench_driver.py (needs python3)
 #   --check-scenarios instead of a sweep, prove every scenario of benchmark/suite.tsv
@@ -47,6 +54,8 @@ BENCH_REPORT_DIR="${BENCH_REPORT_DIR:-$REPO_ROOT/benchmark/reports/$GIT_SHA}"
 mode=full
 libc=glibc
 runs=1
+libs=
+run_offset=0
 compare=0
 in_container=0
 for arg in "$@"; do
@@ -58,11 +67,13 @@ for arg in "$@"; do
         --libc=alpine)     libc=alpine ;;
         --libc=musl)       libc=alpine ;;
         --runs=*)          runs="${arg#--runs=}" ;;
+        --libs=*)          libs="${arg#--libs=}" ;;
+        --run-offset=*)    run_offset="${arg#--run-offset=}" ;;
         --compare)         compare=1 ;;
         --check-scenarios) mode=check ;;
         --in-container)    in_container=1 ;;
         -h|--help)
-            sed -n '2,38p' "$0"; exit 0 ;;
+            sed -n '2,44p' "$0"; exit 0 ;;
         *)
             echo "run-bench.sh: unknown argument: $arg" >&2; exit 2 ;;
     esac
@@ -107,7 +118,8 @@ if [ "$in_container" -eq 0 ]; then
         -v "$REPO_ROOT":/work \
         -v "$(cd "$BENCH_REPORT_DIR" && pwd)":/reports \
         "$image" \
-        sh /work/benchmark/run-bench.sh --in-container --"$mode" --runs="$runs" --libc="$libc"
+        sh /work/benchmark/run-bench.sh --in-container --"$mode" --runs="$runs" \
+            --libs="$libs" --run-offset="$run_offset" --libc="$libc"
     if [ "$mode" = check ]; then
         exit 0
     fi
@@ -244,9 +256,21 @@ check_load() {
     rm -f /tmp/.chaos-"$lib".*
 }
 
+# Non-zero when --libs did not ask for $1. An empty --libs asks for every library, which
+# is what both merge gates use: a gate that measured a different subset per pull request
+# would stop covering what the pull request did not happen to touch.
+skipped_lib() {
+    case ",$libs," in
+        ,,)         return 1 ;;
+        *",$1,"*)   return 1 ;;
+        *)          return 0 ;;
+    esac
+}
+
 if [ "$mode" = check ]; then
     grep -v '^#' "$SUITE" | while read -r lib pt pfx iters empty stem when krev srev; do
         [ -n "$lib" ] || continue
+        skipped_lib "$lib" && continue
         bin=/work/"$BIN_DIR"/bench_"$lib"
         if ! registered "$bin" "${pfx}_errno"; then
             [ "$when" = linux ] && { echo "skip $pfx: not registered here"; continue; }
@@ -272,12 +296,14 @@ fi
 # from it.
 cp "$SUITE" "$BENCH_REPORT_DIR/suite.tsv"
 
-run_idx=0
-while [ "$run_idx" -lt "$runs" ]; do
+run_idx="$run_offset"
+run_last=$((run_offset + runs))
+while [ "$run_idx" -lt "$run_last" ]; do
     run_idx=$((run_idx + 1))
-    echo ">>> [container] sweep run $run_idx / $runs"
+    echo ">>> [container] sweep run $run_idx / $run_last"
     grep -v '^#' "$SUITE" | while read -r lib pt pfx iters empty stem when krev srev; do
         [ -n "$lib" ] || continue
+        skipped_lib "$lib" && continue
         [ "$mode" = smoke ] && [ "$when" != smoke ] && continue
         bin=/work/"$BIN_DIR"/bench_"$lib"
         so=/work/"$LIB_DIR"/libchaos-"$lib".so
