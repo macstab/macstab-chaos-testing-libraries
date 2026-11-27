@@ -195,6 +195,8 @@ jobs:
       # branch that is the whole point of the job, so it fails here.
       - name: Compare
         if: steps.pick.outputs.libs != ''
+        env:
+          BASE_LABEL: ${{ inputs.base || 'the merge base' }}
         run: |
           mkdir -p ab-reports
           rc=0
@@ -204,12 +206,15 @@ jobs:
             ab/head || rc=$?
           cat ab-reports/branch-vs-base-${{ matrix.libc }}-${{ matrix.arch }}.md >> "$GITHUB_STEP_SUMMARY"
           if [ "$rc" -ne 0 ]; then
-            echo "::error::${{ matrix.libc }}-${{ matrix.arch }}: slower than the merge base"
+            echo "::error::${{ matrix.libc }}-${{ matrix.arch }}: slower than ${BASE_LABEL}"
             exit 1
           fi
 
+      # Not plain `success()`: the Compare step exits 1 on a regression, which is exactly the
+      # case whose report is worth keeping. Without this the only interesting run uploads
+      # nothing and the verdict survives as a one-line annotation.
       - name: Upload the comparison
-        if: steps.pick.outputs.libs != ''
+        if: ${{ !cancelled() && steps.pick.outputs.libs != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: ab-${{ matrix.libc }}-${{ matrix.arch }}
