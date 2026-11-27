@@ -147,6 +147,18 @@ static inline size_t chaos_hits_header_generation(char *out, size_t size, uint64
  */
 typedef struct chaos_hit_slot chaos_hit_slot_t;
 
+/**
+ * @brief Adds one to a counter and yields its previous value, ordering nothing else.
+ *
+ * @details For a counter whose value is read as a diagnostic or as an ordinal, never as a
+ * flag that publishes other memory. `__sync_fetch_and_add()` is a full barrier; the
+ * evaluation counter below is incremented once per matched call, which makes it the hottest
+ * atomic in the library, and nothing travels with it: a draw is a pure function of the
+ * ordinal (CHAOS_SEED) and the hits file wants the number eventually, not immediately. On
+ * aarch64 the barriers of a sequentially consistent add cost more than the add.
+ */
+#define CHAOS_COUNT_RELAXED(counter) __atomic_fetch_add(&(counter), UINT64_C(1), __ATOMIC_RELAXED)
+
 struct chaos_hit_slot
 {
     /** Hits of this rule in this process; incremented atomically, reset in a forked child. */

@@ -59,6 +59,12 @@ static int g_offset_calls = 0;
 static int g_regress_calls = 0;
 /** @brief Calls to the FREEZE action stub. */
 static int g_freeze_calls = 0;
+/** @brief Calls to the rule-file check seam `chaos_time_config_prepare()`. */
+static int g_prepare_calls = 0;
+/** @brief Calls to the rule-lookup seam `chaos_time_config_match_loaded()`. */
+static int g_match_loaded_calls = 0;
+/** @brief What the `chaos_time_config_prepare()` seam reports: 0 means no rule is loaded. */
+static int g_prepare_result = 1;
 /** @brief Calls to the real-`clock_gettime` stand-in. */
 static int g_real_clock_gettime_calls = 0;
 /** @brief Non-zero makes the real-`clock_gettime` stand-in fail with this errno. */
@@ -120,6 +126,9 @@ static void reset_wrapper_state(void)
     g_offset_calls = 0;
     g_regress_calls = 0;
     g_freeze_calls = 0;
+    g_prepare_calls = 0;
+    g_match_loaded_calls = 0;
+    g_prepare_result = 1;
     g_real_clock_gettime_calls = 0;
     g_real_clock_gettime_error = 0;
     g_real_nanosleep_calls = 0;
@@ -143,7 +152,7 @@ static void reset_wrapper_state(void)
  * @details @p clock_id is ignored, so a clock-gettime rule applies to every clock; tests
  * check the clock a wrapper reads through `g_last_clock_id` instead.
  */
-int chaos_time_config_match(
+int chaos_time_config_match_loaded(
     chaos_time_effect_t effect,
     chaos_time_operation_t operation,
     clockid_t clock_id,
@@ -151,6 +160,7 @@ int chaos_time_config_match(
 )
 {
     (void)clock_id;
+    ++g_match_loaded_calls;
     if (effect < 0 || effect > CHAOS_TIME_EFFECT_FREEZE || operation < 0 ||
         operation > CHAOS_TIME_OP_USLEEP || rule == NULL || g_stub_match[effect][operation] == 0)
     {
@@ -159,6 +169,37 @@ int chaos_time_config_match(
 
     *rule = g_stub_rules[effect][operation];
     return 1;
+}
+
+/**
+ * @brief Rule-file check seam: counts the call and reports `g_prepare_result`.
+ *
+ * @details A wrapper must check the rule file once per intercepted call, not once per
+ * effect it looks for: the check reads the real clock, so one check per effect multiplies
+ * the cost of the cheapest calls by the number of effects.
+ */
+int chaos_time_config_prepare(void)
+{
+    ++g_prepare_calls;
+    return g_prepare_result;
+}
+
+/**
+ * @brief The combined lookup, as the library defines it: a check, then a lookup.
+ */
+int chaos_time_config_match(
+    chaos_time_effect_t effect,
+    chaos_time_operation_t operation,
+    clockid_t clock_id,
+    chaos_time_rule_t *rule
+)
+{
+    if (rule == NULL || !chaos_time_config_prepare())
+    {
+        return 0;
+    }
+
+    return chaos_time_config_match_loaded(effect, operation, clock_id, rule);
 }
 
 /** @brief LATENCY seam: counts the call and does not sleep. */
@@ -1090,8 +1131,36 @@ static void test_call_real_helpers_without_pointers(void)
     assert(sigaction(SIGALRM, &previous_action, NULL) == 0);
 }
 
+/**
+ * @brief One intercepted clock read checks the rule file once, not once per effect.
+ *
+ * @details The check reads the real clock (chaos_clock_checked_recently()), so one check per
+ * effect makes the cheapest call pay for every effect the library knows about. With no rule
+ * loaded the lookups are skipped as well, which is the empty-rule-file case the benchmark
+ * suite measures as the passthrough arm.
+ */
+static void test_clock_read_checks_the_rule_file_once(void)
+{
+    struct timespec value;
+
+    reset_wrapper_state();
+    g_chaos_time_real_clock_gettime = chaos_time_test_clock_gettime;
+    assert(clock_gettime(CLOCK_MONOTONIC, &value) == 0);
+    assert(g_prepare_calls == 1);
+    assert(g_real_clock_gettime_calls == 1);
+
+    reset_wrapper_state();
+    g_chaos_time_real_clock_gettime = chaos_time_test_clock_gettime;
+    g_prepare_result = 0;
+    assert(clock_gettime(CLOCK_MONOTONIC, &value) == 0);
+    assert(g_prepare_calls == 1);
+    assert(g_match_loaded_calls == 0);
+    assert(g_real_clock_gettime_calls == 1);
+}
+
 int main(void)
 {
+    test_clock_read_checks_the_rule_file_once();
     test_clock_read_applies_regress();
     test_clock_read_applies_freeze();
     test_call_real_helpers();

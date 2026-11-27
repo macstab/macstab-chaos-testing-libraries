@@ -441,13 +441,21 @@ static int chaos_time_read_clock(clockid_t clock_id, struct timespec *value)
     chaos_time_rule_t freeze_rule;
     int rc;
 
-    if (chaos_time_config_match(
+    /* One rule-file check for all five lookups, not one per lookup: the check reads the
+     * real clock, so a check per effect would make the cheapest call in the library pay
+     * for every effect it knows about. It also gives the five lookups one snapshot. */
+    if (!chaos_time_config_prepare())
+    {
+        return chaos_time_call_real_clock_gettime(clock_id, value);
+    }
+
+    if (chaos_time_config_match_loaded(
             CHAOS_TIME_EFFECT_LATENCY, CHAOS_TIME_OP_CLOCK_GETTIME, clock_id, &latency_rule
         ))
     {
         chaos_time_rule_apply_latency(&latency_rule);
     }
-    if (chaos_time_config_match(
+    if (chaos_time_config_match_loaded(
             CHAOS_TIME_EFFECT_ERRNO, CHAOS_TIME_OP_CLOCK_GETTIME, clock_id, &errno_rule
         ) &&
         chaos_time_rule_apply_errno(&errno_rule))
@@ -461,13 +469,13 @@ static int chaos_time_read_clock(clockid_t clock_id, struct timespec *value)
         return rc;
     }
 
-    if (chaos_time_config_match(
+    if (chaos_time_config_match_loaded(
             CHAOS_TIME_EFFECT_OFFSET, CHAOS_TIME_OP_CLOCK_GETTIME, clock_id, &offset_rule
         ))
     {
         chaos_time_rule_apply_offset(&offset_rule, value);
     }
-    if (chaos_time_config_match(
+    if (chaos_time_config_match_loaded(
             CHAOS_TIME_EFFECT_REGRESS, CHAOS_TIME_OP_CLOCK_GETTIME, clock_id, &regress_rule
         ))
     {
@@ -475,7 +483,7 @@ static int chaos_time_read_clock(clockid_t clock_id, struct timespec *value)
     }
     /* Last: a frozen clock stands still, so an OFFSET or REGRESS on the same clock is
      * folded into the reading that gets kept rather than applied to it again. */
-    if (chaos_time_config_match(
+    if (chaos_time_config_match_loaded(
             CHAOS_TIME_EFFECT_FREEZE, CHAOS_TIME_OP_CLOCK_GETTIME, clock_id, &freeze_rule
         ))
     {

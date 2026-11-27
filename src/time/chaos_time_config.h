@@ -212,7 +212,7 @@ static inline uint64_t chaos_time_rule_draw_begin(chaos_time_rule_t *rule)
      * its draw numbering. */
     if (rule->hit != NULL && chaos_hit_slot_current(rule->hit, rule->hit_generation))
     {
-        evaluation = __sync_fetch_and_add(&rule->hit->evaluations, UINT64_C(1));
+        evaluation = CHAOS_COUNT_RELAXED(rule->hit->evaluations);
     }
     rule->draw_base = chaos_time_prng_mix((rule->key ^ g_chaos_time_lineage) + evaluation);
     return evaluation + 1U;

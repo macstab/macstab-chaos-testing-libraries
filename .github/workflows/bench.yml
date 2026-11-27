@@ -1,6 +1,9 @@
 # Pre-release benchmark gate: the release workflow's sweep and release-over-release gate, run on
-# every pull request into main (the develop -> main release PR) and on demand, so a performance
-# regression fails the pull request instead of being found after the tag.
+# every pull request into main (the develop -> main release PR) and into develop (a feature
+# branch), and on demand, so a performance regression fails the pull request instead of being
+# found after the tag. Gating the develop pull request too is deliberate: the correctness gates
+# (ci, matrix, codeql) measure no cost at all, so without it the release pull request is the
+# first run ever and a regression arrives with a whole release behind it.
 #
 #   sweep  per variant on a native runner of its architecture: benchmark scenario check
 #          (every scenario loads, every errno scenario fires on each call), then a 10-run sweep
@@ -17,7 +20,7 @@ name: bench
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, develop]
     # A pull request that changes only Markdown (the release workflow's CHANGELOG and
     # benchmark-matrix pull requests, documentation) changes nothing the sweep measures.
     paths-ignore:
