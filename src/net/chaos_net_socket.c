@@ -1020,8 +1020,8 @@ static chaos_bucket_t *chaos_net_throttle_bucket(int fd, uint64_t rate)
 static size_t chaos_net_throttle_size(chaos_net_rule_t *rule, int fd, size_t size, int *refuse)
 {
     chaos_bucket_t *bucket;
-    const int stream = chaos_net_is_stream(fd);
     uint64_t allowed;
+    int stream;
 
     *refuse = 0;
     if (rule->effect != CHAOS_NET_EFFECT_THROTTLE || size == 0U ||
@@ -1029,6 +1029,10 @@ static size_t chaos_net_throttle_size(chaos_net_rule_t *rule, int fd, size_t siz
     {
         return size;
     }
+    /* After the effect test, not before it: the socket type comes from a getsockopt, and
+     * asking for it up here charged that system call to every send a rule matched, for a
+     * rule that has nothing to throttle. */
+    stream = chaos_net_is_stream(fd);
     bucket = chaos_net_throttle_bucket(fd, rule->rate_bps);
     allowed = chaos_bucket_take(bucket, rule->rate_bps, size, chaos_hits_now_ms());
     if (allowed == (uint64_t)size)

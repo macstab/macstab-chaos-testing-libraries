@@ -952,7 +952,10 @@ static int chaos_net_test_epoll_pwait(
 /* SO_TYPE every descriptor reports; TRICKLE, DUP and CORRUPT under MSG_TRUNC depend on it. */
 static int g_test_socket_type = SOCK_STREAM;
 
-#define CHAOS_NET_SOCKET_TYPE(fd) ((void)(fd), g_test_socket_type)
+/** @brief How often a wrapper asked for SO_TYPE; reading it is a system call. */
+static int g_socket_type_calls = 0;
+
+#define CHAOS_NET_SOCKET_TYPE(fd) ((void)(fd), ++g_socket_type_calls, g_test_socket_type)
 
 /* How the DUP slot table is mapped: 0 normally, 1 fails with ENOMEM, 2 maps but another
  * thread publishes its table first. */
@@ -3157,6 +3160,46 @@ static void arm_throttle_rule(int type, uint64_t rate)
  * - a non-blocking socket is told EAGAIN instead of being made to wait;
  * - a rule that does not fire costs neither bytes nor the wait.
  */
+/**
+ * @brief Only a THROTTLE rule makes a send ask the kernel for the socket type.
+ *
+ * @details chaos_net_throttle_size() needs SO_TYPE to decide how much of a throttled
+ * stream may go out, and reading it is a system call. Asking for it before the effect has
+ * been looked at puts that call on every send a rule matches, whatever the rule does.
+ * Measured against 2.0.0 on one runner, alternating: 20 to 27 % on send and sendto with a
+ * rule that matches and does not fire, on all four variants, while the arm with no rule
+ * at all was untouched -- which is the signature of a cost that starts at the match.
+ */
+static void test_only_throttle_asks_the_socket_type(void)
+{
+    char buffer[16];
+
+    /* A matched ERRNO rule that does not fire: the benchmark's match-no-fire arm. */
+    reset_wrapper_stubs();
+    g_test_socket_type = SOCK_STREAM;
+    g_stub_endpoint_from_peer = 1;
+    g_stub_match_endpoint = 1;
+    memset(&g_stub_rule, 0, sizeof(g_stub_rule));
+    g_stub_rule.effect = CHAOS_NET_EFFECT_ERRNO;
+    g_stub_rule.errnum = EIO;
+    g_should_trigger = 0;
+    g_socket_type_calls = 0;
+    assert(send(4, buffer, sizeof(buffer), 0) == g_send_result);
+    assert(g_socket_type_calls == 0);
+    g_socket_type_calls = 0;
+    assert(sendto(4, buffer, sizeof(buffer), 0, NULL, 0U) == g_sendto_result);
+    assert(g_socket_type_calls == 0);
+
+    /* A THROTTLE rule still gets its answer. */
+    arm_throttle_rule(SOCK_STREAM, 1024U);
+    g_socket_type_calls = 0;
+    (void)send(4, buffer, sizeof(buffer), 0);
+    assert(g_socket_type_calls > 0);
+
+    reset_wrapper_stubs();
+    g_test_socket_type = SOCK_STREAM;
+}
+
 static void test_throttle_sends(void)
 {
     char buffer[32];
@@ -4675,6 +4718,7 @@ static void test_unresolved_symbols_reach_the_kernel(void)
 
 int main(void)
 {
+    test_only_throttle_asks_the_socket_type();
     test_wrappers_forward_inside_library();
     test_unmatched_endpoints_are_forwarded();
     test_rules_that_do_not_fire();
